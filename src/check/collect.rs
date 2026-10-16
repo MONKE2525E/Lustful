@@ -216,6 +216,16 @@ pub enum FnLoc {
     Trait(u32, u32),
     /// `ast.stmt_items[i]`, a fn nested in a body.
     Nested(u32),
+    /// The initializer body (`ast::ConstDef::init_fn`) of the const or
+    /// static at `ast.items[i]`. This and the three below live only
+    /// while check/const_body.rs checks the initializers.
+    ConstItem(u32),
+    /// Of associated const `k` of the impl at `ast.items[i]`.
+    ImplConst(u32, u32),
+    /// Of associated const `k` of the trait at `ast.items[i]`.
+    TraitConst(u32, u32),
+    /// Of the const or static at `ast.stmt_items[i]`.
+    NestedConst(u32),
 }
 
 impl FnLoc {
@@ -238,8 +248,32 @@ impl FnLoc {
                 ItemKind::Fn(d) => Some(d),
                 _ => None,
             },
+            FnLoc::ConstItem(i) => item_init_fn(&ast.items[i as usize]),
+            FnLoc::ImplConst(i, k) => match &ast.items[i as usize].kind {
+                ItemKind::Impl(imp) => imp.consts.get(k as usize).and_then(|c| c.init_fn.as_deref()),
+                _ => None,
+            },
+            FnLoc::TraitConst(i, k) => match &ast.items[i as usize].kind {
+                ItemKind::Trait(t) => t.consts.get(k as usize).and_then(|c| c.init_fn.as_deref()),
+                _ => None,
+            },
+            FnLoc::NestedConst(i) => item_init_fn(&ast.stmt_items[i as usize]),
         };
         def.expect("a fn location names a fn of its Ast")
+    }
+
+    /// True for the initializer body of a const or static item.
+    pub fn is_const_init(self) -> bool {
+        matches!(self, FnLoc::ConstItem(_) | FnLoc::ImplConst(..) | FnLoc::TraitConst(..) | FnLoc::NestedConst(_))
+    }
+}
+
+/// The initializer body of a const or static item.
+fn item_init_fn(item: &ast::Item) -> Option<&ast::FnDef> {
+    match &item.kind {
+        ItemKind::Const(c) => c.init_fn.as_deref(),
+        ItemKind::Static(s) => s.init_fn.as_deref(),
+        _ => None,
     }
 }
 
@@ -1895,7 +1929,7 @@ pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::Exp
 /// const parameter's declared type): a literal or operation out
 /// of that type's range is None, as rustc rejects it.
 pub fn eval_const_int_exp(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, exp: Option<IntTy>) -> Option<i128> {
-    let mut ev = ScalarEval { ast, interner, known, slots: Vec::new(), steps: 0 };
+    let mut ev = ScalarEval { ast, interner, known, slots: Vec::new(), steps: 0, fn_depth: 0, fixed: Vec::new() };
     let mut env: SEnv = Vec::new();
     let v = match ev.expr(&mut env, e, exp.map(SExp::Int), 0) {
         SFlow::V(Some(v)) => v,
@@ -2433,6 +2467,14 @@ struct ScalarEval<'x> {
     known: &'x Known,
     slots: Vec<SVal>,
     steps: u64,
+    /// How many const fn bodies the evaluation is inside. A const fn
+    /// body is borrow-checked as a fn; the const expression itself is
+    /// not (it has no body of its own), so at depth 0 this subset
+    /// takes no borrow and no assignment to a binding without `mut`
+    /// (rustc E0499, E0502, E0506, E0384 and kin could not be seen).
+    fn_depth: u32,
+    /// The slots of the bindings without `mut` at depth 0.
+    fixed: Vec<usize>,
 }
 
 impl<'x> ScalarEval<'x> {
@@ -2505,11 +2547,11 @@ impl<'x> ScalarEval<'x> {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { pat, ty, init, els, .. } => {
-                    let (Some(init), None, Pat::Binding { name, .. }) = (init, els, ast.pat(*pat)) else {
+                    let (Some(init), None, Pat::Binding { name, mutable, .. }) = (init, els, ast.pat(*pat)) else {
                         env.truncate(saved);
                         return SFlow::V(None);
                     };
-                    let name = *name;
+                    let (name, mutable) = (*name, *mutable);
                     let lexp = ty.and_then(|t| sexp_of_written(self.ast, self.interner, self.known, t));
                     let Some(mut v) = self.val(env, *init, lexp, depth + 1) else {
                         env.truncate(saved);
@@ -2525,6 +2567,9 @@ impl<'x> ScalarEval<'x> {
                         }
                     }
                     let slot = self.new_slot(v);
+                    if !mutable && self.fn_depth == 0 {
+                        self.fixed.push(slot);
+                    }
                     env.push((name, slot));
                 }
                 Stmt::Expr { expr, .. } => match self.expr(env, *expr, None, depth + 1) {
@@ -2703,7 +2748,10 @@ impl<'x> ScalarEval<'x> {
                 fenv.push((param.name, slot));
             }
             let rexp = def.ret.and_then(|t| sexp_of_written(ast, self.interner, self.known, t));
-            let out = match self.block(&mut fenv, body, rexp, depth + 1) {
+            self.fn_depth += 1;
+            let flow = self.block(&mut fenv, body, rexp, depth + 1);
+            self.fn_depth -= 1;
+            let out = match flow {
                 SFlow::V(v) | SFlow::Return(v) => v?,
                 _ => return None,
             };
@@ -2911,13 +2959,13 @@ impl<'x> ScalarEval<'x> {
                 SFlow::Return(v)
             }
             Expr::Assign { lhs, rhs } => {
-                let Some(slot) = self.place_slot(env, *lhs, depth + 1) else { return SFlow::V(None) };
+                let Some(slot) = self.place_slot(env, *lhs, depth + 1).filter(|s| !self.fixed.contains(s)) else { return SFlow::V(None) };
                 let exp = s_exp_of(self.slots[slot]);
                 let Some(v) = self.val(env, *rhs, exp, depth + 1) else { return SFlow::V(None) };
                 SFlow::V(if self.store(slot, v) { Some(SVal::Unit) } else { None })
             }
             Expr::AssignOp { op, lhs, rhs } => {
-                let Some(slot) = self.place_slot(env, *lhs, depth + 1) else { return SFlow::V(None) };
+                let Some(slot) = self.place_slot(env, *lhs, depth + 1).filter(|s| !self.fixed.contains(s)) else { return SFlow::V(None) };
                 let cur = self.slots[slot];
                 let shift = matches!(op, BinOp::Shl | BinOp::Shr);
                 let rexp = if shift { None } else { s_exp_of(cur) };
@@ -2931,6 +2979,7 @@ impl<'x> ScalarEval<'x> {
                 let Some(r) = s_combine(*op, cur, b) else { return SFlow::V(None) };
                 SFlow::V(if self.store(slot, r) { Some(SVal::Unit) } else { None })
             }
+            Expr::Ref { .. } if self.fn_depth == 0 => SFlow::V(None),
             Expr::Ref { expr, .. } => SFlow::V(self.place_slot(env, *expr, depth + 1).map(SVal::Ref)),
             Expr::Deref(inner) => SFlow::V(match self.val(env, *inner, None, depth + 1) {
                 Some(SVal::Ref(s)) => Some(self.slots[s]),
@@ -2966,7 +3015,12 @@ impl<'x> ScalarEval<'x> {
     fn const_body(&mut self, body: ast::ExprId, decl: Option<ast::TyId>, depth: u32) -> Option<SVal> {
         let dexp = decl.and_then(|t| sexp_of_written(self.ast, self.interner, self.known, t));
         let mut empty: SEnv = Vec::new();
-        let v = self.val(&mut empty, body, dexp, depth + 1)?;
+        // A const item's initializer is borrow-checked as its own body
+        // (check/const_body.rs), like a const fn's.
+        self.fn_depth += 1;
+        let v = self.val(&mut empty, body, dexp, depth + 1);
+        self.fn_depth -= 1;
+        let v = v?;
         match dexp {
             Some(SExp::Int(it)) => s_coerce_int(v, it),
             Some(SExp::Bool) => match v {
@@ -8042,6 +8096,12 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             return Vec::new();
         }
         self.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
+    }
+    fn variant_count(&self, adt: AdtId) -> u32 {
+        if adt.0 >= u32::MAX - 1 {
+            return 0;
+        }
+        self.p.adt(adt).variants.len() as u32
     }
     fn resolve_ty(&mut self, t: ast::TyId) -> Ty {
         // Scoped resolution first: a written type can apply a generic

@@ -2278,9 +2278,43 @@ impl<'a> Parser<'a> {
         };
         self.expect(Tok::Colon, "`:`")?;
         let ty = self.ty()?;
-        let value = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+        let (value, init_fn) = self.const_value(name.unwrap_or(Sym(0)), name_span)?;
         self.expect(Tok::Semi, "`;`")?;
-        Ok(ConstDef { name, name_span, ty, value, span: start.to(self.prev_span()) })
+        Ok(ConstDef { name, name_span, ty, value, span: start.to(self.prev_span()), init_fn })
+    }
+
+    /// The `= value` of a const, static, or associated const, if
+    /// written, with the value as the body of a fn of its own: a block
+    /// whose tail is the value, over the value's expr and pat ranges
+    /// (`ConstDef::init_fn`).
+    fn const_value(&mut self, name: Sym, name_span: Span) -> PResult<(Option<ExprId>, Option<Box<FnDef>>)> {
+        if !self.eat(Tok::Eq) {
+            return Ok((None, None));
+        }
+        let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
+        let value = self.expr()?;
+        let exprs = (e0, self.ast.exprs.len() as u32);
+        let pats = (p0, self.ast.pats.len() as u32);
+        let span = self.ast.expr_span(value);
+        let body = self.push_block(Block { inner_attrs: Vec::new(), stmts: Vec::new(), tail: Some(value), tail_attrs: Vec::new(), span });
+        let def = FnDef {
+            name,
+            name_span,
+            is_test: false,
+            vis: Vis::Private,
+            attrs: self.scope_allows.clone(),
+            qual: FnQual::default(),
+            generics: Generics::default(),
+            self_param: None,
+            params: Vec::new(),
+            variadic: false,
+            ret: None,
+            where_clause: WhereClause::default(),
+            body: Some(body),
+            exprs,
+            pats,
+        };
+        Ok((Some(value), Some(Box::new(def))))
     }
 
     /// A `static` item: `static [mut] NAME: Ty = value;`.
@@ -2290,9 +2324,9 @@ impl<'a> Parser<'a> {
         let (name, name_span) = self.ident()?;
         self.expect(Tok::Colon, "`:`")?;
         let ty = self.ty()?;
-        let value = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+        let (value, init_fn) = self.const_value(name, name_span)?;
         self.expect(Tok::Semi, "`;`")?;
-        Ok(StaticDef { name, name_span, mutable, ty, value, span: start.to(self.prev_span()) })
+        Ok(StaticDef { name, name_span, mutable, ty, value, span: start.to(self.prev_span()), init_fn })
     }
 
     /// A `type` alias: `type Name = Target;`. Generic aliases reject with
@@ -2909,9 +2943,9 @@ impl<'a> Parser<'a> {
         let (name, name_span) = self.ident()?;
         self.expect(Tok::Colon, "`:`")?;
         let ty = self.ty()?;
-        let default = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+        let (default, init_fn) = self.const_value(name, name_span)?;
         self.expect(Tok::Semi, "`;`")?;
-        Ok(AssocConstDef { name, name_span, vis: Vis::Private, attrs: Vec::new(), ty, default, span: start.to(self.prev_span()) })
+        Ok(AssocConstDef { name, name_span, vis: Vis::Private, attrs: Vec::new(), ty, default, span: start.to(self.prev_span()), init_fn })
     }
 
     /// A trait definition: supertrait bounds, a where clause, and

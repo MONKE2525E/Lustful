@@ -536,6 +536,33 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
             "Return a named type instead of `impl Trait`.",
         )];
     }
+    let own = own_sig(p, body);
+    if own.check
+        && let Some(d) = regions::impl_contract(p, body.fn_id)
+    {
+        ck.errs.push(d);
+    }
+    check_with(ck, own)
+}
+
+/// Borrow-checks the body of an anonymous const (lower.rs
+/// `check_anon_consts`): no parameters, and a value of type `ret` (its
+/// regions `'static`) in local 0, as a const item's initializer body.
+pub fn borrowck_const(p: &Program, body: &Body, ret: Ty) -> Vec<Diag> {
+    if !body.lower_errs.is_empty() {
+        return body.lower_errs.clone();
+    }
+    if in_instance(p, body.fn_id) || untracked_opaque(p, body) {
+        return Vec::new();
+    }
+    let sig = RegionSig::const_value(ret);
+    let own = regions::OwnSig::build(p, body, Some(&sig), false, true);
+    check_with(Ck::new(p, body), own)
+}
+
+/// The passes of `borrowck` after its own signature is known.
+fn check_with<'b, 'p>(mut ck: Ck<'b, 'p>, own: regions::OwnSig) -> Vec<Diag> {
+    let (p, body) = (ck.p, ck.body);
     ck.collect_loans();
     ck.collect_move_paths();
     let n = body.locals.len();
@@ -546,12 +573,6 @@ pub fn borrowck(p: &Program, body: &Body) -> Vec<Diag> {
     // A body with no loans needs no regions: no loan can conflict, and a
     // universal relation can only fail through a loan or a reference value
     // that flows between parameters, which the region pass checks below.
-    let own = own_sig(p, body);
-    if own.check
-        && let Some(d) = regions::impl_contract(p, body.fn_id)
-    {
-        ck.errs.push(d);
-    }
     // A dyn type with late-bound places (R11) may meet one with fixed
     // places, a type error only the region pass sees.
     let needs_regions = !ck.loans.is_empty() || own.n_univ > 0 || regions::may_entail_bounds(p, body) || regions::has_dyn_late(body);

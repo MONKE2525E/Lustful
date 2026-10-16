@@ -378,6 +378,12 @@ impl<'a, T: TyIntern> ConstCx<'a> for InstCx<'a, T> {
         }
         self.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
     }
+    fn variant_count(&self, adt: AdtId) -> u32 {
+        if adt.0 >= u32::MAX - 1 {
+            return 0;
+        }
+        self.p.adt(adt).variants.len() as u32
+    }
     fn pattern_variant(&mut self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
         self.variant_of(segs)
     }

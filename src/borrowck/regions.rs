@@ -140,6 +140,28 @@ pub struct RegionSig {
     pub bounds: Vec<Predicate>,
 }
 
+impl RegionSig {
+    /// The signature of a body with no parameters whose value has type
+    /// `ret` (every region `'static`): a const or static initializer, or
+    /// an anonymous const (check/const_body.rs, lower.rs `check_anon_consts`).
+    pub fn const_value(ret: Ty) -> RegionSig {
+        RegionSig {
+            n_univ: 0,
+            params: Vec::new(),
+            ret,
+            facts: Vec::new(),
+            names: Vec::new(),
+            early: Vec::new(),
+            fn_bounds: Vec::new(),
+            trait_bounds: Vec::new(),
+            item_bounds: Vec::new(),
+            opaque_caps: None,
+            header: Vec::new(),
+            bounds: Vec::new(),
+        }
+    }
+}
+
 /// A bound `T: Tr<'a, ..>` on type param `param` for a trait with lifetime
 /// params: the lifetime args as written (`Region::Param` of the fn's
 /// universals, or `Region::Static`). A call of a `Tr` method through `T`

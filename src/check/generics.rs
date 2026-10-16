@@ -13908,4 +13908,8 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
         errs.extend(materialize(p));
         crate::driver::laps::mark("collect/finish materialize");
     }
+    if errs.is_empty() {
+        crate::check::const_body::check_all(p, errs);
+        crate::driver::laps::mark("collect/finish const bodies");
+    }
 }

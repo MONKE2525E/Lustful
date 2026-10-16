@@ -507,6 +507,9 @@ impl Walk {
             self.vis(&mut c.vis);
             self.attrs(&mut c.attrs);
             self.sp(&mut c.span);
+            if let Some(f) = &mut c.init_fn {
+                self.fn_def(f);
+            }
         }
     }
     fn assoc_types(&mut self, ts: &mut [AssocTypeDef]) {
@@ -588,10 +591,16 @@ impl Walk {
             ItemKind::Const(c) => {
                 self.sp(&mut c.name_span);
                 self.sp(&mut c.span);
+                if let Some(f) = &mut c.init_fn {
+                    self.fn_def(f);
+                }
             }
             ItemKind::Static(s) => {
                 self.sp(&mut s.name_span);
                 self.sp(&mut s.span);
+                if let Some(f) = &mut s.init_fn {
+                    self.fn_def(f);
+                }
             }
             ItemKind::MacroRules(m) => {
                 self.sp(&mut m.name_span);

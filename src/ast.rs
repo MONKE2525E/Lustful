@@ -582,6 +582,8 @@ pub struct AssocConstDef {
     pub ty: TyId,
     pub default: Option<ExprId>,
     pub span: Span,
+    /// The value as a body of its own (`ConstDef::init_fn`).
+    pub init_fn: Option<Box<FnDef>>,
 }
 
 /// An associated type in a trait or an impl. In an impl, `default` is the
@@ -623,6 +625,11 @@ pub struct ConstDef {
     pub ty: TyId,
     pub value: Option<ExprId>,
     pub span: Span,
+    /// The value as the body of a fn with no parameters (a block whose
+    /// tail is `value`, over the value's expr and pat ranges), so the
+    /// initializer is type- and borrow-checked like a fn body
+    /// (check/const_body.rs). None when there is no value.
+    pub init_fn: Option<Box<FnDef>>,
 }
 
 /// A `static` item. `value` is None only in an extern block.
@@ -635,6 +642,8 @@ pub struct StaticDef {
     pub ty: TyId,
     pub value: Option<ExprId>,
     pub span: Span,
+    /// The value as a body of its own (`ConstDef::init_fn`).
+    pub init_fn: Option<Box<FnDef>>,
 }
 
 /// A `macro_rules!` definition. The rules stay as raw token trees: matching
@@ -1445,6 +1454,9 @@ impl Shift {
             self.attrs(&mut c.attrs);
             c.ty = self.t(c.ty);
             c.default = c.default.map(|e| self.e(e));
+            if let Some(f) = &mut c.init_fn {
+                self.fn_def(f);
+            }
         }
     }
     fn assoc_types(&self, ts: &mut [AssocTypeDef]) {
@@ -1547,10 +1559,16 @@ impl Shift {
             ItemKind::Const(c) => {
                 c.ty = self.t(c.ty);
                 c.value = c.value.map(|e| self.e(e));
+                if let Some(f) = &mut c.init_fn {
+                    self.fn_def(f);
+                }
             }
             ItemKind::Static(s) => {
                 s.ty = self.t(s.ty);
                 s.value = s.value.map(|e| self.e(e));
+                if let Some(f) = &mut s.init_fn {
+                    self.fn_def(f);
+                }
             }
             ItemKind::MacroRules(m) => self.trees(&mut m.tokens),
             ItemKind::ExternCrate(_) => {}

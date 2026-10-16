@@ -99,6 +99,7 @@ pub fn lower_closure<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -
         unwind_last: None,
         in_cleanup: false,
         bind_of: Vec::new(),
+        as_code: None,
     };
     let Some(info) = info.filter(|_| !poisoned) else {
         // The parent failed to check and reports why; keep the shape

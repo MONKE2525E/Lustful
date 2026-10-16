@@ -149,6 +149,19 @@ impl Defs {
         }
     }
 
+    /// The number of def records.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Drops the records added after the first `n` (check/const_body.rs
+    /// removes the defs of its transient fns). Adt records stay below `n`.
+    pub fn truncate(&mut self, n: usize) {
+        for (def, _) in self.data.drain(n.min(self.data.len())..) {
+            self.by_def.remove(&def);
+        }
+    }
+
     /// Records one user Adt def and its session-local index, in both directions.
     pub fn insert_adt(&mut self, def: DefId, local: AdtId, data: DefData) {
         self.adt_locals.insert(def, local);

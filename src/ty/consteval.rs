@@ -310,6 +310,8 @@ pub trait ConstCx<'a> {
     /// Field names and types of one variant, in declaration order. Tuple
     /// fields answer with a dummy name; position is what matters there.
     fn variant_fields(&self, adt: AdtId, variant: u32) -> Vec<(Sym, Ty)>;
+    /// The number of variants of an Adt (1 for a struct).
+    fn variant_count(&self, adt: AdtId) -> u32;
     /// The pattern target (Adt, variant) a path pattern names.
     fn pattern_variant(&mut self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)>;
     /// Resolves a written type (casts, `size_of` arguments).
@@ -1017,6 +1019,7 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
         local_debt: Vec::new(),
         self_sym: None,
         ref_bind: false,
+        mut_arg: None,
     };
     let mut env: Env = Vec::new();
     let span = cx.ast().expr_span(e);
@@ -1090,6 +1093,9 @@ struct Evaluator {
     /// True while `match_pat` matches below a reference it went
     /// through: bindings there bind by reference.
     ref_bind: bool,
+    /// The call argument being evaluated when it is a `&mut` borrow:
+    /// the only place a `&mut` value may be made (`mut_ref_outside`).
+    mut_arg: Option<ExprId>,
 }
 
 /// Steps one blob byte grants. A hash loop body (index, xor or
@@ -1512,6 +1518,11 @@ impl Evaluator {
                 return Ok(Flow::Val(self.cast(cx, v, target, span)?));
             }
             Expr::Ref { expr, mutable, .. } => {
+                // An extending `&mut` is part of the final value, which
+                // `check_final_refs` rejects (rustc E0764).
+                if *mutable && self.mut_arg.take() != Some(e) && !self.extending.contains(&e) {
+                    return Err(mut_ref_outside(span, "a `&mut` borrow that is not a const fn call argument"));
+                }
                 // `&STATIC` and `&CONST` keep their identity where the caller
                 // can use it; anything else is a promoted temporary.
                 if let Expr::Path(segs) = cx.ast().expr(*expr)
@@ -3386,7 +3397,10 @@ impl Evaluator {
             let i = i + off;
             let want = body.param_tys.get(i).copied();
             let want_now = if generic { want.map(|w| subst_binds(cx.tys(), w, &binds)) } else { want };
-            let (v0, vt) = self.value_moved(cx, env, a, want_now)?;
+            self.mut_arg = matches!(cx.ast().expr(a), Expr::Ref { mutable: true, .. }).then_some(a);
+            let r = self.value_moved(cx, env, a, want_now);
+            self.mut_arg = None;
+            let (v0, vt) = r?;
             if let Some(want) = want {
                 let ok = if generic { bind_params(cx.tys(), want, vt, &mut binds) } else { const_ty_compatible(cx.tys_ref(), vt, want) };
                 if !ok {
@@ -3403,6 +3417,18 @@ impl Evaluator {
         // place (or the caller's own `&mut` cell, for a
         // reborrow passed on). A write-back target is
         // (arg index, target expr, target-is-a-place).
+        // Only a plain `&mut T` parameter is written back; a `&mut`
+        // inside another parameter type, or in the result, would be a
+        // copy whose writes are lost (`mut_ref_outside`).
+        for &pt in body.param_tys.iter().chain([&body.ret]) {
+            let inner = match cx.tys_ref().kind(pt) {
+                TyKind::Ref(_, m, it) if m.is_mut() && pt != body.ret => it,
+                _ => pt,
+            };
+            if holds_mut_ref(cx, inner, &mut Vec::new()) {
+                return Err(mut_ref_outside(span, "a const fn whose parameter or result holds a `&mut` this way"));
+            }
+        }
         let mut wb_targets: Vec<(usize, ExprId, bool)> = Vec::new();
         for (i, &a) in args.iter().enumerate() {
             let i = i + off;
@@ -4931,12 +4957,18 @@ impl Evaluator {
                             || matches!(v, ConstValue::Aggregate(_)));
                     }
                 }
+                if holds_mut_ref(cx, t, &mut Vec::new()) {
+                    return Err(mut_ref_outside(span, "a binding that holds a `&mut` reference"));
+                }
                 binds.push((*name, self.bind_value(cx, v, t, *mutable, span)?, *mutable, false));
                 Ok(true)
             }
             Pat::At { name, mutable, by_ref, inner } => {
                 if *by_ref {
                     return Err(outside(span, "`ref` bindings in const"));
+                }
+                if holds_mut_ref(cx, t, &mut Vec::new()) {
+                    return Err(mut_ref_outside(span, "a binding that holds a `&mut` reference"));
                 }
                 let bv = self.bind_value(cx, v, t, *mutable, span)?;
                 if self.match_pat(cx, env, *inner, v, t, _in_match, binds)? {
@@ -5054,6 +5086,7 @@ impl Evaluator {
                 let (v, t) = match v {
                     ConstValue::Ref(inner) if matches!(cx.tys_ref().kind(t), TyKind::Ref(..)) => {
                         let it = match cx.tys_ref().kind(t) {
+                            TyKind::Ref(_, m, _) if m.is_mut() => return Err(mut_ref_outside(span, "a pattern matched through a `&mut` reference")),
                             TyKind::Ref(_, _, it) => it,
                             _ => ERROR,
                         };
@@ -5197,6 +5230,7 @@ impl Evaluator {
                 let (v, t) = match v {
                     ConstValue::Ref(inner) => {
                         let it = match cx.tys_ref().kind(t) {
+                            TyKind::Ref(_, m, _) if m.is_mut() => return Err(mut_ref_outside(span, "a pattern matched through a `&mut` reference")),
                             TyKind::Ref(_, _, it) => it,
                             _ => ERROR,
                         };
@@ -6195,4 +6229,58 @@ fn fmt_text(fmt: &[ast::FmtPiece]) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// The evaluator copies a value on every borrow, so a write through a
+/// `&mut` reaches its place only when the borrow is a const fn call
+/// argument (the call writes it back). Every other way to hold a `&mut`
+/// value is outside the bound: a borrow kept in a binding or a value, a
+/// pattern matched through a `&mut`, a const fn whose parameter or
+/// result holds one in another type. Such a write would be lost, a
+/// wrong value (fx-constbck).
+fn mut_ref_outside(span: Span, what: &str) -> Diag {
+    Diag::new(C_OUTSIDE, span, format!("{what} is outside the bounded const evaluator"), "Pass `&mut place` straight to a const fn, or compute the value without a `&mut`.")
+}
+
+/// True when a value of type `t` may hold a `&mut` reference: in
+/// itself, an element, a field of a crate Adt (type args substituted),
+/// or a type argument of any other Adt.
+/// `seen` holds the types on the walk (a recursive type).
+fn holds_mut_ref<'a, C: ConstCx<'a>>(cx: &mut C, t: Ty, seen: &mut Vec<Ty>) -> bool {
+    if seen.contains(&t) {
+        return false;
+    }
+    // A type that keeps growing on the walk (`L<T>` holding `L<(T, T)>`):
+    // assume it may hold one.
+    if seen.len() > 32 {
+        return true;
+    }
+    seen.push(t);
+    let kind = cx.tys_ref().kind(t);
+    let out = match kind {
+        TyKind::Ref(_, m, inner) => m.is_mut() || holds_mut_ref(cx, inner, seen),
+        TyKind::Slice(e) | TyKind::Array(e, _) => holds_mut_ref(cx, e, seen),
+        TyKind::Tuple(ts) => {
+            let ts = cx.tys_ref().tys_of(ts).to_vec();
+            ts.into_iter().any(|e| holds_mut_ref(cx, e, seen))
+        }
+        TyKind::Adt(_, a) => {
+            let args = cx.tys_ref().args(a).to_vec();
+            // A crate Adt holds what its fields hold (a `PhantomData`
+            // marker over a `&mut` holds none); any other, its type args.
+            match cx.tys_ref().local_adt(t) {
+                None => args.iter().any(|g| g.as_ty().is_some_and(|e| holds_mut_ref(cx, e, seen))),
+                Some(adt) => (0..cx.variant_count(adt)).any(|v| {
+                    let fields = cx.variant_fields(adt, v);
+                    fields.into_iter().any(|(_, f)| {
+                        let f = if args.is_empty() { f } else { super::subst(cx.tys(), f, &args) };
+                        holds_mut_ref(cx, f, seen)
+                    })
+                }),
+            }
+        }
+        _ => false,
+    };
+    seen.pop();
+    out
 }

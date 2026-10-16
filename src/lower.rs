@@ -110,7 +110,15 @@ struct Lower<'p> {
     /// Each binding's IR local with its checker local, for its opaque
     /// mark (`mark_opaque_locals`).
     bind_of: Vec<(Local, u32)>,
+    /// An expression that lowers as code even though the checker
+    /// const-evaluated it: the root of an anonymous const's own body
+    /// (`check_anon_consts`).
+    as_code: Option<ExprId>,
 }
+
+/// The scope depth `mark_extending` gives a const initializer's
+/// extended temporaries: none, they are promoted (`promoted_temp`).
+const STATIC_SCOPE: usize = usize::MAX;
 
 /// Lowers one checked function body to IR.
 pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'p> {
@@ -170,6 +178,7 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         unwind_last: None,
         in_cleanup: false,
         bind_of: Vec::new(),
+        as_code: None,
     };
     // A template's own `impl Trait` return is its hidden type here, so the
     // borrow checker sees the returned value's regions (check/opaque.rs).
@@ -213,6 +222,14 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         Some(b) => (p.ast.block(b).span, Some(b)),
         None => (Span::default(), None),
     };
+    // A const or static initializer (check/const_body.rs): the
+    // temporaries its value extends live in static storage, as rustc
+    // gives a const initializer's extended temporaries `'static`.
+    if f.loc.is_const_init()
+        && let Some(t) = body.and_then(|b| p.ast.block(b).tail)
+    {
+        lw.mark_extending(t, STATIC_SCOPE);
+    }
     if let Some(b) = body {
         lw.block_into(b, Some(&Place::local(0)));
     }
@@ -220,7 +237,132 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
     lw.terminate(Terminator::Return, span);
     lw.map_annotations();
     lw.mark_opaque_locals();
-    lw.body
+    check_anon_consts(lw)
+}
+
+/// Borrow-checks the anonymous consts of a body: `const { .. }` blocks,
+/// and array repeat counts other than a literal or a path. The checker
+/// typed their code, but the body uses only their values, so the code
+/// never reached the IR. Each one lowers as a body of its own over the
+/// same checked types, returning its value (the temporaries the value
+/// extends are static, as in a const item), and its borrowck errors join
+/// this body's lowering errors, which borrowck reports first.
+fn check_anon_consts(lw: Lower<'_>) -> Body<'_> {
+    let p = lw.p;
+    let Lower { mut ck, body: mut main, .. } = lw;
+    for e in anon_consts(p, main.fn_id, &ck) {
+        let ty = ck.ty(e);
+        let entry = BlockData { stmts: Vec::new(), term: Terminator::Unreachable, term_span: Span::default() };
+        let sub = Body {
+            fn_id: main.fn_id,
+            tys: main.tys.clone(),
+            locals: Vec::new(),
+            blocks: vec![entry],
+            arg_count: 0,
+            reads: Default::default(),
+            lower_errs: Vec::new(),
+            annotations: Vec::new(),
+            promoted: Vec::new(),
+            index_exprs: Vec::new(),
+            pat_back_index: Vec::new(),
+            pat_front_index: Vec::new(),
+            pat_subslice: Vec::new(),
+            dyn_coerce: Vec::new(),
+            false_edges: Vec::new(),
+            opaque_locals: Vec::new(),
+            opaque_nodrop: Vec::new(),
+            stmt_unwind: Vec::new(),
+        };
+        let mut lw = Lower {
+            p,
+            ck,
+            body: sub,
+            cur: Bb(0),
+            scopes: vec![Vec::new()],
+            loops: Vec::new(),
+            local_map: Vec::new(),
+            mut_index: 0,
+            cow_view: None,
+            making_cow_view: None,
+            drop_ty: Default::default(),
+            upvars: None,
+            guard_places: Vec::new(),
+            or_tags: Vec::new(),
+            or_forced: Vec::new(),
+            guard_temps: Vec::new(),
+            bind_reuse: Vec::new(),
+            bind_depth: 0,
+            prelowered: Vec::new(),
+            spine_gen: 0,
+            extended: Vec::new(),
+            unwind_steps: Default::default(),
+            unwind_end: None,
+            unwind_last: None,
+            in_cleanup: false,
+            bind_of: Vec::new(),
+            as_code: Some(e),
+        };
+        lw.new_local(ty, true, None);
+        lw.local_map = vec![u32::MAX; lw.ck.locals.len()];
+        lw.guard_places = vec![None; lw.ck.locals.len()];
+        let span = p.ast.expr_span(e);
+        let tail = match p.ast.expr(e) {
+            Expr::ConstBlock(b) | Expr::Block(b) => p.ast.block(*b).tail,
+            _ => Some(e),
+        };
+        if let Some(t) = tail {
+            lw.mark_extending(t, STATIC_SCOPE);
+        }
+        match p.ast.expr(e) {
+            Expr::ConstBlock(b) | Expr::Block(b) => lw.block_into(*b, Some(&Place::local(0))),
+            _ => lw.expr_into(e, Some(&Place::local(0))),
+        }
+        lw.pop_scope(span);
+        lw.terminate(Terminator::Return, span);
+        let Lower { ck: back, body: mut sub, .. } = lw;
+        ck = back;
+        let ret = crate::check::const_body::all_static(&mut sub.tys, ty);
+        main.lower_errs.extend(crate::borrowck::borrowck_const(p, &sub, ret));
+    }
+    main
+}
+
+/// The anonymous consts `check_anon_consts` lowers for fn `f`: in a
+/// plain fn or a template (an instance or closure body is checked with
+/// its source), the checker typed, and not inside a nested item (that
+/// item's own body owns them).
+fn anon_consts(p: &Program, f: LocalDefId, ck: &Checked) -> Vec<ExprId> {
+    use crate::check::generics::FnClass;
+    if !matches!(p.gx.fn_class.get(f.0 as usize), Some(FnClass::Plain | FnClass::Template)) || p.gx.closure_fns.contains_key(&f) {
+        return Vec::new();
+    }
+    let (lo, hi) = p.fn_def(f).exprs;
+    let mut out: Vec<ExprId> = Vec::new();
+    for e in (lo..hi).map(ExprId) {
+        match p.ast.expr(e) {
+            Expr::ConstBlock(_) => out.push(e),
+            Expr::ArrayRepeat { len, .. } if !matches!(p.ast.expr(*len), Expr::Int(..) | Expr::Path(_)) => out.push(*len),
+            _ => {}
+        }
+    }
+    out.retain(|&e| ck.ty(e) != ERROR);
+    if out.is_empty() {
+        return out;
+    }
+    let nested: Vec<(u32, u32)> = p
+        .ast
+        .stmt_items
+        .iter()
+        .filter_map(|it| match &it.kind {
+            ast::ItemKind::Fn(d) => Some(d.exprs),
+            ast::ItemKind::Const(c) => c.init_fn.as_ref().map(|d| d.exprs),
+            ast::ItemKind::Static(s) => s.init_fn.as_ref().map(|d| d.exprs),
+            _ => None,
+        })
+        .filter(|&(a, b)| a >= lo && b <= hi && (a, b) != (lo, hi))
+        .collect();
+    out.retain(|e| !nested.iter().any(|&(a, b)| e.0 >= a && e.0 < b));
+    out
 }
 
 impl<'p> Lower<'p> {
@@ -259,9 +401,32 @@ impl<'p> Lower<'p> {
         } else {
             self.expr_into(e, Some(&Place::local(t)));
         }
-        let depth = self.extended.iter().rev().find(|&&(x, _)| x == e).map_or(self.scopes.len() - 1, |&(_, d)| d);
-        self.scopes[depth].push(t);
+        self.push_extended(e, t);
         t
+    }
+    /// Puts temporary `t` of expression `e` in its scope: the innermost
+    /// one, or the one a `let` extends `e` to, or static storage for a
+    /// const initializer's value (`STATIC_SCOPE`).
+    fn push_extended(&mut self, e: ExprId, t: Local) {
+        match self.extended.iter().rev().find(|&&(x, _)| x == e).map_or(self.scopes.len() - 1, |&(_, d)| d) {
+            STATIC_SCOPE => self.body.promoted.push(t),
+            depth => self.scopes[depth].push(t),
+        }
+    }
+    /// True while lowering a const or static initializer or an anonymous
+    /// const other than an inline `const { .. }` block (`check_anon_consts`):
+    /// the const contexts where rustc promotes a `const fn` call. An inline
+    /// const promotes as a fn body does.
+    /// True while lowering a body only borrowck reads: a const or static
+    /// initializer, or an anonymous const (`check_anon_consts`).
+    fn check_only(&self) -> bool {
+        self.as_code.is_some() || self.p.fn_info(self.body.fn_id).loc.is_const_init()
+    }
+    fn const_context(&self) -> bool {
+        match self.as_code {
+            Some(e) => !matches!(self.p.ast.expr(e), Expr::ConstBlock(_)),
+            None => self.p.fn_info(self.body.fn_id).loc.is_const_init(),
+        }
     }
     /// True when `&e` is promoted to `'static` (rustc's promotion rules,
     /// a conservative subset): a literal, a negated or cast literal, a
@@ -311,8 +476,13 @@ impl<'p> Lower<'p> {
             Expr::Tuple(es) | Expr::Array(es) => es.clone().iter().all(|&x| self.promotable(x)),
             Expr::ArrayRepeat { value, .. } => self.promotable(*value),
             // A tuple struct, tuple variant, `Some`, `Ok` or `Err` constructor call.
-            Expr::Call { args, .. } => {
-                matches!(self.ck.res(e), Res::Variant(..) | Res::OptSome | Res::ResOk | Res::ResErr) && args.clone().iter().all(|&x| self.promotable(x))
+            Expr::Call { callee, args } => {
+                // In a const or static initializer (not in a fn), rustc
+                // promotes a call to a `const fn` too.
+                let const_call = self.const_context()
+                    && [self.ck.res(e), self.ck.res(*callee)].into_iter().any(|r| matches!(r, Res::Fn(f) if self.p.fn_info(f).is_const));
+                (const_call || matches!(self.ck.res(e), Res::Variant(..) | Res::OptSome | Res::ResOk | Res::ResErr))
+                    && args.clone().iter().all(|&x| self.promotable(x))
             }
             Expr::Path(_) => {
                 self.ck.const_value(e).is_some()
@@ -1823,7 +1993,9 @@ impl<'p> Lower<'p> {
         let p = self.p;
         let ty = self.ty(e);
         // A value the checker const-evaluated materializes directly.
-        if let Some(cv) = self.ck.const_value(e).cloned() {
+        if self.as_code != Some(e)
+            && let Some(cv) = self.ck.const_value(e).cloned()
+        {
             if let Some(d) = dest {
                 self.const_into(&cv, ty, d, span);
             }
@@ -2736,6 +2908,23 @@ impl<'p> Lower<'p> {
                     },
                     _ => 0,
                 };
+                if let Some(cv) = self.ck.const_value(*value).cloned()
+                    && self.check_only()
+                    && n > 1
+                {
+                    // A body only borrowck reads (a const initializer):
+                    // one element value stands for every slot, so a long
+                    // table (`[const { OnceLock::new() }; 1 << 20]`)
+                    // lowers in one statement.
+                    let elem = match self.kind(ty) {
+                        TyKind::Array(el, _) => el,
+                        _ => self.ty(*value),
+                    };
+                    let t = self.temp(elem);
+                    self.const_into(&cv, elem, &Place::local(t), span);
+                    self.set_or_temp(dest, Rvalue::ArrayRepeat(ty, Operand::Move(Place::local(t)), n), ty, span);
+                    return;
+                }
                 if let Some(cv) = self.ck.const_value(*value).cloned() {
                     // A const element (`[const { .. }; n]`) materializes per slot.
                     let rv = crate::ty::consteval::ConstValue::Repeat(Box::new(cv), n);
@@ -7176,8 +7365,7 @@ impl<'p> Lower<'p> {
         let refs = refs.into_iter().map(|l| Operand::Copy(Place::local(l))).collect();
         let env = self.new_local(env_ty, true, None);
         self.assign(Place::local(env), Rvalue::TupleAgg(env_ty, refs), span);
-        let depth = self.extended.iter().rev().find(|&&(x, _)| x == e).map_or(self.scopes.len() - 1, |&(_, d)| d);
-        self.scopes[depth].push(env);
+        self.push_extended(e, env);
         let rt = self.ref_ty(false, env_ty);
         let r = self.temp(rt);
         self.assign(Place::local(r), Rvalue::Ref(false, Place::local(env)), span);

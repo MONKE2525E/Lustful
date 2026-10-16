@@ -12,6 +12,7 @@ pub mod cells;
 pub mod process;
 pub mod utf8;
 pub mod collect;
+pub mod const_body;
 pub mod constfn;
 pub mod convert;
 pub mod cow;
@@ -2279,6 +2280,9 @@ fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
         return crate::ty::defs::STD_MODULE;
     }
     let Some(tables) = &p.resolved else { return root };
+    if let Some(m) = const_body::module_of(p, fid) {
+        return m;
+    }
     // A def's defining module from the resolver table. Associated
     // defs (trait methods) are not module items, so the walk
     // climbs to their parent def (the trait), which is one.
@@ -9973,6 +9977,11 @@ impl<'p> Ctx<'p> {
                     Ok((v, t)) => {
                         let i = ccx.cx.ei(e);
                         ccx.cx.out.const_exprs[i] = Some(v);
+                        // The block is typed as code too: lowering
+                        // borrow-checks it as a body of its own
+                        // (lower.rs `check_anon_consts`).
+                        let bt = self.block(b, Some(t));
+                        self.unify(bt, t);
                         t
                     }
                     // A generic inline const (ARCH 2.13): a layout over the
@@ -24798,6 +24807,12 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
             return Vec::new();
         }
         self.cx.p.adt(adt).variants[variant as usize].fields.iter().map(|f| (f.name, f.ty)).collect()
+    }
+    fn variant_count(&self, adt: AdtId) -> u32 {
+        if adt.0 >= u32::MAX - 1 {
+            return 0;
+        }
+        self.cx.p.adt(adt).variants.len() as u32
     }
     fn resolve_ty(&mut self, t: ast::TyId) -> Ty {
         self.cx.resolve_written(t)
