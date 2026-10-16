@@ -13283,9 +13283,6 @@ impl<'p> Ctx<'p> {
                     && let Some(want) = expected.map(|t| self.resolve(t))
                     && let Some(elem) = self.wrapper_value_ty(b, want)
                     && self.sized_value(elem)
-                    // A `&T` to `*const T` coercion as the argument is not
-                    // lowered for these builtins yet: keep the old reject.
-                    && !matches!(self.kind(self.resolve(elem)), TyKind::RawPtr(..))
                 {
                     let snap = self.snapshot_vars();
                     if !self.unify(ret, want) {
@@ -21362,6 +21359,9 @@ impl<'p> Ctx<'p> {
                 Coerce::ByNext(t) => self.out.coerce[i] = Coerce::ByNext(self.zonk(t)),
                 Coerce::IntoIterCall(t) => self.out.coerce[i] = Coerce::IntoIterCall(self.zonk(t)),
                 Coerce::ReifyFn(t) => self.out.coerce[i] = Coerce::ReifyFn(self.zonk(t)),
+                // The raw pointer target can still be a var at the coercion
+                // (`Cell::new(&x)` where `Cell<*const u8>` is expected).
+                Coerce::RefToPtr(t) => self.out.coerce[i] = Coerce::RefToPtr(self.zonk(t)),
                 _ => {}
             }
         }
