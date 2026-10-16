@@ -5096,6 +5096,19 @@ impl Rewrite<'_> {
                     Some(pat) => self.pat_bindings(ast, pat, &mut frame.locals),
                     None => {
                         self.binding_over_block_import(p.name, !p.mutable, p.span, &scopes);
+                        // A parameter named like a block `use` of a block
+                        // enum's variant is that variant's path pattern in
+                        // rustc (refutable, or a type mismatch); lust
+                        // rejects it (a single-variant enum would be valid).
+                        if let Some(FrameHit::LocalUse(_)) = self.frame_hit(&[p.name], Namespace::Value, &scopes) {
+                            let n = self.interner.get(p.name);
+                            self.diags.push(Diag::new(
+                                "L0110",
+                                p.span,
+                                format!("parameter `{n}` names an imported variant here, so it would be a pattern, not a binding"),
+                                "Rename the parameter.",
+                            ));
+                        }
                         frame.locals.push(p.name);
                     }
                 }
