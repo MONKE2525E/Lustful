@@ -809,11 +809,26 @@ impl<'p> Lower<'p> {
             }
             (Expr::Index { base, index }, Res::SliceIndex { derefs }) => {
                 let span = self.span(e);
-                let b = match self.deref_steps(e, *base, span) {
-                    Some(root) => root,
-                    None => self.place(*base),
+                let (b, root_ty) = match self.deref_steps(e, *base, span) {
+                    Some(root) => {
+                        let t = self.body.locals[root.local as usize].ty;
+                        (root, t)
+                    }
+                    None => (self.place(*base), self.ty(*base)),
                 };
                 let b = Self::derefs(b, derefs);
+                // A range index is always `Index::index` (or `index_mut`
+                // in a mutable use): the base is borrowed before the
+                // range runs, so a range that reads (or writes) the base
+                // conflicts as in rustc (E0502).
+                let mutable = self.mut_index > 0;
+                let bt = self.peel(root_ty, derefs);
+                let rt = self.ref_ty(mutable, bt);
+                let r = self.temp(rt);
+                self.assign(Place::local(r), Rvalue::Ref(mutable, b), span);
+                let b = Place::local(r).deref();
+                // The bounds are values, not part of the mutable place.
+                let saved = std::mem::take(&mut self.mut_index);
                 let (lo, hi, inclusive) = if let Some(form) = self.ck.index_range(e) {
                     // A range value as the index (check/slice.rs):
                     // its fields are the bounds.
@@ -834,6 +849,7 @@ impl<'p> Lower<'p> {
                     let hi = bound(self, hi_e);
                     (lo, hi, inclusive)
                 };
+                self.mut_index = saved;
                 // The temporary holds the slice place itself (bare `[T]`
                 // or `str` type, a fat value in codegen).
                 let slice = match self.kind(self.ty(e)) {
@@ -844,7 +860,6 @@ impl<'p> Lower<'p> {
                 let t = self.temp(slice);
                 // Range indexing is `Index::index`: it panics at the brackets.
                 let span = self.bracket_span(e, *base, *index);
-                let mutable = self.mut_index > 0;
                 self.assign(Place::local(t), Rvalue::Subslice { base: b, lo, hi, inclusive, mutable }, span);
                 Place::local(t)
             }
