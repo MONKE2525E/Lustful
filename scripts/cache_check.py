@@ -11,7 +11,9 @@
 # The programs are made to have many C units (filler fns give them several hundred KB
 # of C) and the edits change what decides a unit's C: closures added and removed
 # (closure slots move), calls, generic instances, fn pointers, dyn calls, fns moved in
-# the source (slots and unit membership move), filler size (unit boundaries move), and,
+# the source (slots and unit membership move), filler size (unit boundaries move),
+# macro-made fns that only an adapter chain calls, and nested fns added and removed
+# (which move the macro-made fns to new slots while their caller's text stays), and,
 # with --threads, the thread count (the unit byte target). fx-unitcache: the unit key
 # missed a closure slot that an adapter chain called, so an edit that removed earlier
 # closures served the old object and the binary called the wrong closure.
@@ -50,6 +52,16 @@ fn show<T: std::fmt::Debug>(tag: &str, x: T) {
 fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 {
     f(x)
 }
+macro_rules! preds {
+    ($h:ident, $m:ident, $k:expr) => {
+        fn $h(x: &u32) -> bool {
+            *x % $k != 0
+        }
+        fn $m(x: u32) -> u32 {
+            x * $k
+        }
+    };
+}
 '''
 
 GEN_VALUES = ["7u8", "-3i64", "(4u32, true)", "Some(9u16)", '"txt"', "vec![1u8, 2]", "[5i32, 6]", "'c'", "2.5f64", "(1u8, (2i16, 3u64))"]
@@ -78,7 +90,7 @@ def stmt(rng, tag, n_fill, callees):
     """One random statement for a worker fn. `tag` names it in the output."""
     r = {k: rng.randint(1, 9) for k in "abcdefg"}
     r["tag"] = tag
-    kind = rng.choice(["chain", "chain", "chain", "call", "generic", "apply", "fnptr", "dyn", "closure", "sort"])
+    kind = rng.choice(["chain", "chain", "chain", "call", "generic", "apply", "fnptr", "dyn", "closure", "sort", "macfn", "nested"])
     if kind == "call" and callees:
         return f"    println!(\"{tag} {{}}\", w{rng.choice(callees)}(v));"
     if kind == "generic":
@@ -92,6 +104,14 @@ def stmt(rng, tag, n_fill, callees):
         return f"    let d: Box<dyn Area> = Box::new({shape});\n    println!(\"{tag} {{}}\", d.area());"
     if kind == "closure":
         return f"    let c = |x: u32| x * {r['a']} + {r['b']};\n    println!(\"{tag} {{}}\", c({r['c']}) + c({r['d']}));"
+    if kind == "macfn":
+        # Fns a macro expands in a body have no parent by span: their identity is
+        # their stmt item index, which a nested fn added or removed earlier moves
+        # (new slots) while this body's text stays. Only the adapter calls them.
+        return (f"    preds!(h{tag}, m{tag}, {r['a'] + 1});\n"
+                f"    println!(\"{tag} {{}}\", v.iter().copied().filter(h{tag}).map(m{tag}).sum::<u32>());")
+    if kind == "nested":
+        return f"    fn n{tag}(x: u32) -> u32 {{\n        x + {r['a']}\n    }}\n    println!(\"{tag} {{}}\", n{tag}({r['b']}));"
     if kind == "sort":
         return f"    let mut s: Vec<u32> = v.to_vec();\n    s.sort_by_key(|x| (*x * {r['a']}) % {r['b'] + 3});\n    println!(\"{tag} {{:?}}\", s);"
     chain = "".join(a.format(**r) for a in rng.sample(ADAPTERS, rng.randint(1, 5)))
