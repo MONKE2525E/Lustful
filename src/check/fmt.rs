@@ -175,7 +175,9 @@ impl<'p> Ctx<'p> {
             self.check_args(&[param], args, name_span);
             return Some(self.fmt_result_ty());
         }
-        if n == "fmt" && args.len() == 1 && self.tys.local_adt(base).is_none() {
+        // A local Adt gets here only when the user method probe found no
+        // written `fmt` in scope: its derived Debug is the glue.
+        if n == "fmt" && args.len() == 1 {
             return self.builtin_fmt_call(e, recv, base, derefs, name_span, args);
         }
         if n == "to_string"
@@ -206,8 +208,9 @@ impl<'p> Ctx<'p> {
         None
     }
 
-    /// `value.fmt(f)` on a builtin value (`self.0.fmt(f)` in an impl of
-    /// Debug): the one fmt trait in scope that the type implements.
+    /// `value.fmt(f)` on a builtin value or an Adt with a derived Debug
+    /// (`self.0.fmt(f)` in an impl of Debug): the one fmt trait in scope
+    /// that the type implements.
     fn builtin_fmt_call(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name_span: Span, args: &[ExprId]) -> Option<Ty> {
         let p = self.p;
         let candidates: Vec<FmtKind> = FMT_TRAITS
