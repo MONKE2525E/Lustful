@@ -1577,8 +1577,13 @@ impl<'p> Lower<'p> {
     fn expr_into(&mut self, e: ExprId, dest: Option<&Place>) {
         if self.ck.coerce(e) != Coerce::None {
             let op = self.operand(e);
-            if let Some(d) = dest {
-                self.assign(d.clone(), Rvalue::Use(op), self.span(e));
+            match (dest, &op) {
+                (Some(d), _) => self.assign(d.clone(), Rvalue::Use(op), self.span(e)),
+                // An unused coerced value is still read, as rustc's
+                // coercion runs (`if c { &v[0] } else { &&G };` reborrows
+                // through the dropped `&G`, E0716).
+                (None, Operand::Copy(pl) | Operand::Move(pl)) => self.push(StmtKind::FakeRead(pl.local), self.span(e)),
+                (None, _) => {}
             }
             return;
         }

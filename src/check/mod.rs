@@ -2106,6 +2106,11 @@ struct Ctx<'p> {
     /// have no type annotation: their argument regions are inferred, one
     /// each, never higher-ranked (`finish_opaques`).
     pub(super) free_sig_closures: Vec<(DefId, Vec<bool>)>,
+    /// `if`, `match` and block expressions checked with only an earlier
+    /// arm's type as their expectation (`branch_hint`): rustc checks them
+    /// with none, so they coerce nothing to it themselves; the enclosing
+    /// arm's LUB coerces their whole value, after their blocks.
+    pub(super) hinted: Vec<ExprId>,
     /// User `Deref` steps the method lookup is inside (a bound on
     /// `Deref` chains).
     deref_depth: u8,
@@ -2455,6 +2460,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         returns_seen: 0,
         ret_exprs: Vec::new(),
         free_sig_closures: Vec::new(),
+        hinted: Vec::new(),
         closure_bound_inputs: std::collections::HashMap::new(),
         closure_call_outs: std::collections::HashSet::new(),
         open_binops: Vec::new(),
@@ -8647,7 +8653,14 @@ impl<'p> Ctx<'p> {
                 self.lifetime_turbofish(segs);
                 self.path_expr(e, segs, span)
             }
-            Expr::Block(b) => self.block(*b, expected),
+            Expr::Block(b) => {
+                if let Some(tail) = p.ast.block(*b).tail
+                    && self.hinted.contains(&e)
+                {
+                    self.hinted.push(tail);
+                }
+                self.block(*b, expected)
+            }
             Expr::If { cond, then, els } if self.is_let_chain(*cond) => {
                 let scope = self.scopes.len();
                 self.check_chain(*cond);
@@ -8664,20 +8677,30 @@ impl<'p> Ctx<'p> {
                         UNIT
                     }
                     Some(els) => {
+                        let real = if self.hinted.contains(&e) { None } else { expected };
+                        if real.is_none()
+                            && expected.is_some()
+                            && let Some(tail) = p.ast.block(*then).tail
+                        {
+                            self.hinted.push(tail);
+                        }
                         let t1 = self.block(*then, expected);
                         self.scopes.truncate(scope);
+                        if real.is_none() {
+                            self.hinted.push(*els);
+                        }
                         let t2 = self.expr(*els, self.branch_hint(expected, Some(t1)));
-                        if let Some(d) = self.dyn_ref_expectation(expected) {
+                        if let Some(d) = self.dyn_ref_expectation(real) {
                             self.coerce_block_tail(*then, t1, d);
                             self.coerce_expr(*els, t2, d);
                             return d;
                         }
-                        if let Some(exp) = expected.filter(|e| !self.has_unbound_deep(*e)) {
+                        if let Some(exp) = real.filter(|e| !self.has_unbound_deep(*e)) {
                             self.coerce_block_tail(*then, t1, exp);
                             self.coerce_expr(*els, t2, exp);
                             return exp;
                         }
-                        if expected.is_none()
+                        if real.is_none()
                             && let Some(tail) = p.ast.block(*then).tail
                             && self.lub_flip(&[tail], t1, t2)
                         {
@@ -8705,19 +8728,29 @@ impl<'p> Ctx<'p> {
                         UNIT
                     }
                     Some(els) => {
+                        let real = if self.hinted.contains(&e) { None } else { expected };
+                        if real.is_none()
+                            && expected.is_some()
+                            && let Some(tail) = p.ast.block(*then).tail
+                        {
+                            self.hinted.push(tail);
+                        }
                         let t1 = self.block(*then, expected);
+                        if real.is_none() {
+                            self.hinted.push(*els);
+                        }
                         let t2 = self.expr(*els, self.branch_hint(expected, Some(t1)));
-                        if let Some(d) = self.dyn_ref_expectation(expected) {
+                        if let Some(d) = self.dyn_ref_expectation(real) {
                             self.coerce_block_tail(*then, t1, d);
                             self.coerce_expr(*els, t2, d);
                             return d;
                         }
-                        if let Some(exp) = expected.filter(|e| !self.has_unbound_deep(*e)) {
+                        if let Some(exp) = real.filter(|e| !self.has_unbound_deep(*e)) {
                             self.coerce_block_tail(*then, t1, exp);
                             self.coerce_expr(*els, t2, exp);
                             return exp;
                         }
-                        if expected.is_none()
+                        if real.is_none()
                             && let Some(tail) = p.ast.block(*then).tail
                             && self.lub_flip(&[tail], t1, t2)
                         {
@@ -8778,6 +8811,7 @@ impl<'p> Ctx<'p> {
                 UNIT
             }
             Expr::Match { scrut, arms } => {
+                let real = if self.hinted.contains(&e) { None } else { expected };
                 let st = self.expr(*scrut, None);
                 // ARCH 2.12 run point: a match must know the scrutinee enum.
                 self.run_obligations(false);
@@ -8799,8 +8833,11 @@ impl<'p> Ctx<'p> {
                         }
                         self.expect_expr(g, BOOL);
                     }
+                    if real.is_none() && (result.is_some() || expected.is_some()) {
+                        self.hinted.push(arm.body);
+                    }
                     let bt = self.expr(arm.body, self.branch_hint(expected, result));
-                    if let Some(d) = self.dyn_ref_expectation(expected) {
+                    if let Some(d) = self.dyn_ref_expectation(real) {
                         self.coerce_expr(arm.body, bt, d);
                         result = Some(d);
                         self.scopes.truncate(scope);
@@ -8810,7 +8847,7 @@ impl<'p> Ctx<'p> {
                     // coercion site to it (`let r: &str = match ..
                     // { Some(s) => s, .. }` deref-coerces `&String`
                     // to `&str` per arm), as in rustc.
-                    if let Some(exp) = expected.filter(|e| !self.has_unbound_deep(*e)) {
+                    if let Some(exp) = real.filter(|e| !self.has_unbound_deep(*e)) {
                         self.coerce_expr(arm.body, bt, exp);
                         result = Some(exp);
                         self.scopes.truncate(scope);
@@ -8818,7 +8855,7 @@ impl<'p> Ctx<'p> {
                     }
                     result = Some(match result {
                         None => bt,
-                        Some(r) if expected.is_none() && self.lub_flip(&sites, r, bt) => bt,
+                        Some(r) if real.is_none() && self.lub_flip(&sites, r, bt) => bt,
                         Some(r) => self.join(r, bt, &sites, Some(arm.body), self.span(arm.body)),
                     });
                     sites.push(arm.body);
