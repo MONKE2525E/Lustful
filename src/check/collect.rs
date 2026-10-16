@@ -4024,6 +4024,9 @@ pub fn collect_reuse(
         // value (the implicit increment then overflows, E0370).
         let mut next_disc: Option<i128> = Some(0);
         let disc_max = crate::ty::consteval::int_stored(disc_want.max128(), disc_want);
+        // The Adt's scope with regions kept, for the fields' regioned types.
+        let mut keep_scope = p.gx.adt_scopes[id.0 as usize].clone();
+        keep_scope.regions = generics::RegionMode::Keep { next: None, elided: None };
         for (vname, vspan, shape, field_srcs, disc_src, variant_ne) in variants_src {
             let shape = if !is_enum && field_srcs.is_empty() { VariantShape::Unit } else { shape };
             let mut fields = Vec::new();
@@ -4033,8 +4036,7 @@ pub fn collect_reuse(
                 }
                 let resolved = {
                     let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                    let scope = p.gx.adt_scopes[id.0 as usize].clone();
-                    generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, fty, &scope)
+                    generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, fty, &p.gx.adt_scopes[id.0 as usize])
                 };
                 match resolved {
                     Ok(t) => {
@@ -4043,9 +4045,7 @@ pub fn collect_reuse(
                         // (an elided one is rustc E0106).
                         let regioned = {
                             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-                            let mut ks = p.gx.adt_scopes[id.0 as usize].clone();
-                            ks.regions = generics::RegionMode::Keep { next: None, elided: None };
-                            generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, fty, &ks)
+                            generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, fty, &keep_scope)
                         };
                         match regioned {
                             Ok(r) => region_fields.push((variants.len(), fields.len(), r)),
@@ -5192,9 +5192,9 @@ pub(crate) fn fn_record(
             ));
         }
     }
-    let mut scope = parent_gen.scope.clone();
-    // `impl Tr + 'a` arguments take `T: 'a` like written params do.
-    scope.type_outlives |= matches!(loc, FnLoc::Item(_) | FnLoc::Nested(_));
+    // `seed` is the parent's scope with this fn's `type_outlives`
+    // (`impl Tr + 'a` arguments take `T: 'a` like written params do).
+    let mut scope = seed;
     scope.lifetimes.extend(own_scope.lifetimes.iter().copied());
     scope.region_facts.extend(own_scope.region_facts.iter().copied());
     scope.type_params.extend(own_scope.type_params.iter().copied());

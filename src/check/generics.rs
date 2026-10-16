@@ -5770,7 +5770,8 @@ fn region_sig(
         inputs.push(Region::Erased);
     }
     let elided = if self_ambiguous { None } else { self_region.or(if inputs.len() == 1 { Some(inputs[0]) } else { None }) };
-    let mut rs = scope.clone();
+    // The inputs' scope again, for the output: its own elision rule.
+    let mut rs = ks;
     rs.regions = RegionMode::Keep { next: None, elided };
     if elided.is_none()
         && let Some(d) = def.ret.and_then(|t| opaque_elision(ast, interner, known, cx, tys, &rs, t))
@@ -7642,20 +7643,21 @@ pub fn add_synthetic_impls(p: &mut Program) {
     // Derives: one record per (Adt template, derived trait), with
     // a bound per type parameter, as rustc writes them.
     let n_adts = p.gx.adt_info.len();
+    let names = ["Clone", "Copy", "Debug", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default"].map(|n| p.interner.intern(n));
     for a in 0..n_adts {
         let adt = AdtId(a as u32);
         let (def, n_params) = p.gx.adt_info[a];
         let (derives, is_enum) = (p.adt(adt).derives, p.adt(adt).is_enum);
-        let wanted: [(bool, DefId, &str); 9] = [
-            (derives.clone, lang.clone, "Clone"),
-            (derives.copy, lang.copy, "Copy"),
-            (derives.debug, lang.debug, "Debug"),
-            (derives.partial_eq, lang.partial_eq, "PartialEq"),
-            (derives.eq, lang.eq, "Eq"),
-            (derives.hash, lang.hash, "Hash"),
-            (derives.partial_ord, lang.partial_ord, "PartialOrd"),
-            (derives.ord, lang.ord, "Ord"),
-            (derives.default, lang.default, "Default"),
+        let wanted: [(bool, DefId, Sym); 9] = [
+            (derives.clone, lang.clone, names[0]),
+            (derives.copy, lang.copy, names[1]),
+            (derives.debug, lang.debug, names[2]),
+            (derives.partial_eq, lang.partial_eq, names[3]),
+            (derives.eq, lang.eq, names[4]),
+            (derives.hash, lang.hash, names[5]),
+            (derives.partial_ord, lang.partial_ord, names[6]),
+            (derives.ord, lang.ord, names[7]),
+            (derives.default, lang.default, names[8]),
         ];
         for (on, trait_def, dname) in wanted {
             if !on {
@@ -7698,7 +7700,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 &rest,
                 generics,
                 Vec::new(),
-                Synthetic::Derive(p.interner.intern(dname)),
+                Synthetic::Derive(dname),
                 true,
                 span,
             );
@@ -11960,7 +11962,17 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
     }
     let adt_idx = adt_first_index(p);
     check_default_wf(p, &adt_idx, errs);
+    // Under an empty env a type's goals have one answer for every item
+    // (most signatures have no where clause): an item whose types all
+    // passed in an earlier such item owes nothing new.
+    let (mut wf_ok, mut sized_ok): (FxMap<Ty, ()>, FxMap<Ty, ()>) = Default::default();
     for (tys, values, generics, span) in items {
+        let plain = generics.predicates.is_empty();
+        if plain && tys.iter().all(|(t, _)| wf_ok.contains_key(t)) && values.iter().all(|(t, _)| sized_ok.contains_key(t)) {
+            continue;
+        }
+        let errs_before = errs.len();
+        let (tys_seen, values_seen): (Vec<Ty>, Vec<Ty>) = (tys.iter().map(|x| x.0).collect(), values.iter().map(|x| x.0).collect());
         let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
         let mut goals: Vec<(TraitRef, Span)> = Vec::new();
         // Sized goals from value positions and `parts` fail as
@@ -12030,6 +12042,10 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>) {
                 ));
                 break;
             }
+        }
+        if plain && errs.len() == errs_before {
+            wf_ok.extend(tys_seen.into_iter().map(|t| (t, ())));
+            sized_ok.extend(values_seen.into_iter().map(|t| (t, ())));
         }
     }
 }
