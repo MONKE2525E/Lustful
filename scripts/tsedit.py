@@ -535,13 +535,26 @@ def census(a):
     return str(out / "clean.tgz")
 
 
+def merge_shards(results):
+    """One result per tree: shards of the same tree (runs with other `--kinds`) join, rows in
+    KINDS order; a later shard's row of a kind wins."""
+    by = {}
+    for res in results:
+        m = by.setdefault(res["tree"], dict(res, rows=[], states=[]))
+        rows = {r["kind"]: r for r in m["rows"]}
+        rows.update({r["kind"]: r for r in res["rows"]})
+        m["rows"] = [rows[k] for k in KINDS if k in rows]
+        m["states"] = m["states"] + res["states"]
+    return list(by.values())
+
+
 def render_md(results):
     """The docs/speed.md section for tsedit result JSONs: one table per tree."""
     out = []
-    for res in results:
+    for res in merge_shards(results):
         out += [f"### `{res['tree']}`: {res['lines']:,} lines, {res['files']} files", "",
                 f"ts-rust `{res['tsrust_commit'][:9]}`, lust `{res['lust_commit']}`, {res['rustc']}, {res['host']['nproc']} vCPU, "
-                f"{res['probes_per_kind']} probes per kind. Daemon first check {res['daemon_first_ms']:.0f} ms, no-op {res['noop_ms']} ms.", "",
+                f"{res['probes_per_kind']} probes per kind, {len(res['states'])} states. Daemon first check {res['daemon_first_ms']:.0f} ms, no-op {res['noop_ms']} ms.", "",
                 "| Kind | ok states | lust median | lust p95 | cargo median | cargo p95 | Ratio median | Ratio p95 | reject states | false accepts | warm != cold |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for r in res["rows"]:
