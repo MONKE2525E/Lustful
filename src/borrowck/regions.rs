@@ -5745,6 +5745,13 @@ impl<'b, 'p> Builder<'b, 'p> {
                 if let Some((t1, v1)) = avs.get(1) {
                     if b == B::EntryOrInsert {
                         self.relate(*t1, v1, vt, &hvv, Variance::Co);
+                    } else if b == B::EntryOrInsertWith && matches!(self.body.tys.kind(*t1), TyKind::Closure(..)) {
+                        // `or_insert_with(|| ..)` stores what the closure
+                        // returns, not every region it captures (ts-rust
+                        // misc.rs `note_file_names`).
+                        let mut srcs = Vec::new();
+                        self.closure_sources(*t1, v1, &mut 0, &mut srcs);
+                        self.flow_all(&srcs, &hvv);
                     } else {
                         self.flow_all(v1, &hvv);
                     }
@@ -7055,10 +7062,15 @@ impl<'b, 'p> Builder<'b, 'p> {
 
     fn trait_lts_at(&mut self, trait_def: DefId, t: Ty, vars: &[u32], n: usize, depth: u32) -> Option<Vec<u32>> {
         let p = self.p;
-        if self.own.closure || depth > 8 {
+        if depth > 8 {
             return None;
         }
+        // A closure body's type params are its creator's (no own bound
+        // tells); an impl's header tells the same in any body.
         if let TyKind::Param(j) = self.body.tys.kind(t) {
+            if self.own.closure {
+                return None;
+            }
             let sig = p.regions.body_sig(p, self.body.fn_id)?;
             if let Some(b) = sig.trait_bounds.iter().find(|b| b.param == j.0 && b.trait_def == trait_def) {
                 return Some(b.lifetimes.iter().map(|&r| if let Region::Param(k) = r { k + 1 } else { 0 }).collect());
