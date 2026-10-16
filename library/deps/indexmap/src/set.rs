@@ -247,6 +247,12 @@ pub struct Iter<'a, T> {
     inner: map::Keys<'a, T, ()>,
 }
 
+impl<'a, T> Clone for Iter<'a, T> {
+    fn clone(&self) -> Self {
+        Iter { inner: self.inner.clone() }
+    }
+}
+
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
 

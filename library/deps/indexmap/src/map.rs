@@ -684,6 +684,12 @@ pub struct Keys<'a, K, V> {
     inner: Iter<'a, K, V>,
 }
 
+impl<'a, K, V> Clone for Keys<'a, K, V> {
+    fn clone(&self) -> Self {
+        Keys { inner: self.inner.clone() }
+    }
+}
+
 impl<'a, K, V> Iterator for Keys<'a, K, V> {
     type Item = &'a K;
 
@@ -713,6 +719,12 @@ impl<'a, K, V> ExactSizeIterator for Keys<'a, K, V> {}
 /// The values in order.
 pub struct Values<'a, K, V> {
     inner: Iter<'a, K, V>,
+}
+
+impl<'a, K, V> Clone for Values<'a, K, V> {
+    fn clone(&self) -> Self {
+        Values { inner: self.inner.clone() }
+    }
 }
 
 impl<'a, K, V> Iterator for Values<'a, K, V> {
