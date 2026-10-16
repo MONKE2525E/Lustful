@@ -31,7 +31,9 @@ Gate: `scripts/test-adapters.sh rustix`.
   `from_named_raw`, upstream's quoted Debug forms), `getpid`,
   `getppid`, `kill_process`, `test_kill_process`,
   `set_parent_process_death_signal`, `Resource`, `Rlimit`,
-  `getrlimit`, `setrlimit`.
+  `getrlimit`, `setrlimit`, and `waitid` with `WaitId`,
+  `WaitIdOptions` (no Debug) and `WaitIdStatus` (no accessors
+  or Debug yet; `None` when `NOHANG` finds no child, as upstream).
 - Modules and std-only items follow upstream's feature gates
   (`fs`, `path`, `event`, `pipe`, `process`, `stdio`,
   `termios`; `std` for the `io::Error` forms, `stdio::stdin`

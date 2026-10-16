@@ -19,6 +19,13 @@ int32_t lust_sys_x_kill(int32_t pid, int32_t sig);
 int32_t lust_sys_x_getppid(void);
 /* prctl(PR_SET_PDEATHSIG, sig): 0 or errno. */
 int32_t lust_sys_x_prctl_deathsig(int32_t sig);
+/* waitid(2) with the raw idtype, id and options: on success appends
+   si_pid, si_uid, si_signo, si_status and si_code as five i64 (all 0
+   when WNOHANG found no child); 0 or errno. */
+int32_t lust_sys_x_waitid(int32_t idtype, int32_t id, int32_t options, lust_Vec *out);
+/* pthread_sigmask(how, set, NULL) with `set` as a bit mask of the
+   signals 1..64 (bit n-1 is signal n): 0 or errno. For nix. */
+int32_t lust_sys_x_sigmask(int32_t how, uint64_t set);
 /* prctl THP disable: set (mode 1) returns 0 or -errno; get
    (mode 0) returns 0 or 1, or -errno. */
 int32_t lust_sys_x_prctl_thp(int32_t mode, int32_t val);

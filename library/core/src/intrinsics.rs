@@ -51,6 +51,8 @@
 // that adapter:
 //
 //     pub fn sys_x_kill(pid: i32, sig: i32) -> i32;
+//     pub fn sys_x_waitid(idtype: i32, id: i32, options: i32, out: &mut Vec<u8>) -> i32;
+//     pub fn sys_x_sigmask(how: i32, set: u64) -> i32;              // nix only
 //     pub fn sys_x_getppid() -> i32;
 //     pub fn sys_x_prctl_deathsig(sig: i32) -> i32;
 //     pub fn sys_x_getrlimit(resource: i32, out: &mut Vec<u8>) -> i32;

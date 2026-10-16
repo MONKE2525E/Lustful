@@ -1,5 +1,5 @@
 // `rustix::process`: pids, signals, kill, parent death signal,
-// and resource limits.
+// resource limits, and `waitid`.
 
 use crate::io::{Errno, Result};
 use crate::rec_u64;
@@ -279,4 +279,91 @@ pub fn setrlimit(resource: Resource, limits: Rlimit) -> Result<()> {
         return Err(Errno::from_raw_os_error(e));
     }
     Ok(())
+}
+
+/// Options for modifying the behavior of `waitid` (Linux values).
+// No Debug (upstream prints the bitflags form, which this adapter lacks).
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct WaitIdOptions(u32);
+
+impl WaitIdOptions {
+    /// Return immediately if no child has exited.
+    pub const NOHANG: WaitIdOptions = WaitIdOptions(1);
+    /// Return if a stopped child has been resumed by delivery of `Signal::Cont`.
+    pub const CONTINUED: WaitIdOptions = WaitIdOptions(8);
+    /// Wait for processed that have exited.
+    pub const EXITED: WaitIdOptions = WaitIdOptions(4);
+    /// Keep processed in a waitable state.
+    pub const NOWAIT: WaitIdOptions = WaitIdOptions(0x0100_0000);
+    /// Wait for processes that have been stopped.
+    pub const STOPPED: WaitIdOptions = WaitIdOptions(2);
+
+    pub const fn empty() -> WaitIdOptions {
+        WaitIdOptions(0)
+    }
+    pub const fn bits(&self) -> u32 {
+        self.0
+    }
+    pub const fn from_bits_retain(bits: u32) -> WaitIdOptions {
+        WaitIdOptions(bits)
+    }
+    pub const fn contains(&self, other: WaitIdOptions) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl core::ops::BitOr for WaitIdOptions {
+    type Output = WaitIdOptions;
+    fn bitor(self, other: WaitIdOptions) -> WaitIdOptions {
+        WaitIdOptions(self.0 | other.0)
+    }
+}
+
+/// The status of a process after calling `waitid`. Upstream holds the
+/// raw `siginfo_t`; its accessors and Debug are not here yet.
+#[derive(Clone, Copy)]
+pub struct WaitIdStatus {
+    #[allow(dead_code)]
+    signo: i32,
+    #[allow(dead_code)]
+    status: i32,
+    #[allow(dead_code)]
+    code: i32,
+}
+
+/// The identifier to wait on in a call to `waitid`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum WaitId<'a> {
+    /// Wait on all processes.
+    All,
+    /// Wait for a specific process ID.
+    Pid(Pid),
+    /// Wait for a specific process group ID, or the calling process' group ID.
+    Pgid(Option<Pid>),
+    /// Wait for a specific process file descriptor.
+    PidFd(crate::fd::BorrowedFd<'a>),
+}
+
+/// `waitid(_, _, _, opts)`: waits for the specified child process to
+/// change state. `None` when `NOHANG` found no child that changed (the
+/// `siginfo_t`'s pid stays 0), as upstream.
+pub fn waitid<'a, Id: Into<WaitId<'a>>>(id: Id, options: WaitIdOptions) -> Result<Option<WaitIdStatus>> {
+    use crate::fd::AsRawFd;
+    // P_ALL, P_PID, P_PGID, P_PIDFD
+    let (idtype, raw) = match id.into() {
+        WaitId::All => (0, 0),
+        WaitId::Pid(pid) => (1, pid.as_raw_pid()),
+        WaitId::Pgid(pgid) => (2, Pid::as_raw(pgid)),
+        WaitId::PidFd(fd) => (3, fd.as_raw_fd()),
+    };
+    let mut rec: Vec<u8> = Vec::new();
+    let e = core::intrinsics::sys_x_waitid(idtype, raw, options.bits() as i32, &mut rec);
+    if e != 0 {
+        return Err(Errno::from_raw_os_error(e));
+    }
+    if rec_u64(&rec, 0) == 0 {
+        return Ok(None);
+    }
+    Ok(Some(WaitIdStatus { signo: rec_u64(&rec, 2) as i32, status: rec_u64(&rec, 3) as i32, code: rec_u64(&rec, 4) as i32 }))
 }

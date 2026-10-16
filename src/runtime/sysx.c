@@ -12,6 +12,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -45,6 +46,27 @@ int32_t lust_sys_x_kill(int32_t pid, int32_t sig) {
 
 int32_t lust_sys_x_getppid(void) {
     return (int32_t)getppid();
+}
+
+int32_t lust_sys_x_waitid(int32_t idtype, int32_t id, int32_t options, lust_Vec *out) {
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    if (waitid((idtype_t)idtype, (id_t)id, &info, options) != 0) return errno;
+    lust_sysx_u64(out, (uint64_t)(int64_t)info.si_pid);
+    lust_sysx_u64(out, (uint64_t)(int64_t)info.si_uid);
+    lust_sysx_u64(out, (uint64_t)(int64_t)info.si_signo);
+    lust_sysx_u64(out, (uint64_t)(int64_t)info.si_status);
+    lust_sysx_u64(out, (uint64_t)(int64_t)info.si_code);
+    return 0;
+}
+
+int32_t lust_sys_x_sigmask(int32_t how, uint64_t set) {
+    sigset_t s;
+    sigemptyset(&s);
+    for (int n = 1; n <= 64; n++) {
+        if (set >> (n - 1) & 1) sigaddset(&s, n);
+    }
+    return pthread_sigmask(how, &s, NULL);
 }
 
 int32_t lust_sys_x_prctl_deathsig(int32_t sig) {

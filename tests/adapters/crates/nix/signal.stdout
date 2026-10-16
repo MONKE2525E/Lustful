@@ -1,0 +1,13 @@
+SIGHUP=1 SIGSTKFLT=16 SIGIO=29 SIGPWR=30 SIGSYS=31 SIGINT=2 
+true Equal SIGCHLD
+{SIGINT, SIGWINCH}
+true false true
+true
+Ok(())
+4000a00
+Ok(())
+true
+Ok(()) Ok(())
+0
+false
+Ok(())

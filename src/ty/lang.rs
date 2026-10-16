@@ -1244,6 +1244,11 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     // statvfs and fstatvfs: the 11-u64 record out, 0 or errno.
     IntrinsicDef { name: "sys_x_statvfs", c_symbol: "lust_sys_x_statvfs", params: &[S::Bytes, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
     IntrinsicDef { name: "sys_x_fstatvfs", c_symbol: "lust_sys_x_fstatvfs", params: &[S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    // waitid for rustix (tf-front2, sysx.c): the siginfo fields out.
+    IntrinsicDef { name: "sys_x_waitid", c_symbol: "lust_sys_x_waitid", params: &[S::I32, S::I32, S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::Rustix], implemented: true },
+    // pthread_sigmask for nix's SigSet (tf-front2, sysx.c): the set as
+    // a bit mask of signals 1..64; 0 or errno.
+    IntrinsicDef { name: "sys_x_sigmask", c_symbol: "lust_sys_x_sigmask", params: &[S::I32, S::U64], ret: S::I32, allowed: &[C::Nix], implemented: true },
     // prctl THP disable for the nix adapter: mode 0 get (0/1 or
     // -errno), mode 1 set (0 or -errno).
     IntrinsicDef { name: "sys_x_prctl_thp", c_symbol: "lust_sys_x_prctl_thp", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::Nix], implemented: true },

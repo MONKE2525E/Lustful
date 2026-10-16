@@ -17,6 +17,13 @@ fswatch/unix.rs uses. Gate: `scripts/test-adapters.sh nix`.
   as ts-rust does.
 - `NixPath` for `[u8]`, `str`, `OsStr`, `CStr`, `Path`, and
   `PathBuf` (interior NUL is EINVAL, as upstream).
+- `sys::signal` (tf-front2): the `Signal` enum (features
+  `process` or `signal`; Linux numbers, `non_exhaustive`, the
+  upstream derives) and, with `signal`, `pub use Signal::*`,
+  `SigSet` (`empty`, `add`, `remove`, `clear`, `contains`,
+  `thread_block`, `thread_unblock`, `Extend` and
+  `FromIterator` of `Signal`, `Clone`, `Copy`). The mask calls
+  are glibc's `pthread_sigmask`, as upstream's.
 - `sys::prctl` needs feature `process` and `sys::fanotify`
   feature `fanotify`, as upstream.
 - `errno::Errno` (also `nix::Error`): upstream's Linux

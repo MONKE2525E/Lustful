@@ -1,0 +1,9 @@
+16777220 true
+Ok(true)
+Ok(true)
+Err(Os { code: 10, kind: Uncategorized, message: "No child processes" })
+Ok(false)
+Ok(true)
+Some(Os { code: 22, kind: InvalidInput, message: "Invalid argument" })
+true
+Pgid(Some(Pid(1))) All Pgid(None)
