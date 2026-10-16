@@ -5365,8 +5365,12 @@ impl<'p> Lower<'p> {
             let next_f = (next.0 != u32::MAX).then(|| self.resolve_generic_fn(for_e, next));
             // The std blanket IntoIterator is synthetic with the
             // sentinel id: the receiver is already the iterator.
+            // rustc's `match into_iter(head) { mut iter => loop {..} }`
+            // drops the iterator before the head's temporaries (`files().
+            // zip(order().iter())` borrows a temporary until it drops), and
+            // not on an unwind from the head: it joins the scope after it.
             let (iter_ty, it) = if into_iter.0 == u32::MAX {
-                let it = self.temp(self.ty(iter));
+                let it = self.new_local(self.ty(iter), true, None);
                 self.expr_into(iter, Some(&Place::local(it)));
                 (self.ty(iter), it)
             } else {
@@ -5374,11 +5378,12 @@ impl<'p> Lower<'p> {
                 let iter_ty = self.site_ret_ty(for_e, into_iter, into_f);
                 let src = self.temp(self.ty(iter));
                 self.expr_into(iter, Some(&Place::local(src)));
-                let it = self.temp(iter_ty);
+                let it = self.new_local(iter_ty, true, None);
                 let src_op = self.operand_from(Place::local(src), self.ty(iter));
                 self.call_into(CallTarget::Fn(into_f), vec![src_op], Place::local(it), span);
                 (iter_ty, it)
             };
+            self.scopes.last_mut().unwrap().push(it);
             self.goto(head, span);
             // `it: &mut I` stepped by `I`'s own `next` (core's `impl
             // Iterator for &mut I`, check `for_trait_iter`): the reference
@@ -5506,7 +5511,7 @@ impl<'p> Lower<'p> {
                 // An array by value (fx-array-iter): first make its
                 // `array::IntoIter`.
                 _ if crate::ty::iter::iter_parts(&self.body.tys, hash_it).is_some_and(|(k, _)| k == crate::ty::iter::IterKind::ArrayIntoIter) => {
-                    let it = self.temp(hash_it);
+                    let it = self.new_local(hash_it, true, None);
                     let src = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(src)));
                     self.call_into(CallTarget::Builtin(Builtin::IterArrayIntoIter), vec![Operand::Move(Place::local(src))], Place::local(it), span);
@@ -5515,7 +5520,7 @@ impl<'p> Lower<'p> {
                 // An `Option` or `Result` (fx-option-rest): first
                 // make its one-item iterator.
                 _ if crate::ty::iter::iter_parts(&self.body.tys, hash_it).is_some_and(|(k, _)| crate::ty::iter::is_opt_res(k)) => {
-                    let it = self.temp(hash_it);
+                    let it = self.new_local(hash_it, true, None);
                     let src = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(src)));
                     self.call_into(CallTarget::Builtin(Builtin::IterOptRes), vec![Operand::Move(Place::local(src))], Place::local(it), span);
@@ -5524,12 +5529,12 @@ impl<'p> Lower<'p> {
                 _ if crate::ty::iter::iter_parts(&self.body.tys, hash_it).is_some_and(|(k, _)| k == crate::ty::iter::IterKind::ByNext) => {
                     let src = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(src)));
-                    let it = self.temp(hash_it);
+                    let it = self.new_local(hash_it, true, None);
                     self.assign(Place::local(it), Rvalue::TupleAgg(hash_it, vec![Operand::Move(Place::local(src))]), span);
                     (hash_it, it)
                 }
                 _ if hash_it != ERROR => {
-                    let it = self.temp(hash_it);
+                    let it = self.new_local(hash_it, true, None);
                     let src = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(src)));
                     self.call_into(CallTarget::Builtin(Builtin::HashIterNew), vec![Operand::Move(Place::local(src))], Place::local(it), span);
@@ -5542,7 +5547,7 @@ impl<'p> Lower<'p> {
                     self.expr_into(iter, Some(&Place::local(src)));
                     let k = if owned { crate::ty::iter::IterKind::RecvIntoIter } else { crate::ty::iter::IterKind::RecvIter };
                     let it_ty = crate::ty::iter::mk_iter(&mut self.body.tys, k, &[el]);
-                    let it = self.temp(it_ty);
+                    let it = self.new_local(it_ty, true, None);
                     let op = crate::check::sync::SyncOp::RecvMakeIter(if owned { 2 } else { 0 });
                     self.call_into(CallTarget::Builtin(Builtin::Sync(op)), vec![Operand::Move(Place::local(src))], Place::local(it), span);
                     (it_ty, it)
@@ -5551,17 +5556,19 @@ impl<'p> Lower<'p> {
                     let bx = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(bx)));
                     let it_ty = crate::ty::iter::mk_iter(&mut self.body.tys, crate::ty::iter::IterKind::VecIntoIter, &[el]);
-                    let it = self.temp(it_ty);
+                    let it = self.new_local(it_ty, true, None);
                     self.call_into(CallTarget::Builtin(Builtin::BoxSliceIntoIter), vec![Operand::Move(Place::local(bx))], Place::local(it), span);
                     (it_ty, it)
                 }
                 None => {
                     let it_ty = self.ty(iter);
-                    let it = self.temp(it_ty);
+                    let it = self.new_local(it_ty, true, None);
                     self.expr_into(iter, Some(&Place::local(it)));
                     (it_ty, it)
                 }
             };
+            // The iterator joins the scope after the head (as above).
+            self.scopes.last_mut().unwrap().push(it);
             self.goto(head, span);
             let mt = self.ref_ty(true, it_ty);
             let r = self.temp(mt);
@@ -5584,8 +5591,10 @@ impl<'p> Lower<'p> {
             // `break`, `return`, and `?` exits from the body: what
             // is left in it is exactly what still must drop.
             let vt = self.ty(iter);
-            let it = self.temp(vt);
+            let it = self.new_local(vt, true, None);
             self.expr_into(iter, Some(&Place::local(it)));
+            // The Vec drops before the head's temporaries (as above).
+            self.scopes.last_mut().unwrap().push(it);
             self.goto(head, span);
             let sref_t = self.ref_ty(false, vt);
             let sref = self.temp(sref_t);
