@@ -34,7 +34,7 @@
 //     recomputed in another new session. If they match, the warm session (and its caches)
 //     is kept. Success answers are trusted as they are. Background results are compared
 //     only when no input of either compile changed from the warm compile's start to the
-//     end of the fresh one (`input_paths`, `changed_input`: every source file, expansion
+//     end of the fresh one (`session_inputs`, `crate_inputs`, `changed_input`: every source file, expansion
 //     input, Cargo file and build script record, not only the root), and they are applied
 //     on the serve loop (`GuardJobs::drain`), never on the worker thread. The fuzz gate
 //     waits for all started checks to finish (`guard-check: start/done` log lines) and
@@ -443,12 +443,13 @@ enum GuardOutcome {
 }
 
 /// Every file a compile in `session` read for `req`: the root, each source
-/// file of its map (module files, dependency sources), each file an expansion
-/// read (`include_str!` and friends), the Cargo files the graph key covers,
-/// and the build script records. The request itself (command, flags, client
-/// env and shown paths, crate selection) needs no entry: a guard compiles a
-/// clone of the warm request, in this same daemon binary.
-fn input_paths(session: &Session, req: &Request) -> Vec<PathBuf> {
+/// file of its map (module files, dependency sources), and each file an
+/// expansion read (`include_str!` and friends). `crate_inputs` adds the files
+/// that do not depend on the session. The request itself (command, flags,
+/// client env and shown paths, crate selection) needs no entry: a guard
+/// compiles a clone of the warm request, in this same daemon binary.
+/// Cheap (no file system call), so the serve loop takes the warm session's.
+fn session_inputs(session: &Session, req: &Request) -> Vec<PathBuf> {
     let front = &session.front;
     let mut paths = vec![req.file.clone()];
     for k in 0..front.map.file_count() {
@@ -464,10 +465,15 @@ fn input_paths(session: &Session, req: &Request) -> Vec<PathBuf> {
             }
         }
     }
-    paths.extend(protocol::graph_files(&req.session).into_iter().map(|(_, p)| p));
+    paths
+}
+
+/// The inputs of any compile of `req` besides its session's own files: the
+/// Cargo files the graph key covers and the build script records. Read on
+/// the guard's thread (a cache dir can hold many entries).
+fn crate_inputs(req: &Request) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = protocol::graph_files(&req.session).into_iter().map(|(_, p)| p).collect();
     paths.extend(driver::buildscript::record_files(&driver::cache::cache_dir(&req.file)));
-    paths.sort();
-    paths.dedup();
     paths
 }
 
@@ -535,7 +541,7 @@ impl GuardJobs {
     }
 
     /// Redoes `req` in a fresh session on a new thread. `inputs` are the
-    /// warm session's input files (`input_paths`) and `start` is when the
+    /// warm session's input files (`session_inputs`) and `start` is when the
     /// warm compile started. After its compile the worker adds the fresh
     /// session's own inputs and compares only when none of them changed
     /// since `start` (`changed_input`), so an edit anywhere in the crate
@@ -558,7 +564,10 @@ impl GuardJobs {
                     Ok(resp) => {
                         guard_hold();
                         let mut all = inputs;
-                        all.extend(input_paths(&fresh, &req));
+                        all.extend(session_inputs(&fresh, &req));
+                        all.extend(crate_inputs(&req));
+                        all.sort();
+                        all.dedup();
                         match changed_input(&all, start) {
                             None => (GuardOutcome::Fresh(resp), Some(fresh)),
                             Some(path) => (GuardOutcome::Stale(path), None),
@@ -706,7 +715,7 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
         }
         Ok(r) => {
             // An error answer: hand it out now, verify it in the background.
-            let inputs = input_paths(&entry.session, req);
+            let inputs = session_inputs(&entry.session, req);
             let dir = entry.fresh_dir();
             jobs.spawn(req.clone(), r.clone(), inputs, start, dir, served);
             r
@@ -1119,7 +1128,7 @@ mod tests {
         let start = std::time::SystemTime::now();
         let warm = driver::compile(&req, &mut entry.session);
         assert_eq!(warm.code, 1, "store.rs has a type error: {}", warm.stderr);
-        let inputs = input_paths(&entry.session, &req);
+        let inputs = session_inputs(&entry.session, &req);
         assert!(inputs.contains(&store), "the module file is a guard input: {inputs:?}");
 
         // Same inputs, same answer: a match keeps the warm session.

@@ -752,7 +752,8 @@ pub fn build_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
         use std::os::unix::fs::MetadataExt;
-        let core = std::env::current_exe().map(|e| if e.file_name().is_some_and(|n| n == "lust-core") { e } else { e.with_file_name("lust-core") });
+        let core = std::env::current_exe()
+            .map(|e| if e.file_name().is_some_and(|n| n == "lust-core") { e } else { e.with_file_name("lust-core") });
         let file = core.and_then(std::fs::metadata).map_or_else(
             |_| "-".to_string(),
             |m| format!("{:x}.{:x}.{:x}.{:x}.{:x}", m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()),

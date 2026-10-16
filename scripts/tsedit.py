@@ -286,8 +286,10 @@ class Bench:
         return self.run(tsrust_full.cargo_check_cmd(self.target, self.tree), self.cargo_env, COLD_TIMEOUT)
 
     def start_daemon(self):
-        self.daemon = subprocess.Popen([str(self.a.lust), "daemon"], cwd=self.tree, env=self.env,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # The daemon log feeds the guard counts of the report (`guard_counts`).
+        with open(self.work / "daemon.log", "a") as log:
+            self.daemon = subprocess.Popen([str(self.a.lust), "daemon"], cwd=self.tree, env=self.env,
+                                           stdout=subprocess.DEVNULL, stderr=log)
         for _ in range(800):
             if (self.work / "s.sock").exists():
                 return
@@ -658,14 +660,31 @@ class Bench:
         # (a target with no check fails, see scripts/oracle_log.py).
         ok, fails = oracle_log.collect(self.oracle_path)
         res["oracle"] = {"on": oracle_log.on(), "checks": ok, "problems": oracle_log.problems(ok, fails, self.label)}
+        res["guard"] = guard_counts(self.work / "daemon.log")
         if not self.a.keep:
             shutil.rmtree(self.work, ignore_errors=True)
         return res
 
 
+def guard_counts(log):
+    """The daemon's background guard checks (src/daemon.rs): started, and
+    done as match, stale (an input changed during the check), or mismatch.
+    `guard_lines` counts the loud `guard:` lines; any one is a bug or a
+    false alarm to look at, and a mismatch costs the next request a full
+    fresh compile."""
+    text = log.read_text() if log.exists() else ""
+    done = lambda kind: len(re.findall(rf"^guard-check: done \d+ {kind}", text, re.M))  # noqa: E731
+    return {"started": len(re.findall(r"^guard-check: start ", text, re.M)), "match": done("match"), "stale": done("stale"),
+            "mismatch": done("mismatch"), "guard_lines": len(re.findall(r"^guard:", text, re.M))}
+
+
 def print_table(res):
     print(f"\n{res['tree']}: {res['lines']} lines in {res['files']} files, ts-rust {res['tsrust_commit'][:9]}, lust {res['lust_commit']}, "
           f"{res['rustc']}, {res['host']['nproc']} cpus; daemon first {res['daemon_first_ms']:.0f} ms, no-op {res['noop_ms']} ms")
+    g = res.get("guard")
+    if g:
+        print(f"guard checks: {g['started']} started, {g['match']} match, {g['stale']} stale, {g['mismatch']} mismatch, "
+              f"{g['guard_lines']} guard: lines")
     print(f"{'kind':<8} {'ok':>4} {'rej':>4} {'lust med':>9} {'p95':>8} {'cargo med':>10} {'p95':>8} {'ratio':>8} {'p95':>8}"
           f"  {'FA':>3} {'FR':>3} {'w!=c':>4} {'hang':>4}")
     for r in res["rows"]:
