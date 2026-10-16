@@ -132,11 +132,16 @@ impl Interner {
         self.intern_locked(s)
     }
 
-    /// `intern` through the shard lock.
-    fn intern_locked(&self, s: &str) -> Sym {
+    /// The shard that holds `s`.
+    fn shard_of(s: &str) -> usize {
         let mut h = FxHasher::default();
         s.hash(&mut h);
-        let shard = (h.finish() >> 58) as usize & (SHARDS - 1);
+        (h.finish() >> 58) as usize & (SHARDS - 1)
+    }
+
+    /// `intern` through the shard lock.
+    fn intern_locked(&self, s: &str) -> Sym {
+        let shard = Self::shard_of(s);
         let sh = &self.shards[shard];
         let mut map = sh.map.lock().unwrap();
         if let Some(&i) = map.get(s) {
@@ -148,6 +153,17 @@ impl Interner {
         let _ = bucket[off].set(s.into());
         map.insert(s.into(), i as u32);
         Sym(((i as u32) << SHARD_BITS) | shard as u32)
+    }
+
+    /// The `Sym` of `s` when something interned it already, without
+    /// interning it. A scan for names can skip the ones no source uses.
+    pub fn find(&self, s: &str) -> Option<Sym> {
+        if let Some(k) = FIXED.iter().position(|f| *f == s) {
+            return Some(self.fixed[k]);
+        }
+        let shard = Self::shard_of(s);
+        let i = *self.shards[shard].map.lock().unwrap().get(s)?;
+        Some(Sym((i << SHARD_BITS) | shard as u32))
     }
 
     pub fn get(&self, sym: Sym) -> &str {
@@ -183,6 +199,18 @@ mod tests {
             assert_eq!(i.intern(f), i.intern_locked(f));
             assert_eq!(i.get(i.intern(f)), f);
         }
+    }
+
+    /// `find` returns the interned symbol, and None (without interning)
+    /// for a string nobody interned.
+    #[test]
+    fn find_does_not_intern() {
+        let i = Interner::default();
+        let a = i.intern("NonZero");
+        assert_eq!(i.find("NonZero"), Some(a));
+        assert_eq!(i.find("self"), Some(i.intern("self")));
+        assert_eq!(i.find("MaybeUninit"), None);
+        assert_eq!(i.find("MaybeUninit"), None);
     }
 }
 

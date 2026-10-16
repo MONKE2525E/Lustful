@@ -10459,9 +10459,12 @@ const GENERIC_STD_METHODS: &[&str] = &["start_bound", "end_bound", "get", "avail
 /// gate measures plain programs too). One pass over the Ast: collect
 /// calls it once.
 pub fn ast_uses_generic_std(ast: &Ast, interner: &Interner) -> bool {
-    let named = |segs: &[ast::PathSeg]| segs.iter().any(|s| GENERIC_STD_NAMES.contains(&interner.get(s.name)));
+    // Compare Syms, not strings: a name nobody interned is in no Ast node.
+    let syms = |names: &[&str]| -> Vec<Sym> { names.iter().filter_map(|n| interner.find(n)).collect() };
+    let (names, methods) = (syms(GENERIC_STD_NAMES), syms(GENERIC_STD_METHODS));
+    let named = |segs: &[ast::PathSeg]| !names.is_empty() && segs.iter().any(|s| names.contains(&s.name));
     ast.exprs.iter().any(|e| match e {
-        ast::Expr::MethodCall { name, .. } => GENERIC_STD_METHODS.contains(&interner.get(*name)),
+        ast::Expr::MethodCall { name, .. } => methods.contains(name),
         ast::Expr::Path(segs) => named(segs),
         ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
         _ => false,
