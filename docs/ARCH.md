@@ -3146,9 +3146,11 @@ Stated subset cuts (valid Rust lust rejects, tests/reject):
 - GATs (L0620), async (milestone 8b), as before.
 - L0509: a name that two or more glob imports (or a glob and a
   re-export) bring with an answer that depends on rustc's glob
-  event order: the same item with different visibility, or an
-  ambiguity carried on by a further glob (`resolve/order.rs`).
-  An explicit import of the item fixes it.
+  event order (`resolve/order.rs`): the same item with different
+  visibility where rustc can re-fetch a narrower binding and drop
+  the widest, or an ambiguity carried on by a further glob. When
+  no re-fetch can lower it, lust keeps the widest visibility, as
+  rustc does. An explicit import of the item fixes it.
 
 ### 5.6 Negative corpus
 
