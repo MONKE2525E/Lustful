@@ -227,18 +227,83 @@ impl Ctx<'_> {
         !matches!(sel, Selection::NoImpl)
     }
 
+    /// `trait_may_apply` for a std trait, through the nested bounds of the
+    /// impl selection picks (three levels): a blanket impl holds only where
+    /// its bounds may (`ToString` needs `Display`, `ToOwned` `Clone`,
+    /// `IntoIterator` `Iterator`), so a user `fn to_string(&self)` on a type
+    /// without Display is no tie. An open nested bound (`Into`'s `U:
+    /// From<T>`) may hold.
+    fn std_trait_may_apply(&mut self, d: DefId, self_ty: Ty) -> bool {
+        // Core's `impl<T: 'static + ?Sized> Any for T`: the probe does not
+        // check regions, so it may apply to every type.
+        if d == self.p.gx.lang.any {
+            return true;
+        }
+
+        let Some(n) = self.p.gx.index.trait_record(d).map(|r| r.generics.params.len()) else { return false };
+        let snap = self.snapshot_vars();
+        let obl_len = self.obl_len();
+        let mut args = vec![GenericArg::Ty(self_ty)];
+        for _ in 1..n {
+            args.push(GenericArg::Ty(self.new_var(false)));
+        }
+        let args = self.tys.intern_args(&args);
+        let ok = self.trait_ref_may_hold(TraitRef { def: d, args, bindings: EMPTY_BINDINGS }, 3);
+        self.rollback_vars(snap);
+        self.obl_truncate(obl_len);
+        ok
+    }
+
+    fn trait_ref_may_hold(&mut self, tr: TraitRef, depth: u8) -> bool {
+        // Core's `impl<I: Iterator + ?Sized> Iterator for &mut I`, which
+        // lust's selection does not have.
+        if tr.def == self.p.gx.lang.iterator
+            && let Some(GenericArg::Ty(t)) = self.tys.args(tr.args).first().copied()
+            && let TyKind::Ref(_, m, inner) = self.tys.kind(self.resolve(t))
+            && m.is_mut()
+        {
+            let args = self.tys.intern_args(&[GenericArg::Ty(inner)]);
+            return self.trait_ref_may_hold(TraitRef { args, ..tr }, depth);
+        }
+        match self.select_obligation(tr) {
+            Selection::NoImpl => false,
+            Selection::Impl { nested, .. } if depth > 0 => nested.into_iter().all(|pred| match pred {
+                Predicate::Trait(b) if b.count == 0 => self.trait_ref_may_hold(b.value, depth - 1),
+                _ => true,
+            }),
+            _ => true,
+        }
+    }
+
     /// The in-scope traits from outside std that declare a method or
     /// associated fn `name`, each with the receiver form of that item.
     fn user_traits_with(&mut self, name: Sym) -> Vec<(DefId, Option<SelfKind>)> {
+        self.traits_with(name, true)
+    }
+
+    /// `user_traits_with` for the user's traits (`user`) or for std's.
+    fn traits_with(&mut self, name: Sym, user: bool) -> Vec<(DefId, Option<SelfKind>)> {
         let p = self.p;
         let Some(ds) = p.gx.traits_by_method.get(&name) else { return Vec::new() };
         let mut out = Vec::new();
         for &d in ds {
-            if !self.is_user_trait(d) || !method::trait_in_scope_pub(self, d) {
+            if self.is_user_trait(d) != user || !method::trait_in_scope_pub(self, d) {
                 continue;
             }
             let Some(m) = p.gx.index.trait_record(d).and_then(|r| r.method_by_name(name)) else { continue };
-            out.push((d, p.gx.trait_methods.get(&m).and_then(|t| t.self_kind)));
+            // A lang trait's method has its signature in `lang_method_sigs`.
+            // `Any::type_id` has no lang signature (check/any.rs answers it).
+            let kind = p.gx.trait_methods.get(&m).and_then(|t| t.self_kind).or_else(|| p.gx.lang_method_sigs.get(&m).and_then(|t| t.self_kind));
+            let kind = kind.or((d == p.gx.lang.any).then_some(SelfKind::Ref));
+            out.push((d, kind));
+        }
+        // `Iterator`'s provided methods are builtins, not in its lang record.
+        let iterator = p.gx.lang.iterator;
+        if !user
+            && let Some(kind) = iterator_provided_kind(p.interner.get(name))
+            && method::trait_in_scope_pub(self, iterator)
+        {
+            out.push((iterator, Some(kind)));
         }
         out
     }
@@ -285,14 +350,17 @@ impl Ctx<'_> {
     }
 
     /// The first probe at which trait `d`'s method of receiver form `kind`
-    /// may apply over `steps`: Self is a step, `&` one, or `&mut` one.
+    /// may apply over `steps`: Self is a step, `&` one, or `&mut` one (for
+    /// a std trait, through its impl's bounds: `std_trait_may_apply`).
     /// None for an associated fn; a typed receiver is not placed, so it
     /// counts as the first probe.
     fn trait_probe_at(&mut self, steps: &[Ty], d: DefId, kind: Option<SelfKind>) -> Option<usize> {
         let mut first: Option<usize> = None;
+        let std = !self.is_user_trait(d);
         for &s in steps {
             for self_ty in [s, self.tys.mk_ref(false, s), self.tys.mk_ref(true, s)] {
-                if !self.trait_may_apply(d, self_ty) {
+                let may = if std { self.std_trait_may_apply(d, self_ty) } else { self.trait_may_apply(d, self_ty) };
+                if !may {
                     continue;
                 }
                 let recv = match kind? {
@@ -362,6 +430,27 @@ impl Ctx<'_> {
                 }
             }
         }
+        // std's traits place like the user side below: their blanket and
+        // derived impls apply to every step type, user Adts and references
+        // included (core's `Into` for every Sized type, `Clone for &T`, a
+        // derived `PartialEq`), which the table of std types leaves out.
+        // A parameter's bounds are inherent candidates in rustc, which win
+        // over every trait in scope at their step (`v.into()` on `I:
+        // IntoIter`): the generic method search places those steps.
+        let generic = steps.iter().any(|&s| {
+            let mut t = s;
+            while let TyKind::Ref(_, _, inner) = self.tys.kind(t) {
+                t = self.resolve(inner);
+            }
+            matches!(self.tys.kind(t), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) | TyKind::Dyn(..) | TyKind::Infer(_))
+        });
+        let mut std_placed: Option<usize> = None;
+        for (d, kind) in if generic { Vec::new() } else { self.traits_with(name, false) } {
+            if let Some(at) = self.trait_probe_at(&steps, d, kind) {
+                std_tr = Some(std_tr.map_or(at, |t| t.min(at)));
+                std_placed = Some(std_placed.map_or(at, |t| t.min(at)));
+            }
+        }
         if std_inh.is_none() && std_tr.is_none() && !std_typed {
             return StdShadow::None;
         }
@@ -408,10 +497,13 @@ impl Ctx<'_> {
             return StdShadow::Reject;
         }
         // In one probe an inherent item wins; a std trait's item first or
-        // at the user's probe is the trait probe's to decide.
+        // at the user's probe is the trait probe's to decide. A std trait
+        // placed by its impls (`std_placed`) strictly first wins, so the
+        // user trait is skipped.
         match (std_inh, std_tr) {
             (Some(i), t) if i <= user && t.is_none_or(|t| i <= t) => StdShadow::StdFirst,
-            (_, Some(t)) if t <= user => StdShadow::Tie,
+            (_, Some(t)) if t == user || (t < user && std_placed.is_none_or(|p| p > t)) => StdShadow::Tie,
+            (_, Some(_)) if std_placed.is_some_and(|p| p < user) => StdShadow::StdFirst,
             _ => StdShadow::UserFirst,
         }
     }
@@ -511,5 +603,24 @@ impl Ctx<'_> {
             format!("std's `{item}` for `{tn}` may win over or tie with a trait item of that name here, and lust cannot decide it yet"),
             format!("Name the trait in the call, as in {call}, or rename the trait item."),
         );
+    }
+}
+
+/// The receiver form of `Iterator`'s stable provided method `name`, if it
+/// is one (rustc 1.99).
+fn iterator_provided_kind(name: &str) -> Option<SelfKind> {
+    const BY_MUT: &[&str] = &["nth", "by_ref", "any", "all", "find", "find_map", "position", "rposition", "try_fold", "try_for_each"];
+    const BY_VALUE: &[&str] = &[
+        "count", "last", "step_by", "chain", "zip", "map", "for_each", "filter", "filter_map", "enumerate", "peekable", "skip_while",
+        "take_while", "map_while", "skip", "take", "scan", "flat_map", "flatten", "fuse", "inspect", "collect", "partition", "fold",
+        "reduce", "max", "min", "max_by_key", "max_by", "min_by_key", "min_by", "rev", "unzip", "copied", "cloned", "cycle", "sum",
+        "product", "cmp", "partial_cmp", "eq", "ne", "lt", "le", "gt", "ge", "is_sorted", "is_sorted_by", "is_sorted_by_key",
+    ];
+    if BY_MUT.contains(&name) {
+        Some(SelfKind::RefMut)
+    } else if BY_VALUE.contains(&name) {
+        Some(SelfKind::Value)
+    } else {
+        None
     }
 }
