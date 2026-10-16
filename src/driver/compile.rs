@@ -4313,7 +4313,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // C is already built here for every unit in `todo`, so the key costs
     // one hash per unit.
     let mut unit_hits = 0usize;
-    let mut misses: Vec<(PathBuf, String, Option<String>)> = Vec::new();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
@@ -4322,27 +4321,35 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Some(cache) => par_map(&units, |(_, c)| Some(cache.unit_key(c, req.debug))),
         None => vec![None; units.len()],
     };
-    for ((obj, c), key) in units.iter().zip(keys) {
+    // The units move into the miss list, and their C is freed before the
+    // link: on a large program (ts-rust's bins, about 1 GB of C) copies of
+    // it held the peak memory.
+    let (c_bytes, n_units) = (units.iter().map(|u| u.1.len()).sum::<usize>(), units.len());
+    let mut miss_units: Vec<(PathBuf, String)> = Vec::new();
+    let mut miss_keys: Vec<Option<String>> = Vec::new();
+    for ((obj, c), key) in units.into_iter().zip(keys) {
         if let (Some(cache), Some(k)) = (&disk_cache, &key)
-            && cache.unit_object(k, obj)
+            && cache.unit_object(k, &obj)
         {
             unit_hits += 1;
         } else {
-            misses.push((obj.clone(), c.clone(), key));
+            miss_units.push((obj, c));
+            miss_keys.push(key);
         }
     }
-    let miss_units: Vec<(PathBuf, String)> = misses.iter().map(|(o, c, _)| (o.clone(), c.clone())).collect();
     if let Err(e) = crate::tcc::compile_units(&miss_units, req.debug) {
         caches.objects = None;
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
     if let Some(cache) = disk_cache {
-        for (obj, _, key) in &misses {
+        for ((obj, _), key) in miss_units.iter().zip(&miss_keys) {
             if let Some(k) = key {
                 cache.store_unit_object(k, obj);
             }
         }
     }
+    let units_compiled = miss_units.len();
+    drop(miss_units);
     caches.objects = Some(req.debug);
     t.lap("tcc compile");
     let all_base: Vec<PathBuf> = [1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()).map(base_obj).collect();
@@ -4447,9 +4454,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             rechecked: work.len(),
             reused: reads_reused,
             invalidated: reads_invalidated,
-            c_bytes: units.iter().map(|u| u.1.len()).sum(),
+            c_bytes,
             dirty_units: dirty_fn_units.len(),
-            units_compiled: miss_units.len(),
+            units_compiled,
             unit_cache_hits: unit_hits,
             table_rebuilt: todo.iter().any(|&(u, _)| u == 3),
             instances: front.fn_slot.len(),
@@ -4466,23 +4473,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     log_visits(&front.last_visits);
     if req.timings {
-        let kb = units.iter().map(|u| u.1.len()).sum::<usize>() / 1024;
+        let kb = c_bytes / 1024;
         let _ = writeln!(
             resp.stderr,
             "lust build {path}: ok ({} functions, {mode}: {} fn(s) generated, {} units compiled, {} overlays, {kb} KB of C)",
             program.fns.len(),
             bodies.len(),
-            units.len(),
+            n_units,
             caches.overlays.len(),
         );
         t.render(&mut resp.stderr);
     }
     if leak_at_exit {
         std::mem::forget(bodies);
-        std::mem::forget(units);
         std::mem::forget(program);
     } else {
-        drop((bodies, units));
+        drop(bodies);
         program.verified = verified;
         super::patch::keep(front, program);
     }
