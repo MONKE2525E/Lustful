@@ -133,6 +133,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         build_hashers: _,
         written_hash: _,
         hash_impls: _,
+        dyn_keys: _,
         generic_hash: _,
         borrow_impls: _,
         has_generics: _,

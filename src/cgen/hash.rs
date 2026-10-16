@@ -442,7 +442,19 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
             let qc = ctype(q);
             if *g == Glue::HashKeyQ {
                 let s = ctype(&builder_cty(map));
-                (format!("uint64_t hkq_{m}({s} *s, {qc} *k)"), hash_key_body(p, slots, map, q, need))
+                let body = match dyn_key(p, map, q) {
+                    Some(dk) => dyn_hash_body(p, slots, map, dk, need),
+                    None => hash_key_body(p, slots, map, q, need),
+                };
+                (format!("uint64_t hkq_{m}({s} *s, {qc} *k)"), body)
+            } else if let Some(dk) = dyn_key(p, map, q) {
+                // `<dyn K as PartialEq>::eq(probe, stored.borrow())`: both are
+                // fat values passed by value (the fns take `&self`, `&Self`).
+                let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
+                let key = key_of(map, &format!("({e}*)elem"));
+                let borrowed = borrow_expr(p, slots, &k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
+                let call = format!("({}lust_fns[{}])(*(lust_dyn*)ctx, *{borrowed})", fn_ptr_cast(p, dk.eq), slots[dk.eq.0 as usize]);
+                (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("  return {call};\n"))
             } else {
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
                 let key = key_of(map, &format!("({e}*)elem"));
@@ -453,6 +465,36 @@ pub(super) fn glue(p: &Program, slots: &[u32], g: &Glue, t: &CTy, need: &mut dyn
         }
         _ => (String::new(), String::new()),
     }
+}
+
+/// The dyn lookup of a map whose key is a local Adt with a
+/// `Borrow<dyn K>` impl, when `q` is that dyn form (`gx.dyn_keys`).
+fn dyn_key<'p>(p: &'p Program, map: &CTy, q: &CTy) -> Option<&'p crate::check::generics::DynKey> {
+    match (key_cty(map), q) {
+        (CTy::Adt(a), CTy::Dyn) => p.gx.dyn_keys.get(&a),
+        _ => None,
+    }
+}
+
+/// The `hkq_` body of a dyn lookup: a fresh hasher, the written
+/// `<dyn K as Hash>::hash::<H>` instance on the probe (a fat value), then
+/// `finish`, as `make_hash` runs for any key.
+fn dyn_hash_body(p: &Program, slots: &[u32], map: &CTy, dk: &crate::check::generics::DynKey, need: &mut dyn FnMut(Glue, &CTy)) -> String {
+    let s_cty = builder_cty(map);
+    let hc = hasher_cty(p, &s_cty);
+    let Some(&(_, f)) = dk.hash_insts.iter().find(|&&(h, _)| cty(&p.tys, h) == hc) else {
+        unreachable!("dyn key lookup: no hash instance for the map's hasher (check/hashmap.rs checks it)")
+    };
+    let build = build_into(p, slots, &s_cty, "s", "h", need);
+    let finish = hasher_call(p, slots, &hc, 0, "(&h)", "");
+    let drop = if needs_drop_c(p, &hc) {
+        need(Glue::Drop, &hc);
+        format!(" drop_{}(&h);", mangle(&hc))
+    } else {
+        String::new()
+    };
+    let call = format!("({}lust_fns[{}])(*k, &h);", fn_ptr_cast(p, f), slots[f.0 as usize]);
+    format!("  {build}\n  {call}\n  uint64_t r = {finish};{drop}\n  return r;\n")
 }
 
 /// A `Q*` expression for `<K as Borrow<Q>>::borrow` of the key at `k`

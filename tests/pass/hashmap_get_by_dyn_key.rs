@@ -1,5 +1,4 @@
-// expect: L0640
-// Valid Rust: a HashMap lookup through `Borrow<dyn Key>`; lust has no hash glue for dyn lookups yet.
+// A HashMap lookup through `Borrow<dyn Key + 'a>` (ts-rust frontend/module/cache.rs).
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

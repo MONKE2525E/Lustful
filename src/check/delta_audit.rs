@@ -160,6 +160,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         iter_methods: _,          // same
         written_hash: _,          // same
         hash_impls: _,            // same
+        dyn_keys: _,              // same
         generic_hash: _,          // same
         borrow_impls: _,          // same
         has_generics,             // refuse: the fn class stands

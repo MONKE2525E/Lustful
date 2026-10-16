@@ -114,7 +114,7 @@ impl<'p> Ctx<'p> {
         }
         let p = self.p;
         let glue = |cx: &Self, t: Ty| has_hash(p, &cx.tys, t) && has_eq(p, &cx.tys, t);
-        if crate::check::object::mentions_dyn(&self.tys, q) {
+        if crate::check::object::mentions_dyn(&self.tys, q) && !self.dyn_lookup_ok(k, q) {
             let tn = self.tn(q);
             self.errs.push(Diag::new(
                 "L0640",
@@ -141,11 +141,20 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True when a lookup of `k` keys by the dyn type `q` goes through the
+    /// glue's dyn key calls (`gx.dyn_keys`): `k`'s one dyn `Borrow` target
+    /// is `q` (object lifetimes aside), with written `Hash` and `PartialEq`
+    /// impls for it.
+    fn dyn_lookup_ok(&mut self, k: Ty, q: Ty) -> bool {
+        let q = crate::check::object::erase_dyn_region(&mut self.tys, q);
+        self.tys.local_adt(k).and_then(|a| self.p.gx.dyn_keys.get(&a)).is_some_and(|dk| dk.q == q)
+    }
+
     /// True when `K: Borrow<Q>` holds by one of core's impls the hash
     /// glue implements (`borrow_expr` in cgen/hash.rs), or by a written
     /// impl it calls (`gx.borrow_impls`).
     fn builtin_borrow(&self, k: Ty, q: Ty) -> bool {
-        if k == q || self.tys.local_adt(k).is_some_and(|a| self.p.gx.borrow_impls.contains_key(&(a, q))) {
+        if k == q || self.tys.local_adt(k).is_some_and(|a| self.p.gx.borrow_impls.contains_key(&(a, q)) || self.p.gx.dyn_keys.get(&a).is_some_and(|dk| dk.q == q)) {
             return true;
         }
         let tys = &self.tys;

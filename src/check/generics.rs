@@ -5298,6 +5298,10 @@ pub struct GenTables {
     /// (W-STD-B; iface: W-CGEN reads `hash_impls`).
     pub written_hash: FxMap<AdtId, LocalDefId>,
     pub hash_impls: FxMap<AdtId, Vec<(Ty, LocalDefId)>>,
+    /// Map lookups by a dyn key (`impl Borrow<dyn K + 'a> for Key`, with
+    /// written `Hash` and `PartialEq` impls for `dyn K + '_`; ts-rust's
+    /// module caches): per key Adt, the hash glue's calls (cgen/hash.rs).
+    pub dyn_keys: FxMap<AdtId, DynKey>,
     /// The written generic `Hash` impls of concrete Adt instances
     /// (`impl<T: Hash> Hash for VecDeque<T>`): the impl's `hash` fn
     /// and the impl args at the instance. `ensure_written_hash` makes
@@ -5442,6 +5446,7 @@ impl Default for GenTables {
             iter_methods: FxMap::default(),
             written_hash: FxMap::default(),
             hash_impls: FxMap::default(),
+            dyn_keys: FxMap::default(),
             generic_hash: FxMap::default(),
             borrow_impls: FxMap::default(),
             has_generics: false,
@@ -6886,11 +6891,6 @@ pub(crate) fn insert_synthetic(
     }))
 }
 
-/// Finishes one trait impl: associated bindings, the index
-/// record, the orphan check, and method signature validation
-/// against the trait. Called from collect's fn pass after the
-/// impl's methods are in `fns`.
-#[allow(clippy::too_many_arguments)]
 /// `trait Tr: 'static` and `type A: 'static` in the trait: the impl's
 /// Self type and its binding of `A`, in region form (the impl scope's
 /// `self_ty_regioned` and `assoc_regioned`), must name no lifetime but
@@ -6928,6 +6928,11 @@ fn static_header_regions(p: &mut Program, imp: &ast::ImplDef, rec: &TraitRecord,
     }
 }
 
+/// Finishes one trait impl: associated bindings, the index
+/// record, the orphan check, and method signature validation
+/// against the trait. Called from collect's fn pass after the
+/// impl's methods are in `fns`.
+#[allow(clippy::too_many_arguments)]
 pub fn finish_trait_impl(
     p: &mut Program,
     imp: &ast::ImplDef,
@@ -8182,6 +8187,31 @@ pub fn add_synthetic_impls(p: &mut Program) {
     }
     // Lang facts for builtin types.
     let g0 = Generics::default();
+    // core's `impl<A, F: Fn<A> + ?Sized> Fn<A> for &F` (and `FnMut`,
+    // `FnOnce`) and `impl<A, F: FnMut<A> + ?Sized> FnMut<A> for &mut F`
+    // (and `FnOnce`), with `Output = <F as FnOnce<A>>::Output`: a generic
+    // callable passed on by reference (`walk(node, &mut callback)`).
+    // Closures, fn items and fn pointers behind a reference are answered
+    // structurally first (`closure_select_impl`).
+    if let Some(out) = lang.output_of(lang.fn_once) {
+        let a = p.tys.intern(TyKind::Param(ParamId(0)));
+        let f = p.tys.intern(TyKind::Param(ParamId(1)));
+        let params = vec![
+            ParamDef { name: p.interner.intern("Args"), kind: ParamKind::Type, span },
+            ParamDef { name: p.interner.intern("F"), kind: ParamKind::Type, span },
+        ];
+        let fa = p.tys.intern_args(&[GenericArg::Ty(f), GenericArg::Ty(a)]);
+        let output = p.tys.intern(TyKind::Projection(AssocId(out), fa));
+        for (m, base, traits) in [(Mut::Shared, lang.fn_, [lang.fn_, lang.fn_mut, lang.fn_once].as_slice()), (Mut::Mut, lang.fn_mut, [lang.fn_mut, lang.fn_once].as_slice())] {
+            let self_pat = p.tys.intern(TyKind::Ref(Region::Erased, m, f));
+            let pred = Predicate::Trait(Binder::plain(TraitRef { def: base, args: fa, bindings: EMPTY_BINDINGS }));
+            let generics = Generics { parent: None, params: params.clone(), predicates: vec![pred] };
+            for &tr in traits {
+                let assoc = if tr == lang.fn_once { vec![(out, output)] } else { Vec::new() };
+                insert_synthetic(p, &mut ordinal, tr, self_pat, &[a], generics.clone(), assoc, Synthetic::Lang, false, span);
+            }
+        }
+    }
     let scalar_traits = [lang.copy, lang.clone, lang.debug, lang.eq, lang.hash, lang.default];
     let mut scalars: Vec<Ty> = IntTy::ALL_SUPPORTED.iter().map(|&i| int(i)).collect();
     scalars.extend([BOOL, CHAR, UNIT]);
@@ -11232,7 +11262,7 @@ fn ensure_generic_hash(p: &mut Program, adt: AdtId) {
 /// `Hasher` impl. Pairs made in an earlier pass stay.
 fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
     use crate::ty::hash::{HashTy, mk_hash};
-    if p.gx.written_hash.is_empty() && p.gx.generic_hash.is_empty() {
+    if p.gx.written_hash.is_empty() && p.gx.generic_hash.is_empty() && p.gx.dyn_keys.is_empty() {
         return;
     }
     let mut user: Vec<AdtId> = p.gx.hasher_methods.keys().map(|&(a, _)| a).collect();
@@ -11256,6 +11286,33 @@ fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
                 queue.push(inst);
             }
             p.gx.hash_impls.entry(a).or_default().push((h, inst));
+        }
+    }
+    // The dyn lookups' `hash::<H>` (`dyn_keys`): lifetimes erased, H the
+    // template's one type param.
+    let mut keys: Vec<AdtId> = p.gx.dyn_keys.keys().copied().collect();
+    keys.sort_by_key(|a| a.0);
+    for a in keys {
+        let f = p.gx.dyn_keys[&a].hash;
+        let params: Vec<ParamKind> =
+            p.gx.fn_templates.get(f.0 as usize).cloned().flatten().map_or(Vec::new(), |t| t.generics.params.iter().map(|x| x.kind.clone()).collect());
+        for &h in &hashers {
+            if p.gx.dyn_keys[&a].hash_insts.iter().any(|&(t, _)| t == h) {
+                continue;
+            }
+            let args: Vec<GenericArg> =
+                params.iter().map(|k| if matches!(k, ParamKind::Lifetime) { GenericArg::Lifetime(Region::Erased) } else { GenericArg::Ty(h) }).collect();
+            if args.iter().filter(|g| g.as_ty().is_some()).count() != 1 {
+                continue;
+            }
+            let before = p.fns.len();
+            let inst = fn_instance(p, f, &args);
+            if inst.0 as usize >= before {
+                queue.push(inst);
+            }
+            if let Some(k) = p.gx.dyn_keys.get_mut(&a) {
+                k.hash_insts.push((h, inst));
+            }
         }
     }
 }
@@ -12428,13 +12485,32 @@ fn compute_glue_methods(p: &mut Program) {
 /// Adt). A Hash impl with its own `hash_slice` is left out: slices of
 /// the type then hash differently from the glue's loop, so such keys
 /// stay rejected (L0640).
+/// One dyn lookup type of a map key Adt (`GenTables::dyn_keys`): the dyn
+/// type (object lifetime erased), its `Borrow::borrow`, `PartialEq::eq` and
+/// `Hash::hash` templates, and the `hash::<H>` instances by hasher type
+/// (`ensure_written_hash`).
+#[derive(Clone, Debug)]
+pub struct DynKey {
+    pub q: Ty,
+    pub borrow: LocalDefId,
+    pub eq: LocalDefId,
+    pub hash: LocalDefId,
+    pub hash_insts: Vec<(Ty, LocalDefId)>,
+}
+
 fn compute_written_hash(p: &mut Program) {
     use crate::traits::index::Synthetic;
     let (mut hash, mut borrow) = (FxMap::default(), FxMap::default());
+    let lifetimes_only = |g: &Generics| g.params.iter().all(|x| matches!(x.kind, ParamKind::Lifetime));
     for tr in [p.gx.lang.hash, p.gx.lang.borrow] {
         for &id in p.gx.index.impls_of_trait(tr) {
             let rec = p.gx.index.get(id);
-            if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
+            // A lifetime-only impl (`impl<'a> Borrow<dyn K + 'a> for Key`)
+            // is one fn too: lifetimes are erased.
+            let dyn_borrow = tr == p.gx.lang.borrow
+                && lifetimes_only(&rec.generics)
+                && p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty()).is_some_and(|q| matches!(p.tys.kind(q), TyKind::Dyn(..)));
+            if rec.synthetic != Synthetic::None || !rec.local || !(rec.generics.params.is_empty() || dyn_borrow) {
                 continue;
             }
             let TyKind::Adt(d, args) = p.tys.kind(rec.self_ty(&p.tys)) else { continue };
@@ -12450,7 +12526,60 @@ fn compute_written_hash(p: &mut Program) {
         }
     }
     p.gx.written_hash = hash;
+    p.gx.dyn_keys = dyn_keys(p, &borrow);
     p.gx.borrow_impls = borrow;
+}
+
+/// The dyn lookups of `borrow` (key Adt, dyn type) whose dyn type has a
+/// written lifetime-only `Hash` impl (its own `hash`, no `hash_slice`)
+/// and `PartialEq` impl with `Rhs = Self` (its own `eq`, no `ne`): the
+/// glue calls those, as rustc's `HashMap::get` does through `Q: Hash + Eq`.
+fn dyn_keys(p: &mut Program, borrow: &FxMap<(AdtId, Ty), LocalDefId>) -> FxMap<AdtId, DynKey> {
+    use crate::traits::index::Synthetic;
+    let mut out: FxMap<AdtId, DynKey> = FxMap::default();
+    let lifetimes_only = |g: &Generics| g.params.iter().all(|x| matches!(x.kind, ParamKind::Lifetime));
+    let mut by_key: FxMap<AdtId, Vec<(Ty, LocalDefId)>> = FxMap::default();
+    for (&(a, q), &f) in borrow {
+        if matches!(p.tys.kind(q), TyKind::Dyn(..)) {
+            by_key.entry(a).or_default().push((q, f));
+        }
+    }
+    for (a, qs) in by_key {
+        // One dyn lookup type per key: the glue's CTy::Dyn names no trait.
+        let [(q, borrow_fn)] = qs.as_slice() else { continue };
+        let q = crate::check::object::erase_dyn_region(&mut p.tys, *q);
+        let find = |p: &mut Program, tr: DefId, method: &str, bad: &str, rhs: bool| -> Option<LocalDefId> {
+            let ids: Vec<_> = p.gx.index.impls_of_trait(tr).to_vec();
+            let mut found = None;
+            for id in ids {
+                let rec = p.gx.index.get(id).clone();
+                if rec.synthetic != Synthetic::None || !rec.local || !lifetimes_only(&rec.generics) {
+                    continue;
+                }
+                let st = rec.self_ty(&p.tys);
+                if crate::check::object::erase_dyn_region(&mut p.tys, st) != q {
+                    continue;
+                }
+                if rhs {
+                    let r = p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty());
+                    if r.map(|r| crate::check::object::erase_dyn_region(&mut p.tys, r)) != Some(q) {
+                        continue;
+                    }
+                }
+                let named = |n: &str| rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == n));
+                if named(bad).is_some() {
+                    return None;
+                }
+                found = named(method);
+            }
+            found
+        };
+        let (Some(eq), Some(hash)) = (find(p, p.gx.lang.partial_eq, "eq", "ne", true), find(p, p.gx.lang.hash, "hash", "hash_slice", false)) else {
+            continue;
+        };
+        out.insert(a, DynKey { q, borrow: *borrow_fn, eq, hash, hash_insts: Vec::new() });
+    }
+    out
 }
 
 /// The derived traits that need more than the field checks in
