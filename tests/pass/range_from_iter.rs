@@ -17,7 +17,9 @@ fn main() {
     let mut e = (200u8..).enumerate().skip(3);
     println!("{:?}", e.next());
     let mut c = '\u{D7FE}'..;
-    println!("{:?} {:?} {:?} {:?}", c.next(), c.next(), c, c.nth(5));
+    let (x, y) = (c.next(), c.next());
+    println!("{:?} {:?} {:?}", x, y, c);
+    println!("{:?}", c.nth(5));
     let w: Vec<(char, i128)> = "xy".chars().zip(i128::MAX - 3..).collect();
     println!("{:?} {}", w, w.capacity());
     let mut n = 0;
