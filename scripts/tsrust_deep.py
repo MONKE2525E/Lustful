@@ -64,7 +64,8 @@ def remove_users(copy, names, cause_of_name, removed, target):
     pat = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b")
     n = 0
     for p in sorted(copy.rglob("*.rs")):
-        if "target" in p.parts:
+        # Only files a lib or bin target compiles: no integration tests, benches or examples.
+        if {"target", "tests", "benches", "examples"} & set(p.relative_to(copy).parts):
             continue
         lines = p.read_text().split("\n")
         items = prune.items_of(str(p), {})
@@ -148,7 +149,8 @@ def main():
             if not located:
                 # Errors with no span on disk that name an item an earlier round removed (macro
                 # output that used it): remove the items that mention that name, as its cascade.
-                gone = {n for e in errs for n in names_in(e[3]) if n in cause_of_name}
+                # `main` is no item name another item uses (every bin has one).
+                gone = {n for e in errs for n in names_in(e[3]) if n in cause_of_name and n != "main"}
                 if not gone or not remove_users(copy, gone, cause_of_name, removed, name):
                     status[name] = f"stopped: no located error: {errs[0][2]} {errs[0][3][:160]}"
                     break
