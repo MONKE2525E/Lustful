@@ -3636,8 +3636,10 @@ pub(crate) fn resolve_path_ty(
         }
         return Ok(crate::ty::sync::sync_ty(tys, k, &[elem]));
     }
-    // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A).
-    if let n @ ("Weak" | "RefCell" | "Cell") = interner.get(name)
+    // `Weak<T>`, `RefCell<T>`, `Cell<T>`, and the `RefCell` guards
+    // `Ref<'_, T>` / `RefMut<'_, T>` (W-STD-A, R26). A guard's
+    // element may be unsized (`Ref<str>`, `RefMut<dyn Tr>`), as in std.
+    if let n @ ("Weak" | "RefCell" | "Cell" | "Ref" | "RefMut") = interner.get(name)
         && (std_path || !cx.type_names.contains_key(&name))
     {
         let args = match &seg.args {
@@ -3648,7 +3650,10 @@ pub(crate) fn resolve_path_ty(
         // `RefCell<dyn Tr>` behind a pointer is check/own.rs's, and
         // `Weak<dyn Tr>` is cgen/own.rs's; their object lifetime
         // defaults as for `Box<dyn Tr>`.
-        let dyn_cell = matches!(n, "RefCell" | "Weak") && matches!(tys.kind(elem), TyKind::Dyn(..));
+        // A guard over `dyn Tr` (`RefMut<'_, dyn Tr>`) takes the same
+        // default: rustc's is the guard's lifetime, so `'static` only
+        // narrows what lust accepts (R26).
+        let dyn_cell = matches!(n, "RefCell" | "Weak" | "Ref" | "RefMut") && matches!(tys.kind(elem), TyKind::Dyn(..));
         if dyn_cell
             && scope.infer_cell.is_none()
             && matches!(scope.regions, RegionMode::Erase)
@@ -3659,14 +3664,29 @@ pub(crate) fn resolve_path_ty(
         {
             elem = tys.intern(TyKind::Dyn(b, Region::Static));
         }
-        if !dyn_cell && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+        let guard = matches!(n, "Ref" | "RefMut");
+        if !dyn_cell && !guard && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
             return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));
         }
         let which: fn(&crate::ty::BuiltinDefs) -> DefId = match n {
             "Weak" => |d| d.weak,
             "RefCell" => |d| d.refcell,
+            "Ref" => |d| d.ref_guard,
+            "RefMut" => |d| d.ref_mut_guard,
             _ => |d| d.cell,
         };
+        // A guard keeps its lifetime first in a region signature, like
+        // `Cow` and the lock guards, so a returned guard borrows its
+        // source (R26).
+        if guard && matches!(scope.regions, RegionMode::Keep { .. }) {
+            let written = match &seg.args {
+                GenericArgs::Angle(a) => a.iter().find_map(|g| if let AstArg::Lifetime(lt) = g { Some(*lt) } else { None }),
+                _ => None,
+            };
+            let r = scope_region(interner, scope, written, span)?;
+            let def = which(tys.builtins());
+            return Ok(tys.mk_adt(def, &[GenericArg::Lifetime(r), GenericArg::Ty(elem)]));
+        }
         return Ok(tys.mk_builtin1(which, elem));
     }
     if interner.get(name) == "ExitCode" && (std_path || !cx.type_names.contains_key(&name)) {

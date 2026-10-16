@@ -3,7 +3,7 @@
 // Two questions, one answer each. `parts` names the positions inside a
 // type that need a `Sized` type for the type to be well-formed: tuple
 // elements but the last, array and slice elements, the type args of the
-// builtin Adts other than `Box`, `Rc`, `Arc`, `RefCell`, and `Mutex`. Local Adts owe the implicit
+// builtin Adts other than `Box`, `Rc`, `Arc`, `RefCell`, its guards, and `Mutex`. Local Adts owe the implicit
 // `Sized` of their params through their predicates, which the WF walks
 // already prove. `is_sized` answers for one type under a param env.
 //
@@ -33,8 +33,14 @@ pub fn parts(tys: &impl TyIntern, t: Ty, need: &mut impl FnMut(Ty)) {
             None | Some(BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Weak | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => {}
             // `RefCell<T: ?Sized>` and `Mutex<T: ?Sized>`: with a dyn
             // value they are unsized themselves; `MutexGuard<T: ?Sized>`
-            // is a pointer.
-            Some(BuiltinTy::RefCell | BuiltinTy::Sync(crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::MutexGuard)) => {}
+            // and the `RefCell` guards `Ref`/`RefMut<T: ?Sized>` are
+            // pointers.
+            Some(
+                BuiltinTy::RefCell
+                | BuiltinTy::RefGuard
+                | BuiltinTy::RefMutGuard
+                | BuiltinTy::Sync(crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::MutexGuard),
+            ) => {}
             Some(_) => {
                 for g in tys.args(a) {
                     if let Some(e) = g.as_ty() {

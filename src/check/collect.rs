@@ -1339,9 +1339,11 @@ pub fn resolve_ty(
                 crate::check::sync::check_sync_arg(tys, k, e, span)?;
                 return Ok(crate::ty::sync::sync_ty(tys, k, &[e]));
             }
-            // `Weak<T>`, `RefCell<T>`, `Cell<T>` (W-STD-A; the import
-            // itself is checked where paths resolve).
-            if let n @ ("Weak" | "RefCell" | "Cell") = interner.get(name)
+            // `Weak<T>`, `RefCell<T>`, `Cell<T>`, and the `RefCell`
+            // guards `Ref<'_, T>` / `RefMut<'_, T>` (W-STD-A, R26; the
+            // import itself is checked where paths resolve). A guard's
+            // element may be unsized (`Ref<str>`), as in std.
+            if let n @ ("Weak" | "RefCell" | "Cell" | "Ref" | "RefMut") = interner.get(name)
                 && (std_prefixed || !type_names.contains_key(&name))
             {
                 let args = seg.type_args();
@@ -1350,12 +1352,15 @@ pub fn resolve_ty(
                 }
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
                 let weak_dyn = n == "Weak" && matches!(tys.kind(e), TyKind::Dyn(..));
-                if !weak_dyn && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+                let guard = matches!(n, "Ref" | "RefMut");
+                if !weak_dyn && !guard && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
                     return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));
                 }
                 let which: fn(&crate::ty::BuiltinDefs) -> crate::def::DefId = match n {
                     "Weak" => |d| d.weak,
                     "RefCell" => |d| d.refcell,
+                    "Ref" => |d| d.ref_guard,
+                    "RefMut" => |d| d.ref_mut_guard,
                     _ => |d| d.cell,
                 };
                 return Ok(tys.mk_builtin1(which, e));
