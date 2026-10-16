@@ -2437,7 +2437,9 @@ impl FnGen<'_, '_> {
                     e = own::dyn_lock_value(&e);
                     t = CTy::Dyn;
                 }
-                (Proj::Index(l), CTy::Slice(el)) => {
+                // A boxed slice indexes as its fat slice value (a `for` over
+                // `&Box<[T]>` walks it as `&Vec<T>` is walked).
+                (Proj::Index(l), CTy::Slice(el) | CTy::BoxSlice(el)) => {
                     let loc = self.index_loc(*l, loc);
                     e = match self.unw {
                         Some(Unw::Goto(b)) => self.index_unw(&format!("{e}.len"), &format!("{e}.ptr"), *l, &loc, b),

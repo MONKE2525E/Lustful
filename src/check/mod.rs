@@ -14033,6 +14033,13 @@ impl<'p> Ctx<'p> {
                         if let Some(t) = self.std_trait_assoc_call(e, callee, base, segs[1].name, args, span) {
                             return t;
                         }
+                        // A builtin method by the alias's path
+                        // (`FxHashMap::clone(&m)`, check/ufcs.rs).
+                        let mark = self.errs.len();
+                        if let Some(t) = self.builtin_method_by_path(e, segs, Some(base), self.span(callee), args, span, expected) {
+                            return t;
+                        }
+                        self.errs.truncate(mark);
                         let (item, tn) = (self.name(segs[1].name).to_string(), self.tn(base));
                         self.err("L0104", span, format!("no function or associated item `{item}` for `{tn}`"), "Check the name.");
                     } else if base != ERROR {
@@ -18761,9 +18768,14 @@ impl<'p> Ctx<'p> {
                 self.iter_item(i)
             }
             TyKind::Ref(r, m, inner) => {
+                // `&[T]`, `&[T; N]`, `&Vec<T>`, and `&Box<[T]>` (alloc's
+                // `IntoIterator for &Box<[T]>`, and `&mut`, since 1.80).
                 let elem = match self.kind(self.resolve(inner)) {
                     TyKind::Slice(elem) | TyKind::Array(elem, _) => Some(elem),
-                    _ => self.tys.vec_elem(self.resolve(inner)),
+                    _ => {
+                        let i = self.deep(inner);
+                        self.tys.vec_elem(i).or_else(|| self.tys.boxed_slice_elem(i))
+                    }
                 };
                 match elem {
                     Some(elem) => self.tys.intern(TyKind::Ref(r, m, elem)),

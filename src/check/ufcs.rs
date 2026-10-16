@@ -40,12 +40,23 @@ impl<'p> Ctx<'p> {
         let (&recv, rest) = args.split_first()?;
         let n = segs.len();
         let name = segs[n - 1].name;
-        let ty_name = crate::intern::source_name(self.name(segs[n - 2].name)).to_string();
+        let mut ty_name = crate::intern::source_name(self.name(segs[n - 2].name)).to_string();
         let item = self.name(name).to_string();
         // A type path of a std builtin with methods (a module path such as
         // `mem::size_of_val`, a user type, or an associated fn with no
         // receiver keeps its own diagnostics).
-        let std_prefix = segs[..n - 2].iter().all(|s| matches!(self.name(s.name), "std" | "core" | "alloc" | "cell" | "collections" | "sync" | "thread" | "vec" | "string" | "rc" | "boxed" | "hash_map" | "vec_deque"));
+        let mut std_prefix = segs[..n - 2].iter().all(|s| matches!(self.name(s.name), "std" | "core" | "alloc" | "cell" | "collections" | "sync" | "thread" | "vec" | "string" | "rc" | "boxed" | "hash_map" | "vec_deque"));
+        // A type alias of one (`FxHashMap::clone(&m)`): the written type
+        // names the builtin, and `ufcs_recv_ok` unifies the argument with it.
+        let written_d = written.map(|w| self.deep(w));
+        if !BUILTIN_TYPES.contains(&ty_name.as_str())
+            && let Some(w) = written_d
+            && let Some(path) = super::alias_path::builtin_std_path(&self.tys, w)
+            && let Some(last) = path.last().filter(|l| BUILTIN_TYPES.contains(l))
+        {
+            ty_name = last.to_string();
+            std_prefix = true;
+        }
         if !BUILTIN_TYPES.contains(&ty_name.as_str()) || !std_prefix {
             return None;
         }
@@ -141,8 +152,11 @@ impl<'p> Ctx<'p> {
         let Some(named) = super::alias_path::builtin_std_path(&self.tys, t) else { return false };
         let n = segs.len();
         let path: Vec<&str> = segs[..n - 1].iter().map(|s| crate::intern::source_name(self.name(s.name))).collect();
+        // A full path: the canonical one, or a std re-export of the same
+        // type (`use std::collections::HashMap` resolves the bare name to
+        // `std::collections::HashMap`, not `hash_map::HashMap`).
         if n > 2 {
-            return named == path;
+            return named == path || (named.last() == path.last() && matches!(path.first(), Some(&("std" | "core" | "alloc"))));
         }
         if named.last() != path.last() {
             return false;
