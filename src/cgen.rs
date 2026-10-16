@@ -3686,6 +3686,12 @@ impl FnGen<'_, '_> {
             // A fn item or fn pointer as a `dyn Fn` value: no env.
             let shim = self.fn_value_shim(&name, &vt, consume.is_some());
             words.push(format!("(void *){shim}"));
+        } else if let TyKind::Ref(_, _, inner) = p.tys.kind(vt.self_ty)
+            && p.gx.lang.is_fn_family(vt.principal.def)
+            && matches!(p.tys.kind(inner), TyKind::Dyn(..))
+        {
+            let shim = self.dyn_ref_shim(&name, inner);
+            words.push(format!("(void *){shim}"));
         } else {
             // `&C` / `&mut C` of a closure: the data pointer points at
             // the reference, so the entry loads it first.
@@ -3754,6 +3760,48 @@ impl FnGen<'_, '_> {
         } else {
             let args = names.join(", ");
             let _ = writeln!(self.prelude, "static {rt} {name}(void *self{decls}) {{ {rt} r = {call}({args});{free} (void)self; return r; }}");
+        }
+        name
+    }
+
+    /// The call entry of a `dyn Fn` vtable whose value is a reference to
+    /// another `dyn Fn`/`FnMut` object (`&mut dyn FnMut(A) -> R`): the data
+    /// pointer points at that fat reference, so the shim loads it and
+    /// calls the inner object's call entry (`VT_HEADER`, as every dyn Fn
+    /// call does) with the same arguments.
+    fn dyn_ref_shim(&mut self, vt_name: &str, inner: Ty) -> String {
+        let p = self.p;
+        let name = format!("{vt_name}_m0");
+        let lang = p.gx.lang;
+        let Some(pr) = crate::check::object::principal_of(&p.tys, inner) else { return "0".to_string() };
+        let ins: Vec<Ty> = match p.tys.args(pr.args).get(1).and_then(|g| g.as_ty()).map(|t| p.tys.kind(t)) {
+            Some(TyKind::Tuple(ts)) => p.tys.tys_of(ts).to_vec(),
+            _ => Vec::new(),
+        };
+        let out_def = lang.output_of(lang.fn_once);
+        let out = p.tys.bindings(pr.bindings).iter().find(|(d, _)| Some(*d) == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
+        let ret = cty(&p.tys, out);
+        collect_types(&ret, &mut self.sig_types);
+        let params: Vec<CTy> = ins.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).collect();
+        for t in &params {
+            collect_types(t, &mut self.sig_types);
+        }
+        let rt = ctype(&ret);
+        let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", ctype(t))).collect();
+        let tys: String = params.iter().map(|t| format!(", {}", ctype(t))).collect();
+        let args: String = (0..params.len()).map(|i| format!(", a{i}")).collect();
+        let k = crate::check::object::VT_HEADER;
+        let load = "lust_dyn d = *(lust_dyn *)self;";
+        if ret_by_out(p, &ret) {
+            let _ = writeln!(
+                self.prelude,
+                "static void {name}({rt} *out, void *self{decls}) {{ {load} ((void (*)({rt} *, void *{tys}))(d.vt[{k}]))(out, d.data{args}); }}"
+            );
+        } else {
+            let _ = writeln!(
+                self.prelude,
+                "static {rt} {name}(void *self{decls}) {{ {load} return (({rt} (*)(void *{tys}))(d.vt[{k}]))(d.data{args}); }}"
+            );
         }
         name
     }

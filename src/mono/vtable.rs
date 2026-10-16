@@ -99,6 +99,9 @@ pub fn ensure_vtable(p: &mut Program, self_ty: Ty, principal: TraitRef, made: &m
             // the reference (cgen `vtable_shim` loads it first).
             TyKind::Ref(_, _, inner) => match p.tys.kind(inner) {
                 TyKind::Closure(def, _) => vec![p.gx.closures.get(&def)?.body_fn],
+                // `&dyn Fn` / `&mut dyn FnMut`: codegen calls the inner
+                // object's own entry (cgen `dyn_ref_shim`).
+                TyKind::Dyn(..) => Vec::new(),
                 _ => return None,
             },
             TyKind::FnDef(def, args) if p.adt_by_def(def).is_none() => {

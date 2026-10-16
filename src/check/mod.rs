@@ -7432,11 +7432,18 @@ impl<'p> Ctx<'p> {
                 TyKind::FnDef(def, _) => p.is_fn_item_def(def),
                 TyKind::Closure(..) | TyKind::Param(_) | TyKind::FnPtr(_) => true,
                 TyKind::Opaque(..) => self.opaque_mode == opaque::OpaqueMode::View,
-                // A reference to a closure (core's `impl Fn* for &F / &mut F`;
-                // `&mut v` with `v: &mut {closure}` in an instance): its call
-                // entry goes through the reference (cgen `vtable_shim`). Not
-                // as a `dyn FnOnce`, which would consume the reference.
-                TyKind::Ref(_, _, inner) => to.def != lang.fn_once && matches!(self.kind(self.resolve(inner)), TyKind::Closure(..)),
+                // A reference to a closure or to a `dyn Fn`/`FnMut` (core's
+                // `impl Fn* for &F / &mut F`; `&mut v` with `v: &mut
+                // {closure}` or `v: &mut dyn FnMut(..)` in an instance): its
+                // call entry goes through the reference (cgen `vtable_shim`,
+                // `dyn_ref_shim`). Not as a `dyn FnOnce`, which would consume
+                // the reference.
+                TyKind::Ref(_, _, inner) => {
+                    let inner = self.resolve(inner);
+                    to.def != lang.fn_once
+                        && (matches!(self.kind(inner), TyKind::Closure(..))
+                            || object::principal_of(&self.tys, inner).is_some_and(|pr| lang.is_fn_family(pr.def) && pr.def != lang.fn_once))
+                }
                 _ => false,
             };
             if !fn_value {
