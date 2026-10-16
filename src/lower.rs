@@ -2483,8 +2483,17 @@ impl<'p> Lower<'p> {
         let dsc = self.temp(int(IntTy::U32));
         self.assign(Place::local(dsc), Rvalue::Discriminant(tp.clone()), span);
         let is_result = self.body.tys.result_args(ity).is_some();
-        // Variant index of the valued side: Ok is 0, Some is 1.
-        let good: u32 = if is_result { 0 } else { 1 };
+        // `core::ops::ControlFlow` (std source): `Continue` is 0, and a
+        // `Break(b)` returns `ControlFlow::Break(b)` in the return type.
+        let ret_ty = self.body.locals[0].ty;
+        let flow = |t: Ty| {
+            let a = self.body.tys.adt_parts(t).and_then(|(d, _)| self.body.tys.local_adt_of(d));
+            a.is_some_and(|a| self.p.is_control_flow_adt(a))
+        };
+        // The `Break` aggregate names the return type's instance Adt.
+        let control_flow = if flow(ity) && flow(ret_ty) { self.body.tys.local_adt(ret_ty) } else { None };
+        // Variant index of the valued side: Ok and Continue are 0, Some is 1.
+        let good: u32 = if is_result || control_flow.is_some() { 0 } else { 1 };
         let ok_bb = self.new_block();
         let err_bb = self.new_block();
         {
@@ -2493,8 +2502,12 @@ impl<'p> Lower<'p> {
             b.term_span = span;
         }
         self.cur = err_bb;
-        let ret_ty = self.body.locals[0].ty;
-        if let Some((_, err_ty)) = self.body.tys.result_args(ity) {
+        if let Some(adt) = control_flow {
+            let b_ty = self.body.tys.adt_parts(ity).map(|(_, a)| self.body.tys.args(a)[0].as_ty().unwrap_or(ty)).unwrap_or(ty);
+            let payload = tp.clone().project(Proj::Downcast(1)).project(Proj::Field(0));
+            let op = self.operand_from(payload, b_ty);
+            self.assign(Place::local(0), Rvalue::Aggregate(adt, 1, vec![op]), span);
+        } else if let Some((_, err_ty)) = self.body.tys.result_args(ity) {
             let payload = tp.clone().project(Proj::Downcast(1)).project(Proj::Field(0));
             let ret_err = self.body.tys.result_args(ret_ty).map(|(_, e2)| e2).unwrap_or(err_ty);
             let err_op = match self.ck.res(e) {

@@ -8299,17 +8299,54 @@ impl<'p> Ctx<'p> {
             self.decide_try_res(e, err_t, ret_err, span);
             return ok_t;
         }
+        if let Some((def, b, c)) = self.control_flow_args(it) {
+            // `Break(b)` returns as `ControlFlow::Break(b)`: the break
+            // types must agree (std's `FromResidual` converts nothing).
+            let ok = match self.control_flow_args(ret) {
+                Some((_, b2, _)) => self.unify(b, b2),
+                None if general_var(self, ret) => {
+                    let v = self.new_var(false);
+                    let cf = self.tys.mk_adt(def, &[GenericArg::Ty(b), GenericArg::Ty(v)]);
+                    self.unify(ret, cf)
+                }
+                None => false,
+            };
+            if !ok && self.kind(it) != TyKind::Error && self.kind(ret) != TyKind::Error {
+                let tn = self.tn(it);
+                self.err(
+                    "L0112",
+                    span,
+                    format!("the `?` operator on `{tn}` can only be used in a function that returns a `ControlFlow` with the same break type"),
+                    "Change the return type to `ControlFlow<B, _>` with this `B`, or handle the `Break` case with `match`.",
+                );
+            }
+            self.set_res(e, Res::TryPlain);
+            return c;
+        }
         if self.kind(it) != TyKind::Error {
             let tn = self.tn(it);
             self.err(
                 "L0112",
                 span,
-                format!("the `?` operator can only be used on `Option` or `Result` values, not `{tn}`"),
+                format!("the `?` operator can only be used on `Option`, `Result`, or `ControlFlow` values, not `{tn}`"),
                 "Remove the `?`, or produce an `Option` or `Result` first.",
             );
         }
         self.set_res(e, Res::TryPlain);
         ERROR
+    }
+
+    /// The def and `(B, C)` args of a `core::ops::ControlFlow<B, C>`
+    /// type (std source, W-STD-C), for `?` (`try_expr`).
+    fn control_flow_args(&self, t: Ty) -> Option<(DefId, Ty, Ty)> {
+        let (def, args) = self.tys.adt_parts(t)?;
+        if !self.tys.local_adt_of(def).is_some_and(|a| self.p.is_control_flow_adt(a)) {
+            return None;
+        }
+        match self.tys.args(args) {
+            [b, c] => Some((def, b.as_ty()?, c.as_ty()?)),
+            _ => None,
+        }
     }
 
     /// Picks how one `?` on `Result` converts its error type

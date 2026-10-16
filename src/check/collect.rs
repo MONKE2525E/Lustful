@@ -533,6 +533,12 @@ impl Program {
     pub fn is_phantom_adt(&self, a: AdtId) -> bool {
         self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::marker::PhantomData"
     }
+    /// True when Adt `a` is std's `core::ops::ControlFlow` (std source,
+    /// W-STD-C): `?` on it returns its `Break` from the enclosing fn
+    /// (`try_expr` in check, `try_into` in lower).
+    pub fn is_control_flow_adt(&self, a: AdtId) -> bool {
+        self.is_std_adt(a) && self.display_path(self.adt(a).name) == "core::ops::ControlFlow"
+    }
     /// True when Adt `a` is std's `VecDeque` (std source,
     /// W-STD-C): `collect` into it goes through the `Vec` collect
     /// machinery, whose capacity rules are std's for a deque too

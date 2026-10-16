@@ -2,6 +2,7 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
+use std::ops::ControlFlow;
 use std::sync::{LazyLock, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,4 +38,12 @@ impl<T> Job<T> {
 
 pub fn wait() -> Duration {
     Duration::from_secs(3) / 2
+}
+
+/// The first queued value at or over `limit`, through `?` on `ControlFlow`.
+pub fn first_over(queue: &VecDeque<u32>, limit: u32) -> ControlFlow<u32> {
+    for &x in queue {
+        if x >= limit { ControlFlow::Break(x)?; }
+    }
+    ControlFlow::Continue(())
 }
