@@ -98,6 +98,11 @@ pub struct ClosureInfo {
     /// (`'static`, an argument's region) is the creator's to prove
     /// (`closure_requirements`), not an error in the body.
     pub call_out: bool,
+    /// W-BORROW: checked with no expected signature (a `let` closure):
+    /// each region of its output is one free inferred region, never an
+    /// argument's, so it cannot meet `F: Fn(&T) -> &U` or `dyn Fn(&T) ->
+    /// &U`, whose output is the input's (rustc E0308).
+    pub free_sig: bool,
 }
 
 /// The env field type of one capture.
@@ -932,7 +937,7 @@ impl<'p> Ctx<'p> {
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
         let captures_any = !captures.is_empty();
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs, call_out });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs, call_out, free_sig: no_sig });
         if let Some((fp, _, _)) = to_fn_ptr {
             if captures_any {
                 self.err(
@@ -2620,7 +2625,41 @@ impl<'p> Ctx<'p> {
             self.rollback_vars(snap);
             return None;
         }
+        // A closure whose output is not the input's (`bound_output`
+        // None: no expected signature, or one over a type param) has a
+        // free output region in rustc, which a closure that captures
+        // nothing can only fill with `'static` borrows: two such join as
+        // a pointer that returns `'static` there, so it meets no bound
+        // whose output is the input's (E0308). A join of a free output
+        // with a tied one (another closure, a fn item or pointer) is
+        // rustc's higher-ranked LUB, which lust does not follow.
+        let out = self.deep(oa);
+        if may_hold_region(&self.tys, out) {
+            let (fa, fb) = (self.closure_out_free(a), self.closure_out_free(b));
+            if fa != fb {
+                self.rollback_vars(snap);
+                return None;
+            }
+            if fa {
+                let Some(st) = static_output(&mut self.tys, out) else {
+                    self.rollback_vars(snap);
+                    return None;
+                };
+                return Some(self.fn_ptr_ty(&ia, st));
+            }
+        }
         Some(self.fn_ptr_ty(&ia, oa))
+    }
+
+    /// True for a closure type whose output regions are free (its
+    /// `bound_output` is None); false for one tied to its input, and for
+    /// a fn item or pointer (its own signature).
+    fn closure_out_free(&self, t: Ty) -> bool {
+        let TyKind::Closure(def, _) = self.kind(self.resolve(t)) else { return false };
+        match self.closures.iter().find(|c| c.def == def) {
+            Some(c) => c.bound_output.is_none(),
+            None => self.p.gx.closures.get(&def).is_some_and(|g| g.bound_output.is_none()),
+        }
     }
 
     /// rustc's LUB of closures to a fn pointer at the coercion sites of
@@ -2840,6 +2879,48 @@ fn truncate_for_optimization(mut pl: CPlace, mut mode: CaptureMode, tys: &impl T
 /// unresolved type (not a numeric literal's), or an Adt with a lifetime
 /// argument, at any depth.
 /// A type param holds none in a template.
+/// `t` with every region `'static` (references, dyn object lifetimes,
+/// Adt lifetime args): the output of a joined pointer of closures with
+/// free outputs (`closure_lub`). None for a part that may hold a region
+/// it cannot rewrite (a fn pointer, an opaque or param type).
+fn static_output(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
+    Some(match tys.kind(t) {
+        TyKind::Ref(_, m, inner) => {
+            let i = static_output(tys, inner)?;
+            tys.intern(TyKind::Ref(crate::ty::Region::Static, m, i))
+        }
+        TyKind::Dyn(b, _) => tys.intern(TyKind::Dyn(b, crate::ty::Region::Static)),
+        TyKind::Tuple(ts) => {
+            let elems = tys.tys_of(ts).to_vec().into_iter().map(|e| static_output(tys, e)).collect::<Option<Vec<Ty>>>()?;
+            let id = tys.intern_tys(&elems);
+            tys.intern(TyKind::Tuple(id))
+        }
+        TyKind::Array(e, n) => {
+            let e = static_output(tys, e)?;
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Slice(e) => {
+            let e = static_output(tys, e)?;
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Adt(d, a) => {
+            let args = tys
+                .args(a)
+                .to_vec()
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(e) => static_output(tys, e).map(GenericArg::Ty),
+                    GenericArg::Lifetime(_) => Some(GenericArg::Lifetime(crate::ty::Region::Static)),
+                    x => Some(x),
+                })
+                .collect::<Option<Vec<GenericArg>>>()?;
+            tys.mk_adt(d, &args)
+        }
+        _ if may_hold_region(tys, t) => return None,
+        _ => t,
+    })
+}
+
 pub(crate) fn may_hold_region(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Infer(v) => !v.is_int() && !v.is_float(),

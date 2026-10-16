@@ -115,6 +115,15 @@ impl Ctx<'_> {
                 );
                 continue;
             }
+            if self.ptr_not_general(od, h) {
+                self.err(
+                    "L0735",
+                    span,
+                    "the returned fn pointer is not general enough for its `impl Fn*` type: it returns a lifetime of its own where the type returns its argument's",
+                    "Return the closure itself, or a fn pointer whose output lifetime is elided (`fn(&T) -> &U`).",
+                );
+                continue;
+            }
             self.out.opaque_hidden.push((od, h));
         }
     }
@@ -164,6 +173,42 @@ impl Ctx<'_> {
                 && c.output_region.is_none()
             {
                 c.output_region = Some(bo);
+            }
+        }
+        false
+    }
+
+    /// True when hidden type `h` of opaque `od` is a fn pointer that
+    /// cannot meet an `Fn*` bound of the opaque whose output is the
+    /// input's: an output slot there is `'static` in the pointer (`fn(&u8)
+    /// -> &'static u8`, a join of closures with free outputs) or its free
+    /// lifetime (rustc "implementation of `Fn` is not general enough").
+    fn ptr_not_general(&mut self, od: DefId, h: Ty) -> bool {
+        let TyKind::FnPtr(s) = self.kind(h) else { return false };
+        let s = self.tys.sig(s).value;
+        let p = self.p;
+        let Some(info) = p.gx.opaques.get(&od) else { return false };
+        let ins: Vec<Ty> = self.tys.tys_of(s.inputs).to_vec();
+        let mut n_in = 0;
+        for &t in &ins {
+            let mut rs = Vec::new();
+            crate::borrowck::regions_of(&self.tys, t, &mut rs);
+            n_in += rs.len();
+        }
+        let mut prs = Vec::new();
+        crate::borrowck::regions_of(&self.tys, s.output, &mut prs);
+        for b in &info.fn_outs {
+            let Some(bo) = b.output.filter(|_| b.inputs.len() == ins.len()) else { continue };
+            let mut brs = Vec::new();
+            crate::borrowck::regions_of(&p.tys, bo, &mut brs);
+            if brs.len() != prs.len() {
+                continue;
+            }
+            let lost = brs.iter().zip(&prs).enumerate().any(|(k, (br, pr))| {
+                matches!(br, Region::Bound(_)) && (*pr == Region::Static || s.free_slots >> (n_in + k) & 1 == 1)
+            });
+            if lost {
+                return true;
             }
         }
         false

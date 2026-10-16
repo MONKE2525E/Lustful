@@ -3936,6 +3936,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 if pout.is_empty() {
                     return;
                 }
+                if c.free_sig && pout.contains(&Pos::Late) && self.sc.slots(c.output) > 0 {
+                    self.free_output_not_general();
+                    return;
+                }
                 // The closure took its signature from the unbound sugar,
                 // where a fixed output place looks elided from the input:
                 // with a late-bound input, a fixed (not `'static`) output
@@ -6766,6 +6770,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             {
                 self.link_bound_closure(b.value.args, &binds, sig, &univ);
                 self.tie_bound_output(b.value.args, &binds, sig, &univ);
+                self.free_sig_bound(b.value.args, sig, &univ);
                 self.flow_closure_output(b.value.args, &binds, sig, &univ, dv);
                 self.entail_bound(b.value.args, sig, &univ);
                 self.entail_bound_ptr(b.value.args, &binds, sig, &univ);
@@ -7314,6 +7319,47 @@ impl<'b, 'p> Builder<'b, 'p> {
         if slots.iter().enumerate().all(|(i, (r, _))| r.is_none() || paired.get(i) == Some(&true)) {
             self.bound_linked.push(def);
         }
+    }
+
+    /// A closure checked with no expected signature (`ClosureEntry::
+    /// free_sig`, also behind `&`) passed for `F: Fn*(..) -> O` where `O`
+    /// holds a higher-ranked region: its output region is one free
+    /// region, never the input's, so it does not implement the bound
+    /// (rustc E0308 "one type is more general than the other").
+    fn free_sig_bound(&mut self, trait_args: ArgsId, sig: &RegionSig, univ: &[u32]) {
+        let p = self.p;
+        let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
+        let (Some(self_t), Some(tuple)) = (targs.first().and_then(|g| g.as_ty()), targs.get(1).and_then(|g| g.as_ty())) else { return };
+        let (TyKind::Param(jf), TyKind::Tuple(ts)) = (p.tys.kind(self_t), p.tys.kind(tuple)) else { return };
+        let n_in = p.tys.tys_of(ts).len();
+        let Some(out_t) = sig.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).and_then(|b| b.output) else { return };
+        let Some(&(mut ft)) = self.bind_tys.get(&jf.0) else { return };
+        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(ft) {
+            ft = inner;
+        }
+        let TyKind::Closure(def, _) = self.body.tys.kind(ft) else { return };
+        let Some(c_out) = p.gx.closures.get(&def).filter(|c| c.free_sig).map(|c| c.output) else { return };
+        let mut rs = Vec::new();
+        regions_of(&p.tys, out_t, &mut rs);
+        if !rs.iter().any(|r| matches!(r, Region::Bound(_))) {
+            return;
+        }
+        let mut outs: Vec<BoundSlot> = Vec::new();
+        self.bound_slots(out_t, c_out, univ, &mut outs);
+        if outs.contains(&BoundSlot::Hr) {
+            self.free_output_not_general();
+        }
+    }
+
+    /// L0735 for a closure with no expected signature whose output must
+    /// be its argument's (`free_sig_bound`, `dyn_fn_coercion`).
+    fn free_output_not_general(&mut self) {
+        self.errs.push(Diag::new(
+            "L0735",
+            self.span,
+            "this closure is not general enough for the bound it meets: its return lifetime is one inferred lifetime, but the bound's return borrows from its argument",
+            "Pass the closure where it is written (`f(|x: &T| ..)`), so it takes the bound's signature.",
+        ));
     }
 
     /// A closure passed for `F: Fn*(..) -> R` whose regioned output names
