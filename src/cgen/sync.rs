@@ -1288,6 +1288,9 @@ impl FnGen<'_, '_> {
                     collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
                 }
                 self.note_callee(*f);
+                let mut args = args.to_vec();
+                let pts: Vec<CTy> = self.p.fn_info(*f).params.iter().map(|&t| cty(&self.p.tys, t)).collect();
+                self.spill_by_ptr(out, &pts, &mut args);
                 let v = self.tmp();
                 let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, *f), self.slots.of(*f));
                 if ret_is_large(self.p, *f) {
@@ -1332,7 +1335,9 @@ impl FnGen<'_, '_> {
                 v
             }
             Callee::Ptr(ft) => {
-                let CTy::FnPtr(_, r) = ft else { unreachable!("a fn pointer type") };
+                let CTy::FnPtr(ps, r) = ft else { unreachable!("a fn pointer type") };
+                let mut args = args.to_vec();
+                self.spill_by_ptr(out, ps, &mut args);
                 let v = self.tmp();
                 if ret_by_out(self.p, r) {
                     let pre: String = args.iter().map(|a| format!(", {a}")).collect();

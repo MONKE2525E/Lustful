@@ -1612,6 +1612,24 @@ fn param_dropped(p: &Program, t: &CTy) -> bool {
     c_size_align(p, t).0 == 0
 }
 
+/// True when a by-value parameter of C type `t` crosses the C call as a
+/// pointer to a caller copy: its alignment is over 16. tcc 0.9.28 puts
+/// such an argument on the stack 8-aligned, while the callee rounds the
+/// parameter's offset up to the alignment, so the callee reads garbage
+/// (fx-overalign). Every C signature and fn pointer type says `T *`
+/// (`param_ctype`), every call passes the address of a fresh copy
+/// (`FnGen::spill_by_ptr`), forwarding shims pass the pointer on, and
+/// the body copies the value into its local on entry (`FnGen::function`).
+fn param_by_ptr(p: &Program, t: &CTy) -> bool {
+    c_size_align(p, t).1 > 16
+}
+
+/// The C type of a parameter of type `t` in a signature: `T *` when the
+/// value goes by pointer (`param_by_ptr`).
+fn param_ctype(p: &Program, t: &CTy) -> String {
+    if param_by_ptr(p, t) { format!("{}*", ctype(t)) } else { ctype(t) }
+}
+
 /// True when `f` gets C of its own: a plain fn, an instance, or a
 /// closure body fn, with a source body. A template or a trait
 /// method stub is never generated, and an instance of a trait method
@@ -1642,7 +1660,7 @@ fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
     if ret_is_large(p, f) {
         params.push(format!("{ret}*"));
     }
-    params.extend(info.params.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).map(|t| ctype(&t)));
+    params.extend(info.params.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).map(|t| param_ctype(p, &t)));
     // `#[track_caller]`: the caller's location (check/caller.rs).
     if crate::check::caller::is_track_caller(p, f) {
         params.push("lust_loc".to_string());
@@ -1665,7 +1683,7 @@ fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
             .enumerate()
             .map(|(i, &t)| (i, cty(&p.tys, t)))
             .filter(|(_, t)| !param_dropped(p, t))
-            .map(|(i, t)| format!("{} p{}", ctype(&t), i + 1)),
+            .map(|(i, t)| format!("{} p{}", param_ctype(p, &t), i + 1)),
     );
     // `#[track_caller]`: the caller's location, which `FnGen::loc`
     // reports for every panic in the body (check/caller.rs).
@@ -1699,7 +1717,7 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
                 (1..info.params.len()).filter(|&i| !param_dropped(p, &cty(&p.tys, info.params[i]))).collect();
             let names: Vec<String> = kept.iter().map(|i| format!("p{}", i + 1)).collect();
             let decls: Vec<String> =
-                kept.iter().map(|&i| format!("{} p{}", ctype(&cty(&p.tys, info.params[i])), i + 1)).collect();
+                kept.iter().map(|&i| format!("{} p{}", param_ctype(p, &cty(&p.tys, info.params[i])), i + 1)).collect();
             // A by-value Unit env is a dropped parameter; a by-ref env stays.
             let mut all: Vec<String> = if by_ref { vec!["&env".to_string()] } else { Vec::new() };
             all.extend(names);
@@ -1721,7 +1739,7 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
     }
     let kept: Vec<usize> = (0..info.params.len()).filter(|&i| !param_dropped(p, &cty(&p.tys, info.params[i]))).collect();
     let mut names: Vec<String> = kept.iter().map(|i| format!("p{}", i + 1)).collect();
-    let decls: Vec<String> = kept.iter().map(|&i| format!("{} p{}", ctype(&cty(&p.tys, info.params[i])), i + 1)).collect();
+    let decls: Vec<String> = kept.iter().map(|&i| format!("{} p{}", param_ctype(p, &cty(&p.tys, info.params[i])), i + 1)).collect();
     // Check never lets a `#[track_caller]` fn become a value; this keeps
     // the trampoline well formed all the same.
     if crate::check::caller::is_track_caller(p, f) {
@@ -1971,6 +1989,8 @@ impl FnGen<'_, '_> {
             // local is the one possible value of a zero-sized type.
             let decl = if is_param && param_dropped(p, t) {
                 format!("l{i} = {}", zero_lit(p, t))
+            } else if is_param && param_by_ptr(p, t) {
+                format!("l{i} = *p{i}")
             } else if is_param {
                 format!("l{i} = p{i}")
             } else {
@@ -2907,6 +2927,10 @@ impl FnGen<'_, '_> {
                     collect_types(&ct, &mut self.sig_types);
                 }
                 let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let pts: Vec<CTy> = info.params.iter().map(|&t| cty(&self.p.tys, t)).collect();
+                let mut pre = String::new();
+                self.spill_by_ptr(&mut pre, &pts, &mut args);
+                self.out.push_str(&pre);
                 let dropped: Vec<bool> = info.params.iter().map(|&t| param_dropped(self.p, &cty(&self.p.tys, t))).collect();
                 let mut i = 0;
                 args.retain(|_| {
@@ -3112,15 +3136,20 @@ impl FnGen<'_, '_> {
                 let rt = self.tmp();
                 let _ = writeln!(self.out, "    lust_dyn {rt} = {r};");
                 let mut vals: Vec<String> = Vec::new();
-                let mut tys: Vec<String> = vec!["void *".into()];
+                let mut pts: Vec<CTy> = Vec::new();
                 for o in &args[1..] {
                     let (v, t) = self.operand(o, loc, post);
                     collect_types(&t, &mut self.sig_types);
                     if !param_dropped(self.p, &t) {
-                        tys.push(ctype(&t));
+                        pts.push(t);
                         vals.push(v);
                     }
                 }
+                let mut pre = String::new();
+                self.spill_by_ptr(&mut pre, &pts, &mut vals);
+                self.out.push_str(&pre);
+                let mut tys: Vec<String> = vec!["void *".into()];
+                tys.extend(pts.iter().map(|t| param_ctype(self.p, t)));
                 let ret = dest_cty.clone();
                 collect_types(&ret, &mut self.sig_types);
                 let rc = ctype(&ret);
@@ -3139,6 +3168,9 @@ impl FnGen<'_, '_> {
                 let CTy::FnPtr(ps, ret) = &ct else { panic!("indirect call through a non-fn-pointer local") };
                 collect_types(&ct, &mut self.sig_types);
                 let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let mut pre = String::new();
+                self.spill_by_ptr(&mut pre, ps, &mut args);
+                self.out.push_str(&pre);
                 let dropped: Vec<bool> = ps.iter().map(|t| param_dropped(self.p, t)).collect();
                 let mut i = 0;
                 args.retain(|_| {
@@ -3768,7 +3800,7 @@ impl FnGen<'_, '_> {
         };
         collect_types(&ret, &mut self.sig_types);
         let rt = ctype(&ret);
-        let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", ctype(t))).collect();
+        let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", param_ctype(p, t))).collect();
         let names: Vec<String> = (0..params.len()).map(|i| format!("a{i}")).collect();
         let free = if consume { format!(" lust_dealloc(self, sizeof({cts}), _Alignof({cts}));") } else { String::new() };
         if ret_by_out(p, &ret) {
@@ -3804,8 +3836,8 @@ impl FnGen<'_, '_> {
             collect_types(t, &mut self.sig_types);
         }
         let rt = ctype(&ret);
-        let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", ctype(t))).collect();
-        let tys: String = params.iter().map(|t| format!(", {}", ctype(t))).collect();
+        let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", param_ctype(p, t))).collect();
+        let tys: String = params.iter().map(|t| format!(", {}", param_ctype(p, t))).collect();
         let args: String = (0..params.len()).map(|i| format!(", a{i}")).collect();
         let k = crate::check::object::VT_HEADER;
         let load = "lust_dyn d = *(lust_dyn *)self;";
@@ -3852,7 +3884,7 @@ impl FnGen<'_, '_> {
             if param_dropped(p, &cty(&p.tys, t)) {
                 continue;
             }
-            decls.push(format!("{} a{i}", ctype(&cty(&p.tys, t))));
+            decls.push(format!("{} a{i}", param_ctype(p, &cty(&p.tys, t))));
             rest.push(format!("a{i}"));
         }
         let decls = decls.iter().map(|d| format!(", {d}")).collect::<String>();
@@ -3860,7 +3892,15 @@ impl FnGen<'_, '_> {
             let ct = cty(&p.tys, self_ty);
             let cts = ctype(&ct);
             let by_value = !matches!(p.tys.kind(info.params[0]), TyKind::Ref(..));
-            let env = if by_value { format!("*({cts}*)self") } else { format!("({recv})self") };
+            // An over-aligned env goes by pointer (`param_by_ptr`): the body
+            // copies it out of the box before the shim frees the box.
+            let env = if by_value && param_by_ptr(p, &cty(&p.tys, info.params[0])) {
+                format!("({cts}*)self")
+            } else if by_value {
+                format!("*({cts}*)self")
+            } else {
+                format!("({recv})self")
+            };
             let drop = if !by_value && needs_drop_c(p, &ct) {
                 self.want(Glue::Drop, &ct);
                 format!("drop_{}(({cts}*)self); ", mangle(&ct))
@@ -4067,6 +4107,20 @@ impl FnGen<'_, '_> {
         self.fn_call_c(out, f, &all)
     }
 
+    /// Replaces each argument in `args` whose parameter type in `params`
+    /// goes by pointer (`param_by_ptr`) with the address of a fresh copy
+    /// declared in `out`. The callee copies the value again on entry, so
+    /// the copy only has to live until the call returns.
+    fn spill_by_ptr(&mut self, out: &mut String, params: &[CTy], args: &mut [String]) {
+        for (t, a) in params.iter().zip(args.iter_mut()) {
+            if param_by_ptr(self.p, t) && !param_dropped(self.p, t) {
+                let v = self.tmp();
+                let _ = writeln!(out, "    {} {v} = {a};", ctype(t));
+                *a = format!("&{v}");
+            }
+        }
+    }
+
     /// C statements (into `out`) calling fn `f` through its slot with
     /// C argument values `args` (all of its params, in order); returns
     /// the result temp and its C type. `closure_call_c` passes a closure
@@ -4083,6 +4137,8 @@ impl FnGen<'_, '_> {
         // zero-sized argument) is not in the C signature, so it is
         // not passed here either (see `param_dropped`).
         let mut all: Vec<String> = args.to_vec();
+        let pts: Vec<CTy> = self.p.fn_info(f).params.iter().map(|&t| cty(&self.p.tys, t)).collect();
+        self.spill_by_ptr(out, &pts, &mut all);
         let dropped: Vec<bool> = self.p.fn_info(f).params.iter().map(|&t| param_dropped(self.p, &cty(&self.p.tys, t))).collect();
         let mut i = 0;
         all.retain(|_| {
@@ -4215,6 +4271,9 @@ impl FnGen<'_, '_> {
         for (i, t) in ps.iter().enumerate() {
             if param_dropped(self.p, t) {
                 vals.push(zero_lit(self.p, t));
+            } else if param_by_ptr(self.p, t) {
+                decls.push(format!("{} p{i}", param_ctype(self.p, t)));
+                vals.push(format!("(*p{i})"));
             } else {
                 decls.push(format!("{} p{i}", ctype(t)));
                 vals.push(format!("p{i}"));
@@ -9341,7 +9400,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                 if large {
                     params.push(format!("{}*", ctype(r)));
                 }
-                params.extend(ps.iter().filter(|t| !param_dropped(p, t)).map(ctype));
+                params.extend(ps.iter().filter(|t| !param_dropped(p, t)).map(|t| param_ctype(p, t)));
                 let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
                 if large {
                     let _ = writeln!(out, "typedef void (*{ct})({params});");
