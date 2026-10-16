@@ -6769,6 +6769,9 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some(g) = sig.fn_bounds.iter().find(|b| b.param == jg.0 && b.inputs.len() == n_in).cloned() else { return };
         let Some(&ft) = self.bind_tys.get(&jg.0) else { return };
         let Some(src) = self.source_fn_sig(ft, n_in) else { return };
+        if src.is_none() && self.lang_method_general(ft, &g.inputs, g.output) {
+            return;
+        }
         let Some((inputs, output, item)) = src else { return self.unproved_bound(&g) };
         let mut ins: Vec<(Region, Region)> = Vec::new();
         let mut outs: Vec<(Region, Region)> = Vec::new();
@@ -6959,7 +6962,14 @@ impl<'b, 'p> Builder<'b, 'p> {
                 .body_sig(p, root_fn(p, self.body.fn_id))
                 .and_then(|s| s.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned())
                 .map(|f| (f.inputs, f.output, None)),
-            TyKind::FnDef(def, _) => match p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l)) {
+            // A trait method by path (`Clone::clone`), or an impl method
+            // with no signature of its own (a derived one): the trait's
+            // signature, which every impl satisfies (`impl_contract`).
+            TyKind::FnDef(def, _) => match p
+                .local_def(def.hash)
+                .and_then(|l| p.regions.body_sig(p, l).or_else(|| p.regions.trait_methods.get(&impl_trait_method(p, l)?)))
+                .or_else(|| p.regions.trait_methods.get(&def))
+            {
                 Some(fs) if fs.params.len() == n_in => Some((fs.params.clone(), Some(fs.ret), Some(fs.early.clone()))),
                 _ => None,
             },
@@ -7098,6 +7108,49 @@ impl<'b, 'p> Builder<'b, 'p> {
                 _ => return self.bound_mismatch(),
             }
         }
+    }
+
+    /// A std trait method by path (`Clone::clone`, `ToString::to_string`)
+    /// has no region signature here. Its lifetimes are elided, so where
+    /// each input of the bound (regioned `ins -> out`) holds only an
+    /// outer reference and the output no region, it is `for<'r> fn(&'r
+    /// Self) -> R`: as general as any bound of that shape.
+    fn lang_method_general(&mut self, ft: Ty, ins: &[Ty], out: Option<Ty>) -> bool {
+        let p = self.p;
+        let mut t = ft;
+        while let TyKind::Ref(_, _, inner) = self.body.tys.kind(t) {
+            t = inner;
+        }
+        let TyKind::FnDef(def, _) = self.body.tys.kind(t) else { return false };
+        if p.local_def(def.hash).is_some() || p.regions.trait_methods.contains_key(&def) || p.gx.index.trait_of_method(def).is_none() {
+            return false;
+        }
+        // No region inside: none written, and a type param the call binds
+        // to a type with no slots.
+        let no_regions = |this: &mut Self, t: Ty| -> bool {
+            let mut rs = Vec::new();
+            regions_of(&p.tys, t, &mut rs);
+            rs.is_empty() && no_open_parts(this, t)
+        };
+        fn no_open_parts(this: &mut Builder<'_, '_>, t: Ty) -> bool {
+            let tys = &this.p.tys;
+            match tys.kind(t) {
+                TyKind::Param(j) => match this.bind_tys.get(&j.0).copied() {
+                    Some(b) => this.sc.slots(b) == 0,
+                    None => false,
+                },
+                TyKind::Projection(..) | TyKind::Dyn(..) | TyKind::Opaque(..) => false,
+                TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => no_open_parts(this, e),
+                TyKind::Tuple(ts) => tys.tys_of(ts).to_vec().into_iter().all(|e| no_open_parts(this, e)),
+                TyKind::Adt(_, a) => tys.args(a).to_vec().into_iter().all(|g| g.as_ty().is_none_or(|e| no_open_parts(this, e))),
+                _ => true,
+            }
+        }
+        let outer_only = |this: &mut Self, t: Ty| match p.tys.kind(t) {
+            TyKind::Ref(_, _, inner) => no_regions(this, inner),
+            _ => no_regions(this, t),
+        };
+        ins.iter().all(|&t| outer_only(self, t)) && out.is_none_or(|o| no_regions(self, o))
     }
 
     /// An argument whose signature does not pair with the callee's `G:
