@@ -74,7 +74,8 @@ impl Builder<'_, '_> {
     /// to such a part are only borrowed by the call. Every other slot of
     /// the value may sit at any slot of `pt`: covariant ones outlive it,
     /// invariant ones equal it, contravariant ones are outlived by it.
-    /// Returns the slots of `pv` a stored part fills. Callers keep their
+    /// Returns the slots of `pv` a stored part fills (`store_covered`: the
+    /// slots of `av` it related exactly). Callers keep their
     /// own one-way flows (into the other slots, for the adapter and item
     /// rules); this only adds edges.
     pub(super) fn store_into(&mut self, at: Ty, av: &[u32], pt: Ty, pv: &[u32]) -> Vec<bool> {
@@ -86,6 +87,7 @@ impl Builder<'_, '_> {
     pub(super) fn store_parts(&mut self, at: Ty, av: &[u32], pt: Ty, pv: &[u32], flat: bool) -> Vec<bool> {
         let tys = &self.body.tys;
         let mut filled = vec![false; pv.len()];
+        self.store_covered = vec![false; av.len()];
         if (pv.is_empty() || av.is_empty()) && !(has_fn_ptr(tys, at) && has_fn_ptr(tys, pt)) {
             return filled;
         }
@@ -149,6 +151,7 @@ impl Builder<'_, '_> {
             let rest: Vec<u32> = av.iter().zip(&covered).filter(|(_, c)| !**c).map(|(&x, _)| x).collect();
             self.store_flat_in(&rest, pt, pv, &filled);
         }
+        self.store_covered = covered;
         filled
     }
 
@@ -427,6 +430,24 @@ impl Builder<'_, '_> {
 }
 
 /// True when a type holds a fn pointer type.
+/// True when a value of type `t` can only hand on the values it holds, as
+/// they are: it holds no callable (closure, fn item, fn pointer, dyn or
+/// opaque value) that could move a region into a part of another shape
+/// (`it.map(|r| (r, Cell::new(r)))`), and no type param.
+pub(super) fn plain_store(tys: &impl TyIntern, t: Ty) -> bool {
+    !holds_closure(tys, t) && !has_fn_ptr(tys, t) && !has_fn_def(tys, t)
+}
+
+fn has_fn_def(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::FnDef(..) => true,
+        TyKind::Ref(_, _, x) | TyKind::RawPtr(_, x) | TyKind::Array(x, _) | TyKind::Slice(x) => has_fn_def(tys, x),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| has_fn_def(tys, e)),
+        TyKind::Adt(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| has_fn_def(tys, e))),
+        _ => false,
+    }
+}
+
 pub(super) fn has_fn_ptr(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::FnPtr(_) => true,

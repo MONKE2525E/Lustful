@@ -1632,7 +1632,9 @@ impl Ex<'_, '_> {
         let TyKind::Ref(_, _, vec_ty) = self.body.tys.kind(vt) else { return Err("iterator expansion: extend of a non-reference".into()) };
         let elem = self.body.tys.vec_elem(vec_ty).ok_or("iterator expansion: extend of a non-Vec")?;
         let item = self.item(ty)?;
-        let by_ref = item != elem;
+        // Not `item != elem`: a fn pointer keeps `'static` in its type, so
+        // `fn(&u8) -> &'static u8` items into a `Vec<fn(&u8) -> &'b u8>` differ.
+        let by_ref = ref_depth(&self.body.tys, item) > ref_depth(&self.body.tys, elem);
         let push = |this: &mut Self, x: Local| {
             let ax = if by_ref { Operand::Copy(Place::local(x).deref()) } else { this.take(Place::local(x), elem) };
             let u = this.local(UNIT);

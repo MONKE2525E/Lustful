@@ -12266,6 +12266,8 @@ fn prove_trait_ref(
             // for `&str: Copy` and fail a goal the solver's record
             // answered before Self read deep-resolved here.
             TyKind::Ref(_, m, _) if !m.is_mut() && (is_copy || tr.def == lang.clone) => Some(Vec::new()),
+            // `&mut T` is never `Copy` or `Clone` (it does not forward to `T`).
+            TyKind::Ref(_, m, _) if m.is_mut() && (is_copy || tr.def == lang.clone) => return false,
             // A reference defaults only as `&str` or `&[T]`, with no
             // element goal; the other family traits forward to `T`.
             TyKind::Ref(_, m, e) if is_default => matches!(cx.tys.kind(e), TyKind::Str | TyKind::Slice(_)).then_some(Vec::new()),

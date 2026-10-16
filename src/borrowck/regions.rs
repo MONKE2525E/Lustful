@@ -2569,6 +2569,11 @@ pub(super) struct Builder<'b, 'p> {
     /// was related exactly (`item_bound_flows`), so the call needs no
     /// over-approximation for it.
     item_bound_exact: bool,
+    /// The slots of the value the last `store_parts` related exactly.
+    store_covered: Vec<bool>,
+    /// The builtin whose call the region pass reads, if any: its stores put
+    /// each argument whole into the container (`call_opaque_from`).
+    cur_builtin: Option<crate::check::Builtin>,
     /// The closures `closure_created` has seen.
     created: FxMap<DefId, ()>,
     /// The last check of the fn whose closures `closure_reqs` lowers
@@ -2645,6 +2650,8 @@ impl<'b, 'p> Builder<'b, 'p> {
             out_proved: Vec::new(),
             seed_univ: Vec::new(),
             item_bound_exact: false,
+            store_covered: Vec::new(),
+            cur_builtin: None,
             created: FxMap::default(),
             root_check: None,
             bind_tys: FxMap::default(),
@@ -3375,7 +3382,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             self.span = b.term_span;
             if let Terminator::Call { target, args, dest, .. } = &b.term {
+                self.cur_builtin = if let CallTarget::Builtin(b) = target { Some(*b) } else { None };
                 self.call(*target, args, dest);
+                self.cur_builtin = None;
             }
         }
         self.out_reqs_unproved();
@@ -7105,13 +7114,34 @@ impl<'b, 'p> Builder<'b, 'p> {
                 && !v.is_empty()
                 && (v.len() > 1 || store::has_fn_ptr(&self.body.tys, pt))
             {
-                let others: Vec<u32> = avs.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, (_, v))| v.iter().copied()).collect();
-                self.flow_all(&others, &v[1..]);
-                // Exact variance for what it may store (`store_into`).
+                // Exact variance for what it may store (`store_into`), and
+                // a one-way flow of the rest into every slot. A builtin
+                // stores a plain argument whole (or the values it holds, as
+                // they are), so the parts `store_into` related go nowhere
+                // else: `v.push((a, b))` into `Vec<(&'a u8, &'b u8)>` needs
+                // no `'a: 'b`. Any other callee or argument may move a part
+                // anywhere.
                 let pv = v[1..].to_vec();
+                // An iterator method's `dyn` callable (`fold(0, f)` for `f:
+                // &mut dyn FnMut(..)`): an unsized pointee cannot be
+                // overwritten, so only its methods take values, at its trait
+                // args' slots, never at its object lifetime. (A stored `&mut
+                // dyn` keeps the flow: `v.push(d)` may fix `v`'s type.)
+                if let TyKind::Dyn(_, r) = self.body.tys.kind(pt)
+                    && self.cur_builtin.is_some_and(crate::lower::iter::expands)
+                    && self.dyn_fn_sig(*t).is_some()
+                {
+                    let args = &pv[usize::from(!bound(r)).min(pv.len())..];
+                    let all: Vec<u32> = avs.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, (_, v))| v.iter().copied()).collect();
+                    self.flow_all(&all, args);
+                    continue;
+                }
                 for (j, (at, av)) in avs.iter().enumerate() {
                     if j != i {
                         self.store_into(*at, av, pt, &pv);
+                        let exact = self.cur_builtin.is_some() && store::plain_store(&self.body.tys, *at);
+                        let rest: Vec<u32> = av.iter().zip(&self.store_covered).filter(|(_, c)| !exact || !**c).map(|(&x, _)| x).collect();
+                        self.flow_all(&rest, &pv);
                     }
                 }
             }
