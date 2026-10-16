@@ -8,6 +8,7 @@ pub mod buildscript;
 pub mod cache;
 mod compile;
 mod const_reach;
+mod kept_delta;
 pub(crate) mod gen_reuse;
 pub mod graph;
 mod patch;

@@ -359,6 +359,29 @@ impl GenReuse {
         self.templates.insert(p.def_id(t), entry);
     }
 
+    /// Drops this program's node answers: a signature delta changed the
+    /// program they describe (driver/kept_delta.rs).
+    pub fn forget_answers(&mut self) {
+        self.memo.clear();
+    }
+
+    /// Whether template `t`'s stored check still holds; None when none
+    /// is stored (`template` without the copy).
+    pub fn template_holds(&mut self, p: &Program, t: LocalDefId) -> Option<bool> {
+        let src = self.src_of(p, t)?;
+        let (lo, hi) = p.fn_def(t).exprs;
+        let e = self.templates.get(&p.def_id(t))?;
+        Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads))
+    }
+
+    /// True when fn `f`'s stored discovery output still holds
+    /// (`discovered` without the copy).
+    pub fn discovery_holds(&mut self, p: &Program, f: LocalDefId) -> bool {
+        let Some(src) = self.src_of(p, f).filter(|_| self.on) else { return false };
+        let Some(e) = self.discovery.get(&p.def_id(f)) else { return false };
+        e.src == src && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads)
+    }
+
     /// The stored discovery output of fn `f`, if it still holds.
     pub fn discovered(&mut self, p: &Program, f: LocalDefId) -> Option<Discovered> {
         if !self.on {

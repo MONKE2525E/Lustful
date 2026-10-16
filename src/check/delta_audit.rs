@@ -223,12 +223,13 @@ pub fn dump_if_asked(p: &Program, errors: usize) {
     }
 }
 
-/// Collect's work for one plain fn's signature, done again over the
+/// Collect's work for one fn's signature, done again over the
 /// program's Ast (a header delta of the kept program): the record under
 /// its cached parent (`Program::impl_parents`) written over the old one,
 /// then the checks `finish_collect` runs over signatures, in its order
 /// (dyn types, written WF, outlives), then normalization. Err when the fn
-/// would not stay a plain fn, or when its `impl Trait` return comes or
+/// would not stay a plain fn or a template with the same parameter kinds,
+/// or when its `impl Trait` return comes or
 /// goes (`rpit`: the fn defines one before the edit; without it, any
 /// `impl Trait` refuses). Diagnostics go to `errs`. The caller reveals
 /// the hidden type of an `impl Trait` return again.
@@ -244,7 +245,11 @@ pub(crate) fn redo_sig(p: &mut Program, f: LocalDefId, rpit: bool, errs: &mut Ve
     };
     let site = FnSite { loc, owner, self_ty: parent_gen.scope.self_ty, parent, hash: fdef.hash };
     let rec = collect::fn_record(p, &ast, &interner, &known, site, &parent_gen, errs);
-    if rec.is_template() {
+    // A template stays one with the same parameter kinds: instance
+    // arguments and the param env key on them.
+    let kinds = |g: &crate::ty::Generics| g.params.iter().map(|q| q.kind).collect::<Vec<_>>();
+    let old_kinds = p.gx.fn_templates[f.0 as usize].as_ref().map(|t| kinds(&t.generics));
+    if old_kinds != rec.is_template().then(|| kinds(rec.generics())) {
         return Err("sig class");
     }
     if rec.has_opaque() != rpit {
@@ -282,12 +287,13 @@ pub(crate) fn reveal_again(p: &mut Program, f: LocalDefId, old_ret: crate::ty::T
     Ok(())
 }
 
-/// A test hook (`LUST_SIGDELTA_SELFTEST=1`, or `v` to print a count): after a clean collect, redoes
-/// the signature of every plain free fn and inherent method on the same
-/// Ast (`redo_sig`). The digest must stay the same and no diagnostic may
-/// appear, and an `impl Trait` return must reveal the same hidden type;
-/// it panics otherwise. Nested fns are left out (a header delta refuses
-/// them).
+/// A test hook (`LUST_SIGDELTA_SELFTEST=1`, or `v` to print counts and
+/// timing): after a clean collect, redoes the signature of every plain or
+/// template free fn and inherent method on the same Ast (`redo_sig`). The
+/// digest must stay the same, no diagnostic may appear, and a plain fn's
+/// `impl Trait` return must reveal the same hidden type; it panics
+/// otherwise. Nested fns and lang methods are left out (a header delta
+/// refuses them).
 pub fn self_test_if_asked(p: &mut Program) {
     static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let Some(mode) = ON.get_or_init(|| std::env::var("LUST_SIGDELTA_SELFTEST").ok().filter(|v| v == "1" || v == "v")) else { return };
@@ -297,14 +303,21 @@ pub fn self_test_if_asked(p: &mut Program) {
     for i in 0..p.fns.len() {
         let f = LocalDefId(i as u32);
         let inherent = matches!(p.fns[i].loc, FnLoc::Impl(..)) && p.gx.inherent_self_pats.contains_key(&f);
-        if p.gx.fn_class[i] != FnClass::Plain || !(matches!(p.fns[i].loc, FnLoc::Item(_)) || inherent) {
+        let class = p.gx.fn_class[i];
+        if !matches!(class, FnClass::Plain | FnClass::Template)
+            || p.is_lang_method(f)
+            || !(matches!(p.fns[i].loc, FnLoc::Item(_)) || inherent)
+        {
             continue;
         }
         let rpit = p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)));
         let old_ret = p.fns[i].ret;
         let mut errs = Vec::new();
         let t0 = std::time::Instant::now();
-        let r = redo_sig(p, f, rpit, &mut errs).and_then(|()| if rpit { reveal_again(p, f, old_ret) } else { Ok(()) });
+        // A template's hidden type comes from its template check, which
+        // the unchanged body does not need again.
+        let reveal = rpit && class == FnClass::Plain;
+        let r = redo_sig(p, f, rpit, &mut errs).and_then(|()| if reveal { reveal_again(p, f, old_ret) } else { Ok(()) });
         let dt = t0.elapsed();
         (total, worst) = (total + dt, worst.max(dt));
         assert!(

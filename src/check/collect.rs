@@ -5201,6 +5201,10 @@ impl FnRecord {
     pub(crate) fn is_template(&self) -> bool {
         !self.generics.params.is_empty()
     }
+    /// The combined generics (the impl's params, then the fn's own).
+    pub(crate) fn generics(&self) -> &Generics {
+        &self.generics
+    }
     /// The signature returns `impl Trait`.
     pub(crate) fn has_opaque(&self) -> bool {
         self.opaque.is_some() || self.region_sig.as_ref().is_some_and(|r| r.opaque_caps.is_some())
