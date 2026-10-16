@@ -263,9 +263,10 @@ impl<'p> Lower<'p> {
     }
     /// True when `&e` is promoted to `'static` (rustc's promotion rules,
     /// a conservative subset): a literal, a negated or cast literal, a
-    /// const path check folded, arithmetic over those (never a call), a
+    /// const path check folded, arithmetic over those (never a fn call), a
     /// unit variant or unit struct,
-    /// or a tuple, array, or struct literal of those, whose type needs
+    /// or a tuple, array, array repeat, struct literal, or constructor
+    /// call of those, whose type needs
     /// no drop and has no interior mutability (`promotable_ty`).
     fn promotable(&mut self, e: ExprId) -> bool {
         let ty = self.ty(e);
@@ -290,6 +291,11 @@ impl<'p> Lower<'p> {
             }
             Expr::Cast { expr, .. } => matches!(self.p.ast.expr(*expr), Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_)),
             Expr::Tuple(es) | Expr::Array(es) => es.clone().iter().all(|&x| self.promotable(x)),
+            Expr::ArrayRepeat { value, .. } => self.promotable(*value),
+            // A tuple struct, tuple variant, or `Some` constructor call.
+            Expr::Call { args, .. } => {
+                matches!(self.ck.res(e), Res::Variant(..) | Res::OptSome) && args.clone().iter().all(|&x| self.promotable(x))
+            }
             Expr::Path(_) => {
                 self.ck.const_value(e).is_some()
                     || matches!(self.ck.res(e), Res::OptNone)

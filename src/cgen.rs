@@ -837,6 +837,15 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     }
 }
 
+/// A `&str` constant as a `lust_str`. An empty one points at address 1,
+/// as rustc's dangling pointer of a zero-sized allocation (`"".as_ptr()`).
+fn str_lit_c(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "((lust_str){(uint8_t*)(uintptr_t)1, 0})".into();
+    }
+    format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(bytes), bytes.len())
+}
+
 fn c_string_lit(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() + 2);
     s.push('"');
@@ -2465,11 +2474,9 @@ impl FnGen<'_, '_> {
                 Const::Char(c) => (format!("((uint32_t){})", *c as u32), CTy::Char),
                 Const::Str(i) => {
                     let s = &self.p.ast.strings[*i as usize];
-                    (format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len()), CTy::Ref(Box::new(CTy::Str)))
+                    (str_lit_c(s.as_bytes()), CTy::Ref(Box::new(CTy::Str)))
                 }
-                Const::StrBytes(b) => {
-                    (format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(b.as_slice()), b.len()), CTy::Ref(Box::new(CTy::Str)))
-                }
+                Const::StrBytes(b) => (str_lit_c(b.as_slice()), CTy::Ref(Box::new(CTy::Str))),
                 Const::Bytes(b) => {
                     let t = CTy::Array(Box::new(CTy::Int(IntTy::U8)), b.len() as u64);
                     (bytes_array_lit(self.p, &t, b.as_slice()), t)
@@ -3036,6 +3043,10 @@ impl FnGen<'_, '_> {
         match rv {
             Rvalue::Use(o) => self.operand(o, loc, post).0,
             Rvalue::Ref(_, pl) => {
+                if let Some(a) = self.const_zst_addr(pl) {
+                    let (_, t) = self.place(pl, loc);
+                    return format!("(({} *){a})", ctype(&t));
+                }
                 let (e, t) = self.place(pl, loc);
                 // A slice place (a deref of a fat value, or a bare-slice
                 // temporary from a range index) is already the fat value;
@@ -3072,6 +3083,9 @@ impl FnGen<'_, '_> {
             }
             Rvalue::SliceOf(pl) => {
                 let (e, t) = self.place(pl, loc);
+                if let (Some(a), CTy::Array(el, n)) = (self.const_zst_addr(pl), &t) {
+                    return format!("(({}){{ ({} *){a}, {n} }})", ctype(&CTy::Slice(el.clone())), ctype(el));
+                }
                 self.slice_of(&e, &t)
             }
             Rvalue::Subslice { base, lo, hi, inclusive, .. } => {
@@ -3786,6 +3800,20 @@ impl FnGen<'_, '_> {
     }
 
     /// A fat slice value over the whole of an array, Vec, or slice place.
+    /// The address of a zero-sized constant (a promoted temp or a byte
+    /// string temp, or a place inside one): rustc gives it no storage, so
+    /// its address is its alignment (`{:p}` of `&()` prints 0x1, of
+    /// `&[0u64; 0]` 0x8). None for any other place.
+    fn const_zst_addr(&self, pl: &Place) -> Option<String> {
+        let i = pl.local as usize;
+        let is_const = self.body.promoted.contains(&pl.local) || self.byte_blobs.get(i).is_some_and(|b| b.is_some());
+        if !is_const || pl.proj.iter().any(|pr| matches!(pr, Proj::Deref)) {
+            return None;
+        }
+        let (size, align) = c_size_align(self.p, &self.local_cty[i]);
+        (size == 0).then(|| format!("(void *)(uintptr_t){}", align.max(1)))
+    }
+
     fn slice_of(&mut self, e: &str, t: &CTy) -> String {
         match t {
             CTy::Slice(_) => e.to_string(),
@@ -8139,11 +8167,8 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter, slots, None),
         (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
         (CV::Unit, _) => "((lust_Unit){})".into(),
-        (CV::Str(i), _) => {
-            let s = &p.ast.strings[*i as usize];
-            format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(s.as_bytes()), s.len())
-        }
-        (CV::StrBytes(b), _) => format!("((lust_str){{(uint8_t*){}, {}}})", c_string_lit(b.as_slice()), b.len()),
+        (CV::Str(i), _) => str_lit_c(p.ast.strings[*i as usize].as_bytes()),
+        (CV::StrBytes(b), _) => str_lit_c(b.as_slice()),
         (CV::StaticRef(idx), CTy::Slice(_)) => {
             let st = &p.statics[*idx as usize];
             let sct = cty(&p.tys, st.ty);
@@ -8175,7 +8200,16 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             format!("(({})&{name})", ctype(t))
         }
         (CV::Ref(inner), CTy::Slice(el)) => {
-            // A slice over a promoted aggregate or blob.
+            // A slice over a promoted aggregate or blob; over a zero-sized
+            // one (`&[]`, `&[(); 3]`), rustc's pointer is the alignment.
+            let n = match &**inner {
+                CV::Aggregate(vals) => vals.len() as u64,
+                CV::Bytes(b) => b.len() as u64,
+                _ => 1,
+            };
+            if c_size_align(p, &CTy::Array(el.clone(), n)).0 == 0 && matches!(&**inner, CV::Aggregate(_) | CV::Bytes(_)) {
+                return format!("(({}){{ ({} *)(uintptr_t){}, {n} }})", ctype(t), ctype(el), c_size_align(p, el).1.max(1));
+            }
             match &**inner {
                 CV::Aggregate(vals) => {
                     let at = CTy::Array(el.clone(), vals.len() as u64);
@@ -8193,6 +8227,11 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 }
                 _ => zero_lit(p, t),
             }
+        }
+        // A zero-sized pointee has no storage in rustc: its address is
+        // its alignment (`const U: &() = &();` is 0x1).
+        (CV::Ref(_), CTy::Ref(inner_ct)) if c_size_align(p, inner_ct).0 == 0 => {
+            format!("(({} *)(uintptr_t){})", ctype(inner_ct), c_size_align(p, inner_ct).1.max(1))
         }
         (CV::Ref(inner), CTy::Ref(inner_ct)) => {
             let name = promoted_name(counter, pos);
