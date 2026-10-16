@@ -79,6 +79,11 @@ pub enum CTy {
     /// Trait>` it came from, its data `UINTPTR_MAX` when dangling
     /// (cgen/own.rs).
     WeakDyn(bool),
+    /// A `rc::Weak<str>`/`rc::Weak<[T]>` (false) or `sync::Weak<..>`
+    /// (true): the fat value of the `Rc` or `Arc` it came from, as
+    /// `CTy::Own` holds it (cgen/own.rs). There is no dangling form: std
+    /// has no `Weak::new()` for an unsized value.
+    WeakOwn(bool, Box<CTy>),
     /// A `RefCell<T>`: the generated struct `RCL_..` of the borrow
     /// flag `f0` (as Rust's `isize`) and the value `f1`.
     RefCell(Box<CTy>),
@@ -529,7 +534,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::ExitCode => "uint8_t".into(),
         CTy::AccessError => "lust_Unit".into(),
         CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
-        CTy::Own(_, x) => ctype(x),
+        CTy::Own(_, x) | CTy::WeakOwn(_, x) => ctype(x),
         CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) => "lust_dyn".into(),
         CTy::Sync(k, e) => sync::sync_ctype(*k, e),
         CTy::Chars => "lust_Chars".into(),
@@ -622,6 +627,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Guard(e, m) => tok(s, if *m { "GdM" } else { "Gd" }, &[e]),
         CTy::BoxSlice(e) => tok(s, "BS", &[e]),
         CTy::Own(k, e) => tok(s, k.code(), &[e]),
+        CTy::WeakOwn(arc, e) => tok(s, if *arc { "AWkO" } else { "WkO" }, &[e]),
         CTy::DynCell => tok(s, "DCl", &[]),
         CTy::DynGuard(m) => tok(s, if *m { "DGdM" } else { "DGd" }, &[]),
         CTy::DynLock(g) => tok(s, if *g { "DLkG" } else { "DLk" }, &[]),
@@ -680,7 +686,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
         }
         // A raw pointer names its pointee (`A2480*` for `*const Mapper`): its
         // forward typedef must be in the unit too.
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Ptr(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) | CTy::Own(_, e) => {
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Ptr(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) | CTy::Own(_, e) | CTy::WeakOwn(_, e) => {
             collect_types(e, out)
         }
         CTy::ArrayIter(e, n) => {
@@ -735,7 +741,7 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         // declared structs, so a recursive `Option<Rc<Node>>` field works.
         CTy::Cell(e) => by_value_deps(e, out),
         CTy::BoxSlice(e) => out.push(CTy::Slice(e.clone())),
-        CTy::Own(_, e) => by_value_deps(e, out),
+        CTy::Own(_, e) | CTy::WeakOwn(_, e) => by_value_deps(e, out),
         // A lock holds its value; a `PoisonError` is its value's C type.
         CTy::Sync(k, _) if k.is_cell_struct() => out.push(t.clone()),
         CTy::Sync(crate::ty::sync::SyncTy::PoisonError | crate::ty::sync::SyncTy::SendError, e) => by_value_deps(e, out),
@@ -808,7 +814,7 @@ fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
 
 fn needs_drop_c(p: &Program, t: &CTy) -> bool {
     match t {
-        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynGuard(_) | CTy::DynLock(true) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::WeakDyn(_) | CTy::VecIter(_) | CTy::VecDrain(_) | CTy::StrDrain | CTy::Weak(_) | CTy::Guard(..) => true,
+        CTy::String | CTy::Vec(_) | CTy::Boxed(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::WeakOwn(..) | CTy::DynGuard(_) | CTy::DynLock(true) | CTy::Rc(_) | CTy::BoxDyn | CTy::RcDyn | CTy::WeakDyn(_) | CTy::VecIter(_) | CTy::VecDrain(_) | CTy::StrDrain | CTy::Weak(_) | CTy::Guard(..) => true,
         CTy::RefCell(e) | CTy::Cell(e) => needs_drop_c(p, e),
         CTy::Sync(k, e) => sync::sync_needs_drop(p, *k, e),
         CTy::Hash(k, a) => {
@@ -1123,7 +1129,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Ref(_) => Some(layout::ptr_layout()),
             // A raw pointer may be null: no niche (w-cinterop).
             CTy::Ptr(_) => Some(layout::raw_ptr_layout()),
-            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) | CTy::Dyn | CTy::Unsized(..) => {
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::WeakOwn(..) | CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) | CTy::Dyn | CTy::Unsized(..) => {
                 Some(layout::fat_ptr_layout())
             }
             CTy::Tuple(es) => {
@@ -1411,7 +1417,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let align = ea.max(8);
                 (align_up(align_up(es * (*n).max(1), 8) + 16, align), align)
             }
-            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) | CTy::Dyn | CTy::Unsized(..) => (16, 8),
+            CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::WeakOwn(..) | CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) | CTy::Dyn | CTy::Unsized(..) => (16, 8),
             CTy::Adt(a) => {
                 if !seen.insert(*a) {
                     // A by-value cycle has no finite size; check rejects
@@ -9201,6 +9207,10 @@ fn glue_def_value(
     }
     if let CTy::WeakDyn(arc) = t {
         own::weak_dyn_glue_def(*g, *arc, protos, defs);
+        return;
+    }
+    if let CTy::WeakOwn(arc, x) = t {
+        own::weak_own_glue_def(*g, *arc, x, protos, defs);
         return;
     }
     if let (Glue::Drop, CTy::DynGuard(_) | CTy::DynLock(true)) = (g, t) {

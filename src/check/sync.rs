@@ -502,14 +502,14 @@ pub fn sync_type_named(interner: &Interner, segs: &[ast::PathSeg]) -> Option<Syn
 }
 
 /// Rejects a type argument lust cannot give a sync type yet: `str` or
-/// `[T]` in `sync::Weak<T>`. `Arc<str>`, `Arc<[T]>`, `Arc<dyn Trait>`,
-/// `Mutex<dyn Trait>` (check/own.rs), and `sync::Weak<dyn Trait>`
-/// (cgen/own.rs) are fat forms.
+/// `[T]` in a `Mutex`. `Arc<str>`, `Arc<[T]>`, `Arc<dyn Trait>`,
+/// `Mutex<dyn Trait>` (check/own.rs), and `sync::Weak` of `dyn Trait`,
+/// `str` and `[T]` (cgen/own.rs) are fat forms.
 pub fn check_sync_arg(tys: &impl TyIntern, k: SyncTy, e: Ty, span: Span) -> Result<(), Diag> {
     if matches!(k, SyncTy::Mutex | SyncTy::MutexGuard) && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str) {
         return Err(crate::diag::not_yet("L0641", span, "a Mutex of an unsized type"));
     }
-    let unsized_ok = k == SyncTy::Arc || (matches!(k, SyncTy::Mutex | SyncTy::ArcWeak) && matches!(tys.kind(e), TyKind::Dyn(..)));
+    let unsized_ok = matches!(k, SyncTy::Arc | SyncTy::ArcWeak) || (k == SyncTy::Mutex && matches!(tys.kind(e), TyKind::Dyn(..)));
     if !unsized_ok && matches!(k, SyncTy::Arc | SyncTy::ArcWeak) && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
         return Err(crate::diag::not_yet("L0641", span, &format!("an {} of an unsized type", k.name())));
     }

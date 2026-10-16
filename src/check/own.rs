@@ -277,8 +277,12 @@ impl<'p> Ctx<'p> {
         }) else {
             return false;
         };
-        // `Arc::downgrade` of an `Arc<dyn Tr>` is built (cgen/own.rs).
+        // `Arc::downgrade` of an `Arc<dyn Tr>`, and `downgrade` of an Rc or
+        // Arc of `str` or `[T]`, are built (cgen/own.rs).
         if b == Builtin::Sync(S::ArcDowngrade) && matches!(self.kind(e), TyKind::Dyn(..)) {
+            return false;
+        }
+        if matches!(b, Builtin::RcDowngrade | Builtin::Sync(S::ArcDowngrade)) && matches!(self.kind(e), TyKind::Str | TyKind::Slice(_)) {
             return false;
         }
         let tn = self.tn(e);

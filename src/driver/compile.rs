@@ -4018,6 +4018,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 cgen::CTy::BoxDyn => 41u8.hash(h),
                 cgen::CTy::RcDyn => 42u8.hash(h),
                 cgen::CTy::WeakDyn(arc) => (50u8, *arc).hash(h),
+                cgen::CTy::WeakOwn(arc, x) => {
+                    (51u8, *arc).hash(h);
+                    inner(h, p, x);
+                }
                 cgen::CTy::VecIter(x) => {
                     21u8.hash(h);
                     inner(h, p, x);

@@ -4004,7 +4004,9 @@ pub(crate) fn resolve_path_ty(
             elem = tys.intern(TyKind::Dyn(b, Region::Static));
         }
         let guard = matches!(n, "Ref" | "RefMut");
-        if !dyn_cell && !guard && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
+        // `rc::Weak<str>` and `rc::Weak<[T]>` hold the Rc's fat value (cgen/own.rs).
+        let weak_fat = n == "Weak" && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str);
+        if !dyn_cell && !guard && !weak_fat && matches!(tys.kind(elem), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
             return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));
         }
         let which: fn(&crate::ty::BuiltinDefs) -> DefId = match n {

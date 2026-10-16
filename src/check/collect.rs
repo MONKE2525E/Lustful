@@ -1485,7 +1485,8 @@ pub fn resolve_ty(
                     return Err(Diag::new("L0110", span, format!("{n} takes one type argument"), format!("Write `{n}<T>`.")));
                 }
                 let e = resolve_ty(ast, interner, known, type_names, aliases, tys, args[0], self_ty)?;
-                let weak_dyn = n == "Weak" && matches!(tys.kind(e), TyKind::Dyn(..));
+                // `rc::Weak<dyn Tr>`, `Weak<str>` and `Weak<[T]>` (cgen/own.rs).
+                let weak_dyn = n == "Weak" && matches!(tys.kind(e), TyKind::Dyn(..) | TyKind::Str | TyKind::Slice(_));
                 let guard = matches!(n, "Ref" | "RefMut");
                 if !weak_dyn && !guard && matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
                     return Err(not_yet("L0641", span, &format!("a {n} of an unsized type")));

@@ -23156,7 +23156,8 @@ impl<'p> Ctx<'p> {
         }
         for (t, span) in std::mem::take(&mut self.deferred_downgrade) {
             let t = self.deep(t);
-            if matches!(self.kind(t), TyKind::Slice(_) | TyKind::Str) || crate::check::own::dyn_wrapped_elem(&self.tys, t).is_some() {
+            // `Weak<str>` and `Weak<[T]>` are built (cgen/own.rs).
+            if crate::check::own::dyn_wrapped_elem(&self.tys, t).is_some() {
                 self.errs.push(not_yet("L0641", span, "a `Weak` of this unsized type"));
             }
         }

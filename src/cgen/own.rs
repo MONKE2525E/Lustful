@@ -30,14 +30,50 @@ pub(super) fn own_cty(tys: &impl TyIntern, t: Ty) -> Option<CTy> {
 }
 
 /// The `CTy::WeakDyn` form of `t`, if `t` is a `rc::Weak<dyn Tr>` or a
-/// `sync::Weak<dyn Tr>`.
+/// `sync::Weak<dyn Tr>`, and the `CTy::WeakOwn` form of a Weak of `str`
+/// or `[T]`.
 pub(super) fn weak_dyn_cty(tys: &impl TyIntern, t: Ty) -> Option<CTy> {
     let arc = match tys.builtin_of(t)? {
         BuiltinTy::Weak => false,
         BuiltinTy::Sync(crate::ty::sync::SyncTy::ArcWeak) => true,
         _ => return None,
     };
-    matches!(tys.kind(tys.adt_first_ty_arg(t)?), TyKind::Dyn(..)).then_some(CTy::WeakDyn(arc))
+    match tys.kind(tys.adt_first_ty_arg(t)?) {
+        TyKind::Dyn(..) => Some(CTy::WeakDyn(arc)),
+        TyKind::Str => Some(CTy::WeakOwn(arc, Box::new(CTy::Str))),
+        TyKind::Slice(e) => Some(CTy::WeakOwn(arc, Box::new(CTy::Slice(Box::new(cty(tys, e)))))),
+        _ => None,
+    }
+}
+
+/// The glue `g` of a `Weak<str>` or `Weak<[T]>` (`arc`: `sync::Weak`) whose
+/// pointee form is `x`: Drop gives up its weak ref and frees the counted
+/// allocation after the last one (as the `Rc`/`Arc` drop of `own_glue_def`
+/// frees it); Clone takes one more; Debug prints `(Weak)`.
+pub(super) fn weak_own_glue_def(g: Glue, arc: bool, x: &CTy, protos: &mut String, defs: &mut String) {
+    let t = CTy::WeakOwn(arc, Box::new(x.clone()));
+    let (m, ct) = (mangle(&t), ctype(&t));
+    let h = counts(x, "(*p)");
+    let k = if arc { Owner::Arc } else { Owner::Rc };
+    let (proto, body) = match g {
+        Glue::Drop => (
+            format!("void drop_{m}({ct} *p)"),
+            format!(
+                "  uint64_t *h = {h}; if ({}) lust_dealloc((void *)h, {} + {}, 16);\n",
+                dec(k, "&h[1]"),
+                counts_off(x, "(*p)"),
+                value_size(x, "(*p)")
+            ),
+        ),
+        Glue::Clone => {
+            let inc = if arc { format!("lust_arc_inc(&{h}[1])") } else { format!("{h}[1]++") };
+            (format!("{ct} clone_{m}({ct} *p)"), format!("  {inc}; return *p;\n"))
+        }
+        Glue::Debug => (format!("int dbg_{m}(lust_Formatter *f, {ct} *p)"), "  (void)p; return lust_f_write_str(f, (lust_str){(uint8_t *)\"(Weak)\", 6});\n".to_string()),
+        _ => unreachable!("Weak<str> and Weak<[T]> have only Drop, Clone, and Debug glue"),
+    };
+    let _ = writeln!(protos, "{proto};");
+    let _ = writeln!(defs, "{proto} {{\n{body}}}\n");
 }
 
 /// The glue `g` of a `Weak<dyn Tr>` (`arc`: `sync::Weak`): Drop gives
@@ -376,6 +412,39 @@ impl FnGen<'_, '_> {
             }
             // The addresses, not the vtables (`ptr::addr_eq`).
             (B::WeakPtrEq | B::Sync(S::ArcWeakPtrEq), CTy::WeakDyn(_)) => Some(format!("((*{}).data == (*{}).data)", vals[0], vals[1])),
+            // `Weak<str>` and `Weak<[T]>`: the fat value of the pointer,
+            // its counts 16 bytes before the data.
+            (B::RcDowngrade, CTy::Own(Owner::Rc, x)) | (B::Sync(S::ArcDowngrade), CTy::Own(Owner::Arc, x)) if matches!(**x, CTy::Str | CTy::Slice(_)) => {
+                let t = self.tmp();
+                let hc = counts(x, &t);
+                let inc = if b == B::RcDowngrade { format!("{hc}[1]++") } else { format!("lust_arc_downgrade({hc})") };
+                let _ = writeln!(self.out, "    {} {t} = *{}; {inc};", ctype(x), vals[0]);
+                Some(t)
+            }
+            (B::WeakUpgrade | B::Sync(S::ArcWeakUpgrade), CTy::WeakOwn(arc, x)) => {
+                let k = if *arc { Owner::Arc } else { Owner::Rc };
+                let opt = CTy::Option(Box::new(CTy::Own(k, x.clone())));
+                collect_types(&opt, &mut self.sig_types);
+                let (t, w) = (self.tmp(), self.tmp());
+                let hc = counts(x, &w);
+                let field = variant_field(self.p, &opt, &t, 1, 0);
+                let some = disc_set(self.p, &opt, &t, 1);
+                let up = if *arc { format!("lust_arc_upgrade({hc})") } else { format!("({hc}[0] > 0 && ++{hc}[0])") };
+                let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
+                let _ = writeln!(self.out, "    {} {w} = *{}; if ({up}) {{ {field} = {w}; {some} }}", ctype(x), vals[0]);
+                Some(t)
+            }
+            (B::WeakStrongCount | B::Sync(S::ArcWeakStrongCount), CTy::WeakOwn(arc, x)) => {
+                let hc = counts(x, &format!("(*{})", vals[0]));
+                Some(if *arc { format!("lust_arc_load(&{hc}[0])") } else { format!("{hc}[0]") })
+            }
+            (B::WeakWeakCount | B::Sync(S::ArcWeakWeakCount), CTy::WeakOwn(arc, x)) => {
+                let hc = counts(x, &format!("(*{})", vals[0]));
+                Some(if *arc { format!("lust_arc_weak_weak_count({hc})") } else { format!("({0}[0] == 0 ? (uint64_t)0 : {0}[1] - 1)", hc) })
+            }
+            (B::WeakPtrEq | B::Sync(S::ArcWeakPtrEq), CTy::WeakOwn(_, x)) => {
+                Some(format!("({} == {})", data_words(x, &format!("(*{})", vals[0])), data_words(x, &format!("(*{})", vals[1]))))
+            }
             _ => None,
         }
     }
