@@ -70,6 +70,22 @@ pub fn is_std_macro_name(name: &str) -> bool {
     is_token_builtin(name) || is_passthrough(name)
 }
 
+/// True when `name` is a bang macro every module sees without an import
+/// (std's `#[macro_use]` prelude and the builtins of the std prelude), as
+/// rustc 1.99 resolves it. A macro-expanded macro of such a name may not
+/// shadow it (E0659). Measured against rustc: `pin` and `offset_of` live
+/// in modules, so they are not here.
+pub fn is_prelude_macro(name: &str) -> bool {
+    let arch_detect = match std::env::consts::ARCH {
+        "x86_64" | "x86" => "is_x86_feature_detected",
+        "aarch64" => "is_aarch64_feature_detected",
+        _ => "",
+    };
+    (is_std_macro_name(name) && !matches!(name, "pin" | "offset_of"))
+        || name == arch_detect
+        || matches!(name, "const_format_args" | "log_syntax" | "trace_macros" | "concat_bytes" | "cfg_select" | "type_ascribe" | "deref")
+}
+
 /// Macros this file expands at token level.
 pub fn is_token_builtin(name: &str) -> bool {
     matches!(
@@ -722,6 +738,20 @@ fn include_macro(st: &mut Expander, name: &str, call: &Call, depth: u32) -> Resu
                 .map_err(|_| err(C_CALL, rel_span, format!("`{}` is not valid UTF-8", path.display()), "Rust source must be UTF-8."))?;
             let file = crate::diag::FileId(0);
             let trees = st.lex_file_trees(&text, file)?;
+            // Outside an item list rustc reads the file as one expression
+            // ("include macro expected single expression in source").
+            if !st.items_call
+                && (super::starts_item(&trees, st.ctx.interner)
+                    || super::macro_rules_at(&trees, 0, st.ctx.interner).is_some()
+                    || trees.iter().any(|t| t.is_tok(Tok::Semi)))
+            {
+                return Err(err(
+                    C_CALL,
+                    span,
+                    "include! here takes a file that holds one expression",
+                    "Include items at item level, or make the file one expression.",
+                ));
+            }
             let old_file = std::mem::replace(&mut st.cur_file, path.to_string_lossy().to_string());
             let old_real = std::mem::replace(&mut st.cur_real, path.clone());
             let old_src = std::mem::replace(&mut st.cur_src, text);

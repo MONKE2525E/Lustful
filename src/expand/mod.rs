@@ -957,12 +957,13 @@ pub struct Expander<'a> {
     /// different macro of an outer scope (rustc E0659), where a
     /// textual definition or an explicit import does.
     textual: Vec<(Sym, u32, u32)>,
-    /// Names brought in by `use` in scope here, same order rule.
-    imports: Vec<(Sym, u32, u32)>,
+    /// Names brought in by `use` in scope here, same order rule. The
+    /// fourth field is the expansion the `use` was in (`expn`).
+    imports: Vec<(Sym, u32, u32, u32)>,
     /// Macro names glob imports in blocks brought into scope
-    /// here: (name, def, depth), or a `u32::MAX` def when the
-    /// glob's own source name is ambiguous there.
-    glob_macros: Vec<(Sym, u32, u32)>,
+    /// here: (name, def, depth, expansion), or a `u32::MAX` def when
+    /// the glob's own source name is ambiguous there.
+    glob_macros: Vec<(Sym, u32, u32, u32)>,
     /// Type-namespace names those globs may bring (a submodule of
     /// the glob's target that macros are addressable through):
     /// (name, the module path it names, depth). A macro call
@@ -974,6 +975,29 @@ pub struct Expander<'a> {
     /// appear at statement positions, so group depth orders the
     /// lexical scopes macro resolution compares.
     scope_depth: u32,
+    /// The parent of each macro expansion of this walk, by expansion
+    /// id. Id 0 is the file's own tokens (rustc's root expansion), its
+    /// own parent. The output of every macro call, builtins included,
+    /// is walked under a fresh id (`enter_expn`).
+    expn_parent: Vec<u32>,
+    /// The expansion whose output the walk is in.
+    expn: u32,
+    /// The expansion each def index was defined in, parallel to `defs`
+    /// (0 for written and seeded definitions).
+    def_expn: Vec<u32>,
+    /// Plain macro calls walked so far, for `check_late_bindings`.
+    plain_calls: Vec<PlainCall>,
+    /// The `plain_calls` length where the block or module body being
+    /// walked began: the calls a binding made in it can reach.
+    scope_calls: usize,
+    /// Item bindings rustc sees from their whole block or module, made
+    /// after calls of their scope were walked: a block-level `use`, and
+    /// a module-level `use` or a `#[macro_export]` definition (crate
+    /// root) an expansion made. Checked at the end of the walk.
+    late_bindings: Vec<LateBinding>,
+    /// True while `expand_call` runs for a call written in an item list
+    /// (`include!` reads items only there).
+    items_call: bool,
     /// True while the list being expanded is an enum body: its first
     /// part is a variant (`A = 1 + 2`), not a block tail.
     enum_body: bool,
@@ -1063,12 +1087,53 @@ const STACK_HOP_ROOM: usize = 48 << 20;
 /// rejected (L0801) instead of growing without bound.
 const STACK_TOTAL: usize = 1 << 30;
 
+/// One plain macro call of the walk and the binding it resolved to
+/// (`Expander::note_plain_call`).
+struct PlainCall {
+    module: Vec<Sym>,
+    name: Sym,
+    span: Span,
+    /// The expansion the call is in.
+    expn: u32,
+    /// The def it found, `u32::MAX` for a std macro.
+    def: u32,
+    /// The expansion and scope depth of that binding, and whether it is
+    /// a textual definition (`PlainMacro::Found`) written in the call's
+    /// module (`home`).
+    def_expn: u32,
+    depth: u32,
+    textual: bool,
+    home: bool,
+}
+
+/// A binding `check_late_bindings` checks against the calls walked
+/// before it in its scope (`plain_calls[calls]`).
+struct LateBinding {
+    module: Vec<Sym>,
+    name: Sym,
+    def: u32,
+    expn: u32,
+    depth: u32,
+    calls: std::ops::Range<usize>,
+    /// A block glob import: rustc's glob binding is ambiguous with any
+    /// different macro of the name outside it.
+    glob: bool,
+    /// A binding of a block, not of a module.
+    block: bool,
+}
+
 /// The answer of `Expander::plain_macro` for one plain macro
 /// call name.
 enum PlainMacro {
-    Found(u32),
+    /// The def index, the expansion that made the binding, the binding's
+    /// scope depth, and whether it is a textual definition (which rustc
+    /// reads before any `use`).
+    Found(u32, u32, u32, bool),
     /// Layers name different macros and none shadows (L0507).
     Ambiguous,
+    /// The binding found first was made by a macro expansion and may
+    /// not shadow a different one further out (L0507, rustc E0659).
+    Expanded,
     /// No lexical layer binds the name: use the module tables.
     Fallthrough,
 }
@@ -1090,6 +1155,13 @@ impl<'a> Expander<'a> {
             glob_macros: Vec::new(),
             glob_type_names: Vec::new(),
             scope_depth: 0,
+            expn_parent: vec![0],
+            expn: 0,
+            def_expn: Vec::new(),
+            plain_calls: Vec::new(),
+            scope_calls: 0,
+            late_bindings: Vec::new(),
+            items_call: false,
             enum_body: false,
             group: Group::Brace,
             builtin_imports: Vec::new(),
@@ -1441,6 +1513,19 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(
     }
     st.prescan(&tts)?;
     let out = st.expand_list(tts, 0, true, false, 0)?;
+    st.check_late_bindings()?;
+    // A module file's top-level textual definitions reach its parent
+    // under `#[macro_use]`, and the worklist passes written ones only.
+    if !ctx.module_path.is_empty()
+        && let Some(span) = st.expanded_textual_span()
+    {
+        return Err(err(
+            C_UNSUPPORTED,
+            span,
+            "a `macro_rules!` that a macro expansion defines at the top of a module file is not supported yet",
+            "Define the macro with a written `macro_rules!`, or inside a block or an inline module.",
+        ));
+    }
     // rustc also checks type, trait, and layout depth against a lowered
     // limit, and lust does not track those: a crate that lowers it is
     // rejected (after its macros got rustc's own depth error, if any).
@@ -1917,7 +2002,75 @@ impl<'a> Expander<'a> {
             self.push_textual(def.name, idx, def.name_span);
         }
         self.defs.push(def);
+        self.def_expn.push(self.expn);
         idx
+    }
+
+    /// Makes one definition textually visible from here on, and notes
+    /// its module when it is written in this file.
+    fn push_textual(&mut self, name: Sym, idx: u32, name_span: Span) {
+        self.textual.push((name, idx, self.scope_depth));
+        if Some(name_span.file) == self.own_file {
+            self.textual_home.insert(idx, self.module.clone());
+        }
+    }
+
+    /// True when two def indices are the same macro definition:
+    /// the same `macro_rules!` compiled more than once (a textual
+    /// walk and a worklist seed) keeps its name span, so defs
+    /// compare by it, not by index.
+    fn same_macro(&self, a: u32, b: u32) -> bool {
+        a == b
+            || (a != u32::MAX
+                && b != u32::MAX
+                && self.defs.get(a as usize).zip(self.defs.get(b as usize)).is_some_and(|(x, y)| x.name_span == y.name_span))
+    }
+
+    /// `same_macro`, and made by the same expansion: two calls of one
+    /// macro that defines a `macro_rules!` give two different macros
+    /// with the same name span.
+    fn same_def(&self, a: u32, b: u32) -> bool {
+        self.same_macro(a, b) && (a == b || self.def_expn.get(a as usize) == self.def_expn.get(b as usize))
+    }
+
+    /// The name span of a textual definition in scope here that a macro
+    /// expansion made, if any.
+    fn expanded_textual_span(&self) -> Option<Span> {
+        let &(_, idx, _) = self.textual.iter().find(|&&(_, i, _)| self.def_expn.get(i as usize).is_some_and(|&e| e != 0))?;
+        Some(self.defs[idx as usize].name_span)
+    }
+
+    /// Starts a new expansion inside the current one. Returns the
+    /// current one, which the caller restores when the walk of the new
+    /// expansion's output ends.
+    fn enter_expn(&mut self) -> u32 {
+        self.expn_parent.push(self.expn);
+        std::mem::replace(&mut self.expn, self.expn_parent.len() as u32 - 1)
+    }
+
+    /// True when expansion `e` is `outer` or was made inside it.
+    fn expn_within(&self, mut e: u32, outer: u32) -> bool {
+        while e != outer {
+            if e == 0 {
+                return false;
+            }
+            e = self.expn_parent[e as usize];
+        }
+        true
+    }
+
+    /// rustc's rule for a macro-expanded macro binding (E0659,
+    /// "macro-expanded `macro_rules!`s may not shadow existing macros",
+    /// rustc_resolve `may_appear_after`). A plain call found `inner`,
+    /// made in expansion `e_inner`, first. Every different binding of
+    /// the name further out (`outers`, as (def, expansion), and the std
+    /// prelude macro when `std_outer`) is ambiguous with it, unless the
+    /// call or that outer binding is inside `e_inner`.
+    fn expanded_shadows(&self, inner: u32, e_inner: u32, outers: impl IntoIterator<Item = (u32, u32)>, std_outer: bool) -> bool {
+        if self.expn_within(self.expn, e_inner) {
+            return false;
+        }
+        std_outer || outers.into_iter().any(|(i, e)| !self.same_def(i, inner) && !self.expn_within(e, e_inner))
     }
 
     /// Resolves a plain (one-segment) macro call name over the
@@ -1932,44 +2085,28 @@ impl<'a> Expander<'a> {
     /// any different binding outside it (an outer scope, the
     /// module's imports, an exported root macro, or a std macro
     /// of the same name). The same macro by any two layers is
-    /// never ambiguous. `Fallthrough` leaves the name to the
-    /// module tables in `lookup_macro`.
-    /// True when two def indices are the same macro definition:
-    /// the same `macro_rules!` compiled more than once (a textual
-    /// walk and a worklist seed) keeps its name span, so defs
-    /// compare by it, not by index.
-    /// Makes one definition textually visible from here on, and notes
-    /// its module when it is written in this file.
-    fn push_textual(&mut self, name: Sym, idx: u32, name_span: Span) {
-        self.textual.push((name, idx, self.scope_depth));
-        if Some(name_span.file) == self.own_file {
-            self.textual_home.insert(idx, self.module.clone());
-        }
-    }
-
-    fn same_macro(&self, a: u32, b: u32) -> bool {
-        a == b
-            || (a != u32::MAX
-                && b != u32::MAX
-                && self.defs.get(a as usize).zip(self.defs.get(b as usize)).is_some_and(|(x, y)| x.name_span == y.name_span))
-    }
-
+    /// never ambiguous. A binding a macro expansion made also obeys
+    /// `expanded_shadows` (`PlainMacro::Expanded`). `Fallthrough`
+    /// leaves the name to the module tables in `lookup_macro`.
     fn plain_macro(&self, name: Sym, name_text: &str) -> PlainMacro {
         // Stack order is source order and scopes nest, so the
         // latest live entry of each kind is its innermost one.
-        let textual = self.textual.iter().rev().find(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d));
-        let explicit = self.imports.iter().rev().find(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d));
-        let globs: Vec<(u32, u32)> = self.glob_macros.iter().filter(|(n, _, _)| *n == name).map(|&(_, i, d)| (i, d)).collect();
-        let gdepth = globs.iter().map(|&(_, d)| d).max();
+        let textual = self.textual.iter().rposition(|(n, _, _)| *n == name);
+        let explicit = self.imports.iter().rev().find(|(n, ..)| *n == name).map(|&(_, i, d, e)| (i, d, e));
+        let globs: Vec<(u32, u32, u32)> = self.glob_macros.iter().filter(|(n, ..)| *n == name).map(|&(_, i, d, e)| (i, d, e)).collect();
+        let gdepth = globs.iter().map(|&(_, d, _)| d).max();
+        let module_idx = self.module_imports.get(&(self.module.clone(), name)).copied();
+        let exported_idx = if self.module.is_empty() { self.exported.get(&name).copied() } else { None };
+        let std_outer = builtin::is_prelude_macro(name_text);
+        let def_expn = |i: u32| self.def_expn.get(i as usize).copied().unwrap_or(0);
         // rustc reads textual scope first: a textual definition is the
         // answer whenever there is one, and a different macro a `use` or
         // glob binds is only an ambiguity check (E0659, macro_rules vs
         // modularized). It passes for a block binding when the
         // definition is inside that block, and for a module binding when
         // the definition is written in that same module.
-        if let Some((tidx, dt)) = textual {
-            let module_idx = self.module_imports.get(&(self.module.clone(), name)).copied();
-            let exported_idx = if self.module.is_empty() { self.exported.get(&name).copied() } else { None };
+        if let Some(pos) = textual {
+            let (_, tidx, dt) = self.textual[pos];
             let home = self.textual_home.get(&tidx) == Some(&self.module);
             let ok = |idx: u32, d: Option<u32>| -> bool {
                 self.same_macro(tidx, idx)
@@ -1978,21 +2115,50 @@ impl<'a> Expander<'a> {
                         _ => home,
                     }
             };
-            let clash = self.imports.iter().any(|&(n, i, d)| n == name && !ok(i, Some(d)))
-                || globs.iter().any(|&(i, d)| !ok(i, Some(d)))
+            let clash = self.imports.iter().any(|&(n, i, d, _)| n == name && !ok(i, Some(d)))
+                || globs.iter().any(|&(i, d, _)| !ok(i, Some(d)))
                 || module_idx.is_some_and(|i| !ok(i, None))
                 || exported_idx.is_some_and(|i| !ok(i, None))
                 || (module_idx.is_none() && !home && self.ambiguous_imports.contains_key(&(self.module.clone(), name)));
-            return if clash { PlainMacro::Ambiguous } else { PlainMacro::Found(tidx) };
+            if clash {
+                return PlainMacro::Ambiguous;
+            }
+            // Outer textual definitions first, then the module scopes.
+            let outers = (self.textual[..pos].iter().filter(|(n, _, _)| *n == name).map(|&(_, i, _)| (i, def_expn(i))))
+                .chain(self.imports.iter().filter(|(n, ..)| *n == name).map(|&(_, i, _, e)| (i, e)))
+                .chain(globs.iter().map(|&(i, _, e)| (i, e)))
+                .chain(module_idx.map(|i| (i, 0)))
+                .chain(exported_idx.map(|i| (i, def_expn(i))));
+            if self.expanded_shadows(tidx, def_expn(tidx), outers, std_outer) {
+                return PlainMacro::Expanded;
+            }
+            return PlainMacro::Found(tidx, def_expn(tidx), dt, true);
         }
-        if let Some((eidx, de)) = explicit
+        if let Some((eidx, de, ee)) = explicit
             && gdepth.is_none_or(|dg| de >= dg)
         {
-            return PlainMacro::Found(eidx);
+            let outers = (self.imports.iter().filter(|&&(n, _, d, _)| n == name && d < de).map(|&(_, i, _, e)| (i, e)))
+                .chain(globs.iter().filter(|&&(_, d, _)| d < de).map(|&(i, _, e)| (i, e)))
+                .chain(module_idx.map(|i| (i, 0)))
+                .chain(exported_idx.map(|i| (i, def_expn(i))));
+            if self.expanded_shadows(eidx, ee, outers, std_outer) {
+                return PlainMacro::Expanded;
+            }
+            return PlainMacro::Found(eidx, ee, de, false);
         }
-        let Some(dg) = gdepth else { return PlainMacro::Fallthrough };
+        let Some(dg) = gdepth else {
+            // An exported macro an expansion made, found through the
+            // crate root's macro namespace.
+            if module_idx.is_none()
+                && let Some(x) = exported_idx
+                && self.expanded_shadows(x, def_expn(x), [], std_outer)
+            {
+                return PlainMacro::Expanded;
+            }
+            return PlainMacro::Fallthrough;
+        };
         let mut at: Vec<u32> = Vec::new();
-        for &(i, d) in globs.iter().filter(|&&(_, d)| d == dg) {
+        for &(i, _, _) in globs.iter().filter(|&&(_, d, _)| d == dg) {
             if !at.iter().any(|&j| self.same_macro(i, j)) {
                 at.push(i);
             }
@@ -2001,24 +2167,115 @@ impl<'a> Expander<'a> {
             return PlainMacro::Ambiguous;
         }
         let gidx = at[0];
-        let module_idx = self
-            .module_imports
-            .get(&(self.module.clone(), name))
-            .copied()
-            .or_else(|| if self.module.is_empty() { self.exported.get(&name).copied() } else { None });
+        let gexpn = globs.iter().find(|&&(i, d, _)| d == dg && i == gidx).map_or(0, |&(_, _, e)| e);
+        let module_idx = module_idx.or(exported_idx);
         // Any different binding outside the innermost glob layer
         // counts, not only the nearest one of each kind.
         let outer_diff = self.textual.iter().any(|(n, i, d)| *n == name && *d < dg && !self.same_macro(*i, gidx))
-            || self.imports.iter().any(|(n, i, d)| *n == name && *d < dg && !self.same_macro(*i, gidx))
-            || globs.iter().any(|&(i, d)| d < dg && !self.same_macro(i, gidx))
+            || self.imports.iter().any(|&(n, i, d, _)| n == name && d < dg && !self.same_macro(i, gidx))
+            || globs.iter().any(|&(i, d, _)| d < dg && !self.same_macro(i, gidx))
             || module_idx.is_some_and(|i| !self.same_macro(i, gidx))
             || (module_idx.is_none() && self.ambiguous_imports.contains_key(&(self.module.clone(), name)))
             || builtin::is_std_macro_name(name_text);
         if outer_diff {
             PlainMacro::Ambiguous
         } else {
-            PlainMacro::Found(gidx)
+            PlainMacro::Found(gidx, gexpn, dg, false)
         }
+    }
+
+    /// Records one plain macro call and the binding it resolves to, for
+    /// `check_late_bindings`. Runs at the call, in its expansion.
+    fn note_plain_call(&mut self, seg: &Seg, span: Span) {
+        let (def, def_expn, depth, textual) = match self.plain_macro(seg.sym, &seg.text) {
+            PlainMacro::Found(i, e, d, t) => (i, e, d, t),
+            PlainMacro::Fallthrough => match self.lookup_macro(std::slice::from_ref(seg), false) {
+                Some(i) if self.module_imports.contains_key(&(self.module.clone(), seg.sym)) => (i, 0, self.module_depth, false),
+                Some(i) => (i, self.def_expn.get(i as usize).copied().unwrap_or(0), self.module_depth, false),
+                None => (u32::MAX, 0, 0, false),
+            },
+            PlainMacro::Ambiguous | PlainMacro::Expanded => return,
+        };
+        let home = textual && self.textual_home.get(&def) == Some(&self.module);
+        let module = self.module.clone();
+        self.plain_calls.push(PlainCall { module, name: seg.sym, span, expn: self.expn, def, def_expn, depth, textual, home });
+    }
+
+    /// rustc's resolution of the calls a late binding X can reach
+    /// (`late_bindings`), which lust walked before X. Where X is inside
+    /// the binding a call found (a std macro, or a `use` of an outer
+    /// scope), rustc picks X: ambiguous (L0507) when an expansion made X
+    /// and the call is outside it, or when X is a glob over a std macro,
+    /// else a different answer than lust's (L0809). Where X is outside
+    /// it, `expanded_shadows` applies.
+    fn check_late_bindings(&self) -> Result<(), Diag> {
+        for x in &self.late_bindings {
+            for c in &self.plain_calls[x.calls.clone()] {
+                if c.name != x.name || c.module != x.module {
+                    continue;
+                }
+                let text = self.ctx.interner.get(x.name);
+                if self.same_def(c.def, x.def) {
+                    // A written `#[macro_export]` definition in a macro's
+                    // input is in the prescan's root table before its
+                    // expansion runs: the call found X itself, and X may
+                    // not shadow the std macro from outside its expansion.
+                    if c.def == x.def && x.expn != 0 && !self.expn_within(c.expn, x.expn) && builtin::is_prelude_macro(text) {
+                        return Err(Diag::new(
+                            "L0507",
+                            c.span,
+                            format!("`{text}` is ambiguous: a macro-expanded macro may not shadow an existing macro of this name"),
+                            "Rename the macro the expansion defines or imports, or call it only inside that expansion.",
+                        ));
+                    }
+                    continue;
+                }
+                let ambiguous = || {
+                    Diag::new(
+                        "L0507",
+                        c.span,
+                        format!("`{text}` is ambiguous: a macro-expanded macro may not shadow an existing macro of this name"),
+                        "Rename the macro the expansion defines or imports, or call it only inside that expansion.",
+                    )
+                };
+                // rustc reads a textual definition first; a binding of a
+                // module or block is the outer one then, ambiguous unless
+                // the definition is inside that block or written in that
+                // module (`plain_macro`, macro_rules vs modularized).
+                if c.textual && !(if x.block { c.depth >= x.depth } else { c.home }) {
+                    return Err(Diag::new(
+                        "L0507",
+                        c.span,
+                        format!("`{text}` is ambiguous: a `macro_rules!` name and a macro imported in this scope"),
+                        "Rename one of them, or call the imported one by its path.",
+                    ));
+                }
+                let x_inner = c.def == u32::MAX || (!c.textual && c.depth <= x.depth);
+                if x_inner {
+                    if x.expn != 0 && !self.expn_within(c.expn, x.expn) {
+                        return Err(ambiguous());
+                    }
+                    if x.glob && c.def == u32::MAX {
+                        return Err(Diag::new(
+                            "L0507",
+                            c.span,
+                            format!("`{text}` is ambiguous: a glob import in this scope and the std macro"),
+                            "Import the macro you mean explicitly, or call the std one as `std::{text}!`.",
+                        ));
+                    }
+                    return Err(err(
+                        C_UNSUPPORTED,
+                        c.span,
+                        format!("this call of `{text}!` comes before the `use` that binds `{text}` in its scope"),
+                        "Move the `use` above the call.",
+                    ));
+                }
+                if !self.expn_within(x.expn, c.def_expn) && !self.expn_within(c.expn, c.def_expn) {
+                    return Err(ambiguous());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// True when a plain call of this name is the L0507 glob
@@ -2029,8 +2286,8 @@ impl<'a> Expander<'a> {
     /// never read as the std macro.
     fn plain_call_ambiguous(&self, seg: &Seg) -> bool {
         match self.plain_macro(seg.sym, &seg.text) {
-            PlainMacro::Ambiguous => true,
-            PlainMacro::Found(_) => false,
+            PlainMacro::Ambiguous | PlainMacro::Expanded => true,
+            PlainMacro::Found(..) => false,
             PlainMacro::Fallthrough => {
                 self.ambiguous_imports.contains_key(&(self.module.clone(), seg.sym))
                     && !self.module_imports.contains_key(&(self.module.clone(), seg.sym))
@@ -2091,8 +2348,8 @@ impl<'a> Expander<'a> {
         };
         if !leading_colon && segs.len() == 1 {
             match self.plain_macro(last, texts[0]) {
-                PlainMacro::Found(idx) => return Some(idx),
-                PlainMacro::Ambiguous => return None,
+                PlainMacro::Found(idx, ..) => return Some(idx),
+                PlainMacro::Ambiguous | PlainMacro::Expanded => return None,
                 PlainMacro::Fallthrough => {}
             }
             if let Some(idx) = self.module_imports.get(&(self.module.clone(), last)).copied() {
@@ -3365,7 +3622,9 @@ impl<'a> Expander<'a> {
                 }
                 self.scope_depth += 1;
                 let module_depth = std::mem::replace(&mut self.module_depth, self.scope_depth);
+                let scope_calls = std::mem::replace(&mut self.scope_calls, self.plain_calls.len());
                 let expanded = self.expand_list(inner, depth, true, false, nest + 1);
+                self.scope_calls = scope_calls;
                 self.module_depth = module_depth;
                 self.scope_depth -= 1;
                 if name_sym.is_some() {
@@ -3387,6 +3646,21 @@ impl<'a> Expander<'a> {
                 out.push(Tt::Delim(Delim::Brace, inner, gspan));
                 i += 3;
                 continue;
+            }
+            // An out-of-line module: its file sees this textual scope, but
+            // the worklist passes it written definitions only.
+            if item_list
+                && tok_at(&trees, i).map(|t| t.tok) == Some(Tok::Mod)
+                && matches!(tok_at(&trees, i + 1).map(|t| t.tok), Some(Tok::Ident(_)))
+                && tok_at(&trees, i + 2).map(|t| t.tok) == Some(Tok::Semi)
+                && let Some(span) = self.expanded_textual_span()
+            {
+                return Err(err(
+                    C_UNSUPPORTED,
+                    span,
+                    "a `macro_rules!` that a macro expansion defines is in scope of an out-of-line module (`mod name;`)",
+                    "Define the macro with a written `macro_rules!`, or move the module declaration above the macro call.",
+                ));
             }
             // A `use` item: register what it imports, emit it unchanged.
             if let Some(end) = self.use_item_at(&trees, i, item_list) {
@@ -3412,6 +3686,11 @@ impl<'a> Expander<'a> {
                     Tt::Delim(d, inner, span) => (*d, inner.clone(), *span),
                     _ => unreachable!(),
                 };
+                if let [seg] = &segs[..]
+                    && !leading_colon
+                {
+                    self.note_plain_call(seg, seg.span.to(group_span));
+                }
                 // The parser owns only the plain `name!` form, so a
                 // path-qualified call (`std::println!`) keeps just its
                 // last segment and the bang. The name spans the whole
@@ -3437,7 +3716,9 @@ impl<'a> Expander<'a> {
                 // arguments; the other builtins take no outer attribute.
                 let group = if fmt_name == "vec" { Group::Vec } else { Group::Closed };
                 let outer_group = std::mem::replace(&mut self.group, group);
+                let outer_expn = self.enter_expn();
                 let expanded_inner = self.expand_list(inner, depth + args, false, false, nest + 1);
+                self.expn = outer_expn;
                 self.group = outer_group;
                 let mut expanded_inner = expanded_inner?;
                 expanded_inner.extend(msg);
@@ -3459,7 +3740,12 @@ impl<'a> Expander<'a> {
                 let span = segs.first().map_or(group_span, |s| s.span.to(group_span));
                 let call = Call { segs, leading_colon, head, delim, inner, group_span, span };
                 let mut next = group_idx + 1;
-                let expanded = self.expand_call(&call, depth)?;
+                // The call's output, and what walking it expands, is a new
+                // expansion (`expanded_shadows`).
+                let outer_expn = self.enter_expn();
+                let outer_items = std::mem::replace(&mut self.items_call, item_list);
+                let expanded = self.expand_call(&call, depth);
+                self.items_call = outer_items;
                 // An expansion in expression position takes an outer
                 // attribute where the call could have one.
                 let at_stmt = item_list
@@ -3473,8 +3759,9 @@ impl<'a> Expander<'a> {
                     Group::Expr(!cfg_run_misplaced(&out, &trees, i, self.group, self.enum_body, self.ctx.interner))
                 };
                 let outer_group = std::mem::replace(&mut self.group, group);
-                let expanded = self.expand_list(expanded, depth + 1, item_list, stmt_list, nest);
+                let expanded = expanded.and_then(|e| self.expand_list(e, depth + 1, item_list, stmt_list, nest));
                 self.group = outer_group;
+                self.expn = outer_expn;
                 let mut expanded = expanded?;
                 let begins_item = starts_item(&expanded, self.ctx.interner);
                 let next_is_semi = tok_at(&trees, next).map(|t| t.tok) == Some(Tok::Semi);
@@ -3596,7 +3883,9 @@ impl<'a> Expander<'a> {
                 let tuple = group == Group::Tuple && has_top(&inner, 0, Tok::Comma);
                 let outer_group = std::mem::replace(&mut self.group, group);
                 let outer_enum = std::mem::replace(&mut self.enum_body, enum_body);
+                let scope_calls = std::mem::replace(&mut self.scope_calls, self.plain_calls.len());
                 let expanded = self.expand_list(inner, depth, false, d == Delim::Brace, nest + 1);
+                self.scope_calls = scope_calls;
                 self.enum_body = outer_enum;
                 self.group = outer_group;
                 let expanded = match expanded {
@@ -3906,6 +4195,7 @@ impl<'a> Expander<'a> {
         // namespace ("macro-expanded macro_export macros cannot be
         // referred to by absolute paths"). Written defs carry the
         // root context; expansion output is stamped with its own.
+        let export_attr = exported;
         let exported = exported && def.span.ctxt == CtxtId::ROOT;
         self.check_dup_export(def.name, def.name_span, exported)?;
         check_def_form(trees, def)?;
@@ -3917,21 +4207,46 @@ impl<'a> Expander<'a> {
             && let Some(&idx) = self.exported.get(&def.name)
             && self.defs[idx as usize].name_span == def.name_span
         {
+            self.def_expn[idx as usize] = self.expn;
             self.push_textual(def.name, idx, def.name_span);
+            self.note_late_export(export_attr, def.name, idx);
             return Ok(());
         }
         let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
         compiled.local_def = local_def;
-        self.register(Arc::new(compiled), exported, true);
+        let idx = self.register(Arc::new(compiled), exported, true);
+        self.note_late_export(export_attr, def.name, idx);
         Ok(())
+    }
+
+    /// Records a `#[macro_export]` definition an expansion made as a
+    /// crate root binding (`late_bindings`).
+    fn note_late_export(&mut self, export_attr: bool, name: Sym, idx: u32) {
+        if export_attr && self.expn != 0 {
+            let calls = 0..self.plain_calls.len();
+            let x = LateBinding { module: Vec::new(), name, def: idx, expn: self.expn, depth: 0, calls, glob: false, block: false };
+            self.late_bindings.push(x);
+        }
     }
 
     /// If a `use` item a macro cares about starts at `trees[i]`, registers
     /// its macro imports and returns the index just past the `;`.
     fn use_item_at(&mut self, trees: &[Tt], i: usize, item_list: bool) -> Option<usize> {
         let (public, content, end) = use_span_at(trees, i)?;
+        let first = self.imports.len();
         for (segs, leading, alias) in collect_use_sites(&trees[content..end - 1], &[], self.ctx.interner) {
             self.import_macro(&segs, leading, alias, public && item_list);
+        }
+        // A block-level `use` binds in its whole block, and so does a
+        // module-level one an expansion made (the prescan reads the
+        // written ones).
+        if !item_list || self.expn != 0 {
+            for k in first..self.imports.len() {
+                let (name, def, depth, expn) = self.imports[k];
+                let calls = self.scope_calls..self.plain_calls.len();
+                let x = LateBinding { module: self.module.clone(), name, def, expn, depth, calls, glob: false, block: !item_list };
+                self.late_bindings.push(x);
+            }
         }
         // A glob in a block brings the target module's macros into
         // this lexical scope (module-level globs are seeded by the
@@ -3939,9 +4254,19 @@ impl<'a> Expander<'a> {
         // would double-count). A glob at item-list level of a
         // module in this file is module scope, so only a `use`
         // below an item list (a fn body or block) registers here.
-        if !item_list {
+        // A module-level glob an expansion made is not among the
+        // worklist's seeds (they come from written code), so it registers
+        // here too.
+        if !item_list || self.expn != 0 {
+            let first = self.glob_macros.len();
             for (segs, leading) in collect_use_globs(&trees[content..end - 1], &[], self.ctx.interner) {
                 self.import_glob_macros(&segs, leading);
+            }
+            for k in first..self.glob_macros.len() {
+                let (name, def, depth, expn) = self.glob_macros[k];
+                let calls = self.scope_calls..self.plain_calls.len();
+                let x = LateBinding { module: self.module.clone(), name, def, expn, depth, calls, glob: true, block: !item_list };
+                self.late_bindings.push(x);
             }
         }
         Some(end)
@@ -4036,7 +4361,7 @@ impl<'a> Expander<'a> {
                 None if self.ambiguous_imports.contains_key(&(target.clone(), name)) => u32::MAX,
                 None => continue,
             };
-            self.glob_macros.push((name, idx, depth));
+            self.glob_macros.push((name, idx, depth, self.expn));
         }
         let mut subs: Vec<Vec<Sym>> = Vec::new();
         for m in self.by_path.keys().map(|(m, _)| m).chain(self.module_imports.keys().map(|(m, _)| m)) {
@@ -4092,7 +4417,7 @@ impl<'a> Expander<'a> {
             .or_else(|| self.resolve_for_use(segs, leading_colon, &module))
             .or_else(|| if leading_colon { None } else { self.glob_path_lookup(segs) });
         if let Some(idx) = found {
-            self.imports.push((alias, idx, self.scope_depth));
+            self.imports.push((alias, idx, self.scope_depth, self.expn));
             if public {
                 self.by_path.insert((self.module.clone(), alias), idx);
             }
@@ -4112,6 +4437,14 @@ impl<'a> Expander<'a> {
         // is the L0507 ambiguity error, not a missing macro.
         if !call.leading_colon && call.segs.len() == 1 {
             let seg = &call.segs[0];
+            if matches!(self.plain_macro(seg.sym, &seg.text), PlainMacro::Expanded) {
+                return Err(Diag::new(
+                    "L0507",
+                    call.span,
+                    format!("`{}` is ambiguous: a macro-expanded macro may not shadow an existing macro of this name", seg.text),
+                    "Rename the macro the expansion defines, or call it only inside that expansion.",
+                ));
+            }
             if self.plain_call_ambiguous(seg) {
                 // With a textual definition in scope the conflict is
                 // rustc's macro_rules-vs-import one (`plain_macro`).
@@ -4125,6 +4458,7 @@ impl<'a> Expander<'a> {
                 }
                 return Err(crate::resolve::imports::ambiguous_diag(&seg.text, call.span));
             }
+            self.note_plain_call(seg, call.span);
         }
         if !call.leading_colon && call.segs.len() > 1 {
             self.check_macro_path_first(call)?;

@@ -6,6 +6,9 @@
 //! with dependencies, a macro can take a builtin's name in the local
 //! crate only through its own source:
 //! - a `macro_rules!` of that name (or of a `$x` name);
+//! - a `macro_rules!` a macro expansion defines (one inside a macro body or
+//!   a macro call's input): its scope follows rustc's rules for
+//!   macro-expanded macros (E0659), which this scan does not model;
 //! - `#[macro_use] extern crate dep;` (any `extern crate` but the std
 //!   libraries refuses here);
 //! - a `use` whose path passes through a dependency that is not clean
@@ -101,16 +104,29 @@ struct Flat {
 
 /// Adds every `use` tree of one file's tokens to `out`. False on an
 /// `extern crate` of a crate but the std libraries, a `macro_rules!` of a
-/// builtin's name (`builtin`) or of a `$x` name, or a tree the scan
-/// cannot read.
+/// builtin's name (`builtin`) or of a `$x` name, a `macro_rules!` inside a
+/// macro body or a macro call's input, or a tree the scan cannot read.
 fn file_uses(toks: &[Token], interner: &Interner, builtin: &dyn Fn(Sym) -> bool, out: &mut Vec<Flat>) -> bool {
     let at = |i: usize| toks.get(i).map(|t| &t.tok);
     let std_lib = |t: Option<&Tok>| matches!(t, Some(Tok::Ident(s)) if matches!(interner.get(*s), "std" | "core" | "alloc"));
+    let is_macro_rules = |t: Option<&Tok>| matches!(t, Some(Tok::Ident(s)) if interner.get(*s) == "macro_rules");
+    // Open groups, each true when it is a macro body (`macro_rules! m {`)
+    // or a macro call's input (`m!(`, not `#![`).
+    let mut groups: Vec<bool> = Vec::new();
     for i in 0..toks.len() {
         match &toks[i].tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                let back = |k: usize| i.checked_sub(k).and_then(|j| toks.get(j)).map(|t| &t.tok);
+                let call = back(1) == Some(&Tok::Bang) && back(2) != Some(&Tok::Pound);
+                let body = matches!(back(1), Some(Tok::Ident(_))) && back(2) == Some(&Tok::Bang) && is_macro_rules(back(3));
+                groups.push(call || body);
+            }
+            Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                groups.pop();
+            }
             Tok::Extern if at(i + 1) == Some(&Tok::Crate) && !std_lib(at(i + 2)) => return false,
             Tok::Ident(m) if at(i + 1) == Some(&Tok::Bang) && interner.get(*m) == "macro_rules" => match at(i + 2) {
-                Some(Tok::Ident(name)) if !builtin(*name) => {}
+                Some(Tok::Ident(name)) if !builtin(*name) && !groups.contains(&true) => {}
                 _ => return false,
             },
             // `use<'a, T>` is precise capturing, not an import.
@@ -244,6 +260,13 @@ mod tests {
         assert!(!shut("macro_rules! m { ($n:ident) => { macro_rules! $n { () => {} } } } fn main() {}"));
         assert!(!shut("mod m { pub(crate) use matches; } fn main() {}"));
         assert!(shut("macro_rules! twice { ($e:expr) => { $e * 2 } } pub(crate) use twice; fn main() {}"));
+    }
+
+    #[test]
+    fn macro_expanded_macros_open() {
+        assert!(!shut("macro_rules! d { () => { macro_rules! mym { () => {} } } } d!(); fn main() {}"));
+        assert!(!shut("macro_rules! id { ($($t:tt)*) => { $($t)* } } id! { macro_rules! mym { () => {} } } fn main() {}"));
+        assert!(shut("#![allow(unused)] macro_rules! a { () => { 1 } } fn main() { let _ = vec![a!()]; }"));
     }
 
     #[test]
