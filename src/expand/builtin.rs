@@ -802,8 +802,12 @@ fn write_macro(st: &mut Expander, newline: bool, call: &Call) -> Result<Vec<Tt>,
     Ok(write_shape(st, span, dst, fmt_args))
 }
 
+/// The destination goes in parentheses: rustc's `$dst:expr` is one
+/// expression node, so `write!(&mut v, ..)` calls `(&mut v).write_fmt`,
+/// not `&mut (v.write_fmt(..))`.
 fn write_shape(st: &mut Expander, span: Span, dst: Vec<Tt>, fmt_args: Vec<Tt>) -> Vec<Tt> {
     let mut tpl = st.lex_template("__lust_d.write_fmt(format_args!(__lust_a))", span);
+    let dst = vec![Tt::Delim(Delim::Paren, dst, span)];
     tpl = splice_placeholders(tpl, "__lust_d", &dst, st.ctx.interner);
     tpl = splice_placeholders(tpl, "__lust_a", &fmt_args, st.ctx.interner);
     tpl
