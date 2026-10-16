@@ -14680,11 +14680,16 @@ impl<'p> Ctx<'p> {
         }
         let args_id = self.tys.intern_args(&[GenericArg::Ty(base)]);
         let tr = TraitRef { def: self.p.gx.lang.iterator, args: args_id, bindings: EMPTY_BINDINGS };
+        // A trial: the selection's nested obligations (`impl<T> Iterator
+        // for Gen<T>` queues `?T: Sized`) go with its variables, or the
+        // queue keeps an unbound `?T: Sized` to body end (L0610).
         let snap = self.snapshot_vars();
+        let obl_len = self.obl_len();
         let is_iter = crate::ty::iter::is_iter(&self.tys, base)
             || self.tys.is_chars_ty(base)
             || matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_));
         self.rollback_vars(snap);
+        self.obl_truncate(obl_len);
         if !is_iter {
             return None;
         }
