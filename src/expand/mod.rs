@@ -3333,12 +3333,14 @@ impl<'a> Expander<'a> {
         }
         names.sort_by(|a, b| self.ctx.interner.get(*a).cmp(self.ctx.interner.get(*b)));
         for name in names {
-            // A public re-export (`by_path`) is what a glob of the
-            // target sees from outside; the target's own private
+            // A re-export (`by_path`) visible from here is what a glob
+            // of the target sees from outside; the target's own private
             // imports (`module_imports`) only count for a glob in
             // a body of that same module.
             let own = if target == self.module { self.module_imports.get(&(target.clone(), name)).copied() } else { None };
-            let idx = match self.by_path.get(&(target.clone(), name)).copied().or(own) {
+            let key = (target.clone(), name);
+            let visible = self.by_path_vis.get(&key).is_none_or(|v| self.module.starts_with(v));
+            let idx = match self.by_path.get(&key).copied().filter(|_| visible).or(own) {
                 Some(i) => i,
                 None if self.ambiguous_imports.contains_key(&(target.clone(), name)) => u32::MAX,
                 None => continue,
@@ -3375,7 +3377,10 @@ impl<'a> Expander<'a> {
             }
             let mut cand = gpath.clone();
             cand.extend_from_slice(&middle);
-            if let Some(&idx) = self.by_path.get(&(cand.clone(), last)) {
+            let key = (cand.clone(), last);
+            if let Some(&idx) = self.by_path.get(&key)
+                && self.by_path_vis.get(&key).is_none_or(|v| self.module.starts_with(v))
+            {
                 match &found {
                     Some((m, _)) if *m != cand => return None,
                     _ => found = Some((cand, idx)),

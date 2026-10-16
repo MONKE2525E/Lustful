@@ -2513,6 +2513,14 @@ impl MacroEnv {
         loop {
             let mut changed = false;
             for (si, site) in sites.iter().enumerate() {
+                // A private glob binds nothing another module reads by
+                // path in practice, and copying every macro of a
+                // prelude-style module into each importer made this
+                // fixpoint (and its seeds) quadratic on big crates; its
+                // plain-name scope comes from `glob_seeds` below.
+                if site.glob && site.vis.as_deref() == Some(site.module.as_slice()) {
+                    continue;
+                }
                 if site.glob {
                     let target = resolve_glob_module(&site.segs, site.leading, &site.module, &bindings);
                     let names: Vec<(Sym, usize, Option<Vec<Sym>>)> = bindings
