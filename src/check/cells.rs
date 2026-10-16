@@ -29,12 +29,20 @@ impl<'p> Ctx<'p> {
             // `T::default()` inside, built by the default glue (W-STD-B,
             // `cell_default_sig`).
             ("RefCell" | "Cell", "default") => Builtin::DefaultGlue,
+            // By path and as a value (`.map(RefCell::borrow)`): a
+            // PrimAssoc over the method's builtin (`prim_assoc_sig`).
+            ("RefCell", "borrow" | "borrow_mut") => {
+                let elem = self.new_var(false);
+                let self_ty = self.tys.mk_builtin1(|d| d.refcell, elem);
+                let b = if i == "borrow" { Builtin::RefCellBorrow } else { Builtin::RefCellBorrowMut };
+                return Some(Some(Res::PrimAssoc { b, self_ty, name: item }));
+            }
             ("Weak" | "RefCell" | "Cell", _) => {
                 self.err(
                     "L0104",
                     span,
                     format!("no function `{t}::{i}` in lust yet"),
-                    "Lust supports Weak::new, Weak::ptr_eq, RefCell::new, and Cell::new.",
+                    "Lust supports Weak::new, Weak::ptr_eq, RefCell::new, RefCell::borrow, RefCell::borrow_mut, and Cell::new.",
                 );
                 return Some(None);
             }

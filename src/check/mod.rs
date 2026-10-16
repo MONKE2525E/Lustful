@@ -995,6 +995,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::TrailingZeros, Builtin::UnboundedShl, Builtin::UnboundedShr, Builtin::UnsignedAbs, Builtin::WrappingAbs, Builtin::WrappingAdd,
     Builtin::WrappingDiv, Builtin::WrappingMul, Builtin::WrappingNeg, Builtin::WrappingPow, Builtin::WrappingRem, Builtin::WrappingShl,
     Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet, Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetRef), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetMut), Builtin::Sync(crate::check::sync::SyncOp::ArcWeakUpgrade),
+    Builtin::RefCellBorrow, Builtin::RefCellBorrowMut,
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
@@ -3650,6 +3651,25 @@ impl<'p> Ctx<'p> {
                 return Some((Builtin::Sync(op), vec![recv], ret, extras));
             }
             return None;
+        }
+        // `RefCell::borrow` and `borrow_mut` by path and as values
+        // (`.map(RefCell::borrow)`): `&RefCell<T>` to its guard, the
+        // receiver form of check/cells.rs's method table.
+        if let Some(el) = self.tys.refcell_elem(self_ty) {
+            let (b, guard) = match self.name(name) {
+                "borrow" => (B::RefCellBorrow, self.tys.mk_builtin1(|d| d.ref_guard, el)),
+                "borrow_mut" => (B::RefCellBorrowMut, self.tys.mk_builtin1(|d| d.ref_mut_guard, el)),
+                _ => return None,
+            };
+            let recv = self.tys.mk_ref(false, self_ty);
+            let extras = if extra.is_empty() {
+                let mut out = Vec::new();
+                self.collect_infer_tys(self_ty, &mut out);
+                out
+            } else {
+                extra.to_vec()
+            };
+            return Some((b, vec![recv], guard, extras));
         }
         // `NonZero::get` as a value (`map_or(1, NonZero::get)`,
         // TRIAGE T5): the wrapped integer, by value.
