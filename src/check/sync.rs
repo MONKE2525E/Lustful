@@ -39,6 +39,9 @@ pub enum SyncOp {
     AtomicFetch(FetchOp),
     /// `AtomicBool::fetch_not`.
     AtomicFetchNot,
+    /// `fetch_update(set_order, fetch_order, f)`: std's load, then
+    /// compare-exchange loop while `f` gives `Some`.
+    AtomicFetchUpdate,
     AtomicIntoInner,
     AtomicGetMut,
     /// `atomic::fence(order)`.
@@ -160,6 +163,8 @@ pub enum SyncOp {
     CondvarWait,
     /// `Condvar::wait_while(guard, condition)`.
     CondvarWaitWhile,
+    /// `Condvar::wait_timeout_while(guard, dur, condition)`.
+    CondvarWaitTimeoutWhile,
     CondvarNotifyOne,
     CondvarNotifyAll,
     BarrierWait,
@@ -194,7 +199,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 118] = [
+    pub const ALL: [SyncOp; 120] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -212,6 +217,7 @@ impl SyncOp {
         SyncOp::AtomicFetch(FetchOp::Max),
         SyncOp::AtomicFetch(FetchOp::Min),
         SyncOp::AtomicFetchNot,
+        SyncOp::AtomicFetchUpdate,
         SyncOp::AtomicIntoInner,
         SyncOp::AtomicGetMut,
         SyncOp::Fence,
@@ -284,6 +290,7 @@ impl SyncOp {
         SyncOp::SyncNew(SyncTy::Condvar),
         SyncOp::CondvarWait,
         SyncOp::CondvarWaitWhile,
+        SyncOp::CondvarWaitTimeoutWhile,
         SyncOp::CondvarNotifyOne,
         SyncOp::CondvarNotifyAll,
         SyncOp::BarrierWait,
@@ -339,6 +346,7 @@ impl SyncOp {
             SyncOp::AtomicFetch(FetchOp::Max) => (INTS, &["fetch_max"], m),
             SyncOp::AtomicFetch(FetchOp::Min) => (INTS, &["fetch_min"], m),
             SyncOp::AtomicFetchNot => (&["std::sync::atomic::AtomicBool"], &["fetch_not"], m),
+            SyncOp::AtomicFetchUpdate => (ATOMICS, &["fetch_update"], m),
             SyncOp::AtomicIntoInner => (ATOMICS, &["into_inner"], m),
             SyncOp::AtomicGetMut => (ATOMICS, &["get_mut"], m),
             SyncOp::Fence => (&["std::sync::atomic"], &["fence"], f),
@@ -411,6 +419,7 @@ impl SyncOp {
             SyncOp::SyncNew(_) => (&["std::sync::Condvar", "std::sync::Barrier", "std::sync::OnceLock<T>"], &["new"], a),
             SyncOp::CondvarWait => (&["std::sync::Condvar"], &["wait"], m),
             SyncOp::CondvarWaitWhile => (&["std::sync::Condvar"], &["wait_while"], m),
+            SyncOp::CondvarWaitTimeoutWhile => (&["std::sync::Condvar"], &["wait_timeout_while"], m),
             SyncOp::CondvarNotifyOne => (&["std::sync::Condvar"], &["notify_one"], m),
             SyncOp::CondvarNotifyAll => (&["std::sync::Condvar"], &["notify_all"], m),
             SyncOp::BarrierWait => (&["std::sync::Barrier"], &["wait"], m),
@@ -846,13 +855,19 @@ impl<'p> Ctx<'p> {
             "fetch_or" => fetch(FetchOp::Or),
             "fetch_xor" => fetch(FetchOp::Xor),
             "fetch_not" if !is_int => (SyncOp::AtomicFetchNot, Autoref::Ref, vec![ord], vt),
+            "fetch_update" => {
+                let opt = self.tys.mk_option(vt);
+                let f = self.sync_fn_mut_param(&[vt], opt, span);
+                let res = self.tys.mk_result(vt, vt);
+                (SyncOp::AtomicFetchUpdate, Autoref::Ref, vec![ord, ord, f], res)
+            }
             "into_inner" => (SyncOp::AtomicIntoInner, Autoref::None, vec![], vt),
             "get_mut" => {
                 let r = self.tys.mk_ref(true, vt);
                 (SyncOp::AtomicGetMut, Autoref::RefMut, vec![], r)
             }
             // Stable std methods lust does not have yet.
-            "fetch_update" | "as_ptr" | "compare_and_swap" | "from_ptr" | "update" | "try_update" => {
+            "as_ptr" | "compare_and_swap" | "from_ptr" | "update" | "try_update" => {
                 self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `load`, `store`, or `compare_exchange` in a loop.");
                 return Some(self.iter_bail(args));
             }
@@ -864,6 +879,24 @@ impl<'p> Ctx<'p> {
         self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(op), derefs, autoref });
         self.check_args(&params, args, span);
         self.lint_atomic_ordering(op, args);
+        // cgen calls a closure, a fn item of this program, or a fn pointer
+        // there (`Callee`); a builtin item (`Some`) is not one yet.
+        if op == SyncOp::AtomicFetchUpdate
+            && let Some(&fa) = args.get(2)
+        {
+            let mut ft = self.deep(self.out.expr_ty[self.ei(fa)]);
+            if let TyKind::Ref(_, _, i) = self.kind(ft) {
+                ft = self.deep(i);
+            }
+            let ok = match self.kind(ft) {
+                TyKind::Closure(..) | TyKind::FnPtr(_) | TyKind::Error => true,
+                TyKind::FnDef(d, _) => self.p.local_def(d.hash).is_some(),
+                _ => false,
+            };
+            if !ok {
+                self.errs.push(not_yet("L0641", self.span(fa), "this callable as `fetch_update`'s function (use a closure)"));
+            }
+        }
         Some(ret)
     }
 
@@ -1122,6 +1155,20 @@ impl<'p> Ctx<'p> {
                         (SyncOp::CondvarWaitWhile, Autoref::Ref, vec![g, f], ret)
                     }
                 }
+                // `wait_timeout_while(guard, dur, condition) ->
+                // LockResult<(MutexGuard<T>, WaitTimeoutResult)>`.
+                (SyncTy::Condvar, "wait_timeout_while") => {
+                    let t = self.new_var(false);
+                    let g = sync_ty(&mut self.tys, SyncTy::MutexGuard, &[t]);
+                    let wtr = generics::wait_timeout_result_ty(&mut self.tys);
+                    let ts = self.tys.intern_tys(&[g, wtr]);
+                    let pair = self.tys.intern(TyKind::Tuple(ts));
+                    let ret = self.lock_result(pair);
+                    let d = self.duration_ty();
+                    let tm = self.tys.mk_ref(true, t);
+                    let f = self.sync_fn_mut_param(&[tm], BOOL, span);
+                    (SyncOp::CondvarWaitTimeoutWhile, Autoref::Ref, vec![g, d, f], ret)
+                }
                 // `wait_timeout(guard, dur) -> LockResult<(MutexGuard<T>,
                 // WaitTimeoutResult)>` (TRIAGE T5); the ms form takes u64.
                 (SyncTy::Condvar, "wait_timeout" | "wait_timeout_ms") => {
@@ -1232,6 +1279,9 @@ impl<'p> Ctx<'p> {
             SyncOp::AtomicStore => (1, &[2, 3], "atomic stores cannot have `Acquire` or `AcqRel` ordering"),
             SyncOp::AtomicCompareExchange | SyncOp::AtomicCompareExchangeWeak => {
                 (3, &[1, 3], "`compare_exchange`'s failure ordering may not be `Release` or `AcqRel`")
+            }
+            SyncOp::AtomicFetchUpdate => {
+                (1, &[1, 3], "`fetch_update`'s failure ordering may not be `Release` or `AcqRel`, since a failed `fetch_update` does not result in a write")
             }
             SyncOp::Fence | SyncOp::CompilerFence => (0, &[0], "memory fences cannot have `Relaxed` ordering"),
             _ => return,

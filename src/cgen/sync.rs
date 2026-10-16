@@ -966,6 +966,57 @@ impl FnGen<'_, '_> {
         t
     }
 
+    /// `a.fetch_update(set_order, fetch_order, f)`, as std writes it: load
+    /// with `fetch_order`, then while `f(prev)` gives `Some(next)`, a
+    /// compare-exchange of `prev` for `next` (`Ok(prev)` on success; a
+    /// failure reloads `prev`); `Err(prev)` once `f` gives `None`.
+    fn atomic_fetch_update(&mut self, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
+        let callee = self.callee_of(&ops[3]);
+        let (a, at) = self.operand(&ops[0], loc, post);
+        let (so, sot) = self.operand(&ops[1], loc, post);
+        let (fo, fot) = self.operand(&ops[2], loc, post);
+        let v = atomic_of_ref(&at);
+        let w = width(v);
+        let word = format!("uint{}_t", w * 8);
+        let vt = vt_of(v);
+        let (env, env_ty) = self.operand(&ops[3], loc, post);
+        collect_types(&env_ty, &mut self.sig_types);
+        let ev = self.tmp();
+        let _ = writeln!(self.out, "    {} {ev} = {env};", ctype(&env_ty));
+        let res = CTy::Result(Box::new(vt.clone()), Box::new(vt.clone()));
+        let opt = CTy::Option(Box::new(vt.clone()));
+        collect_types(&res, &mut self.sig_types);
+        collect_types(&opt, &mut self.sig_types);
+        let (t, prev, old) = (self.tmp(), self.tmp(), self.tmp());
+        let (sord, ford) = (ord(self.p, &so, &sot), ord(self.p, &fo, &fot));
+        let _ = writeln!(self.out, "    {} {t}; {word} {prev} = lust_at_load_{w}(({word}*)({a}), {ford}, {loc});", ctype(&res));
+        let mut body = String::new();
+        let r = self.callee_call_c(&mut body, &callee, &ev, &[format!("(({}){prev})", ctype(&vt))]);
+        let ok_f = variant_field(self.p, &res, &t, 0, 0);
+        let err_f = variant_field(self.p, &res, &t, 1, 0);
+        let (set_ok, set_err) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
+        let nx = self.tmp();
+        let _ = writeln!(body, "  {} {nx} = {r};", ctype(&opt));
+        let some = variant_field(self.p, &opt, &nx, 1, 0);
+        let is_none = format!("{} == 0", disc_call(self.p, &opt, &format!("(&{nx})")));
+        let _ = writeln!(body, "  if ({is_none}) {{ {set_err} {err_f} = ({}){prev}; break; }}", ctype(&vt));
+        let _ = writeln!(body, "  {word} {old};");
+        let _ = writeln!(
+            body,
+            "  if (lust_at_cas_{w}(({word}*)({a}), {prev}, ({word})({some}), {sord}, {ford}, &{old}, 1)) {{ {set_ok} {ok_f} = ({}){prev}; break; }}",
+            ctype(&vt)
+        );
+        let _ = writeln!(body, "  {prev} = {old};");
+        let drop_env = if needs_drop_c(self.p, &env_ty) {
+            self.want(Glue::Drop, &env_ty);
+            format!("drop_{}(&{ev});", mangle(&env_ty))
+        } else {
+            String::new()
+        };
+        let _ = writeln!(self.out, "    for (;;) {{\n{body}    }}\n    {drop_env}");
+        t
+    }
+
     /// `cv.wait_while(guard, f)`: waits while `f(&mut *guard)` holds; and
     /// `once.get_or_init(f)`: runs `f` only in the call that sets the
     /// value (a closure that never runs still drops its env).
@@ -973,7 +1024,10 @@ impl FnGen<'_, '_> {
         let callee = self.callee_of(&ops[ci]);
         let once = !matches!(callee, Callee::Closure(_, false));
         let target = self.operand(&ops[0], loc, post).0;
-        let guard = (op == SyncOp::CondvarWaitWhile).then(|| self.operand(&ops[1], loc, post));
+        let guard = matches!(op, SyncOp::CondvarWaitWhile | SyncOp::CondvarWaitTimeoutWhile).then(|| self.operand(&ops[1], loc, post));
+        // `wait_timeout_while`: the duration, then std's loop over
+        // `dur.checked_sub(start.elapsed())` (the runtime's `lust_cv_left`).
+        let dur = (op == SyncOp::CondvarWaitTimeoutWhile).then(|| self.operand(&ops[2], loc, post));
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
         collect_types(&env_ty, &mut self.sig_types);
         let ev = self.tmp();
@@ -985,6 +1039,25 @@ impl FnGen<'_, '_> {
             String::new()
         };
         let mut body = String::new();
+        if let (Some((g, gt)), Some((d, dt))) = (guard.clone(), dur) {
+            let (secs, nanos) = if matches!(dt, CTy::Adt(_)) { (format!("({d}).f0"), format!("({d}).f1")) } else { (format!("({d}).secs"), format!("({d}).nanos")) };
+            let (start, timed, rs, rn) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
+            let _ = writeln!(self.out, "    long {start}[2]; lust_cv_start({start}); uint8_t {timed} = 0; uint64_t {rs}; uint32_t {rn};");
+            let r = self.callee_call_c(&mut body, &callee, &ev, &[format!("&({g})->v")]);
+            let _ = writeln!(body, "  if (!{r}) break;");
+            let _ = writeln!(body, "  if (!lust_cv_left({start}, {secs}, {nanos}, &{rs}, &{rn})) {{ {timed} = 1; break; }}");
+            let _ = writeln!(body, "  (void)lust_cv_wait_timeout({target}, &({g})->st, {rs}, {rn});");
+            let _ = writeln!(self.out, "    for (;;) {{\n{body}    }}\n    {drop_env}");
+            let wtr = self.p.tys.local_adt_of(crate::check::generics::wait_timeout_result_def()).map_or(CTy::Unit, CTy::Adt);
+            let pair = CTy::Tuple(vec![gt.clone(), wtr.clone()]);
+            let res = CTy::Result(Box::new(pair.clone()), Box::new(CTy::Sync(SyncTy::PoisonError, Box::new(pair.clone()))));
+            collect_types(&res, &mut self.sig_types);
+            let (pv, t) = (self.tmp(), self.tmp());
+            let _ = writeln!(self.out, "    {} {pv}; {pv}.f0 = {g}; {pv}.f1 = ({}){{ {timed} }};", ctype(&pair), ctype(&wtr));
+            let f = variant_field(self.p, &res, &t, 0, 0);
+            let _ = writeln!(self.out, "    {} {t}; {} {f} = {pv};", ctype(&res), disc_set(self.p, &res, &t, 0));
+            return t;
+        }
         if let Some((g, gt)) = guard {
             let r = self.callee_call_c(&mut body, &callee, &ev, &[format!("&({g})->v")]);
             let _ = writeln!(body, "  if (!{r}) break; lust_cv_wait({target}, &({g})->st);");
@@ -1170,9 +1243,13 @@ impl FnGen<'_, '_> {
         let ci = match op {
             SyncOp::ScopeSpawn | SyncOp::OnceGetOrInit | SyncOp::BuilderSpawn => 1,
             SyncOp::CondvarWaitWhile | SyncOp::BuilderSpawnScoped => 2,
+            SyncOp::CondvarWaitTimeoutWhile => 3,
             _ => 0,
         };
-        if matches!(op, SyncOp::CondvarWaitWhile | SyncOp::OnceGetOrInit) {
+        if op == SyncOp::AtomicFetchUpdate {
+            return self.atomic_fetch_update(ops, loc, post);
+        }
+        if matches!(op, SyncOp::CondvarWaitWhile | SyncOp::CondvarWaitTimeoutWhile | SyncOp::OnceGetOrInit) {
             return self.closure_wait_or_init(op, ops, ci, loc, post);
         }
         let callee = self.callee_of(&ops[ci]);

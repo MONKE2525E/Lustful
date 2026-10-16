@@ -1315,6 +1315,32 @@ static void lust_mono_now(long ts[2]) LUST_BODY({
 #endif
 })
 
+/* `Instant::now()` for `Condvar::wait_timeout_while` (cgen/sync.rs). */
+void lust_cv_start(long ts[2]) LUST_BODY({ lust_mono_now(ts); })
+
+/* std's `dur.checked_sub(start.elapsed())`: 1 and the time left in
+   `*rs`/`*rn`, or 0 when the elapsed time is past `dur`. */
+int lust_cv_left(const long start[2], uint64_t secs, uint32_t nanos, uint64_t *rs, uint32_t *rn) LUST_BODY({
+    long now[2];
+    lust_mono_now(now);
+    uint64_t es = (uint64_t)(now[0] - start[0]);
+    long en = now[1] - start[1];
+    if (en < 0) {
+        es -= 1;
+        en += 1000000000L;
+    }
+    if (es > secs || (es == secs && (uint32_t)en > nanos)) return 0;
+    uint64_t s = secs - es;
+    long n = (long)nanos - en;
+    if (n < 0) {
+        s -= 1;
+        n += 1000000000L;
+    }
+    *rs = s;
+    *rn = (uint32_t)n;
+    return 1;
+})
+
 int lust_cv_wait_timeout(uint32_t *cv, uint32_t *m, uint64_t secs, uint32_t nanos) LUST_BODY({
     long dl[2];
     lust_mono_now(dl);

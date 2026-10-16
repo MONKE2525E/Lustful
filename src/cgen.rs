@@ -4208,6 +4208,8 @@ impl FnGen<'_, '_> {
             | crate::check::sync::SyncOp::ScopeSpawn
             | crate::check::sync::SyncOp::ThreadScope
             | crate::check::sync::SyncOp::CondvarWaitWhile
+            | crate::check::sync::SyncOp::CondvarWaitTimeoutWhile
+            | crate::check::sync::SyncOp::AtomicFetchUpdate
             | crate::check::sync::SyncOp::OnceGetOrInit
             | crate::check::sync::SyncOp::BuilderSpawn
             | crate::check::sync::SyncOp::BuilderSpawnScoped),

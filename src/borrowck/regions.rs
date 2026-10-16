@@ -4283,7 +4283,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             return;
         }
         // `cv.wait(guard)` and `wait_while`: the guard comes back as is.
-        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::CondvarWait | crate::check::sync::SyncOp::CondvarWaitWhile)) = target
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::CondvarWait | crate::check::sync::SyncOp::CondvarWaitWhile | crate::check::sync::SyncOp::CondvarWaitTimeoutWhile)) = target
             && let Some((_, gv)) = avs.get(1)
             && dv.len() == 2 * gv.len()
         {
