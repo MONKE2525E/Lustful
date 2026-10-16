@@ -3311,6 +3311,11 @@ impl FnGen<'_, '_> {
                 let (t, xt, i) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(self.out, "    {et} {xt} = {xv};\n    uint64_t {i}_n = {nv};");
                 let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({i}_n, sizeof({et}), _Alignof({et}));");
+                if self.p.unwind {
+                    // A capacity overflow panic returns here under panic=unwind:
+                    // fill nothing, drop the value, and unwind.
+                    let _ = writeln!(self.out, "    if ({t}.cap < {i}_n) {i}_n = 0;");
+                }
                 let clone = if is_copy_c(self.p, &ec) {
                     xt.to_string()
                 } else {
@@ -6080,7 +6085,16 @@ impl FnGen<'_, '_> {
                     );
                 }
                 let _ = writeln!(self.out, "    if ({n} <= {vv}->len) {{ {vv}->len = {n}; }} else {{");
-                let _ = writeln!(self.out, "      lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));");
+                if self.p.unwind {
+                    // After a capacity overflow panic (panic=unwind) the Vec is
+                    // unchanged and the value is dropped; `(void)` keeps
+                    // `wrap_calls` from unwinding before that drop (the
+                    // statement's own check unwinds after it).
+                    let _ = writeln!(self.out, "      (void)lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));");
+                    let _ = writeln!(self.out, "      if ({vv}->cap >= {n}) {{");
+                } else {
+                    let _ = writeln!(self.out, "      lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));");
+                }
                 if is_copy_c(self.p, e) {
                     let _ = writeln!(self.out, "      while ({vv}->len < {n}) (({et}*){vv}->ptr)[{vv}->len++] = {tv};");
                 } else {
@@ -6092,6 +6106,15 @@ impl FnGen<'_, '_> {
                         "      for (uint64_t {i} = {vv}->len; {i} + 1 < {n}; {i}++) (({et}*){vv}->ptr)[{i}] = clone_{}(&{tv});\n      (({et}*){vv}->ptr)[{n} - 1] = {tv};\n      {vv}->len = {n};",
                         mangle(e)
                     );
+                }
+                if self.p.unwind {
+                    if needs_drop_c(self.p, e) {
+                        self.want(Glue::Drop, e);
+                        // The frame holds the exception while the drop runs.
+                        let _ = writeln!(self.out, "      }} else if (lust_unw_pending && lust_unw_take(&ex)) {{ drop_{}(&{tv}); lust_unw_resume(&ex); }}", mangle(e));
+                    } else {
+                        let _ = writeln!(self.out, "      }}");
+                    }
                 }
                 let _ = writeln!(self.out, "    }}");
                 "((lust_Unit){})".into()
