@@ -11004,13 +11004,24 @@ fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplReco
         // form here: the structural check and `prove_goal` do not
         // normalize projections in a trait ref's Self type.
         let t = crate::ty::subst(&mut p.tys, arg, impl_args);
-        let t = normalize_global(p, t);
+        let mut t = normalize_global(p, t);
+        // `&T: Debug` (and Display) holds exactly when `T: Debug` does
+        // (std's impls for `&T` and `&mut T`): ask about `T`, so
+        // `OnceCell<&No>` with `No: !Debug` makes no instance (its body
+        // check failed the build). A closure is never Debug or Display.
+        while let TyKind::Ref(_, _, u) = p.tys.kind(t) {
+            t = u;
+        }
+        if matches!(p.tys.kind(t), TyKind::Closure(..)) {
+            return false;
+        }
         // The structural answer (builtin types, tuples, derives), else a
         // written impl (`prove_goal`), else an arg the proof cannot see.
         let structural = if d == lang.debug { crate::check::collect::has_debug(p, &p.tys, t) } else { crate::check::collect::has_display(p, &p.tys, t) };
         let ok = structural || {
             let args = p.tys.intern_args(&[GenericArg::Ty(t)]);
-            prove_goal(p, &[], TraitRef { def: d, args, bindings: EMPTY_BINDINGS }) || args_hold_refs(&p.tys, t)
+            prove_goal(p, &[], TraitRef { def: d, args, bindings: EMPTY_BINDINGS })
+                || (args_hold_refs(&p.tys, t) && !ref_pointee_lacks(p, t, d, 0))
         };
         if !ok {
             return false;
@@ -11018,6 +11029,49 @@ fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplReco
     }
     let _ = tr;
     others.iter().all(|&o| prove_goal(p, &[], o)) || args_hold_refs(&p.tys, self_ty)
+}
+
+/// True when a reference inside `t`'s type arguments (at any depth)
+/// points at a type that surely lacks the fmt trait `d` (Debug or
+/// Display): a closure, or a type with no structural answer, no
+/// written impl, and no references of its own (`G<&No>` with `No:
+/// !Debug`). `fmt_impl_bounds_hold` trusts other reference args.
+fn ref_pointee_lacks(p: &mut Program, t: Ty, d: DefId, depth: u32) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    let inner: Vec<Ty> = match p.tys.kind(t) {
+        TyKind::Tuple(ts) => p.tys.tys_of(ts).to_vec(),
+        TyKind::Array(e, _) | TyKind::Slice(e) => vec![e],
+        TyKind::Adt(_, a) => p.tys.args(a).iter().filter_map(|g| g.as_ty()).collect(),
+        TyKind::Ref(..) => vec![t],
+        _ => return false,
+    };
+    for mut e in inner {
+        if !matches!(p.tys.kind(e), TyKind::Ref(..)) {
+            if ref_pointee_lacks(p, e, d, depth + 1) {
+                return true;
+            }
+            continue;
+        }
+        while let TyKind::Ref(_, _, u) = p.tys.kind(e) {
+            e = u;
+        }
+        if matches!(p.tys.kind(e), TyKind::Closure(..)) {
+            return true;
+        }
+        let lang = p.gx.lang;
+        let structural =
+            if d == lang.debug { crate::check::collect::has_debug(p, &p.tys, e) } else { crate::check::collect::has_display(p, &p.tys, e) };
+        let args = p.tys.intern_args(&[GenericArg::Ty(e)]);
+        if !structural && !prove_goal(p, &[], TraitRef { def: d, args, bindings: EMPTY_BINDINGS }) && !args_hold_refs(&p.tys, e) {
+            return true;
+        }
+        if ref_pointee_lacks(p, e, d, depth + 1) {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when some type argument of `t` (at any depth) is a reference,
