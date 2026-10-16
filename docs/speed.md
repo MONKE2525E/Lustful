@@ -343,6 +343,80 @@ tables below. The gate's speed row runs one probe per kind on
 goport-util-small.
 
 <!-- tsedit-table:start -->
+### `ts_goport (clean fork)`: 151,330 lines, 683 files
+
+ts-rust `660832d85`, lust `c938c0f9b`, rustc 1.99.0 (b940084d7 2026-09-28), 16 vCPU, 8 probes per kind, 200 states. Daemon first check 4226 ms, no-op 3.91 ms.
+
+| Kind | ok states | lust median | lust p95 | cargo median | cargo p95 | Ratio median | Ratio p95 | reject states | false accepts | warm != cold |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| body | 16 | 7.9 ms | 1416.1 | 3187 ms | 3592 | **401.3x** | **2.5x** | 8 | 0 | 0 |
+| infer | 24 | 246.7 ms | 1405.6 | 3101 ms | 3222 | **12.6x** | **2.3x** | 8 | 0 | 0 |
+| sig | 19 | 1958.8 ms | 2603.9 | 3077 ms | 3193 | **1.6x** | **1.2x** | 13 | 0 | 0 |
+| sigx | 12 | 1863.6 ms | 2587.9 | 3060 ms | 3317 | **1.6x** | **1.3x** | 4 | 0 | 0 |
+| oblig | 16 | 12.2 ms | 1534.5 | 3965 ms | 5170 | **325.2x** | **3.4x** | 8 | 0 | 0 |
+| derive | 15 | 3935.9 ms | 7019.8 | 8195 ms | 15403 | **2.1x** | **2.2x** | 1 | 0 | 0 |
+| generic | 18 | 9.3 ms | 16.5 | 4158 ms | 4746 | **446.7x** | **288.1x** | 6 | 0 | 0 |
+| rpit | 24 | 2457.3 ms | 5710.6 | 4212 ms | 9229 | **1.7x** | **1.6x** | 8 | 0 | 0 |
+
+### `goport_util (clean fork)`: 77,488 lines, 80 files
+
+ts-rust `660832d85`, lust `c938c0f9b`, rustc 1.99.0 (b940084d7 2026-09-28), 16 vCPU, 6 probes per kind, 132 states. Daemon first check 1349 ms, no-op 2.56 ms.
+
+| Kind | ok states | lust median | lust p95 | cargo median | cargo p95 | Ratio median | Ratio p95 | reject states | false accepts | warm != cold |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| body | 12 | 4.8 ms | 8.7 | 628 ms | 660 | **131.1x** | **76.0x** | 6 | 0 | 0 |
+| infer | 18 | 65.8 ms | 77.9 | 636 ms | 685 | **9.7x** | **8.8x** | 6 | 0 | 0 |
+| sig | 14 | 189.1 ms | 279.5 | 612 ms | 667 | **3.2x** | **2.4x** | 10 | 0 | 0 |
+| sigx | 9 | 229.0 ms | 286.0 | 707 ms | 754 | **3.1x** | **2.6x** | 3 | 0 | 0 |
+| oblig | 12 | 4.9 ms | 11.3 | 638 ms | 672 | **129.5x** | **59.3x** | 6 | 0 | 0 |
+| derive | 9 | 293.6 ms | 303.9 | 945 ms | 1157 | **3.2x** | **3.8x** | 3 | 0 | 0 |
+| generic | 13 | 4.3 ms | 15.8 | 563 ms | 630 | **131.1x** | **39.9x** | 5 | 0 | 0 |
+| rpit | 5 | 12.3 ms | 182.1 | 566 ms | 596 | **45.9x** | **3.3x** | 1 | 0 | 0 |
+
+### `goport_lsproto (clean fork)`: 31,500 lines, 17 files
+
+ts-rust `660832d85`, lust `c938c0f9b`, rustc 1.99.0 (b940084d7 2026-09-28), 16 vCPU, 6 probes per kind, 108 states. Daemon first check 1696 ms, no-op 3.33 ms.
+
+| Kind | ok states | lust median | lust p95 | cargo median | cargo p95 | Ratio median | Ratio p95 | reject states | false accepts | warm != cold |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| body | 12 | 5.0 ms | 12.4 | 1126 ms | 1212 | **224.7x** | **97.6x** | 6 | 0 | 0 |
+| infer | 18 | 108.5 ms | 130.1 | 1230 ms | 1315 | **11.3x** | **10.1x** | 6 | 0 | 0 |
+| sig | 15 | 291.3 ms | 443.0 | 1115 ms | 1248 | **3.8x** | **2.8x** | 9 | 0 | 0 |
+| sigx | 9 | 285.0 ms | 323.5 | 1186 ms | 1289 | **4.2x** | **4.0x** | 3 | 0 | 0 |
+| oblig | 12 | 5.3 ms | 9.2 | 1160 ms | 1236 | **217.7x** | **135.0x** | 6 | 0 | 0 |
+| derive | 7 | 493.9 ms | 523.3 | 1058 ms | 1650 | **2.1x** | **3.2x** | 5 | 0 | 0 |
+| generic | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| rpit | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+
+### `tsrust-all4`: 165,987 lines, 783 files
+
+ts-rust `b11b618ae`, lust `c938c0f9b`, rustc 1.99.0 (b940084d7 2026-09-28), 16 vCPU, 6 probes per kind, 150 states. Daemon first check 2414 ms, no-op 4.24 ms.
+
+| Kind | ok states | lust median | lust p95 | cargo median | cargo p95 | Ratio median | Ratio p95 | reject states | false accepts | warm != cold |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| body | 12 | 7.2 ms | 17.9 | 3805 ms | 4516 | **530.0x** | **252.7x** | 6 | 0 | 0 |
+| infer | 18 | 132.1 ms | 164.7 | 2759 ms | 4404 | **20.9x** | **26.7x** | 6 | 0 | 0 |
+| sig | 16 | 848.3 ms | 1028.9 | 2265 ms | 2381 | **2.7x** | **2.3x** | 8 | 0 | 0 |
+| sigx | 9 | 1018.7 ms | 1090.8 | 2384 ms | 2708 | **2.3x** | **2.5x** | 3 | 0 | 0 |
+| oblig | 12 | 4.5 ms | 9.9 | 2377 ms | 2662 | **534.1x** | **269.7x** | 6 | 0 | 0 |
+| derive | 9 | 1171.4 ms | 1299.5 | 3299 ms | 4842 | **2.8x** | **3.7x** | 3 | 0 | 0 |
+| generic | 14 | 4.1 ms | 11.0 | 2282 ms | 2452 | **551.3x** | **222.7x** | 4 | 0 | 0 |
+| rpit | 18 | 950.1 ms | 1303.5 | 2265 ms | 2659 | **2.4x** | **2.0x** | 6 | 0 | 0 |
+
+### `goport-util`: 37,978 lines, 81 files
+
+ts-rust `b11b618ae`, lust `c938c0f9b`, rustc 1.99.0 (b940084d7 2026-09-28), 16 vCPU, 6 probes per kind, 146 states. Daemon first check 399 ms, no-op 1.24 ms.
+
+| Kind | ok states | lust median | lust p95 | cargo median | cargo p95 | Ratio median | Ratio p95 | reject states | false accepts | warm != cold |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| body | 12 | 4.1 ms | 10.3 | 394 ms | 436 | **96.8x** | **42.3x** | 6 | 0 | 0 |
+| infer | 18 | 41.2 ms | 48.8 | 374 ms | 423 | **9.1x** | **8.7x** | 6 | 0 | 0 |
+| sig | 16 | 113.5 ms | 147.6 | 331 ms | 370 | **2.9x** | **2.5x** | 8 | 0 | 0 |
+| sigx | 9 | 132.2 ms | 149.6 | 382 ms | 414 | **2.9x** | **2.8x** | 3 | 0 | 0 |
+| oblig | 12 | 3.1 ms | 7.3 | 344 ms | 362 | **109.8x** | **49.8x** | 6 | 0 | 0 |
+| derive | 8 | 151.0 ms | 166.6 | 481 ms | 711 | **3.2x** | **4.3x** | 4 | 0 | 0 |
+| generic | 14 | 2.9 ms | 5.7 | 326 ms | 375 | **113.9x** | **66.5x** | 4 | 0 | 0 |
+| rpit | 15 | 103.2 ms | 121.9 | 280 ms | 326 | **2.7x** | **2.7x** | 5 | 0 | 0 |
 <!-- tsedit-table:end -->
 
 ## Larger slices
