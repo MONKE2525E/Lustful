@@ -10916,11 +10916,13 @@ fn iter_fn_instance(p: &mut Program, local: LocalDefId, impl_args: &[GenericArg]
 /// can call records anything (check/iter.rs `by_next_fns`): a written
 /// impl that defines no provided method besides `size_hint`. Std
 /// source Adts keep their builtin iterator kinds and are skipped, except
-/// the `core::iter` sources (library/core/src/iter.rs), which step by
-/// their own `next` as a user iterator does.
+/// the `core::iter` sources (library/core/src/iter.rs) and
+/// `core::char::DecodeUtf16`, which step by their own `next` as a user
+/// iterator does.
 fn ensure_iter_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>) {
     use crate::traits::index::Synthetic;
-    if p.gx.iter_methods.contains_key(&adt) || (p.is_std_adt(adt) && !p.display_path(p.adt(adt).name).starts_with("core::iter::")) {
+    let own_next = |path: String| path.starts_with("core::iter::") || path == "core::char::DecodeUtf16";
+    if p.gx.iter_methods.contains_key(&adt) || (p.is_std_adt(adt) && !own_next(p.display_path(p.adt(adt).name))) {
         return;
     }
     let Some(self_ty) = p.tys.full_adt_ty(adt) else { return };

@@ -180,3 +180,93 @@ impl char {
         ToUppercase { state: CaseState::new(self, true) }
     }
 }
+
+// `char::decode_utf16` (std `core/src/char/decode.rs`): UTF-16 code
+// units to chars, an unpaired surrogate as an error. No Debug for the
+// iterator (it would print the inner iterator's Debug) and no
+// `Error` impl here: both reject.
+
+/// An iterator that decodes UTF-16 encoded code points from an iterator
+/// of `u16`s.
+#[derive(Clone)]
+pub struct DecodeUtf16<I>
+where
+    I: Iterator<Item = u16>,
+{
+    iter: I,
+    buf: Option<u16>,
+}
+
+/// An error that can be returned when decoding UTF-16 code points.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DecodeUtf16Error {
+    code: u16,
+}
+
+impl<I: Iterator<Item = u16>> Iterator for DecodeUtf16<I> {
+    type Item = Result<char, DecodeUtf16Error>;
+
+    fn next(&mut self) -> Option<Result<char, DecodeUtf16Error>> {
+        let u = match self.buf.take() {
+            Some(buf) => buf,
+            None => self.iter.next()?,
+        };
+
+        // `from_u32` cannot fail on these values (std uses the unchecked
+        // form); `unwrap_or` keeps this std source free of panic sites.
+        if !(0xD800..=0xDFFF).contains(&u) {
+            Some(Ok(char::from_u32(u as u32).unwrap_or('\0')))
+        } else if u >= 0xDC00 {
+            Some(Err(DecodeUtf16Error { code: u }))
+        } else {
+            let u2 = match self.iter.next() {
+                Some(u2) => u2,
+                None => return Some(Err(DecodeUtf16Error { code: u })),
+            };
+            if u2 < 0xDC00 || u2 > 0xDFFF {
+                self.buf = Some(u2);
+                return Some(Err(DecodeUtf16Error { code: u }));
+            }
+            let c = (((u & 0x3ff) as u32) << 10 | (u2 & 0x3ff) as u32) + 0x1_0000;
+            Some(Ok(char::from_u32(c).unwrap_or('\0')))
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (low, high) = self.iter.size_hint();
+        let (low_buf, high_buf) = match self.buf {
+            None => (0, 0),
+            Some(u) if !(0xD800..=0xDFFF).contains(&u) => (1, 1),
+            Some(_u) if high == Some(0) => (1, 1),
+            Some(_u) => (0, 1),
+        };
+        let low = low.div_ceil(2) + low_buf;
+        let high = high.and_then(|h| h.checked_add(high_buf));
+        (low, high)
+    }
+}
+
+impl DecodeUtf16Error {
+    /// Returns the unpaired surrogate which caused this error.
+    pub fn unpaired_surrogate(&self) -> u16 {
+        self.code
+    }
+}
+
+impl core::fmt::Display for DecodeUtf16Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "unpaired surrogate found: {:x}", self.code)
+    }
+}
+
+impl char {
+    /// Creates an iterator over the UTF-16 encoded code points in `iter`,
+    /// returning unpaired surrogates as `Err`s.
+    // Std takes any `IntoIterator<Item = u16>` and returns
+    // `DecodeUtf16<I::IntoIter>`; lust cannot prove the struct's bound on
+    // that projection yet, so only iterators are taken here (the same
+    // type for them; other arguments reject).
+    pub fn decode_utf16<I: Iterator<Item = u16>>(iter: I) -> DecodeUtf16<I> {
+        DecodeUtf16 { iter, buf: None }
+    }
+}

@@ -95,7 +95,7 @@ pub const STD_MODULES: &[StdModule] = &[
         krate: ShippedCrate::Core,
         paths: &[("core", "char"), ("std", "char")],
         full: false,
-        triggers: &["ToLowercase", "ToUppercase", "to_lowercase", "to_uppercase"],
+        triggers: &["ToLowercase", "ToUppercase", "to_lowercase", "to_uppercase", "decode_utf16", "DecodeUtf16", "DecodeUtf16Error"],
     },
     StdModule {
         name: "__lust_std_sync",
