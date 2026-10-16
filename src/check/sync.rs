@@ -1417,7 +1417,7 @@ pub fn builtin_auto(
         }
         // `env::Args`, `Rc`, `rc::Weak`, the `RefCell` guards, and the
         // `fmt` types are neither `Send` nor `Sync`.
-        B::Args | B::Rc | B::Weak | B::RefGuard | B::RefMutGuard | B::Fmt(_) => Some(false),
+        B::Iter(crate::ty::iter::IterKind::Args) | B::Rc | B::Weak | B::RefGuard | B::RefMutGuard | B::Fmt(_) => Some(false),
         // `Cell<T>` and `RefCell<T>` are `Send` when `T` is; never `Sync`.
         B::Cell | B::RefCell => {
             if send {

@@ -1759,7 +1759,8 @@ impl<'p> Ctx<'p> {
             | K::ChunksExactMut
             | K::CharIndices
             | K::VecDrain
-            | K::StringDrain => true,
+            | K::StringDrain
+            | K::Args => true,
             K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => self.double_ended(a[0]),
             K::Chain => self.double_ended(a[0]) && self.double_ended(a[1]),
             // These need ExactSizeIterator too: lust keeps them forward-only for now.
@@ -1858,7 +1859,8 @@ impl<'p> Ctx<'p> {
             | K::MapIntoKeys
             | K::MapIntoValues
             | K::SetIter
-            | K::SetIntoIter => true,
+            | K::SetIntoIter
+            | K::Args => true,
             K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::StepBy | K::Copied | K::Cloned | K::Peekable | K::Inspect => {
                 self.exact_size(a[0], span)
             }

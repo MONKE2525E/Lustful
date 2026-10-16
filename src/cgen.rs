@@ -41,7 +41,6 @@ pub enum CTy {
     /// glue compares, orders, hashes, and prints the address itself.
     Ptr(Box<CTy>),
     Adt(AdtId),
-    Args,
     Chars,
     /// A tuple, emitted as a generated struct with fields f0, f1, ... (W-CORELANG).
     Tuple(Vec<CTy>),
@@ -267,7 +266,6 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
                 CTy::Result(Box::new(cty(tys, a)), Box::new(cty(tys, b)))
             }
             Some(BuiltinTy::Chars) => CTy::Chars,
-            Some(BuiltinTy::Args) => CTy::Args,
             Some(BuiltinTy::ExitCode) => CTy::ExitCode,
             Some(BuiltinTy::Iter(k)) => iter_cty(tys, t, k),
             Some(BuiltinTy::Fmt(k)) => CTy::Fmt(k),
@@ -404,6 +402,7 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => cty(tys, a[0]),
         K::MapIntoValues | K::ByNext => cty(tys, a[1]),
         K::StrSplit => CTy::Ref(Box::new(CTy::Str)),
+        K::Args => CTy::String,
         _ => iter_item_cty(tys, a[0]),
     }
 }
@@ -446,7 +445,7 @@ fn is128(i: IntTy) -> bool {
 /// core/src/iter/traits/accum.rs, 8 core/src/iter/range.rs, 9
 /// core/src/cell.rs, 10 std/src/thread/local.rs, 11 core/src/ops/arith.rs, 12
 /// core/src/slice/index.rs, 13 core/src/iter/traits/exact_size.rs, 14
-/// core/src/slice/mod.rs, 15 core/src/ops/function.rs),
+/// core/src/slice/mod.rs, 15 core/src/ops/function.rs, 16 std/src/env.rs),
 /// plus 0x40 for `pow`. Lowering names one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFF_FF00u64 + file) << 40) | (line << 20) | col)
@@ -517,7 +516,6 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(_) => format!("O_{}", mangle(t)),
         CTy::Result(..) => format!("R_{}", mangle(t)),
-        CTy::Args => "lust_Args".into(),
         CTy::ExitCode => "uint8_t".into(),
         CTy::AccessError => "lust_Unit".into(),
         CTy::BoxSlice(e) => ctype(&CTy::Slice(e.clone())),
@@ -590,7 +588,6 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Float(f) => tok(s, f.name(), &[]),
         CTy::Str => tok(s, "str", &[]),
         CTy::String => tok(s, "S", &[]),
-        CTy::Args => tok(s, "Args", &[]),
         CTy::Chars => tok(s, "Chars", &[]),
         CTy::Dyn => tok(s, "dyn", &[]),
         CTy::BoxDyn => tok(s, "Bxdyn", &[]),
@@ -756,7 +753,6 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         | CTy::FnPtr(..)
         | CTy::Ref(_)
         | CTy::Ptr(_)
-        | CTy::Args
         | CTy::ExitCode
         | CTy::AccessError
         | CTy::Chars
@@ -1064,7 +1060,6 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                     HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues => Some(plain_layout(104, 8)),
                 }
             }
-            CTy::Args => Some(plain_layout(8, 8)),
             CTy::ExitCode => Some(plain_layout(1, 1)),
             // A lock: its words, the poison flag, then the value (no
             // niche: `UnsafeCell`). `PoisonError<T>` is laid out as `T`.
@@ -1330,7 +1325,6 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let align = ea.max(8);
                 (align_up(align_up(8, ea) + es, align), align)
             }
-            CTy::Args => (8, 8),
             CTy::Fmt(k) => fmt_size_align(*k),
             CTy::ExitCode => (1, 1),
             CTy::Sync(k, e) if k.is_cell_struct() => {
@@ -2780,6 +2774,9 @@ impl FnGen<'_, '_> {
             // `MaybeUninit::uninit` and `zeroed` (TRIAGE T5): a
             // zero compound literal of the destination type (an
             // uninitialized value may hold any bytes; zero is one).
+            // `env::args()`: the `IterKind::Args` state (front, back)
+            // over every process argument.
+            CallTarget::Builtin(Builtin::EnvArgs) => format!("(({}){{ 0, (uint64_t)lust_argc }})", ctype(dest_cty)),
             CallTarget::Builtin(Builtin::MaybeUninitUninit | Builtin::MaybeUninitZeroed) => format!("(({}){{0}})", ctype(dest_cty)),
             CallTarget::Builtin(Builtin::MaybeUninitNew) => {
                 let (v, _) = self.operand(&args[0], loc, post);
@@ -4418,8 +4415,8 @@ impl FnGen<'_, '_> {
                     t
                 }
             }
-            B::EnvArgs => "((lust_Args){ (uint64_t)lust_argc })".into(),
-            B::ArgsCount => format!("{}.n", vals[0]),
+            B::EnvArgs => unreachable!("a dest-typed compound literal in the call dispatch"),
+            B::EnvArg => format!("lust_env_arg({}, {})", vals[0], vals[1]),
             B::StrLen => format!("{}.len", vals[0]),
             B::StrIsEmpty => format!("({}.len == 0)", vals[0]),
             B::StrToString => format!("lust_string_from({})", vals[0]),

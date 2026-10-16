@@ -718,7 +718,6 @@ fn tn_adt(p: &Program, tys: &mut impl TyIntern, t: Ty, open: bool, in_sig: bool)
         Some(B::RefGuard) => return Some(tn_apply("core::cell::Ref", vec!["'_".into(), tn_first(p, tys, t, open, in_sig)?])),
         Some(B::RefMutGuard) => return Some(tn_apply("core::cell::RefMut", vec!["'_".into(), tn_first(p, tys, t, open, in_sig)?])),
         Some(B::Chars) => return Some("core::str::iter::Chars<'_>".into()),
-        Some(B::Args) => return Some("std::env::Args".into()),
         Some(B::ExitCode) => return Some("std::process::ExitCode".into()),
         Some(B::LocalKey) => return one(p, tys, "std::thread::local::LocalKey"),
         Some(B::AccessError) => return Some("std::thread::local::AccessError".into()),
@@ -897,6 +896,7 @@ fn tn_iter(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::iter::Iter
         K::SetIter => lt_one(tys, "std::collections::hash::set::Iter"),
         K::SetIntoIter => one(tys, "std::collections::hash::set::IntoIter"),
         K::StrSplit => tn_str_split(p, tys, &args, open, in_sig),
+        K::Args => Some("std::env::Args".into()),
         _ => None,
     }
 }

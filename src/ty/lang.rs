@@ -1839,6 +1839,7 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/str/Bytes",
     "std/str/CharIndices",
     "std/str/Chars",
+    "std/env/Args",
     "std/str/Lines",
     "std/str/RSplit",
     "std/str/RSplitN",

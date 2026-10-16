@@ -2392,6 +2392,42 @@ int lust_utf8_check(const uint8_t *v, uint64_t len, uint64_t *valid_up_to, uint8
     return 1;
 })
 
+/* `env::Args` (IterKind::Args): process argument `i` as a String. One
+   that is not UTF-8 panics as std's `Args::next` (`back` 0) or
+   `next_back` (`back` 1) does: `into_string().unwrap()` on an Err that
+   prints the bytes with OsStr's Debug (valid runs as str Debug escapes
+   them, each invalid byte as \xNN). */
+lust_String lust_env_arg(uint64_t i, int back) LUST_BODY({
+    lust_str a;
+    a.ptr = (const uint8_t *)lust_argv[i];
+    a.len = strlen(lust_argv[i]);
+    uint64_t up;
+    uint8_t el;
+    if (lust_utf8_check(a.ptr, a.len, &up, &el)) return lust_string_from(a);
+    lust_String s = lust_string_new();
+    lust_string_push_cstr(&s, "called `Result::unwrap()` on an `Err` value: \"");
+    uint64_t at = 0;
+    while (at < a.len) {
+        if (!lust_utf8_check(a.ptr + at, a.len - at, &up, &el)) {
+            if (el == 0) el = (uint8_t)(a.len - at - up);
+        } else {
+            up = a.len - at;
+            el = 0;
+        }
+        uint64_t j = at;
+        while (j < at + up) lust_fmt_escape(&s, lust_utf8_next(a.ptr, &j), '"');
+        for (uint64_t k = 0; k < el; k++) {
+            char b[8];
+            snprintf(b, sizeof b, "\\x%02X", a.ptr[at + up + k]);
+            lust_string_push_cstr(&s, b);
+        }
+        at += up + el;
+    }
+    lust_string_push_cstr(&s, "\"");
+    lust_panic(&s, back ? lust_std_loc(16, 914, 56) : lust_std_loc(16, 878, 51));
+    return lust_string_new();
+})
+
 /* `Display` of `str::Utf8Error` (and `FromUtf8Error`, which shows its
    `Utf8Error`): Rust writes it with `write!`, so no padding applies. */
 void lust_fmt_utf8_error(lust_String *out, uint64_t valid_up_to, uint32_t has_len, uint64_t len) LUST_BODY({

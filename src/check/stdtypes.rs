@@ -87,6 +87,7 @@ pub fn iter_by_path(path: &[&str]) -> Option<StdIterPath> {
         ["std" | "core", "iter", "Inspect"] => S::Kind(K::Inspect),
         ["std" | "core", "iter", "Flatten"] => S::Kind(K::Flatten),
         ["std" | "core", "iter", "RepeatN"] => S::Kind(K::RepeatN),
+        ["std", "env", "Args"] => S::Kind(K::Args),
         ["std" | "core", "option", "Iter"] => S::Kind(K::OptionIter),
         ["std" | "core", "option", "IterMut"] => S::Kind(K::OptionIterMut),
         ["std" | "core", "option", "IntoIter"] => S::Kind(K::OptionIntoIter),

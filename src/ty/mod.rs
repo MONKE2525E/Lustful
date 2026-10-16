@@ -6,7 +6,7 @@
 // interned slice arenas next to the kind arena (`ArgsId`, `TysId`); with ids as payloads
 // `TyKind` stays `Copy` and hashing a `Ty` stays O(1).
 //
-// `String`, `Vec<T>`, `Option<T>`, `Chars`, and `Args` are `Adt` types with builtin defs
+// `String`, `Vec<T>`, `Option<T>`, and `Chars` are `Adt` types with builtin defs
 // (see `BuiltinDefs`), not `TyKind` cases. The special code paths for them in check, lower,
 // and cgen stay until the minimal generic pipeline passes its gate (ARCH 9.3); those paths
 // now reach the types through the compat helpers on `TyIntern` (`vec_elem`, `is_string_ty`,
@@ -666,8 +666,6 @@ pub struct BuiltinDefs {
     pub rc: DefId,
     /// `str::Chars`, the iterator from `s.chars()`.
     pub chars: DefId,
-    /// `std::env::Args`.
-    pub args: DefId,
     /// The builtin iterator structs, by `IterKind` index (ty/iter.rs).
     pub iters: [DefId; iter::IterKind::ALL.len()],
     /// The `core::fmt` structs, by `FmtTy` index (ty/fmt.rs).
@@ -713,8 +711,6 @@ impl BuiltinDefs {
             Some(BuiltinTy::Result)
         } else if def == self.chars {
             Some(BuiltinTy::Chars)
-        } else if def == self.args {
-            Some(BuiltinTy::Args)
         } else if let Some(i) = self.fmt_tys.iter().position(|&d| d == def) {
             Some(BuiltinTy::Fmt(fmt::FmtTy::ALL[i]))
         } else if def == self.weak {
@@ -754,7 +750,6 @@ pub enum BuiltinTy {
     Boxed,
     Rc,
     Chars,
-    Args,
     /// A std iterator struct (ty/iter.rs).
     Iter(iter::IterKind),
     /// A `core::fmt` struct (ty/fmt.rs).
@@ -1318,7 +1313,6 @@ impl GlobalTys {
             boxed: builtin_def(&["alloc", "boxed"], "Box"),
             rc: builtin_def(&["alloc", "rc"], "Rc"),
             chars: builtin_def(&["core", "str"], "Chars"),
-            args: builtin_def(&["std", "env"], "Args"),
             iters: iter::IterKind::ALL.map(iter::iter_def),
             fmt_tys: fmt::FmtTy::ALL.map(fmt::fmt_def),
             weak: builtin_def(&["alloc", "rc"], "Weak"),
@@ -1365,7 +1359,7 @@ impl GlobalTys {
             g.intern(TyKind::Str),
             g.intern(TyKind::Adt(builtins.string, EMPTY_ARGS)),
             g.intern(TyKind::Never),
-            g.intern(TyKind::Adt(builtins.args, EMPTY_ARGS)),
+            g.intern(TyKind::Adt(builtins.iters[iter::IterKind::Args as usize], EMPTY_ARGS)),
             g.mk_ref(false, STR),
         ];
         debug_assert_eq!(pre, [ERROR, UNIT, BOOL, CHAR, STR, STRING, NEVER, ARGS, REF_STR]);
@@ -1971,7 +1965,7 @@ mod tests {
         let mut g = GlobalTys::new();
         let b = g.builtins();
         assert_eq!(g.kind(STRING), TyKind::Adt(b.string, EMPTY_ARGS));
-        assert_eq!(g.kind(ARGS), TyKind::Adt(b.args, EMPTY_ARGS));
+        assert_eq!(g.kind(ARGS), TyKind::Adt(b.iters[iter::IterKind::Args as usize], EMPTY_ARGS));
         assert_eq!(g.kind(CHARS), TyKind::Adt(b.chars, EMPTY_ARGS));
         assert_eq!(g.kind(REF_STR), TyKind::Ref(Region::Erased, Mut::Shared, STR));
         assert_eq!(g.kind(I32), TyKind::Int(IntTy::I32));

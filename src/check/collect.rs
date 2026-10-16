@@ -664,7 +664,6 @@ pub fn ty_name(p: &Program, tys: &impl TyIntern, t: Ty) -> String {
             Some(BuiltinTy::RefGuard) => format!("Ref<'_, {}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::RefMutGuard) => format!("RefMut<'_, {}>", tys.adt_first_ty_arg(t).map_or("_".into(), |e| ty_name(p, tys, e))),
             Some(BuiltinTy::Chars) => "std::str::Chars".into(),
-            Some(BuiltinTy::Args) => "std::env::Args".into(),
             Some(BuiltinTy::Fmt(k)) => format!("std::fmt::{}", k.name()),
             Some(BuiltinTy::ExitCode) => "ExitCode".into(),
             Some(BuiltinTy::Sync(k)) => match tys.adt_first_ty_arg(t) {
@@ -3167,7 +3166,6 @@ pub fn collect_reuse(
         };
         insert_builtin(&mut p, b.result, DefsKind::Enum, known.Result, two_ty_params);
         insert_builtin(&mut p, b.chars, DefsKind::Struct, interner.intern("Chars"), Generics::default());
-        insert_builtin(&mut p, b.args, DefsKind::Struct, interner.intern("Args"), Generics::default());
         for k in crate::ty::fmt::FmtTy::ALL {
             insert_builtin(&mut p, b.fmt_tys[k as usize], DefsKind::Struct, interner.intern(k.name()), Generics::default());
         }

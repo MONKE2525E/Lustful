@@ -565,7 +565,6 @@ impl AdtTables {
                 | BuiltinTy::Boxed
                 | BuiltinTy::Rc
                 | BuiltinTy::Chars
-                | BuiltinTy::Args
                 | BuiltinTy::Iter(_)
                 | BuiltinTy::Weak,
             ) => return (Variance::Co, DropMode::Owned),
@@ -5286,7 +5285,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => args[0].clone(),
             K::MapIntoValues | K::ByNext => args[1].clone(),
             // (usize, char): no regions.
-            K::CharIndices | K::StringDrain => Vec::new(),
+            K::CharIndices | K::StringDrain | K::Args => Vec::new(),
             // Range kinds that are `RangeBounds` values here, not iterators.
             K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
             K::Flatten => self.item_slots(a[1], &args[1])?,
@@ -5636,7 +5635,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk => false,
+            K::StringDrain | K::RangeFrom | K::RangeTo | K::RangeFull | K::RangeToInclusive | K::Utf8Chunk | K::Args => false,
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
                 vars.get(..n0).is_some_and(|v| self.iter_items(a0, v, out))
             }

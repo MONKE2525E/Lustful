@@ -8293,6 +8293,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 }
                 K::MapIntoKeys | K::SetIntoIter | K::RepeatN | K::ArrayIntoIter => ps[0],
                 K::MapIntoValues | K::ByNext => ps[1],
+                K::Args => STRING,
                 K::Enumerate => {
                     let inner = proj(p, ps[0]);
                     let ts = p.tys.intern_tys(&[USIZE, inner]);
@@ -8334,7 +8335,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 | K::MapIntoKeys
                 | K::MapIntoValues
                 | K::SetIter
-                | K::SetIntoIter => Some(Vec::new()),
+                | K::SetIntoIter
+                | K::Args => Some(Vec::new()),
                 K::Map | K::Copied | K::Cloned | K::Rev | K::Enumerate | K::Inspect | K::Take | K::Skip | K::StepBy | K::Peekable => {
                     Some(vec![pred_on(p, lang.exact_size_iterator, ps[0])])
                 }
@@ -8359,7 +8361,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 | K::OptionIntoIter
                 | K::ResultIter
                 | K::ResultIterMut
-                | K::ResultIntoIter => Some(Vec::new()),
+                | K::ResultIntoIter
+                | K::Args => Some(Vec::new()),
                 K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => {
                     Some(vec![pred_on(p, lang.double_ended_iterator, ps[0])])
                 }

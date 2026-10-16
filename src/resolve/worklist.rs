@@ -440,14 +440,15 @@ fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
                     && matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::PathSep))
                     && match toks.get(i + 2).map(|t| t.tok) {
                         Some(Tok::Ident(m)) => {
-                            // `std::env::args` and `std::process::exit` keep
-                            // the compiler's std handling: no route change.
+                            // `std::env::args` (and its `Args` type) and
+                            // `std::process::exit` keep the compiler's std
+                            // handling: no route change.
                             let item = match (toks.get(i + 3).map(|t| t.tok), toks.get(i + 4).map(|t| t.tok)) {
                                 (Some(Tok::PathSep), Some(Tok::Ident(n))) => interner.get(n),
                                 _ => "",
                             };
                             match interner.get(m) {
-                                "env" => item != "args",
+                                "env" => !matches!(item, "args" | "Args"),
                                 "process" => !matches!(item, "exit" | "abort"),
                                 // They return `io::Result`: `std::io::Error` is
                                 // in the platform crate (mentions_std_platform).
@@ -1330,12 +1331,12 @@ fn group_names_platform(text: &str) -> bool {
     false
 }
 
-/// True for `std::env::args` and `std::process::exit`/`abort` (`rest`
+/// True for `std::env::args` and `Args` and `std::process::exit`/`abort` (`rest`
 /// follows the module name): the compiler's own std handling serves
 /// them, as in `needs_resolve_lexed`, so they need no platform crate.
 fn compiler_std_item(module: &str, rest: &str) -> bool {
     let items: &[&str] = match module {
-        "env" => &["::args"],
+        "env" => &["::args", "::Args"],
         "process" => &["::exit", "::abort"],
         _ => return false,
     };

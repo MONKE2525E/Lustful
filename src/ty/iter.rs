@@ -192,6 +192,11 @@ pub enum IterKind {
     /// declaration order for drop. Never named in source: only the
     /// `collect` expansion builds one (lower/iter.rs).
     TryCollect,
+    /// `std::env::Args`: no args, item `String`; (front, back)
+    /// indexes into the process arguments. `next` and `next_back`
+    /// check the UTF-8 of the argument they take and panic as std's
+    /// `into_string().unwrap()` does (runtime `lust_env_arg`).
+    Args,
 }
 
 /// Which std struct a `StrSplit` is (its `[u8; mode]` type argument).
@@ -310,7 +315,7 @@ pub enum Field {
 }
 
 impl IterKind {
-    pub const ALL: [IterKind; 62] = [
+    pub const ALL: [IterKind; 63] = [
         IterKind::SliceIter,
         IterKind::SliceIterMut,
         IterKind::VecIntoIter,
@@ -373,6 +378,7 @@ impl IterKind {
         IterKind::Utf8Chunks,
         IterKind::Utf8Chunk,
         IterKind::TryCollect,
+        IterKind::Args,
     ];
 
     /// True for the hashed-collection iterators.
@@ -456,6 +462,7 @@ impl IterKind {
             K::Utf8Chunks => (&["core", "str"], "Utf8Chunks"),
             K::Utf8Chunk => (&["core", "str"], "Utf8Chunk"),
             K::TryCollect => (&["core", "iter", "lust"], "TryCollect"),
+            K::Args => (&["std", "env"], "Args"),
         }
     }
 
@@ -502,7 +509,7 @@ impl IterKind {
             | K::MapIntoIter
             | K::MapIntoKeys
             | K::MapIntoValues => 2,
-            K::CharIndices | K::StringDrain | K::RangeFull | K::EncodeUtf16 => 0,
+            K::CharIndices | K::StringDrain | K::RangeFull | K::EncodeUtf16 | K::Args => 0,
             _ => 1,
         }
     }
@@ -573,6 +580,7 @@ impl IterKind {
             K::Utf8Chunks => "std::str::Utf8Chunks",
             K::Utf8Chunk => "std::str::Utf8Chunk",
             K::TryCollect => "",
+            K::Args => "std::env::Args",
         }
     }
 
@@ -651,6 +659,7 @@ impl IterKind {
             // stores its flag.
             K::RangeFull => &[F::Bool],
             K::TryCollect => &[F::Arg(0), F::OptArg(1)],
+            K::Args => &[F::Usize, F::Usize],
         }
     }
 }
@@ -765,6 +774,7 @@ pub fn item_ty(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         },
         K::EncodeUtf16 => int(IntTy::U16),
         K::TryCollect => a[2],
+        K::Args => STRING,
     })
 }
 

@@ -1860,6 +1860,29 @@ impl Ex<'_, '_> {
                 self.none(&dest, opt);
                 self.goto(join);
             }
+            // `env::Args`: the argument at the front (or back) index while
+            // the indexes differ, taken first, then checked as UTF-8 as
+            // std's `into_string().unwrap()` does (runtime `lust_env_arg`).
+            K::Args => {
+                let c = self.cmp(Lt, Operand::Copy(f(0)), Operand::Copy(f(1)));
+                let (s, n) = self.branch(c);
+                self.cur = s;
+                let idx = self.local(USIZE);
+                if back {
+                    self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
+                    self.assign(Place::local(idx), Rvalue::Use(Operand::Copy(f(1))));
+                } else {
+                    self.assign(Place::local(idx), Rvalue::Use(Operand::Copy(f(0))));
+                    self.assign(f(0), Rvalue::Bin(Add, Operand::Copy(f(0)), Self::usize_c(1)));
+                }
+                let st = self.local(STRING);
+                self.call_builtin(Builtin::EnvArg, vec![Operand::Copy(Place::local(idx)), Operand::Const(Const::Bool(back))], Place::local(st));
+                self.some(&dest, opt, Operand::Move(Place::local(st)));
+                self.goto(join);
+                self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
             // `iter::RepeatN` (Copy `T`, W-STD-B): the element while the
             // count lasts, from either end.
             K::RepeatN => {
@@ -3949,6 +3972,12 @@ impl Ex<'_, '_> {
                 let n = self.size(itp.clone(), ty)?;
                 set_exact(self, n);
             }
+            // `env::Args`: exact, back index minus front index.
+            K::Args => {
+                let n = self.local(USIZE);
+                self.assign(Place::local(n), Rvalue::Bin(Sub, Operand::Copy(f(1)), Operand::Copy(f(0))));
+                set_exact(self, Operand::Copy(Place::local(n)));
+            }
             K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => {
                 let n = self.size(itp.clone(), ty)?;
                 set_exact(self, n);
@@ -4464,6 +4493,8 @@ impl Ex<'_, '_> {
             // `ProcessResults` is not `TrustedLen` (a failure can
             // end it early), whatever the source is.
             K::TryCollect => false,
+            // `env::Args` is not `TrustedLen` in std.
+            K::Args => false,
         }
     }
 

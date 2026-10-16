@@ -3866,7 +3866,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     (9u8, a.0).hash(h);
                     crate::driver::graph::layout_fingerprint(p, p.def_of_adt(*a)).0.hash(h);
                 }
-                cgen::CTy::Args => 10u8.hash(h),
                 cgen::CTy::Chars => 11u8.hash(h),
                 cgen::CTy::Fmt(k) => (40u8, *k as u8).hash(h),
                 cgen::CTy::Unsized(a, x) => {

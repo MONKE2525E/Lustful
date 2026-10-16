@@ -78,7 +78,9 @@ pub enum Builtin {
     VecNew,
     VecWithCapacity,
     EnvArgs,
-    ArgsCount,
+    /// One process argument as a `String` (`IterKind::Args`'s `next`
+    /// and `next_back`, lower/iter.rs): args (index, from the back).
+    EnvArg,
     StrLen,
     StrIsEmpty,
     StrToString,
@@ -15240,7 +15242,6 @@ impl<'p> Ctx<'p> {
                 Some((B::BoolThen, Autoref::None, vec![f], o))
             }
             (None, TyKind::Bool | TyKind::Char) if name == k.to_string => Some((B::ToString, Autoref::Ref, vec![], STRING)),
-            (Some(BuiltinTy::Args), _) if name == k.count => Some((B::ArgsCount, Autoref::None, vec![], USIZE)),
             // Trait methods work on an integer of unknown type; inherent ones (pow, abs) do not.
             (None, k2) if k2.is_int_infer() && name == k.min => Some((B::Min, Autoref::None, vec![base], base)),
             (None, k2) if k2.is_int_infer() && name == k.max => Some((B::Max, Autoref::None, vec![base], base)),
@@ -17173,7 +17174,7 @@ impl<'p> Ctx<'p> {
         // Valid Rust lust has no rendering for yet: integer exponent
         // formats, and `env::Args` Debug (`Args { inner: [..] }`).
         let int_exp = matches!(spec.kind, FmtKind::LowerExp | FmtKind::UpperExp) && (matches!(bk, TyKind::Int(_)) || bk.is_int_infer());
-        if int_exp || (spec.kind == FmtKind::Debug && self.tys.builtin_of(base) == Some(BuiltinTy::Args)) {
+        if int_exp || (spec.kind == FmtKind::Debug && self.tys.builtin_of(base) == Some(BuiltinTy::Iter(crate::ty::iter::IterKind::Args))) {
             let what = if int_exp { "an integer exponent format" } else { "Debug of `std::env::Args`" };
             self.errs.push(not_yet("L0641", span, what));
             return;

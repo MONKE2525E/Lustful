@@ -42,7 +42,6 @@ typedef struct { void *ptr; uint64_t len; uint64_t cap; uint64_t front; } lust_V
    to `start` while its Drain lives; the drop glue (cgen.rs) drops what
    was not yielded and moves the tail down to `start`. */
 typedef struct { void *vec; uint64_t start; uint64_t front; uint64_t back; uint64_t tail_start; uint64_t tail_len; } lust_VecDrain;
-typedef struct { uint64_t n; } lust_Args;
 /* `&dyn Trait` and `&mut dyn Trait` (ARCH 2.8): the data pointer and the
    vtable, an array of words: drop glue, size, align, one super vtable per
    supertrait, then one entry per method (see src/check/object.rs). */
