@@ -3188,9 +3188,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // hidden type through its `Sig` without naming the edited item: an
     // unchanged `g() -> impl Debug { f() }` is no longer `Send` once `f`
     // returns an `Rc` (sigedit: Sol's RPIT chain). As for an RPIT body
-    // edit, every unchanged passing body is a read-set candidate.
-    let opaque = |i: usize| crate::check::generics::opaque_def(program.def_id(LocalDefId(i as u32)));
-    if mode == "signatures" && changed.iter().any(|&i| i < fn_count && program.gx.opaque_hidden.contains_key(&opaque(i))) {
+    // edit, every unchanged passing body is a read-set candidate. The
+    // return type decides, not a revealed hidden type: a definer whose
+    // body now fails has none, and its callers must still check again.
+    let rpit = |i: usize| {
+        let mut found = Vec::new();
+        if let Some(t) = program.fn_def(LocalDefId(i as u32)).ret {
+            crate::check::generics::nested_impl_traits(&program.ast, t, &mut found);
+        }
+        !found.is_empty()
+    };
+    if mode == "signatures" && changed.iter().any(|&i| i < fn_count && rpit(i)) {
         let mut listed = vec![false; fn_count];
         changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
         let cands: Vec<usize> = (0..fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !listed[i]).collect();

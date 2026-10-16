@@ -5637,7 +5637,7 @@ fn apit_param(
 /// under references, slices, arrays, tuples, and generic args. Not under
 /// fn pointers or `dyn`, where rustc rejects them (E0562), and not inside
 /// another `impl Trait`'s bounds.
-fn nested_impl_traits(ast: &Ast, id: ast::TyId, out: &mut Vec<ast::TyId>) {
+pub(crate) fn nested_impl_traits(ast: &Ast, id: ast::TyId, out: &mut Vec<ast::TyId>) {
     match ast.ty(id) {
         TyExpr::ImplTrait { .. } => out.push(id),
         TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) | TyExpr::Ptr { inner, .. } => {
