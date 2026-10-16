@@ -313,8 +313,8 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
                     .unwrap_or_default();
                 CTy::Hash(k, args)
             }
-            None => match tys.local_adt(t) {
-                Some(a) => CTy::Adt(tys.c_adt(a)),
+            None => match crate::ty::c_adt_of(tys, t) {
+                Some(a) => CTy::Adt(a),
                 None => CTy::Unit,
             },
         },

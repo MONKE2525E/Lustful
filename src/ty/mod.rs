@@ -1094,6 +1094,11 @@ pub trait TyIntern {
     fn c_adt(&self, a: AdtId) -> AdtId {
         a
     }
+    /// The first instance registered under the region-free args `key`
+    /// (`GlobalTys::adt_c_keys`). None when this store has no registry.
+    fn c_instance(&self, _def: DefId, _key: ArgsId) -> Option<AdtId> {
+        None
+    }
     /// The session-local index of a user Adt type. None for builtin Adts and
     /// non-Adt types; builtin checks must run first where both can appear.
     /// The builtin def list answers without a table lookup, which keeps
@@ -1115,6 +1120,60 @@ pub trait TyIntern {
         }
         self.local_adt_of(def)
     }
+}
+
+/// The Adt whose C type the user Adt type `t` uses (`cgen::cty`). A
+/// generic application with `'static` regions that mono never made (only
+/// a dead fn's signature names it) takes the instance that differs from it
+/// only in lifetimes, so a value moves between the two as one C type.
+pub fn c_adt_of(tys: &impl TyIntern, t: Ty) -> Option<AdtId> {
+    let a = tys.local_adt(t)?;
+    if tys.flags(t).contains_static_region()
+        && let Some((def, args)) = tys.adt_parts(t)
+        && tys.local_adt_instance(def, args).is_none()
+        && let Some(key) = region_free_args_get(tys, args)
+        && let Some(inst) = tys.c_instance(def, key)
+    {
+        return Some(tys.c_adt(inst));
+    }
+    Some(tys.c_adt(a))
+}
+
+/// `GlobalTys::region_free` without interning: None when the region-free
+/// form was never interned (then no instance has it).
+fn region_free_get(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    if !tys.flags(t).contains_static_region() {
+        return Some(t);
+    }
+    let k = match tys.kind(t) {
+        TyKind::Ref(_, m, i) => TyKind::Ref(Region::Erased, m, region_free_get(tys, i)?),
+        TyKind::Dyn(b, _) => TyKind::Dyn(b, Region::Erased),
+        TyKind::RawPtr(m, i) => TyKind::RawPtr(m, region_free_get(tys, i)?),
+        TyKind::Slice(e) => TyKind::Slice(region_free_get(tys, e)?),
+        TyKind::Array(e, n) => TyKind::Array(region_free_get(tys, e)?, n),
+        TyKind::Tuple(ts) => {
+            let elems: Option<Vec<Ty>> = tys.tys_of(ts).iter().map(|&e| region_free_get(tys, e)).collect();
+            TyKind::Tuple(tys.get_tys(&elems?)?)
+        }
+        TyKind::Adt(d, a) => TyKind::Adt(d, region_free_args_get(tys, a)?),
+        _ => return Some(t),
+    };
+    tys.get(k)
+}
+
+/// `GlobalTys::region_free_args` without interning.
+fn region_free_args_get(tys: &impl TyIntern, args: ArgsId) -> Option<ArgsId> {
+    let old = tys.args(args);
+    let new: Option<Vec<GenericArg>> = old
+        .iter()
+        .map(|&g| match g {
+            GenericArg::Ty(t) => region_free_get(tys, t).map(GenericArg::Ty),
+            GenericArg::Lifetime(_) => Some(GenericArg::Lifetime(Region::Erased)),
+            c => Some(c),
+        })
+        .collect();
+    let new = new?;
+    if new.as_slice() == old { Some(args) } else { tys.get_args(&new) }
 }
 
 /// The containment bits of a kind about to be interned. Children are already
@@ -1608,6 +1667,9 @@ impl TyIntern for GlobalTys {
     fn c_adt(&self, a: AdtId) -> AdtId {
         self.adt_c_canon.get(&a).copied().unwrap_or(a)
     }
+    fn c_instance(&self, def: DefId, key: ArgsId) -> Option<AdtId> {
+        self.adt_c_keys.get(&(def, key)).copied()
+    }
     fn full_adt_ty_of(&self, local: AdtId) -> Option<Ty> {
         self.full_adt_ty(local)
     }
@@ -1802,6 +1864,9 @@ impl TyIntern for Tys<'_> {
     }
     fn c_adt(&self, a: AdtId) -> AdtId {
         self.global.c_adt(a)
+    }
+    fn c_instance(&self, def: DefId, key: ArgsId) -> Option<AdtId> {
+        self.global.c_instance(def, key)
     }
     fn full_adt_ty_of(&self, local: AdtId) -> Option<Ty> {
         self.global.full_adt_ty(local)
