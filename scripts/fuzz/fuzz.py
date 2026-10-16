@@ -30,6 +30,8 @@
 import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 from collections import Counter
 import sigops
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import oracle_log  # noqa: E402  (scripts/oracle_log.py)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LUST = os.path.join(ROOT, "target/release/lust")
@@ -389,6 +391,9 @@ class Harness:
         self.env = dict(os.environ, LUST_DAEMON_SOCKET=self.sock, LUST_NO_CACHE="1")
         self.cold = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(self.work, "none"),
                          LUST_NO_CACHE="1", LUST_NO_DAEMON="1")
+        # Under LUST_CHECK_ITEMPATCH=1 the daemon logs its oracle checks here
+        # (the cold side is a one-shot and logs none).
+        self.oracle_path = oracle_log.setup(self.env, self.work)
         self.logpath = os.path.join(self.work, "daemon.log")
         self.log = open(self.logpath, "w")
         self.daemon = None
@@ -509,8 +514,16 @@ class Harness:
                 raise RuntimeError("background guard checks did not finish")
             time.sleep(0.005)
 
+    def oracle_checks(self):
+        """(ok count, failure lines) of this harness's oracle log, read
+        once: the lines also go to the caller's LUST_ITEMPATCH_LOG."""
+        if not hasattr(self, "_oracle_seen"):
+            self._oracle_seen = oracle_log.collect(self.oracle_path)
+        return self._oracle_seen
+
     def close(self):
         self.kill_daemon()
+        self.oracle_checks()
         self.log.close()
         if self.keep_work:
             print(f"kept work dir {self.work} (daemon log: {self.logpath})")
@@ -609,13 +622,18 @@ def sig_pulse(h, a, srng, fs, write_fn, save_fn, ext, ops, bad_ops, seen_guard, 
 
 def sig_result(h, ext, failures):
     """Prints the sigops and patch oracle lines; returns failures plus the
-    oracle's."""
+    oracle's. Under the oracle a run with no `ok` check fails too: the
+    oracle never saw its edits (a blind spot)."""
     if ext.on():
         print(ext.summary())
     n = h.oracle_count()
-    if n or os.environ.get("LUST_CHECK_ITEMPATCH"):
-        print(f"itempatch oracle failures={n}")
-    return failures + n
+    ok, fails = h.oracle_checks()
+    bad = oracle_log.problems(ok, fails, "fuzz")
+    if n or oracle_log.on():
+        print(f"itempatch oracle failures={n} checks={ok} log_failures={len(fails)}")
+        for p in bad:
+            print(f"ORACLE {p}")
+    return failures + max(n, len(bad))
 
 
 def item_bounds(lines):

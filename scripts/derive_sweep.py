@@ -10,15 +10,18 @@
 # Classes per version: false accept (lust accepts, rustc rejects), false
 # reject (lust rejects valid Rust; counted, not a failure: a lust gap in
 # both modes), warm != cold, wrong output, hang (a lust timeout; never a
-# reject). Exit 1 on any false accept, warm != cold, wrong output, or hang.
+# reject). Exit 1 on any false accept, warm != cold, wrong output, or hang,
+# and under LUST_CHECK_ITEMPATCH=1 on any patch oracle failure or a program
+# the oracle never checked.
 #
 # Usage: python3 scripts/derive_sweep.py [--count N] [--seed S] [--jobs J] [--keep DIR] [--resolver]
 # --resolver adds a `const` item to every program, so the daemon takes the resolver path (with
-# its body patch) instead of the single-file chunk path; only that path runs the patch oracle
-# (LUST_CHECK_ITEMPATCH=1).
+# its body patch) instead of the single-file chunk path. The patch oracle (LUST_CHECK_ITEMPATCH=1)
+# covers both paths.
 # Env: LUST_BIN (default target/release/lust).
 import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ProcessPoolExecutor
+import oracle_log  # scripts/oracle_log.py
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUST = os.environ.get("LUST_BIN", os.path.join(ROOT, "target/release/lust"))
@@ -144,10 +147,11 @@ def case(args):
     env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
     env.pop("LUST_NO_DAEMON", None)
     cold_env = dict(env, LUST_NO_DAEMON="1")
+    oracle_path = oracle_log.setup(env, work)
     log = open(os.path.join(work, "daemon.log"), "w")
     daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=env, stderr=log, start_new_session=True)
     main = os.path.join(work, "main.rs")
-    res = {"versions": 0, "fa": [], "fr": 0, "wc": [], "wrong": [], "hang": [], "rustc_rejects": 0}
+    res = {"versions": 0, "fa": [], "fr": 0, "wc": [], "wrong": [], "hang": [], "oracle": [], "oracle_ok": 0, "rustc_rejects": 0}
     try:
         t0 = time.time()
         while not os.path.exists(sock):
@@ -201,6 +205,9 @@ def case(args):
         except Exception:
             daemon.terminate()
         log.close()
+        ok, fails = oracle_log.collect(oracle_path)
+        res["oracle_ok"] = ok
+        res["oracle"] = oracle_log.problems(ok, fails, f"seed {seed}")
         shutil.rmtree(work, ignore_errors=True)
     return seed, res
 
@@ -219,18 +226,18 @@ def main():
     seeds = [(a.seed + i, a.keep, a.resolver) for i in range(a.count)]
     with ProcessPoolExecutor(max_workers=a.jobs) as pool:
         results = list(pool.map(case, seeds))
-    tot = {"versions": 0, "fa": 0, "fr": 0, "wc": 0, "wrong": 0, "hang": 0, "rustc_rejects": 0}
+    tot = {"versions": 0, "fa": 0, "fr": 0, "wc": 0, "wrong": 0, "hang": 0, "oracle": 0, "oracle_ok": 0, "rustc_rejects": 0}
     for seed, r in sorted(results):
-        for k in ("fa", "wc", "wrong", "hang"):
+        for k in ("fa", "wc", "wrong", "hang", "oracle"):
             for line in r[k]:
                 print(f"{k.upper()} {line}")
             tot[k] += len(r[k])
-        for k in ("versions", "fr", "rustc_rejects"):
+        for k in ("versions", "fr", "rustc_rejects", "oracle_ok"):
             tot[k] += r[k]
     print(f"derive-sweep: {a.count} programs, {tot['versions']} versions ({tot['rustc_rejects']} rustc rejects): "
           f"false_accepts={tot['fa']} warm_ne_cold={tot['wc']} wrong={tot['wrong']} hangs={tot['hang']} "
-          f"false_rejects={tot['fr']}")
-    return 1 if tot["fa"] or tot["wc"] or tot["wrong"] or tot["hang"] else 0
+          f"false_rejects={tot['fr']}" + (f" oracle_checks={tot['oracle_ok']} oracle_failures={tot['oracle']}" if oracle_log.on() else ""))
+    return 1 if tot["fa"] or tot["wc"] or tot["wrong"] or tot["hang"] or tot["oracle"] else 0
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@
 # Exit 0 = pass, 1 = a mismatch, 2 = setup error.
 import os, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ProcessPoolExecutor
+import oracle_log  # scripts/oracle_log.py
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUST = os.environ.get("LUST_BIN", os.path.join(ROOT, "target/release/lust"))
@@ -120,6 +121,7 @@ def scenario(srcdir):
     sock = os.path.join(work, "d.sock")
     env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
     env.pop("LUST_NO_DAEMON", None)
+    oracle_path = oracle_log.setup(env, work)
     log = open(os.path.join(work, "daemon.log"), "w")
     daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=env, stderr=log,
                               start_new_session=True)
@@ -202,6 +204,9 @@ def scenario(srcdir):
         except Exception:
             daemon.terminate()
         log.close()
+        # Under LUST_CHECK_ITEMPATCH=1 a scenario the oracle never checked
+        # fails (the returned tuple holds this same list).
+        problems.extend(oracle_log.problems(*oracle_log.collect(oracle_path), name))
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(work + "-cargo-target", ignore_errors=True)
     return name, problems, notes

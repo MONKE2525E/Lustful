@@ -86,6 +86,7 @@ sys.path.insert(0, str(ROOT / "bench/slices"))
 import prune  # noqa: E402  (bench/slices/prune.py: the slice-items tool)
 import speed_slice  # noqa: E402
 import tsrust_full  # noqa: E402
+import oracle_log  # noqa: E402  (scripts/oracle_log.py)
 
 KINDS = ["body", "infer", "sig", "sigx", "oblig", "derive", "generic", "rpit"]
 MANIFEST_KINDS = ["mfeat", "medition", "mlints", "mprofile", "mdeps", "mtarget"]
@@ -242,6 +243,8 @@ class Bench:
         self.env = dict(os.environ, LUST_DAEMON_SOCKET=str(self.work / "s.sock"), LUST_CACHE_DIR=str(self.work / "cache"),
                         LUST_DAEMON_IDLE="7200s", CARGO_TARGET_DIR=str(self.work / "lust-cargo-target"), LUST_STATS="1")
         self.env.pop("LUST_NO_DAEMON", None)
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.oracle_path = oracle_log.setup(self.env, str(self.work))
         self.cargo_env = dict(os.environ, CARGO_TARGET_DIR=str(self.work / "cargo-target"), CARGO_NET_OFFLINE="true")
         self.cargo_env.pop("RUSTFLAGS", None)
 
@@ -636,6 +639,10 @@ class Bench:
                "host": {"nproc": os.cpu_count(), "load_at_end": os.getloadavg()[0]}, "seed": self.a.seed, "probes_per_kind": self.a.probes,
                "daemon_first_ms": round(first_ms, 1), "noop_ms": round(statistics.median(noop), 2), "secs": round(secs),
                "rows": rows, "states": self.states}
+        # Under LUST_CHECK_ITEMPATCH=1: the oracle's checks and failures
+        # (a target with no check fails, see scripts/oracle_log.py).
+        ok, fails = oracle_log.collect(self.oracle_path)
+        res["oracle"] = {"on": oracle_log.on(), "checks": ok, "problems": oracle_log.problems(ok, fails, self.label)}
         if not self.a.keep:
             shutil.rmtree(self.work, ignore_errors=True)
         return res
@@ -658,8 +665,10 @@ def summary_line(res):
     rs = res["rows"]
     kinds = " ".join(f"{r['kind']} {r['ratio']}x/{r['ratio_p95']}x" for r in rs if r.get("ratio"))
     tot = lambda k: sum(r[k] for r in rs)  # noqa: E731
+    o = res.get("oracle", {})
+    oracle = f", oracle {o['checks']} checks {len(o['problems'])} failures" if o.get("on") else ""
     return (f"tsedit: {res['tree']} {res['lines']} lines: {kinds}; {len(res['states'])} states, {tot('false_accepts')} false accepts, "
-            f"{tot('false_rejects')} false rejects, {tot('warm_ne_cold')} warm!=cold, {tot('hangs')} hangs")
+            f"{tot('false_rejects')} false rejects, {tot('warm_ne_cold')} warm!=cold, {tot('hangs')} hangs{oracle}")
 
 
 def census(a):
@@ -758,7 +767,10 @@ def main():
     for line in lines:
         print(line)
     rs = [r for res in results for r in res["rows"]]
-    sys.exit(1 if any(r["false_accepts"] or r["warm_ne_cold"] or r["hangs"] for r in rs) else 0)
+    oracle_bad = [p for res in results for p in res.get("oracle", {}).get("problems", [])]
+    for p in oracle_bad[:20]:
+        print(f"ORACLE {p}")
+    sys.exit(1 if oracle_bad or any(r["false_accepts"] or r["warm_ne_cold"] or r["hangs"] for r in rs) else 0)
 
 
 if __name__ == "__main__":
