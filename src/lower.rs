@@ -1818,6 +1818,8 @@ impl<'p> Lower<'p> {
             Expr::Match { scrut, arms } => self.match_into(*scrut, arms, dest, span),
             Expr::Call { callee, args } => {
                 let res = self.ck.res(e);
+                // Through a fn item shim (`Checked::fn_shim_calls`).
+                let span = self.ck.fn_shim_span(e).unwrap_or(span);
                 // A call through an Fn-family bound of a type parameter
                 // (template checks), or through a `dyn Fn` value's
                 // vtable: a method call with the callee as its receiver.

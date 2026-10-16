@@ -1970,6 +1970,7 @@ impl<'p> Ctx<'p> {
                 self.generic_sites.push((ei, f, fargs));
             }
             self.set_res(e, r);
+            self.note_fn_shim_call(e, ct, peeled);
             self.check_args(&params, args, span);
             return ret;
         }
@@ -2174,6 +2175,39 @@ impl<'p> Ctx<'p> {
     }
 
     /// The call mode a template's abstract check recorded for this call.
+    /// Records a call of a primitive method item (`u32::ilog2`) through
+    /// an Fn-family bound in an instance (`fn_shim_calls`). rustc calls
+    /// the item through its shim's Fn trait method: the template's, or
+    /// `call` behind a `&` and `call_mut` behind a `&mut` (core's
+    /// `impl Fn* for &F` and `&mut F` forward to those); a `Box` keeps
+    /// the method. A direct call of the item value is not through a
+    /// bound and keeps the call's own location.
+    fn note_fn_shim_call(&mut self, e: ExprId, ct: Ty, item: Ty) {
+        let Some(mut mode) = self.template_call_mode(e) else { return };
+        if !self.is_prim_item(item) {
+            return;
+        }
+        let mut t = self.resolve(ct);
+        while t != item {
+            match self.kind(t) {
+                TyKind::Ref(_, m, inner) => {
+                    mode = if m.is_mut() { ClosureKind::FnMut } else { ClosureKind::Fn };
+                    t = self.resolve(inner);
+                }
+                _ => match self.tys.boxed_elem(t) {
+                    Some(inner) => t = self.resolve(inner),
+                    None => break,
+                },
+            }
+        }
+        let line = match mode {
+            ClosureKind::Fn => 79,
+            ClosureKind::FnMut => 166,
+            ClosureKind::FnOnce => 250,
+        };
+        self.out.fn_shim_calls.push((e, line));
+    }
+
     fn template_call_mode(&self, e: ExprId) -> Option<ClosureKind> {
         let p = self.p;
         if p.gx.fn_class.get(self.fid.0 as usize) != Some(&generics::FnClass::Instance) {

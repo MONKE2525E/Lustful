@@ -466,6 +466,7 @@ pub(super) struct ArgTrial {
     dmeth: usize,
     closures: usize,
     calls: usize,
+    shims: usize,
     locals: usize,
     binops: usize,
     open: usize,
@@ -485,6 +486,7 @@ impl ArgTrial {
             dmeth: cx.deferred_methods.len(),
             closures: cx.closures.len(),
             calls: cx.out.closure_calls.len(),
+            shims: cx.out.fn_shim_calls.len(),
             locals: cx.out.locals.len(),
             binops: cx.deferred_binops.len(),
             open: cx.open_binops.len(),
@@ -503,6 +505,7 @@ impl ArgTrial {
         cx.deferred_methods.truncate(self.dmeth);
         cx.closures.truncate(self.closures);
         cx.out.closure_calls.truncate(self.calls);
+        cx.out.fn_shim_calls.truncate(self.shims);
         cx.out.locals.truncate(self.locals);
         cx.deferred_binops.truncate(self.binops);
         cx.open_binops.truncate(self.open);

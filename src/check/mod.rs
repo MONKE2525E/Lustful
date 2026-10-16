@@ -1564,6 +1564,11 @@ pub struct Checked<'g> {
     /// Every closure call and the Fn trait it goes through. Mono keeps
     /// the template's answers for its instances (`template_calls`).
     pub closure_calls: Vec<(ExprId, closure::ClosureKind)>,
+    /// Calls of a primitive method item through an Fn-family bound (in
+    /// an instance), with the line of the Fn trait method rustc's fn
+    /// item shim runs in core/src/ops/function.rs: a `#[track_caller]`
+    /// panic in the item reports it (`Ctx::value_call`).
+    pub fn_shim_calls: Vec<(ExprId, u32)>,
     /// True when this is a closure body fn whose parent failed to
     /// check: the parent reports the errors, lowering emits nothing.
     pub poisoned: bool,
@@ -1609,6 +1614,12 @@ impl Checked<'_> {
     }
     pub fn res(&self, e: ExprId) -> Res {
         self.expr_res[(e.0 - self.expr_base) as usize]
+    }
+    /// The panic location of a call through a fn item shim
+    /// (`fn_shim_calls`): core/src/ops/function.rs at the Fn trait
+    /// method's line.
+    pub fn fn_shim_span(&self, e: ExprId) -> Option<Span> {
+        self.fn_shim_calls.iter().find(|(x, _)| *x == e).map(|&(_, line)| Span::std_site(15, line, 5))
     }
     /// The range form of a `drain` call (check/iter.rs).
     pub fn drain_range(&self, e: ExprId) -> Option<DrainRange> {
@@ -2169,6 +2180,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             reads: if p.record_reads { Reads::new() } else { Reads::off() },
             closures: Vec::new(),
             closure_calls: Vec::new(),
+            fn_shim_calls: Vec::new(),
             poisoned: false,
             annotations: Vec::new(),
             queue_work: 0,
