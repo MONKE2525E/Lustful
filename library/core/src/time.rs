@@ -45,7 +45,7 @@ impl Duration {
         } else {
             let secs = match secs.checked_add((nanos / NANOS_PER_SEC) as u64) {
                 Some(s) => s,
-                None => panic!("overflow in Duration::new"),
+                None => panic!("overflow in Duration::new"), //@ core/src/time.rs:201:18
             };
             let nanos = nanos % NANOS_PER_SEC;
             Duration { secs, nanos }
@@ -74,6 +74,7 @@ impl Duration {
         Duration { secs, nanos: subsec_nanos }
     }
 
+    #[track_caller]
     pub const fn from_nanos_u128(nanos: u128) -> Duration {
         let secs = nanos / (NANOS_PER_SEC as u128);
         if secs > u64::MAX as u128 {
@@ -85,14 +86,14 @@ impl Duration {
 
     pub const fn from_hours(hours: u64) -> Duration {
         if hours > u64::MAX / (SECS_PER_MINUTE * MINS_PER_HOUR) {
-            panic!("overflow in Duration::from_hours");
+            panic!("overflow in Duration::from_hours"); //@ core/src/time.rs:424:13
         }
         Duration::from_secs(hours * MINS_PER_HOUR * SECS_PER_MINUTE)
     }
 
     pub const fn from_mins(mins: u64) -> Duration {
         if mins > u64::MAX / SECS_PER_MINUTE {
-            panic!("overflow in Duration::from_mins");
+            panic!("overflow in Duration::from_mins"); //@ core/src/time.rs:452:13
         }
         Duration::from_secs(mins * SECS_PER_MINUTE)
     }
@@ -130,7 +131,7 @@ impl Duration {
     }
 
     pub const fn abs_diff(self, other: Duration) -> Duration {
-        if let Some(res) = self.checked_sub(other) { res } else { other.checked_sub(self).unwrap() }
+        if let Some(res) = self.checked_sub(other) { res } else { other.checked_sub(self).unwrap() } //@ never
     }
 
     pub const fn checked_add(self, rhs: Duration) -> Option<Duration> {
@@ -223,14 +224,14 @@ impl Duration {
     pub fn from_secs_f64(secs: f64) -> Duration {
         match Duration::try_from_secs_f64(secs) {
             Ok(v) => v,
-            Err(e) => panic!("{}", e),
+            Err(e) => panic!("{}", e), //@ core/src/time.rs:962:23
         }
     }
 
     pub fn from_secs_f32(secs: f32) -> Duration {
         match Duration::try_from_secs_f32(secs) {
             Ok(v) => v,
-            Err(e) => panic!("{}", e),
+            Err(e) => panic!("{}", e), //@ core/src/time.rs:999:23
         }
     }
 
@@ -372,7 +373,7 @@ impl Duration {
 impl core::ops::Add for Duration {
     type Output = Duration;
     fn add(self, rhs: Duration) -> Duration {
-        self.checked_add(rhs).expect("overflow when adding durations")
+        self.checked_add(rhs).expect("overflow when adding durations") //@ core/src/time.rs:1257:31
     }
 }
 
@@ -385,7 +386,7 @@ impl core::ops::AddAssign for Duration {
 impl core::ops::Sub for Duration {
     type Output = Duration;
     fn sub(self, rhs: Duration) -> Duration {
-        self.checked_sub(rhs).expect("overflow when subtracting durations")
+        self.checked_sub(rhs).expect("overflow when subtracting durations") //@ core/src/time.rs:1277:31
     }
 }
 
@@ -398,7 +399,7 @@ impl core::ops::SubAssign for Duration {
 impl core::ops::Mul<u32> for Duration {
     type Output = Duration;
     fn mul(self, rhs: u32) -> Duration {
-        self.checked_mul(rhs).expect("overflow when multiplying duration by scalar")
+        self.checked_mul(rhs).expect("overflow when multiplying duration by scalar") //@ core/src/time.rs:1297:31
     }
 }
 

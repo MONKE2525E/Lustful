@@ -34,6 +34,7 @@ mod protocol;
 mod resolve;
 mod scan;
 mod stdload;
+mod stdloc;
 mod stdmods;
 mod tcc;
 mod testrun;

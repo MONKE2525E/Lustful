@@ -454,7 +454,8 @@ fn is128(i: IntTy) -> bool {
 /// core/src/iter/traits/accum.rs, 8 core/src/iter/range.rs, 9
 /// core/src/cell.rs, 10 std/src/thread/local.rs, 11 core/src/ops/arith.rs, 12
 /// core/src/slice/index.rs, 13 core/src/iter/traits/exact_size.rs, 14
-/// core/src/slice/mod.rs, 15 core/src/ops/function.rs, 16 std/src/env.rs),
+/// core/src/slice/mod.rs, 15 core/src/ops/function.rs, 16 std/src/env.rs,
+/// and the std source markers' files after them: `stdloc::STD_FILES`),
 /// plus 0x40 for `pow`. Lowering names one with `Span::std_site`.
 fn std_loc(file: u64, line: u64, col: u64) -> String {
     format!("{}ull", ((0xFF_FF00u64 + file) << 40) | (line << 20) | col)
@@ -1797,7 +1798,13 @@ impl FnGen<'_, '_> {
         if crate::check::caller::is_track_caller(self.p, self.body.fn_id) {
             return "ltc".to_string();
         }
-        let (l, c) = self.map.line_display_col(self.map.call_site(span));
+        let span = self.map.call_site(span);
+        // A panic site in shipped std source reports std's own file and
+        // line (its `//@` marker, src/stdloc.rs), as rustc does.
+        if let Some((f, l, c)) = crate::stdloc::site(self.p, self.map, span) {
+            return std_loc(f as u64, l as u64, c as u64);
+        }
+        let (l, c) = self.map.line_display_col(span);
         let rel = l.saturating_sub(self.base_line).min(0xFFFFF) as u64;
         let slot = self.slots[self.body.fn_id.0 as usize] as u64;
         format!("{}u", (slot << 40) | (rel << 20) | c.min(0xFFFFF) as u64)

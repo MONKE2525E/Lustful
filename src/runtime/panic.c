@@ -509,6 +509,20 @@ static const char *const lust_std_files[] = {
     LUST_STD_SRC "core/src/slice/mod.rs",
     LUST_STD_SRC "core/src/ops/function.rs",
     LUST_STD_SRC "std/src/env.rs",
+    /* The files of std source markers (src/stdloc.rs STD_FILES). */
+    LUST_STD_SRC "core/src/time.rs",
+    LUST_STD_SRC "std/src/time.rs",
+    LUST_STD_SRC "alloc/src/collections/btree/search.rs",
+    LUST_STD_SRC "alloc/src/collections/vec_deque/mod.rs",
+    LUST_STD_SRC "std/src/path.rs",
+    LUST_STD_SRC "std/src/panicking.rs",
+    LUST_STD_SRC "core/src/cell/once.rs",
+    LUST_STD_SRC "core/src/cell/lazy.rs",
+    LUST_STD_SRC "std/src/sync/lazy_lock.rs",
+    LUST_STD_SRC "core/src/io/write.rs",
+    LUST_STD_SRC "alloc/src/io/read.rs",
+    LUST_STD_SRC "alloc/src/io/impls.rs",
+    LUST_STD_SRC "core/src/io/borrowed_buf.rs",
 };
 #endif
 

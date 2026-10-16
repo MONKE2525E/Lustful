@@ -85,7 +85,7 @@ fn builtin_text(rel: &str) -> Option<&'static str> {
 
 /// The text of one shipped file: from `$LUST_STD_SRC/<rel>` when the
 /// override is set (section 3.8), else the built-in copy.
-fn source_text(rel: &str) -> Result<String, String> {
+pub(crate) fn source_text(rel: &str) -> Result<String, String> {
     match std::env::var_os("LUST_STD_SRC") {
         Some(dir) if !dir.is_empty() => {
             let path = std::path::Path::new(&dir).join(rel);

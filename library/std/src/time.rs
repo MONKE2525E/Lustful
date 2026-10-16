@@ -135,7 +135,7 @@ impl core::ops::Add<Duration> for Instant {
 
 impl core::ops::AddAssign<Duration> for Instant {
     fn add_assign(&mut self, other: Duration) {
-        *self = *self + other;
+        *self = *self + other; //@ std/src/time.rs:435:17
     }
 }
 
@@ -149,7 +149,7 @@ impl core::ops::Sub<Duration> for Instant {
 
 impl core::ops::SubAssign<Duration> for Instant {
     fn sub_assign(&mut self, other: Duration) {
-        *self = *self - other;
+        *self = *self - other; //@ std/src/time.rs:452:17
     }
 }
 
@@ -217,7 +217,7 @@ impl core::ops::Add<Duration> for SystemTime {
 
 impl core::ops::AddAssign<Duration> for SystemTime {
     fn add_assign(&mut self, other: Duration) {
-        *self = *self + other;
+        *self = *self + other; //@ std/src/time.rs:754:17
     }
 }
 
@@ -231,7 +231,7 @@ impl core::ops::Sub<Duration> for SystemTime {
 
 impl core::ops::SubAssign<Duration> for SystemTime {
     fn sub_assign(&mut self, other: Duration) {
-        *self = *self - other;
+        *self = *self - other; //@ std/src/time.rs:771:17
     }
 }
 
