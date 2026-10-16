@@ -11022,6 +11022,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     // W-SHIM: instances whose behavior lust cannot make exact.
     for i in first_instance..p.fns.len() {
         errs.extend(crate::check::platform::user_write_fmt_instance(p, LocalDefId(i as u32)));
+        errs.extend(crate::check::platform::io_copy_instance(p, LocalDefId(i as u32)));
     }
     errs
 }

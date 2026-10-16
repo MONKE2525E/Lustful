@@ -15,7 +15,7 @@ use crate::def::LocalDefId;
 use crate::diag::{Diag, Span};
 use crate::ty::lang::ShippedCrate;
 use super::Ctx;
-use crate::ty::{AdtId, Ty, TyIntern, TyKind};
+use crate::ty::{AdtId, Mut, Ty, TyIntern, TyKind};
 
 /// L0641 when `inst` is the default `io::Write::write_fmt` body of the
 /// platform crate instantiated for a writer that std does not define.
@@ -68,6 +68,81 @@ fn user_writer_diag(p: &Program, tys: &impl TyIntern, writer: Ty, fallback: Span
         "`write!` into a user-defined `std::io::Write` type is not supported yet",
         "Format into a `String` with `format!`, then call `write_all` with its bytes.",
     ))
+}
+
+/// True for std's `io::copy` in the platform crate (library/std/src/io.rs),
+/// or one of its instances.
+pub(crate) fn is_platform_io_copy(p: &Program, f: LocalDefId) -> bool {
+    let info = p.fn_info(f);
+    p.shipped_crate_at(info.def(&p.ast).name_span) == Some(ShippedCrate::Std) && p.display_path(info.name) == "std::io::copy"
+}
+
+/// L0641 when std 1.99 would not run `io::copy(&mut R, &mut W)` as lust's
+/// `stack_buffer_copy` port does: std specializes on the static types
+/// (alloc/src/io/copy/generic.rs, std/src/sys/io/kernel_copy/linux.rs).
+/// An in-memory or buffered reader (`&[u8]`, `VecDeque<u8>`, `BufReader`)
+/// or writer (`BufWriter`, `Vec<u8>`) takes another loop, and an OS
+/// handle on both sides copies in the kernel. A reader or writer still
+/// generic says nothing here (its instance answers in a build).
+pub fn io_copy_diag(p: &Program, tys: &impl TyIntern, r: Ty, w: Ty, span: Span) -> Option<Diag> {
+    let name = |t: Ty| -> Option<String> {
+        let a = tys.local_adt(t)?;
+        (p.shipped_crate_at(p.adt(a).span).is_some()).then(|| p.display_path(p.adt(a).name))
+    };
+    let unknown = |t: Ty| matches!(tys.kind(t), TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_));
+    if unknown(r) || unknown(w) {
+        return None;
+    }
+    let ends = |n: &Option<String>, list: &[&str]| n.as_deref().is_some_and(|n| list.iter().any(|x| n.ends_with(x)));
+    let in_memory_reader = match tys.kind(r) {
+        TyKind::Ref(_, _, inner) => tys.kind(inner) == TyKind::Slice(crate::ty::int(crate::ty::IntTy::U8)),
+        _ => ends(&name(r), &["::BufReader", "::VecDeque"]),
+    };
+    let buffered_writer = tys.vec_elem(w) == Some(crate::ty::int(crate::ty::IntTy::U8)) || ends(&name(w), &["::BufWriter"]);
+    // An OS handle (std's `CopyRead` / `CopyWrite` impls), through `&` for
+    // the shared handles and `&mut` for every one.
+    fn handle(p: &Program, tys: &impl TyIntern, t: Ty, list: &[&str], by_ref: &[&str]) -> bool {
+        let named = |t: Ty, list: &[&str]| {
+            tys.local_adt(t).is_some_and(|a| p.shipped_crate_at(p.adt(a).span).is_some() && list.iter().any(|x| p.display_path(p.adt(a).name).ends_with(x)))
+        };
+        match tys.kind(t) {
+            TyKind::Ref(_, Mut::Mut, inner) => handle(p, tys, inner, list, by_ref),
+            TyKind::Ref(_, _, inner) => named(inner, by_ref),
+            _ => named(t, list),
+        }
+    }
+    const SHARED: &[&str] = &["::File", "::TcpStream", "::UnixStream"];
+    let os_reader = handle(p, tys, r, &["::File", "::TcpStream", "::UnixStream", "::ChildStdout", "::ChildStderr", "::StdinLock"], SHARED);
+    let os_writer = handle(p, tys, w, &["::File", "::TcpStream", "::UnixStream", "::ChildStdin", "::StdoutLock", "::StderrLock"], SHARED);
+    let what = if in_memory_reader {
+        "an in-memory or buffered reader"
+    } else if buffered_writer {
+        "a `Vec<u8>` or `BufWriter` writer"
+    } else if os_reader && os_writer {
+        "an OS handle on both sides (std copies in the kernel)"
+    } else {
+        return None;
+    };
+    Some(Diag::new(
+        "L0641",
+        span,
+        format!("`std::io::copy` with {what} is not supported yet"),
+        "Copy through a plain reader and writer, or loop with `read` and `write_all`.",
+    ))
+}
+
+/// `io_copy_diag` for an instance of `io::copy` a build materializes.
+pub fn io_copy_instance(p: &Program, inst: LocalDefId) -> Option<Diag> {
+    if !is_platform_io_copy(p, inst) {
+        return None;
+    }
+    let f = p.fn_info(inst);
+    let peel = |t: Ty| match p.tys.kind(t) {
+        TyKind::Ref(_, _, inner) => Some(inner),
+        _ => None,
+    };
+    let (r, w) = (peel(*f.params.first()?)?, peel(*f.params.get(1)?)?);
+    io_copy_diag(p, &p.tys, r, w, f.def(&p.ast).name_span)
 }
 
 /// Fns that are `unsafe fn` in rustc's std but safe fns in lust's std

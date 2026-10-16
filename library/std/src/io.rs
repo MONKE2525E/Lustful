@@ -788,6 +788,39 @@ pub trait Read {
     }
 }
 
+/// std 1.99's `io::copy` on the path it takes when neither side is a
+/// type std specializes (alloc/src/io/copy/generic.rs
+/// `stack_buffer_copy`): an 8 KiB buffer, `read` into it until 0 (an
+/// `Interrupted` error is retried), then `write_all` of each chunk. A
+/// `Read` impl's `read` sees the buffer as std's default `read_buf`
+/// leaves it: zeroed once, then holding the earlier bytes. The calls std
+/// specializes (in-memory and buffered readers and writers, two OS
+/// handles) reject in check/platform.rs `io_copy_diag`.
+pub fn copy<R: Read + ?Sized, W: Write + ?Sized>(reader: &mut R, writer: &mut W) -> Result<u64> {
+    let mut buf = [0u8; 8192];
+    let mut len: u64 = 0;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                if e.is_interrupted() {
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+        if n > buf.len() {
+            core::intrinsics::panic_read_buf_overrun();
+            return Ok(len);
+        }
+        if n == 0 {
+            return Ok(len);
+        }
+        len += n as u64;
+        writer.write_all(&buf[..n])?;
+    }
+}
+
 impl Read for &[u8] {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let cur: &[u8] = *self;

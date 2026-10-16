@@ -657,6 +657,10 @@ void lust_panic_std(const char *msg, const char *where) LUST_BODY({ lust_panic_s
    payload: RawVec's capacity overflow, the atomic ordering checks). */
 void lust_panic_std_lit(const char *msg, const char *where) LUST_BODY({ lust_panic_std_kind(LUST_EXC_STR, msg, where); })
 
+/* core 1.99's `BorrowedCursor::advance_checked` assert, as `io::copy`'s
+   default `read_buf` hits it when `read` returns more than the buffer. */
+void lust_panic_read_buf_overrun(void) LUST_BODY({ lust_panic_std_kind(LUST_EXC_STR, "assertion failed: n <= init_unfilled", "core/src/io/borrowed_buf.rs:287:9"); })
+
 /* `panic_any(payload)`: the hook prints the payload's text, then it
    unwinds (abort mode: aborts). */
 void lust_panic_box(lust_dyn b, lust_loc loc) LUST_BODY({

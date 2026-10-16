@@ -1852,6 +1852,9 @@ struct Ctx<'p> {
     /// `Range<{integer}>::len` and kin: the element must end as one of
     /// core's exact-size range integers (check/iter.rs `exact_size`).
     deferred_exact_range: Vec<(Ty, bool, Span)>,
+    /// `std::io::copy` calls: the `&mut R` and `&mut W` argument types,
+    /// checked once known (`platform::io_copy_diag`).
+    deferred_io_copy: Vec<(Ty, Ty, Span)>,
     /// The expression of the expression statement being checked (`e;`):
     /// `Vec::splice` is taken only there, where its `Splice` drops at once.
     stmt_expr: Option<ExprId>,
@@ -2248,6 +2251,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_sum: Vec::new(),
         deferred_copy: Vec::new(),
         deferred_exact_range: Vec::new(),
+        deferred_io_copy: Vec::new(),
         stmt_expr: None,
         deferred_ord: Vec::new(),
         deferred_sort_ord: Vec::new(),
@@ -8183,6 +8187,14 @@ impl<'p> Ctx<'p> {
                     Some(t) => t,
                     None => self.call(e, *callee, args, span, expected),
                 };
+                // `std::io::copy`: the shapes std specializes (check/platform.rs).
+                if let Res::Fn(f) = self.out.res(*callee)
+                    && args.len() == 2
+                    && crate::check::platform::is_platform_io_copy(p, f)
+                {
+                    let (r, w) = (self.out.ty(args[0]), self.out.ty(args[1]));
+                    self.deferred_io_copy.push((r, w, span));
+                }
                 // Every call path (variant ctors like `Some(v[1..])` too).
                 for &a in args.iter() {
                     self.reject_unsized_value(a);
@@ -22386,6 +22398,19 @@ impl<'p> Ctx<'p> {
             if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
+            }
+        }
+        for (r, w, span) in std::mem::take(&mut self.deferred_io_copy) {
+            let peel = |cx: &mut Self, t: Ty| {
+                let t = cx.deep(t);
+                match cx.kind(t) {
+                    TyKind::Ref(_, _, inner) => cx.deep(inner),
+                    _ => t,
+                }
+            };
+            let (r, w) = (peel(self, r), peel(self, w));
+            if let Some(d) = crate::check::platform::io_copy_diag(self.p, &self.tys, r, w, span) {
+                self.errs.push(d);
             }
         }
         for (t, incl, span) in std::mem::take(&mut self.deferred_exact_range) {

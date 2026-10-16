@@ -1570,6 +1570,7 @@ const TYPES: &[&str] = &[
     "std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH} and core::time::Duration (std source modules; no layout queries)",
     "std::marker::PhantomData<T> (std source; no Debug or Hash yet)",
     "std::cmp::Reverse<T> with reversed Ord and PartialOrd, Debug, Hash, Default, Clone (std source)",
+    "std::io::copy on std's stack-buffer path (not for &[u8], VecDeque, BufReader readers, Vec<u8> or BufWriter writers, or an OS handle on both sides)",
     "std::ops::ControlFlow<B, C> with `?`, is_break/is_continue, break_value/continue_value, map_break/map_continue (std source)",
     "std::cell::{OnceCell, LazyCell} and std::sync::{OnceLock, LazyLock, Once} (std source; single-threaded; static LazyLock not yet; no Once::call_once_force)",
     "std::collections::{BTreeMap, BTreeSet, VecDeque} with btree_map::Entry, owned-item Extend, From arrays, and collect into all three (std source; keys with derived or std order only; no Index or range yet)",

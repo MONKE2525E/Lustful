@@ -1278,6 +1278,9 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     // hook is installed, and std's default hook text (file, line, column,
     // message) for the hook `take_hook` hands out.
     IntrinsicDef { name: "panic_hook_custom", c_symbol: "lust_hook_custom", params: &[S::Bool], ret: S::Unit, allowed: ONLY_STD, implemented: true },
+    // core's `BorrowedCursor::advance_checked` assert (`io::copy` with a
+    // `Read` impl that reports more bytes than its buffer holds).
+    IntrinsicDef { name: "panic_read_buf_overrun", c_symbol: "lust_panic_read_buf_overrun", params: &[], ret: S::Unit, allowed: ONLY_STD, implemented: true },
     IntrinsicDef {
         name: "panic_default_hook",
         c_symbol: "lust_hook_default",
