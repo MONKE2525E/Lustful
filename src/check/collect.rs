@@ -7498,8 +7498,10 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Closure(_, a) => closure_fields(tys, a).iter().all(|&e| is_copy(p, tys, e)),
         TyKind::Array(e, _) => is_copy(p, tys, e),
         _ => {
-            // `MaybeUninit<T>` is Copy for every T (TRIAGE T5).
-            if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::maybe_uninit_def()) {
+            // `MaybeUninit<T>` is Copy for every T (TRIAGE T5), and so
+            // is `NonZero<T>` (T is always a primitive integer): a field
+            // of either is Copy before any instance of it exists.
+            if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::maybe_uninit_def() || d == generics::nonzero_def()) {
                 return true;
             }
             if tys.is_exit_code(t)
