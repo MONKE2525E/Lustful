@@ -981,9 +981,13 @@ pub fn may_borrow_in(p: &Program, tys: &impl TyIntern, env: &[Predicate], t: Ty)
         TyKind::Dyn(..) => !dyn_is_static(p, tys, t),
         TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => may_borrow_in(p, tys, env, e),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| may_borrow_in(p, tys, env, e)),
-        TyKind::Adt(_, a) | TyKind::FnDef(_, a) => {
-            tys.is_chars_ty(t) || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow_in(p, tys, env, e)))
+        // A user Adt with lifetime params (`B<'b>`): check erases them.
+        TyKind::Adt(d, a) => {
+            tys.is_chars_ty(t)
+                || p.gx.adt_lifetimes.get(&d).is_some_and(|v| !v.is_empty())
+                || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow_in(p, tys, env, e)))
         }
+        TyKind::FnDef(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| may_borrow_in(p, tys, env, e))),
         _ => false,
     }
 }
