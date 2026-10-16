@@ -7892,7 +7892,7 @@ impl<'p> Ctx<'p> {
             match stmt {
                 Stmt::Let { pat, ty, init, els, .. } => {
                     let ty_ann = ty;
-                    let annotated = ty.filter(|&t| generics::names_lifetime(&self.p.ast, &self.p.interner, t));
+                    let annotated = ty.filter(|&t| self.annotation_has_regions(t));
                     let declared = ty.map(|t| if annotated.is_some() { self.resolve_annotation(t) } else { self.resolve_written(t) });
                     let ty = match (declared, init) {
                         (Some(d), Some(init)) => {

@@ -1912,6 +1912,36 @@ pub fn names_lifetime_beyond_static_refs(ast: &Ast, interner: &Interner, id: ast
     names_lifetime_with(ast, interner, id, true)
 }
 
+/// True when a written type names a type alias with no lifetime params
+/// (`alias` looks one up by name) whose body holds a reference or a dyn
+/// type (`type R = &'static u32`). Those
+/// regions are `'static` (`staticize`), so a body annotation that names
+/// the alias binds them as a written `'static` would (rustc E0597 for
+/// `let x: R = &local`).
+pub fn names_static_alias(ast: &Ast, alias: &dyn Fn(Sym) -> Option<Ty>, tys: &mut impl TyIntern, id: ast::TyId) -> bool {
+    let mut go = |t: ast::TyId| names_static_alias(ast, alias, tys, t);
+    match ast.ty(id) {
+        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) => go(*inner),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => go(*inner),
+        TyExpr::Tuple(elems) => elems.iter().any(|&e| go(e)),
+        TyExpr::Path(segs) => {
+            let args: Vec<ast::TyId> = segs
+                .iter()
+                .flat_map(|s| match &s.args {
+                    GenericArgs::Angle(a) => a.iter().filter_map(|g| if let AstArg::Type(t) = g { Some(*t) } else { None }).collect(),
+                    GenericArgs::Parenthesized { inputs, output } => inputs.iter().copied().chain(*output).collect(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            if args.into_iter().any(&mut go) {
+                return true;
+            }
+            segs.len() == 1 && alias(segs[0].name).is_some_and(|t| staticize(tys, t) != t)
+        }
+        _ => false,
+    }
+}
+
 /// `names_lifetime`; with `static_refs`, a `'static` written on a
 /// reference does not count (`names_lifetime_beyond_static_refs`).
 fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_refs: bool) -> bool {
@@ -2158,6 +2188,34 @@ fn mentions_ref(tys: &impl TyIntern, t: Ty) -> bool {
         TyKind::Adt(_, a) | TyKind::Projection(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| mentions_ref(tys, e))),
         TyKind::Dyn(..) | TyKind::FnPtr(_) | TyKind::Opaque(..) | TyKind::Param(_) => true,
         _ => false,
+    }
+}
+
+/// The resolved body of an alias with no lifetime params at one use
+/// (W-BORROW). Its regions are `'static` (`staticize`) in a region
+/// signature and a recorded body annotation (`Ctx::annotation_has_regions`).
+/// Elsewhere in a body (a cast target, a turbofish) the checker would
+/// erase them and the borrow checker never see them, so an alias that
+/// holds a reference is the same reject as a written `'static` there.
+fn alias_at_use(tys: &mut impl TyIntern, scope: &Scope, alias_ty: Ty, span: Span) -> Result<Ty, Diag> {
+    fn holds_ref(tys: &impl TyIntern, t: Ty) -> bool {
+        match tys.kind(t) {
+            TyKind::Ref(..) => true,
+            TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::RawPtr(_, e) => holds_ref(tys, e),
+            TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| holds_ref(tys, e)),
+            TyKind::Adt(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| holds_ref(tys, e))),
+            _ => false,
+        }
+    }
+    match scope.regions {
+        RegionMode::Keep { .. } => Ok(staticize(tys, alias_ty)),
+        RegionMode::Erase if scope.infer_cell.is_some() && !scope.annotation && holds_ref(tys, alias_ty) => Err(Diag::new(
+            "L0203",
+            span,
+            "a type alias with a `'static` reference is not supported here inside a body yet",
+            "Write the aliased type with `'_`, or bind the value with a `let` annotation that names the alias.",
+        )),
+        RegionMode::Erase => Ok(alias_ty),
     }
 }
 
@@ -3846,7 +3904,7 @@ pub(crate) fn resolve_path_ty(
         return if seg.has_args() {
             Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
         } else {
-            Ok(alias_ty)
+            alias_at_use(tys, scope, alias_ty, span)
         };
     }
     if !local_block {
@@ -4085,7 +4143,7 @@ pub(crate) fn resolve_path_ty(
         return if seg.has_args() {
             Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
         } else {
-            Ok(alias_ty)
+            alias_at_use(tys, scope, alias_ty, span)
         };
     }
     if segs.len() == 1
@@ -4107,7 +4165,7 @@ pub(crate) fn resolve_path_ty(
                 })
                 .collect()
         });
-        let alias_ty = if matches!(scope.regions, RegionMode::Keep { .. }) { staticize(tys, alias_ty) } else { alias_ty };
+        let alias_ty = alias_at_use(tys, scope, alias_ty, span)?;
         if kinds.is_empty() {
             return if seg.has_args() {
                 Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))

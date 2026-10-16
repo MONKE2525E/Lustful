@@ -1141,3 +1141,18 @@ impl super::Ctx<'_> {
         true
     }
 }
+
+impl super::Ctx<'_> {
+    /// True when the borrow checker must see the regions of body
+    /// annotation `t` (`record_annotation`, closure param and return
+    /// annotations): it names a lifetime, or a type alias whose body holds
+    /// `'static` regions (`generics::names_static_alias`).
+    pub(super) fn annotation_has_regions(&mut self, t: crate::ast::TyId) -> bool {
+        let p = self.p;
+        let local = self.body_scope.local_aliases.clone();
+        let alias = |n: crate::intern::Sym| {
+            local.iter().rev().find(|(m, _)| *m == n).map(|&(_, t)| t).or_else(|| p.aliases.get(&n).copied())
+        };
+        super::generics::names_lifetime(&p.ast, &p.interner, t) || super::generics::names_static_alias(&p.ast, &alias, &mut self.tys, t)
+    }
+}

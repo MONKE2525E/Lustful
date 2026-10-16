@@ -801,7 +801,7 @@ impl<'p> Ctx<'p> {
         let mut input_regions: Vec<Option<Ty>> = Vec::with_capacity(params.len());
         for (i, prm) in params.iter().enumerate() {
             let exp = expected_inputs.as_ref().and_then(|v| v.get(i).copied());
-            let named = prm.ty.is_some_and(|w| generics::names_lifetime(&self.p.ast, &self.p.interner, w));
+            let named = prm.ty.is_some_and(|w| self.annotation_has_regions(w));
             // An unnamed annotation that does not resolve here (`Vec<_>`)
             // counts as unannotated: free, as rustc infers `_`.
             let elided = if no_sig { Region::Bound(0) } else { Region::Erased };
@@ -839,7 +839,7 @@ impl<'p> Ctx<'p> {
         let mut output_region: Option<Ty> = None;
         let output = match (ret, sig.and_then(|s| s.1)) {
             (Some(w), exp) => {
-                let named = generics::names_lifetime(&self.p.ast, &self.p.interner, w);
+                let named = self.annotation_has_regions(w);
                 if named {
                     output_region = self.regioned_annotation(w, Region::Erased, true);
                     let mut rs = Vec::new();
