@@ -1555,6 +1555,11 @@ impl FnGen<'_, '_> {
     /// through the runtime's atomic `lust_arc_*` functions.
     fn arc_builtin(&mut self, op: SyncOp, vals: &[String], tys: &[CTy]) -> String {
         use SyncOp as S;
+        // `Arc::as_ptr` of an `Arc<[T]>`, `Arc<str>` or `Arc<dyn Tr>`: the
+        // owning value is the fat view of its data.
+        if op == S::ArcAsPtr && super::owning_fat_ref(&tys[0]) {
+            return format!("(*{})", vals[0]);
+        }
         // The element type of the first operand (`Arc<T>`, `&Arc<T>`,
         // `&mut Arc<T>`, `&Weak<T>`), or the operand itself for `new`.
         let elem = match op {

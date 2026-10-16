@@ -247,6 +247,9 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Slice(e) => CTy::Slice(Box::new(cty(tys, e))),
         TyKind::Dyn(..) => CTy::Dyn,
         TyKind::Ref(_, _, e) => ref_cty(tys, e),
+        // A raw pointer to `str`, `[T]` or `dyn Tr` is fat, laid out as
+        // the reference (check/mod.rs `fat_raw_vals` limits its uses).
+        TyKind::RawPtr(_, e) if matches!(tys.kind(e), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) => ref_cty(tys, e),
         TyKind::RawPtr(_, e) => CTy::Ptr(Box::new(cty(tys, e))),
         // An unsized newtype is laid out as its field (W-SHIM).
         TyKind::Adt(d, _) if let Some(f) = tys.unsized_field(d) => match tys.local_adt(t) {
@@ -312,6 +315,31 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
 /// The C form of a reference to `e`: a slice or dyn reference is its
 /// fat value, a reference to an unsized newtype is the newtype's own
 /// fat form (W-SHIM), anything else a pointer.
+/// The address of a fat pointer value of C type `t` (`&str`, `&[T]`,
+/// `&dyn Tr` and their raw forms); None for a thin one.
+fn fat_addr(v: &str, t: &CTy) -> Option<String> {
+    match t {
+        CTy::Dyn => Some(format!("(({v}).data)")),
+        CTy::Slice(_) | CTy::Str => Some(format!("((void*)({v}).ptr)")),
+        CTy::Ref(inner) if **inner == CTy::Str => Some(format!("((void*)({v}).ptr)")),
+        _ => None,
+    }
+}
+
+/// True when `t` is a reference to an owning pointer whose value is the
+/// fat view of its data (`Rc<dyn Tr>`, `Rc<str>`, `Arc<[T]>`): its
+/// `as_ptr` is that value.
+fn owning_fat_ref(t: &CTy) -> bool {
+    match t {
+        CTy::Ref(inner) => match &**inner {
+            CTy::RcDyn => true,
+            CTy::Own(_, x) => matches!(**x, CTy::Str | CTy::Slice(_) | CTy::Dyn),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn ref_cty(tys: &impl TyIntern, e: Ty) -> CTy {
     match tys.kind(e) {
         TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
@@ -3197,6 +3225,12 @@ impl FnGen<'_, '_> {
             Rvalue::Cast(o, to) => {
                 let (a, from) = self.operand(o, loc, post);
                 let to = cty(&self.body.tys, *to);
+                // A fat raw pointer cast to a thin one keeps its address.
+                if matches!(to, CTy::Ptr(_))
+                    && let Some(addr) = fat_addr(&a, &from)
+                {
+                    return format!("(({}){addr})", ctype(&to));
+                }
                 // Casts to or from a 128-bit struct value are not C casts.
                 match (&from, &to) {
                     // Float casts go through the runtime helpers so rounding
@@ -6327,12 +6361,22 @@ impl FnGen<'_, '_> {
             // the C address itself.
             B::PtrFromRef => vals[0].clone(),
             B::PtrNull => "((void*)0)".into(),
-            B::PtrEqFn => format!("((void*)({}) == (void*)({}))", vals[0], vals[1]),
+            // Fat operands: `addr_eq` compares the addresses, `eq` the
+            // address and the length (check/mod.rs allows no dyn `eq`).
+            B::PtrEqFn | B::PtrAddrEqFn if fat_addr(&vals[0], &tys[0]).is_some() || fat_addr(&vals[1], &tys[1]).is_some() => {
+                let addr = |i: usize| fat_addr(&vals[i], &tys[i]).unwrap_or_else(|| format!("((void*)({}))", vals[i]));
+                // `eq` of two fat slice or str pointers also compares the
+                // lengths (check/mod.rs allows no dyn `eq`).
+                let len = if b == B::PtrEqFn { format!(" && ({}).len == ({}).len", vals[0], vals[1]) } else { String::new() };
+                format!("({} == {}{len})", addr(0), addr(1))
+            }
+            B::PtrEqFn | B::PtrAddrEqFn => format!("((void*)({}) == (void*)({}))", vals[0], vals[1]),
             B::PtrIsNull => format!("(({}) == 0)", vals[0]),
-            B::PtrCast => format!("((void*)({}))", vals[0]),
-            B::PtrAddr => format!("((uint64_t)(uintptr_t)({}))", vals[0]),
+            B::PtrCast => format!("((void*)({}))", fat_addr(&vals[0], &tys[0]).unwrap_or_else(|| vals[0].clone())),
+            B::PtrAddr => format!("((uint64_t)(uintptr_t)({}))", fat_addr(&vals[0], &tys[0]).unwrap_or_else(|| vals[0].clone())),
             B::PtrWithAddr => format!("((void*)(uintptr_t)({}))", vals[1]),
             // `Rc::as_ptr`: the payload behind the counts.
+            B::SmartAsPtr if owning_fat_ref(&tys[0]) => format!("(*{})", vals[0]),
             B::SmartAsPtr => format!("(&(*{})->v)", vals[0]),
             B::SeqAsPtr => slice_like(&tys[0], &vals[0]).1,
             B::StrAsPtr => match &tys[0] {

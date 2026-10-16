@@ -267,7 +267,7 @@ impl<'p> Ctx<'p> {
     /// Rejects an `Rc` or `Arc` fn on a pointer to `str` or `[T]` (the
     /// first param, behind a reference) that needs a sized value
     /// (`try_unwrap`, `into_inner`, `unwrap_or_clone`: rustc E0277), or
-    /// that lust does not build for one yet (`downgrade`, `as_ptr`).
+    /// that lust does not build for one yet (`downgrade`).
     /// True after reporting.
     pub(super) fn own_call_guard(&mut self, b: Builtin, params: &[Ty], span: Span) -> bool {
         use crate::check::sync::SyncOp as S;
@@ -278,7 +278,8 @@ impl<'p> Ctx<'p> {
                 | Builtin::RcUnwrapOrClone
                 | Builtin::Sync(S::ArcTryUnwrap | S::ArcIntoInner | S::ArcUnwrapOrClone)
         );
-        let not_yet = matches!(b, Builtin::RcDowngrade | Builtin::SmartAsPtr | Builtin::Sync(S::ArcDowngrade | S::ArcAsPtr));
+        // `as_ptr` of these is a fat raw pointer (check/mod.rs `fat_raw_vals`).
+        let not_yet = matches!(b, Builtin::RcDowngrade | Builtin::Sync(S::ArcDowngrade));
         if !sized_only && !not_yet {
             return false;
         }

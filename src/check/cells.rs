@@ -97,6 +97,9 @@ impl<'p> Ctx<'p> {
                 (vec![r, r], BOOL)
             }
             // `Rc::as_ptr(&rc) -> *const T` (w-cinterop).
+            // A direct call with a fat result (`Rc<dyn Tr>`, `Rc<str>`) drops
+            // this entry for `fat_raw_vals` (check/mod.rs `call`); a fn value
+            // keeps it.
             Builtin::SmartAsPtr => {
                 self.deferred_sized.push((elem, self.p.ast.expr_span(callee)));
                 let rc = self.tys.mk_rc(elem);
