@@ -6351,13 +6351,14 @@ fn register_assoc_consts(
                 let self_ty = owner.map(|o| p.tys.adt_ty(o));
                 let ty = match resolve_item_ty(p, c.ty, self_ty) {
                     Ok(t) => t,
-                    Err(d) => match p.gx.trait_assoc_consts.get(&assoc).copied().filter(|&(t, _)| !p.tys.flags(t).contains_param()) {
+                    Err(d) => match generics::impl_const_decl_ty(p, impl_def, assoc) {
                         // The scoped check in `finish_trait_impl`
                         // already validated the written type; a
                         // plain resolve failure here only means it
-                        // names the impl's parameters, so the
-                        // trait's concrete type stands in.
-                        Some((t, _)) => t,
+                        // names the impl's parameters or `Self::A`,
+                        // so the trait's type (with this impl's
+                        // bindings) stands in.
+                        Some(t) => t,
                         None => {
                             errs.push(d);
                             continue;

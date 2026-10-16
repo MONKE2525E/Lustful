@@ -2233,6 +2233,13 @@ pub(crate) fn resolve_const_arg(
     span: Span,
 ) -> Result<ConstId, Diag> {
     match ast.expr(e) {
+        // `{ N }`: a const parameter in braces is the parameter.
+        ast::Expr::Block(b)
+            if ast.block(*b).stmts.is_empty()
+                && ast.block(*b).tail.is_some_and(|t| matches!(ast.expr(t), ast::Expr::Path(segs) if segs.len() == 1 && scope.const_params.iter().any(|(n, ..)| *n == segs[0].name))) =>
+        {
+            resolve_const_arg(ast, interner, known, tys, scope, ast.block(*b).tail.unwrap(), span)
+        }
         ast::Expr::Path(segs) if segs.len() == 1 => {
             if let Some(&(_, c)) = scope.const_values.iter().find(|(n, _)| *n == segs[0].name)
                 && !ast.is_parenthesized(e)
@@ -6718,13 +6725,23 @@ pub fn finish_trait_impl(
         };
         if let Some(&(want, _)) = p.gx.trait_assoc_consts.get(&assoc) {
             let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-            match resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, ac.ty, scope) {
+            // `Self::A` in the written type names this impl's binding
+            // for `A` (`const MIN: Self::Primitive = 0;`).
+            let args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
+            let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+            let mut sc = scope.clone();
+            sc.assoc_srcs.push(AssocSrc {
+                self_ty,
+                trait_def: tr.def,
+                args: tr.args,
+                assocs: rec.assoc_items.iter().map(|&(d, n, _)| (n, d)).collect(),
+            });
+            match resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, ac.ty, &sc) {
                 Ok(got) => {
-                    let args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
+                    let got = rewrite_impl_projections(p, got, self_ty, &assoc_tys);
                     let want = subst(&mut p.tys, want, &args);
                     // `Self::A` in the declared type is this impl's
                     // binding for `A` (as for method signatures).
-                    let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
                     let want = rewrite_impl_projections(p, want, self_ty, &assoc_tys);
                     if got != want {
                         errs.push(Diag::new(
@@ -7025,6 +7042,24 @@ fn check_drop_impl(p: &Program, imp: &ast::ImplDef, generics: &Generics, self_pa
 /// is still a parameter.
 fn rewrite_impl_projections(p: &mut Program, t: Ty, self_ty: Ty, assoc_tys: &[(DefId, Ty)]) -> Ty {
     rewrite_projections_at(p, t, self_ty, assoc_tys, 0)
+}
+
+/// The type a trait impl's const `assoc` has by the trait's
+/// declaration, in the impl's parameter space: the trait args and the
+/// impl's associated type bindings filled in (`const MIN:
+/// Self::Primitive` in an impl with `type Primitive = i16;` is `i16`).
+/// None when the impl has no record or the type still names a
+/// parameter. Collect uses it when the plain resolver cannot read the
+/// written type; `finish_trait_impl` checks that the two agree.
+pub(crate) fn impl_const_decl_ty(p: &mut Program, impl_def: DefId, assoc: DefId) -> Option<Ty> {
+    let (want, _) = p.gx.trait_assoc_consts.get(&assoc).copied()?;
+    let (_, rec) = p.gx.index.by_def(impl_def)?;
+    let (args, assoc_tys) = (rec.trait_ref.args, rec.assoc_tys.clone());
+    let args: Vec<GenericArg> = p.tys.args(args).to_vec();
+    let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+    let t = subst(&mut p.tys, want, &args);
+    let t = rewrite_impl_projections(p, t, self_ty, &assoc_tys);
+    (!p.tys.flags(t).contains_param()).then_some(t)
 }
 
 /// `rewrite_impl_projections` at nesting `depth`: a projection on
@@ -7752,10 +7787,12 @@ pub fn add_synthetic_impls(p: &mut Program) {
             if !on {
                 continue;
             }
+            // A const parameter is a const arg (`ArrayStr<N>`), as in
+            // written impl headers; the others are type args.
             let param_args: Vec<GenericArg> = (0..n_params as u32)
-                .map(|i| {
-                    let t = p.tys.intern(TyKind::Param(ParamId(i)));
-                    GenericArg::Ty(t)
+                .map(|i| match p.gx.adt_generics[a].params.get(i as usize).map(|prm| prm.kind) {
+                    Some(ParamKind::Const(_)) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i))),
+                    _ => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i)))),
                 })
                 .collect();
             let self_pat = p.tys.mk_adt(def, &param_args);
@@ -10642,7 +10679,24 @@ fn fmt_impl_bounds_hold(p: &mut Program, record: &crate::traits::index::ImplReco
                 });
             }
             let args = p.tys.intern_args(&args);
-            others.push(TraitRef { def: d, args, bindings: b.value.bindings });
+            // The bindings name impl parameters too (`B: Bounds<Primitive
+            // = P>`): they take the selected args, normalized as above.
+            let raw_b: Vec<(DefId, GenericArg)> = p.tys.bindings(b.value.bindings).to_vec();
+            let mut new_b: Vec<(DefId, GenericArg)> = Vec::with_capacity(raw_b.len());
+            for (assoc, g) in raw_b {
+                new_b.push((
+                    assoc,
+                    match g.as_ty() {
+                        Some(t) => {
+                            let t = crate::ty::subst(&mut p.tys, t, impl_args);
+                            GenericArg::Ty(normalize_global(p, t))
+                        }
+                        None => g,
+                    },
+                ));
+            }
+            let bindings = p.tys.intern_bindings(&new_b);
+            others.push(TraitRef { def: d, args, bindings });
             continue;
         }
         let Some(arg) = p.tys.args(b.value.args).first().and_then(|g| g.as_ty()) else { return false };
@@ -11430,7 +11484,24 @@ fn prove_trait_ref(
     }
     match solver.select(cx, index, env, tr) {
         Selection::Impl { nested, .. } => nested.iter().all(|pred| match pred {
-            Predicate::Trait(b) if b.count == 0 => prove_trait_ref(p, solver, cx, env, b.value, depth + 1, seen),
+            Predicate::Trait(b) if b.count == 0 => {
+                // A nested goal on a projection (`<Y as Bounds>::Primitive:
+                // Prim`, from an associated type's bound) asks its normal
+                // form: the solver does not select on a projection Self.
+                let mut goal = b.value;
+                let argv: Vec<GenericArg> = cx.tys.args(goal.args).to_vec();
+                if argv.iter().any(|g| g.as_ty().is_some_and(|t| cx.tys.flags(t).contains_projection())) {
+                    let normed: Vec<GenericArg> = argv
+                        .iter()
+                        .map(|&g| match g.as_ty() {
+                            Some(t) => GenericArg::Ty(crate::traits::solve::normalize(solver, cx, index, env, t)),
+                            None => g,
+                        })
+                        .collect();
+                    goal.args = cx.tys.intern_args(&normed);
+                }
+                prove_trait_ref(p, solver, cx, env, goal, depth + 1, seen)
+            }
             _ => true,
         }),
         Selection::ParamEvidence(_) => true,

@@ -4124,10 +4124,17 @@ impl<'p> Ctx<'p> {
 
     /// The const a const inference variable bound to, if any.
     fn resolve_const(&self, c: ConstId) -> ConstId {
-        match self.tys.const_kind(c) {
-            ConstKind::Infer(id) if id >= generics::INFER_MARKER_BASE => self.const_bindings.get(&id).copied().unwrap_or(c),
-            _ => c,
+        // A variable can be bound to another variable (`K::H(1)` gives
+        // `K<?a>`, a struct literal field `K<?b>`, and `?b` is fixed
+        // later), so follow the chain to its end.
+        let mut c = c;
+        while let ConstKind::Infer(id) = self.tys.const_kind(c)
+            && id >= generics::INFER_MARKER_BASE
+            && let Some(&next) = self.const_bindings.get(&id)
+        {
+            c = next;
         }
+        c
     }
 
     /// Unifies two consts, binding a const inference variable. The
@@ -9670,7 +9677,9 @@ impl<'p> Ctx<'p> {
     /// own and then joins them (two closures make a fn pointer), while a
     /// nested `if` or `match` would coerce its arms to the hint.
     fn branch_hint(&self, expected: Option<Ty>, prev: Option<Ty>) -> Option<Ty> {
-        expected.or(prev.filter(|&t| !matches!(self.kind(t), TyKind::Closure(..) | TyKind::FnDef(..))))
+        // A diverging earlier branch (`!`) says nothing about the
+        // others: `if a { return x; } else if b { 1 } else { 2 }`.
+        expected.or(prev.filter(|&t| !matches!(self.kind(t), TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::Never)))
     }
 
     /// The expected type when it is a fn pointer (see `LoopCtx::want`).
@@ -17943,6 +17952,10 @@ impl<'p> Ctx<'p> {
     /// kin). Every flag applies to every type, as in Rust: the impl
     /// reads the ones it uses (`{:05}` on a str pads with spaces).
     fn check_fmt_arg(&mut self, t: Ty, spec: FmtSpec, span: Span) {
+        // A projection reads through its normalization: `B::MIN` with
+        // `const MIN: Self::Primitive` under `B: Bounds<Primitive = P>`
+        // is a `P` (as in the deferred Debug loop).
+        let t = self.normalize_here(t);
         let (_, base) = self.autoderef(t);
         let bk = self.kind(base);
         // Valid Rust lust has no rendering for yet: integer exponent
@@ -18985,7 +18998,11 @@ impl<'p> Ctx<'p> {
                 Selection::ParamEvidence(_) => {
                     let (declared, _) = p.gx.trait_assoc_consts[&assoc];
                     let args: Vec<GenericArg> = self.tys.args(tr.args).to_vec();
-                    Some((None, subst(&mut self.tys, declared, &args)))
+                    // `const MIN: Self::Primitive` under `B: Bounds<Primitive
+                    // = i8>` reads as an `i8` (casts and drops need the
+                    // normal form).
+                    let t = subst(&mut self.tys, declared, &args);
+                    Some((None, self.normalize_here(t)))
                 }
                 _ => None,
             };
@@ -19176,14 +19193,24 @@ impl<'p> Ctx<'p> {
     }
 
     /// A zero const value of one type, for the template-only
-    /// placeholder in `finish`. Reference and other non-const
-    /// shapes have no placeholder: a trait associated const of
-    /// such a type read through a type parameter still fails
-    /// the template check with the unassigned-temp error.
+    /// placeholder in `finish`. A `&str` gets an empty string and a
+    /// parameter or projection type the unit value (the template is
+    /// only borrow checked). Other reference and non-const shapes have no
+    /// placeholder: a trait associated const of such a type read
+    /// through a type parameter still fails the template check with
+    /// the unassigned-temp error.
     fn zero_const(&mut self, t: Ty) -> Option<crate::ty::consteval::ConstValue> {
         use crate::ty::consteval::ConstValue;
         let t = self.deep(t);
+        let t = self.normalize_here(t);
         match self.tys.kind(t) {
+            // `const WHAT: &'static str` read through a parameter.
+            TyKind::Ref(_, _, inner) if matches!(self.tys.kind(inner), TyKind::Str) => Some(ConstValue::StrBytes(crate::ast::ByteBlob::new(Vec::new()))),
+            // A value of a parameter's type (`B::MIN` with `const MIN:
+            // Self::Primitive` under `B: Bounds<Primitive = P>`): the
+            // template body is only borrow checked, never built, so any
+            // initialized value stands in.
+            TyKind::Param(_) | TyKind::Projection(..) => Some(ConstValue::Unit),
             TyKind::Adt(..) if self.tys.option_elem(t).is_some() => Some(ConstValue::Variant(0, Vec::new())),
             TyKind::Adt(..) => {
                 let p = self.p;
