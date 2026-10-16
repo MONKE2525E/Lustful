@@ -3687,8 +3687,12 @@ impl FnGen<'_, '_> {
             let shim = self.fn_value_shim(&name, &vt, consume.is_some());
             words.push(format!("(void *){shim}"));
         } else {
+            // `&C` / `&mut C` of a closure: the data pointer points at
+            // the reference, so the entry loads it first.
+            let through_ref = p.gx.lang.is_fn_family(vt.principal.def)
+                && matches!(p.tys.kind(vt.self_ty), TyKind::Ref(_, _, inner) if matches!(p.tys.kind(inner), TyKind::Closure(..)));
             for (j, &f) in vt.methods.iter().enumerate() {
-                let shim = self.vtable_shim(&name, j, f, consume);
+                let shim = self.vtable_shim(&name, j, f, consume, through_ref);
                 words.push(format!("(void *){shim}"));
             }
         }
@@ -3761,8 +3765,10 @@ impl FnGen<'_, '_> {
     /// entry to that shape. With `consume` (the concrete type of a `dyn
     /// FnOnce` vtable) the shim takes the value out of the box (an
     /// `FnOnce` closure's by-value env) or drops it after the call (an
-    /// `Fn`/`FnMut` closure's), then frees the box.
-    fn vtable_shim(&mut self, vt_name: &str, j: usize, f: LocalDefId, consume: Option<Ty>) -> String {
+    /// `Fn`/`FnMut` closure's), then frees the box. With `through_ref`
+    /// (the concrete type is a reference to the closure) the receiver
+    /// is the pointer stored at the data pointer.
+    fn vtable_shim(&mut self, vt_name: &str, j: usize, f: LocalDefId, consume: Option<Ty>, through_ref: bool) -> String {
         self.note_callee(f);
         let p = self.p;
         let info = p.fn_info(f);
@@ -3819,7 +3825,7 @@ impl FnGen<'_, '_> {
         }
         let mut names: Vec<String> = Vec::new();
         if !recv_dropped {
-            names.push(format!("({recv})self"));
+            names.push(if through_ref { format!("({recv})*(void **)self") } else { format!("({recv})self") });
         }
         names.extend(rest);
         let names = names.join(", ");

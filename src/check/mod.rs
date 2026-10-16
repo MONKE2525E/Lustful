@@ -7432,6 +7432,11 @@ impl<'p> Ctx<'p> {
                 TyKind::FnDef(def, _) => p.is_fn_item_def(def),
                 TyKind::Closure(..) | TyKind::Param(_) | TyKind::FnPtr(_) => true,
                 TyKind::Opaque(..) => self.opaque_mode == opaque::OpaqueMode::View,
+                // A reference to a closure (core's `impl Fn* for &F / &mut F`;
+                // `&mut v` with `v: &mut {closure}` in an instance): its call
+                // entry goes through the reference (cgen `vtable_shim`). Not
+                // as a `dyn FnOnce`, which would consume the reference.
+                TyKind::Ref(_, _, inner) => to.def != lang.fn_once && matches!(self.kind(self.resolve(inner)), TyKind::Closure(..)),
                 _ => false,
             };
             if !fn_value {

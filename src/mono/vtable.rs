@@ -95,6 +95,12 @@ pub fn ensure_vtable(p: &mut Program, self_ty: Ty, principal: TraitRef, made: &m
     if p.gx.lang.is_fn_family(principal.def) {
         let methods = match p.tys.kind(self_ty) {
             TyKind::Closure(def, _) => vec![p.gx.closures.get(&def)?.body_fn],
+            // `&C` / `&mut C` of a closure: the same body, called through
+            // the reference (cgen `vtable_shim` loads it first).
+            TyKind::Ref(_, _, inner) => match p.tys.kind(inner) {
+                TyKind::Closure(def, _) => vec![p.gx.closures.get(&def)?.body_fn],
+                _ => return None,
+            },
             TyKind::FnDef(def, args) if p.adt_by_def(def).is_none() => {
                 let f = p.local_def(def.hash)?;
                 let args: Vec<GenericArg> = p.tys.args(args).to_vec();
