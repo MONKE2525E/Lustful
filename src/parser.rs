@@ -5469,13 +5469,22 @@ impl<'a> Parser<'a> {
                     Ok(extra.len() - 1)
                 };
                 // `.*` takes the next positional argument before the value.
+                // A positional reference (`{}`, `{0}`, `.*`, `1$`) names an
+                // explicit argument only: a captured variable appended
+                // below is never one (rustc: "N positional arguments in
+                // format string, but there are M arguments").
                 let mut counts = [None, None];
+                let mut positional = Vec::new();
                 for (slot, count) in [width_arg, precision_arg].into_iter().enumerate() {
                     counts[slot] = match count {
                         None => None,
-                        Some(FmtCount::Index(n)) => Some(n),
+                        Some(FmtCount::Index(n)) => {
+                            positional.push(n);
+                            Some(n)
+                        }
                         Some(FmtCount::Next) => {
                             next += 1;
+                            positional.push(next - 1);
                             Some(next - 1)
                         }
                         Some(FmtCount::Name(n)) => Some(by_name(self, &n, extra, &mut used)?),
@@ -5483,12 +5492,17 @@ impl<'a> Parser<'a> {
                 }
                 let index = if name.is_empty() {
                     next += 1;
+                    positional.push(next - 1);
                     next - 1
                 } else if let Ok(n) = name.parse::<usize>() {
+                    positional.push(n);
                     n
                 } else {
                     by_name(self, name, extra, &mut used)?
                 };
+                if positional.iter().any(|&i| i >= explicit) {
+                    return Err(syntax(span, "format string refers to a missing argument"));
+                }
                 for i in counts.iter().flatten().chain([&index]) {
                     if *i >= extra.len() {
                         return Err(syntax(span, "format string refers to a missing argument"));
