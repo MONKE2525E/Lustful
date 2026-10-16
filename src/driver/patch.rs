@@ -96,7 +96,11 @@ pub(crate) struct PatchBase {
     /// True when the std splice follows the root text in file 0.
     spliced: bool,
     /// Per map file: the std needs and std platform mention of its own
-    /// text (the root's before the splice).
+    /// text (the root's before the splice); none for a file of the std
+    /// platform crate. The std plan folds only the other files' asks
+    /// (`ResolvedCrate::std_asks`), and the platform crate's files always
+    /// name platform modules, so counting them would hide a root that
+    /// stops naming one (a cold resolve then drops the platform crate).
     needs: Vec<(StdNeeds, bool)>,
     /// Per map file: the stat that proves its text unchanged, if any.
     stamps: Vec<Option<Stamp>>,
@@ -246,7 +250,11 @@ impl PatchBase {
         let n = map.file_count();
         let texts: Vec<(usize, &str)> =
             (0..n).map(|k| (k, if k == 0 { root_unspliced.as_str() } else { map.text(FileId(k as u32)).unwrap_or("") })).collect();
-        let needs = super::compile::par_map(&texts, |&(_, t)| file_needs(t));
+        let platform = crate::resolve::worklist::std_platform_root();
+        let platform = platform.parent().unwrap_or(&platform);
+        let needs = super::compile::par_map(&texts, |&(k, t)| {
+            if k > 0 && std::path::Path::new(map.path(FileId(k as u32))).starts_with(platform) { Default::default() } else { file_needs(t) }
+        });
         let stamps = (0..n)
             .map(|k| {
                 let path = map.path(FileId(k as u32));
