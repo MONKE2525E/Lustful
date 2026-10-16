@@ -414,17 +414,17 @@ pub mod btree_map {
                 };
                 match ord {
                     core::cmp::Ordering::Less => {
-                        out.push(core::mem::replace(&mut na, None).unwrap());
+                        out.push(core::mem::replace(&mut na, None).unwrap()); //@ never
                         na = a.next();
                     }
                     core::cmp::Ordering::Greater => {
-                        out.push(core::mem::replace(&mut nb, None).unwrap());
+                        out.push(core::mem::replace(&mut nb, None).unwrap()); //@ never
                         nb = b.next();
                     }
                     core::cmp::Ordering::Equal => {
                         let dropped = core::mem::replace(&mut na, None);
                         drop(dropped);
-                        out.push(core::mem::replace(&mut nb, None).unwrap());
+                        out.push(core::mem::replace(&mut nb, None).unwrap()); //@ never
                         na = a.next();
                         nb = b.next();
                     }
@@ -448,16 +448,20 @@ pub mod btree_map {
 
     impl<K: Ord, V> BTreeMap<K, V> {
         /// The entry span of a range: std's panic checks first
-        /// (BTreeMap texts), then binary searches for both ends.
+        /// (BTreeMap texts), then binary searches for both ends. An
+        /// empty map checks nothing, as std's has no root to search.
         fn range_span<Q: ?Sized + Ord>(&self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> (usize, usize)
         where
             K: Borrow<Q>,
         {
             use core::ops::Bound;
+            if self.entries.is_empty() {
+                return (0, 0);
+            }
             let bounded = match (&start, &end) {
                 (Bound::Excluded(s), Bound::Excluded(e)) => {
                     if super::cmp_of(*s, *e) == core::cmp::Ordering::Equal {
-                        panic!("range start and end are equal and excluded in BTreeMap");
+                        panic!("range start and end are equal and excluded in BTreeMap"); //@ alloc/src/collections/btree/search.rs:112:21
                     }
                     Some((s, e))
                 }
@@ -469,7 +473,7 @@ pub mod btree_map {
             if let Some((s, e)) = bounded
                 && super::cmp_of(*s, *e) == core::cmp::Ordering::Greater
             {
-                panic!("range start is greater than range end in BTreeMap");
+                panic!("range start is greater than range end in BTreeMap"); //@ alloc/src/collections/btree/search.rs:121:21
             }
             let lo = match &start {
                 Bound::Included(x) => match self.search(*x) {
@@ -787,7 +791,9 @@ pub mod btree_map {
         K: Borrow<Q>,
     {
         type Output = V;
-        /// As std's: a missing key panics with `no entry found for key`.
+        /// As std's: a missing key panics with `no entry found for key`,
+        /// at the caller (core's `Index::index` is `#[track_caller]`).
+        #[track_caller]
         fn index(&self, key: &Q) -> &V {
             match self.get(key) {
                 Some(v) => v,
@@ -1052,17 +1058,17 @@ pub mod btree_set {
                 };
                 match ord {
                     core::cmp::Ordering::Less => {
-                        out.push(core::mem::replace(&mut na, None).unwrap());
+                        out.push(core::mem::replace(&mut na, None).unwrap()); //@ never
                         na = a.next();
                     }
                     core::cmp::Ordering::Greater => {
-                        out.push(core::mem::replace(&mut nb, None).unwrap());
+                        out.push(core::mem::replace(&mut nb, None).unwrap()); //@ never
                         nb = b.next();
                     }
                     core::cmp::Ordering::Equal => {
                         let dropped = core::mem::replace(&mut na, None);
                         drop(dropped);
-                        out.push(core::mem::replace(&mut nb, None).unwrap());
+                        out.push(core::mem::replace(&mut nb, None).unwrap()); //@ never
                         na = a.next();
                         nb = b.next();
                     }
@@ -1107,16 +1113,19 @@ pub mod btree_set {
 
     impl<T: Ord> BTreeSet<T> {
         /// The element span of a range, with std's panic checks
-        /// (BTreeSet texts).
+        /// (BTreeSet texts). An empty set checks nothing (see BTreeMap's).
         fn range_span<Q: ?Sized + Ord>(&self, start: core::ops::Bound<&Q>, end: core::ops::Bound<&Q>) -> (usize, usize)
         where
             T: Borrow<Q>,
         {
             use core::ops::Bound;
+            if self.items.is_empty() {
+                return (0, 0);
+            }
             let bounded = match (&start, &end) {
                 (Bound::Excluded(s), Bound::Excluded(e)) => {
                     if super::cmp_of(*s, *e) == core::cmp::Ordering::Equal {
-                        panic!("range start and end are equal and excluded in BTreeSet");
+                        panic!("range start and end are equal and excluded in BTreeSet"); //@ alloc/src/collections/btree/search.rs:110:21
                     }
                     Some((s, e))
                 }
@@ -1128,7 +1137,7 @@ pub mod btree_set {
             if let Some((s, e)) = bounded
                 && super::cmp_of(*s, *e) == core::cmp::Ordering::Greater
             {
-                panic!("range start is greater than range end in BTreeSet");
+                panic!("range start is greater than range end in BTreeSet"); //@ alloc/src/collections/btree/search.rs:119:21
             }
             let lo = match &start {
                 Bound::Included(x) => match self.search(*x) {
@@ -1481,7 +1490,7 @@ pub mod vec_deque {
         }
 
         pub fn rotate_left(&mut self, n: usize) {
-            assert!(n <= self.len());
+            assert!(n <= self.len()); //@ alloc/src/collections/vec_deque/mod.rs:3137:9
             let len = self.buf.len();
             if len <= 1 || n == 0 || n == len {
                 return;
@@ -1507,7 +1516,7 @@ pub mod vec_deque {
         }
 
         pub fn rotate_right(&mut self, n: usize) {
-            assert!(n <= self.len());
+            assert!(n <= self.len()); //@ alloc/src/collections/vec_deque/mod.rs:3180:9
             let len = self.buf.len();
             if len <= 1 || n == 0 || n == len {
                 return;
@@ -1587,7 +1596,7 @@ pub mod vec_deque {
         pub fn insert(&mut self, index: usize, value: T) {
             let len = self.buf.len();
             if index > len {
-                panic!("index out of bounds");
+                panic!("index out of bounds"); //@ alloc/src/collections/vec_deque/mod.rs:2564:9
             }
             let pre = self.pre_grow();
             self.buf.insert(index, value);
@@ -1614,8 +1623,8 @@ pub mod vec_deque {
         }
 
         pub fn swap(&mut self, i: usize, j: usize) {
-            assert!(i < self.len());
-            assert!(j < self.len());
+            assert!(i < self.len()); //@ alloc/src/collections/vec_deque/mod.rs:1030:9
+            assert!(j < self.len()); //@ alloc/src/collections/vec_deque/mod.rs:1031:9
             self.buf.swap(i, j);
         }
 
@@ -1624,6 +1633,7 @@ pub mod vec_deque {
         }
 
         pub fn reserve(&mut self, additional: usize) {
+            self.buf.len().checked_add(additional).expect("capacity overflow"); //@ alloc/src/collections/vec_deque/mod.rs:1108:56
             let pre = self.pre_grow();
             let len = self.buf.len();
             self.buf.reserve(additional);
@@ -1631,6 +1641,7 @@ pub mod vec_deque {
         }
 
         pub fn reserve_exact(&mut self, additional: usize) {
+            self.buf.len().checked_add(additional).expect("capacity overflow"); //@ alloc/src/collections/vec_deque/mod.rs:1078:56
             let pre = self.pre_grow();
             let len = self.buf.len();
             self.buf.reserve_exact(additional);
@@ -1723,7 +1734,7 @@ pub mod vec_deque {
 
         pub fn split_off(&mut self, at: usize) -> VecDeque<T> {
             let len = self.buf.len();
-            assert!(at <= len, "`at` out of bounds");
+            assert!(at <= len, "`at` out of bounds"); //@ alloc/src/collections/vec_deque/mod.rs:2672:9
             VecDeque { buf: self.buf.split_off(at), head: 0 }
         }
 

@@ -24,14 +24,31 @@
 use super::*;
 
 /// True when `f` has `#[track_caller]`: its own attribute, or its
-/// template's for an instance. A closure body fn never has it.
+/// template's for an instance, or it implements `Index::index` or
+/// `IndexMut::index_mut` (core marks the trait's prototypes, and rustc
+/// gives every impl of a marked prototype the attribute). A closure body
+/// fn never has it.
 pub fn is_track_caller(p: &Program, f: LocalDefId) -> bool {
     // A closure body fn or a trait method stub borrows another fn's def.
     if p.gx.closure_fns.contains_key(&f) || matches!(p.gx.fn_class.get(f.0 as usize), Some(generics::FnClass::Stub)) {
         return false;
     }
     let info = p.fn_info(f);
-    info.def(&p.ast).attrs.iter().any(|a| a.path.len() == 1 && p.name(a.path[0].name) == "track_caller")
+    info.def(&p.ast).attrs.iter().any(|a| a.path.len() == 1 && p.name(a.path[0].name) == "track_caller") || implements_index(p, f)
+}
+
+/// True when `f` is an impl's `index` or `index_mut` for core's `Index`
+/// or `IndexMut` (see `is_track_caller`).
+fn implements_index(p: &Program, f: LocalDefId) -> bool {
+    let name = p.name(p.fn_info(f).name);
+    if name != "index" && name != "index_mut" {
+        return false;
+    }
+    let src = p.gx.instances.get(&f).and_then(|i| i.template_local).unwrap_or(f);
+    p.defs
+        .parent_of(p.def_id(src))
+        .and_then(|imp| p.gx.index.by_def(imp))
+        .is_some_and(|(_, rec)| rec.trait_def == p.gx.lang.index || rec.trait_def == p.gx.lang.index_mut)
 }
 
 /// The rejects for `#[track_caller]` uses lust does not support, and
@@ -54,7 +71,7 @@ pub fn check_attrs(p: &Program, errs: &mut Vec<Diag>) {
             errs.push(Diag::new("L0110", def.name_span, "`main` function is not allowed to be `#[track_caller]`", "Remove the attribute."));
             continue;
         }
-        if crate::borrowck::impl_trait_method(p, f).is_some() && p.fn_shipped_crate(f).is_none() {
+        if crate::borrowck::impl_trait_method(p, f).is_some() && p.fn_shipped_crate(f).is_none() && !implements_index(p, f) {
             errs.push(generics::dyn_not_yet(def.name_span, "`#[track_caller]` on a trait impl method"));
         }
     }
