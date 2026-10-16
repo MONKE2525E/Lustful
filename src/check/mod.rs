@@ -2189,7 +2189,8 @@ struct OrFrame {
 
 /// The module a body checks in: the module of the def that owns
 /// the body, exactly as a non-generic body in that module sees it
-/// (ARCH 1.5). AST fns read `fn_module` by `LocalDefId`. Fns mono
+/// (ARCH 1.5). AST fns read the resolver's def table
+/// (`collect::def_module_of_fn`), else `fn_module` by `LocalDefId`. Fns mono
 /// appends are past that vec: an instance takes its template's
 /// module, and a trait-default template (or a template with no
 /// local form) takes the module its def was defined in. Closure
@@ -2224,8 +2225,10 @@ fn defining_module(p: &Program, fid: LocalDefId) -> crate::ty::defs::ModuleId {
     // most one hop in practice; the bound guards only against a
     // malformed table.
     for _ in 0..8 {
+        // The def table first: the index table shifts when collect
+        // dropped fns the resolver counted (after an earlier error).
         if let Some(m) = tables.fn_module.get(cur.0 as usize) {
-            return *m;
+            return crate::check::collect::def_module_of_fn(p, cur.0 as usize).unwrap_or(*m);
         }
         if let Some(info) = p.gx.instances.get(&cur) {
             if let Some(template) = info.template_local {

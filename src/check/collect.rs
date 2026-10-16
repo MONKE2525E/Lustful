@@ -6899,6 +6899,23 @@ pub(crate) fn named_field_is_private(p: &Program, adt: AdtId, field: Sym, from: 
 }
 
 /// True when tuple field `index` of `adt` is not visible from `from`.
+/// The defining module of AST fn `i` from the resolver's def table (an
+/// associated fn climbs to its impl or trait, a body fn to its outer
+/// fn), or None when the table has no entry. Unlike `fn_module[i]` it
+/// cannot shift when collect drops an item the resolver counted (the
+/// fns of an impl whose trait or type failed to resolve).
+pub(crate) fn def_module_of_fn(p: &Program, i: usize) -> Option<crate::ty::defs::ModuleId> {
+    let tables = p.resolved.as_deref()?;
+    let mut def = *p.fn_defs.get(i)?;
+    for _ in 0..4 {
+        if let Some(info) = tables.def_info.get(&def) {
+            return Some(info.module);
+        }
+        def = p.defs.parent_of(def).or_else(|| p.gx.index.trait_of_method(def)).or_else(|| p.gx.index.trait_of_assoc(def))?;
+    }
+    None
+}
+
 pub(crate) fn tuple_field_is_private(p: &Program, adt: AdtId, index: u32, from: crate::ty::defs::ModuleId) -> bool {
     let Some(tables) = &p.resolved else { return false };
     let Some(def) = p.defs.def_of_adt(adt) else { return false };
@@ -7022,7 +7039,8 @@ impl CollectCx<'_> {
     /// consts included), else the enclosing function's module for
     /// an item in a body (the smallest fn expression range that
     /// holds the initializer; nested fn items share their outer
-    /// function's module, so any holding range gives it).
+    /// function's module, so any holding range gives it), read as
+    /// `def_module_of_fn`.
     fn pending_module(&self, it: &PendingConst) -> Option<crate::ty::defs::ModuleId> {
         let tables = self.p.resolved.as_deref()?;
         if let Some(m) = tables.const_init_module.get(&it.span) {
@@ -7037,9 +7055,9 @@ impl CollectCx<'_> {
             if it.expr.0 >= lo && it.expr.0 < hi {
                 let size = hi - lo;
                 if best.is_none_or(|(b, _)| size < b)
-                    && let Some(m) = tables.fn_module.get(i)
+                    && let Some(m) = def_module_of_fn(self.p, i).or_else(|| tables.fn_module.get(i).copied())
                 {
-                    best = Some((size, *m));
+                    best = Some((size, m));
                 }
             }
         }
