@@ -1,6 +1,4 @@
-// expect: L0104
-// Valid Rust: adapters through `&mut I` (the by_ref form) over a user
-// iterator are not implemented yet.
+// Adapters through `&mut I` (the by_ref form) over a user iterator.
 struct C(u32);
 
 impl Iterator for C {
