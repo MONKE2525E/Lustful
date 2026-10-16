@@ -2614,16 +2614,40 @@ fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
     if start >= trees.len() {
         return None;
     }
+    // A `let` statement ends at its `;` (commas in closure parameters or
+    // generic arguments do not end it).
+    if tok_at(trees, start).map(|t| t.tok) == Some(Tok::Let) {
+        return Some(semi_end(trees, start));
+    }
+    // A block-like expression statement ends at its last block, as in
+    // rustc (no `;` needed, no binary operator, call, or index after it),
+    // unless `.` or `?` continues it into a plain expression statement.
+    // A head this scan cannot bound gives no end: the caller rejects.
+    if block_like_start(trees, start) {
+        let e = block_like_end(trees, start)?;
+        return Some(match tok_at(trees, e).map(|t| t.tok) {
+            Some(Tok::Semi) => e + 1,
+            Some(Tok::Dot | Tok::Question) => semi_end(trees, e),
+            _ => e,
+        });
+    }
     let mut j = start;
     while j < trees.len() {
         match &trees[j] {
             Tt::Tok(t) if t.tok == Tok::Semi => return Some(j + 1),
             Tt::Tok(t) if t.tok == Tok::Comma => return Some(j + 1),
             Tt::Tok(t) if t.tok == Tok::FatArrow => {
-                // A match arm: a block body, or up to the next comma.
-                if matches!(trees.get(j + 1), Some(Tt::Delim(Delim::Brace, _, _))) {
-                    let e = j + 2;
-                    return Some(if tok_at(trees, e).map(|t| t.tok) == Some(Tok::Comma) { e + 1 } else { e });
+                // A match arm: a block-like body ends at its last block
+                // (`1 => match c { .. }` needs no comma, as in rustc)
+                // unless `.` or `?` continues it; any other body runs up
+                // to the next comma.
+                if block_like_start(trees, j + 1) {
+                    let e = block_like_end(trees, j + 1)?;
+                    match tok_at(trees, e).map(|t| t.tok) {
+                        Some(Tok::Comma) => return Some(e + 1),
+                        Some(Tok::Dot | Tok::Question) => {}
+                        _ => return Some(e),
+                    }
                 }
                 let mut k = j + 1;
                 while k < trees.len() {
@@ -2638,6 +2662,13 @@ fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
                 // A struct literal or pattern in a head position; the
                 // next brace group is the node's block. Step over the
                 // head group and let that group end the node.
+                j += 1;
+            }
+            // A call or index on a struct literal or inner block (`S {}(x)`,
+            // `x = { v }[0]`) continues the expression.
+            Tt::Delim(Delim::Brace, _, _)
+                if j > start && matches!(trees.get(j + 1), Some(Tt::Delim(Delim::Paren | Delim::Bracket, _, _))) =>
+            {
                 j += 1;
             }
             Tt::Delim(Delim::Brace, _, _) => match tok_at(trees, j + 1).map(|t| t.tok) {
@@ -2688,6 +2719,286 @@ fn node_end(trees: &[Tt], start: usize) -> Option<usize> {
         }
     }
     Some(trees.len())
+}
+
+/// True when an attribute run with a `cfg` or `cfg_attr` ends at `after`,
+/// on an expression statement whose top level is a binary operation,
+/// assignment, cast, or range. rustc rejects that whatever the cfg
+/// says, even when the run expands to no attribute at all (E0658). The
+/// parser checks the attributes that reach it; a run the expander strips
+/// is checked here. The caller passes only runs at a statement start (after `;`, a
+/// brace group, or nothing); only a node that ends with `;` counts, as
+/// no field, variant, or arm does. A cfg'd operator expression as a
+/// block tail is a known gap.
+fn cfg_on_operator_stmt(trees: &[Tt], after: usize, interner: &Interner) -> bool {
+    if tok_at(trees, after).map(|t| t.tok) == Some(Tok::Let) || item_end(trees, after, interner).is_some() {
+        return false;
+    }
+    // A block-like statement counts only when `.` or `?` continues it
+    // (`{ s }.a + 1;`).
+    let (scan, operand) = if block_like_start(trees, after) {
+        match block_like_end(trees, after) {
+            Some(e) if matches!(tok_at(trees, e).map(|t| t.tok), Some(Tok::Dot | Tok::Question)) => (e, false),
+            _ => return false,
+        }
+    } else {
+        (after, true)
+    };
+    if let Some((_, _, g)) = path_call_at(trees, after, interner)
+        && matches!(trees.get(g), Some(Tt::Delim(Delim::Brace, _, _)))
+        && !matches!(tok_at(trees, g + 1).map(|t| t.tok), Some(Tok::Dot | Tok::Question))
+    {
+        return false;
+    }
+    match node_end(trees, after) {
+        // A top-level `:` shows a field, parameter, or `let`-like node.
+        Some(end) if end > scan + 1 && trees[end - 1].is_tok(Tok::Semi) && !trees[scan..end].iter().any(|t| t.is_tok(Tok::Colon)) => {
+            expr_stmt_has_top_op(trees, scan, end - 1, operand)
+        }
+        _ => false,
+    }
+}
+
+/// The end of a dropped macro call node whose group is at `g` (the
+/// path starts at `start`). A brace call is a whole statement or item,
+/// as in rustc, unless `.` or `?` continues it or `=>` or `,` shows it
+/// is a pattern or operand; a `;` after the group joins the node. A
+/// paren or bracket call is an expression that may go on (`m!() - x`,
+/// `m!().f()`), bounded as any other node.
+fn macro_node_end(trees: &[Tt], start: usize, g: usize) -> Option<usize> {
+    let next = tok_at(trees, g + 1).map(|t| t.tok);
+    if next == Some(Tok::Semi) {
+        return Some(g + 2);
+    }
+    let brace = matches!(trees.get(g), Some(Tt::Delim(Delim::Brace, _, _)));
+    if brace && !matches!(next, Some(Tok::Dot | Tok::Question | Tok::FatArrow | Tok::Comma)) {
+        return Some(g + 1);
+    }
+    node_end(trees, start)
+}
+
+/// The index after the first top-level `;` at or after `j`, or the list
+/// end (a tail expression).
+fn semi_end(trees: &[Tt], j: usize) -> usize {
+    (j..trees.len()).find(|&k| trees[k].is_tok(Tok::Semi)).map_or(trees.len(), |k| k + 1)
+}
+
+/// True when a block-like expression starts at `s`: `if`, `match`,
+/// `loop`, `while`, `for`, a block, `unsafe {`, `const {`, or a label
+/// on one of these (rustc's `expr_requires_semi_to_be_stmt` is false).
+fn block_like_start(trees: &[Tt], s: usize) -> bool {
+    let brace_at = |k: usize| matches!(trees.get(k), Some(Tt::Delim(Delim::Brace, _, _)));
+    match trees.get(s) {
+        Some(Tt::Delim(Delim::Brace, _, _) | Tt::Frag(FragKind::Block, _, _)) => true,
+        Some(Tt::Tok(t)) => match t.tok {
+            Tok::If | Tok::Match | Tok::Loop | Tok::While | Tok::For => true,
+            Tok::Unsafe | Tok::Const => brace_at(s + 1),
+            Tok::Lifetime(_) => tok_at(trees, s + 1).map(|t| t.tok) == Some(Tok::Colon) && block_like_start(trees, s + 2),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The index after the block-like expression at `s` (see
+/// `block_like_start`): after its block, or after the last block of an
+/// `if .. else if .. else` chain. None when the head has a form this
+/// token scan does not bound (a closure, `async`, a stray `;`).
+fn block_like_end(trees: &[Tt], s: usize) -> Option<usize> {
+    let brace_at = |k: usize| matches!(trees.get(k), Some(Tt::Delim(Delim::Brace, _, _)));
+    match trees.get(s)? {
+        Tt::Delim(Delim::Brace, _, _) | Tt::Frag(FragKind::Block, _, _) => return Some(s + 1),
+        Tt::Tok(_) => {}
+        _ => return None,
+    }
+    match tok_at(trees, s)?.tok {
+        Tok::Unsafe | Tok::Const | Tok::Loop => brace_at(s + 1).then_some(s + 2),
+        Tok::Lifetime(_) if tok_at(trees, s + 1).map(|t| t.tok) == Some(Tok::Colon) => block_like_end(trees, s + 2),
+        Tok::Match | Tok::While => Some(body_brace(trees, s + 1)? + 1),
+        Tok::For => {
+            // The pattern runs to the first top-level `in`.
+            let in_at = (s + 1..trees.len()).find(|&k| trees[k].is_tok(Tok::In))?;
+            Some(body_brace(trees, in_at + 1)? + 1)
+        }
+        Tok::If => {
+            let e = body_brace(trees, s + 1)? + 1;
+            if tok_at(trees, e).map(|t| t.tok) != Some(Tok::Else) {
+                return Some(e);
+            }
+            if tok_at(trees, e + 1).map(|t| t.tok) == Some(Tok::If) {
+                return block_like_end(trees, e + 1);
+            }
+            brace_at(e + 1).then_some(e + 2)
+        }
+        _ => None,
+    }
+}
+
+/// The index of the body block of an `if`, `while`, `match`, or `for`
+/// whose head expression starts at `j`. The head is an expression with
+/// no struct literal: a brace group in operand position is a block
+/// expression, one after a macro path is the macro's group, an inner
+/// block-like expression is skipped whole, and the first other brace
+/// group is the body. `let` patterns run to their `=`. None for a head
+/// this scan does not bound: a closure, `async`, or a `;`, `,`, `=>`.
+fn body_brace(trees: &[Tt], mut j: usize) -> Option<usize> {
+    let mut operand = true;
+    while j < trees.len() {
+        match &trees[j] {
+            Tt::Delim(Delim::Brace, _, _) if !operand => return Some(j),
+            Tt::Delim(..) | Tt::Frag(..) => {
+                operand = false;
+                j += 1;
+            }
+            Tt::Tok(t) => match t.tok {
+                Tok::Let => {
+                    j = (j + 1..trees.len()).find(|&k| trees[k].is_tok(Tok::Eq))? + 1;
+                    operand = true;
+                }
+                Tok::If | Tok::Match | Tok::Loop | Tok::While | Tok::For | Tok::Unsafe | Tok::Const | Tok::Lifetime(_)
+                    if operand && block_like_start(trees, j) =>
+                {
+                    j = block_like_end(trees, j)?;
+                    operand = false;
+                }
+                Tok::Semi | Tok::Comma | Tok::FatArrow | Tok::Async | Tok::Move => return None,
+                Tok::Pipe | Tok::OrOr if operand => return None,
+                // A macro call: path, `!`, and its group (any delimiter).
+                Tok::Bang if !operand && matches!(trees.get(j + 1), Some(Tt::Delim(..))) => j += 2,
+                // Turbofish generic arguments: skip to the matching `>`.
+                Tok::PathSep if tok_at(trees, j + 1).map(|t| t.tok) == Some(Tok::Lt) => {
+                    j = generics_end(trees, j + 1, trees.len())?;
+                    operand = false;
+                }
+                Tok::Ident(_)
+                | Tok::Reserved(_)
+                | Tok::Int(..)
+                | Tok::Float(_)
+                | Tok::Str(..)
+                | Tok::ByteStr(_)
+                | Tok::ByteChar(_)
+                | Tok::Char(..)
+                | Tok::Lifetime(_)
+                | Tok::True
+                | Tok::False
+                | Tok::SelfLower
+                | Tok::SelfUpper
+                | Tok::Crate
+                | Tok::Super
+                | Tok::Await
+                | Tok::Question
+                | Tok::Underscore => {
+                    operand = false;
+                    j += 1;
+                }
+                // `.`, `::`, and every operator or prefix keyword expects
+                // more of the expression before a body can start.
+                _ => {
+                    if t.tok != Tok::PathSep {
+                        operand = t.tok != Tok::Dot;
+                    }
+                    j += 1;
+                }
+            },
+        }
+    }
+    None
+}
+
+/// The index after the `>` that closes the generic argument list whose
+/// `<` is at `lt`, scanning below `e`; None when it does not close.
+fn generics_end(trees: &[Tt], lt: usize, e: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for j in lt..e {
+        match tok_at(trees, j).map(|t| t.tok) {
+            Some(Tok::Lt) => depth += 1,
+            Some(Tok::Shl) => depth += 2,
+            Some(Tok::Gt) => depth -= 1,
+            Some(Tok::Shr) => depth -= 2,
+            Some(Tok::Semi | Tok::FatArrow) => return None,
+            _ => {}
+        }
+        if depth <= 0 {
+            return Some(j + 1);
+        }
+    }
+    None
+}
+
+/// True when the expression statement in `trees[s..e]` (no attributes)
+/// has a binary operator, assignment, cast, or range at its top level.
+/// `operand` is false when the scan starts after a first operand (the
+/// `.` or `?` that continues a block-like expression). rustc puts a statement's outer attributes on the
+/// leftmost operand then, which is an error for `cfg` as for any other
+/// attribute (E0658, and "removing an expression is not supported in
+/// this position" when the cfg is off). A prefix `return`, `break`, or
+/// closure takes the whole rest, so the attribute covers it all.
+fn expr_stmt_has_top_op(trees: &[Tt], s: usize, e: usize, mut operand: bool) -> bool {
+    let mut j = s;
+    while j < e {
+        match &trees[j] {
+            Tt::Delim(..) | Tt::Frag(..) => operand = false,
+            Tt::Tok(t) => match t.tok {
+                Tok::Return | Tok::Break | Tok::Pipe | Tok::OrOr | Tok::Move | Tok::Async | Tok::Static if operand => return false,
+                Tok::If | Tok::Match | Tok::Loop | Tok::While | Tok::For | Tok::Unsafe | Tok::Const | Tok::Lifetime(_)
+                    if operand && block_like_start(trees, j) =>
+                {
+                    let Some(end) = block_like_end(trees, j) else { return true };
+                    j = end;
+                    operand = false;
+                    continue;
+                }
+                Tok::Minus | Tok::Star | Tok::Amp | Tok::AndAnd | Tok::Bang | Tok::Mut if operand => {}
+                // A qualified path `<T as Tr>::f`, or turbofish arguments.
+                Tok::Lt | Tok::PathSep
+                    if (operand && t.tok == Tok::Lt) || (t.tok == Tok::PathSep && tok_at(trees, j + 1).map(|t| t.tok) == Some(Tok::Lt)) =>
+                {
+                    let lt = if t.tok == Tok::Lt { j } else { j + 1 };
+                    let Some(end) = generics_end(trees, lt, e) else { return true };
+                    j = end;
+                    operand = false;
+                    continue;
+                }
+                Tok::DotDot | Tok::DotDotEq => return true,
+                Tok::Bang if matches!(trees.get(j + 1), Some(Tt::Delim(..))) => j += 1,
+                Tok::Semi => return false,
+                Tok::As
+                | Tok::Eq
+                | Tok::EqEq
+                | Tok::Ne
+                | Tok::Lt
+                | Tok::Le
+                | Tok::Gt
+                | Tok::Ge
+                | Tok::Plus
+                | Tok::Minus
+                | Tok::Star
+                | Tok::Slash
+                | Tok::Percent
+                | Tok::PlusEq
+                | Tok::MinusEq
+                | Tok::StarEq
+                | Tok::SlashEq
+                | Tok::PercentEq
+                | Tok::AmpEq
+                | Tok::PipeEq
+                | Tok::CaretEq
+                | Tok::ShlEq
+                | Tok::ShrEq
+                | Tok::Amp
+                | Tok::AndAnd
+                | Tok::Pipe
+                | Tok::OrOr
+                | Tok::Caret
+                | Tok::Shl
+                | Tok::Shr => return true,
+                Tok::Dot | Tok::PathSep => {}
+                _ => operand = false,
+            },
+        }
+        j += 1;
+    }
+    false
 }
 
 /// Takes `trees[i]` out by value, leaving a placeholder behind.
@@ -2933,7 +3244,14 @@ impl<'a> Expander<'a> {
                 // A `{}` call at a statement boundary is a statement of its
                 // own in rustc (see `brace_stmt` below), never an operand.
                 let brace_call_stmt = stmt_list && !item_list && stmt_boundary && call.delim == Delim::Brace && !begins_item;
-                if !brace_call_stmt && should_wrap(&expanded, &out, tok_at(&trees, next).map(|t| t.tok), trees.get(next), self.ctx.interner) {
+                // A `m!(..);` call at a statement boundary is a statement
+                // macro: rustc parses its expansion as statements, so it
+                // is spliced as written (`#[a] if c {} {}` is two).
+                let semi_stmt = stmt_list && !item_list && stmt_boundary && next_is_semi;
+                if !brace_call_stmt
+                    && !semi_stmt
+                    && should_wrap(&expanded, &out, tok_at(&trees, next).map(|t| t.tok), trees.get(next), self.ctx.interner)
+                {
                     expanded = vec![Tt::Delim(Delim::Paren, expanded, call.span)];
                 }
                 // A `()` or `[]` call in statement position is an
@@ -3076,6 +3394,26 @@ impl<'a> Expander<'a> {
             after = next.end;
             attrs.push(next);
         }
+        // The parser checks attributes that reach it; a run the expander
+        // strips here is checked first.
+        let stmt_start = match out.last() {
+            None => true,
+            Some(Tt::Tok(t)) => t.tok == Tok::Semi,
+            Some(Tt::Delim(d, _, _)) => *d == Delim::Brace,
+            Some(Tt::Frag(..)) => false,
+        };
+        if !item_list
+            && stmt_start
+            && let Some(a) = attrs.iter().find(|a| matches!(a.path.as_str(), "cfg" | "cfg_attr"))
+            && cfg_on_operator_stmt(trees, after, self.ctx.interner)
+        {
+            return Err(err(
+                C_SYNTAX,
+                a.span,
+                "attributes on expressions are not permitted in this context",
+                "Put the attribute on a block around the statement, or use cfg!.",
+            ));
+        }
         // cfg_attr(cond, attr): keep, drop, or substitute. One level is
         // enough for the shapes in use; a substituted cfg is honored by
         // falling through to the cfg check below with its own trees.
@@ -3151,11 +3489,9 @@ impl<'a> Expander<'a> {
                         // a disabled `include!` or `compile_error!`
                         // from ever expanding (found in ts-rust's
                         // wasm-only bundled embed).
-                        if let Some((_, _, group_idx)) = path_call_at(trees, after, self.ctx.interner) {
-                            let mut end = group_idx + 1;
-                            if tok_at(trees, end).map(|t| t.tok) == Some(Tok::Semi) {
-                                end += 1;
-                            }
+                        if let Some((_, _, group_idx)) = path_call_at(trees, after, self.ctx.interner)
+                            && let Some(end) = macro_node_end(trees, after, group_idx)
+                        {
                             return Ok(end);
                         }
                         if let Some(end) = item_end(trees, after, self.ctx.interner) {
@@ -3199,11 +3535,9 @@ impl<'a> Expander<'a> {
                 // a disabled `include!` or `compile_error!`
                 // from ever expanding (found in ts-rust's
                 // wasm-only bundled embed).
-                if let Some((_, _, group_idx)) = path_call_at(trees, after, self.ctx.interner) {
-                    let mut end = group_idx + 1;
-                    if tok_at(trees, end).map(|t| t.tok) == Some(Tok::Semi) {
-                        end += 1;
-                    }
+                if let Some((_, _, group_idx)) = path_call_at(trees, after, self.ctx.interner)
+                    && let Some(end) = macro_node_end(trees, after, group_idx)
+                {
                     return Ok(end);
                 }
                 if let Some(end) = item_end(trees, after, self.ctx.interner) {

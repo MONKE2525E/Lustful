@@ -3709,15 +3709,17 @@ impl<'a> Parser<'a> {
             // A cfg syntax check reads `m! {..}` as rustc does: a whole
             // statement, so `m! {} [1]` is two statements, not an index.
             let brace_mac = self.cfg_syntax && self.at_brace_macro_call();
-            let block_like = labeled
+            let mut block_like = labeled
                 || const_block
                 || brace_mac
                 || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
             // A statement (or block tail) block may carry inner attributes.
             self.block_inner_ok = true;
             let expr = if block_like {
+                // A labeled block-like statement ends at its block too:
+                // `'a: { .. } [x]` is two statements, not an index.
                 let e = if labeled {
-                    self.expr()?
+                    self.primary(false, true)?
                 } else if brace_mac {
                     self.primary(false, false)?
                 } else if const_block {
@@ -3729,7 +3731,10 @@ impl<'a> Parser<'a> {
                     self.block_like_expr(true)?
                 };
                 // Allow method calls on a block-like expression, as rustc does.
+                // The statement is then a plain expression: it needs a `;`
+                // unless it is the block's tail.
                 if self.peek() == Tok::Dot || self.peek() == Tok::Question {
+                    block_like = false;
                     let e = self.postfix(e)?;
                     self.binary_rest(e, 0, false)?
                 } else {
