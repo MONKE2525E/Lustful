@@ -779,10 +779,23 @@ pub trait AdtShapes {
 /// application's arguments bound to the Adt's params (a frame below), so
 /// `W<u64>` gets its own layout with no substituted type built.
 pub fn layout_of_ty(tys: &impl TyIntern, shapes: &impl AdtShapes, t: Ty) -> Result<Layout, ()> {
+    LAST_FAILURE.with(|f| f.set(None));
     let mut frames: Vec<Frame> = Vec::new();
     let mut memo: Vec<((Ty, Option<usize>), Option<Layout>)> = Vec::new();
     let mut active: Vec<(Ty, Option<usize>)> = Vec::new();
     go(tys, shapes, t, None, &mut frames, &mut memo, &mut active)
+}
+
+thread_local! {
+    /// The innermost type whose layout failed in this thread's last
+    /// `layout_of_ty` call. Only diagnostics read it (`last_failure`).
+    static LAST_FAILURE: std::cell::Cell<Option<Ty>> = const { std::cell::Cell::new(None) };
+}
+
+/// The innermost type of the last failed `layout_of_ty` call on this
+/// thread, so L0652 can name the form that has no layout.
+pub fn last_failure() -> Option<Ty> {
+    LAST_FAILURE.with(|f| f.get())
 }
 
 /// One generic application's arguments, each paired with the frame its
@@ -835,6 +848,9 @@ fn go(
     }
     active.push((t, env));
     let r = compute(tys, shapes, t, env, frames, memo, active);
+    if r.is_err() && LAST_FAILURE.with(|f| f.get()).is_none() {
+        LAST_FAILURE.with(|f| f.set(Some(peel_param(tys, t, env, frames).0)));
+    }
     active.pop();
     memo.push(((t, env), r.as_ref().ok().cloned()));
     r

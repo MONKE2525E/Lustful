@@ -193,6 +193,15 @@ pub enum ConstGeneric {
 }
 
 /// The questions the evaluator asks its caller.
+/// L0652's text for a `size_of` or `align_of` with no layout: it names the
+/// innermost type that has none (`layout::last_failure`), when known.
+fn layout_fail_text<'a>(cx: &impl ConstCx<'a>, what: &str) -> String {
+    match super::layout::last_failure() {
+        Some(t) => format!("unsupported layout form in `{what}`: `{}`", cx.ty_text(t)),
+        None => format!("unsupported layout form in `{what}`"),
+    }
+}
+
 pub trait ConstCx<'a> {
     type Tys: TyIntern;
     fn tys(&mut self) -> &mut Self::Tys;
@@ -3158,13 +3167,13 @@ impl Evaluator {
         match cx.call_target(callee) {
             CallTarget::SizeOf(t) => {
                 let l = cx.layout(t).ok_or_else(|| {
-                    Diag::new("L0652", span, "unsupported layout form in `size_of`", "Use a type inside the supported layout grammar.")
+                    Diag::new("L0652", span, layout_fail_text(&*cx, "size_of"), "Use a type inside the supported layout grammar.")
                 })?;
                 Ok((ConstValue::Int(l.size as i128), USIZE))
             }
             CallTarget::AlignOf(t) => {
                 let l = cx.layout(t).ok_or_else(|| {
-                    Diag::new("L0652", span, "unsupported layout form in `align_of`", "Use a type inside the supported layout grammar.")
+                    Diag::new("L0652", span, layout_fail_text(&*cx, "align_of"), "Use a type inside the supported layout grammar.")
                 })?;
                 Ok((ConstValue::Int(l.align as i128), USIZE))
             }

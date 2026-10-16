@@ -394,6 +394,9 @@ impl<'a, T: TyIntern> ConstCx<'a> for InstCx<'a, T> {
         let p: &Program = self.p;
         crate::ty::layout::layout_of_ty(self.tys, &super::collect::UserLayout(p), t).ok()
     }
+    fn ty_text(&self, t: Ty) -> String {
+        super::collect::ty_name(self.p, &*self.tys, t)
+    }
     fn adt_repr(&self, adt: AdtId) -> crate::ty::layout::Repr {
         self.p.adt(adt).repr
     }
