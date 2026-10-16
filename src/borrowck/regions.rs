@@ -424,7 +424,10 @@ impl AdtTables {
                     match *g {
                         GenericArg::Lifetime(r) => {
                             let rv = self.region_variance.get(&def).and_then(|x| x.get(k)).copied().unwrap_or(Variance::Inv);
-                            let rm = self.region_drop.get(&def).and_then(|x| x.get(k)).copied().unwrap_or(DropMode::All);
+                            let rm = match builtin_region_drop(&p.tys, ty) {
+                                Some(m) => m,
+                                None => self.region_drop.get(&def).and_then(|x| x.get(k)).copied().unwrap_or(DropMode::All),
+                            };
                             let mm = if m == DropMode::None { DropMode::None } else { m.join(rm) };
                             note(r, v.then(rv), mm, var, drop);
                             k += 1;
@@ -627,6 +630,17 @@ impl AdtTables {
 /// a user Adt's declared lifetimes, or one for the builtin borrowing
 /// iterators (`Chars`, `slice::Iter`, `slice::IterMut`) and the `RefCell`
 /// guards (`Ref`, `RefMut`), whose erased types drop the lifetime.
+/// The drop mode of a builtin Adt's lifetimes (None for any other type):
+/// a guard's drop gives its borrow back and a `Drain`'s moves the tail
+/// back, so they use it (rustc E0499 on `let d = v.drain(..); v.push(1)`);
+/// the other builtins have no destructor that reads their borrow.
+fn builtin_region_drop(tys: &impl TyIntern, t: Ty) -> Option<DropMode> {
+    use crate::ty::iter::IterKind;
+    let b = tys.builtin_of(t)?;
+    let uses = tys.guard_elem(t).is_some() || matches!(b, BuiltinTy::Iter(IterKind::VecDrain | IterKind::StringDrain));
+    Some(if uses { DropMode::All } else { DropMode::None })
+}
+
 fn adt_regions(p: &Program, tys: &impl TyIntern, t: Ty) -> u32 {
     adt_region_count(&p.gx.adt_lifetimes, tys, t)
 }
@@ -972,11 +986,8 @@ impl<'t, 'p, T: TyIntern> SlotCx<'t, 'p, T> {
             TyKind::Adt(def, args) => {
                 let mut at = at;
                 for k in 0..adt_regions(self.p, self.tys, t) {
-                    // A guard's drop gives its borrow back, so it uses it.
-                    let rm = if self.tys.guard_elem(t).is_some() {
-                        DropMode::All
-                    } else if self.tys.builtin_of(t).is_some() {
-                        DropMode::None
+                    let rm = if let Some(m) = builtin_region_drop(self.tys, t) {
+                        m
                     } else {
                         self.p.regions.adts(self.p).region_modes(def, k as usize).1
                     };
