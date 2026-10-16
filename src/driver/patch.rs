@@ -417,9 +417,10 @@ struct NewItem {
     name: Sym,
     /// The old fn's expression range (`FnDef::exprs`).
     old_exprs: (u32, u32),
-    /// A trait impl's method: the tail runs in full mode, because
-    /// operators, `for` loops and generic callers reach it without
-    /// naming it (sigedit R10).
+    /// The tail runs in full mode: a trait impl's method (operators,
+    /// `for` loops and generic callers reach it without naming it,
+    /// sigedit R10), or a const fn (const and static values that call
+    /// it move, and the bodies that read them need not name it; R5).
     full: bool,
 }
 
@@ -975,8 +976,8 @@ fn find_derive_edit(front: &Front, text: &str, edit: Edit) -> Result<NewDerive, 
 /// does but the patch cannot prove the edit (the caller resolves).
 /// Refused (R2, R5, and v1 limits): a header with a macro call, `$`,
 /// an attribute after `fn`, or an APIT; attributes the expander acts
-/// on; a body that needs the expander, or holds items; a const fn; a
-/// fn from a macro expansion. A trait impl's method takes the patch
+/// on; a body that needs the expander, or holds items; a fn from a
+/// macro expansion. A trait impl's method and a const fn take the patch
 /// with `NewItem::full`.
 fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Option<&'static str>> {
     let base = front.patch.as_ref().ok_or(Some("no base"))?;
@@ -1004,10 +1005,8 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     }
     let (fn_index, item, sub, lo, hi) = found.ok_or(None)?;
     let def = fn_def_at(ast, item, sub);
-    let full = matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.trait_ref.is_some());
-    if def.qual.is_const {
-        return Err(Some("item: const fn"));
-    }
+    // The outline holds the qualifiers, so the new fn is const too.
+    let full = def.qual.is_const || matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.trait_ref.is_some());
     let root = |s: crate::diag::Span| s.ctxt == CtxtId::ROOT && s.file == file;
     if !root(def.name_span) || !def.body.is_some_and(|bl| root(ast.blocks[bl.0 as usize].span)) {
         return Err(Some("item: expansion"));
@@ -1106,9 +1105,6 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
         new_def.attrs.truncate(own);
         new_def.attrs.extend_from_slice(&def.attrs[own..]);
         new_def.name = def.name;
-        if new_def.qual.is_const {
-            return Err(Some("item: const fn"));
-        }
         let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
         let outer = match &ast.items[item].kind {
             ItemKind::Impl(imp) => Some(&imp.generics),
@@ -3380,6 +3376,33 @@ pub fn run() -> i64 {
         for &(old, new, path) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
             assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A const fn's header edit takes the item patch in full mode: the
+    /// const it computes moves, and `run` reads that const (in an array
+    /// length) without naming the fn.
+    #[test]
+    fn const_fn_item_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-const-item-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "pub const fn sq(x: i64) -> i64 {\n    x * x\n}\n\nconst N: i64 = sq(3);\n\n\
+                   pub fn run() -> i64 {\n    let a: [u8; 9] = [0; N as usize];\n    a.len() as i64\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let steps: &[(&str, &str, &str, i32)] = &[
+            ("pub const fn sq(x: i64) -> i64 {\n    x * x\n", "pub const fn sq(x: i32) -> i64 {\n    x as i64 * x as i64\n", "item", 0),
+            ("pub const fn sq(x: i32) -> i64 {\n    x as i64 * x as i64\n", "pub const fn sq(x: i32) -> i64 {\n    x as i64 * x as i64 + 1\n", "patch", 1),
+            ("pub const fn sq(x: i32) -> i64 {\n    x as i64 * x as i64 + 1\n", "pub const fn sq(x: i64) -> i64 {\n    x * x\n", "item", 0),
+            ("pub const fn sq(x: i64) -> i64 {\n    x * x\n", "pub const fn sq(x: i16) -> i64 {\n    x as i64 * x as i64 + 1\n", "item", 1),
+        ];
+        for &(old, new, path, code) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+            assert_eq!(check(&mut warm, &root).0, code, "{new:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
