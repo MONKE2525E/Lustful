@@ -2079,9 +2079,27 @@ impl<'p> Ctx<'p> {
     }
 
     /// `sum` and `product` into an integer or float type `S`, from
-    /// items `S` or `&S` (Rust's `Sum<S>` and `Sum<&S>` impls).
+    /// items `S` or `&S` (Rust's `Sum<S>` and `Sum<&S>` impls), or into
+    /// `Option<S>` / `Result<S, E>` from items `Option<U>` / `Result<U, E>`.
     fn sum_target_ok(&mut self, target: Ty, item: Ty, n: &str, span: Span) -> bool {
         let t = self.resolve(target);
+        // `Option<T>: Sum<Option<U>>` and `Result<T, E>: Sum<Result<U, E>>`
+        // (core's try_process) when `T: Sum<U>`.
+        let i = self.resolve(item);
+        let shunt = match (self.tys.option_elem(t), self.tys.result_args(t)) {
+            (Some(tt), _) => Some((tt, self.tys.option_elem(i), None)),
+            (_, Some((tt, te))) => Some((tt, self.tys.result_args(i).map(|r| r.0), self.tys.result_args(i).map(|r| (te, r.1)))),
+            _ => None,
+        };
+        if let Some((tt, iu, errs)) = shunt {
+            let errs_ok = errs.is_none_or(|(a, b)| self.unify(a, b));
+            let Some(iu) = iu.filter(|_| errs_ok) else {
+                let (tn, iname) = (self.tn(t), self.tn(item));
+                self.err("L0612", span, format!("`{tn}` cannot be the {n} of `{iname}` items"), format!("Map the items to `{tn}` first."));
+                return false;
+            };
+            return self.sum_target_ok(tt, iu, n, span);
+        }
         let numeric = |k: TyKind| matches!(k, TyKind::Int(_) | TyKind::Float(_));
         if !numeric(self.kind(t)) {
             if matches!(self.kind(t), TyKind::Infer(_)) {

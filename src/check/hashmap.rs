@@ -479,23 +479,22 @@ impl<'p> Ctx<'p> {
                 let r = self.tys.mk_ref(false, k);
                 Some((B::EntryKey, Autoref::Ref, vec![], r, None))
             }
-            // The closure forms. std's bound is FnOnce; lust asks FnMut,
-            // which only refuses closures that move out of a capture (the
-            // expansion calls through `&mut`), never a wrong run.
+            // The closure forms take std's `FnOnce` bound: the expansion
+            // calls an `FnOnce` closure by value (lower/iter.rs).
             (HashTy::Entry, "or_insert_with") => {
-                let f = self.fn_mut_param(&[], v, name_span);
+                let f = self.fn_once_param(&[], v, name_span);
                 let r = self.tys.mk_ref(true, v);
                 Some((B::EntryOrInsertWith, Autoref::None, vec![f], r, None))
             }
             (HashTy::Entry, "or_insert_with_key") => {
                 let rk = self.tys.mk_ref(false, k);
-                let f = self.fn_mut_param(&[rk], v, name_span);
+                let f = self.fn_once_param(&[rk], v, name_span);
                 let r = self.tys.mk_ref(true, v);
                 Some((B::EntryOrInsertWithKey, Autoref::None, vec![f], r, None))
             }
             (HashTy::Entry, "and_modify") => {
                 let rv = self.tys.mk_ref(true, v);
-                let f = self.fn_mut_param(&[rv], UNIT, name_span);
+                let f = self.fn_once_param(&[rv], UNIT, name_span);
                 Some((B::EntryAndModify, Autoref::None, vec![f], base, None))
             }
             _ => None,

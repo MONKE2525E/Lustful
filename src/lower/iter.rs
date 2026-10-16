@@ -566,6 +566,25 @@ impl Ex<'_, '_> {
         Ok(())
     }
 
+    /// `dest = f(args..)` through `FnOnce::call_once` for the callable in
+    /// local `f`: an `FnOnce` closure moves in; any other callable goes by
+    /// `call_fn` and drops right after the call, as `call_once` does.
+    fn call_fn_once(&mut self, fty: Ty, f: Local, args: Vec<Operand>, dest: Place) -> R {
+        if let TyKind::Closure(def, _) = self.body.tys.kind(fty)
+            && let Some(entry) = self.p.gx.closures.get(&def)
+            && entry.kind == ClosureKind::FnOnce
+        {
+            let body_fn = entry.body_fn;
+            let mut ops = vec![Operand::Move(Place::local(f))];
+            ops.extend(args);
+            self.call(CallTarget::Fn(body_fn), ops, dest);
+            return Ok(());
+        }
+        self.call_fn(fty, Place::local(f), args, dest)?;
+        self.drop_local(f);
+        Ok(())
+    }
+
     // ---------- Builtin calls ----------
 
     fn builtin(&mut self, b: Builtin, args: Vec<Operand>, dest: Place) -> R {
@@ -885,9 +904,12 @@ impl Ex<'_, '_> {
                         let rv = self.local(rv_ty);
                         self.call_builtin(Builtin::EntryGetMut, vec![Operand::Move(Place::local(rm))], Place::local(rv));
                         let u = self.local(UNIT);
-                        self.call_fn(fty, Place::local(fl), vec![Operand::Move(Place::local(rv))], Place::local(u))?;
+                        self.call_fn_once(fty, fl, vec![Operand::Move(Place::local(rv))], Place::local(u))?;
                         self.assign(dest.clone(), Rvalue::Use(Operand::Move(Place::local(el))));
                     }
+                }
+                if vr_ty.is_some() {
+                    self.drop_local(fl);
                 }
                 self.goto(join);
                 self.cur = no;
@@ -903,14 +925,16 @@ impl Ex<'_, '_> {
                         } else {
                             Vec::new()
                         };
-                        self.call_fn(fty, Place::local(fl), fargs, Place::local(v))?;
+                        self.call_fn_once(fty, fl, fargs, Place::local(v))?;
                         self.call_builtin(Builtin::EntryInsert, vec![Operand::Move(Place::local(el)), Operand::Move(Place::local(v))], dest);
                     }
-                    None => self.assign(dest, Rvalue::Use(Operand::Move(Place::local(el)))),
+                    None => {
+                        self.assign(dest, Rvalue::Use(Operand::Move(Place::local(el))));
+                        self.drop_local(fl);
+                    }
                 }
                 self.goto(join);
                 self.cur = join;
-                self.drop_local(fl);
                 return Ok(());
             }
             // A str split iterator (W-STD-B, check/split.rs): the runtime's
@@ -5897,27 +5921,98 @@ impl Ex<'_, '_> {
     /// `sum` and `product`: a fold from 0 or 1 (`-0.0` and `1.0` for
     /// floats, as Rust 1.99 does), with checked arithmetic.
     fn sum(&mut self, product: bool, itp: Place, ty: Ty, dest: Place, dest_ty: Ty) -> R {
-        let zero = match self.body.tys.kind(dest_ty) {
+        if self.body.tys.option_elem(dest_ty).is_some() || self.body.tys.result_args(dest_ty).is_some() {
+            return self.sum_try(product, itp, ty, dest, dest_ty);
+        }
+        let zero = self.sum_zero(product, dest_ty)?;
+        let acc = self.local(dest_ty);
+        self.assign(Place::local(acc), Rvalue::Use(Operand::Const(zero)));
+        let op = if product { crate::ast::BinOp::Mul } else { crate::ast::BinOp::Add };
+        self.each(&itp, ty, &mut |this, x, item| {
+            let v = if matches!(this.body.tys.kind(item), TyKind::Ref(..)) { Place::local(x).deref() } else { Place::local(x) };
+            this.sum_step(op, acc, v);
+            Ok(())
+        })?;
+        self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(acc))));
+        Ok(())
+    }
+
+    /// `acc = acc op v`, where an overflow reports at core's
+    /// `integer_sum_product!` line.
+    fn sum_step(&mut self, op: crate::ast::BinOp, acc: Local, v: Place) {
+        let at = std::mem::replace(&mut self.span, crate::diag::Span::std_site(7, 206, 1));
+        self.assign(Place::local(acc), Rvalue::Bin(op, Operand::Copy(Place::local(acc)), Operand::Copy(v)));
+        self.span = at;
+    }
+
+    /// `sum`/`product` into `Option<T>` or `Result<T, E>` (core's
+    /// `try_process` over a `GenericShunt`): each `Some`/`Ok` payload adds
+    /// in; the first `None` or `Err` stops the pull and is the result (the
+    /// rest stays in the iterator); the end wraps the total. The pulls are
+    /// std's `try_fold` steps, as in `search`.
+    fn sum_try(&mut self, product: bool, itp: Place, ty: Ty, dest: Place, dest_ty: Ty) -> R {
+        let (t, is_res) = match self.body.tys.option_elem(dest_ty) {
+            Some(t) => (t, false),
+            None => (self.body.tys.result_args(dest_ty).ok_or("iterator expansion: sum into a non-numeric type")?.0, true),
+        };
+        let zero = self.sum_zero(product, t)?;
+        let acc = self.local(t);
+        self.assign(Place::local(acc), Rvalue::Use(Operand::Const(zero)));
+        let op = if product { crate::ast::BinOp::Mul } else { crate::ast::BinOp::Add };
+        // `Some` is discriminant 1 and `Ok` 0; the payload is field 0.
+        let (go_d, go_v) = if is_res { (0, 0) } else { (1, 1) };
+        let join = self.block();
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let saved = std::mem::replace(&mut self.fold, true);
+        let pulled = self.pull(&itp, ty);
+        self.fold = saved;
+        let (_, n, x, item) = pulled?;
+        let u = match self.body.tys.option_elem(item) {
+            Some(u) => u,
+            None => self.body.tys.result_args(item).ok_or("iterator expansion: sum of non-Option items")?.0,
+        };
+        let d = self.local(int(IntTy::U32));
+        self.assign(Place::local(d), Rvalue::Discriminant(Place::local(x)));
+        let (go, stop) = (self.block(), self.block());
+        self.term(Terminator::Switch(Operand::Copy(Place::local(d)), vec![(go_d, go)], stop));
+        self.cur = go;
+        let payload = Place::local(x).project(Proj::Downcast(go_v)).project(Proj::Field(0));
+        let v = if matches!(self.body.tys.kind(u), TyKind::Ref(..)) { payload.deref() } else { payload };
+        self.sum_step(op, acc, v);
+        self.drop_local(x);
+        self.goto(lp);
+        self.cur = stop;
+        if is_res {
+            let e = self.take(Place::local(x).project(Proj::Downcast(1)).project(Proj::Field(0)), self.body.tys.result_args(item).map_or(ERROR, |r| r.1));
+            self.assign(dest.clone(), Rvalue::Res(dest_ty, false, e));
+        } else {
+            self.none(&dest, dest_ty);
+        }
+        self.goto(join);
+        self.cur = n;
+        if is_res {
+            self.assign(dest, Rvalue::Res(dest_ty, true, Operand::Copy(Place::local(acc))));
+        } else {
+            self.some(&dest, dest_ty, Operand::Copy(Place::local(acc)));
+        }
+        self.goto(join);
+        self.cur = join;
+        Ok(())
+    }
+
+    /// The start value of `sum` (0, or -0.0 for floats as core's
+    /// `float_sum_product!`) or `product` (1) for the numeric type `t`.
+    fn sum_zero(&self, product: bool, t: Ty) -> Result<Const, String> {
+        Ok(match self.body.tys.kind(t) {
             TyKind::Int(i) => Const::Int(u128::from(product), i),
             TyKind::Float(fl) => {
                 let v: f64 = if product { 1.0 } else { -0.0 };
                 Const::Float(if fl == FloatTy::F32 { u64::from((v as f32).to_bits()) } else { v.to_bits() }, fl)
             }
             _ => return Err("iterator expansion: sum into a non-numeric type".into()),
-        };
-        let acc = self.local(dest_ty);
-        self.assign(Place::local(acc), Rvalue::Use(Operand::Const(zero)));
-        let op = if product { crate::ast::BinOp::Mul } else { crate::ast::BinOp::Add };
-        self.each(&itp, ty, &mut |this, x, item| {
-            let v = if matches!(this.body.tys.kind(item), TyKind::Ref(..)) { Place::local(x).deref() } else { Place::local(x) };
-            // Overflow reports at core's `integer_sum_product!` line.
-            let at = std::mem::replace(&mut this.span, crate::diag::Span::std_site(7, 206, 1));
-            this.assign(Place::local(acc), Rvalue::Bin(op, Operand::Copy(Place::local(acc)), Operand::Copy(v)));
-            this.span = at;
-            Ok(())
-        })?;
-        self.assign(dest, Rvalue::Use(Operand::Copy(Place::local(acc))));
-        Ok(())
+        })
     }
 
     /// `min`/`max` (key None) and `min_by_key`/`max_by_key`: Rust's
