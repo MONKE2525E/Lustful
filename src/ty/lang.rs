@@ -2046,6 +2046,8 @@ const STD_FN_PATHS: &[&str] = &[
     "std/panic/panic_any",
     "core/any/type_name",
     "std/any/type_name",
+    "alloc/fmt/format",
+    "std/fmt/format",
 ];
 
 const STD_MACRO_PATHS: &[&str] = &[

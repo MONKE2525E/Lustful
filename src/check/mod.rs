@@ -373,6 +373,9 @@ pub enum Builtin {
     MemDrop,
     /// `mem::forget(v)`: takes ownership and never drops (W-STD-C).
     MemForget,
+    /// `std::fmt::format(args)` (alloc): `args.to_string()`, the same
+    /// code in std (`SpecToString for fmt::Arguments`).
+    FmtFormat,
     /// `core::intrinsics::once_init(&slot, v)`: writes `Some(v)` into an
     /// `Option<T>` behind a shared reference. Std source only: the
     /// interior write of `OnceCell`/`OnceLock` (W-STD-C).
@@ -10811,6 +10814,15 @@ impl<'p> Ctx<'p> {
                 return Some(Res::Builtin(b));
             }
         }
+        // `std::fmt::format` lives in alloc, so `core::fmt::format` is
+        // no path (rustc E0425).
+        if names.len() == 3
+            && (names[0] == k.std || self.name(names[0]) == "alloc")
+            && self.name(names[1]) == "fmt"
+            && self.name(names[2]) == "format"
+        {
+            return Some(Res::Builtin(Builtin::FmtFormat));
+        }
         // A canonical std type path plus an associated item
         // (`std::vec::Vec::new`, `core::option::Option::Some`):
         // the last two segments name the type and the item, as in
@@ -13282,6 +13294,7 @@ impl<'p> Ctx<'p> {
                         let t = self.callee_turbo_ty(callee, span);
                         (vec![t], UNIT)
                     }
+                    Builtin::FmtFormat => (vec![crate::ty::fmt::fmt_ty(&mut self.tys, crate::ty::fmt::FmtTy::Arguments)], STRING),
                     Builtin::OnceInit | Builtin::OnceTake => {
                         let t = self.new_var(false);
                         let o = self.tys.mk_option(t);

@@ -3942,6 +3942,13 @@ impl FnGen<'_, '_> {
             | B::CowDeref => unreachable!("fmt and conversion builtins emit in cgen/fmt.rs"),
             // The operand was moved into the call: no drop ever runs.
             B::MemForget => "((lust_Unit){})".into(),
+            // `fmt::format(args)`: the value `args.to_string()` formats.
+            B::FmtFormat => {
+                let tmp = self.tmp();
+                let ct = CTy::Fmt(crate::ty::fmt::FmtTy::Arguments);
+                let _ = writeln!(self.out, "    {} {tmp} = {};", ctype(&ct), vals[0]);
+                self.to_string_value(&ct, &format!("(&{tmp})"), loc)
+            }
             // Interior writes of std source cells (W-STD-C): the slot is
             // an `Option<T>` behind a shared reference. `once_init` runs
             // only on a `None` slot, so nothing is overwritten.
