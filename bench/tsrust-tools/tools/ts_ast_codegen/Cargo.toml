@@ -1,0 +1,11 @@
+[package]
+name = "ts_ast_codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
