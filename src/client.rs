@@ -53,6 +53,14 @@ fn log_dir(file: &Path) -> PathBuf {
     }
 }
 
+/// Allocator settings for a daemon process. mimalloc gives freed pages back to the OS 10 ms
+/// after a request frees them, so the next warm request faults them in again: on ts_goport
+/// that cost 100 ms to 2 s per request after a few seconds idle (w-tsedit). A daemon keeps
+/// them (its RSS stays at its peak). A value the user set wins.
+fn daemon_alloc_env() -> Vec<(&'static str, &'static str)> {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_some() { Vec::new() } else { vec![("MIMALLOC_PURGE_DELAY", "-1")] }
+}
+
 /// Starts `lust-core daemon` detached (its own session, output to the log file), unless
 /// autostart is off or another client or daemon already claims this socket. The current
 /// command is still answered cold by the caller; the next one finds the daemon warm.
@@ -70,6 +78,7 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
     // waits for this process to exit first (exec keeps the pid, so that is the cold
     // compile), so the pre-warm never competes with the command in front of it.
     cmd.arg("daemon")
+        .envs(daemon_alloc_env())
         .env("LUST_DAEMON_PREWARM", file)
         .env("LUST_DAEMON_PREWARM_AFTER", std::process::id().to_string())
         .env("LUST_DAEMON_LOCK_FD", lock_fd.to_string())
@@ -131,7 +140,11 @@ fn main() {
         }
         // A daemon command or bad arguments: let the compiler handle it.
         _ => {
-            let err = std::process::Command::new(&core).args(&args).exec();
+            let mut cmd = std::process::Command::new(&core);
+            if args.first().map(String::as_str) == Some("daemon") {
+                cmd.envs(daemon_alloc_env());
+            }
+            let err = cmd.args(&args).exec();
             eprintln!("error: cannot run {}: {err}", core.display());
             std::process::exit(2);
         }
