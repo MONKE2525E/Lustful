@@ -1357,12 +1357,18 @@ impl<'p> Ctx<'p> {
             "sum" | "product" => {
                 let target = self.iter_target(turbofish, expected, span);
                 // An open item type picks no impl (`u32: Sum<u32>` and
-                // `Sum<&u32>`): rustc waits for it, and body end checks it.
-                let open_item = {
-                    let i = self.resolve(item);
-                    self.unbound_general(i) && !self.unbound_general(self.resolve(target))
+                // `Sum<&u32>`), nor does an open result type (`S: Sum<&u64>`
+                // with `S` fixed by a later `.unwrap_or(0)` into a `u64`
+                // return): rustc keeps `S: Sum<Item>` pending, and body end
+                // checks it.
+                // A literal variable result (`match .. { 0 => 0, _ => it.sum() }`)
+                // waits too: body end picks the one impl it fits.
+                let open = {
+                    let (i, t) = (self.resolve(item), self.resolve(target));
+                    let tk = self.kind(t);
+                    self.unbound_general(i) || self.unbound_general(t) || tk.is_int_infer() || tk.is_float_infer()
                 };
-                if open_item {
+                if open {
                     self.deferred_sum.push((target, item, n == "sum", span));
                 } else if !self.sum_target_ok(target, item, n, span) {
                     return self.iter_bail(args);
@@ -2032,9 +2038,9 @@ impl<'p> Ctx<'p> {
         false
     }
 
-    /// Body end: a `sum` or `product` whose item type was open when it
-    /// was checked (`deferred_sum`), now that the item type is known, or
-    /// rustc's E0283 when it is still open.
+    /// Body end: a `sum` or `product` whose item or result type was open
+    /// when it was checked (`deferred_sum`), now that later uses fixed
+    /// them, or rustc's E0282/E0283 when one is still open.
     pub(super) fn finish_deferred_sums(&mut self) {
         for (target, item, sum, span) in std::mem::take(&mut self.deferred_sum) {
             let n = if sum { "sum" } else { "product" };
@@ -2046,6 +2052,27 @@ impl<'p> Ctx<'p> {
                     "Annotate the element type of the source, such as `let v: Vec<u32> = Vec::new();`.",
                 );
             } else {
+                // A result fixed only as a literal (`.unwrap_or(0)`): an
+                // integer variable matches every integer impl, so rustc
+                // selects the one `Sum<Item>` impl whose type is the item's
+                // (`u64: Sum<&u64>`); with none, literal fallback names it.
+                let t = self.resolve(target);
+                let tk = self.kind(t);
+                if tk.is_int_infer() || tk.is_float_infer() {
+                    let i = self.resolve(item);
+                    let plain = match self.kind(i) {
+                        TyKind::Ref(_, Mut::Shared, x) => self.resolve(x),
+                        _ => i,
+                    };
+                    let fits = match self.kind(plain) {
+                        TyKind::Int(_) => tk.is_int_infer(),
+                        TyKind::Float(_) => tk.is_float_infer(),
+                        _ => false,
+                    };
+                    if !(fits && self.unify(t, plain)) {
+                        self.literal_fallback_ty(t);
+                    }
+                }
                 self.sum_target_ok(target, item, n, span);
             }
         }
