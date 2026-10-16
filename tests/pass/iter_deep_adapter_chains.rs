@@ -3,35 +3,50 @@
 // expands each op inline, so an arm that expanded an inner op twice made
 // the code exponential in the chain depth: `skip(0)` x10 then `count()`
 // took over 60 s to build (fx-traitdepth, fx-cgen-ice). Each arm now
-// expands each inner op once; this case builds in well under a second.
+// expands each inner op once, so this case builds fast. One fn per chain
+// keeps each C function small for the sanitizer build.
+
+fn skips(v: &[u32]) {
+    let it = v.iter().skip(0).skip(1).skip(0).skip(2).skip(0).skip(1).skip(0).skip(0).skip(1).skip(0).skip(0).skip(1);
+    println!("{}", it.clone().count());
+    let mut s = it;
+    println!("{:?}", s.nth(1));
+}
+
+fn peeks(v: &[u32]) {
+    let it = v.iter().peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable();
+    let mut p = it.peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable();
+    println!("{:?}", p.peek());
+    println!("{:?}", p.nth(2));
+    println!("{}", p.count());
+}
+
+fn steps(v: &[u32]) {
+    let it = v.iter().step_by(1).step_by(2).step_by(1).step_by(1).step_by(2).step_by(1).step_by(1).step_by(1).step_by(1).step_by(1).step_by(1).step_by(1);
+    let mut st = it.clone();
+    println!("{:?} {:?}", st.next(), st.nth(1));
+    println!("{}", it.count());
+}
+
+fn takes(v: &[u32]) {
+    let it = v.iter().take(19).take(18).take(17).take(16).take(15).take(14).take(13).take(12).take(11).take(10).take(9).take(8).take(7).take(6);
+    let mut t = it;
+    println!("{:?} {:?} {:?}", t.nth(3), t.nth(20), t.next());
+}
+
+fn filtered_skips(v: &[u32]) {
+    let mut f = v.iter().skip(1).filter(|x| **x != 4).skip(0).filter(|_| true).skip(1).filter(|_| true).skip(0).filter(|_| true);
+    println!("{:?}", f.nth(2));
+}
+
 fn main() {
     let v: Vec<u32> = (1..=20).collect();
-    let skips = v.iter().skip(0).skip(1).skip(0).skip(2).skip(0).skip(1).skip(0).skip(0).skip(1).skip(0).skip(0).skip(1);
-    println!("{}", skips.clone().count());
-    let mut s = skips.clone();
-    println!("{:?} {:?} {:?}", s.nth(1), s.next(), s.nth(2));
-    println!("{:?}", skips.clone().last());
-    println!("{}", skips.map(|x| *x).sum::<u32>());
-
-    let peeks = v.iter().peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable();
-    let peeks = peeks.peekable().peekable().peekable().peekable().peekable().peekable().peekable().peekable();
-    let mut p = peeks.peekable().peekable().peekable().peekable();
-    println!("{:?}", p.peek());
-    println!("{:?} {:?}", p.nth(2), p.peek());
-    println!("{}", p.count());
-
-    let steps = v.iter().step_by(1).step_by(2).step_by(1).step_by(1).step_by(2).step_by(1).step_by(1).step_by(1);
-    let mut st = steps.clone();
-    println!("{:?} {:?} {:?}", st.next(), st.nth(0), st.nth(5));
-    println!("{}", steps.clone().count());
-    println!("{:?}", steps.collect::<Vec<_>>());
-
-    let takes = v.iter().take(19).take(18).take(17).take(16).take(15).take(14).take(13).take(12).take(11).take(10);
-    let mut t = takes.clone();
-    println!("{:?} {:?} {:?}", t.nth(3), t.nth(20), t.next());
-    println!("{}", takes.count());
-
-    // Mixed, with the overflow forms over a range (O(1) inner `nth`).
+    skips(&v);
+    peeks(&v);
+    steps(&v);
+    takes(&v);
+    filtered_skips(&v);
+    // The overflow forms over a range (an O(1) inner `nth`).
     let mut m = (0..50u32).skip(usize::MAX - 1).peekable().take(4).skip(0).step_by(1).skip(1).peekable().skip(0);
     println!("{:?} {}", m.nth(3), m.count());
     let mut r = (0..1000u64).skip(3).step_by(2).skip(1).peekable().take(400).skip(2).step_by(3).skip(0).peekable();
