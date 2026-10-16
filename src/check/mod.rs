@@ -7112,6 +7112,12 @@ impl<'p> Ctx<'p> {
         if self.deref_depth >= 4 || self.tys.local_adt(base).is_none() {
             return None;
         }
+        // Core's blanket `Into`/`TryInto` may hold for any receiver, so
+        // rustc picks them at the first step and never reaches the target:
+        // `W<String>` into a `String` is E0277, not `String`'s impl.
+        if matches!(self.name(name), "into" | "try_into") {
+            return None;
+        }
         let (f, target, impl_args) = self.user_deref_fn(lang.deref, base, "deref", name_span)?;
         let depth = self.deref_depth;
         let tref = self.tys.mk_ref(false, target);
@@ -10725,6 +10731,87 @@ impl<'p> Ctx<'p> {
             };
         }
         None
+    }
+
+    /// Where the method probe of call `e` on a receiver of type `rt`
+    /// starts, as (derefs, step type): a call through a user `Deref`
+    /// (`method_via_user_deref`) checks on `&Target`, a step rustc does
+    /// not have, so its probe starts one deref in, at the target place.
+    pub(super) fn probe_start(&self, e: ExprId, rt: Ty) -> (u8, Ty) {
+        let rt = self.resolve(rt);
+        match self.tys.kind(rt) {
+            TyKind::Ref(_, _, inner) if self.user_deref_call == Some(e) => (1, self.resolve(inner)),
+            _ => (0, rt),
+        }
+    }
+
+    /// rustc's probe for `Clone::clone` (`&self`) or, with `mutable`,
+    /// `clone_from` (`&mut self`) over the reference and guard steps of
+    /// `rt`: the first step whose by-value form (the step is `&Self`, or
+    /// `&mut Self`) or autoref form has a Clone `Self`. A shared reference
+    /// is Clone, so the walk stops at the first one: `(&&s).clone()` is
+    /// `&String`, `(&s).clone()` is `String`, `(& &mut s).clone()` is
+    /// `& &mut String`. Gives the derefs to `Self` (units as `autoderef`)
+    /// and `Self`; None when no step has a Clone `Self` (the later
+    /// dispatch reports or finds a user `Deref` step).
+    fn clone_self_step(&self, e: ExprId, rt: Ty, mutable: bool) -> Option<(u8, Ty)> {
+        let p = self.p;
+        let (mut d, mut t) = self.probe_start(e, rt);
+        loop {
+            if let TyKind::Ref(_, m, inner) = self.tys.kind(t)
+                && m.is_mut() == mutable
+                && has_clone(p, &self.tys, self.resolve(inner))
+            {
+                return Some((d + 1, self.resolve(inner)));
+            }
+            // `clone` autorefs with `&`, `clone_from` with `&mut`.
+            if has_clone(p, &self.tys, t) {
+                return Some((d, t));
+            }
+            t = match self.tys.kind(t) {
+                TyKind::Ref(_, _, inner) => self.resolve(inner),
+                _ => self.resolve(self.tys.guard_elem(t)?.0),
+            };
+            d = d.checked_add(1)?;
+        }
+    }
+
+    /// `x.clone()` or `x.clone_from(src)` when `clone_self_step` puts Self
+    /// at a reference type: the builtin copy of that reference. None when
+    /// Self is no reference (the dispatch below answers at the pointee).
+    fn ref_clone_call(&mut self, e: ExprId, recv: ExprId, rt: Ty, name: Sym, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        let mutable = match self.name(name) {
+            "clone" => false,
+            "clone_from" => true,
+            _ => return None,
+        };
+        let (derefs, self_ty) = self.clone_self_step(e, rt, mutable)?;
+        if !matches!(self.tys.kind(self_ty), TyKind::Ref(..)) {
+            return None;
+        }
+        // A user trait's `clone` may come first or tie: the user method
+        // probe decides.
+        let std_recv = self.tys.mk_ref(mutable, self_ty);
+        if self.user_trait_at_or_before(e, rt, name, std_recv) {
+            return None;
+        }
+        let lang = self.p.gx.lang;
+        let (_, base) = self.autoderef(rt);
+        self.record_glue_reads(lang.clone, base);
+        self.check_packed_borrow(recv, name_span);
+        if mutable {
+            self.set_res(e, Res::BuiltinMethod { b: Builtin::CloneFrom, derefs, autoref: Autoref::RefMut });
+            let src = self.tys.mk_ref(false, self_ty);
+            self.check_args(&[src], args, name_span);
+            return Some(UNIT);
+        }
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs, autoref: Autoref::Ref });
+        // An instance must clone the same reference even where its
+        // pointee type is Clone (`t.clone()` on `t: &T`, T unbounded).
+        // (`clone_from`'s walk never asks a pointee type at a shared step.)
+        self.record_pick(e, lang.clone, derefs, ReceiverForm::Ref);
+        self.check_args(&[], args, name_span);
+        Some(self_ty)
     }
 
     fn autoderef_smart(&self, t: Ty) -> (u8, Ty) {
@@ -15456,6 +15543,15 @@ impl<'p> Ctx<'p> {
         {
             return ret;
         }
+        // `clone`/`clone_from` whose Self is a reference (core's `Clone for
+        // &T`): rustc's probe stops at the first shared reference step, so
+        // `(&&s).clone()` is `&String`, never `S::clone` on the pointee.
+        if !builtin_only
+            && turbofish.is_empty()
+            && let Some(ret) = self.ref_clone_call(e, recv, rt, name, name_span, args)
+        {
+            return ret;
+        }
         // The inherent methods of `core::cmp::Ordering` (no user
         // impl can add inherent methods to it).
         if let Some(ret) = self.ordering_method(e, base, derefs, name, name_span, args) {
@@ -15657,25 +15753,7 @@ impl<'p> Ctx<'p> {
         // candidate: the probe goes on (trait methods, later deref
         // steps such as `LazyLock<HashMap<..>>::get`), as in rustc, and
         // only a miss reports it (E0599's note).
-        // `clone` on a reference to a non-Clone type clones the reference.
         if name == k.clone {
-            if !has_clone(p, &self.tys, base) && derefs > 0 {
-                self.record_glue_reads(p.gx.lang.clone, base);
-                // Peel all but the last reference; the clone copies that reference.
-                let mut cur = self.resolve(rt);
-                for _ in 0..derefs - 1 {
-                    if let TyKind::Ref(_, _, inner) = self.tys.kind(cur) {
-                        cur = self.resolve(inner);
-                    }
-                }
-                self.check_packed_borrow(recv, name_span);
-                self.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs: derefs - 1, autoref: Autoref::Ref });
-                // An instance must clone the same reference even where its
-                // pointee type is Clone (`t.clone()` on `t: &T`, T unbounded).
-                self.record_pick(e, p.gx.lang.clone, derefs - 1, ReceiverForm::Ref);
-                self.check_args(&[], args, name_span);
-                return cur;
-            }
             if has_clone(p, &self.tys, base) {
                 self.record_glue_reads(p.gx.lang.clone, base);
                 self.check_packed_borrow(recv, name_span);

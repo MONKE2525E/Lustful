@@ -284,6 +284,50 @@ impl Ctx<'_> {
         Ok(self.probe_of_receiver(steps, recv))
     }
 
+    /// The first probe at which trait `d`'s method of receiver form `kind`
+    /// may apply over `steps`: Self is a step, `&` one, or `&mut` one.
+    /// None for an associated fn; a typed receiver is not placed, so it
+    /// counts as the first probe.
+    fn trait_probe_at(&mut self, steps: &[Ty], d: DefId, kind: Option<SelfKind>) -> Option<usize> {
+        let mut first: Option<usize> = None;
+        for &s in steps {
+            for self_ty in [s, self.tys.mk_ref(false, s), self.tys.mk_ref(true, s)] {
+                if !self.trait_may_apply(d, self_ty) {
+                    continue;
+                }
+                let recv = match kind? {
+                    SelfKind::Value => self_ty,
+                    SelfKind::Ref => self.tys.mk_ref(false, self_ty),
+                    SelfKind::RefMut => self.tys.mk_ref(true, self_ty),
+                    _ => return Some(0),
+                };
+                if let Some(at) = self.probe_of_receiver(steps, recv) {
+                    first = Some(first.map_or(at, |f| f.min(at)));
+                }
+            }
+        }
+        first
+    }
+
+    /// True when an in-scope user trait's method `name` may apply to call
+    /// `e` (receiver type `rt`) at or before the probe whose receiver type
+    /// is `std_recv`, a std item's: the user method probe must decide
+    /// (`impl Tr for W` with `fn clone(&self)` comes before core's `Clone
+    /// for &W` on a `&W` receiver, and ties with it on a `&&W` one).
+    pub(super) fn user_trait_at_or_before(&mut self, e: ExprId, rt: Ty, name: Sym, std_recv: Ty) -> bool {
+        let users = self.user_traits_with(name);
+        if users.is_empty() {
+            return false;
+        }
+        let mut steps = self.std_probe_steps(rt);
+        // Through a user `Deref`, rustc's step is the target place itself.
+        if self.user_deref_call == Some(e) && steps.len() > 1 && matches!(self.tys.kind(steps[0]), TyKind::Ref(..)) {
+            steps.remove(0);
+        }
+        let std_at = self.probe_of_receiver(&steps, std_recv);
+        users.into_iter().filter_map(|(d, kind)| self.trait_probe_at(&steps, d, kind)).any(|u| std_at.is_none_or(|s| u <= s))
+    }
+
     /// Rule zero for `recv.name(..)` with receiver type `rt` (see the
     /// module comment): who wins in rustc's probe order. Instances skip
     /// it: the template check of the same body decided (rustc resolves a

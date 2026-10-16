@@ -225,8 +225,7 @@ impl<'p> Ctx<'p> {
             return self.deref_call(e, recv, rt, n == "deref_mut", name_span);
         }
         // Self: where the template's pick put it (an instance of a
-        // generic body), else one reference peeled (the by-value step of
-        // a `&self` method), else the receiver by autoref.
+        // generic body), else rustc's probe order (`conv_self_step`).
         let conv_traits = [lang.as_ref, lang.as_mut, lang.borrow, lang.borrow_mut, lang.to_owned];
         let replayed = self.replay_pick(e).filter(|pk| conv_traits.contains(&pk.trait_def));
         let (self_ty, self_derefs) = match replayed {
@@ -240,10 +239,7 @@ impl<'p> Ctx<'p> {
                 }
                 (t, pick.derefs)
             }
-            None => match self.tys.kind(rt) {
-                TyKind::Ref(_, _, inner) => (self.deep(inner), 1u8),
-                _ => (rt, 0u8),
-            },
+            None => self.conv_self_step(e, rt, n)?,
         };
         // A user Adt's own impls answer in the generic method search
         // first. Only core's reflexive `impl<T> Borrow<T> for T` (and
@@ -260,7 +256,12 @@ impl<'p> Ctx<'p> {
             }
             _ => false,
         };
-        if (self.tys.local_adt(self_ty).is_some() && !reflexive) || matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..)) {
+        // A Clone Adt's `to_owned` is core's blanket `impl<T: Clone>
+        // ToOwned for T` (a user impl would overlap it).
+        let blanket_owned = n == "to_owned" && has_clone(p, &self.tys, self_ty);
+        if (self.tys.local_adt(self_ty).is_some() && !reflexive && !blanket_owned)
+            || matches!(self.tys.kind(self_ty), TyKind::Param(_) | TyKind::Projection(..))
+        {
             return None;
         }
         if n == "clone_into" {
@@ -371,6 +372,57 @@ impl<'p> Ctx<'p> {
         Some(self.tys.mk_ref(mutable, target))
     }
 
+    /// The Self type and derefs of conversion method `n` on a receiver
+    /// of type `rt` in rustc's probe order: at each step the by-value form
+    /// (the step is `&X`, or `&mut X` for a `&mut self` method) with X as
+    /// Self, then the step itself by autoref. Core's reflexive `Borrow<T>
+    /// for T` holds at the first step, so `borrow` takes `X` from a `&X`
+    /// receiver and every other receiver as is (`&mut String` borrows as
+    /// `&mut String` or `String`, never `str`). `to_owned` holds where
+    /// Self is Clone (every shared reference), `str`, or a Clone slice:
+    /// `(&&s).to_owned()` is `&String`, `(&mut &s).to_owned()` is
+    /// `String`. `as_ref`/`as_mut` peel one reference (their `&T` impls
+    /// forward to T's). None when no step holds.
+    fn conv_self_step(&mut self, e: ExprId, rt: Ty, n: &str) -> Option<(Ty, u8)> {
+        let (d0, start) = self.probe_start(e, rt);
+        let ref_parts = |cx: &mut Self, t: Ty| match cx.tys.kind(t) {
+            TyKind::Ref(_, m, inner) => Some((m.is_mut(), cx.deep(inner))),
+            _ => None,
+        };
+        match n {
+            "borrow" | "borrow_mut" => Some(match ref_parts(self, start) {
+                Some((m, x)) if m == (n == "borrow_mut") => (x, d0 + 1),
+                _ => (start, d0),
+            }),
+            "to_owned" => {
+                let p = self.p;
+                let holds = |cx: &Self, t: Ty| match cx.tys.kind(t) {
+                    TyKind::Str => true,
+                    TyKind::Slice(el) => has_clone(p, &cx.tys, el),
+                    _ => has_clone(p, &cx.tys, t),
+                };
+                let (mut d, mut t) = (d0, start);
+                loop {
+                    let r = ref_parts(self, t);
+                    if let Some((false, x)) = r
+                        && holds(self, x)
+                    {
+                        return Some((x, d + 1));
+                    }
+                    if holds(self, t) {
+                        return Some((t, d));
+                    }
+                    t = r?.1;
+                    d = d.checked_add(1)?;
+                }
+            }
+            _ => Some(match ref_parts(self, rt) {
+                Some((_, x)) => (x, 1),
+                None => (rt, 0),
+            }),
+        }
+    }
+
     /// `x.deref()` and `x.deref_mut()` on a builtin Self (see
     /// `builtin_deref_target`): std's impls return `&**self`, which is
     /// the conversion builtin of `&Self` to `&Target`. Self is the template's pick in an instance, else
@@ -425,12 +477,17 @@ impl<'p> Ctx<'p> {
         };
         let mut t = rt;
         for d in 0..8u8 {
-            if let TyKind::Ref(_, m, x) = self.tys.kind(t) {
+            // The by-value form: `deref(&self)` takes a `&X` step (not a
+            // `&mut X`: `(&mut s).deref()` is core's `&mut T` impl, `&String`),
+            // `deref_mut` a `&mut X` step.
+            if let TyKind::Ref(_, m, x) = self.tys.kind(t)
+                && m.is_mut() == mutable
+            {
                 let x = self.deep(x);
                 if deferred(self, x) {
                     return None;
                 }
-                if (!mutable || m.is_mut()) && self.builtin_deref_target(x, mutable).is_some() {
+                if self.builtin_deref_target(x, mutable).is_some() {
                     return Some((x, d + 1));
                 }
             }
