@@ -1,4 +1,4 @@
-// expect: L0733
+// expect: L0306
 // rustc E0597: the predicate stores `&s` in a value of the map, and `s` dies first.
 use std::collections::HashMap;
 fn main() {
