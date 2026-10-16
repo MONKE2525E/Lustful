@@ -456,6 +456,12 @@ impl GenReuse {
         Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads))
     }
 
+    /// The read keys of every stored template check (the derive delta
+    /// fingerprints the moved ones at once before its replay).
+    pub(crate) fn template_read_keys(&self) -> impl Iterator<Item = &ReadKey> {
+        self.templates.values().flat_map(|e| e.reads.iter().map(|(k, _)| k))
+    }
+
     /// `template_holds` when only the read keys `moves` takes can have
     /// moved since the stored check (a derive-only request, sigedit P3.2):
     /// the other reads are not compared.

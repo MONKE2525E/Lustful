@@ -165,9 +165,28 @@ fn replay_templates(
     let names = reach_names(p, reach, fn_count);
     let mut moves = crate::driver::graph::DeriveMoves::memoized(reach);
     let idents = &front.chunks[0].scan.body_idents;
+    // The moved keys the stored checks read, fingerprinted once and in
+    // parallel into the request's answers (`GenReuse::memo`), which
+    // `template_holds_moved` reads below.
+    if keyed {
+        p.fp_memo.on(p.adts.len());
+        let prog: &Program = p;
+        let reuse = &caches.gen_reuse;
+        let mut seen: crate::intern::FxMap<crate::driver::graph::ReadKey, ()> = crate::intern::FxMap::default();
+        let keys: Vec<crate::driver::graph::ReadKey> = reuse
+            .template_read_keys()
+            .filter(|k| !reuse.memo.contains_key(*k) && seen.insert(**k, ()).is_none() && prog.derive_key_moves(&mut moves, k))
+            .copied()
+            .collect();
+        let fresh = crate::driver::compile::par_map(&keys, |k| prog.read_fingerprint(k));
+        caches.gen_reuse.memo.extend(keys.into_iter().zip(fresh));
+        p.fp_memo.off();
+    }
+    crate::driver::laps::mark("kept/derive templates keys");
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
     let out = (|| {
+        let mut again = Vec::new();
         for t in (0..fn_count as u32).map(LocalDefId) {
             if p.gx.fn_class.get(t.0 as usize) != Some(&FnClass::Template) || p.is_lang_method(t) {
                 continue;
@@ -193,6 +212,10 @@ fn replay_templates(
                     }
                 }
             }
+            again.push(t);
+        }
+        crate::driver::laps::mark("kept/derive templates walk");
+        for t in again {
             let body = p.fn_def(t).exprs;
             super::kept_delta::recheck_template(p, t, &[body], caches)?;
         }
