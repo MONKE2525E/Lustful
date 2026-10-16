@@ -382,7 +382,7 @@ impl Ctx<'_> {
             // A lang trait's method has its signature in `lang_method_sigs`.
             // `Any::type_id` has no lang signature (check/any.rs answers it).
             let kind = p.gx.trait_methods.get(&m).and_then(|t| t.self_kind).or_else(|| p.gx.lang_method_sigs.get(&m).and_then(|t| t.self_kind));
-            let kind = kind.or((d == p.gx.lang.any).then_some(SelfKind::Ref));
+            let kind = kind.or((d == p.gx.lang.any).then_some(SelfKind::Ref)).or_else(|| method::hash_method_kind(self, d, name));
             out.push((d, kind));
         }
         // `Iterator`'s provided methods are builtins, not in its lang record.
@@ -465,22 +465,25 @@ impl Ctx<'_> {
         first
     }
 
-    /// True when an in-scope user trait's method `name` may apply to call
-    /// `e` (receiver type `rt`) at or before the probe whose receiver type
-    /// is `std_recv`, a std item's: the user method probe must decide
+    /// True when an in-scope user trait's method `name`, or a user type's
+    /// inherent method, may apply to call `e` (receiver type `rt`) at or
+    /// before the probe whose receiver type is `std_recv`, a std item's:
+    /// the user method probe must decide
     /// (`impl Tr for W` with `fn clone(&self)` comes before core's `Clone
     /// for &W` on a `&W` receiver, and ties with it on a `&&W` one).
     pub(super) fn user_trait_at_or_before(&mut self, e: ExprId, rt: Ty, name: Sym, std_recv: Ty) -> bool {
         let users = self.user_traits_with(name);
-        if users.is_empty() {
-            return false;
-        }
         let mut steps = self.std_probe_steps(rt);
         // Through a user `Deref`, rustc's step is the target place itself.
         if self.user_deref_call == Some(e) && steps.len() > 1 && matches!(self.tys.kind(steps[0]), TyKind::Ref(..)) {
             steps.remove(0);
         }
         let std_at = self.probe_of_receiver(&steps, std_recv);
+        // A user type's inherent method at or before std's probe wins
+        // (`S::clone(&self)` on `r: &S`, at the `&S` step's by-value probe).
+        if self.inherent_probe(&steps, name).is_some_and(|i| std_at.is_none_or(|s| i <= s)) {
+            return true;
+        }
         users.into_iter().filter_map(|(d, kind)| self.trait_probe_at(&steps, d, kind)).any(|u| std_at.is_none_or(|s| u <= s))
     }
 
@@ -493,13 +496,13 @@ impl Ctx<'_> {
             return StdShadow::None;
         }
         let users = self.user_traits_with(name);
-        if users.is_empty() {
-            return StdShadow::None;
-        }
         let mut steps = self.std_probe_steps(rt);
         // Through a user `Deref`, rustc's step is the target place itself.
         if self.user_deref_call == Some(e) && steps.len() > 1 && matches!(self.tys.kind(steps[0]), TyKind::Ref(..)) {
             steps.remove(0);
+        }
+        if users.is_empty() {
+            return self.std_before_inherent(&steps, name);
         }
         let item = self.name(name).to_string();
         // std's earliest inherent and trait probes.
@@ -594,6 +597,74 @@ impl Ctx<'_> {
             (_, Some(_)) if std_placed.is_some_and(|p| p < user) => StdShadow::StdFirst,
             _ => StdShadow::UserFirst,
         }
+    }
+
+    /// The first probe over `steps` at which a user type's inherent
+    /// method `name` applies (its receiver is the step, `&` it, or `&mut`
+    /// it), if any.
+    fn inherent_probe(&mut self, steps: &[Ty], name: Sym) -> Option<usize> {
+        let p = self.p;
+        let mut inh: Option<usize> = None;
+        for &s in steps {
+            let Some((adt, _)) = self.tys.adt_parts(s) else { continue };
+            if !self.std_type_names(s).is_empty() {
+                continue;
+            }
+            let Some(fs) = p.gx.inherent_methods.get(&(adt, name)) else { continue };
+            for &f in fs {
+                let recv = match p.fn_info(f).self_kind {
+                    Some(SelfKind::Value) => s,
+                    Some(SelfKind::Ref) => self.tys.mk_ref(false, s),
+                    Some(SelfKind::RefMut) => self.tys.mk_ref(true, s),
+                    _ => continue,
+                };
+                if let Some(at) = self.probe_of_receiver(steps, recv) {
+                    inh = Some(inh.map_or(at, |i| i.min(at)));
+                }
+            }
+        }
+        inh
+    }
+
+    /// With no user trait method of the name: a user type's inherent
+    /// method `name` found at a later autoderef step loses to a std item
+    /// that applies at an earlier probe (`(&&v).to_owned()` is core's
+    /// `ToOwned for &S` at the `&&S` step, not `S::to_owned`). Std's side
+    /// is a std type's inherent item (the table) or a std trait in scope
+    /// placed by its impls (selection); lust's builtin dispatch does not
+    /// give that pick here, so the call is L0643. In one probe the
+    /// inherent method wins, as in rustc.
+    fn std_before_inherent(&mut self, steps: &[Ty], name: Sym) -> StdShadow {
+        let Some(inh) = self.inherent_probe(steps, name) else { return StdShadow::None };
+        if inh == 0 {
+            return StdShadow::None;
+        }
+        let item = self.name(name).to_string();
+        let mut std_at: Option<usize> = None;
+        for j in 0..steps.len() {
+            for l in self.std_letters_at(steps[j], &item) {
+                if l.is_ascii_lowercase()
+                    && let Ok(Some(at)) = self.std_probe(steps, j, l)
+                {
+                    std_at = Some(std_at.map_or(at, |s| s.min(at)));
+                }
+            }
+        }
+        let generic = steps.iter().any(|&s| {
+            let mut t = s;
+            while let TyKind::Ref(_, _, inner) = self.tys.kind(t) {
+                t = self.resolve(inner);
+            }
+            matches!(self.tys.kind(t), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) | TyKind::Dyn(..) | TyKind::Infer(_))
+        });
+        if !generic {
+            for (d, kind) in self.traits_with(name, false) {
+                if let Some(at) = self.trait_probe_at(steps, d, kind) {
+                    std_at = Some(std_at.map_or(at, |s| s.min(at)));
+                }
+            }
+        }
+        if std_at.is_some_and(|s| s < inh) { StdShadow::Reject } else { StdShadow::None }
     }
 
     /// `std_shadow_method` at a method call `e` (receiver type `rt`, `base`

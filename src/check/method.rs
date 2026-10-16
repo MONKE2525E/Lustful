@@ -609,7 +609,7 @@ impl ArgTrial {
 /// `Hash::hash` has no lang signature (its `H: Hasher` parameter has no
 /// stub form), but its receiver is `&self`: a derived or std impl still
 /// counts as a candidate next to a user trait's `hash` (rustc E0034).
-fn hash_method_kind(cx: &Ctx, trait_def: DefId, name: Sym) -> Option<SelfKind> {
+pub(super) fn hash_method_kind(cx: &Ctx, trait_def: DefId, name: Sym) -> Option<SelfKind> {
     (trait_def == cx.p.gx.lang.hash && cx.name(name) == "hash").then_some(SelfKind::Ref)
 }
 
