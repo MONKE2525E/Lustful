@@ -1,5 +1,5 @@
-// The fixed form of tests/reject/glob_order_same_item_two_vis.rs: an explicit
-// import sets the binding, so the glob order does not matter.
+// The fixed form of tests/reject/glob_order_refetch_drops_vis.rs: an explicit import
+// sets the binding, so the glob order does not matter.
 mod shapes {
     pub struct Square;
     impl Square {
@@ -9,8 +9,13 @@ mod shapes {
     }
 }
 
+mod extra {
+    pub use crate::shapes::*;
+}
+
 mod prelude {
     pub use crate::shapes::*;
+    pub(crate) use crate::extra::*;
 }
 
 mod geometry {

@@ -1,7 +1,5 @@
-// expect: L0509
-// Valid Rust: rustc keeps the public binding of `Square` here. The same item comes
-// through a public and a private glob, and in other shapes rustc's answer depends
-// on its import order, so lust rejects the class (subset rule, L0509).
+// The same item through a public glob and a private prelude glob: rustc keeps the
+// widest visibility in every order, so lust accepts it (see L0509).
 mod shapes {
     pub struct Square;
     impl Square {

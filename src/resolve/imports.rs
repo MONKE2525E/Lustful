@@ -795,6 +795,8 @@ impl ResolvedTables {
                 return InsertOut::Changed;
             }
         }
+        let wider = matches!(self.lookup(module, ns, name),
+            Some(BindState::One(old)) if old.target == bind.target && old.rank == 1 && bind.rank == 1 && self.glob_vis_wider(&bind, old));
         let map = &mut self.maps[module.0 as usize][ns_index(ns)];
         let out = match map.get(&name) {
             None => {
@@ -810,10 +812,17 @@ impl ResolvedTables {
                     // is legal and stays `Same`. An explicit import of the
                     // item a glob already brought is legal too, and it
                     // raises the binding to explicit rank: other globs
-                    // can then no longer make the name ambiguous here.
+                    // can then no longer make the name ambiguous here. A
+                    // second glob of the item with a wider visibility
+                    // widens the binding, as rustc keeps the widest
+                    // (`ambiguity_vis_max`; `resolve::order` rejects the
+                    // orders where rustc drops it again).
                     if old.rank == 2 && bind.rank == 2 {
                         InsertOut::Dup
                     } else if bind.rank > old.rank {
+                        map.insert(name, BindState::One(bind));
+                        InsertOut::Changed
+                    } else if wider {
                         map.insert(name, BindState::One(bind));
                         InsertOut::Changed
                     } else {
@@ -854,6 +863,33 @@ impl ResolvedTables {
             self.touch(module, name);
         }
         out
+    }
+
+    /// True when glob binding `a` reaches strictly more modules than `b`.
+    /// A `pub(in path)` visibility compares as neither (lust keeps the
+    /// first binding there).
+    fn glob_vis_wider(&self, a: &Bind, b: &Bind) -> bool {
+        let region = |vis: &VisKind, m: ModuleId| -> Option<(u8, ModuleId)> {
+            match vis {
+                VisKind::Pub => Some((2, m)),
+                VisKind::Crate => Some((1, self.root_of(m))),
+                VisKind::Priv => Some((0, m)),
+                VisKind::Super => Some(match self.modules[m.0 as usize].parent {
+                    Some(p) => (0, p),
+                    None => (1, self.root_of(m)),
+                }),
+                VisKind::In(_) => None,
+            }
+        };
+        let (Some((ra, ma)), Some((rb, mb))) = (region(&a.vis, a.def_module), region(&b.vis, b.def_module)) else { return false };
+        match (ra, rb) {
+            (2, 2) => false,
+            (2, _) => true,
+            (1, 1) => false,
+            (1, 0) => self.root_of(ma) == self.root_of(mb),
+            (0, 0) => ma != mb && self.is_within(mb, ma),
+            _ => false,
+        }
     }
 
     /// Records a change of `name` in `module` (`glob_log`).
@@ -966,10 +1002,12 @@ impl ResolvedTables {
             self.touch(module, name);
             return InsertOut::Changed;
         }
+        // A wider copy of the same item keeps the source it came from first.
+        let same_item = matches!(self.lookup(module, ns, name), Some(BindState::One(old)) if old.target == bind.target);
         let out = self.insert(module, ns, name, bind);
         match self.lookup(module, ns, name) {
             Some(BindState::One(_)) => {
-                if out == InsertOut::Changed {
+                if out == InsertOut::Changed && !same_item {
                     self.glob_src.insert(key, src);
                 }
             }
