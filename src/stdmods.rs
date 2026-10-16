@@ -159,7 +159,7 @@ pub const STD_MODULES: &[StdModule] = &[
         krate: ShippedCrate::Core,
         paths: &[("core", "iter"), ("std", "iter")],
         full: false,
-        triggers: &["once", "Once"],
+        triggers: &["once", "once_with", "from_fn", "successors", "Once", "OnceWith", "FromFn", "Successors"],
     },
 ];
 

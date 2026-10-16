@@ -1,4 +1,4 @@
-// expect: L0505
+// expect: L0312
 // Probe g_gen_closure_iter__array_wrap (probes, w-opaque2): rustc and lust reject it.
 #![allow(unused)]
 struct C { v: Vec<u32>, n: u8, g: G<u32> }
