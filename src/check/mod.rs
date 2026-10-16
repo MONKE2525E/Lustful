@@ -18239,6 +18239,13 @@ impl<'p> Ctx<'p> {
         if crate::check::collect::cow_arg(&self.tys, self.resolve(lt)) == Some(STR) && op == BinOp::Add {
             let rt_deep = self.deep(rt);
             if crate::check::collect::cow_arg(&self.tys, rt_deep) != Some(STR) {
+                // Two `AddAssign` impls: no coercion of the right side (E0277).
+                let exact_str = matches!(self.kind(rt_deep), TyKind::Ref(_, Mut::Shared, inner) if self.resolve(inner) == STR);
+                if !exact_str && !matches!(self.kind(rt_deep), TyKind::Error) {
+                    let rn = self.tn(rt_deep);
+                    self.err("L0113", span, format!("cannot add-assign `{rn}` to `Cow<str>`"), "Add a `&str` (`&*s`, `s.as_str()`) or a `Cow<str>`.");
+                    return UNIT;
+                }
                 self.coerce_expr(rhs, rt, REF_STR);
             }
             self.set_res(e, Res::Bin { ld: 0, rd: 0 });
@@ -18502,11 +18509,19 @@ impl<'p> Ctx<'p> {
             return STRING;
         }
         // Cow<str> + &str (a Cow right side stays a Cow: the
-        // separate `Add<Cow>` impl reads its view at lowering).
+        // separate `Add<Cow>` impl reads its view at lowering). With two
+        // impls rustc selects on the right operand's own type, so it does
+        // not coerce it: `cow + &string` is E0277.
         let lt_deep = self.deep(lt);
         if op == Add && crate::check::collect::cow_arg(&self.tys, lt_deep) == Some(STR) {
             let rt_deep = self.deep(rt);
             if crate::check::collect::cow_arg(&self.tys, rt_deep) != Some(STR) {
+                let exact_str = matches!(self.kind(rt_deep), TyKind::Ref(_, Mut::Shared, inner) if self.resolve(inner) == STR);
+                if !exact_str && !matches!(self.kind(rt_deep), TyKind::Error) {
+                    let rn = self.tn(rt_deep);
+                    self.err("L0113", span, format!("cannot add `{rn}` to `Cow<str>`"), "Add a `&str` (`&*s`, `s.as_str()`) or a `Cow<str>`.");
+                    return ERROR;
+                }
                 self.coerce_expr(rhs, rt, REF_STR);
             }
             self.set_res(e, Res::Bin { ld: 0, rd: 0 });
