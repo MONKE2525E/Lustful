@@ -24089,6 +24089,16 @@ impl<'p> SolveCx for Ctx<'p> {
         {
             return Some(self.derive_query_holds(tr.def, self_ty));
         }
+        // A builtin iterator's Clone has no impl record either: the
+        // method probe's where-clause filter (`impl<T: Clone> Tag for T`
+        // at a `Range<i32>` receiver) must see the same answer as
+        // `select_obligation_at`.
+        if tr.def == lang.clone
+            && matches!(self.kind(self_ty), TyKind::Adt(..))
+            && (self.tys.is_chars_ty(self_ty) || crate::ty::iter::iter_parts(&self.tys, self_ty).is_some())
+        {
+            return Some(self.derive_query_holds(tr.def, self_ty));
+        }
         None
     }
     fn record_impl_set(&mut self, trait_def: DefId, self_ty: Ty, _failed: bool) {

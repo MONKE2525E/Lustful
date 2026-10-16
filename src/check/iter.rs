@@ -301,6 +301,11 @@ impl<'p> Ctx<'p> {
         if n == "hash" && it::iter_parts(&self.tys, base).is_some_and(|(k, _)| k.is_range()) {
             return None;
         }
+        // A name of no iterator trait and no iterator view method (a user
+        // trait's `tag`, from `impl<T: Clone> Tag for T`): normal resolution.
+        if !STD_ITER_TRAIT_METHODS.contains(&n.as_str()) && !ITER_VIEW_METHODS.contains(&n.as_str()) {
+            return None;
+        }
         Some(self.iter_call(e, recv, base, base, derefs, &n, name_span, args, turbofish, expected))
     }
 
@@ -2606,6 +2611,24 @@ impl<'p> Ctx<'p> {
         }
     }
 }
+
+/// Every method of core's `Iterator`, `DoubleEndedIterator`, and
+/// `ExactSizeIterator` (rust-src 1.99). On a builtin iterator these go to
+/// `iter_call`, which answers or rejects them; other names resolve normally.
+const STD_ITER_TRAIT_METHODS: &[&str] = &[
+    "advance_back_by", "advance_by", "all", "any", "array_chunks", "by_ref", "chain", "cloned", "cmp", "cmp_by", "collect",
+    "collect_into", "copied", "count", "cycle", "enumerate", "eq", "eq_by", "filter", "filter_map", "find", "find_map", "flat_map",
+    "flatten", "fold", "for_each", "fuse", "ge", "gt", "inspect", "intersperse", "intersperse_with", "is_empty", "is_partitioned",
+    "is_sorted", "is_sorted_by", "is_sorted_by_key", "last", "le", "len", "lt", "map", "map_while", "map_windows", "max", "max_by",
+    "max_by_key", "min", "min_by", "min_by_key", "ne", "next", "next_back", "next_chunk", "next_chunk_back", "nth", "nth_back",
+    "partial_cmp", "partial_cmp_by", "partition", "partition_in_place", "peekable", "position", "product", "reduce", "rev", "rfind",
+    "rfold", "rposition", "scan", "size_hint", "skip", "skip_while", "step_by", "sum", "take", "take_while", "try_collect", "try_find",
+    "try_fold", "try_for_each", "try_reduce", "try_rfold", "unzip", "zip",
+];
+
+/// The methods `iter_call` answers that belong to an iterator type
+/// itself, not to an iterator trait (`Peekable::peek`, `Chars::as_str`).
+const ITER_VIEW_METHODS: &[&str] = &["peek", "as_slice", "as_mut_slice", "as_str", "remainder", "into_remainder"];
 
 /// The adapter and consumer methods `iter_call` answers, by name: the
 /// calls that wrap a `ByNext` iterator.
