@@ -123,6 +123,16 @@ fn record_path(cache_dir: &Path, manifest_dir: &Path) -> PathBuf {
     cache_dir.join(format!("buildscript-{h:016x}.txt"))
 }
 
+/// Every build script record in `cache_dir` (any package). The daemon's
+/// guard counts them as compile inputs: a rerun rewrites its record.
+pub fn record_files(cache_dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(cache_dir) else { return Vec::new() };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("buildscript-") && n.ends_with(".txt")))
+        .collect()
+}
+
 /// File contents hash for rerun-if inputs; a missing file hashes as a
 /// fixed sentinel, so creating or deleting the file changes the hash.
 fn file_hash(path: &Path) -> u64 {

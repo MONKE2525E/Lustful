@@ -33,7 +33,9 @@
 //     the fresh session replaces the warm one, and the next answer for that crate is
 //     recomputed in another new session. If they match, the warm session (and its caches)
 //     is kept. Success answers are trusted as they are. Background results are compared
-//     only when the source bytes did not change during the check, and they are applied
+//     only when no input of either compile changed from the warm compile's start to the
+//     end of the fresh one (`input_paths`, `changed_input`: every source file, expansion
+//     input, Cargo file and build script record, not only the root), and they are applied
 //     on the serve loop (`GuardJobs::drain`), never on the worker thread. The fuzz gate
 //     waits for all started checks to finish (`guard-check: start/done` log lines) and
 //     counts any "guard:" line as a failure, as it did when the guard was synchronous.
@@ -431,13 +433,74 @@ fn replace_session(entry: &mut Entry, key: &SessionKey) {
 
 /// What one background fresh-session check found.
 enum GuardOutcome {
-    /// A fresh compile of the same source bytes; its session travels along
+    /// A fresh compile of the same inputs; its session travels along
     /// for adoption on a mismatch.
     Fresh(Response),
     /// The fresh compile panicked.
     Panicked,
-    /// The source bytes changed during the check: no comparison is possible.
-    Stale,
+    /// This input changed after the warm compile started: no comparison is possible.
+    Stale(PathBuf),
+}
+
+/// Every file a compile in `session` read for `req`: the root, each source
+/// file of its map (module files, dependency sources), each file an expansion
+/// read (`include_str!` and friends), the Cargo files the graph key covers,
+/// and the build script records. The request itself (command, flags, client
+/// env and shown paths, crate selection) needs no entry: a guard compiles a
+/// clone of the warm request, in this same daemon binary.
+fn input_paths(session: &Session, req: &Request) -> Vec<PathBuf> {
+    let front = &session.front;
+    let mut paths = vec![req.file.clone()];
+    for k in 0..front.map.file_count() {
+        let p = front.map.path(crate::diag::FileId(k as u32));
+        if !p.is_empty() {
+            paths.push(PathBuf::from(p));
+        }
+    }
+    for chunk in &front.chunks {
+        for dep in &chunk.expand_deps {
+            if let crate::expand::Dep::File { path, .. } = dep {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths.extend(protocol::graph_files(&req.session).into_iter().map(|(_, p)| p));
+    paths.extend(driver::buildscript::record_files(&driver::cache::cache_dir(&req.file)));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The first of `paths` that may have changed after `start` (the warm
+/// compile's start), or None. A file's ctime moves on every write, truncate,
+/// rename and delete, and nothing can set it back, so a ctime at or before
+/// `start` proves the file held the same bytes from then until now: through
+/// the warm compile and the fresh one, edits and reverts (A -> B -> A)
+/// included. A missing file counts by its nearest existing directory, whose
+/// ctime a delete moves. The proof is as fine as the filesystem's clock: an
+/// edit in the first clock tick of the warm compile can read as older, which
+/// at worst shows as a mismatch; it never hides one.
+fn changed_input(paths: &[PathBuf], start: std::time::SystemTime) -> Option<PathBuf> {
+    let start = start.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let start = (start.as_secs() as i64, start.subsec_nanos() as i64);
+    let newer = |md: &std::fs::Metadata| (md.ctime(), md.ctime_nsec()) > start;
+    paths
+        .iter()
+        .find(|p| match p.symlink_metadata() {
+            // A symlinked file: its link and its target both count.
+            Ok(md) => newer(&md) || (md.file_type().is_symlink() && std::fs::metadata(p).map_or(true, |t| newer(&t))),
+            Err(_) => p.ancestors().skip(1).find_map(|d| d.symlink_metadata().ok()).map_or(true, |md| newer(&md)),
+        })
+        .cloned()
+}
+
+/// Test knob (`LUST_GUARD_HOLD_MS`, default 0): a guard worker waits this
+/// long before and after its fresh compile, so a daemon scenario can edit
+/// files while a check is in flight.
+fn guard_hold() {
+    if let Some(ms) = std::env::var("LUST_GUARD_HOLD_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 }
 
 /// One finished background check, sent from its worker thread to the serve loop.
@@ -471,12 +534,13 @@ impl GuardJobs {
         GuardJobs { tx, rx, next_seq: 0, pending: 0 }
     }
 
-    /// Redoes `req` in a fresh session on a new thread. `src` is the source
-    /// bytes read on the serve loop right after the warm compile; the worker
-    /// compares only when the file still holds exactly those bytes before
-    /// and after its compile, so an edit in between reads as stale, never as
-    /// a guard mismatch.
-    fn spawn(&mut self, req: Request, warm: Response, src: Vec<u8>, dir: PathBuf, served: u64) {
+    /// Redoes `req` in a fresh session on a new thread. `inputs` are the
+    /// warm session's input files (`input_paths`) and `start` is when the
+    /// warm compile started. After its compile the worker adds the fresh
+    /// session's own inputs and compares only when none of them changed
+    /// since `start` (`changed_input`), so an edit anywhere in the crate
+    /// during either compile reads as stale, never as a guard mismatch.
+    fn spawn(&mut self, req: Request, warm: Response, inputs: Vec<PathBuf>, start: std::time::SystemTime, dir: PathBuf, served: u64) {
         self.next_seq += 1;
         let seq = self.next_seq;
         self.pending += 1;
@@ -488,14 +552,18 @@ impl GuardJobs {
         let _ = crate::pool::thread("lust-guard").spawn(move || {
             let work_dir = dir.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let same = |req: &Request| std::fs::read(&req.file).ok().as_deref() == Some(&src[..]);
-                if !same(&req) {
-                    return (GuardOutcome::Stale, None);
-                }
+                guard_hold();
                 let mut fresh = Session::new(work_dir, true, req.session.clone());
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile_background(&req, &mut fresh))) {
-                    Ok(resp) if same(&req) => (GuardOutcome::Fresh(resp), Some(fresh)),
-                    Ok(_) => (GuardOutcome::Stale, None),
+                    Ok(resp) => {
+                        guard_hold();
+                        let mut all = inputs;
+                        all.extend(input_paths(&fresh, &req));
+                        match changed_input(&all, start) {
+                            None => (GuardOutcome::Fresh(resp), Some(fresh)),
+                            Some(path) => (GuardOutcome::Stale(path), None),
+                        }
+                    }
                     Err(_) => (GuardOutcome::Panicked, None),
                 }
             }));
@@ -528,9 +596,9 @@ fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
     let file = done.key.krate.root.display().to_string();
     let seq = done.seq;
     match done.outcome {
-        GuardOutcome::Stale => {
+        GuardOutcome::Stale(ref path) => {
             let _ = std::fs::remove_dir_all(&done.dir);
-            eprintln!("guard-check: done {seq} stale for {file} (source changed during the check)");
+            eprintln!("guard-check: done {seq} stale for {file} ({} changed during the check)", path.display());
         }
         GuardOutcome::Panicked => {
             let _ = std::fs::remove_dir_all(&done.dir);
@@ -625,6 +693,7 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
         // check is spawned for it.
         return compile_fresh(entry, req).0;
     }
+    let start = std::time::SystemTime::now();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, &mut entry.session))) {
         Ok(r) if r.code == 0 || r.code == 2 => r,
         Ok(r) if r.code == 3 && r.stderr.contains("function count mismatch") => {
@@ -637,12 +706,9 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
         }
         Ok(r) => {
             // An error answer: hand it out now, verify it in the background.
-            // Without the current source bytes no honest comparison is
-            // possible, so a read failure here just skips the check.
-            if let Ok(src) = std::fs::read(&req.file) {
-                let dir = entry.fresh_dir();
-                jobs.spawn(req.clone(), r.clone(), src, dir, served);
-            }
+            let inputs = input_paths(&entry.session, req);
+            let dir = entry.fresh_dir();
+            jobs.spawn(req.clone(), r.clone(), inputs, start, dir, served);
             r
         }
         Err(payload) => {
@@ -958,6 +1024,118 @@ mod tests {
         assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "match keeps the session");
         assert!(entry.recompute_next, "the earlier recompute mark stands");
         assert_ne!(entry.session.obj_dir(), warm_dir.as_path());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A check request for `file` as the client sends it.
+    fn check_req(file: &Path) -> Request {
+        protocol::Request {
+            cmd: protocol::Cmd::Check,
+            session: SessionKey::synthetic(file, false),
+            out: file.with_extension(""),
+            json: false,
+            timings: false,
+            debug: false,
+            emit_c: None,
+            max_errors: 20,
+            run_args: None,
+            harness: false,
+            client: protocol::Client::default(),
+            file: file.to_path_buf(),
+        }
+    }
+
+    /// Writes `text` to `path` after the clock has moved past every earlier
+    /// timestamp (file times tick in a coarse clock).
+    fn write_later(path: &Path, text: &str) {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Runs one guard check to its end on the test thread's own channel.
+    fn guard_once(req: &Request, warm: Response, inputs: Vec<PathBuf>, start: std::time::SystemTime, dir: PathBuf) -> GuardDone {
+        let mut jobs = GuardJobs::new();
+        jobs.spawn(req.clone(), warm, inputs, start, dir, 1);
+        jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends")
+    }
+
+    /// The ctime proof: untouched files pass; a write, a revert to the same
+    /// bytes (A -> B -> A), and a delete after `start` each count as changed.
+    #[test]
+    fn changed_input_sees_writes_reverts_and_deletes_after_start() {
+        let dir = std::env::temp_dir().join(format!("lust-guard-ctime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b, c) = (dir.join("a.rs"), dir.join("b.rs"), dir.join("c.rs"));
+        for p in [&a, &b, &c] {
+            std::fs::write(p, "fn f() {}\n").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let start = std::time::SystemTime::now();
+        let all = vec![a.clone(), b.clone(), c.clone()];
+        assert_eq!(changed_input(&all, start), None, "nothing changed");
+        write_later(&b, "fn g() {}\n");
+        std::fs::write(&b, "fn f() {}\n").unwrap();
+        assert_eq!(changed_input(&all, start), Some(b.clone()), "a revert to the same bytes still moved");
+        assert_eq!(changed_input(&[a.clone()], start), None);
+        std::fs::remove_file(&c).unwrap();
+        assert_eq!(changed_input(&[a.clone(), c.clone()], start), Some(c.clone()), "a delete moves the dir");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The w-sig-small 09:45 false mismatch: a crate whose root is
+    /// unchanged while a module file is edited during the guard check.
+    /// The check is stale, never a mismatch. Without the edit, the same
+    /// check matches the warm answer, and a warm answer that differs from
+    /// the fresh one on the same inputs is still adopted as a mismatch.
+    #[test]
+    fn guard_ignores_module_edits_and_adopts_real_mismatches() {
+        let base = std::env::temp_dir().join(format!("lust-guard-mod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("main.rs");
+        let store = base.join("store.rs");
+        std::fs::write(&root, "mod store;\nfn main() {\n    store::put(1);\n}\n").unwrap();
+        std::fs::write(&store, "pub fn put(x: u8) -> u8 {\n    x + true\n}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let req = check_req(&root);
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let entry = entry_for(&mut sessions, &base.join("s"), &req.session, &mut 0);
+        let start = std::time::SystemTime::now();
+        let warm = driver::compile(&req, &mut entry.session);
+        assert_eq!(warm.code, 1, "store.rs has a type error: {}", warm.stderr);
+        let inputs = input_paths(&entry.session, &req);
+        assert!(inputs.contains(&store), "the module file is a guard input: {inputs:?}");
+
+        // Same inputs, same answer: a match keeps the warm session.
+        let done = guard_once(&req, warm.clone(), inputs.clone(), start, base.join("f1"));
+        assert!(matches!(&done.outcome, GuardOutcome::Fresh(f) if f.stderr == warm.stderr && f.code == warm.code));
+
+        // Same inputs, a warm answer that differs: a real mismatch.
+        let wrong = Response { stderr: "error[L0001]: not what a fresh session says\n".into(), ..warm.clone() };
+        let done = guard_once(&req, wrong, inputs.clone(), start, base.join("f2"));
+        assert!(matches!(done.outcome, GuardOutcome::Fresh(_)));
+        sessions.get_mut(&req.session).unwrap().served = 1;
+        apply_guard(&mut sessions, done);
+        let entry = sessions.get(&req.session).unwrap();
+        assert!(entry.recompute_next, "a mismatch on the same inputs is adopted");
+        assert_eq!(entry.session.obj_dir(), base.join("f2").as_path());
+
+        // The module file is fixed after the warm answer (the root stays
+        // byte for byte): the fresh answer differs, but the check is stale.
+        write_later(&store, "pub fn put(x: u8) -> u8 {\n    x + 1\n}\n");
+        let done = guard_once(&req, warm.clone(), inputs.clone(), start, base.join("f3"));
+        assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == store), "module edit reads as stale");
+
+        // An edit and a revert of the root (A -> B -> A, fx-cgen-rec 11:16):
+        // the bytes match again, the check is still stale.
+        let text = std::fs::read_to_string(&root).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let start = std::time::SystemTime::now();
+        write_later(&root, "fn main() {}\n");
+        std::fs::write(&root, &text).unwrap();
+        let done = guard_once(&req, warm, vec![root.clone()], start, base.join("f4"));
+        assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == root), "a reverted root reads as stale");
         let _ = std::fs::remove_dir_all(&base);
     }
 

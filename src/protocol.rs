@@ -206,32 +206,46 @@ pub fn manifest_dir(session: &SessionKey) -> Option<PathBuf> {
 
 pub fn graph_key(session: &SessionKey) -> u64 {
     let mut h = hash_bytes(1, &[session.describe().as_bytes()]);
+    for (label, path) in graph_files(session) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            h = hash_bytes(h, &[label.as_bytes(), &bytes]);
+        }
+    }
+    h
+}
+
+/// The files `graph_key` covers, each with the label it hashes under, in
+/// hash order: the manifest, then per directory up to the root its
+/// `.cargo/config.toml`, `.cargo/config` and `.lust.toml`, and the nearest
+/// `Cargo.lock`. Only files that exist. The daemon's guard counts them as
+/// compile inputs too.
+pub fn graph_files(session: &SessionKey) -> Vec<(&'static str, PathBuf)> {
     let manifest_path = match &session.krate.manifest_path {
         Some(p) => Some(p.clone()),
         // Same synthetic-crate rule as `manifest_dir`.
         None if session.krate.package_id.starts_with("file:") => None,
         None => find_manifest(&session.krate.root).map(|m| m.path),
     };
-    if let Some(manifest) = manifest_path {
-        if let Ok(bytes) = std::fs::read(&manifest) {
-            h = hash_bytes(h, &[b"manifest", &bytes]);
-        }
-        let mut dir = manifest.parent();
-        let mut lock_found = false;
-        while let Some(d) = dir {
-            for name in [".cargo/config.toml", ".cargo/config", ".lust.toml"] {
-                if let Ok(bytes) = std::fs::read(d.join(name)) {
-                    h = hash_bytes(h, &[name.as_bytes(), &bytes]);
-                }
-            }
-            if !lock_found && let Ok(bytes) = std::fs::read(d.join("Cargo.lock")) {
-                h = hash_bytes(h, &[b"lock", &bytes]);
-                lock_found = true;
-            }
-            dir = d.parent();
-        }
+    let mut files = Vec::new();
+    let Some(manifest) = manifest_path else { return files };
+    if manifest.is_file() {
+        files.push(("manifest", manifest.clone()));
     }
-    h
+    let mut dir = manifest.parent();
+    let mut lock_found = false;
+    while let Some(d) = dir {
+        for name in [".cargo/config.toml", ".cargo/config", ".lust.toml"] {
+            if d.join(name).is_file() {
+                files.push((name, d.join(name)));
+            }
+        }
+        if !lock_found && d.join("Cargo.lock").is_file() {
+            files.push(("lock", d.join("Cargo.lock")));
+            lock_found = true;
+        }
+        dir = d.parent();
+    }
+    files
 }
 
 /// The host target triple, for the tier-1 hosts lust runs on. Empty when the
