@@ -444,6 +444,19 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     }
 }
 
+/// The target of a symbolic link. std's readlink loop shrinks the
+/// buffer to the target's length, so the capacity is the length.
+pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+    let mut buf: Vec<u8> = Vec::new();
+    match status(core::intrinsics::sys_readlink(bytes_of(path.as_ref()), &mut buf)) {
+        Ok(()) => {
+            buf.shrink_to_fit();
+            Ok(PathBuf::from_os_string(OsString::__from_vec(buf)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// True when the path exists (following symlinks); errors other than
 /// NotFound are returned.
 pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {

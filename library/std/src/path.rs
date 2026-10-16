@@ -782,6 +782,11 @@ impl Path {
         crate::fs::canonicalize(self)
     }
 
+    /// `fs::read_link` of this path.
+    pub fn read_link(&self) -> crate::io::Result<PathBuf> {
+        crate::fs::read_link(self)
+    }
+
     /// A value that formats the path with `{}` (invalid UTF-8 becomes U+FFFD).
     pub fn display(&self) -> Display<'_> {
         Display { path: self }
