@@ -1574,6 +1574,36 @@ fn fn_env(p: &Program, f: LocalDefId) -> &[Predicate] {
     p.gx.fn_scopes.get(f.0 as usize).map_or(&[][..], |fs| &fs.env)
 }
 
+/// The erased form of `t` (every region `Erased`, Adt lifetime args
+/// dropped) when this body's interner has it; None when it does not or `t`
+/// holds a `dyn` or a fn pointer with a free region.
+fn erased_lookup(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    match tys.kind(t) {
+        TyKind::Ref(_, m, i) => tys.get(TyKind::Ref(Region::Erased, m, erased_lookup(tys, i)?)),
+        TyKind::RawPtr(m, i) => tys.get(TyKind::RawPtr(m, erased_lookup(tys, i)?)),
+        TyKind::Slice(e) => tys.get(TyKind::Slice(erased_lookup(tys, e)?)),
+        TyKind::Array(e, n) => tys.get(TyKind::Array(erased_lookup(tys, e)?, n)),
+        TyKind::Tuple(ts) => {
+            let es = tys.tys_of(ts).iter().map(|&e| erased_lookup(tys, e)).collect::<Option<Vec<Ty>>>()?;
+            tys.get(TyKind::Tuple(tys.get_tys(&es)?))
+        }
+        TyKind::Adt(def, args) => {
+            let mut a = Vec::new();
+            for g in tys.args(args).iter() {
+                match *g {
+                    GenericArg::Ty(e) => a.push(GenericArg::Ty(erased_lookup(tys, e)?)),
+                    GenericArg::Lifetime(_) => {}
+                    c => a.push(c),
+                }
+            }
+            tys.get(TyKind::Adt(def, tys.get_args(&a)?))
+        }
+        TyKind::Dyn(..) => None,
+        TyKind::FnPtr(sig) if tys.sig(sig).value.free_region != Region::Erased => None,
+        _ => Some(t),
+    }
+}
+
 /// The type params in `t` (also inside projections), by index, once each.
 /// True when `t` may hold a closure value (also behind a type param, an
 /// infer var, or an opaque type): `closure_only_call`.
@@ -4006,7 +4036,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             return true;
         }
         let outs = self.sig_slot_regions(out);
-        let one = if let [one] = slots[..] { Some(one) } else { None };
+        // Elision's one input lifetime: a `'static` slot is no elided one
+        // (it comes from a substituted type: `fn(&(K, V)) -> &K` at `K =
+        // &'static str`; check rejects a written one next to an elided output).
+        let late: Vec<u32> = slots.iter().copied().filter(|&v| v != 0).collect();
+        let one = if let [one] = late[..] { Some(one) } else { None };
         let rv = outs
             .iter()
             .map(|&r| match is_free(&mut j) {
@@ -5575,6 +5609,36 @@ impl<'b, 'p> Builder<'b, 'p> {
                 self.flow_all(&rest, v);
             }
         }
+        self.map_output_part(dt, dv, &ranges);
+    }
+
+    /// A `map`-family adapter `dt` (vars `dv`, parts at `ranges`) whose
+    /// callable is a fn item or a `dyn Fn` (behind references and boxes):
+    /// its output part `B` holds what the callable returns for the inner
+    /// items (`callable_out`), so a reader of `B` sees the items' borrows.
+    /// A closure ties `B` through `closure_reqs`. A fn pointer is left
+    /// alone: a library field type writes `Map<I, fn(&(K, V)) -> &K>`, whose
+    /// `B` is no place of this call; its readers go through `iter_items`.
+    /// An unpaired callable lets every item and callable region reach `B`.
+    fn map_output_part(&mut self, dt: Ty, dv: &[u32], ranges: &[(usize, usize)]) {
+        use crate::ty::iter::IterKind as K;
+        let Some((K::Map | K::FilterMap | K::MapWhile, a)) = crate::ty::iter::iter_parts(&self.body.tys, dt) else { return };
+        let (Some(&a0), Some(&f), Some(&bt)) = (a.first(), a.get(1), a.get(2)) else { return };
+        if matches!(self.body.tys.kind(f), TyKind::Closure(..) | TyKind::FnPtr(_)) {
+            return;
+        }
+        let (Some(&(s0, n0)), Some(&(s1, n1)), Some(&(s2, n2))) = (ranges.first(), ranges.get(1), ranges.get(2)) else { return };
+        let (iv, fv, out) = (dv[s0..s0 + n0].to_vec(), dv[s1..s1 + n1].to_vec(), dv[s2..s2 + n2].to_vec());
+        let mut xs = Vec::new();
+        if !self.iter_items(a0, &iv, &mut xs) {
+            xs = vec![iv.clone()];
+        }
+        for x in xs {
+            if !self.callable_out(f, &fv, &x, bt, &out) {
+                let srcs: Vec<u32> = x.iter().chain(&fv).copied().collect();
+                self.flow_all(&srcs, &out);
+            }
+        }
     }
     /// The vars of the slots of `t` (laid out from `*at` in `vars`) that do
     /// not sit inside a closure type, plus the captured sources of the
@@ -6184,6 +6248,55 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// iterator's own slots (`vars`, in slot order), for the builtin
     /// kinds whose item is made of parts of the iterator type. None for
     /// the rest (`Chain` mixes two sources).
+    /// The output vars `item` (type `bt`) of one call of an adapter's
+    /// callable `f` (vars `fv`) on an item with vars `x`: a fn pointer by
+    /// its late-bound signature, a `&dyn Fn` by its sugar signature, a
+    /// plain fn item by its region signature. False when `f` is another
+    /// callable or the signature does not pair (the caller's flow then).
+    fn callable_out(&mut self, f: Ty, fv: &[u32], x: &[u32], bt: Ty, item: &[u32]) -> bool {
+        match self.body.tys.kind(f) {
+            TyKind::FnPtr(sig) => {
+                let s = self.body.tys.sig(sig).value;
+                let ins: Vec<Ty> = self.body.tys.tys_of(s.inputs).to_vec();
+                let free = if s.free_slots != 0 { fv.first().map(|&v| (s.free_slots, v)) } else { None };
+                let [it] = ins[..] else { return false };
+                // Against its own output type: `filter_map`'s callable returns
+                // `Option<B>`, which has `B`'s slots.
+                let out = s.output;
+                if (s.free_slots != 0 && free.is_none()) || self.sc.slots(it) as usize != x.len() || self.sc.slots(out) as usize != item.len() {
+                    return false;
+                }
+                self.call_late_bound_free(&ins, out, free, &[(it, x.to_vec())], out, item)
+            }
+            TyKind::FnDef(def, fargs) if self.body.tys.args(fargs).is_empty() => {
+                let Some(l) = self.p.local_def(def.hash) else { return false };
+                let Callee::Sig(sig) = self.callee(l) else { return false };
+                let params = self.p.fn_info(l).params.clone();
+                let [pt] = params[..] else { return false };
+                if self.p.tys.flags(pt).contains_param() || self.sc.slots(pt) as usize != x.len() {
+                    return false;
+                }
+                self.call_sig(l, sig, &[(pt, x.to_vec())], bt, item)
+            }
+            // A `dyn Fn` behind references and boxes: the item's own type is
+            // the input's erased form (its slots give each slot's variance).
+            _ if let Some((ins, _)) = self.dyn_fn_sig(f) => {
+                let [it] = ins[..] else { return false };
+                let Some(at) = erased_lookup(&self.body.tys, it) else { return false };
+                if self.sc.slots(at) as usize != x.len() {
+                    return false;
+                }
+                self.call_dyn_fn(&[(f, fv.to_vec()), (at, x.to_vec())], bt, item)
+            }
+            // A reference to another callable calls what it points to.
+            TyKind::Ref(_, _, inner) => match fv.get(1..) {
+                Some(iv) => self.callable_out(inner, iv, x, bt, item),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     fn item_slots(&mut self, t: Ty, vars: &[u32]) -> Option<Vec<u32>> {
         use crate::ty::iter::IterKind as K;
         if self.body.tys.is_chars_ty(t) {
@@ -6211,6 +6324,14 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::Utf8Chunks => own.clone(),
             K::Utf8Chunk => return None,
             K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::VecDrain => args[0].clone(),
+            // A `map` with no closure: what `iter_items` reads (above B).
+            K::Map | K::FilterMap | K::MapWhile if !matches!(a.get(1).map(|&f| self.body.tys.kind(f)), Some(TyKind::Closure(..))) => {
+                let mut xs = Vec::new();
+                if !self.iter_items(t, vars, &mut xs) {
+                    return None;
+                }
+                xs.into_iter().next()?
+            }
             K::Map | K::FilterMap | K::MapWhile | K::TryCollect => args[2].clone(),
             K::Copied | K::Cloned => args[1].clone(),
             K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
@@ -6572,7 +6693,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::RecvIntoIter => match vars.get(..n0) {
+            K::VecIntoIter | K::ArrayIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::RecvIntoIter => match vars.get(..n0) {
                 Some(v) => {
                     out.push(v.to_vec());
                     true
@@ -6640,6 +6761,36 @@ impl<'b, 'p> Builder<'b, 'p> {
             // out after the inner iterator's) and its free arguments.
             K::Map | K::FilterMap | K::MapWhile => {
                 let (Some(&f), Some(&bt)) = (a.get(1), a.get(2)) else { return false };
+                // A fn pointer, a `&dyn Fn`, or a fn item: its output through
+                // its signature, for each item it takes (`callable_out`).
+                if !matches!(self.body.tys.kind(f), TyKind::Closure(..)) {
+                    let nf = self.sc.slots(f) as usize;
+                    let nb = self.sc.slots(bt) as usize;
+                    let Some(fv) = vars.get(n0..n0 + nf).map(<[u32]>::to_vec) else { return false };
+                    let mut xs = Vec::new();
+                    if !vars.get(..n0).is_some_and(|v| self.iter_items(a0, v, &mut xs)) {
+                        return false;
+                    }
+                    let mut items = Vec::with_capacity(xs.len());
+                    for x in xs {
+                        let item: Vec<u32> = (0..nb).map(|_| self.fresh()).collect();
+                        if !self.callable_out(f, &fv, &x, bt, &item) {
+                            // A fn pointer whose erased signature does not
+                            // pair (a library field type: `fn(&(K, V)) -> &K`
+                            // at `K = &str`) keeps its callers' rule. Any
+                            // other callable: the output may hold any region
+                            // of the item and of the callable.
+                            if matches!(self.body.tys.kind(f), TyKind::FnPtr(_)) {
+                                return false;
+                            }
+                            let srcs: Vec<u32> = x.iter().chain(&fv).copied().collect();
+                            self.flow_all(&srcs, &item);
+                        }
+                        items.push(item);
+                    }
+                    out.extend(items);
+                    return true;
+                }
                 let TyKind::Closure(def, cargs) = self.body.tys.kind(f) else { return false };
                 let nf = self.sc.slots(f) as usize;
                 let nb = self.sc.slots(bt) as usize;
@@ -6721,11 +6872,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            // The other W-STD-B kinds (array::IntoIter, repeat_n, Windows,
-            // CharIndices, Flatten, option::IntoIter): the conservative item
-            // rule.
-            K::ArrayIntoIter
-            | K::RepeatN
+            // The other W-STD-B kinds (repeat_n, Windows, CharIndices,
+            // Flatten, option::IntoIter): the conservative item rule.
+            K::RepeatN
             | K::Windows
             | K::Chunks
             | K::ChunksMut
