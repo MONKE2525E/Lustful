@@ -749,6 +749,35 @@ impl FnGen<'_, '_> {
         }
     }
 
+    /// `SyncSender::try_send` (TRIAGE T5): like `ChanSend`, with
+    /// the runtime's full/disconnected codes selecting the
+    /// `TrySendError` variant of the destination Result.
+    pub(super) fn chan_try_send(&mut self, args: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> String {
+        let (chan, _) = self.operand(&args[0], loc, post);
+        let (v, vt) = self.operand(&args[1], loc, post);
+        let et = match dest {
+            CTy::Result(_, e) => (**e).clone(),
+            _ => CTy::Unit,
+        };
+        let (t, vv, r) = (self.tmp(), self.tmp(), self.tmp());
+        let err = variant_field(self.p, dest, &t, 1, 0);
+        let full = variant_field(self.p, &et, &err, 0, 0);
+        let disc = variant_field(self.p, &et, &err, 1, 0);
+        let _ = writeln!(
+            self.out,
+            "    {} {vv} = {}; {} {t}; int {r} = lust_chan_try_send(*{}, &{vv}); if ({r} == 0) {{ {} }} else {{ {} if ({r} == 2) {{ {disc} = {vv}; {} }} else {{ {full} = {vv}; {} }} }}",
+            ctype(&vt),
+            v,
+            ctype(dest),
+            chan,
+            disc_set(self.p, dest, &t, 0),
+            disc_set(self.p, dest, &t, 1),
+            disc_set(self.p, &et, &err, 1),
+            disc_set(self.p, &et, &err, 0)
+        );
+        t
+    }
+
     /// `mpsc::channel()` or `sync_channel(cap)` into the C pair type
     /// `pair` (`(Sender<T>, Receiver<T>)`): one runtime channel that both
     /// ends point at, with `T`'s drop glue for values left queued.
@@ -1111,6 +1140,33 @@ impl FnGen<'_, '_> {
                 let guard = tys[1].clone();
                 let _ = writeln!(self.out, "    lust_cv_wait({}, &({})->st);", vals[0], vals[1]);
                 ok(self, guard, vals[1].clone())
+            }
+            S::CondvarWaitTimeout | S::CondvarWaitTimeoutMs => {
+                // The pair value: the guard back, plus the
+                // WaitTimeoutResult aggregate over the runtime's flag.
+                let guard = tys[1].clone();
+                let wtr = if op == S::CondvarWaitTimeoutMs {
+                    CTy::Bool
+                } else {
+                    self.p.tys.local_adt_of(crate::check::generics::wait_timeout_result_def()).map_or(CTy::Unit, CTy::Adt)
+                };
+                let pair = CTy::Tuple(vec![guard.clone(), wtr.clone()]);
+                collect_types(&pair, &mut self.sig_types);
+                let (tv, pv) = (self.tmp(), self.tmp());
+                let (secs, nanos) = if op == S::CondvarWaitTimeoutMs {
+                    (format!("({} / 1000)", vals[2]), format!("((uint32_t)({} % 1000) * 1000000u)", vals[2]))
+                } else if matches!(tys[2], CTy::Adt(_)) {
+                    (format!("({}).f0", vals[2]), format!("({}).f1", vals[2]))
+                } else {
+                    (format!("({}).secs", vals[2]), format!("({}).nanos", vals[2]))
+                };
+                let flag = format!("(uint8_t)lust_cv_wait_timeout({}, &({})->st, {secs}, {nanos})", vals[0], vals[1]);
+                // The deprecated ms form's bool is the inverse:
+                // true when the wait did not time out.
+                let f1 = if op == S::CondvarWaitTimeoutMs { format!("(uint8_t)!({flag})") } else { format!("({}){{ {flag} }}", ctype(&wtr)) };
+                let _ = writeln!(self.out, "    {} {pv}; {pv}.f0 = {}; {pv}.f1 = {f1};", ctype(&pair), vals[1]);
+                let _ = tv;
+                ok(self, pair, pv)
             }
             S::CondvarNotifyOne | S::CondvarNotifyAll => format!("(lust_cv_notify({}, {}), ((lust_Unit){{}}))", vals[0], u8::from(op == S::CondvarNotifyAll)),
             S::BarrierWait => format!("((uint8_t)lust_barrier_wait({}))", vals[0]),

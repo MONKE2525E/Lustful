@@ -665,6 +665,25 @@ int lust_chan_send(lust_Chan *c, const void *v) LUST_BODY({
     return 0;
 })
 
+/* try_send: 0 sent; 1 full (the value stays with the caller);
+   2 the receiver is gone (the value stays with the caller). A
+   rendezvous channel (cap 0) sends only into a waiting receiver
+   with nothing queued, as std's does. */
+int lust_chan_try_send(lust_Chan *c, const void *v) LUST_BODY({
+    lust_mutex_lock(&c->lock);
+    if (!c->rx_alive) { lust_mutex_unlock(&c->lock); return 2; }
+    if (c->cap == 0) {
+        if (c->rx_waiting == 0 || c->len > 0) { lust_mutex_unlock(&c->lock); return 1; }
+    } else if (c->cap > 0 && c->len >= (uint64_t)c->cap) {
+        lust_mutex_unlock(&c->lock);
+        return 1;
+    }
+    lust_chan_push(c, v);
+    lust_chan_changed(c);
+    lust_mutex_unlock(&c->lock);
+    return 0;
+})
+
 /* 0 received into out; 1 every sender is gone and nothing is queued.
    `block` 0 is try_recv: 1 means empty, 2 disconnected. */
 int lust_chan_recv(lust_Chan *c, void *out, int block) LUST_BODY({
@@ -730,6 +749,72 @@ void lust_cv_wait(uint32_t *cv, uint32_t *m) LUST_BODY({
 void lust_cv_notify(uint32_t *cv, int all) LUST_BODY({
     __atomic_add_fetch(cv, 1, 5);
     lust_futex_wake(cv, all ? 0x7fffffff : 1);
+})
+
+/* `Condvar::wait_timeout`: like lust_cv_wait, but 1 when the
+   duration elapsed with no notify seen (std's timed_out: true
+   only when the timeout is known to have elapsed). The deadline
+   is monotonic, as std's is on Linux; the futex wait takes the
+   remaining time (a relative timeout, CLOCK_MONOTONIC). */
+#if defined(__linux__)
+#if defined(__x86_64__)
+#define LUST_SYS_CLOCK_GETTIME 228
+#elif defined(__aarch64__)
+#define LUST_SYS_CLOCK_GETTIME 113
+#endif
+#endif
+
+static void lust_mono_now(long ts[2]) LUST_BODY({
+#ifdef LUST_SYS_CLOCK_GETTIME
+    syscall(LUST_SYS_CLOCK_GETTIME, 1 /* CLOCK_MONOTONIC */, ts);
+#else
+    ts[0] = 0;
+    ts[1] = 0;
+#endif
+})
+
+int lust_cv_wait_timeout(uint32_t *cv, uint32_t *m, uint64_t secs, uint32_t nanos) LUST_BODY({
+    long dl[2];
+    lust_mono_now(dl);
+    dl[0] += (long)secs;
+    dl[1] += (long)nanos;
+    if (dl[1] >= 1000000000L) {
+        dl[0] += 1;
+        dl[1] -= 1000000000L;
+    }
+    uint32_t s;
+    __atomic_load(cv, &s, 5);
+    lust_mutex_unlock(m);
+    int timed = 0;
+    for (;;) {
+        uint32_t cur;
+        __atomic_load(cv, &cur, 5);
+        if (cur != s) break;
+        long now[2];
+        lust_mono_now(now);
+        long rs = dl[0] - now[0];
+        long rn = dl[1] - now[1];
+        if (rn < 0) {
+            rs -= 1;
+            rn += 1000000000L;
+        }
+        if (rs < 0) {
+            timed = 1;
+            break;
+        }
+#ifdef LUST_SYS_FUTEX
+        {
+            long rel[2];
+            rel[0] = rs;
+            rel[1] = rn;
+            syscall(LUST_SYS_FUTEX, cv, 128 /* FUTEX_WAIT_PRIVATE */, s, rel, (void *)0, 0);
+        }
+#else
+        sched_yield();
+#endif
+    }
+    lust_mutex_lock(m);
+    return timed;
 })
 
 typedef struct lust_Barrier {

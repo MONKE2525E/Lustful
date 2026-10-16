@@ -3569,6 +3569,27 @@ pub fn collect_reuse(
                     )
                 }
 
+                // std: `enum TrySendError<T> { Full(T),
+                // Disconnected(T) }` (TRIAGE T5). Its Debug hides
+                // the value (`TrySendError::Full(..)`) and its
+                // Display is std's text: synthetic impls in
+                // generics.rs, glue in cgen/fmt.rs.
+                26 => {
+                    let t = p.tys.intern(TyKind::Param(ParamId(0)));
+                    let tuple = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Tuple, fields: vec![field("0", t)], disc, non_exhaustive: false };
+                    (
+                        generics::try_send_error_def(),
+                        vec![tuple("Full", 0), tuple("Disconnected", 1)],
+                        Derives { clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
+                    )
+                }
+                // std: `struct WaitTimeoutResult(bool)` with
+                // derived Debug (TRIAGE T5).
+                27 => (
+                    generics::wait_timeout_result_def(),
+                    vec![Variant { name, shape: VariantShape::Tuple, fields: vec![field("0", BOOL)], disc: 0, non_exhaustive: false }],
+                    Derives { debug: true, clone: true, copy: true, partial_eq: true, eq: true, hash: true, ..Derives::default() },
+                ),
                 // core: `struct NonZero<T>(T)` (TRIAGE T5). Debug
                 // and Display forward to the integer (synthetic
                 // impls in generics.rs, glue in cgen/fmt.rs), so
@@ -3600,7 +3621,7 @@ pub fn collect_reuse(
             p.adts[id.0 as usize] =
                 AdtDef { name, is_enum, variants, derives, span, repr: crate::ty::layout::Repr::default(), non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 {
+            if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 || usize::MAX - item_idx == 26 {
                 // `Bound<T>` and `NonZero<T>`: the generic synthetic
                 // std Adts. Give each its param and field table, as
                 // the field pass does for a user generic type.
@@ -3610,7 +3631,7 @@ pub fn collect_reuse(
                 // fast path; the perf gate measures those). Both
                 // flags, like `Cow`: mono's lang-enum fast path
                 // (user_generics false) makes no Adt instances.
-                if generics::ast_uses_bound(ast, interner) || generics::ast_uses_nonzero(ast, interner) {
+                if generics::ast_uses_bound(ast, interner) || generics::ast_uses_nonzero(ast, interner) || generics::ast_uses_try_send_error(ast, interner) {
                     p.gx.has_generics = true;
                     p.gx.user_generics = true;
                 }
@@ -3627,6 +3648,8 @@ pub fn collect_reuse(
                 let t = p.tys.intern(TyKind::Param(ParamId(0)));
                 if usize::MAX - item_idx == 12 {
                     p.regions.adt_fields.insert(def, vec![vec![t], vec![t], Vec::new()]);
+                } else if usize::MAX - item_idx == 26 {
+                    p.regions.adt_fields.insert(def, vec![vec![t], vec![t]]);
                 } else {
                     p.regions.adt_fields.insert(def, vec![vec![t]]);
                 }
@@ -8548,6 +8571,11 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             if let Some((a, b)) = tys.result_args(t) {
                 return glue_debug(p, tys, a, seen) && glue_debug(p, tys, b, seen);
             }
+            // `TrySendError`'s Debug hides the value, so it
+            // needs no Debug on T (TRIAGE T5).
+            if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::try_send_error_def()) {
+                return true;
+            }
             match tys.local_adt(t) {
                 Some(a) => {
                     (p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
@@ -8610,6 +8638,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::infallible_def()
                         // `NonZero<T>` displays its integer (TRIAGE T5).
                         || d == generics::nonzero_def()
+                        || d == generics::try_send_error_def()
                 })
                 || tys.builtin_of(t) == Some(BuiltinTy::AccessError)
                 || (tys.local_adt(t).is_some() && crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.display))

@@ -841,6 +841,8 @@ pub enum Builtin {
     NonZeroNew,
     /// `NonZero::get`: the wrapped integer (field 0).
     NonZeroGet,
+    /// `WaitTimeoutResult::timed_out`: its flag (field 0).
+    WaitTimedOut,
     /// `Range::is_empty` and the range kinds' `contains`, plus
     /// `RangeInclusive::start` and `end`: expanded in lower/iter.rs.
     RangeIsEmpty,
@@ -892,7 +894,7 @@ pub(crate) const PRIM_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::StringIntoBytes, Builtin::StringIsEmpty, Builtin::StringLen, Builtin::SwapBytes, Builtin::ToString, Builtin::TrailingOnes,
     Builtin::TrailingZeros, Builtin::UnboundedShl, Builtin::UnboundedShr, Builtin::UnsignedAbs, Builtin::WrappingAbs, Builtin::WrappingAdd,
     Builtin::WrappingDiv, Builtin::WrappingMul, Builtin::WrappingNeg, Builtin::WrappingPow, Builtin::WrappingRem, Builtin::WrappingShl,
-    Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet,
+    Builtin::WrappingShr, Builtin::WrappingSub, Builtin::PrimFromCast, Builtin::NonZeroGet, Builtin::Sync(crate::check::sync::SyncOp::PoisonIntoInner), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetRef), Builtin::Sync(crate::check::sync::SyncOp::PoisonGetMut), Builtin::Sync(crate::check::sync::SyncOp::ArcWeakUpgrade),
 ];
 
 /// The `PRIM_VALUE_BUILTINS` index of a builtin, if listed.
@@ -3384,6 +3386,42 @@ impl<'p> Ctx<'p> {
         // type is the one extra; its legality is checked where the
         // call is checked (and deferred for an item value, like
         // `String::from`).
+        // Sync builtin methods by path (`PoisonError::into_inner`,
+        // `Weak::upgrade`; TRIAGE T5): the receiver forms of
+        // check/sync.rs's method table.
+        if let Some(k) = crate::ty::sync::sync_kind(&self.tys, self_ty) {
+            use crate::check::sync::SyncOp;
+            use crate::ty::sync::SyncTy;
+            let elem = self.tys.adt_first_ty_arg(self_ty).unwrap_or(ERROR);
+            let n = self.name(name);
+            let sig = match (k, n) {
+                (SyncTy::PoisonError, "into_inner") => Some((SyncOp::PoisonIntoInner, Autoref::None, elem)),
+                (SyncTy::PoisonError, "get_ref") => Some((SyncOp::PoisonGetRef, Autoref::Ref, self.tys.mk_ref(false, elem))),
+                (SyncTy::PoisonError, "get_mut") => Some((SyncOp::PoisonGetMut, Autoref::RefMut, self.tys.mk_ref(true, elem))),
+                (SyncTy::ArcWeak, "upgrade") => {
+                    let arc = crate::ty::sync::sync_ty(&mut self.tys, SyncTy::Arc, &[elem]);
+                    Some((SyncOp::ArcWeakUpgrade, Autoref::Ref, self.tys.mk_option(arc)))
+                }
+                _ => None,
+            };
+            if let Some((op, autoref, ret)) = sig {
+                let recv = match autoref {
+                    Autoref::None => self_ty,
+                    Autoref::Ref => self.tys.mk_ref(false, self_ty),
+                    Autoref::RefMut => self.tys.mk_ref(true, self_ty),
+                    Autoref::SliceRef | Autoref::SliceRefMut => return None,
+                };
+                let extras = if extra.is_empty() {
+                    let mut out = Vec::new();
+                    self.collect_infer_tys(self_ty, &mut out);
+                    out
+                } else {
+                    extra.to_vec()
+                };
+                return Some((Builtin::Sync(op), vec![recv], ret, extras));
+            }
+            return None;
+        }
         // `NonZero::get` as a value (`map_or(1, NonZero::get)`,
         // TRIAGE T5): the wrapped integer, by value.
         if let Some(inner) = generics::nonzero_elem(&self.tys, self_ty) {
@@ -13897,6 +13935,10 @@ impl<'p> Ctx<'p> {
         }
         // The inherent methods of `core::num::NonZero<T>` (same).
         if let Some(ret) = self.nonzero_adt_method(e, recv, base, derefs, name, name_span, args) {
+            return ret;
+        }
+        // `WaitTimeoutResult::timed_out` (same).
+        if let Some(ret) = self.wait_timeout_result_method(e, recv, base, derefs, name, name_span, args) {
             return ret;
         }
         // The inherent methods of `alloc::borrow::Cow` (W-STD-B).

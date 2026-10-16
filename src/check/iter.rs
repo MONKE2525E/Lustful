@@ -474,6 +474,30 @@ impl<'p> Ctx<'p> {
         Some(ret)
     }
 
+    /// `WaitTimeoutResult::timed_out`: its flag (TRIAGE T5).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn wait_timeout_result_method(
+        &mut self,
+        e: ExprId,
+        recv: ExprId,
+        base: Ty,
+        derefs: u8,
+        name: Sym,
+        name_span: Span,
+        args: &[ExprId],
+    ) -> Option<Ty> {
+        let _ = recv;
+        if self.tys.adt_parts(self.resolve(base)).map(|(d, _)| d) != Some(generics::wait_timeout_result_def()) {
+            return None;
+        }
+        if self.name(name) != "timed_out" {
+            return None;
+        }
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::WaitTimedOut, derefs, autoref: Autoref::Ref });
+        self.check_args(&[], args, name_span);
+        Some(BOOL)
+    }
+
     /// The inherent methods of `core::num::NonZero<T>` lust takes:
     /// `get` (the wrapped integer). `new` is an associated fn
     /// (check's `resolve_assoc`); the rest of std's arithmetic

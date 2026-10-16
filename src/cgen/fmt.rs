@@ -166,6 +166,13 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut dy
         let inner = cty(&p.tys, p.adt(*a).variants[0].fields[0].ty);
         return format!("  return {};\n", fmt_expr(&inner, FmtKind::Debug, "f", "(&p->f0)", need));
     }
+    // `TrySendError`'s Debug hides the value: `TrySendError::Full(..)`.
+    if let CTy::Adt(a) = t
+        && p.def_of_adt(*a) == crate::check::generics::try_send_error_def()
+    {
+        let disc = disc_call(p, t, "p");
+        return format!("  return lust_f_write_str(f, ({disc}) ? {} : {});\n", lit("TrySendError::Disconnected(..)"), lit("TrySendError::Full(..)"));
+    }
     // `Cow<B>` prints the `B` it derefs to, with no variant name.
     if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {
         return format!("  {decl}\n  return {};\n", fmt_expr(&rb, FmtKind::Debug, "f", "(&v_)", need));
@@ -322,6 +329,13 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &[u32], need: &mut 
     {
         let inner = cty(&p.tys, p.adt(*a).variants[0].fields[0].ty);
         return format!("  return {};\n", fmt_expr(&inner, FmtKind::Display, "f", "(&p->f0)", need));
+    }
+    // `TrySendError`'s Display is std's per-variant text.
+    if let CTy::Adt(a) = t
+        && p.def_of_adt(*a) == crate::check::generics::try_send_error_def()
+    {
+        let disc = disc_call(p, t, "p");
+        return format!("  return lust_f_pad(f, ({disc}) ? {} : {});\n", lit("sending on a closed channel"), lit("sending on a full channel"));
     }
     // `Cow<B>` displays the `B` it derefs to (W-STD-B).
     if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {

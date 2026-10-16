@@ -2735,6 +2735,7 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    if ({len} == {n}) {{ {ok_assign} {ok_d} }} else {{ {err_f} = {te}; {err_d} }}");
                 t
             }
+            CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::ChanTrySend)) => self.chan_try_send(args, dest_cty, loc, post),
             CallTarget::Builtin(b) => match self.hash_builtin(b, args, dest_cty, loc, post) {
                 Some(v) => v,
                 None => match self.split_builtin(b, args, dest_cty, loc, post) {
@@ -3941,6 +3942,7 @@ impl FnGen<'_, '_> {
             B::PrimFromCast => unreachable!("lowered as a cast (lower.rs)"),
             B::NonZeroNew => unreachable!("lowered as an aggregate (lower.rs)"),
             B::NonZeroGet => format!("(({0}).f0)", vals[0]),
+            B::WaitTimedOut => format!("((*{0}).f0)", vals[0]),
             B::EntryOrInsertWith | B::EntryOrInsertWithKey | B::EntryAndModify => unreachable!("expanded with its closure (lower/iter.rs)"),
             B::MemDrop => {
                 // The operand was moved into the call, so its own

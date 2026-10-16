@@ -1627,6 +1627,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "core/str/Utf8Error",
     "std/str/Utf8Error",
     "std/sync/mpsc/RecvError",
+    "std/sync/mpsc/TrySendError",
+    "std/sync/WaitTimeoutResult",
     "std/sync/mpsc/TryRecvError",
     "alloc/string/FromUtf8Error",
     "std/string/FromUtf8Error",

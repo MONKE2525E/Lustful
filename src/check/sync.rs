@@ -133,6 +133,14 @@ pub enum SyncOp {
     ChanRecv,
     /// `Receiver::try_recv`.
     ChanTryRecv,
+    /// `SyncSender::try_send` (TRIAGE T5).
+    ChanTrySend,
+    /// `Condvar::wait_timeout` (TRIAGE T5).
+    CondvarWaitTimeout,
+    /// `Condvar::wait_timeout_ms` (deprecated in std, same form).
+    CondvarWaitTimeoutMs,
+    /// `WaitTimeoutResult::timed_out`.
+    WaitTimedOut,
     /// `Condvar::new()`, `Barrier::new(n)`, `OnceLock::new()` (const fns).
     SyncNew(SyncTy),
     CondvarWait,
@@ -172,7 +180,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 107] = [
+    pub const ALL: [SyncOp; 111] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -248,6 +256,10 @@ impl SyncOp {
         SyncOp::ChanSend,
         SyncOp::ChanRecv,
         SyncOp::ChanTryRecv,
+        SyncOp::ChanTrySend,
+        SyncOp::CondvarWaitTimeout,
+        SyncOp::CondvarWaitTimeoutMs,
+        SyncOp::WaitTimedOut,
         SyncOp::SyncNew(SyncTy::Condvar),
         SyncOp::CondvarWait,
         SyncOp::CondvarWaitWhile,
@@ -364,6 +376,10 @@ impl SyncOp {
             SyncOp::ChanSend => (&["std::sync::mpsc::Sender<T>", "std::sync::mpsc::SyncSender<T>"], &["send"], m),
             SyncOp::ChanRecv => (&["std::sync::mpsc::Receiver<T>"], &["recv"], m),
             SyncOp::ChanTryRecv => (&["std::sync::mpsc::Receiver<T>"], &["try_recv"], m),
+            SyncOp::ChanTrySend => (&["std::sync::mpsc::SyncSender<T>"], &["try_send"], m),
+            SyncOp::CondvarWaitTimeout => (&["std::sync::Condvar"], &["wait_timeout"], m),
+            SyncOp::CondvarWaitTimeoutMs => (&["std::sync::Condvar"], &["wait_timeout_ms"], m),
+            SyncOp::WaitTimedOut => (&["std::sync::WaitTimeoutResult"], &["timed_out"], m),
             SyncOp::SyncNew(_) => (&["std::sync::Condvar", "std::sync::Barrier", "std::sync::OnceLock<T>"], &["new"], a),
             SyncOp::CondvarWait => (&["std::sync::Condvar"], &["wait"], m),
             SyncOp::CondvarWaitWhile => (&["std::sync::Condvar"], &["wait_while"], m),
@@ -525,7 +541,13 @@ impl<'p> Ctx<'p> {
             (SyncTy::Arc, _, "unwrap_or_clone") => SyncOp::ArcUnwrapOrClone,
             (SyncTy::ArcWeak, _, "new") => SyncOp::ArcWeakNew,
             // `sync::Weak`'s methods called by path (`Weak::upgrade(&w)`).
-            (SyncTy::ArcWeak, _, "upgrade") => SyncOp::ArcWeakUpgrade,
+            (SyncTy::ArcWeak, _, "upgrade") => {
+                // By path and as a value (`.and_then(Weak::upgrade)`,
+                // TRIAGE T5): a PrimAssoc over the SyncOp.
+                let elem = self.new_var(false);
+                let self_ty = sync_ty(&mut self.tys, SyncTy::ArcWeak, &[elem]);
+                return Some(Some(Res::PrimAssoc { b: Builtin::Sync(SyncOp::ArcWeakUpgrade), self_ty, name: item }));
+            }
             (SyncTy::ArcWeak, _, "strong_count") => SyncOp::ArcWeakStrongCount,
             (SyncTy::ArcWeak, _, "weak_count") => SyncOp::ArcWeakWeakCount,
             (SyncTy::ArcWeak, _, "ptr_eq") => SyncOp::ArcWeakPtrEq,
@@ -541,6 +563,19 @@ impl<'p> Ctx<'p> {
             (SyncTy::Duration, _, "from_micros") => SyncOp::DurFrom(2),
             (SyncTy::Duration, _, "from_nanos") => SyncOp::DurFrom(3),
             (SyncTy::PoisonError, _, "new") => SyncOp::PoisonNew,
+            // `PoisonError::into_inner` and kin by path, as a
+            // value too (`unwrap_or_else(PoisonError::into_inner)`,
+            // TRIAGE T5): a PrimAssoc over the method's SyncOp.
+            (SyncTy::PoisonError, _, "into_inner" | "get_ref" | "get_mut") => {
+                let op = match i.as_str() {
+                    "into_inner" => SyncOp::PoisonIntoInner,
+                    "get_ref" => SyncOp::PoisonGetRef,
+                    _ => SyncOp::PoisonGetMut,
+                };
+                let elem = self.new_var(false);
+                let self_ty = sync_ty(&mut self.tys, SyncTy::PoisonError, &[elem]);
+                return Some(Some(Res::PrimAssoc { b: Builtin::Sync(op), self_ty, name: item }));
+            }
             _ => {
                 self.err(
                     "L0640",
@@ -552,6 +587,19 @@ impl<'p> Ctx<'p> {
             }
         };
         Some(Some(Res::Builtin(Builtin::Sync(op))))
+    }
+
+    /// The `Duration` type a sync call takes: the std source
+    /// `core::time::Duration` Adt when spliced, else the builtin.
+    fn duration_ty(&mut self) -> Ty {
+        let p = self.p;
+        let src = (0..p.adts.len() as u32)
+            .map(AdtId)
+            .find(|&a| p.is_std_adt(a) && p.display_path(p.adt(a).name) == "core::time::Duration");
+        match src {
+            Some(a) => self.tys.adt_ty(a),
+            None => sync_ty(&mut self.tys, SyncTy::Duration, &[]),
+        }
     }
 
     /// Parameter and return types of a `Builtin::Sync` associated or free
@@ -931,7 +979,15 @@ impl<'p> Ctx<'p> {
                     };
                     (SyncOp::RecvMakeIter(u), autoref, crate::ty::iter::mk_iter(&mut self.tys, kind, &[el]))
                 }
-                (_, "try_send" | "send_timeout" | "recv_timeout" | "recv_deadline") => {
+                (SyncTy::SyncSender, "try_send") => {
+                    let te = generics::try_send_error_ty(&mut self.tys, el);
+                    let r = self.tys.mk_result(UNIT, te);
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::ChanTrySend), derefs, autoref: Autoref::Ref });
+                    self.check_args(&[el], args, span);
+                    return Some(r);
+                }
+                (_, "send_timeout" | "recv_timeout" | "recv_deadline") => {
                     self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use `send`, `recv`, or `try_recv`.");
                     return Some(self.iter_bail(args));
                 }
@@ -954,6 +1010,29 @@ impl<'p> Ctx<'p> {
                         (SyncOp::CondvarWaitWhile, Autoref::Ref, vec![g, f], ret)
                     }
                 }
+                // `wait_timeout(guard, dur) -> LockResult<(MutexGuard<T>,
+                // WaitTimeoutResult)>` (TRIAGE T5); the ms form takes u64.
+                (SyncTy::Condvar, "wait_timeout" | "wait_timeout_ms") => {
+                    let t = self.new_var(false);
+                    let g = sync_ty(&mut self.tys, SyncTy::MutexGuard, &[t]);
+                    let pair = {
+                        let wtr = generics::wait_timeout_result_ty(&mut self.tys);
+                        let ts = self.tys.intern_tys(&[g, wtr]);
+                        self.tys.intern(TyKind::Tuple(ts))
+                    };
+                    if n == "wait_timeout" {
+                        let ret = self.lock_result(pair);
+                        let d = self.duration_ty();
+                        (SyncOp::CondvarWaitTimeout, Autoref::Ref, vec![g, d], ret)
+                    } else {
+                        // The deprecated ms form pairs the guard
+                        // with a plain bool, not a WaitTimeoutResult.
+                        let ts = self.tys.intern_tys(&[g, BOOL]);
+                        let pair = self.tys.intern(TyKind::Tuple(ts));
+                        let ret = self.lock_result(pair);
+                        (SyncOp::CondvarWaitTimeoutMs, Autoref::Ref, vec![g, int(IntTy::U64)], ret)
+                    }
+                }
                 (SyncTy::Condvar, "notify_one") => (SyncOp::CondvarNotifyOne, Autoref::Ref, vec![], UNIT),
                 (SyncTy::Condvar, "notify_all") => (SyncOp::CondvarNotifyAll, Autoref::Ref, vec![], UNIT),
                 (SyncTy::Barrier, "wait") => (SyncOp::BarrierWait, Autoref::Ref, vec![], sync_ty(&mut self.tys, SyncTy::BarrierWaitResult, &[])),
@@ -973,7 +1052,7 @@ impl<'p> Ctx<'p> {
                 }
                 (SyncTy::OnceLock, "into_inner") => (SyncOp::OnceIntoInner, Autoref::None, vec![], self.tys.mk_option(el)),
                 (SyncTy::OnceLock, "take") => (SyncOp::OnceTake, Autoref::RefMut, vec![], self.tys.mk_option(el)),
-                (_, "wait_timeout" | "wait_timeout_while" | "wait_timeout_ms" | "get_mut_or_init" | "get_or_try_init" | "try_insert" | "wait_with" | "get_or_init_with") => {
+                (_, "wait_timeout_while" | "get_mut_or_init" | "get_or_try_init" | "try_insert" | "wait_with" | "get_or_init_with") => {
                     self.err("L0640", span, format!("`{}::{n}` is not implemented in lust yet", k.name()), "Use the methods without timeouts.");
                     return Some(self.iter_bail(args));
                 }

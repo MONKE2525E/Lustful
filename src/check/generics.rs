@@ -864,6 +864,28 @@ pub fn nonzero_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
     (def == nonzero_def()).then(|| tys.adt_first_ty_arg(t)).flatten()
 }
 
+/// The def of `std::sync::mpsc::TrySendError<T>` (TRIAGE T5):
+/// a synthetic generic enum Adt like `Bound`.
+pub fn try_send_error_def() -> DefId {
+    std_adt_table()[26].2
+}
+
+/// The `std::sync::mpsc::TrySendError<T>` type.
+pub fn try_send_error_ty(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    tys.mk_adt(try_send_error_def(), &[GenericArg::Ty(t)])
+}
+
+/// The def of `std::sync::WaitTimeoutResult` (TRIAGE T5): a
+/// synthetic tuple struct over its timed-out flag.
+pub fn wait_timeout_result_def() -> DefId {
+    std_adt_table()[27].2
+}
+
+/// The `std::sync::WaitTimeoutResult` type.
+pub fn wait_timeout_result_ty(tys: &mut impl TyIntern) -> Ty {
+    tys.intern(TyKind::Adt(wait_timeout_result_def(), EMPTY_ARGS))
+}
+
 /// The def of `core::ops::Bound<T>`, a synthetic generic enum Adt:
 /// `Included(T)`, `Excluded(T)`, `Unbounded`, in std's order.
 pub fn bound_def() -> DefId {
@@ -887,14 +909,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 26] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 28] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 26] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 26]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 28] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 28]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -924,6 +946,8 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 26] {
             (23, "CharErrorKind", adt(&["core", "char"], "CharErrorKind"), true),
             (24, "TryFromSliceError", adt(&["core", "array"], "TryFromSliceError"), false),
             (25, "NonZero", adt(&["core", "num"], "NonZero"), false),
+            (26, "TrySendError", adt(&["std", "sync", "mpsc"], "TrySendError"), true),
+            (27, "WaitTimeoutResult", adt(&["std", "sync"], "WaitTimeoutResult"), false),
         ]
     })
 }
@@ -932,7 +956,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 26] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -967,6 +991,8 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("any", "TypeId", type_id_def()),
         ("ops", "Bound", bound_def()),
         ("num", "NonZero", nonzero_def()),
+        ("mpsc", "TrySendError", try_send_error_def()),
+        ("sync", "WaitTimeoutResult", wait_timeout_result_def()),
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
         ("cell", "BorrowMutError", borrow_mut_error_def()),
@@ -3279,6 +3305,19 @@ pub(crate) fn resolve_path_ty(
                     return Err(Diag::new("L0110", span, "`Bound` takes one type argument", "Write `Bound<&T>`, for example."));
                 }
                 return Ok(tys.mk_adt(bound_def(), &args));
+            }
+            // `std::sync::mpsc::TrySendError<T>` (TRIAGE T5).
+            if path.len() == 4 && path[1] == "sync" && path[2] == "mpsc" && path[3] == "TrySendError" {
+                let seg = segs.last().unwrap();
+                let GenericArgs::Angle(a) = &seg.args else {
+                    return Err(Diag::new("L0110", span, "`TrySendError` takes one type argument", "Write `TrySendError<T>`."));
+                };
+                let args: Vec<GenericArg> =
+                    resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, "TrySendError")?.into_iter().filter(|g| g.as_ty().is_some()).collect();
+                if args.len() != 1 {
+                    return Err(Diag::new("L0110", span, "`TrySendError` takes one type argument", "Write `TrySendError<T>`."));
+                }
+                return Ok(tys.mk_adt(try_send_error_def(), &args));
             }
             // `core::num::NonZero<T>` and its aliases
             // (`NonZeroU32` and kin, TRIAGE T5): one integer
@@ -7671,6 +7710,14 @@ pub fn add_synthetic_impls(p: &mut Program) {
         g1.predicates = pred_on_p0(p, lang.display);
         insert_synthetic(p, &mut ordinal, lang.display, nz_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
     }
+    // `TrySendError<T>` (TRIAGE T5): Display is std's text, with
+    // no bound on T (glue in cgen/fmt.rs). Its Debug hides the
+    // value, also with no bound (collect's glue_debug list).
+    {
+        let tse_p0 = try_send_error_ty(&mut p.tys, p0);
+        insert_synthetic(p, &mut ordinal, lang.display, tse_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.debug, tse_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
     // Rc<T>: Clone needs no bound on T (it bumps the count);
     // the rest follow the pointee like Box, with Deref only.
     {
@@ -10113,6 +10160,25 @@ pub fn ast_uses_nonzero(ast: &Ast, interner: &Interner) -> bool {
     };
     ast.exprs.iter().any(|e| match e {
         ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "get" | "available_parallelism"),
+        ast::Expr::Path(segs) => named(segs),
+        ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.tys.iter().any(|t| match t {
+        TyExpr::Path(segs) => named(segs),
+        TyExpr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
+        _ => false,
+    }) || ast.pats.iter().any(|p| match p {
+        ast::Pat::Path(segs) | ast::Pat::TupleStruct { path: segs, .. } | ast::Pat::Struct { path: segs, .. } => named(segs),
+        _ => false,
+    })
+}
+
+pub fn ast_uses_try_send_error(ast: &Ast, interner: &Interner) -> bool {
+    let named = |segs: &[ast::PathSeg]| {
+        segs.iter().any(|s| matches!(interner.get(s.name), "TrySendError" | "try_send"))
+    };
+    ast.exprs.iter().any(|e| match e {
+        ast::Expr::MethodCall { name, .. } => matches!(interner.get(*name), "try_send"),
         ast::Expr::Path(segs) => named(segs),
         ast::Expr::QPath { trait_path, segs, .. } => named(trait_path) || named(segs),
         _ => false,
