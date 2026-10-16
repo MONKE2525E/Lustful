@@ -87,7 +87,7 @@ pub const STD_MODULES: &[StdModule] = &[
         krate: ShippedCrate::Std,
         paths: &[("std", "sync")],
         full: false,
-        triggers: &["LazyLock"],
+        triggers: &["LazyLock", "Once"],
     },
     StdModule {
         name: "__lust_std_panic",

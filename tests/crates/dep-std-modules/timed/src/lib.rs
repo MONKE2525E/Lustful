@@ -2,8 +2,10 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::net::Ipv4Addr;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static READY: Once = Once::new();
 
 static TABLE: LazyLock<BTreeMap<u32, &'static str>> = LazyLock::new(|| BTreeMap::from([(2, "two"), (1, "one")]));
 
@@ -23,6 +25,8 @@ pub fn job() -> Job<u8> {
 
 impl<T> Job<T> {
     pub fn report(&self) -> String {
+        READY.call_once(|| println!("ready"));
+        READY.call_once(|| println!("again"));
         let left = self.deadline.saturating_duration_since(Instant::now());
         let names: Vec<&str> = TABLE.values().copied().collect();
         let after_epoch = SystemTime::now().duration_since(UNIX_EPOCH).is_ok();

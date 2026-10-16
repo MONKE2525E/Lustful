@@ -1,8 +1,9 @@
 # A source dependency that uses std types lust ships as source modules
-# (src/stdmods.rs: std::time, collections, marker, sync, cell, net,
-# error), while the root names none of them. The std splice lives in
-# the root's file 0 and dependencies resolve first, so before the fix
-# the dependency saw no std modules: L0102 `unknown type Instant`.
+# (src/stdmods.rs: std::time, collections, marker, sync with LazyLock
+# and Once, cell, net, error), while the root names none of them. The
+# std splice lives in the root's file 0 and dependencies resolve first,
+# so before the fix the dependency saw no std modules: L0102 `unknown
+# type Instant`.
 [package]
 name = "dep-std-modules"
 version = "0.1.0"

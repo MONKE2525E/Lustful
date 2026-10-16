@@ -1,4 +1,4 @@
-// `std::sync` overlay (docs/ARCH.md section 3.1; W-STD-C): `LazyLock`.
+// `std::sync` overlay (docs/ARCH.md section 3.1; W-STD-C): `LazyLock`, `Once`.
 // `OnceLock`, `Arc`, `Mutex`, and the other `sync` items stay compiler-
 // known (W-THREADS, thread-safe); `std::sync::X` walks into this module
 // only for the names it defines (`STD_MODULES` in src/stdmods.rs).
@@ -77,5 +77,44 @@ impl<T: core::fmt::Debug, F> core::fmt::Debug for LazyLock<T, F> {
             None => d.field(&Uninit),
         };
         d.finish()
+    }
+}
+
+/// A one-time initialization guard, adapted from rust-lang/rust 1.99
+/// `std/src/sync/once.rs`. The run happens inside W-THREADS's
+/// `OnceLock<()>`, so a second caller blocks until the first run ends.
+/// A run that panics leaves the lock empty and `poisoned` set: the next
+/// `call_once` runs the closure below again, which panics as std's
+/// poisoned `Once` does. (`call_once_force` and `OnceState` have no lust
+/// form, so a program that names them does not compile.)
+pub struct Once {
+    done: std::sync::OnceLock<()>,
+    poisoned: std::sync::atomic::AtomicBool,
+}
+
+impl Once {
+    pub const fn new() -> Once {
+        Once { done: std::sync::OnceLock::new(), poisoned: std::sync::atomic::AtomicBool::new(false) }
+    }
+
+    pub fn call_once<F: FnOnce()>(&self, f: F) {
+        self.done.get_or_init(|| {
+            if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+                panic!("Once instance has previously been poisoned");
+            }
+            self.poisoned.store(true, std::sync::atomic::Ordering::Release);
+            f();
+            self.poisoned.store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.done.get().is_some()
+    }
+}
+
+impl core::fmt::Debug for Once {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Once").finish_non_exhaustive()
     }
 }
