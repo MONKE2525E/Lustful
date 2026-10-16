@@ -1180,9 +1180,13 @@ pub fn add_sync_impls(p: &mut crate::check::collect::Program, ordinal: &mut u32,
     for tr in [lang.as_ref, lang.borrow] {
         insert_synthetic(p, ordinal, tr, arc, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
-    for tr in [lang.clone, lang.debug, lang.default] {
+    for tr in [lang.clone, lang.debug] {
         insert_synthetic(p, ordinal, tr, weak, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
+    // `impl<T> Default for Weak<T>`: `T: Sized` (`Weak<dyn Fn()>` has
+    // no default; R26 sweep).
+    let g = bound(p, lang.sized);
+    insert_synthetic(p, ordinal, lang.default, weak, &[], g, Vec::new(), Synthetic::Lang, false, span);
     // `Mutex<T>` and `RwLock<T>`: Debug and Default through `T`,
     // `From<T>`. Their guards: `Deref<Target = T>` (and `DerefMut` but
     // for the read guard), Debug and Display through `T`. `PoisonError`

@@ -7812,6 +7812,13 @@ pub fn add_synthetic_impls(p: &mut Program) {
             false,
             span,
         );
+        // rc::Weak<T>: Debug (prints `(Weak)`) and Clone with no bound
+        // on T, as in alloc (`OnceCell<S>: Debug` with a `Weak` field
+        // in `S`, R26).
+        let weak_p0 = p.tys.mk_builtin1(|d| d.weak, p0);
+        for tr in [lang.debug, lang.clone] {
+            insert_synthetic(p, &mut ordinal, tr, weak_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
     }
     // From<T> for T, and Into through From.
     insert_synthetic(p, &mut ordinal, lang.from, p0, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
