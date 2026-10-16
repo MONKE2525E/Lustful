@@ -374,8 +374,8 @@ pub(crate) fn reveal_again(p: &mut Program, f: LocalDefId, old_ret: crate::ty::T
 /// A test hook (`LUST_SIGDELTA_SELFTEST=1`, or `v` to print counts,
 /// timing, and the refusal census, also to the file `LUST_SIGDELTA_CENSUS`
 /// names): after a clean collect, redoes the
-/// signature of every plain or template free fn and inherent method on the
-/// same Ast (`redo_sig`). The digest must stay the same, no diagnostic may
+/// signature of every plain or template free fn, inherent method, and
+/// trait impl method the delta takes on the same Ast (`redo_sig`). The digest must stay the same, no diagnostic may
 /// appear, and a plain fn's `impl Trait` return must reveal the same hidden
 /// type. A failure appends one line to the file `LUST_SIGDELTA_LOG` names
 /// (a daemon answers a panicked request again, so sweeps read the log),
@@ -399,14 +399,16 @@ pub fn self_test_if_asked(p: &mut Program) {
     for i in 0..p.fns.len() {
         let f = LocalDefId(i as u32);
         let inherent = matches!(p.fns[i].loc, FnLoc::Impl(..)) && p.gx.inherent_self_pats.contains_key(&f);
+        let rpit = p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)));
+        // A trait impl method the delta takes (`generics::delta_impl_trait`).
+        let trait_impl = loc_is_trait_impl(p, p.fns[i].loc) && !rpit && generics::delta_impl_trait(p, f).is_some();
         let class = p.gx.fn_class[i];
         if !matches!(class, FnClass::Plain | FnClass::Template)
             || p.is_lang_method(f)
-            || !(matches!(p.fns[i].loc, FnLoc::Item(_)) || inherent)
+            || !(matches!(p.fns[i].loc, FnLoc::Item(_)) || inherent || trait_impl)
         {
             continue;
         }
-        let rpit = p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)));
         let old_ret = p.fns[i].ret;
         let mut errs = Vec::new();
         let t0 = std::time::Instant::now();
