@@ -1175,7 +1175,7 @@ fn slot_update(
 ) -> Result<(Vec<usize>, Vec<usize>, bool), String> {
     let fn_count = fn_at.len();
     front.fn_loc = fn_locations(&front.ast);
-    let had_env = front.env_hash.is_some();
+    let had_env = std::mem::take(&mut front.walk_after_reject) || front.env_hash.is_some();
     // Cached output stays reusable in full mode when every Adt and
     // static of the last parse keeps its session-local index in
     // this parse (pure additions append at the end of the session
@@ -2245,6 +2245,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if front.resolved_crate && !wants_resolver {
         front.ast = Arc::default();
         front.env_hash = None;
+        front.walk_after_reject = false;
         front.walk_pending.clear();
         front.const_fn_pending = false;
         front.prev_adt_ids.clear();
@@ -3084,6 +3085,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // does a body patch's: its items are the last full resolve's,
             // and only a body moved (a const fn body that fails const
             // evaluation, say); the next request collects again.
+            // The per-slot caches still match this request's slot update
+            // (bodies it changed lost their passing mark there), so the
+            // next slot update keeps them and walks every passing body
+            // (`Front::walk_after_reject`) instead of clearing them.
             // But this request's dirty state never reached the bodies:
             // read-set walk candidates kept their passing mark for a walk
             // that never ran (a body that calls a fn whose bound changed),
@@ -3098,11 +3103,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             caches.gen_reuse.forget_failed_gate();
             if caches.gen_reuse.template_errors != ds.len() && visits.path != "patch" {
                 front.env_hash = None;
+                front.walk_after_reject = true;
             }
-            // Its static ids are unknown, and generic reuse may hold
-            // entries made under them: the next full resolve drops it.
+            // This collect's static ids are unknown, so the generic reuse
+            // entries it stored or replayed go. The rest were made under
+            // the last program's static ids, which stay the reference.
             if nested_statics {
-                front.prev_static_defs = None;
+                let env = caches.gen_reuse.env;
+                caches.gen_reuse.drop_env(env);
             }
             if super::item_oracle::on() {
                 let (build, tables) = (req.cmd == Cmd::Build, resolved_tables.as_ref());

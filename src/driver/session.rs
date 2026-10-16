@@ -74,6 +74,13 @@ pub(crate) struct Front {
     /// every passing body is a read-set candidate, so the users of the
     /// opaque type check again. Cleared by the request that collects.
     pub(crate) rpit_edit: bool,
+    /// Set by a full resolve whose collect failed: its slot update left the
+    /// per-slot caches consistent (changed bodies lost their passing mark),
+    /// so the next slot update keeps them in full mode and the read-set
+    /// walk checks every passing body, instead of a full rebuild. That
+    /// also keeps the const fn compare and generic reuse. Cleared by the
+    /// next slot update and by anything that resets the front.
+    pub(crate) walk_after_reject: bool,
     /// Slots of read-set walk candidates that a failed collect left
     /// unwalked: they kept their passing mark, but their stored reads may
     /// be stale. The next request adds the ones still passing to its walk
@@ -385,6 +392,7 @@ impl Session {
                 prev_static_defs: None,
                 revalue_consts: false,
                 rpit_edit: false,
+                walk_after_reject: false,
                 walk_pending: Vec::new(),
                 const_fn_pending: false,
                 items: Vec::new(),

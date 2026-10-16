@@ -159,6 +159,14 @@ impl GenReuse {
         self.unstored.clear();
     }
 
+    /// Drops the entries a collect under `env` stored or replayed (a
+    /// failed collect: its static ids are unknown). Entries made under
+    /// another env stay.
+    pub fn drop_env(&mut self, env: u64) {
+        self.templates.retain(|_, e| e.env != env);
+        self.discovery.retain(|_, e| e.env != env);
+    }
+
     /// Notes that a fresh discovery check of `f` stored nothing.
     pub fn note_unstored(&mut self, p: &Program, f: LocalDefId) {
         self.unstored.insert(p.def_id(f), ());
