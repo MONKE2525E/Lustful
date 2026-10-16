@@ -61,7 +61,8 @@ prints "reserved, not yet emitted".
 | L0543-L0549 | Known-value checks | check | reserved | |
 | L0601 | Types and aliases | W-RESOLVE | in use | Type alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
-| L0603-L0609 | Types and aliases | W-CORELANG | reserved | |
+| L0603 | Types and aliases | fx-scanfa | in use | Unstable type form: a written `!` outside a fn return type (rustc E0658) |
+| L0604-L0609 | Types and aliases | W-CORELANG | reserved | |
 | L0610-L0613 | Traits and inference | W-TRAITS-CORE | in use | L0610 annotations needed, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known |
 | L0614 | Traits and inference | W-TRAITS-CORE | in use | Trait, generic, or where-clause form is not supported yet (S3b parser reject) |
 | L0615 | Traits and inference | W-TRAITS-CORE | in use | Overlapping impls (coherence) |

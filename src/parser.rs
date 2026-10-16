@@ -2702,7 +2702,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RParen, "`)`")?;
-        let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
+        let ret = if self.eat(Tok::Arrow) { Some(self.ret_ty()?) } else { None };
         let where_clause = self.where_clause()?;
         // A fn body block permits inner attributes at its start.
         self.block_inner_ok = true;
@@ -3092,6 +3092,18 @@ impl<'a> Parser<'a> {
         self.nest(|p| p.ty_inner())
     }
 
+    /// The type after `->` in a fn, fn pointer, or closure: the one
+    /// place where a written `!` is stable (rustc gates it in `Fn() -> !`
+    /// sugar too).
+    fn ret_ty(&mut self) -> PResult<TyId> {
+        let start = self.span();
+        if self.peek() == Tok::Bang {
+            self.bump();
+            return Ok(self.push_ty(TyExpr::Never, start.to(self.prev_span())));
+        }
+        self.ty()
+    }
+
     fn ty_inner(&mut self) -> PResult<TyId> {
         let start = self.span();
         match self.peek() {
@@ -3226,7 +3238,7 @@ impl<'a> Parser<'a> {
                 if variadic && !self.cfg_syntax {
                     return Err(not_yet(C_TY, start, "variadic function pointer types"));
                 }
-                let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
+                let ret = if self.eat(Tok::Arrow) { Some(self.ret_ty()?) } else { None };
                 Ok(self.push_ty(
                     TyExpr::FnPtr { binder: Vec::new(), qual: FnQual::default(), inputs, variadic: false, ret },
                     start.to(self.prev_span()),
@@ -3245,10 +3257,18 @@ impl<'a> Parser<'a> {
                 Ok(self.push_ty(TyExpr::Ptr { mutable, inner }, start.to(self.prev_span())))
             }
             Tok::Bang => {
-                // The never type: its AST shape is `TyExpr::Never` (S3b) and
-                // check already unifies it. Its parser lands with S5 because
-                // the first source std fn (`std::process::exit`) returns it.
+                // A written `!` is stable only as a whole return type
+                // (`ret_ty`); rustc gates every other position (E0658,
+                // `never_type`). Cfg-disabled code is not gated.
                 self.bump();
+                if !self.cfg_syntax {
+                    return Err(Diag::new(
+                        "L0603",
+                        start,
+                        "the `!` type is unstable outside a function return type",
+                        "Use an empty enum (`enum Never {}`) or `std::convert::Infallible`.",
+                    ));
+                }
                 Ok(self.push_ty(TyExpr::Never, start.to(self.prev_span())))
             }
             Tok::Underscore => {
@@ -4235,7 +4255,7 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::Comma, "`,` or `|`")?;
             }
         }
-        let ret = if self.eat(Tok::Arrow) { Some(self.ty()?) } else { None };
+        let ret = if self.eat(Tok::Arrow) { Some(self.ret_ty()?) } else { None };
         // With a written return type the body must be a block, as in Rust.
         if ret.is_some() && self.peek() != Tok::LBrace {
             return Err(syntax(self.span(), "expected `{` after the closure return type"));

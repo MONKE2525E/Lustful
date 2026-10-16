@@ -72,6 +72,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0542](L0542.md) | invalid atomic memory ordering |
 | [L0601](L0601.md) | type alias cycle |
 | [L0602](L0602.md) | this type form is not supported yet |
+| [L0603](L0603.md) | the `!` type is unstable outside a function return type |
 | [L0610](L0610.md) | type annotations needed |
 | [L0611](L0611.md) | trait selection overflow |
 | [L0612](L0612.md) | no impl of the trait for this type |

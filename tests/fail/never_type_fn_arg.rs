@@ -1,0 +1,4 @@
+// expect: L0603
+// rustc E0658: the `!` type is experimental outside a fn return type (hunt5).
+fn f(x: !) -> i32 { x }
+fn main() { println!("hi"); }
