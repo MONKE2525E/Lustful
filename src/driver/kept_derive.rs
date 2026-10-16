@@ -150,9 +150,9 @@ fn apply_item(p: &mut Program, item: usize, undo: &mut crate::check::derive_delt
 }
 
 /// The source names a body must mention to read a derive list of the
-/// reach: the reach Adts and their variants, and the fns, consts, and
-/// statics whose types name one (a value of a reach type comes from one
-/// of them, or from a type the body writes).
+/// reach: the reach Adts and their variants, the type aliases of a reach
+/// type, and the fns, consts, and statics whose types name one (a value of
+/// a reach type comes from one of them, or from a type the body writes).
 fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count: usize) -> crate::intern::FxMap<crate::intern::Sym, ()> {
     let mut out = crate::intern::FxMap::default();
     let mut add = |s: crate::intern::Sym| {
@@ -177,6 +177,9 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
             add(p.fn_def(f).name);
         }
     }
+    // Type aliases of a reach type (`type T2 = S;` names S as T2).
+    p.aliases.iter().filter(|&(_, &t)| reach.ty(&p.tys, t)).for_each(|(&n, _)| add(n));
+    p.gx.generic_aliases.iter().filter(|(_, a)| reach.ty(&p.tys, a.erased)).for_each(|(&n, _)| add(n));
     p.consts.iter().filter(|c| reach.ty(&p.tys, c.ty)).for_each(|c| add(c.name));
     p.statics.iter().filter(|s| reach.ty(&p.tys, s.ty)).for_each(|s| add(s.name));
     out

@@ -198,13 +198,15 @@ T5_USES = {
 T5_HELPERS = "fn need_eq<X: Eq>(_x: &X) {}\n"
 # Contexts: (items with NAME and BODY, main expression). `gmk` gets its
 # value from mk() alone; `gmkc` does too, inside a template with closures
-# (no stored check: it rechecks when its body names the reach).
+# (no stored check: it rechecks when its body names the reach); `galias`
+# names A only through a type alias (its literal too), with closures.
 T5_CONTEXTS = {
     "gfn": ("fn NAME<T>(a: A, _t: T) -> String {\n    BODY\n}\n", "NAME(mk(), 0u8)"),
     "gclosure": ("fn NAME<T>(a: A, _t: T) -> String {\n    let f = |a: A| BODY;\n    f(a)\n}\n", "NAME(mk(), 'c')"),
     "gdefault": ("trait NAMET {\n    fn NAME(&self, a: A) -> String {\n        BODY\n    }\n}\nimpl NAMET for u8 {}\n", "1u8.NAME(mk())"),
     "gimpl": ("struct NAMES<T>(T);\nimpl<T> NAMES<T> {\n    fn NAME(&self, a: A) -> String {\n        BODY\n    }\n}\n", "NAMES(2u16).NAME(mk())"),
     "gmk": ("fn NAME<T>(_t: T) -> String {\n    let a = mk();\n    BODY\n}\n", "NAME(3i32)"),
+    "galias": ("type NAMEA = A;\nfn NAME<T>(_t: T) -> String {\n    let g = || 1u8;\n    let a: NAMEA = MK_ALIAS;\n    format!(\"{}{}\", g(), BODY)\n}\n", "NAME(2u64)"),
     "gmkc": ("fn NAME<T>(_t: T) -> String {\n    let g = || 1u8;\n    let a = mk();\n    format!(\"{}{}\", g(), BODY)\n}\n", "NAME(true)"),
 }
 for _tr, _use in T5_USES.items():
@@ -242,6 +244,24 @@ FULL = ["Clone", "Copy", "Debug", "PartialEq"]
 FULL3 = ["Clone", "Copy", "Debug", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord"]
 
 
+def alias_literal(mk, alias):
+    """mk's literal through a type alias of A: a tuple struct takes the
+    braced form (`Alias { 0: .., 1: .. }`; an alias is no constructor fn)."""
+    m = re.match(r"^AG?\((.*)\)$", mk)
+    if not m:
+        return re.sub(r"^AG?(?=\W)", alias, mk)
+    parts, depth, cur = [], 0, ""
+    for ch in m.group(1):
+        depth += ch in "([" and 1 or ch in ")]" and -1 or 0
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur.strip())
+    return f"{alias} {{ " + ", ".join(f"{i}: {v}" for i, v in enumerate(parts)) + " }"
+
+
 def program(adt, derives, shapes, resolver=False, main_result=False, unrel=None):
     defn, mk, show, alias, _ = adt
     out = ["const _ROUTE: u8 = 0;\n"] if resolver else []
@@ -252,7 +272,8 @@ def program(adt, derives, shapes, resolver=False, main_result=False, unrel=None)
     out.append(f"fn mk() -> A {{\n    {mk}\n}}\n")
     out.append(f"fn show(a: &A) -> String {{\n    {show}\n}}\n")
     for sh in shapes:
-        out.append(SHAPES[sh][0].replace("MK_CONST", mk))
+        # MK_ALIAS: mk's literal through the shape's alias of A.
+        out.append(SHAPES[sh][0].replace("MK_CONST", mk).replace("MK_ALIAS", alias_literal(mk, sh + "A")))
     out.append("fn main() -> Result<(), A> {\n" if main_result else "fn main() {\n")
     if unrel is not None:
         out.append(f"    println!(\"u{unrel}\");\n")
