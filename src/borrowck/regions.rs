@@ -648,7 +648,7 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
                 | IterKind::ResultIter
                 | IterKind::ResultIterMut,
             )
-            | BuiltinTy::Iter(IterKind::StrSplit)
+            | BuiltinTy::Iter(IterKind::StrSplit | IterKind::StrMatches | IterKind::EncodeUtf16)
             | BuiltinTy::RefGuard
             | BuiltinTy::RefMutGuard,
         ) => return 1,
