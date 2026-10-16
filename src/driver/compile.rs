@@ -3031,12 +3031,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         Err(why) => {
-            // This mode's program goes (collect makes a new one); the
-            // other mode's stays unless the generic state moved.
+            // `reuse_kept` took this mode's program; it is back only when
+            // the program stands for the next request (a refused header
+            // delta left it as it was), and a clean collect replaces it.
+            // Every program goes when the generic state moved.
             visits.kept = why;
-            let slot = usize::from(req.cmd == Cmd::Build);
-            let drop_all = why == "gen state";
-            let old: Vec<_> = (0..2).filter(|&i| i == slot || drop_all).filter_map(|i| front.kept[i].take()).collect();
+            let old: Vec<_> = if why == "gen state" { front.kept.iter_mut().filter_map(Option::take).collect() } else { Vec::new() };
             if !old.is_empty() && caches.persistent {
                 let _ = crate::pool::thread("lust-drop").spawn(move || drop(old));
             }

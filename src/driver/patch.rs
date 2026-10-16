@@ -490,6 +490,9 @@ struct KeptEdit {
     header: bool,
     /// A derive list edit: the kept program does not stand (no delta yet).
     derive: bool,
+    /// The program's spans already moved for it (`reuse_kept` kept the
+    /// program after a refused header delta).
+    shifted: bool,
 }
 
 /// One edited fn's discovery output as the kept program was built with
@@ -524,6 +527,7 @@ pub(super) fn try_patch(
             rpit: e.body.as_ref().is_some_and(|b| b.rpit.is_some()),
             header: e.item.is_some(),
             derive: e.derive.is_some(),
+            shifted: false,
         })
         .collect();
     // Everything above only read; from here the front state changes, and
@@ -1905,9 +1909,10 @@ pub(super) fn reuse_kept(
         }
     }
     let mut spans = 0;
-    for e in &mut edits {
+    for e in edits.iter_mut().filter(|e| !e.shifted) {
         let (edit, ctxts) = (e.edit, &mut e.ctxts);
         spans += crate::check::prog_shift::shift_program(&mut p, &mut |s| edit.span(s, ctxts));
+        e.shifted = true;
     }
     // Item patch edits: the signature delta redoes each edited header
     // (its own template check and reveal included).
@@ -1918,9 +1923,16 @@ pub(super) fn reuse_kept(
         .filter_map(|e| Some(super::kept_delta::HeaderEdit { fn_index: e.fn_index?, old_exprs: e.old_exprs }))
         .collect();
     if !headers.is_empty() {
-        let front = &*front;
         let reach = front.patch.as_ref().and_then(|b| b.reach.as_ref());
-        super::kept_delta::apply_headers(&mut p, front, caches, reach, &headers, walk_instances)?;
+        if let Err((why, intact)) = super::kept_delta::apply_headers(&mut p, front, caches, reach, &headers, walk_instances) {
+            // The program is as it was, with its spans moved: it stays
+            // for the next request, which redoes these headers with its
+            // own (sigedit R9: a rejected header edit, then its fix).
+            if intact {
+                front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases });
+            }
+            return Err(why);
+        }
     }
     // An edited fn that returns `impl Trait`: collect reveals its hidden
     // type from the new body, so the program stands only while that type

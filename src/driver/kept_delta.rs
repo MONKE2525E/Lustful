@@ -31,8 +31,10 @@
 // again, and its hidden type must stand: then the auto traits callers read
 // through it, and any opaque type that names it, stand too); a header with a `dyn` or macro type (eager vtables scan the Ast
 // for `dyn`); programs without user generics (collect's whole-Ast flag
-// scans may turn them on); and any diagnostic: v1 drops the kept program
-// then and answers through the full path.
+// scans may turn them on); and any diagnostic. The full path answers
+// then. A refusal before any write, or a diagnostic of a new signature
+// (its old records go back, `delta_audit::undo`), leaves the program as
+// it was: `reuse_kept` keeps it for the next request (sigedit R9).
 //
 // check/delta_audit.rs lists what the delta does with each Program field.
 use super::const_reach::ConstReach;
@@ -54,8 +56,10 @@ pub(crate) struct HeaderEdit {
 
 /// Applies header edits to the kept program `p`. `reach` is the patch
 /// base's const reach, if it has one. Err names the first condition that
-/// failed (the `kept=` of `lust-visits:`); `p` is then half edited and
-/// must be dropped.
+/// failed (the `kept=` of `lust-visits:`), and says whether `p` is as it
+/// was (a refusal before any write, or a diagnostic of a new signature,
+/// whose records go back: the caller may keep it for the next request,
+/// sigedit R9) or half edited (it must be dropped).
 #[allow(dead_code)] // The item patch (sigedit P1.3) calls it from `reuse_kept`.
 pub(crate) fn apply_headers(
     p: &mut Program,
@@ -64,7 +68,67 @@ pub(crate) fn apply_headers(
     reach: Option<&ConstReach>,
     edits: &[HeaderEdit],
     walk_instances: bool,
-) -> Result<(), &'static str> {
+) -> Result<(), (&'static str, bool)> {
+    let fns = untouched_refusals(p, front, reach, edits, walk_instances).map_err(|e| (e, true))?;
+    let opaque_idents = opaque_body_idents(p);
+    let namers = rpit_namers(p, &opaque_idents, &fns).map_err(|e| (e, true))?;
+    super::laps::mark("collect/delta refusals");
+    // The node answers of the last collect describe the old signatures.
+    caches.gen_reuse.forget_answers();
+    // Every new signature first: a body checked below may call any of them.
+    let mut errs: Vec<Diag> = Vec::new();
+    let mut old_rets = Vec::with_capacity(fns.len());
+    let mut undos = Vec::with_capacity(fns.len());
+    for &i in &fns {
+        let f = LocalDefId(i as u32);
+        let rpit = p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)));
+        old_rets.push((rpit, p.fns[i].ret));
+        undos.push(crate::check::delta_audit::sig_undo(p, f));
+        let out = crate::check::delta_audit::redo_sig(p, f, rpit, &mut errs);
+        if let Err(why) = out.and_then(|()| if errs.is_empty() { Ok(()) } else { Err("sig diag") }) {
+            undos.into_iter().rev().for_each(|u| crate::check::delta_audit::undo(p, u));
+            return Err((why, true));
+        }
+    }
+    let half = |e: &'static str| (e, false);
+    super::laps::mark("collect/delta redo");
+    for (&i, &(rpit, old_ret)) in fns.iter().zip(&old_rets) {
+        let f = LocalDefId(i as u32);
+        if p.gx.fn_class[i] == FnClass::Template {
+            let ranges: Vec<(u32, u32)> = edits.iter().filter(|e| e.fn_index == i).map(|e| e.old_exprs).collect();
+            recheck_template(p, f, &ranges, caches).map_err(half)?;
+        } else if rpit {
+            crate::check::delta_audit::reveal_again(p, f, old_ret).map_err(half)?;
+        }
+    }
+    // A plain fn that reveals an opaque type and names an edited fn: its
+    // hidden type (and so the auto traits callers read through it) must
+    // stand under the new signatures. Then the opaque types that name it
+    // see no change either.
+    for g in namers {
+        let (record_reads, unwind) = (p.record_reads, p.unwind);
+        (p.record_reads, p.unwind) = (true, false);
+        let stands = crate::check::opaque::hidden_stands(p, g);
+        (p.record_reads, p.unwind) = (record_reads, unwind);
+        if !stands {
+            return Err(half("hidden type"));
+        }
+    }
+    super::laps::mark("collect/delta reveal");
+    let out = replay_bodies(p, front, caches, &fns, walk_instances).map_err(half);
+    super::laps::mark("collect/delta replay");
+    out
+}
+
+/// The edited fns of `edits`, sorted, or the first refusal that needs no
+/// write to the program (`refusal` and the const reach).
+fn untouched_refusals(
+    p: &Program,
+    front: &Front,
+    reach: Option<&ConstReach>,
+    edits: &[HeaderEdit],
+    walk_instances: bool,
+) -> Result<Vec<usize>, &'static str> {
     if !p.gx.user_generics {
         return Err("sig flags");
     }
@@ -79,7 +143,6 @@ pub(crate) fn apply_headers(
     let mut fns: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
     fns.sort_unstable();
     fns.dedup();
-    let opaque_idents = opaque_body_idents(p);
     for &i in &fns {
         if i >= front.fn_loc.len() {
             return Err("sig class");
@@ -89,49 +152,7 @@ pub(crate) fn apply_headers(
             return Err("sig const");
         }
     }
-    let namers = rpit_namers(p, &opaque_idents, &fns)?;
-    super::laps::mark("collect/delta refusals");
-    // The node answers of the last collect describe the old signatures.
-    caches.gen_reuse.forget_answers();
-    // Every new signature first: a body checked below may call any of them.
-    let mut errs: Vec<Diag> = Vec::new();
-    let mut old_rets = Vec::with_capacity(fns.len());
-    for &i in &fns {
-        let f = LocalDefId(i as u32);
-        let rpit = p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)));
-        old_rets.push((rpit, p.fns[i].ret));
-        crate::check::delta_audit::redo_sig(p, f, rpit, &mut errs)?;
-        if !errs.is_empty() {
-            return Err("sig diag");
-        }
-    }
-    super::laps::mark("collect/delta redo");
-    for (&i, &(rpit, old_ret)) in fns.iter().zip(&old_rets) {
-        let f = LocalDefId(i as u32);
-        if p.gx.fn_class[i] == FnClass::Template {
-            let ranges: Vec<(u32, u32)> = edits.iter().filter(|e| e.fn_index == i).map(|e| e.old_exprs).collect();
-            recheck_template(p, f, &ranges, caches)?;
-        } else if rpit {
-            crate::check::delta_audit::reveal_again(p, f, old_ret)?;
-        }
-    }
-    // A plain fn that reveals an opaque type and names an edited fn: its
-    // hidden type (and so the auto traits callers read through it) must
-    // stand under the new signatures. Then the opaque types that name it
-    // see no change either.
-    for g in namers {
-        let (record_reads, unwind) = (p.record_reads, p.unwind);
-        (p.record_reads, p.unwind) = (true, false);
-        let stands = crate::check::opaque::hidden_stands(p, g);
-        (p.record_reads, p.unwind) = (record_reads, unwind);
-        if !stands {
-            return Err("hidden type");
-        }
-    }
-    super::laps::mark("collect/delta reveal");
-    let out = replay_bodies(p, front, caches, &fns, walk_instances);
-    super::laps::mark("collect/delta replay");
-    out
+    Ok(fns)
 }
 
 /// An edited template checks again as collect's template check does

@@ -269,6 +269,60 @@ pub(crate) fn redo_sig(p: &mut Program, f: LocalDefId, rpit: bool, errs: &mut Ve
     Ok(())
 }
 
+/// The record of one fn as `redo_sig` finds it: `undo` writes it back,
+/// so a delta that hits a diagnostic leaves the kept program as it was
+/// (sigedit PLAN R9). These are every table `install_fn(Replace)` and the
+/// signature kernels write for the fn (`normalize_fn_sig` rewrites the
+/// params and return); new types the record interned stay, unread.
+pub(crate) struct SigUndo {
+    f: LocalDefId,
+    fn_sig: (Option<crate::ast::SelfKind>, Vec<crate::ty::Ty>, crate::ty::Ty, Option<usize>, bool),
+    def: Option<(crate::ty::Generics, crate::ty::defs::SigData)>,
+    template: Option<generics::FnTemplate>,
+    scope: generics::FnScope,
+    class: FnClass,
+    regions: (Option<crate::borrowck::RegionSig>, Option<crate::borrowck::RegionSig>),
+    opaque: (crate::def::DefId, Option<generics::OpaqueInfo>),
+}
+
+/// Takes fn `f`'s record before `redo_sig` (see `SigUndo`).
+pub(crate) fn sig_undo(p: &Program, f: LocalDefId) -> SigUndo {
+    let (i, info, def) = (f.0 as usize, p.fn_info(f), p.def_id(f));
+    let od = generics::opaque_def(def);
+    SigUndo {
+        f,
+        fn_sig: (info.self_kind, info.params.clone(), info.ret, info.ret_borrows_from, info.is_const),
+        def: p.defs.get(def).map(|d| (d.generics.clone(), d.sig.clone())),
+        template: p.gx.fn_templates[i].clone(),
+        scope: p.gx.fn_scopes[i].clone(),
+        class: p.gx.fn_class[i],
+        regions: (p.regions.fns.get(&f).cloned(), p.regions.opaque_sigs.get(&f).cloned()),
+        opaque: (od, p.gx.opaques.get(&od).cloned()),
+    }
+}
+
+/// Writes back what `sig_undo` took.
+pub(crate) fn undo(p: &mut Program, u: SigUndo) {
+    let (i, def) = (u.f.0 as usize, p.def_id(u.f));
+    let info = &mut p.fns[i];
+    (info.self_kind, info.params, info.ret, info.ret_borrows_from, info.is_const) = u.fn_sig;
+    if let (Some(d), Some((g, sig))) = (p.defs.get_mut(def), u.def) {
+        (d.generics, d.sig) = (g, sig);
+    }
+    (p.gx.fn_templates[i], p.gx.fn_scopes[i], p.gx.fn_class[i]) = (u.template, u.scope, u.class);
+    for (map, old) in [(&mut p.regions.fns, u.regions.0), (&mut p.regions.opaque_sigs, u.regions.1)] {
+        match old {
+            Some(r) => map.insert(u.f, r),
+            None => map.remove(&u.f),
+        };
+    }
+    match u.opaque.1 {
+        Some(o) => p.gx.opaques.insert(u.opaque.0, o),
+        None => p.gx.opaques.remove(&u.opaque.0),
+    };
+    p.regions.outlives_items.clear();
+}
+
 /// Reveals plain fn `f`'s own `impl Trait` again from its body under
 /// its new signature, as `reveal_plain` does in collect. The hidden type
 /// must be the one the program holds (or none, before and after): other
