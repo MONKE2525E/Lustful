@@ -1881,6 +1881,12 @@ struct Ctx<'p> {
     /// (`map(u64::from)`, TRIAGE T12), re-tested at finish
     /// against `std_from`, like `deferred_string_from`.
     deferred_prim_from: Vec<(Ty, Ty, Span)>,
+    /// (callee, call, target, input, span) of a `Box::from(x)` (or `Rc`,
+    /// `Arc`) whose target only a later coercion fixes
+    /// (`Box::leak(Box::from(s))` into `&str`, check/own.rs): the std
+    /// conversion is picked at finish, as rustc selects the `From`
+    /// impl once the target is known.
+    deferred_own_from: Vec<(ExprId, ExprId, Ty, Ty, Span)>,
     /// Types a `std::any::type_name::<T>()` call names, tested at
     /// finish: lust must be able to print rustc's exact string for
     /// each (`any::type_name_of`), else the call is a reject.
@@ -2364,6 +2370,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_clone: Vec::new(),
         deferred_string_from: Vec::new(),
         deferred_prim_from: Vec::new(),
+        deferred_own_from: Vec::new(),
         deferred_type_names: Vec::new(),
         deferred_trait_fn_values: Vec::new(),
         deferred_trait_fn_calls: Vec::new(),
@@ -23280,6 +23287,25 @@ impl<'p> Ctx<'p> {
                     self.errs.push(unsupported(span, &what));
                 }
             }
+        }
+        for (callee, e, dst, at, span) in std::mem::take(&mut self.deferred_own_from) {
+            let (dst, at) = (self.deep(dst), self.deep(at));
+            if self.has_error_kind(dst) || self.has_error_kind(at) {
+                continue;
+            }
+            // The input was checked as itself, so only a std conversion
+            // that takes it unchanged applies here.
+            if self.tys.flags(dst).contains_infer() || self.std_from_arg(dst, at) != Some(at) {
+                self.err(
+                    "L0610",
+                    span,
+                    "type annotations needed: cannot infer the type this `from` builds",
+                    "Write the target type, for example `let s: Rc<str> = Rc::from(x);`.",
+                );
+                continue;
+            }
+            self.set_res(callee, Res::Builtin(Builtin::ConvInto));
+            self.set_res(e, Res::Builtin(Builtin::ConvInto));
         }
         for (dst, src, span) in std::mem::take(&mut self.deferred_prim_from) {
             let src = self.deep(src);

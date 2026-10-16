@@ -104,6 +104,24 @@ impl<'p> Ctx<'p> {
         };
         let dst = want.map(|t| self.deep(t)).filter(|&t| self.tys.builtin_of(t) == Some(builtin));
         let Some(dst) = dst.filter(|&t| !self.tys.flags(t).contains_infer()) else {
+            // No target yet: rustc keeps `Box<?U>: From<A>` pending until
+            // a later coercion fixes `?U` (`Box::leak(Box::from(s))` into
+            // `&str`). The pick waits for finish (`deferred_own_from`).
+            if args.len() == 1 && !self.has_error_kind(at) {
+                let u = self.new_var(false);
+                let open = match k {
+                    Owner::Box => self.tys.mk_boxed(u),
+                    Owner::Rc => self.tys.mk_rc(u),
+                    Owner::Arc => crate::ty::sync::sync_ty(&mut self.tys, crate::ty::sync::SyncTy::Arc, &[u]),
+                };
+                if let Some(w) = dst
+                    && !self.unify(w, open)
+                {
+                    self.mismatch(span, w, open);
+                }
+                self.deferred_own_from.push((callee, e, open, at, span));
+                return (vec![at], open);
+            }
             if !self.has_error_kind(at) {
                 self.err(
                     "L0610",
