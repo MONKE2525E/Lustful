@@ -151,6 +151,7 @@ impl Ctx<'_> {
             for &path in traits {
                 if let Some(ls) = tab.traits.get(path).and_then(|m| m.get(item))
                     && self.std_trait_may_be_in_scope(path)
+                    && self.std_impl_may_apply(t, path)
                 {
                     out.extend(ls);
                 }
@@ -160,24 +161,111 @@ impl Ctx<'_> {
     }
 
     /// True unless std trait `path` (not in the prelude) is surely out of
-    /// scope everywhere in the crate: no `use` of a std item of its name,
-    /// no glob of a std module, and no std trait lust models under its
-    /// name in scope here. rustc probes only traits in scope (a where
-    /// clause on a concrete type does not bring one in).
+    /// scope at this body. rustc probes only the traits in scope where the
+    /// call is (a where clause on a concrete type does not bring one in):
+    /// a `use` in this module of a std item of its name (renamed, `as _`,
+    /// or brought by a glob of a module that re-exports it), a glob of a
+    /// std module in this module, a fn-local `use` in an enclosing block,
+    /// or a std trait lust models under its name that is in scope here.
+    /// A fn-local `use` lust does not record as a trait path (a glob, or
+    /// a trait lust does not know) counts for the whole crate.
     fn std_trait_may_be_in_scope(&mut self, path: &str) -> bool {
         let p = self.p;
         let simple = path.rsplit("::").next().unwrap_or(path);
-        // No resolver tables: the crate has no `use` at all.
-        let Some(res) = &p.resolved else { return false };
-        if !res.std_globs.is_empty() {
+        let named = |s: &Sym| p.interner.get(*s) == simple;
+        if self.std_trait_scopes.iter().flatten().any(|path| path.last().is_some_and(named)) || self.fn_local_std_use(simple) {
             return true;
         }
-        let named = |s: &Sym| p.interner.get(*s) == simple;
-        if res.std_aliases.values().any(|(_, path)| path.last().is_some_and(named)) {
-            return true;
+        // No resolver tables: the crate has no module-level `use`.
+        if let Some(res) = &p.resolved {
+            let module = self.module;
+            if res.std_globs.iter().any(|(m, _)| *m == module)
+                || res.std_aliases.iter().any(|(&(m, _, _), (_, path))| m == module && path.last().is_some_and(named))
+            {
+                return true;
+            }
         }
         let modeled: Vec<DefId> = p.gx.trait_names.iter().filter(|(n, _)| named(n)).map(|(_, &d)| d).collect();
         modeled.into_iter().any(|d| !self.is_user_trait(d) && method::trait_in_scope_pub(self, d))
+    }
+
+    /// True when a fn-local `use` anywhere in the crate imports a std
+    /// glob or a std item named `simple` (std, core, or alloc paths).
+    fn fn_local_std_use(&self, simple: &str) -> bool {
+        fn tree_hits(t: &crate::ast::UseTree, std: bool, simple: &str, interner: &crate::intern::Interner) -> bool {
+            let std = std || t.prefix.first().is_some_and(|s| matches!(interner.get(s.name), "std" | "core" | "alloc"));
+            match &t.kind {
+                crate::ast::UseKind::Glob => std,
+                crate::ast::UseKind::Simple { .. } => std && t.prefix.last().is_some_and(|s| interner.get(s.name) == simple),
+                crate::ast::UseKind::Group(ts) => ts.iter().any(|c| tree_hits(c, std, simple, interner)),
+            }
+        }
+        let p = self.p;
+        p.ast.stmt_items.iter().any(|it| matches!(&it.kind, ItemKind::Use(u) if tree_hits(&u.tree, false, simple, &p.interner)))
+    }
+
+    /// False when std's impl of trait `path` for step type `t` surely
+    /// does not apply, so the table's trait row must not count there:
+    /// `Box`, `Rc`, and `Arc` forward a trait only when the pointee has it
+    /// (`Rc<T>: Hash` needs `T: Hash`), `&T` and `&mut T` forward theirs,
+    /// `Arc` has io `Read`, `Write`, and `Seek` only for `Arc<File>`, and
+    /// `Rc` and a shared reference to a smart pointer have none. Only a
+    /// pointee whose impls lust knows in full decides: a user type
+    /// (selection) or a user trait object (its supertraits). Any other
+    /// may hold, which can only give a tie (L0643).
+    fn std_impl_may_apply(&mut self, t: Ty, path: &str) -> bool {
+        const ALWAYS: &[&str] = &[
+            "std::any::Any",
+            "std::borrow::Borrow",
+            "std::borrow::BorrowMut",
+            "std::fmt::Pointer",
+            "std::ops::Deref",
+            "std::ops::DerefMut",
+        ];
+        if ALWAYS.contains(&path) {
+            return true;
+        }
+        let io = matches!(path, "std::io::Read" | "std::io::Write" | "std::io::Seek" | "std::io::BufRead");
+        let t = self.resolve(t);
+        let smart = |cx: &Self, x: Ty| {
+            matches!(cx.tys.builtin_of(x), Some(BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc)))
+        };
+        if let TyKind::Ref(_, m, inner) = self.tys.kind(t) {
+            let inner = self.resolve(inner);
+            if io && !m.is_mut() {
+                return !smart(self, inner);
+            }
+            return self.std_impl_may_apply(inner, path);
+        }
+        if smart(self, t) {
+            let Some(pointee) = self.tys.adt_first_ty_arg(t) else { return true };
+            let pointee = self.resolve(pointee);
+            return match self.tys.builtin_of(t) {
+                Some(BuiltinTy::Rc) if io => false,
+                Some(BuiltinTy::Sync(_)) if io => {
+                    matches!(self.tys.kind(pointee), TyKind::Infer(_)) || self.std_type_names(pointee) == ["File"]
+                }
+                _ => self.std_impl_may_apply(pointee, path),
+            };
+        }
+        // A leaf type: only one whose impls lust knows in full decides.
+        // The std trait as lust's lang trait; any other may hold.
+        let p = self.p;
+        let lang = &p.gx.lang;
+        let Some(d) = (match path {
+            "std::hash::Hash" => Some(lang.hash),
+            "std::hash::Hasher" => Some(lang.hasher),
+            "std::fmt::Debug" => Some(lang.debug),
+            "std::fmt::Display" => Some(lang.display),
+            _ => None,
+        }) else {
+            return true;
+        };
+        if let Some(principal) = object::principal_of(&self.tys, t) {
+            return !self.is_user_trait(principal.def) || object::principal_has_supertrait(p, principal.def, d);
+        }
+        let user_adt = matches!(self.tys.kind(t), TyKind::Adt(..)) && self.std_type_names(t).is_empty();
+        !user_adt || self.std_trait_may_apply(d, t)
     }
 
     /// rustc's autoderef steps for a method probe from receiver type `rt`:

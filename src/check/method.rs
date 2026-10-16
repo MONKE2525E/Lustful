@@ -560,6 +560,13 @@ impl ArgTrial {
     }
 }
 
+/// `Hash::hash` has no lang signature (its `H: Hasher` parameter has no
+/// stub form), but its receiver is `&self`: a derived or std impl still
+/// counts as a candidate next to a user trait's `hash` (rustc E0034).
+fn hash_method_kind(cx: &Ctx, trait_def: DefId, name: Sym) -> Option<SelfKind> {
+    (trait_def == cx.p.gx.lang.hash && cx.name(name) == "hash").then_some(SelfKind::Ref)
+}
+
 /// `trait_method_probe` over every trait in scope, or over `only`
 /// when a template pick or a where clause already fixed the trait
 /// (scope was decided there). A confirmed hit is recorded as a
@@ -635,7 +642,7 @@ pub(super) fn trait_probe_for(
                     }
                     sig.self_kind
                 }
-                None => None,
+                None => hash_method_kind(cx, trait_def, name),
             }
         } else {
             None
@@ -877,7 +884,8 @@ pub(super) fn trait_probe_for(
                 && trait_def != p.gx.lang.into
                 && trait_def != p.gx.lang.try_into
                 && !matches!(trait_def, d if d == p.gx.lang.fn_ || d == p.gx.lang.fn_mut || d == p.gx.lang.fn_once)
-                && p.gx.lang_method_sigs.get(&method_def).is_some_and(|s| s.self_kind.is_some())
+                && (p.gx.lang_method_sigs.get(&method_def).is_some_and(|s| s.self_kind.is_some())
+                    || hash_method_kind(cx, trait_def, name).is_some())
                 && !lang_hits.contains(&trait_def)
             {
                 lang_hits.push(trait_def);
@@ -1566,6 +1574,60 @@ pub(super) fn plain_inherent_probe(
     Probe::Miss
 }
 
+/// How many std supertraits of dyn principal `principal` (Debug,
+/// Display, Hasher, ..., which have no `dyn_infos` and so are not in
+/// `object_cands`) declare a method `name` of receiver form `form`. They
+/// are object candidates too, in scope or not: with `trait U: Debug {
+/// fn fmt(&self) }`, `dyn U`'s `x.fmt()` is ambiguous in rustc (E0034).
+fn std_super_cands(
+    cx: &Ctx,
+    principal: DefId,
+    name: Sym,
+    form: ReceiverForm,
+    cands: &[(usize, crate::check::object::ObjectCand)],
+) -> usize {
+    let p = cx.p;
+    let mut seen: Vec<DefId> = Vec::new();
+    let mut work = vec![principal];
+    let mut n = 0;
+    while let Some(cur) = work.pop() {
+        if seen.contains(&cur) {
+            continue;
+        }
+        seen.push(cur);
+        let Some(rec) = p.gx.index.trait_record(cur) else { continue };
+        if cur != principal
+            && !p.gx.dyn_infos.contains_key(&cur)
+            && !cands.iter().any(|(_, c)| c.owner.def == cur)
+            && let Some(m) = rec.method_by_name(name)
+        {
+            let kind =
+                p.gx.trait_methods.get(&m).and_then(|t| t.self_kind).or_else(|| p.gx.lang_method_sigs.get(&m).and_then(|t| t.self_kind));
+            let same = match kind {
+                Some(SelfKind::Ref) => form == ReceiverForm::Ref,
+                Some(SelfKind::RefMut) => form == ReceiverForm::RefMut,
+                Some(SelfKind::Value | SelfKind::Typed) => form == ReceiverForm::Value,
+                None => false,
+            };
+            n += usize::from(same);
+        }
+        for pred in &rec.generics.predicates {
+            if let Predicate::Trait(b) = pred
+                && b.count == 0
+                && cx
+                    .tys
+                    .args(b.value.args)
+                    .first()
+                    .and_then(|g| g.as_ty())
+                    .is_some_and(|t| matches!(cx.tys.kind(t), TyKind::Param(ParamId(0))))
+            {
+                work.push(b.value.def);
+            }
+        }
+    }
+    n
+}
+
 /// The inherent probe of a dyn step (ARCH 2.8, 2.10): methods of
 /// `impl dyn Trait` blocks and the object candidates (methods of the
 /// principal and its supertraits, which need no import) are both
@@ -1626,7 +1688,8 @@ pub(super) fn dyn_probe(
             Err(_) => p.gx.trait_methods.get(&c.def).and_then(|t| form_of(t.self_kind)) == Some(form),
         })
         .collect();
-    if inherent.is_some() as usize + cands.len() > 1 {
+    let std_supers = if only.is_some() { 0 } else { std_super_cands(cx, principal.def, name, form, &cands) };
+    if inherent.is_some() as usize + cands.len() + std_supers > 1 {
         cx.err(
             "L0720",
             name_span,
