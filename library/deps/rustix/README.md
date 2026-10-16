@@ -18,10 +18,15 @@ Gate: `scripts/test-adapters.sh rustix`.
   `StatxTimestamp`, `StatVfs`, `Timespec`, `Timestamps`,
   `UTIME_NOW`, `UTIME_OMIT`, `open`, `openat`, `fstat`,
   `statat`, `statx`, `statvfs`, `fstatvfs`, `accessat`,
-  `utimensat`, `mknodat`, `fcntl_getfl`, `fcntl_setfl`.
-- `fs::inotify`: `CreateFlags`, `WatchFlags`, `ReadFlags`,
-  `init`, `add_watch`, `remove_watch`. Events are read with
-  `io::read` on the fd, as ts-rust does.
+  `utimensat`, `mknodat`, `fcntl_getfl`, `fcntl_setfl`,
+  `RawDir` and `RawDirEntry` (one getdents64 per refill with
+  upstream's buffer length after the 8-byte alignment trim;
+  the kernel bytes are copied into the caller's `MaybeUninit`
+  buffer, and entries parse from a private copy).
+- `fs::inotify`: `CreateFlags`, `WatchFlags`, `ReadFlags`
+  (with bitflags' Debug form), `init`, `add_watch`,
+  `remove_watch`, `Reader` and `Event` (one read(2) per refill,
+  as `RawDir`).
 - `process`: `Pid`, `RawPid`, `Signal` (named consts,
   `from_named_raw`, upstream's quoted Debug forms), `getpid`,
   `getppid`, `kill_process`, `test_kill_process`,
@@ -58,9 +63,11 @@ Gate: `scripts/test-adapters.sh rustix`.
   the `fs` and `process` items
   beyond the lists above (wait and exec forms included), and
   layout queries on every adapter type.
-- Debug of the flag types (upstream prints flag-name lists),
+- Debug of the flag types other than `ReadFlags` (upstream
+  prints flag-name lists),
   upstream's `Arg` methods (`as_str`, `into_with_c_str`, ...;
   a user `Arg` impl rejects), `Statx::stx_attributes` (its
   `StatxAttributes` type is not here), and the `SpareCapacity`
-  buffer form beyond the `Vec::spare_capacity_mut` slices
-  `RawDir::new` takes.
+  buffer form. `RawDir::new` and `Reader::new` take any
+  `&mut [MaybeUninit<u8>]` (lust std has no
+  `Vec::spare_capacity_mut` yet).

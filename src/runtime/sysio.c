@@ -23,9 +23,14 @@ static void lust_sysio_push(lust_Vec *out, const void *p, uint64_t n) {
     out->len += n;
 }
 
-/* One read into a fresh heap buffer, appended to the Vec. */
+/* One read into a fresh heap buffer, appended to the Vec. A zero
+   max still makes the syscall (its error, or 0), as std and rustix do. */
 int64_t lust_sys_fd_read(int32_t fd, uint64_t max, lust_Vec *out) {
-    if (max == 0) return 0;
+    if (max == 0) {
+        uint8_t none;
+        ssize_t z = read(fd, &none, 0);
+        return z < 0 ? -(int64_t)errno : (int64_t)z;
+    }
     uint8_t *tmp = malloc((size_t)max);
     if (!tmp) lust_oom();
     ssize_t n = read(fd, tmp, (size_t)max);

@@ -161,9 +161,6 @@ pub fn read<Fd: AsFd, Buf: Buffer<u8>>(fd: Fd, mut buf: Buf) -> Result<usize> {
 
 /// The fill of `read` over a plain slice.
 fn read_into<Fd: AsFd>(fd: Fd, buf: &mut [u8]) -> Result<usize> {
-    if buf.is_empty() {
-        return Ok(0);
-    }
     let mut out: Vec<u8> = Vec::new();
     let n = core::intrinsics::sys_fd_read(fd.as_fd().as_raw_fd(), buf.len() as u64, &mut out);
     if n < 0 {

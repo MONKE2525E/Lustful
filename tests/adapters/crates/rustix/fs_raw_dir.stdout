@@ -7,6 +7,13 @@ true
 true
 1
 Event { wd: 1, events: ReadFlags(CREATE), cookie: 0, file_name: Some("new.txt") }
+ReadFlags(
+    CREATE,
+)
 true true new.txt
 true
 ReadFlags(ACCESS | 0x80000000)
+ReadFlags(0x0) ReadFlags(0x80000000)
+ReadFlags(
+    CREATE | ISDIR,
+)

@@ -677,7 +677,7 @@ impl<'buf, Fd: AsFd> RawDir<'buf, Fd> {
             self.raw.clear();
             let n = core::intrinsics::sys_x_getdents(self.fd.as_fd().as_raw_fd(), self.buf.len() as u64, &mut self.raw);
             if n < 0 {
-                return Some(Err(Errno((-n) as i32)));
+                return Some(Err(Errno::from_raw_os_error((-n) as i32)));
             }
             if n == 0 {
                 return None;
@@ -694,7 +694,7 @@ impl<'buf, Fd: AsFd> RawDir<'buf, Fd> {
         let word = |i: usize| u64::from_le_bytes([at[i], at[i + 1], at[i + 2], at[i + 3], at[i + 4], at[i + 5], at[i + 6], at[i + 7]]);
         let reclen = u16::from_le_bytes([at[16], at[17]]) as usize;
         let name_end = at[19..reclen].iter().position(|&b| b == 0).map(|p| 19 + p + 1).unwrap_or(reclen);
-        let name = std::ffi::CStr::from_bytes_with_nul(&at[19..name_end]).unwrap_or_default();
+        let name = std::ffi::CStr::from_bytes_with_nul(&at[19..name_end]).expect("the kernel ends each name with a NUL");
         let ent = RawDirEntry { file_name: name, file_type: at[18], inode_number: word(0), next_entry_cookie: word(8) as i64 };
         self.offset += reclen;
         Some(Ok(ent))
@@ -749,8 +749,9 @@ impl core::fmt::Debug for RawDirEntry<'_> {
 }
 
 impl FileType {
-    /// The type of a directory entry's `d_type` byte.
-    pub const fn from_dirent_d_type(d_type: u8) -> FileType {
+    /// The type of a directory entry's `d_type` byte (crate-private,
+    /// as upstream).
+    pub(crate) const fn from_dirent_d_type(d_type: u8) -> FileType {
         match d_type {
             1 => FileType::Fifo,
             2 => FileType::CharacterDevice,
@@ -937,10 +938,23 @@ impl ReadFlags {
     pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
-/// The bitflags Debug form upstream prints for `ReadFlags`
-/// (known bits by name in declaration order, the rest as hex).
-/// Other flag types in this adapter stay without Debug (README).
+/// The Debug form bitflags 2 derives for `ReadFlags`: a tuple
+/// struct around the flag names (`ReadFlags(ACCESS | 0x8)`,
+/// `ReadFlags(0x0)` when empty), so `{:#?}` breaks lines as
+/// upstream. Other flag types in this adapter stay without Debug
+/// (README).
 impl core::fmt::Debug for ReadFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ReadFlags").field(&ReadFlagNames(self.0)).finish()
+    }
+}
+
+/// The inner bitflags value of `ReadFlags` Debug: the names of the
+/// set bits in declaration order, then the unnamed rest as hex
+/// (bitflags' `parser::to_writer`; every ReadFlags bit is one bit).
+struct ReadFlagNames(u32);
+
+impl core::fmt::Debug for ReadFlagNames {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         const NAMES: &[(u32, &str)] = &[
             (0x0000_0001, "ACCESS"),
@@ -960,9 +974,11 @@ impl core::fmt::Debug for ReadFlags {
             (0x0000_4000, "QUEUE_OVERFLOW"),
             (0x0000_2000, "UNMOUNT"),
         ];
+        if self.0 == 0 {
+            return write!(f, "{:#x}", 0u32);
+        }
         let mut rest = self.0;
         let mut first = true;
-        f.write_str("ReadFlags(")?;
         for &(bit, name) in NAMES {
             if rest & bit != 0 {
                 if !first {
@@ -973,13 +989,13 @@ impl core::fmt::Debug for ReadFlags {
                 rest &= !bit;
             }
         }
-        if rest != 0 || first {
+        if rest != 0 {
             if !first {
                 f.write_str(" | ")?;
             }
-            write!(f, "{rest:#x}")?;
+            write!(f, "{:#x}", rest)?;
         }
-        f.write_str(")")
+        Ok(())
     }
 }
 
@@ -1055,7 +1071,7 @@ impl core::ops::BitAnd for ReadFlags {
                 self.raw.clear();
                 let n = core::intrinsics::sys_fd_read(self.fd.as_fd().as_raw_fd(), self.buf.len() as u64, &mut self.raw);
                 if n < 0 {
-                    return Err(Errno((-n) as i32));
+                    return Err(Errno::from_raw_os_error((-n) as i32));
                 }
                 if n == 0 {
                     return Err(Errno::INVAL);
@@ -1075,7 +1091,7 @@ impl core::ops::BitAnd for ReadFlags {
             let len = u32::from_le_bytes([at[12], at[13], at[14], at[15]]) as usize;
             let file_name = if len > 0 {
                 let end = at[16..16 + len].iter().position(|&b| b == 0).map(|p| 16 + p + 1).unwrap_or(16 + len);
-                Some(std::ffi::CStr::from_bytes_with_nul(&at[16..end]).unwrap_or_default())
+                Some(std::ffi::CStr::from_bytes_with_nul(&at[16..end]).expect("the kernel ends each name with a NUL"))
             } else {
                 None
             };

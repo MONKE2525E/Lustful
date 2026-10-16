@@ -37,11 +37,10 @@ fn main() {
     println!("{:?}", names);
     println!("{}", types.contains(&FileType::Directory) && types.contains(&FileType::RegularFile));
 
-    // A heap buffer through spare_capacity_mut, as upstream's
-    // portable example does.
+    // A heap buffer, as ts-rust's fswatch shim passes it.
     let fd2 = openat(CWD, &dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).unwrap();
-    let mut vbuf: Vec<u8> = Vec::with_capacity(64);
-    let mut raw2 = RawDir::new(&fd2, vbuf.spare_capacity_mut());
+    let mut vbuf = vec![MaybeUninit::<u8>::uninit(); 64];
+    let mut raw2 = RawDir::new(&fd2, &mut vbuf);
     let first = raw2.next().unwrap().unwrap();
     println!("{}", first.ino() > 0);
 
@@ -56,9 +55,12 @@ fn main() {
     let mut reader = Reader::new(&ino, &mut ibuf);
     let ev = reader.next().unwrap();
     println!("{:?}", ev);
+    println!("{:#?}", ev.events());
     println!("{} {} {}", ev.wd() == wd, ev.events().contains(inotify::ReadFlags::CREATE), ev.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     println!("{}", reader.is_buffer_empty());
     println!("{:?}", inotify::ReadFlags::from_bits_retain(0x8000_0001));
+    println!("{:?} {:?}", inotify::ReadFlags::empty(), inotify::ReadFlags::from_bits_retain(0x8000_0000));
+    println!("{:#?}", inotify::ReadFlags::ISDIR | inotify::ReadFlags::CREATE);
     inotify::remove_watch(&ino, wd).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
