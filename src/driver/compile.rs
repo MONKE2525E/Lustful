@@ -3807,14 +3807,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // with it, as this mode's mark. A set this request checks again keeps
     // its old marks until then (a skipped std body keeps them for good);
     // the other mode's mark stands while the set does. The program takes
-    // the mark when it is kept.
+    // the mark when it is kept. An error answer that leaves the put-back
+    // program in place (`patch::keep_err`) gives these sets their old
+    // marks back (`old_marks`): they held against that program before
+    // this request and did not change, so the revert after a reject takes
+    // the keyed walk.
     let verified = next_verified();
     let mode_at = usize::from(program.gx.walk_instances);
+    let mut old_marks: Vec<(usize, u64)> = Vec::new();
     {
         let mut in_work = vec![false; program.fns.len()];
         work.iter().for_each(|&i| in_work[i] = true);
         for i in (0..program.fns.len()).filter(|&i| !in_work[i]) {
             if let Some(Some(r)) = caches.slot_reads.get_mut(slot(i)) {
+                old_marks.push((slot(i), r.verified[mode_at]));
                 r.verified[mode_at] = verified;
             }
         }
@@ -3929,7 +3935,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         } else {
             drop(results);
             program.verified = verified;
-            super::patch::keep_err(front, program);
+            if !super::patch::keep_err(front, program) {
+                for (s, mark) in old_marks {
+                    if let Some(Some(r)) = caches.slot_reads.get_mut(s) {
+                        r.verified[mode_at] = mark;
+                    }
+                }
+            }
         }
         return resp;
     }

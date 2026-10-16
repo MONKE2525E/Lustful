@@ -531,12 +531,14 @@ pub(crate) fn keep(front: &mut Front, mut program: crate::check::collect::Progra
 }
 
 /// `keep` for a request that answers with errors: a program `reuse_kept`
-/// put back (`KeptProgram::prefer`) stays.
-pub(crate) fn keep_err(front: &mut Front, program: crate::check::collect::Program) {
+/// put back (`KeptProgram::prefer`) stays. False when it stayed (the
+/// caller gives the read sets that program's marks back).
+pub(crate) fn keep_err(front: &mut Front, program: crate::check::collect::Program) -> bool {
     if front.kept[usize::from(program.gx.walk_instances)].as_ref().is_some_and(|k| k.prefer) {
-        return;
+        return false;
     }
     keep(front, program);
+    true
 }
 
 /// One patch edit under a detached kept program.
