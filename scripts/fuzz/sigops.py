@@ -32,6 +32,9 @@
 #   sig_umacro     a fn whose body calls a user macro: header edits with the
 #                  same body (the item patch reuses the body's expansion),
 #                  then a macro input or macro definition edit
+#   sig_tdefault   trait default bodies (templates after the AST fns) that
+#                  call a fn and use a derived type: header edits of the fn,
+#                  and a derive drop of a trait a default body uses
 # `External` adds verdicts from rustc 1.99 and a pinned baseline lust for
 # the op states (`--rustc`, `--baseline`): a state where the warm answer
 # disagrees with rustc fails unless the baseline gives the same answer
@@ -41,7 +44,7 @@ import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
        "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl",
-       "sig_apit", "sig_umacro"]
+       "sig_apit", "sig_umacro", "sig_tdefault"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -406,6 +409,27 @@ def sig_umacro(rng, fs):
              (mdef, "{ [$(format!(\"{}\", $x)),*].to_vec() }"),
              (mdef, "{ vec![$($x),*] }")]
     return _header_walk(rng, fs, items, head, edits, extra)
+
+
+def sig_tdefault(rng, fs):
+    """A fn `f`, a derived struct, and a trait whose default bodies (a
+    method with a closure, an associated fn) call f and use the struct's
+    Copy, Debug and Default; then header edits of f, and a derive drop
+    with a header edit on top (`_header_walk`)."""
+    k = rng.randrange(10**6)
+    head = f"fn zd{k}_f(x: u32) -> u32 {{"
+    derive = "#[derive(Clone, Copy, Debug, Default)]"
+    items = (f"\n{head}\n    x\n}}\n{derive}\nstruct Zq{k}(u32);\n"
+             f"trait Zd{k} {{\n    fn zd{k}_m(&self, q: Zq{k}) -> u32 {{\n        let c = || zd{k}_f(q.0);\n        let (a, b) = (q, q);\n"
+             f"        c() + a.0 + b.0 + format!(\"{{:?}}\", q).len() as u32\n    }}\n"
+             f"    fn zd{k}_s() -> u32 {{\n        let d: Zq{k} = Default::default();\n        zd{k}_f(d.0)\n    }}\n}}\n"
+             f"impl Zd{k} for u8 {{}}\n"
+             f"#[allow(dead_code)]\nfn zd{k}_use() -> u32 {{\n    1u8.zd{k}_m(Zq{k}(2)) + <u8 as Zd{k}>::zd{k}_s()\n}}\n")
+    edits = [f"fn zd{k}_f(x: u64) -> u32 {{", f"fn zd{k}_f(x: u32) -> u64 {{", f"fn zd{k}_f(x: &u32) -> u32 {{",
+             f"fn zd{k}_f(x: u32, _y: u8) -> u32 {{", f"fn zd{k}_f(x: u32) -> u32 where u32: Copy {{",
+             f"const fn zd{k}_f(x: u32) -> u32 {{"]
+    drops = [(derive, derive.replace(t, "")) for t in ("Copy, ", "Debug, ", ", Default", "Clone, Copy, ")]
+    return _header_walk(rng, fs, items, head, edits, drops)
 
 
 def sig_states(rng, fs):
