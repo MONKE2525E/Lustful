@@ -8234,6 +8234,11 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
     if let Some((a, b)) = tys.result_args(t) {
         return glue_clone(p, tys, a, seen) && glue_clone(p, tys, b, seen);
     }
+    // A builtin iterator std makes Clone, when a bitwise copy is its
+    // clone (`iter_clone_is_copy`).
+    if tys.is_chars_ty(t) || crate::ty::iter::iter_parts(tys, t).is_some() {
+        return iter_clone_is_copy(p, tys, t);
+    }
     match tys.local_adt(t) {
         Some(a) => {
             // A written non-generic impl: the glue calls its method.
@@ -8244,6 +8249,64 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
                 || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen)
         }
         None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen),
+    }
+}
+
+/// True when `t` is a builtin iterator (or `Chars`) whose std type is
+/// Clone and whose stored state is plain data, so a bitwise copy is its
+/// clone (cgen's `Clone` of a C tuple of Copy fields): every stored
+/// part is a shared slice or `&str`, an index or flag, a Copy value (a
+/// closure with Copy captures, a Copy pattern, a Copy item in a
+/// `Peekable` slot), or such an iterator. Owning and mutable iterators
+/// (`vec::IntoIter`, `IterMut`, the drains, the hash iterators, `Args`)
+/// and core's slice `SplitN`/`RSplitN` (not Clone) stay false.
+pub fn iter_clone_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    use crate::ty::iter::{Field, IterKind as K, SliceSplitMode};
+    if tys.is_chars_ty(t) {
+        return true;
+    }
+    let Some((k, a)) = crate::ty::iter::iter_parts(tys, t) else { return false };
+    let part = |t: Ty| if crate::ty::iter::is_iter(tys, t) { iter_clone_is_copy(p, tys, t) } else { is_copy(p, tys, t) };
+    let ok_kind = match k {
+        K::SliceIter | K::Range | K::RangeInclusive | K::Map | K::Filter | K::Enumerate | K::Rev | K::Take | K::Skip | K::Chain | K::Zip => true,
+        K::Copied | K::Cloned | K::FilterMap | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::RepeatN | K::ByNext => true,
+        K::Windows | K::CharIndices | K::Flatten | K::OptionIntoIter | K::OptionIter | K::ResultIter | K::ResultIntoIter => true,
+        K::StrSplit | K::StrMatches | K::EncodeUtf16 | K::Chunks | K::ChunksExact | K::Utf8Chunks => true,
+        K::SliceSplit => {
+            a.get(2).and_then(|&m| crate::ty::iter::slice_split_mode(tys, m)).is_some_and(|m| !matches!(m, SliceSplitMode::SplitN | SliceSplitMode::RSplitN))
+        }
+        _ => false,
+    };
+    ok_kind
+        && k.fields().iter().all(|f| match *f {
+            Field::Usize | Field::Bool | Field::Chars | Field::Str | Field::OptRef(_, false) | Field::SliceRef(_, false) => true,
+            Field::Arg(i) | Field::OptArg(i) => a.get(i as usize).is_some_and(|&t| part(t)),
+            Field::PeekSlot(i) => a.get(i as usize).is_some_and(|&t| iter_item_is_copy(p, tys, t)),
+            _ => false,
+        })
+}
+
+/// True when the item type of the builtin iterator `t` is Copy, by its
+/// kind (no interning; `ty::iter::item_ty` builds the type itself).
+fn iter_item_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    use crate::ty::iter::IterKind as K;
+    if tys.is_chars_ty(t) {
+        return true;
+    }
+    let Some((k, a)) = crate::ty::iter::iter_parts(tys, t) else { return false };
+    let arg = |i: usize| a.get(i).copied().unwrap_or(ERROR);
+    match k {
+        K::SliceIter | K::Windows | K::Chunks | K::ChunksExact | K::SliceSplit | K::CharIndices | K::StrSplit | K::StrMatches | K::EncodeUtf16 => true,
+        K::OptionIter | K::ResultIter | K::Range | K::RangeInclusive => true,
+        K::Map | K::FilterMap => is_copy(p, tys, arg(2)),
+        K::Copied | K::Cloned => is_copy(p, tys, arg(1)),
+        K::OptionIntoIter | K::ResultIntoIter | K::RepeatN => is_copy(p, tys, arg(0)),
+        K::ByNext => is_copy(p, tys, arg(1)),
+        K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate | K::Chain => {
+            iter_item_is_copy(p, tys, arg(0))
+        }
+        K::Zip => iter_item_is_copy(p, tys, arg(0)) && iter_item_is_copy(p, tys, arg(1)),
+        _ => false,
     }
 }
 

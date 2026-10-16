@@ -4625,6 +4625,10 @@ impl<'p> Ctx<'p> {
             TyKind::Closure(..) if trait_def == lang.copy || trait_def == lang.clone => {}
             // core's `impl<F: FnPtr> Hash for F` (the address).
             TyKind::FnPtr(_) => return trait_def == lang.hash,
+            // A builtin iterator std makes Clone (`iter_clone_is_copy`).
+            TyKind::Adt(..) if trait_def == lang.clone && (self.tys.is_chars_ty(self_ty) || crate::ty::iter::iter_parts(&self.tys, self_ty).is_some()) => {
+                return crate::check::collect::iter_clone_is_copy(p, &self.tys, self_ty);
+            }
             // core's `impl Debug for !` (`catch_unwind` of a closure that
             // always panics gives `Result<!, _>`; W-UNWIND).
             TyKind::Never => return trait_def == lang.debug,

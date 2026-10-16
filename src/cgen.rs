@@ -404,6 +404,14 @@ fn iter_item_cty(tys: &impl TyIntern, t: Ty) -> CTy {
         K::StrSplit => CTy::Ref(Box::new(CTy::Str)),
         K::Args => CTy::String,
         K::SliceSplit | K::SliceSplitMut => CTy::Slice(Box::new(cty(tys, a[0]))),
+        // As `ty::iter::item_ty`: the chunk slices, the matches' `&str`
+        // (with the byte offset for the indexed modes), UTF-16 units.
+        K::Chunks | K::ChunksMut | K::ChunksExact | K::ChunksExactMut => CTy::Slice(Box::new(cty(tys, a[0]))),
+        K::StrMatches => match crate::ty::iter::matches_mode(tys, a[1]) {
+            Some(m) if m.indexed() => CTy::Tuple(vec![CTy::Int(IntTy::Usize), CTy::Ref(Box::new(CTy::Str))]),
+            _ => CTy::Ref(Box::new(CTy::Str)),
+        },
+        K::EncodeUtf16 => CTy::Int(IntTy::U16),
         _ => iter_item_cty(tys, a[0]),
     }
 }
