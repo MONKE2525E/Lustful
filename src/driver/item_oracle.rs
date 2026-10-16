@@ -96,8 +96,10 @@ impl Digest {
                 d.impl_sets.insert((rec.def, head), p.read_fingerprint(&ReadKey::ImplSet(key)).fingerprint);
             }
         }
-        for &def in p.const_defs.iter().chain(&p.static_defs) {
-            d.names.entry(def).or_insert_with(|| "const or static".to_string());
+        let consts = p.const_defs.iter().zip(p.consts.iter().map(|c| ("const", c.name)));
+        let statics = p.static_defs.iter().zip(p.statics.iter().map(|s| ("static", s.name)));
+        for (&def, (kind, name)) in consts.chain(statics) {
+            d.names.entry(def).or_insert_with(|| format!("{kind} {}", p.interner.get(name)));
             d.defs.insert(def, DefFacts { sig: sig(def), layout: None, class: None });
         }
         for (&od, &t) in &p.gx.opaque_hidden {
@@ -243,7 +245,10 @@ pub(super) fn check(
     let mut cold_tables = cold.tables;
     cold_tables.std_ranges.clone_from(&std_ranges);
     let mut reuse = crate::driver::gen_reuse::GenReuse::default();
-    let mut order = crate::check::collect::DefOrder::default();
+    // The session's def numbering (static and Adt indices), which the
+    // warm collect grew: the cold program numbers its defs the same way.
+    let o = &front.def_order;
+    let mut order = crate::check::collect::DefOrder { adts: o.adts.clone(), statics: o.statics.clone(), instances: o.instances.clone() };
     let collected = crate::check::collect::collect_reuse(
         Arc::new(ast),
         front.interner.clone(),
