@@ -861,21 +861,32 @@ impl fmt::Debug for StdioField {
     }
 }
 
+/// Bytes std holds as a `CString` in a `Command`: `ByteStr`'s Debug.
+struct CBytes<'a>(&'a [u8]);
+
+impl fmt::Debug for CBytes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        crate::ffi::__lust_bytestr_debug(self.0, f)
+    }
+}
+
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if f.alternate() {
-            let mut args: Vec<OsString> = vec![os_string(self.argv0())];
+            // std keeps the program, argv, and cwd as CStrings: their
+            // Debug is `ByteStr`'s (`CBytes`).
+            let mut args: Vec<CBytes<'_>> = vec![CBytes(self.argv0())];
             for i in 0..self.args.len() {
-                args.push(os_string(&self.args[i]));
+                args.push(CBytes(&self.args[i]));
             }
             let mut s = f.debug_struct("Command");
-            s.field("program", &os_string(&self.program));
+            s.field("program", &CBytes(&self.program));
             s.field("args", &args);
             if self.clear || !self.envs.is_empty() {
                 s.field("env", &EnvDebug { clear: self.clear, envs: &self.envs });
             }
             if let Some(cwd) = &self.cwd {
-                s.field("cwd", &Some(PathBuf::from_os_string(os_string(cwd))));
+                s.field("cwd", &Some(CBytes(cwd)));
             }
             if let Some(cfg) = &self.stdin {
                 s.field("stdin", &Some(StdioField(cfg.kind)));
@@ -890,7 +901,7 @@ impl fmt::Debug for Command {
             return s.finish();
         }
         if let Some(cwd) = &self.cwd {
-            write!(f, "cd {:?} && ", PathBuf::from_os_string(os_string(cwd)))?;
+            write!(f, "cd {:?} && ", CBytes(cwd))?;
         }
         if self.clear || !self.envs.is_empty() {
             // The `env` command is only needed to clear or remove
@@ -927,9 +938,9 @@ impl fmt::Debug for Command {
         }
         // std prints a changed argv[0] after the program in brackets.
         if *self.argv0() != self.program {
-            write!(f, "[{:?}] ", os_string(&self.program))?;
+            write!(f, "[{:?}] ", CBytes(&self.program))?;
         }
-        write!(f, "{:?}", os_string(self.argv0()))?;
+        write!(f, "{:?}", CBytes(self.argv0()))?;
         for i in 0..self.args.len() {
             write!(f, " {:?}", os_string(&self.args[i]))?;
         }

@@ -455,52 +455,51 @@ impl CStr {
 }
 
 impl fmt::Debug for CStr {
-    // std's form: quoted, valid text as text, ", \, \n, \r, \t named,
-    // other control and invalid bytes as lowercase \xNN.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("\"")?;
-        let mut rest = self.to_bytes();
-        while !rest.is_empty() {
-            let valid = core::intrinsics::sys_utf8_valid_up_to(rest);
-            let text = &rest[..valid];
-            let mut run = 0usize;
-            for i in 0..text.len() {
-                let b = text[i];
-                let esc: Option<&str> = match b {
-                    b'"' => Some("\\\""),
-                    b'\\' => Some("\\\\"),
-                    b'\n' => Some("\\n"),
-                    b'\r' => Some("\\r"),
-                    b'\t' => Some("\\t"),
-                    0x00..=0x1f | 0x7f => None,
-                    _ => {
-                        run += 1;
-                        continue;
-                    }
-                };
-                if run > 0 {
-                    f.write_str(core::intrinsics::sys_bytes_as_str(&text[i - run..i]))?;
-                    run = 0;
-                }
-                match esc {
-                    Some(e) => f.write_str(e)?,
-                    None => write!(f, "\\x{:02x}", b)?,
-                }
-            }
-            if run > 0 {
-                f.write_str(core::intrinsics::sys_bytes_as_str(&text[text.len() - run..]))?;
-            }
-            if valid == rest.len() {
-                break;
-            }
-            let bad = invalid_len(&rest[valid..]);
-            for k in 0..bad {
-                write!(f, "\\x{:02x}", rest[valid + k])?;
-            }
-            rest = &rest[valid + bad..];
-        }
-        f.write_str("\"")
+        __lust_bytestr_debug(self.to_bytes(), f)
     }
+}
+
+/// std's `ByteStr` Debug, which `CStr` and `CString` use (and
+/// `process::Command` and `os::unix::net::SocketAddr` print through):
+/// quoted; NUL as `\0`; an ASCII char as `u8::escape_ascii` gives it
+/// (`\t`, `\r`, `\n`, `\\`, `\'`, `\"`, other controls `\xNN`); other
+/// valid text by `char::escape_debug`; invalid bytes as `\xNN`.
+pub fn __lust_bytestr_debug(bytes: &[u8], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("\"")?;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let valid = core::intrinsics::sys_utf8_valid_up_to(rest);
+        let text = core::intrinsics::sys_bytes_as_str(&rest[..valid]);
+        for c in text.chars() {
+            match c {
+                '\0' => f.write_str("\\0")?,
+                '\t' => f.write_str("\\t")?,
+                '\r' => f.write_str("\\r")?,
+                '\n' => f.write_str("\\n")?,
+                '\\' => f.write_str("\\\\")?,
+                '\'' => f.write_str("\\'")?,
+                '"' => f.write_str("\\\"")?,
+                ' '..='~' => write!(f, "{}", c)?,
+                '\x01'..='\x7f' => write!(f, "\\x{:02x}", c as u32)?,
+                _ => {
+                    // `char::escape_debug`: the char's Debug without
+                    // its quotes (no quote char is above U+007F).
+                    let d = format!("{:?}", c);
+                    f.write_str(&d[1..d.len() - 1])?;
+                }
+            }
+        }
+        if valid == rest.len() {
+            break;
+        }
+        let bad = invalid_len(&rest[valid..]);
+        for k in 0..bad {
+            write!(f, "\\x{:02x}", rest[valid + k])?;
+        }
+        rest = &rest[valid + bad..];
+    }
+    f.write_str("\"")
 }
 
 impl PartialEq for CStr {

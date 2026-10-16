@@ -191,7 +191,11 @@ impl core::fmt::Debug for SocketAddr {
                 Some(p) => write!(f, "{p:?} (pathname)"),
                 None => f.write_str("(unnamed)"),
             },
-            KIND_ABSTRACT => write!(f, "{:?} (abstract)", String::from_utf8_lossy(&self.name)),
+            KIND_ABSTRACT => {
+                // std prints the name as a `ByteStr`.
+                std::ffi::__lust_bytestr_debug(&self.name, f)?;
+                f.write_str(" (abstract)")
+            }
             _ => f.write_str("(unnamed)"),
         }
     }
