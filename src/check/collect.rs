@@ -4738,17 +4738,20 @@ pub fn collect_reuse(
     let deferred_debug = check_derive_fields(&p, &|_| true, &mut errs);
     p.gx.deferred_debug_fields.extend(deferred_debug);
 
-    // Unsized newtypes (W-SHIM): a non-generic struct whose only field
-    // is `str`, `[T]`, or another unsized newtype is itself unsized and
-    // laid out as that field (`std::path::Path`, `std::ffi::OsStr`).
-    // Nested ones settle in a fixpoint, whatever the declaration order.
+    // Unsized newtypes (W-SHIM): a struct whose only field is `str`,
+    // `[T]`, or (non-generic only) another unsized newtype is itself
+    // unsized and laid out as that field (`std::path::Path`,
+    // `std::ffi::OsStr`, indexmap's `map::Slice<K, V>` over
+    // `[Bucket<K, V>]`). Nested ones settle in a fixpoint, whatever the
+    // declaration order.
     loop {
         let mut grew = false;
         for (i, adt) in p.adts.iter().enumerate() {
             let [v] = adt.variants.as_slice() else { continue };
             let [f] = v.fields.as_slice() else { continue };
             let Some(def) = p.tys.def_of_local_adt(AdtId(i as u32)) else { continue };
-            if adt.is_enum || p.tys.unsized_field(def).is_some() || p.gx.adt_generics.get(i).is_some_and(|g| !g.params.is_empty()) {
+            let generic = p.gx.adt_generics.get(i).is_some_and(|g| !g.params.is_empty());
+            if adt.is_enum || p.tys.unsized_field(def).is_some() || (generic && !matches!(p.tys.kind(f.ty), TyKind::Str | TyKind::Slice(_))) {
                 continue;
             }
             if matches!(p.tys.kind(f.ty), TyKind::Str | TyKind::Slice(_)) || !is_sized_ty(&p.tys, f.ty) {

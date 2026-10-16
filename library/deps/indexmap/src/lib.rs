@@ -4,7 +4,7 @@
 // src/inner.rs, so insertion order, capacity, and the Hash and Eq calls
 // a key sees match upstream for the same hasher. Not here (they reject
 // at the use): Equivalent (lookups take `K: Borrow<Q>` as std maps do),
-// slices, drain, splice, raw entries, sorted inserts, the rayon, serde,
+// most of map::Slice (as_slice and its read-only core are here), drain, splice, raw entries, sorted inserts, the rayon, serde,
 // and borsh features, and the indexmap!/indexset! macros.
 
 mod indices;

@@ -22,9 +22,13 @@ Lust adapter crate (docs/ARCH.md section 3.6). Gate:
   `sort_unstable_by`, `sort_unstable_by_key`, `reverse`, `get_index`,
   `get_index_mut`, `first`, `last`, `first_mut`, `last_mut`,
   `swap_remove_index`, `shift_remove_index`, `move_index`,
-  `swap_indices`; `IntoIterator`, `Extend`, `FromIterator`, `Index`,
+  `swap_indices`, `as_slice`; `IntoIterator` (by value, `&`, `&mut`), `Extend`, `FromIterator`, `Index`,
   `Clone`, `Default`, `Debug`, `PartialEq`, `Eq`.
 - `IndexSet<T, S = RandomState>` over `IndexMap<T, (), S>`, as upstream.
+- `map::Slice<K, V>`, an unsized newtype over the entries as upstream:
+  `len`, `is_empty`, `first`, `last` (const, as upstream), `get_index`,
+  `iter`, `keys`, `values`, `IntoIterator for &Slice`, `Debug`,
+  `PartialEq<Slice<K2, V2>>` (order counts, upstream's `slice_eq`), `Eq`.
 - The hash index is hashbrown 0.17.1's table logic for usize slots and
   the core is upstream's src/inner.rs, so order, capacity, and the Hash
   and Eq calls a key sees match upstream for the same hasher. Checked
@@ -34,7 +38,8 @@ Lust adapter crate (docs/ARCH.md section 3.6). Gate:
 
 ## Rejected (lust error, never a different answer)
 
-- `Equivalent` (lookups take `K: Borrow<Q>`, as std maps do), slices,
+- `Equivalent` (lookups take `K: Borrow<Q>`, as std maps do), the other
+  `Slice` items (mutable and boxed slices, ranges, ordering, hashing),
   `drain`, `splice`, `extract_if`, raw entries, sorted inserts,
   `insert_before`, `shift_insert`, `replace_index`, `get_disjoint_mut`,
   the `indexmap!`/`indexset!` macros, and the rayon, serde, borsh,

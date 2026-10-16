@@ -258,10 +258,14 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
             _ => CTy::Ptr(Box::new(cty(tys, e))),
         },
         // An unsized newtype is laid out as its field (W-SHIM).
-        TyKind::Adt(d, _) if let Some(f) = tys.unsized_field(d) => match tys.local_adt(t) {
-            Some(a) => CTy::Unsized(a, Box::new(cty(tys, f))),
-            None => cty(tys, f),
-        },
+        TyKind::Adt(d, a) if let Some(f) = tys.unsized_field(d) => {
+            // A generic one lays out as its instance's field.
+            let f = if tys.args(a).is_empty() { f } else { tys.unsized_inst_field(d, a).unwrap_or(f) };
+            match tys.local_adt(t) {
+                Some(a) => CTy::Unsized(a, Box::new(cty(tys, f))),
+                None => cty(tys, f),
+            }
+        }
         TyKind::Adt(..) => match tys.builtin_of(t) {
             Some(BuiltinTy::String) => CTy::String,
             Some(BuiltinTy::Vec) => CTy::Vec(Box::new(cty(tys, tys.adt_first_ty_arg(t).unwrap_or(ERROR)))),

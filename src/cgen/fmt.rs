@@ -1224,9 +1224,9 @@ pub(super) fn unsized_slice_elem(p: &Program, mut b: Ty) -> Option<Ty> {
         match p.tys.kind(b) {
             TyKind::Slice(e) => return Some(e),
             TyKind::Adt(d, a) => {
-                let f = p.tys.unsized_field(d)?;
+                let mut f = p.tys.unsized_field(d)?;
                 if !p.tys.args(a).is_empty() && p.tys.flags(f).contains_param() {
-                    return None;
+                    f = p.tys.unsized_inst_field(d, a)?;
                 }
                 b = f;
             }

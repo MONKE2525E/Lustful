@@ -874,8 +874,14 @@ pub trait TyIntern {
     /// The def of the user Adt with this session-local index, if registered.
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId>;
     /// The unsized field of an unsized newtype Adt (W-SHIM; see
-    /// `GlobalTys::unsized_adts`), None for every other def.
+    /// `GlobalTys::unsized_adts`), None for every other def. For a
+    /// generic one this is the template's field (it names the params).
     fn unsized_field(&self, _def: DefId) -> Option<Ty> {
+        None
+    }
+    /// The field of one instance of a generic unsized newtype, made by
+    /// mono (`register_unsized_inst`); None before that.
+    fn unsized_inst_field(&self, _def: DefId, _args: ArgsId) -> Option<Ty> {
         None
     }
     /// True when `t` lives in the global store, so a fresh store over
@@ -1309,10 +1315,13 @@ pub struct GlobalTys {
     /// order where registered: `Adt(def, args)` with the instance's
     /// args, not always `EMPTY_ARGS`.
     adt_full_tys: Vec<Option<Ty>>,
-    /// Unsized newtypes (W-SHIM): a non-generic struct whose only field
-    /// is unsized (`str`, `[T]`, or another such struct), by def, to that
-    /// field's type. `std::path::Path` and `std::ffi::OsStr` are these.
+    /// Unsized newtypes (W-SHIM): a struct whose only field is unsized
+    /// (`str`, `[T]`, or, non-generic only, another such struct), by
+    /// def, to that field's type. `std::path::Path`, `std::ffi::OsStr`,
+    /// and indexmap's generic `map::Slice<K, V>` are these.
     unsized_adts: FxMap<DefId, Ty>,
+    /// The field of each mono instance of a generic unsized newtype.
+    unsized_insts: FxMap<(DefId, ArgsId), Ty>,
 }
 
 impl GlobalTys {
@@ -1356,6 +1365,7 @@ impl GlobalTys {
             adt_c_canon: FxMap::default(),
             adt_full_tys: Vec::new(),
             unsized_adts: FxMap::default(),
+            unsized_insts: FxMap::default(),
         };
         // The intern calls must stay out of the assertions: `debug_assert_eq!`
         // drops its arguments in release builds, which would skip the interning.
@@ -1454,6 +1464,11 @@ impl GlobalTys {
     /// once its single field type is known to be unsized.
     pub fn register_unsized_adt(&mut self, def: DefId, field: Ty) {
         self.unsized_adts.insert(def, field);
+    }
+    /// Records the field of one instance of a generic unsized newtype
+    /// (mono's `adt_instance`).
+    pub fn register_unsized_inst(&mut self, def: DefId, args: ArgsId, field: Ty) {
+        self.unsized_insts.insert((def, args), field);
     }
     /// Records one materialized generic Adt instance: its applied
     /// type (already interned) and its session-local index. The
@@ -1580,6 +1595,9 @@ impl TyIntern for GlobalTys {
     }
     fn unsized_field(&self, def: DefId) -> Option<Ty> {
         self.unsized_adts.get(&def).copied()
+    }
+    fn unsized_inst_field(&self, def: DefId, args: ArgsId) -> Option<Ty> {
+        self.unsized_insts.get(&(def, args)).copied()
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
         self.adt_defs.get(local.0 as usize).copied().filter(|d| *d != DefId::PLACEHOLDER)
@@ -1769,6 +1787,9 @@ impl TyIntern for Tys<'_> {
     }
     fn unsized_field(&self, def: DefId) -> Option<Ty> {
         self.global.unsized_field(def)
+    }
+    fn unsized_inst_field(&self, def: DefId, args: ArgsId) -> Option<Ty> {
+        self.global.unsized_inst_field(def, args)
     }
     fn is_global_ty(&self, t: Ty) -> bool {
         t.0 < self.global.kinds.len()

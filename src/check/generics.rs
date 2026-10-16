@@ -10444,6 +10444,12 @@ fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId 
     p.adts[at] =
         crate::check::collect::AdtDef::new(name, is_enum, variants, derives, span, p.adt(template).repr, adt_ne);
     p.tys.register_adt_instance(def, args_id, id);
+    // A generic unsized newtype's instance field, for its C form.
+    if p.tys.unsized_field(def).is_some()
+        && let Some(f) = p.adts[at].variants.first().and_then(|v| v.fields.first()).map(|f| f.ty)
+    {
+        p.tys.register_unsized_inst(def, args_id, f);
+    }
     p.defs.insert_adt_instance(def, id);
     p.gx.adt_info[at] = (def, args.len());
     let full = p.tys.full_adt_ty(id).unwrap();

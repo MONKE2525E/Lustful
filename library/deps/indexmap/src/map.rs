@@ -67,6 +67,11 @@ impl<K, V, S> IndexMap<K, V, S> {
         Iter { entries: &self.core.entries, front: 0, back: self.core.entries.len() }
     }
 
+    /// All entries as a `Slice`, in order.
+    pub fn as_slice(&self) -> &Slice<K, V> {
+        Slice::from_slice(self.core.entries.as_slice())
+    }
+
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
         IterMut { inner: self.core.entries.iter_mut() }
     }
@@ -801,6 +806,100 @@ impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
 }
 
 impl<K, V> ExactSizeIterator for IntoIter<K, V> {}
+
+/// A dynamically-sized slice of an `IndexMap`'s entries (upstream's
+/// `map::Slice`, `#[repr(transparent)]` over `[Bucket<K, V>]`). Unlike
+/// `IndexMap`, its `PartialEq` and `Eq` consider order. lust makes the
+/// reference from the entries by its shipped-source coercion of a
+/// reference to an unsized newtype's field (upstream: a pointer cast).
+#[repr(transparent)]
+pub struct Slice<K, V> {
+    pub(crate) entries: [Bucket<K, V>],
+}
+
+impl<K, V> Slice<K, V> {
+    pub(crate) fn from_slice(entries: &[Bucket<K, V>]) -> &Self {
+        entries
+    }
+
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn get_index(&self, index: usize) -> Option<(&K, &V)> {
+        match self.entries.get(index) {
+            Some(b) => Some((&b.key, &b.value)),
+            None => None,
+        }
+    }
+
+    pub const fn first(&self) -> Option<(&K, &V)> {
+        match self.entries.first() {
+            Some(b) => Some((&b.key, &b.value)),
+            None => None,
+        }
+    }
+
+    pub const fn last(&self) -> Option<(&K, &V)> {
+        match self.entries.last() {
+            Some(b) => Some((&b.key, &b.value)),
+            None => None,
+        }
+    }
+
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter { entries: &self.entries, front: 0, back: self.entries.len() }
+    }
+
+    pub fn keys(&self) -> Keys<'_, K, V> {
+        Keys { inner: self.iter() }
+    }
+
+    pub fn values(&self) -> Values<'_, K, V> {
+        Values { inner: self.iter() }
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a Slice<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Iter<'a, K, V> {
+        self.iter()
+    }
+}
+
+impl<K: core::fmt::Debug, V: core::fmt::Debug> core::fmt::Debug for Slice<K, V> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Upstream passes `self` (its `IntoIterator` is `iter`).
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Upstream's `slice_eq`: lengths, then each pair by index, in order.
+impl<K, V, K2, V2> PartialEq<Slice<K2, V2>> for Slice<K, V>
+where
+    K: PartialEq<K2>,
+    V: PartialEq<V2>,
+{
+    fn eq(&self, other: &Slice<K2, V2>) -> bool {
+        if self.entries.len() != other.entries.len() {
+            return false;
+        }
+        for i in 0..self.entries.len() {
+            if !(self.entries[i].key == other.entries[i].key && self.entries[i].value == other.entries[i].value) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl<K: Eq, V: Eq> Eq for Slice<K, V> {}
 
 impl<K, V, S> IntoIterator for IndexMap<K, V, S> {
     type Item = (K, V);

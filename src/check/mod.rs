@@ -6406,11 +6406,18 @@ impl<'p> Ctx<'p> {
     /// True when `field` is the unsized field of the newtype `outer`,
     /// directly or through nested newtypes (W-SHIM coercion in shipped
     /// std source).
-    fn newtype_field_of(&self, outer: Ty, field: Ty) -> bool {
+    fn newtype_field_of(&mut self, outer: Ty, field: Ty) -> bool {
         let mut t = outer;
-        while let TyKind::Adt(d, _) = self.kind(t) {
+        while let TyKind::Adt(d, a) = self.kind(t) {
             let Some(f) = self.tys.unsized_field(d) else { return false };
-            if f == field {
+            // A generic newtype's field under the outer type's args.
+            let f = if self.tys.args(a).is_empty() {
+                f
+            } else {
+                let args: Vec<GenericArg> = self.tys.args(a).to_vec();
+                subst(&mut self.tys, f, &args)
+            };
+            if f == field || self.deep(f) == self.deep(field) {
                 return true;
             }
             t = f;
