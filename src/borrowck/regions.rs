@@ -5444,8 +5444,21 @@ impl<'b, 'p> Builder<'b, 'p> {
         let vv = v0[1 + nk..1 + nk + nv].to_vec();
         self.relate(v, &vv, v, dv, Variance::Co);
         if b == crate::check::Builtin::MapInsert {
-            let others: Vec<u32> = avs[1..].iter().flat_map(|(_, v)| v.iter().copied()).collect();
-            self.flow_all(&others, &v0[1..]);
+            // The key flows into the map's K slots and the value into its
+            // V slots (`HashMap<&'a str, &'static str>::insert(k, v)`: `k`
+            // need not be `'static`).
+            let (kmap, vmap) = (v0[1..1 + nk].to_vec(), v0[1 + nk..1 + nk + nv].to_vec());
+            let paired = match &avs[1..] {
+                [(kt, kv), (vt, vv)] => {
+                    let (kt, kv, vt, vv) = (*kt, kv.clone(), *vt, vv.clone());
+                    (kv.is_empty() || self.relate(kt, &kv, k, &kmap, Variance::Co)) && (vv.is_empty() || self.relate(vt, &vv, v, &vmap, Variance::Co))
+                }
+                _ => false,
+            };
+            if !paired {
+                let others: Vec<u32> = avs[1..].iter().flat_map(|(_, v)| v.iter().copied()).collect();
+                self.flow_all(&others, &v0[1..]);
+            }
         }
         true
     }
