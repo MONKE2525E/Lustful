@@ -248,15 +248,17 @@ impl<'p> Ctx<'p> {
         rs.contains(&Region::Static)
     }
 
-    /// `t` with every region `Region::Bound(0)`, Adt lifetime args
-    /// included: the output of a `dyn Fn` signature, whose regions are all
-    /// the one input region's (`ClosureInfo::bound_output`).
+    /// `t` with every region but a written `'static` `Region::Bound(0)`,
+    /// Adt lifetime args included: the written output of a `dyn Fn`
+    /// signature (`dyn_fn_written_out`), whose other regions are all the
+    /// one input region's (`ClosureInfo::bound_output`). An Adt without
+    /// lifetime args (erased) gets `Bound(0)` for each.
     fn rebind_bound(&mut self, t: Ty) -> Ty {
-        let b = Region::Bound(0);
+        let b = |r: Region| if r == Region::Static { r } else { Region::Bound(0) };
         match self.kind(t) {
-            TyKind::Ref(_, m, e) => {
+            TyKind::Ref(r, m, e) => {
                 let e = self.rebind_bound(e);
-                self.tys.intern(TyKind::Ref(b, m, e))
+                self.tys.intern(TyKind::Ref(b(r), m, e))
             }
             TyKind::Tuple(ts) => {
                 let es: Vec<Ty> = self.tys.tys_of(ts).to_vec().into_iter().map(|e| self.rebind_bound(e)).collect();
@@ -273,8 +275,10 @@ impl<'p> Ctx<'p> {
             }
             TyKind::Adt(d, args) => {
                 let n = self.p.gx.adt_lifetimes.get(&d).map_or(0, |v| v.len());
-                let mut new: Vec<GenericArg> = vec![GenericArg::Lifetime(b); n];
-                for g in self.tys.args(args).to_vec() {
+                let old = self.tys.args(args).to_vec();
+                let lts: Vec<Region> = old.iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+                let mut new: Vec<GenericArg> = (0..n).map(|i| GenericArg::Lifetime(b(lts.get(i).copied().unwrap_or(Region::Erased)))).collect();
+                for g in old {
                     match g {
                         GenericArg::Ty(e) => new.push(GenericArg::Ty(self.rebind_bound(e))),
                         GenericArg::Lifetime(_) => {}
@@ -285,6 +289,49 @@ impl<'p> Ctx<'p> {
                 self.tys.intern(TyKind::Adt(d, a))
             }
             _ => t,
+        }
+    }
+
+    /// `t` with each `DYN_LATE` region `Erased`, Adt lifetime args kept
+    /// (`ty::unbind` drops them): a dyn's written output as a closure's
+    /// `output_region`, its `'static` slots pinned and the others free.
+    fn late_erased(&mut self, t: Ty) -> Ty {
+        let t = self.deep(t);
+        let late = |r: Region| if r == crate::ty::DYN_LATE { Region::Erased } else { r };
+        match self.kind(t) {
+            TyKind::Ref(r, m, e) => {
+                let e = self.late_erased(e);
+                self.tys.intern(TyKind::Ref(late(r), m, e))
+            }
+            TyKind::Tuple(ts) => {
+                let es: Vec<Ty> = self.tys.tys_of(ts).to_vec().into_iter().map(|e| self.late_erased(e)).collect();
+                let ts = self.tys.intern_tys(&es);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Slice(e) => {
+                let e = self.late_erased(e);
+                self.tys.intern(TyKind::Slice(e))
+            }
+            TyKind::Array(e, n) => {
+                let e = self.late_erased(e);
+                self.tys.intern(TyKind::Array(e, n))
+            }
+            TyKind::Adt(d, args) => {
+                let new: Vec<GenericArg> = self
+                    .tys
+                    .args(args)
+                    .to_vec()
+                    .into_iter()
+                    .map(|g| match g {
+                        GenericArg::Ty(e) => GenericArg::Ty(self.late_erased(e)),
+                        GenericArg::Lifetime(r) => GenericArg::Lifetime(late(r)),
+                        c => c,
+                    })
+                    .collect();
+                let a = self.tys.intern_args(&new);
+                self.tys.intern(TyKind::Adt(d, a))
+            }
+            _ => crate::ty::unbind(&mut self.tys, t),
         }
     }
 
@@ -385,6 +432,15 @@ impl<'p> Ctx<'p> {
     /// late-bound regions made plain (`ty::unbind`). None for another
     /// type.
     pub(super) fn dyn_fn_parts(&mut self, t: Ty) -> Option<(DefId, Ty, Ty)> {
+        let (def, tuple, out) = self.dyn_fn_written(t)?;
+        let (tuple, out) = (crate::ty::unbind(&mut self.tys, tuple), crate::ty::unbind(&mut self.tys, out));
+        Some((def, tuple, out))
+    }
+
+    /// `dyn_fn_parts` before `ty::unbind`: the object's late-bound regions
+    /// are `DYN_LATE`, and an Adt keeps its lifetime args, a written
+    /// `'static` among them (R11), which `unbind` drops.
+    fn dyn_fn_written(&mut self, t: Ty) -> Option<(DefId, Ty, Ty)> {
         let lang = self.p.gx.lang;
         let pr = crate::check::object::principal_of(&self.tys, self.resolve(t))?;
         if !lang.is_fn_family(pr.def) {
@@ -393,7 +449,6 @@ impl<'p> Ctx<'p> {
         let tuple = self.tys.args(pr.args).get(1).and_then(|g| g.as_ty())?;
         let out_def = lang.output_of(lang.fn_once)?;
         let out = self.tys.bindings(pr.bindings).iter().find(|(d, _)| *d == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
-        let (tuple, out) = (crate::ty::unbind(&mut self.tys, tuple), crate::ty::unbind(&mut self.tys, out));
         Some((pr.def, tuple, out))
     }
 
@@ -415,6 +470,7 @@ impl<'p> Ctx<'p> {
         let mut to_fn_ptr: Option<(Ty, Ty, Ty)> = None;
         let mut dyn_sig: Option<(Ty, Option<Ty>)> = None;
         let mut dyn_out: Option<Ty> = None;
+        let mut dyn_written_out: Option<Ty> = None;
         if let Some(t) = expected {
             let t = self.resolve(t);
             match self.kind(t) {
@@ -440,6 +496,7 @@ impl<'p> Ctx<'p> {
                     if let Some((_, tuple, out)) = self.dyn_fn_parts(t) {
                         dyn_sig = Some((tuple, Some(out)));
                         dyn_out = Some(out);
+                        dyn_written_out = self.dyn_fn_written(t).map(|w| w.2);
                     }
                 }
                 _ => {}
@@ -465,7 +522,7 @@ impl<'p> Ctx<'p> {
             .unwrap_or_default();
         let call_out = expected.is_some_and(|t| matches!(self.kind(self.resolve(t)), TyKind::Infer(v) if self.closure_call_outs.contains(&v.0)));
         let bound_output = bound_output.or_else(|| {
-            let o = self.deep(dyn_out?);
+            let o = self.deep(dyn_written_out?);
             Some(self.rebind_bound(o))
         });
         let bound_output = bound_output.or_else(|| self.fn_ptr_bound_output(to_fn_ptr?.0));
@@ -582,7 +639,11 @@ impl<'p> Ctx<'p> {
                 // W-BORROW: a `&'static` the expected fn pointer or `dyn Fn`
                 // output writes pins that slot, as a `'static` return
                 // annotation does.
-                if (dyn_out.is_some() || to_fn_ptr.is_some()) && self.has_static_region(x) {
+                // A written `'static` lifetime arg of an Adt (`W<'static,
+                // &u8>`) is only in the dyn's written output.
+                if let Some(w) = dyn_written_out.filter(|&w| self.has_static_region(w)) {
+                    output_region = Some(self.late_erased(w));
+                } else if (dyn_out.is_some() || to_fn_ptr.is_some()) && self.has_static_region(x) {
                     output_region = Some(self.deep(x));
                 }
                 x
