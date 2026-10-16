@@ -85,6 +85,21 @@ pub struct Bind {
     pub def_module: ModuleId,
 }
 
+/// What one clashing binding of an ambiguous name brings
+/// (`ResolvedTables::ambig_vis`): an item, a std alias path, or the
+/// ambiguity of a globbed module. `certain` says that ambiguity reaches
+/// the importer whichever glob rustc saw first (`ambiguous_certain`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum AmbItem {
+    Item(Target),
+    Std(Vec<Sym>),
+    Amb { certain: bool },
+}
+
+/// One clashing binding of an ambiguous name: its visibility, the
+/// module that defines privacy for it, and what it brings.
+pub type AmbEntry = (VisKind, ModuleId, AmbItem);
+
 /// One pending single import (`ResolvedTables::pending_single`).
 #[derive(Clone, Debug)]
 pub struct PendingSingle {
@@ -264,7 +279,7 @@ pub struct ResolvedTables {
     /// copies an ambiguous name only to an importer that can see one
     /// of them, as rustc imports only accessible bindings: two private
     /// globs that clash stay inside their module. Fixpoint state only.
-    pub ambig_vis: FxMap<(ModuleId, u8, Sym), Vec<(VisKind, ModuleId)>>,
+    pub ambig_vis: FxMap<(ModuleId, u8, Sym), Vec<AmbEntry>>,
     /// Single imports that read an ambiguous name, with the namespace,
     /// source module, and name read. rustc rejects such an import even
     /// when nothing uses it (E0659); `run_imports` reports the ones
@@ -759,8 +774,8 @@ impl ResolvedTables {
         {
             let alias = self.std_aliases.remove(&key);
             if bind.rank <= 1 {
-                let mut vis = vec![(bind.vis.clone(), bind.def_module)];
-                vis.extend(alias.map(|(v, _)| (v, alias_def)));
+                let mut vis: Vec<AmbEntry> = alias.map(|(v, path)| (v, alias_def, AmbItem::Std(path))).into_iter().collect();
+                vis.push((bind.vis.clone(), bind.def_module, AmbItem::Item(bind.target)));
                 let _ = self.set_ambiguous(module, ns, name, vis);
                 return InsertOut::Changed;
             }
@@ -795,7 +810,10 @@ impl ResolvedTables {
                 } else if bind.rank < old.rank {
                     InsertOut::Same
                 } else if bind.rank <= 1 {
-                    let vis = vec![(old.vis.clone(), old.def_module), (bind.vis.clone(), bind.def_module)];
+                    let vis = vec![
+                        (old.vis.clone(), old.def_module, AmbItem::Item(old.target)),
+                        (bind.vis.clone(), bind.def_module, AmbItem::Item(bind.target)),
+                    ];
                     let _ = self.set_ambiguous(module, ns, name, vis);
                     InsertOut::Changed
                 } else {
@@ -809,7 +827,7 @@ impl ResolvedTables {
                 } else {
                     // One more glob item: its visibility can carry
                     // the ambiguity onward too.
-                    if self.set_ambiguous(module, ns, name, vec![(bind.vis, bind.def_module)]) {
+                    if self.set_ambiguous(module, ns, name, vec![(bind.vis, bind.def_module, AmbItem::Item(bind.target))]) {
                         InsertOut::Changed
                     } else {
                         InsertOut::Same
@@ -822,7 +840,7 @@ impl ResolvedTables {
     /// Marks a name `Ambiguous`, with the visibilities of the bindings
     /// that clash (`ambig_vis`). A name that is already ambiguous adds
     /// them to its list. Returns true when the state or the list changed.
-    pub fn set_ambiguous(&mut self, module: ModuleId, ns: Namespace, name: Sym, vis: Vec<(VisKind, ModuleId)>) -> bool {
+    pub fn set_ambiguous(&mut self, module: ModuleId, ns: Namespace, name: Sym, vis: Vec<AmbEntry>) -> bool {
         let key = (module, ns_index(ns) as u8, name);
         let map = &mut self.maps[module.0 as usize][ns_index(ns)];
         let old = map.insert(name, BindState::Ambiguous);
@@ -833,11 +851,11 @@ impl ResolvedTables {
         }
         // A glob binding the ambiguity replaces still counts.
         let old_vis = match old {
-            Some(BindState::One(b)) if b.rank <= 1 => Some((b.vis, b.def_module)),
+            Some(BindState::One(b)) if b.rank <= 1 => Some((b.vis, b.def_module, AmbItem::Item(b.target))),
             _ => None,
         };
         let mut grew = !was;
-        for v in vis.into_iter().chain(old_vis) {
+        for v in old_vis.into_iter().chain(vis) {
             if !list.contains(&v) {
                 list.push(v);
                 grew = true;
@@ -846,12 +864,45 @@ impl ResolvedTables {
         grew
     }
 
+    /// True when the ambiguity of `name` in `src` is certain in rustc.
+    /// With `from` (a glob importer), it must also reach `from`: `from`
+    /// sees two different items among the clashing bindings, or a
+    /// certain ambiguity of a globbed module. rustc gives a propagated
+    /// ambiguity the visibility of the glob it saw first, so with one
+    /// visible item it may stay in `src`. Without `from` (an import of
+    /// the name from `src`), `src` itself must hold two different items
+    /// or a certain ambiguity: rustc reports that import whatever it
+    /// sees. A use of an uncertain name still rejects; an import that
+    /// read one is not reported for it at the end. No record counts as
+    /// certain (that only rejects).
+    pub fn ambiguous_certain(&self, src: ModuleId, ns: Namespace, name: Sym, from: Option<ModuleId>, interner: &Interner) -> bool {
+        let Some(list) = self.ambig_vis.get(&(src, ns_index(ns) as u8, name)) else { return true };
+        let mut items: Vec<&AmbItem> = Vec::new();
+        for (v, m, item) in list {
+            if let Some(from) = from
+                && !self.visible(v, *m, from, interner)
+            {
+                continue;
+            }
+            match item {
+                AmbItem::Amb { certain: true } => return true,
+                AmbItem::Amb { certain: false } => {}
+                _ if !items.contains(&item) => items.push(item),
+                _ => {}
+            }
+        }
+        items.len() >= 2
+    }
+
     /// True when an importer in `from` can see the ambiguous name
-    /// `name` of module `src` (`ambig_vis`). A name with no recorded
-    /// visibility counts as visible: the ambiguity then only rejects.
+    /// `name` of module `src` (`ambig_vis`): one of the clashing
+    /// bindings is visible there. rustc gives the ambiguity the
+    /// visibility of the glob it saw first, in its own order; any one
+    /// visible binding is the safe reading (it only rejects). A name
+    /// with no recorded visibility counts as visible.
     pub fn ambiguous_visible(&self, src: ModuleId, ns: Namespace, name: Sym, from: ModuleId, interner: &Interner) -> bool {
         match self.ambig_vis.get(&(src, ns_index(ns) as u8, name)) {
-            Some(list) if !list.is_empty() => list.iter().any(|(v, m)| self.visible(v, *m, from, interner)),
+            Some(list) if !list.is_empty() => list.iter().any(|(v, m, _)| self.visible(v, *m, from, interner)),
             _ => true,
         }
     }
@@ -975,9 +1026,9 @@ impl ResolvedTables {
         let key = (module, ns_index(ns) as u8, name);
         match self.lookup(module, ns, name) {
             Some(BindState::One(b)) if b.rank >= 2 => return false,
-            Some(BindState::Ambiguous) => return self.set_ambiguous(module, ns, name, vec![(vis, def_module)]),
+            Some(BindState::Ambiguous) => return self.set_ambiguous(module, ns, name, vec![(vis, def_module, AmbItem::Std(path))]),
             Some(BindState::One(b)) => {
-                let both = vec![(b.vis.clone(), b.def_module), (vis, def_module)];
+                let both = vec![(b.vis.clone(), b.def_module, AmbItem::Item(b.target)), (vis, def_module, AmbItem::Std(path))];
                 let _ = self.set_ambiguous(module, ns, name, both);
                 return true;
             }
@@ -992,9 +1043,10 @@ impl ResolvedTables {
             Some(_) if !self.std_glob_aliases.contains_key(&key) => false,
             Some((_, old)) if same_std_item(old, &path) => false,
             Some(_) => {
-                let (old_vis, _) = self.std_aliases.remove(&key).expect("checked above");
+                let (old_vis, old_path) = self.std_aliases.remove(&key).expect("checked above");
                 let old_def = self.std_glob_aliases.remove(&key).unwrap_or(module);
-                let _ = self.set_ambiguous(module, ns, name, vec![(old_vis, old_def), (vis, def_module)]);
+                let both = vec![(old_vis, old_def, AmbItem::Std(old_path)), (vis, def_module, AmbItem::Std(path))];
+                let _ = self.set_ambiguous(module, ns, name, both);
                 true
             }
         }
@@ -2305,20 +2357,6 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             }
                         }
                         for (ns, name, bind) in entries {
-                            // The same item by a glob of wider visibility:
-                            // the binding takes that visibility (rustc
-                            // replaces a glob binding that is not at
-                            // least as visible).
-                            if let Some(BindState::One(old)) = tables.lookup(imp.module, ns, name)
-                                && old.rank == 1
-                                && old.target == bind.target
-                                && !tables.vis_within(&bind.vis, bind.def_module, &old.vis, old.def_module, interner)
-                            {
-                                tables.maps[imp.module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
-                                tables.glob_src.insert((imp.module, ns_index(ns) as u8, name), src);
-                                changed = true;
-                                continue;
-                            }
                             if tables.insert_glob(imp.module, ns, name, bind, src) == InsertOut::Changed {
                                 changed = true;
                             }
@@ -2343,13 +2381,18 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 .collect();
                             names.sort_by(|a, b| interner.get(*a).cmp(interner.get(*b)));
                             for name in names {
+                                let certain = tables.ambiguous_certain(src, ns, name, Some(imp.module), interner);
+                                let item = AmbItem::Amb { certain };
                                 let vis = match tables.ambig_vis.get(&(src, ns_index(ns) as u8, name)) {
                                     Some(list) => list
                                         .iter()
-                                        .filter(|(v, m)| tables.visible(v, *m, imp.module, interner))
-                                        .map(|(v, m)| tables.glob_vis(imp, v, *m, interner))
+                                        .filter(|(v, m, _)| tables.visible(v, *m, imp.module, interner))
+                                        .map(|(v, m, _)| {
+                                            let (v, m) = tables.glob_vis(imp, v, *m, interner);
+                                            (v, m, item.clone())
+                                        })
                                         .collect(),
-                                    None => vec![(imp.vis.clone(), imp.module)],
+                                    None => vec![(imp.vis.clone(), imp.module, item)],
                                 };
                                 if insert_ambiguous(tables, imp.module, ns, name, vis) {
                                     tables.glob_src.insert((imp.module, ns_index(ns) as u8, name), src);
@@ -2665,7 +2708,9 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 // and the import itself is an error if
                                 // the source is still ambiguous at the end.
                                 any = true;
-                                let out = insert_ambiguous(tables, imp.module, ns, *name, vec![(imp.vis.clone(), imp.module)]);
+                                let certain = tables.ambiguous_certain(src, ns, last, None, interner);
+                                let entry = (imp.vis.clone(), imp.module, AmbItem::Amb { certain });
+                                let out = insert_ambiguous(tables, imp.module, ns, *name, vec![entry]);
                                 changed |= out;
                                 tables.ambig_single.push((imp.clone(), ns, src, last));
                             }
@@ -2839,7 +2884,9 @@ fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: 
         // A source that settled to an item the import cannot see is
         // a private import, as rustc reports it from the final tables.
         let diag = match state {
-            Some(BindState::Ambiguous) => ambiguous_diag(interner.get(last), imp.span),
+            Some(BindState::Ambiguous) if tables.ambiguous_certain(src, ns, last, None, interner) => {
+                ambiguous_diag(interner.get(last), imp.span)
+            }
             Some(BindState::One(f)) if !tables.visible(&f.vis, f.def_module, imp.module, interner) => {
                 private_diag(interner.get(last), imp.span)
             }
@@ -2922,7 +2969,9 @@ fn finalize_singles(tables: &mut ResolvedTables, interner: &Interner, diags: &mu
                 ),
                 "Import the item from the module that defines it.",
             ),
-            Some(BindState::Ambiguous) => ambiguous_diag(interner.get(last), span),
+            Some(BindState::Ambiguous) if tables.ambiguous_certain(src, ns, last, None, interner) => {
+                ambiguous_diag(interner.get(last), span)
+            }
             _ => continue,
         };
         seen.push(span);
@@ -2934,7 +2983,7 @@ fn finalize_singles(tables: &mut ResolvedTables, interner: &Interner, diags: &mu
 /// where it is ambiguous, or an explicit import of such a name. `vis`
 /// is the visibility the name gets here (`ambig_vis`). Returns true on
 /// a change, a wider visibility included.
-fn insert_ambiguous(tables: &mut ResolvedTables, module: ModuleId, ns: Namespace, name: Sym, vis: Vec<(VisKind, ModuleId)>) -> bool {
+fn insert_ambiguous(tables: &mut ResolvedTables, module: ModuleId, ns: Namespace, name: Sym, vis: Vec<AmbEntry>) -> bool {
     match tables.lookup(module, ns, name) {
         Some(BindState::One(Bind { rank: 2, .. })) => false,
         _ => tables.set_ambiguous(module, ns, name, vis),
