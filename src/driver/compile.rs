@@ -265,13 +265,15 @@ struct Visits {
     discovery: usize,
     checked: usize,
     reads: usize,
+    /// Slots the keyed walk after a header delta answered (`keyed_dirty`).
+    keyed: usize,
 }
 
 impl Visits {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={} reads={}",
+            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={} reads={} keyed={}",
             self.path,
             if self.why.is_empty() { "-".to_string() } else { self.why.replace(' ', "_") },
             self.files,
@@ -284,7 +286,8 @@ impl Visits {
             self.checked,
             if self.kept.is_empty() { "-".to_string() } else { self.kept.replace(' ', "_") },
             self.prog_spans,
-            self.reads
+            self.reads,
+            self.keyed
         );
     }
 }
@@ -710,6 +713,31 @@ fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::R
         now
     });
     par_map(sets, |r| r.map(|r| r.iter().filter(|(k, stored)| shards[shard_of(k)].get(*k) != Some(*stored)).count()))
+}
+
+/// A fresh program generation (`Program::verified`, `Reads::verified`).
+fn next_verified() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The keyed dirty walk after a header delta (Sol review 2 item 1), by
+/// slot: Some(dirty) for a read set that held against the delta's base
+/// program (`Reads::verified` of its mode is `base`), where only the keys the delta can
+/// move (`kept_delta::Touched`) may have moved, so only those compare
+/// (graph.rs `ReadIndex::dirty_slots`). None for any other slot: a read
+/// set of another program, or none; the full walk decides it.
+fn keyed_dirty(
+    p: &collect::Program,
+    front: &Front,
+    caches: &mut Caches,
+    touched: &mut crate::driver::kept_delta::Touched,
+    base: u64,
+) -> Vec<Option<bool>> {
+    let mode = usize::from(p.gx.walk_instances);
+    let def_slot = |d: def::DefId| p.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
+    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &mut |k| touched.hit(p, k), &def_slot);
+    caches.slot_reads.iter().zip(dirty).map(|(r, d)| r.as_ref().filter(|r| r.verified[mode] == base).map(|_| d)).collect()
 }
 
 /// The file's inner `allow` attributes, for seeding later chunks so a
@@ -3082,11 +3110,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // only provable body edits happened since (`patch::reuse_kept`). Its
     // laps (the signature delta's) count as collect laps.
     super::laps::start();
+    caches.header_moves = None;
     let kept = if gen_ok_here {
         super::patch::reuse_kept(front, caches, resolved_tables.as_ref(), req.cmd == Cmd::Build)
     } else {
         Err("gen state")
     };
+    // What a header delta on the kept program can move, when no derive
+    // delta ran with it (the keyed walks below).
+    let mut header_moves = caches.header_moves.take().filter(|_| kept.is_ok() && caches.derive_dirty.is_none());
     // What a derive delta on the kept program can move, when every edit of
     // this request is a derive list edit (the keyed dirty walk below).
     let derive_dirty = caches.derive_dirty.take().filter(|_| std::mem::take(&mut caches.derive_only) && kept.is_ok());
@@ -3126,8 +3158,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         changed.sort_unstable();
         caches.glue_stale = true;
     }
+    // The kept program's generation (`Program::verified`): the slot read
+    // sets marked with it held against it before this request's deltas.
+    // The program loses it here, so one kept again before this request
+    // walks its read sets (a template error) gives the next request no
+    // base.
+    let mut keyed_base = 0;
     let kept = match kept {
-        Ok((p, spans, errs)) => {
+        Ok((mut p, spans, errs)) => {
+            keyed_base = std::mem::take(&mut p.verified);
             visits.kept = "reuse";
             visits.prog_spans = spans;
             if errs.is_empty() {
@@ -3446,6 +3485,43 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         changed.retain(|&i| reused.get(i) != Some(&true));
         t.lap("reads keyed walk");
     }
+    // The keyed walk after a header delta (Sol review 2 item 1): a read
+    // set of the delta's base program can only have moved in the keys the
+    // delta moved (`keyed_dirty`). The candidates and the instance bodies
+    // below with such a set take its answer; the others (a set of another
+    // program, after a failed collect, say) go on to the full walks. The
+    // oracle proves each keyed clean set with the full walk.
+    let keyed: Option<Vec<Option<bool>>> = match header_moves.as_mut() {
+        Some(touched) if keyed_base != 0 && (!mention_only.is_empty() || program.gx.has_generics) => {
+            super::laps::start();
+            let k = keyed_dirty(&program, front, caches, touched, keyed_base);
+            t.lap("reads keyed index");
+            t.note_parts(super::laps::take());
+            Some(k)
+        }
+        _ => None,
+    };
+    let keyed_clean = |caches: &Caches, s: usize, memo: &mut FxMap<_, _>, i: usize| {
+        let clean = keyed.as_ref().is_some_and(|k| k.get(s) == Some(&Some(false)));
+        if clean && super::item_oracle::on() && caches.slot_reads[s].as_ref().is_some_and(|r| program.reads_dirty_memo(r, memo) != 0) {
+            super::item_oracle::fail("keyed clean body has dirty reads", visits.path, &i.to_string());
+        }
+        clean
+    };
+    if keyed.is_some() && !mention_only.is_empty() {
+        let mut memo = FxMap::default();
+        let mut reused = vec![false; mention_only.iter().max().map_or(0, |&m| m + 1)];
+        mention_only.retain(|&i| {
+            let clean = keyed_clean(caches, front.fn_slot[i] as usize, &mut memo, i);
+            reused[i] = clean;
+            !clean
+        });
+        let n = reused.iter().filter(|&&r| r).count();
+        reads_reused += n;
+        visits.keyed += n;
+        changed.retain(|&i| reused.get(i) != Some(&true));
+        t.lap("reads keyed walk");
+    }
     if !mention_only.is_empty() {
         let slot_at = |i: usize| front.fn_slot[i] as usize;
         // First the dirty count of each candidate's stored reads (None:
@@ -3614,6 +3690,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     match (&caches.slot_reads[s], &derive_dirty) {
                         (None, _) => recheck = true,
                         (Some(r), Some(d)) => recheck = !clean(r, d),
+                        (Some(_), None) if keyed.as_ref().is_some_and(|k| matches!(k.get(s), Some(Some(_)))) => {
+                            recheck = !keyed_clean(caches, s, &mut memo, i);
+                            visits.keyed += 1;
+                        }
                         (Some(_), None) => {
                             by_reads.push(i);
                             continue;
@@ -3642,6 +3722,24 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("generic reuse walk");
+    // This program's generation (`Program::verified`): every stored read
+    // set this request does not check again holds against it now (the
+    // walks above, or no candidate), and the checks below store theirs
+    // with it, as this mode's mark. A set this request checks again keeps
+    // its old marks until then (a skipped std body keeps them for good);
+    // the other mode's mark stands while the set does. The program takes
+    // the mark when it is kept.
+    let verified = next_verified();
+    let mode_at = usize::from(program.gx.walk_instances);
+    {
+        let mut in_work = vec![false; program.fns.len()];
+        work.iter().for_each(|&i| in_work[i] = true);
+        for i in (0..program.fns.len()).filter(|&i| !in_work[i]) {
+            if let Some(Some(r)) = caches.slot_reads.get_mut(slot(i)) {
+                r.verified[mode_at] = verified;
+            }
+        }
+    }
     // A one-shot check needs no IR after borrowck: dropping each body on
     // its worker lets the allocator reuse the memory for the next body,
     // instead of touching fresh pages for every function.
@@ -3706,6 +3804,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         {
             let mut stored = body.reads.clone();
             let _ = program.sig_of(&mut stored, program.def_id(LocalDefId(i as u32)));
+            stored.verified[mode_at] = verified;
             caches.slot_reads[slot(i)] = Some(stored);
         }
         diags.extend(results[k].1.iter().cloned());
@@ -3749,6 +3848,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             std::mem::forget(program);
         } else {
             drop(results);
+            program.verified = verified;
             super::patch::keep(front, program);
         }
         return resp;
@@ -3795,6 +3895,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             std::mem::forget(program);
         } else {
             drop(results);
+            program.verified = verified;
             super::patch::keep(front, program);
         }
         return resp;
@@ -4120,6 +4221,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 std::mem::forget(program);
             } else {
                 drop((bodies, units));
+                program.verified = verified;
                 super::patch::keep(front, program);
             }
             return resp;
@@ -4301,6 +4403,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         std::mem::forget(program);
     } else {
         drop((bodies, units));
+        program.verified = verified;
         super::patch::keep(front, program);
     }
     resp

@@ -258,6 +258,9 @@ pub(crate) struct Caches {
     pub(crate) derive_dirty: Option<Vec<bool>>,
     /// This request's edits are all derive list edits (`Patched::derive_only`).
     pub(crate) derive_only: bool,
+    /// The read keys this request's header delta can move
+    /// (driver/kept_delta.rs `Touched`). Taken by the compile tail.
+    pub(crate) header_moves: Option<crate::driver::kept_delta::Touched>,
     /// The cached IR body per slot, in the translatable form of
     /// `ir_cache::CachedBody`. Set when the slot's body is lowered;
     /// read when a slot renumber makes its C stale and the C must be
@@ -434,6 +437,7 @@ impl Session {
                 read_index: Default::default(),
                 derive_dirty: None,
                 derive_only: false,
+                header_moves: None,
                 slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,

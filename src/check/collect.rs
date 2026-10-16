@@ -399,6 +399,11 @@ pub struct Program {
     /// `gen_reuse` stamp agrees with this program (`gen_reuse::stamp_now`
     /// when the driver keeps it, `patch::keep`); 0 before.
     pub(crate) reuse_stamp: u64,
+    /// The driver's generation of this program (`compile`'s generic
+    /// block): every passing slot read set marked with it holds against
+    /// this program. 0 when no slot is (a fresh collect, or a kept
+    /// program a delta moved before its read sets were walked).
+    pub(crate) verified: u64,
 }
 
 impl Program {
@@ -3350,6 +3355,7 @@ pub fn collect_reuse(
         const_goals: Vec::new(),
         impl_parents: HashMap::default(),
         reuse_stamp: 0,
+        verified: 0,
     };
     let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;

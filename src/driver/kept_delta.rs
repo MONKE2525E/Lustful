@@ -73,6 +73,13 @@ pub(crate) fn apply_headers(
     bases: &mut Bases,
 ) -> Result<(), (&'static str, bool)> {
     let out = apply(p, front, caches, reach, edits, walk_instances, bases);
+    // The keys this delta can move, for the compile tail's keyed walk.
+    if out.is_ok() {
+        let mut fns: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
+        fns.sort_unstable();
+        fns.dedup();
+        caches.header_moves = Some(Touched::new(p, &fns));
+    }
     // A program kept after a diagnostic keeps the outputs its callers'
     // bodies have now (`own_bases`).
     if let Err((why @ ("sig diag" | "hidden diag"), true)) = out {
@@ -309,7 +316,9 @@ fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'sta
 /// (graph.rs `binding_fingerprint`, `method_set_fingerprint`). No other
 /// node reads an edited fn's record (every other fn keeps its signature
 /// and hidden type). A `Checked` read never holds by fingerprint.
-struct Touched {
+/// A successful delta leaves its set in `Caches::header_moves` (the
+/// compile tail's keyed walk, read only).
+pub(crate) struct Touched {
     defs: Vec<crate::def::DefId>,
     names: Vec<crate::intern::Sym>,
     seen: crate::intern::FxMap<ReadKey, bool>,
@@ -322,7 +331,8 @@ impl Touched {
         Touched { defs, names, seen: Default::default() }
     }
 
-    fn hit(&mut self, p: &Program, k: &ReadKey) -> bool {
+    /// True when the delta may move the fingerprint of `k`.
+    pub(crate) fn hit(&mut self, p: &Program, k: &ReadKey) -> bool {
         let (defs, names) = (&self.defs, &self.names);
         *self.seen.entry(*k).or_insert_with(|| match k {
             ReadKey::Sig(d) => defs.contains(d),

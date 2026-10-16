@@ -229,6 +229,11 @@ pub struct Reads {
     /// or 0 when none: a new key resets it, so a changed set is indexed
     /// again.
     seal: u64,
+    /// By mode (check, build), the generation of the kept program these
+    /// reads last held against (`Program::verified`), or 0: the driver's
+    /// keyed walk trusts a key a delta did not move only for a set of the
+    /// delta's base program. A new set has none.
+    pub(crate) verified: [u64; 2],
 }
 
 impl Reads {
@@ -239,7 +244,7 @@ impl Reads {
 
     /// A sink that records nothing (see `off`).
     pub fn off() -> Reads {
-        Reads { map: FxMap::default(), off: true, seal: 0 }
+        Reads { map: FxMap::default(), off: true, seal: 0, verified: [0; 2] }
     }
 
     /// Records one read. The first record of a key wins.
@@ -1965,12 +1970,12 @@ impl ReadIndex {
     ) -> (Vec<bool>, Vec<bool>) {
         self.sync(slot_reads);
         crate::driver::laps::mark("keyed/sync");
+        let moved: Vec<(&ReadKey, &Vec<(u32, u64)>)> = self.by_key.iter().filter(|(k, _)| moves(k)).collect();
+        crate::driver::laps::mark("keyed/classify");
+        let now: Vec<Read> = moved.iter().map(|(k, _)| p.read_fingerprint(k)).collect();
+        crate::driver::laps::mark("keyed/fingerprint");
         let mut dirty = vec![false; slot_reads.len()];
-        for (k, list) in &self.by_key {
-            if !moves(k) {
-                continue;
-            }
-            let now = p.read_fingerprint(k);
+        for ((k, list), now) in moved.into_iter().zip(now) {
             for &(s, seal) in list {
                 let s = s as usize;
                 if self.stamp.get(s) != Some(&seal) || dirty[s] {
@@ -1981,31 +1986,33 @@ impl ReadIndex {
                 }
             }
         }
+        crate::driver::laps::mark("keyed/compare");
         let live = |s: usize, seal: u64| self.stamp.get(s) == Some(&seal);
         let mut has_checked = vec![false; slot_reads.len()];
-        let checked: Vec<(DefId, &Vec<(u32, u64)>)> =
-            self.by_key.iter().filter_map(|(k, list)| if let ReadKey::Checked(d) = k { Some((*d, list)) } else { None }).collect();
-        for (_, list) in &checked {
-            list.iter().filter(|&&(s, seal)| live(s as usize, seal)).for_each(|&(s, _)| has_checked[s as usize] = true);
-        }
-        loop {
-            let mut grew = false;
-            for (d, list) in &checked {
-                if !def_slot(*d).is_some_and(|s| dirty.get(s).copied().unwrap_or(false)) {
-                    continue;
+        // The readers of each body by its slot, through `Checked` reads;
+        // dirt spreads from each dirty slot to its live readers.
+        let mut readers_of: FxMap<usize, Vec<&Vec<(u32, u64)>>> = FxMap::default();
+        for (k, list) in &self.by_key {
+            if let ReadKey::Checked(d) = k {
+                list.iter().filter(|&&(s, seal)| live(s as usize, seal)).for_each(|&(s, _)| has_checked[s as usize] = true);
+                if let Some(s) = def_slot(*d) {
+                    readers_of.entry(s).or_default().push(list);
                 }
-                for &(s, seal) in list.iter() {
-                    if live(s as usize, seal) && !dirty[s as usize] {
-                        dirty[s as usize] = true;
-                        grew = true;
+            }
+        }
+        let mut work: Vec<usize> = (0..dirty.len()).filter(|&s| dirty[s]).collect();
+        while let Some(s) = work.pop() {
+            for list in readers_of.get(&s).into_iter().flatten() {
+                for &(r, seal) in list.iter() {
+                    let r = r as usize;
+                    if live(r, seal) && !dirty[r] {
+                        dirty[r] = true;
+                        work.push(r);
                     }
                 }
             }
-            if !grew {
-                break;
-            }
         }
-        crate::driver::laps::mark("keyed/scan");
+        crate::driver::laps::mark("keyed/checked");
         (dirty, has_checked)
     }
 }
