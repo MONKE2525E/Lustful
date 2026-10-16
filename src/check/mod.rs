@@ -1375,8 +1375,9 @@ pub enum Coerce {
     /// `&Vec<T>` to a slice reference; the bool is the target mutability.
     SliceFromVec(bool),
     /// `&Box<T>` (possibly behind more references) to `&T` or
-    /// `&mut T`: this many derefs reach the pointee place, and
-    /// the bool is the target mutability.
+    /// `&mut T`, and `&&mut T` or `&mut &mut T` to `&T` or `&mut T`:
+    /// a reborrow of the place this many derefs down; the bool is the
+    /// target mutability.
     BoxToRef(u8, bool),
     /// An unsizing coercion to a dyn reference (ARCH 2.8): `&T` or
     /// `&mut T` to `&dyn Tr` (a new fat pointer), or `&dyn Sub` to
@@ -5863,6 +5864,41 @@ impl<'p> Ctx<'p> {
                 }
                 self.dyn_regions(t, expected, false, span);
                 Coerce::Deref(fd - ed)
+            }
+            // `&&mut T` to `&T` and `&mut &mut T` to `&mut T` (rustc's
+            // deref coercion through an inner `&mut`): a reborrow of the
+            // pointee, `&**x` or `&mut **x`, never a copy of the inner
+            // `&mut`. A `&mut` target needs every reference on the way to
+            // be `&mut` (rustc E0596 otherwise, which unify then reports).
+            (TyKind::Ref(_, fm, _), TyKind::Ref(_, em, _))
+                if !dyn_target
+                    && fd > ed
+                    && (!em.is_mut() || fm.is_mut())
+                    && {
+                        let snap_vars = self.snapshot_vars();
+                        let obl_len = self.obl_len();
+                        let exact = self.unify(found, expected);
+                        self.rollback_vars(snap_vars);
+                        self.obl_truncate(obl_len);
+                        !exact && {
+                            // The refs peeled off, all `&mut` for a `&mut` target.
+                            let mut t = found;
+                            let mut all_mut = true;
+                            for _ in 0..fd - ed {
+                                if let TyKind::Ref(_, m, inner) = self.kind(t) {
+                                    all_mut &= m.is_mut();
+                                    t = inner;
+                                }
+                            }
+                            matches!(self.kind(t), TyKind::Ref(_, Mut::Mut, _)) && (!em.is_mut() || all_mut) && {
+                                let TyKind::Ref(_, _, x) = self.kind(t) else { unreachable!() };
+                                let TyKind::Ref(_, _, y) = self.kind(expected) else { unreachable!() };
+                                self.unify(x, y)
+                            }
+                        }
+                    } =>
+            {
+                Coerce::BoxToRef(fd - ed + 1, em.is_mut())
             }
             // A dyn target takes the unsizing arm below even when the
             // types already unify: it checks the object lifetimes.
