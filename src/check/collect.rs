@@ -9109,7 +9109,7 @@ impl crate::ty::layout::AdtShapes for Program {
 /// generic machinery on for every compile that splices it (tf-std2,
 /// realish20 collect 19 to 74 ms).
 fn uses_cow(p: &mut Program, ast: &Ast, interner: &crate::intern::Interner) -> bool {
-    let cow = interner.intern("Cow");
+    let cow = interner.intern(generics::COW);
     let shipped = |sp: Span| p.shipped_crate_at(sp).is_some();
     let hit = |segs: &[ast::PathSeg]| segs.iter().any(|s| s.name == cow);
     let mut shipped_cow_tys: Vec<Span> = Vec::new();

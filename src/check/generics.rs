@@ -10482,6 +10482,25 @@ const GENERIC_STD_NAMES: &[&str] = &[
 /// and `MaybeUninit`'s `uninit` and `write`.
 const GENERIC_STD_METHODS: &[&str] = &["start_bound", "end_bound", "get", "available_parallelism", "try_send", "uninit", "write"];
 
+/// The name collect's `uses_cow` looks for.
+pub const COW: &str = "Cow";
+/// Names `materialize`'s scan looks for: `std::thread::Result<T>` (its
+/// `thread` segment) and `panic_any` name a `dyn Any` with no `dyn` in
+/// the text.
+const THREAD: &str = "thread";
+const PANIC_ANY: &str = "panic_any";
+
+/// True for a name one of the whole-Ast scans that turn the generic
+/// flags on looks for: `COW`, the two lists above, `THREAD`, and
+/// `PANIC_ANY`. A warm body patch (driver/patch.rs `plain_body`) sends a
+/// body that holds one to a full collect while the program is not yet
+/// generic, so a new scanned name goes in one of these lists, never in a
+/// list of its own (w-daemon-sound: the patch missed NonZero,
+/// TrySendError, MaybeUninit, thread::Result, and panic_any).
+pub fn flag_scan_name(name: &str) -> bool {
+    [COW, THREAD, PANIC_ANY].contains(&name) || GENERIC_STD_NAMES.contains(&name) || GENERIC_STD_METHODS.contains(&name)
+}
+
 /// True when the program uses a generic synthetic std Adt (`Bound<T>`,
 /// `NonZero<T>`, `TrySendError<T>`, `MaybeUninit<T>`) by one of the names above. These
 /// Adts are registered for every program; their instances need the
@@ -10526,13 +10545,13 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         let closures = p.ast.exprs.iter().zip(&p.ast.expr_spans).any(|(e, sp)| matches!(e, ast::Expr::Closure { .. }) && user(sp));
         // `std::thread::Result<T>` names `Box<dyn Any + Send>` with no
         // `dyn` in the text (R26).
-        let (thread, result) = (p.interner.intern("thread"), p.interner.intern("Result"));
+        let (thread, result) = (p.interner.intern(THREAD), p.interner.intern("Result"));
         let thread_result = |t: &TyExpr| match t {
             TyExpr::Path(segs) => segs.len() >= 2 && segs[segs.len() - 1].name == result && segs[segs.len() - 2].name == thread,
             _ => false,
         };
         let dyns = p.ast.tys.iter().zip(&p.ast.ty_spans).any(|(t, sp)| (matches!(t, TyExpr::Dyn { .. }) || thread_result(t)) && user(sp));
-        let panic_any = p.interner.intern("panic_any");
+        let panic_any = p.interner.intern(PANIC_ANY);
         let panic_anys = p
             .ast
             .exprs
