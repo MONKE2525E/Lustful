@@ -641,6 +641,10 @@ pub enum Builtin {
     /// `flatten` and `flat_map` (W-STD-B).
     IterFlatten,
     IterFlatMap,
+    /// `flatten` over items with a written `IntoIterator` impl (R15):
+    /// `Flatten<Map<I, F>>` with `F` the impl's `into_iter` fn item,
+    /// which is what core's `Flatten` calls on each item.
+    IterFlattenInto,
     IterFold,
     /// `try_fold(init, f)` with an `Option` or `Result` closure result.
     IterTryFold,
@@ -2196,6 +2200,10 @@ struct Ctx<'p> {
     /// args (zonked into the entry and requested as instances at body
     /// end).
     deref_sites: Vec<(DerefTable, usize, bool, LocalDefId, Vec<GenericArg>)>,
+    /// Instances of written `into_iter` fns that `flatten` calls per
+    /// item (check/iter.rs `written_into_iter_fn`): zonked into
+    /// `inst_requests` at body end.
+    into_iter_requests: Vec<(LocalDefId, Vec<GenericArg>)>,
     /// Expressions with entries in `out.deref_recv`, `deref_coerce`, or
     /// `index_recv`. A second check of such an expression (a trial check,
     /// or an argument checked to pick a form and then again) first drops
@@ -2557,6 +2565,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         call_expected: None,
         deref_depth: 0,
         deref_sites: Vec::new(),
+        into_iter_requests: Vec::new(),
         place_step_exprs: Default::default(),
         or_frames: Vec::new(),
         or_log: None,
@@ -24290,6 +24299,10 @@ impl<'p> Ctx<'p> {
             {
                 self.out.const_exprs[i] = Some(v);
             }
+        }
+        for (template, args) in std::mem::take(&mut self.into_iter_requests) {
+            let zargs: Vec<GenericArg> = args.iter().map(|&g| if let GenericArg::Ty(t) = g { GenericArg::Ty(self.zonk(t)) } else { g }).collect();
+            self.out.inst_requests.push((template, zargs));
         }
         // Generic user `deref` fns of method receivers, as call sites.
         for (table, idx, is_mut, template, args) in std::mem::take(&mut self.deref_sites) {

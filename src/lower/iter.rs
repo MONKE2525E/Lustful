@@ -104,6 +104,7 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::EntryOrInsertWithKey
             | B::EntryAndModify
             | B::IterFlatten
+            | B::IterFlattenInto
             | B::IterFlatMap
             | B::HashFromArray
             | B::DlEntries
@@ -1056,16 +1057,17 @@ impl Ex<'_, '_> {
             }
             // `flatten()` and `flat_map(f)` (W-STD-B): (Some(iter), None,
             // None); flat_map's iter is `Map<I, F>`.
-            B::IterFlatten | B::IterFlatMap => {
+            B::IterFlatten | B::IterFlatMap | B::IterFlattenInto => {
                 let i = self.unwrap_op(arg()?)?;
                 let (_, fa) = self.kind_args(dest_ty).ok_or("iterator expansion: bad flatten iterator")?;
-                let inner = if b == B::IterFlatMap {
-                    let f = arg()?;
+                let inner = if b == B::IterFlatten {
+                    i
+                } else {
+                    // `IterFlattenInto`'s `into_iter` fn item is zero-sized.
+                    let f = if b == B::IterFlatMap { arg()? } else { Operand::Const(Const::Unit) };
                     let m = self.local(fa[0]);
                     self.assign(Place::local(m), Rvalue::TupleAgg(fa[0], vec![i, f]));
                     Operand::Move(Place::local(m))
-                } else {
-                    i
                 };
                 let fields = it::field_tys(&mut self.body.tys, dest_ty).ok_or("iterator expansion: bad flatten iterator")?;
                 let (o, s) = (self.local(fields[0]), self.local(fields[1]));

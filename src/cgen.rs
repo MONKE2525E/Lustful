@@ -5781,6 +5781,7 @@ impl FnGen<'_, '_> {
             | B::IterUtf8Chunks
             | B::IterRemainder
             | B::IterFlatten
+            | B::IterFlattenInto
             | B::IterFlatMap
             | B::HashFromArray
             | B::DlEntries

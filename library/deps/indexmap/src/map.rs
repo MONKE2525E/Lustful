@@ -762,6 +762,15 @@ impl<'a, K, V, S> IntoIterator for &'a IndexMap<K, V, S> {
     }
 }
 
+impl<'a, K, V, S> IntoIterator for &'a mut IndexMap<K, V, S> {
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = IterMut<'a, K, V>;
+
+    fn into_iter(self) -> IterMut<'a, K, V> {
+        self.iter_mut()
+    }
+}
+
 /// The entries in order, by value.
 pub struct IntoIter<K, V> {
     inner: std::vec::IntoIter<Bucket<K, V>>,

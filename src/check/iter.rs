@@ -1113,8 +1113,14 @@ impl<'p> Ctx<'p> {
             // `flatten` and `flat_map` (W-STD-B): the inner items' (or the
             // closure output's) IntoIter is the second iterator.
             "flatten" => {
-                let Some(u) = self.flat_inner(item, span) else { return self.iter_bail(args) };
-                (B::IterFlatten, vec![], mk(self, K::Flatten, &[base, u]))
+                if let Some((g, out)) = self.written_into_iter_fn(item) {
+                    let Some(u) = self.flat_inner(out, span) else { return self.iter_bail(args) };
+                    let m = mk(self, K::Map, &[base, g, out]);
+                    (B::IterFlattenInto, vec![], mk(self, K::Flatten, &[m, u]))
+                } else {
+                    let Some(u) = self.flat_inner(item, span) else { return self.iter_bail(args) };
+                    (B::IterFlatten, vec![], mk(self, K::Flatten, &[base, u]))
+                }
             }
             // `flat_map(f)` is `Flatten<Map<I, F>>`, what std's FlatMap runs.
             "flat_map" => {
@@ -2028,6 +2034,71 @@ impl<'p> Ctx<'p> {
                 }
                 None
             }
+        }
+    }
+
+    /// For `flatten` over items of a user or adapter type (or a
+    /// reference to one) with a written `IntoIterator` impl (R15, `&IndexMap`):
+    /// the impl's `into_iter` as a fn item type, and its `IntoIter`.
+    /// The instance is requested for mono here, so the item type must be
+    /// fully known and free of type parameters. None for every other
+    /// item type (the builtin routes of `flat_inner`).
+    fn written_into_iter_fn(&mut self, item: Ty) -> Option<(Ty, Ty)> {
+        use crate::traits::index::Synthetic;
+        let t = self.deep(item);
+        let mut core = t;
+        while let TyKind::Ref(_, _, inner) = self.kind(core) {
+            core = self.resolve(inner);
+        }
+        if self.tys.local_adt(core).is_none() || self.tys.builtin_of(core).is_some() || self.has_general_var(t) || self.tys.flags(t).contains_param() {
+            return None;
+        }
+        let lang = self.p.gx.lang;
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
+        let tr = TraitRef { def: lang.into_iterator, args: args_id, bindings: EMPTY_BINDINGS };
+        let snap = self.snapshot_vars();
+        let Selection::Impl { id, args: impl_args, unbound, .. } = self.select_obligation(tr) else {
+            self.rollback_vars(snap);
+            return None;
+        };
+        let rec = self.p.gx.index.get(id).clone();
+        let name = self.p.interner.intern("into_iter");
+        let f = rec.items.iter().find_map(|&d| self.p.local_def(d.hash).filter(|&l| self.p.fn_info(l).name == name));
+        let (Some(f), Some(out)) = (f, rec.assoc_ty(lang.assoc_into_iter)) else {
+            self.rollback_vars(snap);
+            return None;
+        };
+        if rec.synthetic != Synthetic::None || !unbound.is_empty() {
+            self.rollback_vars(snap);
+            return None;
+        }
+        let prefix: Vec<GenericArg> = impl_args.into_iter().map(|g| if let GenericArg::Ty(x) = g { GenericArg::Ty(self.deep(x)) } else { g }).collect();
+        if prefix.iter().any(|g| g.as_ty().is_some_and(|x| self.has_general_var(x))) {
+            self.rollback_vars(snap);
+            return None;
+        }
+        if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|x| x.is_some()) {
+            self.into_iter_requests.push((f, prefix.clone()));
+        }
+        let fargs = self.tys.intern_args(&prefix);
+        let g = self.tys.intern(TyKind::FnDef(self.p.def_id(f), fargs));
+        let out = self.subst_settled(out, &prefix);
+        Some((g, self.deep(out)))
+    }
+
+    /// True when `t` holds an inference variable that is not an integer
+    /// or float literal's (those settle by fallback at the latest).
+    fn has_general_var(&mut self, t: Ty) -> bool {
+        let t = self.resolve(t);
+        if !self.tys.flags(t).contains_infer() {
+            return false;
+        }
+        match self.kind(t) {
+            TyKind::Infer(v) => !v.is_int() && !v.is_float(),
+            TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => self.has_general_var(e),
+            TyKind::Tuple(ts) => self.tys.tys_of(ts).to_vec().into_iter().any(|e| self.has_general_var(e)),
+            TyKind::Adt(_, a) => self.tys.args(a).to_vec().into_iter().any(|g| g.as_ty().is_some_and(|e| self.has_general_var(e))),
+            _ => true,
         }
     }
 
