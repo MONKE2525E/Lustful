@@ -5475,6 +5475,13 @@ impl<'b, 'p> Builder<'b, 'p> {
         // A fallback flow into an adapter that can write through shared
         // memory goes both ways (see `has_interior`).
         let interior = has_interior(&self.body.tys, dt);
+        // Parts a source fills exactly. A source with no exact part relates
+        // the parts of it the adapter holds at their variance (`store_into`:
+        // `vec.into_iter()` of an invariant `T`), and its other regions flow
+        // only into the slots no source fills, after every source is paired
+        // (two chained closures keep their captures apart).
+        let mut taken = vec![false; dv.len()];
+        let mut pending: Vec<(Ty, &[u32])> = Vec::new();
         for (t, v) in avs {
             if v.is_empty() {
                 continue;
@@ -5489,9 +5496,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 used[j] = true;
                 let (s0, n) = ranges[j];
                 let part = dv[s0..s0 + n].to_vec();
-                let okb = self.by_next_part(*t, v, comps[j], &part);
-                if !okb {
-                    self.adapter_fallback(*t, v, dt, dv, interior);
+                if self.by_next_part(*t, v, comps[j], &part) {
+                    taken[s0..s0 + n].fill(true);
+                } else {
+                    pending.push((*t, v));
                 }
                 continue;
             }
@@ -5500,29 +5508,31 @@ impl<'b, 'p> Builder<'b, 'p> {
                     used[j] = true;
                     let (s0, n) = ranges[j];
                     let part = dv[s0..s0 + n].to_vec();
-                    if !self.relate(*t, v, comps[j], &part, Variance::Co) {
-                        self.adapter_fallback(*t, v, dt, dv, interior);
+                    if self.relate(*t, v, comps[j], &part, Variance::Co) {
+                        taken[s0..s0 + n].fill(true);
+                    } else {
+                        pending.push((*t, v));
                     }
                 }
-                None => self.adapter_fallback(*t, v, dt, dv, interior),
+                None => pending.push((*t, v)),
+            }
+        }
+        // The parts of each unpaired source the adapter holds, first, then
+        // the rest of their regions into what no source fills.
+        for &(t, v) in &pending {
+            let filled = self.store_into(t, v, dt, dv);
+            for (k, f) in taken.iter_mut().zip(filled) {
+                *k |= f;
+            }
+        }
+        let rest: Vec<u32> = dv.iter().zip(&taken).filter(|(_, k)| !**k).map(|(&x, _)| x).collect();
+        for (_, v) in pending {
+            self.flow_all(v, &rest);
+            if interior {
+                self.flow_all(&rest, v);
             }
         }
     }
-    /// `call_adapter`'s rule for a source it cannot pair with a part: the
-    /// parts of the source the adapter holds relate at their variance
-    /// (`store_into`: `vec.into_iter()` of an invariant `T`); every source
-    /// region may reach the adapter's other slots (both ways when the
-    /// adapter can write through shared memory).
-    fn adapter_fallback(&mut self, t: Ty, v: &[u32], dt: Ty, dv: &[u32], interior: bool) {
-        let filled = self.store_into(t, v, dt, dv);
-        let rest: Vec<u32> = dv.iter().zip(&filled).filter(|(_, f)| !**f).map(|(&x, _)| x).collect();
-        self.flow_all(v, &rest);
-        if interior {
-            self.flow_all(&rest, v);
-        }
-    }
-
-
     /// The vars of the slots of `t` (laid out from `*at` in `vars`) that do
     /// not sit inside a closure type, plus the captured sources of the
     /// closures that return borrows.
