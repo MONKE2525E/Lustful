@@ -3227,8 +3227,9 @@ impl FnGen<'_, '_> {
                 let (v, _) = self.operand(ptr, loc, post);
                 let ct = cty(&self.body.tys, *ty);
                 match &ct {
-                    // An `Rc<T>` points at its allocation, the counts first.
-                    CTy::Rc(e) => {
+                    // An `Rc<T>` or `Arc<T>` points at its allocation, the
+                    // counts first.
+                    CTy::Rc(e) | CTy::Sync(crate::ty::sync::SyncTy::Arc, e) => {
                         let rc = format!("RcI_{}", mangle(e));
                         format!("(({rc} *)((char *)({v}).data - (uintptr_t)&(({rc} *)0)->v))")
                     }

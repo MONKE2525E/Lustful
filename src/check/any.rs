@@ -247,11 +247,14 @@ impl<'p> Ctx<'p> {
             let (t0, _) = steps[0];
             let elem = self.tys.smart_elem(t0).map(|t| self.resolve(t))?;
             let boxed = self.tys.boxed_elem(t0).is_some();
+            // std has `Rc<dyn Any>::downcast` and, for `Arc`, only
+            // `Arc<dyn Any + Send + Sync>::downcast`.
+            let arc = crate::ty::sync::sync_kind(&self.tys, t0) == Some(crate::ty::sync::SyncTy::Arc);
+            let autos = if arc { AutoTraits { send: true, sync: true, unpin: false } } else { AutoTraits::default() };
             let ok = if boxed {
                 is_downcast_dyn(p, &self.tys, elem)
             } else {
-                object::principal_of(&self.tys, elem).is_some_and(|pr| pr.def == p.gx.lang.any)
-                    && object::dyn_auto(p, &self.tys, elem) == AutoTraits::default()
+                object::principal_of(&self.tys, elem).is_some_and(|pr| pr.def == p.gx.lang.any) && object::dyn_auto(p, &self.tys, elem) == autos
             };
             if !ok {
                 return None;
@@ -265,7 +268,21 @@ impl<'p> Ctx<'p> {
             let Some(t) = self.any_target(e, explicit, turbofish, want, name_span, true) else { return Some(self.any_fail(args)) };
             self.check_args(&[], args, name_span);
             self.set_res(e, Res::Any { op: AnyOp::Downcast, derefs: 0, autoref: Autoref::None });
-            let owned = if boxed { self.tys.mk_boxed(t) } else { self.tys.mk_rc(t) };
+            // `Arc::downcast` bounds the target by `Any + Send + Sync`.
+            if arc {
+                for tr in [p.gx.lang.send, p.gx.lang.sync] {
+                    let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
+                    let trait_ref = TraitRef { def: tr, args, bindings: EMPTY_BINDINGS };
+                    self.obl.push(obligations::Obligation::Trait { trait_ref, span: name_span, depth: 0 });
+                }
+            }
+            let owned = if boxed {
+                self.tys.mk_boxed(t)
+            } else if arc {
+                crate::ty::sync::sync_ty(&mut self.tys, crate::ty::sync::SyncTy::Arc, &[t])
+            } else {
+                self.tys.mk_rc(t)
+            };
             return Some(self.tys.mk_result(owned, t0));
         }
         let (_, derefs) = steps.iter().copied().find(|&(t, _)| is_downcast_dyn(p, &self.tys, t))?;
