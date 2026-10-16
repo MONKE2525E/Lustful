@@ -1949,6 +1949,17 @@ impl Table {
     }
 }
 
+pub struct Bag<T> {
+    pub items: Vec<T>,
+}
+
+impl<T> Bag<T> {
+    pub fn all(&self) -> impl Iterator<Item = &T> + '_ {
+        // @p6
+        self.items.iter()
+    }
+}
+
 pub fn ranges(x: &Table) -> impl Iterator<Item = (i64, i64, i64)> + '_ {
     // @p2
     let a = x.r16.iter().map(|&(lo, hi, s)| (i64::from(lo), i64::from(hi), i64::from(s)));
@@ -1977,8 +1988,9 @@ pub fn run() -> i64 {
     }
     need_send(adder(1));
     need_send(token());
+    let bag = Bag { items: vec![4i64, 5] };
     // @p5
-    n + adder(2)(3) + T.starts().sum::<i64>()
+    n + adder(2)(3) + T.starts().sum::<i64>() + bag.all().next().copied().unwrap_or(0)
 }
 """
 
@@ -2002,7 +2014,9 @@ PATCHSEQ_VALUES = [("consts.rs", "    4\n}", "    5\n}"), ("consts.rs", "    3\n
                    ("rpit.rs", "    7u8\n", "    std::rc::Rc::new(7u8)\n"),
                    ("rpit.rs", "    move |x| x + n\n", "    let r = std::rc::Rc::new(n);\n    move |x| x + *r\n"),
                    ("rpit.rs", "    move |x| x + n\n", "    move |x| x + n as i32\n"),
-                   ("rpit.rs", "t.0 as i64)", "t.1 as i64)"), ("rpit.rs", "t.0 as i64)", "t.0)")]
+                   ("rpit.rs", "t.0 as i64)", "t.1 as i64)"), ("rpit.rs", "t.0 as i64)", "t.0)"),
+                   ("rpit.rs", "self.items.iter()\n", "self.items.iter().rev()\n"),
+                   ("rpit.rs", "self.items.iter()\n", "self.items.iter().skip(1)\n")]
 
 
 def cmd_run_patchseq(a):

@@ -1348,11 +1348,9 @@ pub(super) fn reuse_kept(
         match p.gx.fn_class.get(fn_index) {
             Some(FnClass::Plain) => {}
             // A template with closures stands when its closures are the
-            // registered ones (checked below, before its template check).
-            Some(FnClass::Template)
-                if !walk_instances
-                    && !p.is_lang_method(f)
-                    && !p.gx.opaques.contains_key(&crate::check::generics::opaque_def(p.def_id(f))) => {}
+            // registered ones (checked below, before its template check),
+            // and one that returns `impl Trait` while its hidden type does.
+            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) => {}
             _ => return Err("fn class"),
         }
     }
@@ -1364,7 +1362,8 @@ pub(super) fn reuse_kept(
     // An edited fn that returns `impl Trait`: collect reveals its hidden
     // type from the new body, so the program stands only while that type
     // does (`Front::rpit_edit` sends the request on to collect otherwise).
-    let mut rpit: Vec<usize> = edits.iter().filter(|e| e.rpit).filter_map(|e| e.fn_index).collect();
+    let plain = |i: &usize| p.gx.fn_class.get(*i) == Some(&FnClass::Plain);
+    let mut rpit: Vec<usize> = edits.iter().filter(|e| e.rpit).filter_map(|e| e.fn_index).filter(plain).collect();
     rpit.sort_unstable();
     rpit.dedup();
     for fn_index in rpit {
@@ -1397,8 +1396,15 @@ pub(super) fn reuse_kept(
         // Collect's template check runs before mono: a coercion of a
         // type parameter to `dyn` then needs no concrete vtable.
         let (counts, mono_done) = (p.gx.mono_counts, std::mem::replace(&mut p.gx.mono_done, false));
+        // A template's own `impl Trait`: its check stores the hidden type
+        // callers reveal, which must stand as for a plain fn.
+        let od = crate::check::generics::opaque_def(p.def_id(f));
+        let hidden = p.gx.opaque_hidden.get(&od).copied();
         template_errs.extend(crate::check::generics::check_template(&mut p, f, &mut caches.gen_reuse));
         (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
+        if p.gx.opaque_hidden.get(&od).copied() != hidden {
+            return Err("hidden type");
+        }
     }
     // Discovery checks every plain body when user generics exist; with
     // only the lang enum methods' generics, a build checks the bodies
@@ -2461,6 +2467,16 @@ impl Table {
     }
 }
 
+pub struct Bag<T> {
+    pub items: Vec<T>,
+}
+
+impl<T> Bag<T> {
+    pub fn all(&self) -> impl Iterator<Item = &T> + '_ {
+        self.items.iter()
+    }
+}
+
 pub fn ranges(x: &Table) -> impl Iterator<Item = (i64, i64, i64)> + '_ {
     let a = x.r16.iter().map(|&(lo, hi, s)| (i64::from(lo), i64::from(hi), i64::from(s)));
     let b = x.r32.iter().map(|&(lo, hi, s)| (lo as i64, hi as i64, s as i64));
@@ -2490,7 +2506,9 @@ pub fn run() -> i64 {
     }
     need_send(adder(1));
     need_send(token());
-    n + adder(2)(3) + T.starts().sum::<i64>() + once(String::from(\"ab\"))() as i64
+    let bag = Bag { items: vec![4i64, 5] };
+    need_send(bag.all());
+    n + adder(2)(3) + T.starts().sum::<i64>() + once(String::from(\"ab\"))() as i64 + bag.all().next().copied().unwrap_or(0)
 }
 ";
 
@@ -2498,7 +2516,8 @@ pub fn run() -> i64 {
     /// The kept program stands while the new body reveals the same hidden
     /// type; another hidden type (a caller loses `Send`, a closure captures
     /// another type), a definer error, and its fix collect again and walk
-    /// the callers' reads. Each step gives the cold answer, and a build
+    /// the callers' reads. A generic method's template check stores its
+    /// hidden type, which must stand the same way. Each step gives the cold answer, and a build
     /// prints what a cold build prints.
     #[test]
     fn rpit_body_edit_matches_cold() {
@@ -2515,6 +2534,13 @@ pub fn run() -> i64 {
             ("    b.chain(a)\n", "    a.chain(b)\n", "hidden_type"),
             ("    let lust_bench_edit: u32 = 1;\n", "", "reuse"),
             ("        self.r16.iter()", "        let _k = 2;\n        self.r16.iter()", "reuse"),
+            ("        self.items.iter()\n", "        let _q = 1;\n        self.items.iter()\n", "reuse"),
+            ("        self.items.iter()\n", "        self.items.iter().rev()\n", "hidden_type"),
+            ("        self.items.iter().rev()\n", "        self.items.iter()\n", "hidden_type"),
+            ("        self.items.iter()\n", "        let r = std::rc::Rc::new(1);\n        self.items.iter().filter(move |_| *r > 0)\n", ""),
+            ("        let r = std::rc::Rc::new(1);\n        self.items.iter().filter(move |_| *r > 0)\n", "        self.items.iter()\n", ""),
+            ("        self.items.iter()\n", "        self.items.iter().map(|x| x)\n", ""),
+            ("        self.items.iter().map(|x| x)\n", "        self.items.iter()\n", ""),
             ("    7u8\n", "    std::rc::Rc::new(7u8)\n", "hidden_type"),
             ("    std::rc::Rc::new(7u8)\n", "    7u16\n", "hidden_type"),
             ("    7u16\n", "    7u8\n", "hidden_type"),

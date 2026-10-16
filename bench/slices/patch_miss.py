@@ -109,6 +109,9 @@ def visits(line):
 
 def report(rows):
     ms = [r["ms"] for r in rows]
+    if not ms:
+        print("0 checks")
+        return
     print(f"{len(rows)} checks: median {s.pct(ms, 50):.1f} ms, p95 {s.pct(ms, 95):.1f}, worst {max(ms):.1f}")
     groups = {}
     for r in rows:
