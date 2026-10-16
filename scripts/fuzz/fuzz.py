@@ -16,6 +16,11 @@
 # the limit (the daemon side on a fresh daemon), a finished retry is reported
 # as "slow" and judged normally, and only a second timeout is the hang.
 # `--strict` also requires the full stderr text to match.
+# `--sig-ops` adds a signature-edit pulse (sigops.py) on a fixed cadence from its own
+# RNG; it ends on the state it started from, so the main stream stays the same.
+# `--rustc` also judges the pulse's op states against rustc, and `--baseline LUST`
+# against a pinned baseline lust (see sigops.External). Under LUST_CHECK_ITEMPATCH=1
+# every `itempatch oracle:` line in the daemon log is a failure.
 #
 # Usage:
 #   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3|patchseq [--modules 40] [--strict]
@@ -24,6 +29,7 @@
 # Exit status: 0 = clean, 1 = a failure was found, 2 = setup error.
 import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 from collections import Counter
+import sigops
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LUST = os.path.join(ROOT, "target/release/lust")
@@ -369,6 +375,7 @@ class Harness:
         self._log_off = 0
         self._log_partial = ""
         self._guard = 0
+        self._oracle = 0
         self._gstart = 0
         self._gdone = 0
         self._gstart_base = 0
@@ -468,10 +475,18 @@ class Harness:
         for line in lines:
             if "guard:" in line:
                 self._guard += 1
+            if "itempatch oracle:" in line:
+                self._oracle += 1
+                print(f"ORACLE {line.strip()[:400]}", flush=True)
             if "guard-check: start " in line:
                 self._gstart += 1
             if "guard-check: done " in line:
                 self._gdone += 1
+
+    def oracle_count(self):
+        """Patch oracle failures (LUST_CHECK_ITEMPATCH) the daemon logged so far."""
+        self._poll_log()
+        return self._oracle
 
     def guard_count(self):
         self._poll_log()
@@ -552,6 +567,55 @@ def compare(h, cmd, strict):
     if strict and da[2] != co[2]:
         return False, "strict stderr mismatch", da, co
     return True, "", da, co
+
+
+def sig_pulse(h, a, srng, fs, write_fn, save_fn, ext, ops, bad_ops, seen_guard, tag, strict):
+    """One signature-edit op (sigops.py) from the files `fs`: each of its
+    states is compared warm vs cold (and, for the op states, judged by
+    `ext`); the last state is `fs` again. On a failure the files go back to
+    `fs`. Returns (failures, seen_guard)."""
+    op, states = sigops.sig_states(srng, fs)
+    ops[op if states else op + "-none"] += 1
+    failures, prev = 0, fs
+    for k, state in enumerate(states):
+        write_fn(state)
+        ok, why, da, co = compare(h, "check", strict)
+        h.wait_guard_idle()
+        g = h.guard_count()
+        if g > seen_guard:
+            save_fn(f"guard-{tag}s{k}", prev, state)
+            print(f"GUARD {tag} sig op {op} state {k}: warm answer differed", flush=True)
+            seen_guard = g
+        if ok and k < len(states) - 1:
+            judged = ext.judge(h.crate, da[0] == 0, h.cold)
+            if judged:
+                ok, why = False, judged
+        if not ok:
+            failures += 1
+            bad_ops[f"{op} {why}"] += 1
+            save_fn(f"bad-{tag}s{k}", prev, state)
+            print(f"FAIL[{why}] {tag} sig op {op} state {k}\n"
+                  f"  daemon={da[0]} {da[2][:200]!r}\n"
+                  f"  cold  ={co[0] if co else '-'} {(co[2][:200] if co else '')!r}", flush=True)
+            if why in ("daemon hang", "daemon died"):
+                h.kill_daemon()
+                h.start_daemon()
+            write_fn(fs)
+            h.run_cmd("check", True)
+            break
+        prev = state
+    return failures, seen_guard
+
+
+def sig_result(h, ext, failures):
+    """Prints the sigops and patch oracle lines; returns failures plus the
+    oracle's."""
+    if ext.on():
+        print(ext.summary())
+    n = h.oracle_count()
+    if n or os.environ.get("LUST_CHECK_ITEMPATCH"):
+        print(f"itempatch oracle failures={n}")
+    return failures + n
 
 
 def item_bounds(lines):
@@ -1077,6 +1141,9 @@ def cmd_run(a):
     grng = random.Random(a.seed ^ 0x61E6)
     # `main` return-type edits (make_main_ret_edit) on their own RNG.
     mrng = random.Random(a.seed ^ 0x4D41)
+    # Signature-edit pulses (--sig-ops) on their own RNG.
+    srng = random.Random(a.seed ^ 0x516ED)
+    ext = sigops.External(a.rustc, a.baseline)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -1195,11 +1262,20 @@ def cmd_run(a):
                     bad_ops[gop] += gf
                     if a.stop_first:
                         break
+            if a.sig_ops and it % 5 == 2:
+                one = lambda fs: h.write(fs["crate.rs"])
+                pair = lambda tag, p, c: save_pair(a.out, tag, p["crate.rs"], c["crate.rs"])
+                sf, seen_guard = sig_pulse(h, a, srng, {"crate.rs": text}, one, pair, ext, ops, bad_ops,
+                                           seen_guard, f"iter{it}", a.strict)
+                failures += sf
+                if sf and a.stop_first:
+                    break
             if (it + 1) % 250 == 0:
                 print(f"... {it + 1}/{a.edits} failures={failures} "
                       f"{time.time() - t0:.0f}s", flush=True)
         h.wait_guard_idle()
         guard = h.guard_count()
+        failures = sig_result(h, ext, failures)
         print(f"RESULT seed={a.seed} crate={a.crate} modules={a.modules} edits={a.edits} "
               f"failures={failures} guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
@@ -1481,6 +1557,8 @@ def cmd_run_multi(a, rename=False, feat3=False):
     frng = random.Random(a.seed ^ 0xFEA7)
     vrng = random.Random(a.seed ^ 0x715)
     frng3 = random.Random(a.seed ^ 0x5EED3)
+    srng = random.Random(a.seed ^ 0x516ED)
+    ext = sigops.External(a.rustc, a.baseline)
     seed_files = MULTI3_SEED if feat3 else MULTI2_SEED if rename else MULTI_SEED
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -1674,10 +1752,17 @@ def cmd_run_multi(a, rename=False, feat3=False):
                         break
                 if failures and a.stop_first:
                     break
+            if a.sig_ops and it % 5 == 2:
+                sf, seen_guard = sig_pulse(h, a, srng, files, write_all, save_bundle, ext, ops, bad_ops,
+                                           seen_guard, f"iter{it}", a.strict)
+                failures += sf
+                if sf and a.stop_first:
+                    break
             if (it + 1) % 250 == 0:
                 print(f"... {it + 1}/{a.edits} failures={failures} {time.time() - t0:.0f}s", flush=True)
         h.wait_guard_idle()
         guard = h.guard_count()
+        failures = sig_result(h, ext, failures)
         print(f"RESULT seed={a.seed} crate={a.crate} edits={a.edits} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
@@ -2053,6 +2138,8 @@ def cmd_run_patchseq(a):
     every 8 iterations the files go back to the seed, and a run compares
     program output."""
     rng = random.Random(a.seed)
+    srng = random.Random(a.seed ^ 0x516ED)
+    ext = sigops.External(a.rustc, a.baseline)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
     # The daemon's `lust-visits:` lines show which path each answer took.
@@ -2158,6 +2245,17 @@ def cmd_run_patchseq(a):
                 prev = cur
             files = seq[-1][1]
             it += 1
+            if a.sig_ops:
+                def save_ps(tag, p, c):
+                    for side, fs in (("prev", p), ("cur", c)):
+                        for rel, text in fs.items():
+                            path = os.path.join(a.out, f"patchseq-{a.seed}-{tag}", side, rel)
+                            os.makedirs(os.path.dirname(path), exist_ok=True)
+                            with open(path, "w") as f:
+                                f.write(text)
+                seen = h.guard_count()
+                sf, _ = sig_pulse(h, a, srng, files, write_all, save_ps, ext, ops, bad_ops, seen, f"it{it}", True)
+                failures += sf
             if it % 8 == 0:
                 ok, why, ra, rb = compare(h, "run", True)
                 if not ok and why != "program hang":
@@ -2170,6 +2268,7 @@ def cmd_run_patchseq(a):
                 print(f"... {steps}/{a.edits} failures={failures} {time.time() - t0:.0f}s", flush=True)
         h.wait_guard_idle()
         guard = h.guard_count()
+        failures = sig_result(h, ext, failures)
         print(f"RESULT seed={a.seed} crate=patchseq edits={steps} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(Counter(k.split(":")[-1] for k in ops.elements())))
@@ -2286,6 +2385,9 @@ def main():
     r.add_argument("--fail-on-guard", action="store_true")
     r.add_argument("--keep-work", action="store_true")
     r.add_argument("--record", default=None, help="dir to write every text as NNNN.rs")
+    r.add_argument("--sig-ops", action="store_true", help="signature-edit pulses (sigops.py)")
+    r.add_argument("--rustc", action="store_true", help="judge sigops states against rustc")
+    r.add_argument("--baseline", default=None, help="baseline lust binary for --rustc")
     for name in ("replay", "shrink"):
         s = sub.add_parser(name)
         s.add_argument("--prev", required=True)

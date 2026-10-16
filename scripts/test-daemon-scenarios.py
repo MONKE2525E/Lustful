@@ -138,6 +138,7 @@ def scenario(srcdir):
             f for f in os.listdir(srcdir)
             if f.startswith("v") and (f.endswith(".rs") or os.path.isdir(os.path.join(srcdir, f))))
         mtime = int(time.time())
+        oracle_seen = 0
         for v in versions:
             mtime += 2
             vpath = os.path.join(srcdir, v)
@@ -187,6 +188,14 @@ def scenario(srcdir):
                     problems.append(f"{tag}: cold wrong: cold=({crc},{cout!r}) rustc=({rrc},{rout!r})")
             else:
                 notes.append(f"{tag}: lust rejects valid Rust in both modes (unsupported today)")
+            # Under LUST_CHECK_ITEMPATCH=1 the daemon logs each oracle failure
+            # (and answers that request again from a fresh session).
+            log.flush()
+            with open(os.path.join(work, "daemon.log")) as f:
+                hits = [l.strip() for l in f if "itempatch oracle:" in l]
+            if len(hits) > oracle_seen:
+                problems.append(f"{tag}: {hits[oracle_seen][:300]}")
+                oracle_seen = len(hits)
     finally:
         try:
             os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
