@@ -2198,6 +2198,20 @@ pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>)
     {
         errs.push(d);
     }
+    // An instance request past rustc's type-length limit is its
+    // post-mono error (a doubling arg, `f::<((T, T), (T, T))>`); mono
+    // never snapshots one (generics::snapshot_ty).
+    if errs.is_empty()
+        && p.gx.walk_instances
+        && let Some((t, _)) = ck.inst_requests.iter().find(|(_, a)| a.iter().any(|g| g.as_ty().is_some_and(|e| generics::over_type_length(&ck.tys, e))))
+    {
+        errs.push(Diag::new(
+            "L0611",
+            p.fn_def(*t).name_span,
+            format!("reached the type-length limit while instantiating `{}`", p.interner.get(p.fn_def(*t).name)),
+            "Reduce the recursive generic instantiation.",
+        ));
+    }
     (ck, errs)
 }
 

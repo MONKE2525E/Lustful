@@ -9273,19 +9273,75 @@ pub(crate) enum OwnedArg {
 /// zonk could not resolve): such a type names no instance, and the
 /// body that made it has an error report of its own.
 pub(crate) fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
+    // A type past rustc's type-length limit is never an instance arg
+    // rustc builds (its post-mono error), and as an owned tree a type
+    // that doubles its args per level is exponential: no snapshot.
+    if over_type_length(src, t) {
+        return None;
+    }
+    snapshot_ty_tree(src, t)
+}
+
+/// rustc's default `type_length_limit`: an instance whose args walk
+/// more nodes than this is a build error.
+pub(crate) const TYPE_LENGTH_LIMIT: u64 = 1_048_576;
+
+/// True when `t` walks more than `TYPE_LENGTH_LIMIT` nodes as a tree.
+/// Small types answer from a bounded walk; a large one is counted
+/// once per distinct node.
+pub(crate) fn over_type_length(src: &dyn TyIntern, t: Ty) -> bool {
+    fn bounded(src: &dyn TyIntern, t: Ty, budget: &mut u32) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        ty_children(src, t).into_iter().all(|e| bounded(src, e, budget))
+    }
+    fn length(src: &dyn TyIntern, t: Ty, memo: &mut FxMap<Ty, u64>) -> u64 {
+        if let Some(&n) = memo.get(&t) {
+            return n;
+        }
+        let n = ty_children(src, t).into_iter().fold(1u64, |acc, e| acc.saturating_add(length(src, e, memo)));
+        memo.insert(t, n);
+        n
+    }
+    if bounded(src, t, &mut 4096) {
+        return false;
+    }
+    length(src, t, &mut FxMap::default()) > TYPE_LENGTH_LIMIT
+}
+
+/// The type arguments and parts one level inside `t`.
+fn ty_children(src: &dyn TyIntern, t: Ty) -> Vec<Ty> {
+    match src.kind(t) {
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => vec![e],
+        TyKind::Tuple(ts) => src.tys_of(ts).to_vec(),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
+            src.args(a).iter().filter_map(|g| g.as_ty()).collect()
+        }
+        TyKind::FnPtr(sig) => {
+            let s = src.sig(sig).value;
+            src.tys_of(s.inputs).iter().copied().chain([s.output]).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `snapshot_ty` without the length check.
+fn snapshot_ty_tree(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
     Some(match src.kind(t) {
         TyKind::Infer(_) | TyKind::Error => return None,
-        TyKind::Ref(r, m, e) => OwnedTy::Ref(r, m, Box::new(snapshot_ty(src, e)?)),
-        TyKind::RawPtr(m, e) => OwnedTy::RawPtr(m, Box::new(snapshot_ty(src, e)?)),
-        TyKind::Slice(e) => OwnedTy::Slice(Box::new(snapshot_ty(src, e)?)),
+        TyKind::Ref(r, m, e) => OwnedTy::Ref(r, m, Box::new(snapshot_ty_tree(src, e)?)),
+        TyKind::RawPtr(m, e) => OwnedTy::RawPtr(m, Box::new(snapshot_ty_tree(src, e)?)),
+        TyKind::Slice(e) => OwnedTy::Slice(Box::new(snapshot_ty_tree(src, e)?)),
         TyKind::Array(e, n) => match src.const_kind(n) {
             ConstKind::Infer(_) => return None,
-            k => OwnedTy::Array(Box::new(snapshot_ty(src, e)?), k),
+            k => OwnedTy::Array(Box::new(snapshot_ty_tree(src, e)?), k),
         },
         TyKind::Tuple(ts) => {
             let mut out = Vec::new();
             for e in src.tys_of(ts).to_vec() {
-                out.push(snapshot_ty(src, e)?);
+                out.push(snapshot_ty_tree(src, e)?);
             }
             OwnedTy::Tuple(out)
         }
@@ -9298,9 +9354,9 @@ pub(crate) fn snapshot_ty(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
             let b = src.sig(sig);
             let mut inputs = Vec::new();
             for e in src.tys_of(b.value.inputs).to_vec() {
-                inputs.push(snapshot_ty(src, e)?);
+                inputs.push(snapshot_ty_tree(src, e)?);
             }
-            OwnedTy::FnPtr(b, inputs, Box::new(snapshot_ty(src, b.value.output)?))
+            OwnedTy::FnPtr(b, inputs, Box::new(snapshot_ty_tree(src, b.value.output)?))
         }
         TyKind::Dyn(b, r) => {
             let bounds = src.dyn_bounds(b).clone();
