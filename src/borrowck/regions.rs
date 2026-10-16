@@ -1146,6 +1146,48 @@ fn regions_walk(tys: &impl TyIntern, t: Ty, fn_ptrs: bool, out: &mut Vec<Region>
     }
 }
 
+/// `regions_of` plus each dyn's object lifetime where it is not
+/// late-bound (`'static` when the trait needs it), in the slot order of
+/// `Builder::sugar_regions`: a fn item's signature paired with a
+/// `dyn Fn*` target's places (`entail_dyn`).
+fn sig_slot_regions(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<Region>) {
+    match tys.kind(t) {
+        TyKind::Ref(r, _, inner) => {
+            if !bound(r) {
+                out.push(r);
+            }
+            sig_slot_regions(p, tys, inner, out);
+        }
+        TyKind::Dyn(_, r) => {
+            if !bound(r) {
+                out.push(if crate::check::object::dyn_is_static(p, tys, t) { Region::Static } else { r });
+            }
+            for e in dyn_arg_tys(tys, t) {
+                sig_slot_regions(p, tys, e, out);
+            }
+        }
+        TyKind::Adt(_, args) => {
+            if tys.is_chars_ty(t) {
+                out.push(Region::Erased);
+            }
+            for g in tys.args(args).to_vec() {
+                match g {
+                    GenericArg::Ty(e) => sig_slot_regions(p, tys, e, out),
+                    GenericArg::Lifetime(r) if !bound(r) => out.push(r),
+                    _ => {}
+                }
+            }
+        }
+        TyKind::Tuple(ts) => {
+            for e in tys.tys_of(ts).to_vec() {
+                sig_slot_regions(p, tys, e, out);
+            }
+        }
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => sig_slot_regions(p, tys, e, out),
+        _ => regions_of(tys, t, out),
+    }
+}
+
 /// `t` (a template-form type over the Adt's params) with `args` substituted,
 /// if every type it needs is already interned. Never interns.
 fn subst_get(tys: &impl TyIntern, t: Ty, args: &[GenericArg]) -> Option<Ty> {
@@ -8138,7 +8180,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let mut f_in_regions: Vec<Region> = Vec::new();
         for (&t, &n) in f_ins.iter().zip(&n_slots) {
             let mut rs = Vec::new();
-            regions_of(&p.tys, t, &mut rs);
+            sig_slot_regions(p, &p.tys, t, &mut rs);
             if rs.len() != n {
                 return unproved(self);
             }
@@ -8146,7 +8188,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let mut f_out_regions: Vec<Region> = Vec::new();
         if let Some(o) = f_out {
-            regions_of(&p.tys, o, &mut f_out_regions);
+            sig_slot_regions(p, &p.tys, o, &mut f_out_regions);
         }
         // The target's places: each late-bound input its own binder, a
         // late-bound output the one late-bound input's, any other the var
