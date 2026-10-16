@@ -138,6 +138,18 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// A zonked pattern or local type with its projections normalized
+    /// (`let r = x.try_into();` before a later use fixes the target),
+    /// as `settle_projections` does for expression types. A type that
+    /// does not normalize stays as it is: its expressions report it.
+    pub(super) fn settled(&mut self, t: Ty) -> Ty {
+        if self.is_template_check() || !self.tys.flags(t).contains_projection() {
+            return t;
+        }
+        let n = self.normalize_here(t);
+        if self.tys.flags(n).contains_projection() { t } else { n }
+    }
+
     fn defer_args(&mut self, a: ArgsId, span: Span) -> ArgsId {
         let old: Vec<GenericArg> = self.tys.args(a).to_vec();
         let new: Vec<GenericArg> = old

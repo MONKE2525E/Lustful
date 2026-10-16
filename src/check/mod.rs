@@ -5393,6 +5393,19 @@ impl<'p> Ctx<'p> {
         self.tys.intern_args(&new)
     }
 
+    /// `t` resolved when it is a projection whose args hold no
+    /// unbound inference variable (`unify` normalizes it then).
+    fn closed_projection(&mut self, t: Ty) -> Option<Ty> {
+        if !matches!(self.tys.kind(t), TyKind::Projection(..)) {
+            return None;
+        }
+        if !self.tys.flags(t).contains_infer() {
+            return Some(t);
+        }
+        let d = self.deep(t);
+        (!self.tys.flags(d).contains_infer()).then_some(d)
+    }
+
     fn unify(&mut self, a: Ty, b: Ty) -> bool {
         let (a, b) = (self.resolve(a), self.resolve(b));
         if a == b {
@@ -5408,25 +5421,23 @@ impl<'p> Ctx<'p> {
         }
         // A projection that normalizes now unifies through its
         // normal form (section 2.5). Only when its args hold no
-        // inference variable: selection inside probes already
-        // handles the open case, and normalizing there would loop.
+        // inference variable once resolved (a late target bound
+        // since: `let r = x.try_into(); let r: Result<u8, E> = r;`):
+        // selection inside probes already handles the open case, and
+        // normalizing there would loop.
         if !self.in_norm {
-            let na = if matches!(self.tys.kind(a), TyKind::Projection(..)) && !self.tys.flags(a).contains_infer() {
+            let na = self.closed_projection(a).map_or(a, |a| {
                 self.in_norm = true;
                 let n = self.normalize_here(a);
                 self.in_norm = false;
                 n
-            } else {
-                a
-            };
-            let nb = if matches!(self.tys.kind(b), TyKind::Projection(..)) && !self.tys.flags(b).contains_infer() {
+            });
+            let nb = self.closed_projection(b).map_or(b, |b| {
                 self.in_norm = true;
                 let n = self.normalize_here(b);
                 self.in_norm = false;
                 n
-            } else {
-                b
-            };
+            });
             if na != a || nb != b {
                 return self.unify(na, nb);
             }
@@ -21733,12 +21744,14 @@ impl<'p> Ctx<'p> {
         self.settle_projections();
         for i in 0..self.out.pat_ty.len() {
             let t = self.out.pat_ty[i];
-            self.out.pat_ty[i] = self.zonk(t);
+            let z = self.zonk(t);
+            self.out.pat_ty[i] = self.settled(z);
         }
         self.finish_closures();
         for i in 0..self.out.locals.len() {
             let t = self.out.locals[i].ty;
             let z = self.zonk(t);
+            let z = self.settled(z);
             if z == ERROR && !self.has_error_kind(t) {
                 let span = self.out.locals[i].span;
                 let name = self.name(self.out.locals[i].name).to_string();
