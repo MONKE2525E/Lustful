@@ -8398,8 +8398,11 @@ impl<'p> Ctx<'p> {
                 self.tys.intern(TyKind::Tuple(ts))
             }
             Expr::Array(elems) => {
+                // An expected array or slice (`&[x]` where `&[Box<dyn Tr>]` is
+                // expected) gives the element type each element coerces to,
+                // as rustc's `check_expr_array` takes it.
                 let exp_elem = expected.and_then(|t| match self.kind(t) {
-                    TyKind::Array(el, _) => Some(el),
+                    TyKind::Array(el, _) | TyKind::Slice(el) => Some(el),
                     _ => None,
                 });
                 let elem = self.array_elems(elems, exp_elem);
