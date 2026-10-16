@@ -264,7 +264,7 @@ impl<'p> Lower<'p> {
             (ClosureKind::Fn, _) => self.env_ref(place, false, cty, span),
         };
         let mut ops = vec![env];
-        ops.extend(self.ordered_operands(args));
+        ops.extend(self.call_arg_operands(args, span));
         let d = self.call_dest(dest, ty);
         self.call_into(CallTarget::Fn(target), ops, d, span);
         if let Some(own) = owned {

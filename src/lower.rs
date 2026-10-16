@@ -2111,10 +2111,8 @@ impl<'p> Lower<'p> {
                         }
                     }
                 }
-                let ops: Vec<Operand> = match (res, args.as_slice()) {
-                    (Res::Fn(_) | Res::Indirect, [a0, rest @ ..]) if !rest.is_empty() && self.ck.coerce(*a0) == Coerce::Reborrow && self.is_place_expr(*a0) => {
-                        self.two_phase_reborrow_args(*a0, rest, span)
-                    }
+                let ops: Vec<Operand> = match res {
+                    Res::Fn(_) | Res::Indirect => self.call_arg_operands(args, span),
                     _ => self.ordered_operands(args),
                 };
                 match res {
@@ -4414,23 +4412,37 @@ impl<'p> Lower<'p> {
         )
     }
 
-    /// The operands of a fn call whose first argument is a `&mut` place
-    /// reborrowed by coercion (`f(nodes, nodes.len())`): rustc's argument
-    /// coercion reborrow is two-phase, so it is lowered as a method
-    /// receiver's (a shared reservation while `rest` runs, `FakeRead`,
-    /// then the `&mut`; `two_phase_receiver` in borrowck).
-    fn two_phase_reborrow_args(&mut self, a0: ExprId, rest: &[ExprId], span: Span) -> Vec<Operand> {
-        let pl = self.place(a0).deref();
-        let inner = self.peel(self.ty(a0), 1);
+    /// The operands of call arguments `args` (after any receiver or
+    /// closure env) in the `ordered_operands` order, where the first
+    /// `&mut` place that argument coercion reborrows and a later argument
+    /// follows (`f(nodes, nodes.len())`, `cb(1, self, id(&self.syms))`)
+    /// is two-phase, as rustc's argument coercion reborrow is: lowered as
+    /// a method receiver's (a shared reservation while the later
+    /// arguments run, `FakeRead`, then the `&mut`; `two_phase_receiver`
+    /// in borrowck). A place through an index (`v[0]` is an `IndexMut`
+    /// borrow in rustc, not two-phase) takes its `&mut` at once.
+    pub(super) fn call_arg_operands(&mut self, args: &[ExprId], span: Span) -> Vec<Operand> {
+        let two_phase = (0..args.len().saturating_sub(1)).find(|&i| self.ck.coerce(args[i]) == Coerce::Reborrow && self.is_place_expr(args[i]));
+        let Some(j) = two_phase else { return self.ordered_operands(args) };
+        let mut ops: Vec<Operand> = (0..j).map(|i| self.ordered_operand(args, i)).collect();
+        let pl = self.place(args[j]).deref();
+        let inner = self.peel(self.ty(args[j]), 1);
+        let mt = self.ref_ty(true, inner);
+        if pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+            let t = self.temp(mt);
+            self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+            ops.push(Operand::Move(Place::local(t)));
+            ops.extend((j + 1..args.len()).map(|i| self.ordered_operand(args, i)));
+            return ops;
+        }
         let st = self.ref_ty(false, inner);
         let reserve = self.temp(st);
         self.assign(Place::local(reserve), Rvalue::Ref(false, pl.clone()), span);
-        let rest_ops: Vec<Operand> = self.ordered_operands(rest);
+        let rest_ops: Vec<Operand> = (j + 1..args.len()).map(|i| self.ordered_operand(args, i)).collect();
         self.push(StmtKind::FakeRead(reserve), span);
-        let mt = self.ref_ty(true, inner);
         let t = self.temp(mt);
         self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
-        let mut ops = vec![Operand::Move(Place::local(t))];
+        ops.push(Operand::Move(Place::local(t)));
         ops.extend(rest_ops);
         ops
     }
@@ -4629,11 +4641,22 @@ impl<'p> Lower<'p> {
                     Some(pl) => self.operand_from(Self::derefs(pl.clone(), derefs), recv_ty),
                     None => self.operand_derefs(recv, derefs),
                 };
+                // A by-value receiver place is read before the arguments
+                // run, as each argument is (`ordered_operands`): rustc
+                // copies `self.tracer` in `self.tracer.map(|t| self.bump())`
+                // to a temporary first.
+                let o = match o {
+                    Operand::Copy(ref pl) | Operand::Move(ref pl)
+                        if args.iter().any(|&x| !self.inert_expr(x)) && !(pl.proj.is_empty() && self.body.locals[pl.local as usize].name.is_none()) =>
+                    {
+                        let t = self.temp(recv_ty);
+                        self.assign(Place::local(t), Rvalue::Use(o), span);
+                        self.operand_from(Place::local(t), recv_ty)
+                    }
+                    o => o,
+                };
                 ops.push(o);
-                for (ai, &a) in args.iter().enumerate() {
-                    let o = self.ordered_operand(args, ai);
-                    ops.push(o);
-                }
+                ops.extend(self.call_arg_operands(args, span));
             }
             Autoref::Ref => {
                 let t = match self.slice_index_recv_ref(recv, root.is_none() && derefs == 0, false, recv_ty, span) {
@@ -4651,10 +4674,7 @@ impl<'p> Lower<'p> {
                     }
                 };
                 ops.push(Operand::Copy(Place::local(t)));
-                for (ai, &a) in args.iter().enumerate() {
-                    let o = self.ordered_operand(args, ai);
-                    ops.push(o);
-                }
+                ops.extend(self.call_arg_operands(args, span));
             }
             Autoref::SliceRef | Autoref::SliceRefMut => {
                 // The array-to-slice autoderef step: `derefs` peels
@@ -4731,7 +4751,15 @@ impl<'p> Lower<'p> {
                 let pl = Self::derefs(pl, derefs);
                 let mt = self.ref_ty(true, recv_ty);
                 let via_deref = matches!(callee, Callee::Builtin(b) if self.slice_method_via_deref(b, recv_ty));
-                if via_deref || pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
+                // An overloaded call (`cb(..)` through `FnMut`): rustc's
+                // autoref of the callee is not two-phase; its arguments'
+                // reborrows are (`call_arg_operands`).
+                if matches!(self.p.ast.expr(e), Expr::Call { callee, .. } if *callee == recv) {
+                    let t = self.temp(mt);
+                    self.assign(Place::local(t), Rvalue::Ref(true, pl), span);
+                    ops.push(Operand::Move(Place::local(t)));
+                    ops.extend(self.call_arg_operands(args, span));
+                } else if via_deref || pl.proj.iter().any(|x| matches!(x, Proj::Index(_))) {
                     // The receiver is reached through an `IndexMut` borrow or a slice
                     // method's `DerefMut`/unsize, which is not two-phase: take the `&mut`
                     // before the arguments run, so an argument that borrows the container

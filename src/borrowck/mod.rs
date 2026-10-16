@@ -1768,18 +1768,19 @@ impl<'b, 'p> Ck<'b, 'p> {
     }
 
     /// True when the call ending block `b` takes a two-phase `&mut`
-    /// receiver: its first argument moves the temporary that the block's
-    /// last statement borrows mutably, right after a `FakeRead` of the
-    /// reservation, an unnamed shared borrow of the same place (a `let`
-    /// binding's `FakeRead` is not one).
+    /// receiver or argument (lower.rs `call_arg_operands`): one of its
+    /// arguments moves the temporary that the block's last statement
+    /// borrows mutably, right after a `FakeRead` of the reservation, an
+    /// unnamed shared borrow of the same place (a `let` binding's
+    /// `FakeRead` is not one).
     fn two_phase_receiver(&self, b: u32, args: &[Operand]) -> bool {
         let stmts = &self.body.blocks[b as usize].stmts;
         let [.., before, last] = stmts.as_slice() else { return false };
-        let (StmtKind::FakeRead(r), StmtKind::Assign(t, Rvalue::Ref(true, place)), Some(Operand::Move(a))) = (&before.kind, &last.kind, args.first())
-        else {
+        let (StmtKind::FakeRead(r), StmtKind::Assign(t, Rvalue::Ref(true, place))) = (&before.kind, &last.kind) else {
             return false;
         };
-        if !t.proj.is_empty() || !a.proj.is_empty() || a.local != t.local || self.body.locals[*r as usize].name.is_some() {
+        let moved = args.iter().any(|a| matches!(a, Operand::Move(a) if a.proj.is_empty() && a.local == t.local));
+        if !t.proj.is_empty() || !moved || self.body.locals[*r as usize].name.is_some() {
             return false;
         }
         // The reservation is made before the arguments run, so it is in
