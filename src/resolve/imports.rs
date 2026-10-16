@@ -248,11 +248,12 @@ pub struct ResolvedTables {
     /// binding the single import later replaces. Fixpoint state of
     /// `run_imports` only.
     pub pending_single: FxMap<(ModuleId, Sym), Vec<PendingSingle>>,
-    /// False once the fixpoint stalls with imports still waiting: the
-    /// wait rule of `single_pending_for` then stops, so an import cycle
-    /// the rule cannot order still resolves (`finalize_singles` checks
-    /// the result).
-    pub pending_wait: bool,
+    /// True once the fixpoint stalls: no sweep changes anything. Until
+    /// then a single import that reads an ambiguous glob name waits,
+    /// since the source's own explicit import may still settle it; after
+    /// the stall it binds what is there (an L0507 at the end if it stays
+    /// ambiguous). Fixpoint state of `run_imports` only.
+    pub import_stall: bool,
     /// The bindings single imports made: (import span, importing
     /// module, source module, name read, namespace, target). rustc
     /// checks each import again against the final tables
@@ -406,7 +407,7 @@ impl ResolvedTables {
             std_glob_aliases: FxMap::default(),
             glob_src: FxMap::default(),
             pending_single: FxMap::default(),
-            pending_wait: true,
+            import_stall: false,
             single_binds: Vec::new(),
             ambig_vis: FxMap::default(),
             ambig_single: Vec::new(),
@@ -1944,7 +1945,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     tables.pending_single.clear();
     tables.ambig_single.clear();
     tables.single_binds.clear();
-    tables.pending_wait = true;
+    tables.import_stall = false;
     for imp in imports {
         if let ImportKind::Single { name, path } = &imp.kind
             && let Some((&last, mod_path)) = path.split_last()
@@ -1955,6 +1956,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     }
     let cap = tables.modules.len() + 2;
     let mut rounds = 0;
+    let mut stall_sweep = false;
     loop {
         rounds += 1;
         if rounds > cap + imports.len() {
@@ -1963,15 +1965,21 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
         let mut changed = false;
         let mut still: Vec<(usize, &Import)> = Vec::new();
         for (i, imp) in pending.drain(..) {
+            // The stall sweep retries only single imports: nothing
+            // changed since the last sweep, so no glob copies more.
+            if stall_sweep && matches!(imp.kind, ImportKind::Glob { .. }) {
+                still.push((i, imp));
+                continue;
+            }
             match try_import(tables, imp, self_sym, interner, &mut diags) {
                 TryOut::Done(did_change) => {
                     changed |= did_change;
                     resolved[i] = true;
                     if let ImportKind::Single { name, .. } = &imp.kind {
                         settle_single(tables, imp.module, *name, imp.span);
-                        // The glob bindings this import hid can now
-                        // reach glob importers: another sweep runs.
-                        changed = true;
+                        // A glob binding this import hid can now reach
+                        // glob importers: another sweep runs.
+                        changed |= glob_bound(tables, imp.module, *name);
                     }
                 }
                 TryOut::Stay { changed: c, resolved: r } => {
@@ -1983,8 +1991,10 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
             }
         }
         pending = still;
-        if !pending.is_empty() && !changed && tables.pending_wait {
-            tables.pending_wait = false;
+        stall_sweep = false;
+        if !pending.is_empty() && !changed && !tables.import_stall {
+            tables.import_stall = true;
+            stall_sweep = true;
             continue;
         }
         if pending.is_empty() || !changed {
@@ -2608,6 +2618,15 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     if src != imp.module && !explicit_here && single_pending_for(tables, src, last, imp.module, interner) {
                         return TryOut::Wait;
                     }
+                    // An ambiguous glob name can still settle (the
+                    // source's explicit import lands): wait for the stall.
+                    let ambiguous_here = [Namespace::Type, Namespace::Value].iter().any(|&ns| {
+                        matches!(tables.lookup(src, ns, last), Some(BindState::Ambiguous))
+                            && tables.ambiguous_visible(src, ns, last, imp.module, interner)
+                    });
+                    if ambiguous_here && !tables.import_stall {
+                        return TryOut::Wait;
+                    }
                     // Bind the name in every namespace that has it.
                     let mut any = false;
                     let mut changed = false;
@@ -2805,7 +2824,8 @@ fn same_std_item(a: &[Sym], b: &[Sym]) -> bool {
 }
 
 /// L0507 for each single import that read an ambiguous name
-/// (`ambig_single`) whose source is still ambiguous now, once per import.
+/// (`ambig_single`) whose source is still ambiguous now, L0510 when the
+/// source settled to an item the import cannot see; once per import.
 fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: &mut Vec<Diag>) {
     let mut seen: Vec<Span> = Vec::new();
     for (imp, ns, src, last) in std::mem::take(&mut tables.ambig_single) {
@@ -2813,11 +2833,30 @@ fn report_ambig_single(tables: &mut ResolvedTables, interner: &Interner, diags: 
             (Namespace::Macro, ImportKind::Single { path, .. }) => tables.macro_import_lookup(&imp, src, path.len() == 1, last),
             _ => tables.lookup(src, ns, last).cloned(),
         };
-        if matches!(state, Some(BindState::Ambiguous)) && !seen.contains(&imp.span) {
-            seen.push(imp.span);
-            diags.push(ambiguous_diag(interner.get(last), imp.span));
+        if seen.contains(&imp.span) {
+            continue;
         }
+        // A source that settled to an item the import cannot see is
+        // a private import, as rustc reports it from the final tables.
+        let diag = match state {
+            Some(BindState::Ambiguous) => ambiguous_diag(interner.get(last), imp.span),
+            Some(BindState::One(f)) if !tables.visible(&f.vis, f.def_module, imp.module, interner) => {
+                private_diag(interner.get(last), imp.span)
+            }
+            _ => continue,
+        };
+        seen.push(imp.span);
+        diags.push(diag);
     }
+}
+
+/// True when `module` binds `name` at glob rank in some namespace (an
+/// ambiguous name or a glob std alias included).
+fn glob_bound(tables: &ResolvedTables, module: ModuleId, name: Sym) -> bool {
+    [Namespace::Type, Namespace::Value, Namespace::Macro].iter().any(|&ns| {
+        matches!(tables.lookup(module, ns, name), Some(BindState::Ambiguous) | Some(BindState::One(Bind { rank: 0..=1, .. })))
+            || tables.std_glob_aliases.contains_key(&(module, ns_index(ns) as u8, name))
+    })
 }
 
 /// Marks the single import at `span` (of `name` in `module`) as
@@ -2836,12 +2875,11 @@ fn settle_single(tables: &mut ResolvedTables, module: ModuleId, name: Sym, span:
 /// binding of the name in `src` may yet be replaced, so a single import
 /// from `from` waits (rustc's `single_imports` check in
 /// `resolve_ident_in_module`). The pending import could bind it when
-/// its module path is not resolved yet, or when its source module has
-/// a binding of the name the pending import's module can see.
+/// its module path is not resolved yet, when its source module has a
+/// binding of the name the pending import's module can see, or, until
+/// the fixpoint stalls (`import_stall`), when the source has no
+/// binding of the name yet (a glob may still bring one).
 fn single_pending_for(tables: &ResolvedTables, src: ModuleId, name: Sym, from: ModuleId, interner: &Interner) -> bool {
-    if !tables.pending_wait {
-        return false;
-    }
     let Some(list) = tables.pending_single.get(&(src, name)) else { return false };
     list.iter().any(|p| {
         tables.visible(&p.vis, src, from, interner)
@@ -2851,7 +2889,8 @@ fn single_pending_for(tables: &ResolvedTables, src: ModuleId, name: Sym, from: M
                     match tables.lookup(m, ns, p.last) {
                         Some(BindState::One(b)) => tables.visible(&b.vis, b.def_module, src, interner),
                         Some(BindState::Ambiguous) => tables.ambiguous_visible(m, ns, p.last, src, interner),
-                        None => false,
+                        // A glob may still bring it until the stall.
+                        None => !tables.import_stall,
                     }
                 }),
                 PathRes::Done(_) => false,
