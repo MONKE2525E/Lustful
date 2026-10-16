@@ -1415,6 +1415,18 @@ fn fn_env(p: &Program, f: LocalDefId) -> &[Predicate] {
 }
 
 /// The type params in `t` (also inside projections), by index, once each.
+/// True when `t` may hold a closure value (also behind a type param, an
+/// infer var, or an opaque type): `closure_only_call`.
+fn holds_closure(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Closure(..) | TyKind::Opaque(..) | TyKind::Param(_) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Dyn(..) => true,
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => holds_closure(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| holds_closure(tys, e)),
+        TyKind::Adt(_, a) | TyKind::FnDef(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| holds_closure(tys, e))),
+        _ => false,
+    }
+}
+
 fn params_in(tys: &impl TyIntern, t: Ty, out: &mut Vec<u32>) {
     match tys.kind(t) {
         TyKind::Param(j) => {
@@ -1801,8 +1813,8 @@ impl OwnSig {
                     }
                     _ => t,
                 };
-                if let TyKind::Closure(_, args) = sc.tys.kind(cl) {
-                    closure_roles(sc, args, &mut roles);
+                if let TyKind::Closure(cdef, args) = sc.tys.kind(cl) {
+                    closure_roles(sc, cdef, args, &mut roles);
                 }
                 while out.len() < n {
                     let u = fresh(self, "a lifetime the closure captures");
@@ -1984,18 +1996,21 @@ impl OwnSig {
 /// the region into other places (a source) and whether it may write a
 /// region there (a sink). A shared capture `&'c T`: `'c` and `T`'s slots
 /// are sources; a mutable one `&'c mut T`: `T`'s slots are sources and
-/// sinks, `'c` neither (a captured `&mut` cannot escape); a by-value
-/// field: its slots are sources and sinks. The body may make any source
-/// outlive any sink and its output; the creator adds what the body needs
-/// of that (`closure_reqs`), or every source-to-sink edge when the body
-/// does not solve, and a call's result holds what the body returns.
-pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, T>, args: ArgsId, out: &mut Vec<(bool, bool)>) {
+/// sinks, `'c` neither (a captured `&mut` cannot escape), except in an
+/// `FnOnce` closure, whose body owns its env and may move the `&mut`
+/// out (`'c` a source); a by-value field: its slots are sources and
+/// sinks. The body may make any source outlive any sink and its output;
+/// the creator adds what the body needs of that (`closure_reqs`), or
+/// every source-to-sink edge when the body does not solve, and a call's
+/// result holds what the body returns.
+pub(super) fn closure_roles<T: TyIntern>(sc: &mut SlotCx<'_, '_, T>, def: DefId, args: ArgsId, out: &mut Vec<(bool, bool)>) {
+    let once = sc.p.gx.closures.get(&def).is_some_and(|c| c.kind == crate::check::closure::ClosureKind::FnOnce);
     for f in closure_fields(sc.tys, args) {
         match sc.tys.kind(f) {
             TyKind::Ref(_, m, inner) => {
                 let n = sc.slots(inner) as usize;
                 if m.is_mut() {
-                    out.push((false, false));
+                    out.push((once, false));
                     out.extend(std::iter::repeat_n((true, true), n));
                 } else {
                     out.push((true, false));
@@ -2244,14 +2259,14 @@ fn implied_walk<T: TyIntern>(
             }
         }
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => implied_walk(sc, e, us, at, outer, facts),
-        TyKind::Closure(_, args) => {
+        TyKind::Closure(cdef, args) => {
             // The closure contract: every source outlives every sink.
             let start = *at;
             for e in closure_fields(sc.tys, args) {
                 implied_walk(sc, e, us, at, outer, facts);
             }
             let mut roles = Vec::new();
-            closure_roles(sc, args, &mut roles);
+            closure_roles(sc, cdef, args, &mut roles);
             for (i, &(src, _)) in roles.iter().enumerate() {
                 for (j, &(_, snk)) in roles.iter().enumerate() {
                     if src && snk && i != j
@@ -3160,7 +3175,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             seen.push(def);
             let mut roles = Vec::new();
-            closure_roles(&mut self.sc, args, &mut roles);
+            closure_roles(&mut self.sc, def, args, &mut roles);
             let needs = match self.closure_reqs(def, &roles) {
                 Some(reqs) => reqs.iter().any(|(x, _)| matches!(x, End::Out(_))),
                 None => true,
@@ -3327,7 +3342,9 @@ impl<'b, 'p> Builder<'b, 'p> {
                     let n1 = self.sc.slots(a[1]) as usize;
                     if let (Some(src), Some(item)) = (dv.get(own..own + n0), dv.get(own + n0..own + n0 + n1)) {
                         let (src, item) = (src.to_vec(), item.to_vec());
-                        self.flow_all(&src, &item);
+                        if !self.by_next_item(a[0], &src, a[1], &item) {
+                            self.flow_all(&src, &item);
+                        }
                     }
                 }
                 if let TyKind::Closure(def, args) = self.body.tys.kind(*ty) {
@@ -3337,7 +3354,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     // body solves (`closure_reqs`), else all of it.
                     self.place(dest, &mut dv, &mut d);
                     let mut roles = Vec::new();
-                    closure_roles(&mut self.sc, args, &mut roles);
+                    closure_roles(&mut self.sc, def, args, &mut roles);
                     self.closure_created(def, &roles, &dv, true);
                 }
             }
@@ -3805,7 +3822,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     None => None,
                 };
                 let mut roles = Vec::new();
-                closure_roles(&mut self.sc, cargs, &mut roles);
+                closure_roles(&mut self.sc, def, cargs, &mut roles);
                 match self.closure_reqs(def, &roles) {
                     Some(reqs) => {
                         for &(x, y) in reqs.iter() {
@@ -3940,7 +3957,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             if ok && param_out {
                 let TyKind::Closure(def, args) = self.body.tys.kind(t) else { continue };
                 let mut roles = Vec::new();
-                closure_roles(&mut self.sc, args, &mut roles);
+                closure_roles(&mut self.sc, def, args, &mut roles);
                 if self.closure_reqs(def, &roles).is_none() {
                     continue;
                 }
@@ -4043,7 +4060,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         for (t, v) in &avs {
             if let TyKind::Closure(def, args) = self.body.tys.kind(*t) {
                 let mut roles = Vec::new();
-                closure_roles(&mut self.sc, args, &mut roles);
+                closure_roles(&mut self.sc, def, args, &mut roles);
                 self.closure_arg_vars(def, &roles, v);
             }
         }
@@ -4286,7 +4303,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     };
                     if let TyKind::Closure(def, args) = self.body.tys.kind(ct) {
                         let mut roles = Vec::new();
-                        closure_roles(&mut self.sc, args, &mut roles);
+                        closure_roles(&mut self.sc, def, args, &mut roles);
                         let caps: Vec<u32> = ev.iter().skip(skip).copied().collect();
                         let vars = self.closure_arg_vars(def, &roles, &caps);
                         let n_out = self.p.gx.closures.get(&def).map(|c| c.output).map(|t| self.sc.slots(t) as usize);
@@ -4474,6 +4491,11 @@ impl<'b, 'p> Builder<'b, 'p> {
                 && self.call_cell(b, &avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(b) = target
                 && self.call_tls(b, &avs, dt, &dv) => {}
+            // A builtin whose only regioned arguments are closures, and whose
+            // result does not hold a closure (`cond.then(|| ..)`): the result
+            // holds what the closures return, which `closure_sources` gave it
+            // above, not every region they capture.
+            _ if matches!(target, CallTarget::Builtin(_)) && self.closure_only_call(&avs, dt) => {}
             _ => {
                 match target {
                     CallTarget::Fn(f) if self.returns_opaque(f) => self.call_opaque_from(&avs, &all, dt, &dv),
@@ -4486,6 +4508,132 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
     }
 
+    /// The item slots of a `ByNext` wrapper through its iterator's own
+    /// `fn next(&mut self) -> Option<Item>` signature: the iterator's
+    /// regions (`src`) reach the item only where the signature puts them,
+    /// so `btree_map::Iter<'a, K, V>`'s `(&'a K, &'a V)` keeps `K`'s own
+    /// regions. False (nothing paired) when the signature does not pair,
+    /// for example a `-> Option<Self::Item>` written with the projection.
+    fn by_next_item(&mut self, it: Ty, src: &[u32], item_ty: Ty, item: &[u32]) -> bool {
+        let p = self.p;
+        let Ok(fns) = crate::check::iter::by_next_fns(p, &self.body.tys, it) else { return false };
+        let Some(sig) = p.regions.body_sig(p, fns.next) else { return false };
+        let Some(&self_r) = sig.params.first() else { return false };
+        let TyKind::Ref(_, Mut::Mut, self_inner) = p.tys.kind(self_r) else { return false };
+        let Some(item_r) = p.tys.option_elem(sig.ret) else { return false };
+        let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
+        let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
+        self.bind_tys.clear();
+        let (mut sv, mut rv) = (Vec::new(), Vec::new());
+        if !(self.inst(self_inner, it, &univ, &mut binds, &mut sv)
+            && self.inst(item_r, item_ty, &univ, &mut binds, &mut rv)
+            && sv.len() == src.len()
+            && rv.len() == item.len())
+        {
+            return false;
+        }
+        for &(a, b) in &sig.facts {
+            let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
+            self.edge(x, y);
+        }
+        self.relate(it, src, it, &sv, Variance::Inv) && self.relate(item_ty, &rv, item_ty, item, Variance::Co)
+    }
+
+    /// `call_adapter` for iterator `it` (vars `v`) stored as `ByNext`
+    /// wrapper type `w` (its slot vars `part`): `v` flows into the inner
+    /// iterator's slots, and `next_sig_item`'s item into the item slots.
+    /// False when the shapes or the signature do not pair.
+    fn by_next_part(&mut self, it: Ty, v: &[u32], w: Ty, part: &[u32]) -> bool {
+        let Some((_, a)) = crate::ty::iter::iter_parts(&self.body.tys, w) else { return false };
+        let (Some(&inner), Some(&item_ty)) = (a.first(), a.get(1)) else { return false };
+        let own = adt_regions(self.p, &self.body.tys, w) as usize;
+        let (n0, n1) = (self.sc.slots(inner) as usize, self.sc.slots(item_ty) as usize);
+        let (Some(ip), Some(tp)) = (part.get(own..own + n0), part.get(own + n0..own + n0 + n1)) else { return false };
+        let (ip, tp) = (ip.to_vec(), tp.to_vec());
+        if !self.relate(it, v, inner, &ip, Variance::Co) {
+            return false;
+        }
+        match self.next_sig_item(it, v) {
+            Some(item) if item.len() == n1 => self.relate(item_ty, &item, item_ty, &tp, Variance::Co),
+            _ => false,
+        }
+    }
+
+    /// The item slot vars of library or user iterator type `t` (its slot
+    /// vars `vars`) through its `fn next(&mut self) -> Option<Item>`
+    /// signature: the impl's params bind from `t`'s slots, and the item's
+    /// slots are the signature's (`(&'a K, &'a V)` of `btree_map::Iter`:
+    /// the own region, `K`'s slots, the own region). None when the
+    /// signature does not pair (an `Option<Self::Item>` return).
+    fn next_sig_item(&mut self, t: Ty, vars: &[u32]) -> Option<Vec<u32>> {
+        let p = self.p;
+        let fns = crate::check::iter::by_next_fns(p, &self.body.tys, t).ok()?;
+        let sig = p.regions.body_sig(p, fns.next)?;
+        let &self_r = sig.params.first()?;
+        let TyKind::Ref(_, Mut::Mut, self_inner) = p.tys.kind(self_r) else { return None };
+        let item_r = p.tys.option_elem(sig.ret)?;
+        let univ: Vec<u32> = (0..sig.n_univ).map(|_| self.fresh()).collect();
+        let mut binds: FxMap<u32, Vec<u32>> = FxMap::default();
+        self.bind_tys.clear();
+        let mut sv = Vec::new();
+        if !self.inst(self_inner, t, &univ, &mut binds, &mut sv) || sv.len() != vars.len() || !self.relate(t, vars, t, &sv, Variance::Inv) {
+            return None;
+        }
+        for &(a, b) in &sig.facts {
+            let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
+            self.edge(x, y);
+        }
+        let mut item = Vec::new();
+        self.vars_from_binds(item_r, &univ, &binds, &mut item).then_some(item)
+    }
+
+    /// The slot vars of regioned signature type `r` when every type param
+    /// in it is already bound (`binds`) and its regions map through `univ`
+    /// (`next_sig_item`). False for a projection, a dyn type, or an
+    /// unbound param.
+    fn vars_from_binds(&mut self, r: Ty, univ: &[u32], binds: &FxMap<u32, Vec<u32>>, out: &mut Vec<u32>) -> bool {
+        let p = self.p;
+        match p.tys.kind(r) {
+            TyKind::Param(j) => match binds.get(&j.0) {
+                Some(v) => {
+                    out.extend_from_slice(v);
+                    true
+                }
+                None => false,
+            },
+            TyKind::Ref(rr, _, ri) => {
+                let v = self.inst_region(rr, univ);
+                out.push(v);
+                self.vars_from_binds(ri, univ, binds, out)
+            }
+            TyKind::Tuple(ts) => p.tys.tys_of(ts).to_vec().into_iter().all(|e| self.vars_from_binds(e, univ, binds, out)),
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.vars_from_binds(e, univ, binds, out),
+            TyKind::Adt(_, a) => {
+                let lts: Vec<Region> = p.tys.args(a).iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+                let n = adt_regions(p, &p.tys, r) as usize;
+                if lts.len() != n {
+                    return false;
+                }
+                for x in lts {
+                    let v = self.inst_region(x, univ);
+                    out.push(v);
+                }
+                p.tys.args(a).to_vec().into_iter().filter_map(|g| g.as_ty()).all(|e| self.vars_from_binds(e, univ, binds, out))
+            }
+            TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Never => true,
+            _ if r == UNIT => true,
+            _ => false,
+        }
+    }
+
+    /// True when every argument with regions is a closure value, there is
+    /// one, and `dt` holds no closure type (`closure_only` builtins).
+    fn closure_only_call(&self, avs: &[(Ty, Vec<u32>)], dt: Ty) -> bool {
+        let tys = &self.body.tys;
+        let is_closure = |t: Ty| matches!(tys.kind(t), TyKind::Closure(..));
+        avs.iter().any(|(t, _)| is_closure(*t)) && avs.iter().all(|(t, v)| v.is_empty() || is_closure(*t)) && !holds_closure(tys, dt)
+    }
+
     /// `fold(init, f)`: the result is the initial value or what the body
     /// returns (the closure's sources, which `call` added from its
     /// requirements); the iterator's own borrow reaches it only through
@@ -4494,7 +4642,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let [_, (it, iv), (ct, _)] = avs else { return false };
         let TyKind::Closure(def, args) = self.body.tys.kind(*ct) else { return false };
         let mut roles = Vec::new();
-        closure_roles(&mut self.sc, args, &mut roles);
+        closure_roles(&mut self.sc, def, args, &mut roles);
         self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, dt, dv, Variance::Co))
     }
 
@@ -4509,7 +4657,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some(acc) = self.body.tys.option_elem(dt).or_else(|| self.body.tys.result_args(dt).map(|(t, _)| t)) else { return false };
         let Some(av) = dv.get(..self.sc.slots(acc) as usize) else { return false };
         let mut roles = Vec::new();
-        closure_roles(&mut self.sc, args, &mut roles);
+        closure_roles(&mut self.sc, def, args, &mut roles);
         self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, acc, av, Variance::Co))
     }
 
@@ -4849,6 +4997,25 @@ impl<'b, 'p> Builder<'b, 'p> {
         let interior = has_interior(&self.body.tys, dt);
         for (t, v) in avs {
             if v.is_empty() {
+                continue;
+            }
+            // A library or user iterator passed where the adapter's type
+            // holds its `ByNext` wrapper: the iterator is the wrapper's
+            // inner part, and the item part is what its `next` returns.
+            let wrapped = (0..comps.len()).find(|&j| {
+                !used[j] && matches!(crate::ty::iter::iter_parts(&self.body.tys, comps[j]), Some((crate::ty::iter::IterKind::ByNext, a)) if a.first() == Some(t))
+            });
+            if let Some(j) = wrapped {
+                used[j] = true;
+                let (s0, n) = ranges[j];
+                let part = dv[s0..s0 + n].to_vec();
+                let okb = self.by_next_part(*t, v, comps[j], &part);
+                    if !okb {
+                    self.flow_all(v, dv);
+                    if interior {
+                        self.flow_all(dv, v);
+                    }
+                }
                 continue;
             }
             match (0..comps.len()).find(|&j| !used[j] && comps[j] == *t && ranges[j].1 == v.len()) {
@@ -5503,7 +5670,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             let inputs = c.inputs.clone();
             let c_output = c.output;
             let mut roles = Vec::new();
-            closure_roles(&mut self.sc, args, &mut roles);
+            closure_roles(&mut self.sc, def, args, &mut roles);
             let Some(vars) = self.closure_arg_vars(def, &roles, v) else { continue };
             let arg_roles: Vec<Option<(bool, bool)>> = slots.into_iter().map(|(r, _)| r).collect();
             let mut items: Vec<u32> = Vec::new();
@@ -5601,7 +5768,16 @@ impl<'b, 'p> Builder<'b, 'p> {
             out.push(Vec::new());
             return true;
         }
-        let Some((k, a)) = crate::ty::iter::iter_parts(&self.body.tys, t) else { return false };
+        let Some((k, a)) = crate::ty::iter::iter_parts(&self.body.tys, t) else {
+            // A library or user iterator type: its `next` signature.
+            return match self.next_sig_item(t, vars) {
+                Some(item) => {
+                    out.push(item);
+                    true
+                }
+                None => false,
+            };
+        };
         // `string::Drain` yields owned `char`s, like `Chars`.
         if k == K::StringDrain {
             out.push(Vec::new());
@@ -5700,7 +5876,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let nb = self.sc.slots(bt) as usize;
                 let Some(caps) = vars.get(n0..n0 + nf).map(<[u32]>::to_vec) else { return false };
                 let mut roles = Vec::new();
-                closure_roles(&mut self.sc, cargs, &mut roles);
+                closure_roles(&mut self.sc, def, cargs, &mut roles);
                 let Some(reqs) = self.closure_reqs(def, &roles) else { return false };
                 let args = self.closure_args.get(&def).cloned().unwrap_or_default();
                 let item: Vec<u32> = (0..nb).map(|_| self.fresh()).collect();
@@ -5955,7 +6131,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             TyKind::Closure(def, args) => {
                 if self.closure_returns_regions(def) {
                     let mut roles = Vec::new();
-                    closure_roles(&mut self.sc, args, &mut roles);
+                    closure_roles(&mut self.sc, def, args, &mut roles);
                     let av = self.closure_args.get(&def).cloned().unwrap_or_default();
                     match self.closure_reqs(def, &roles) {
                         // What its body returns (`closure_reqs`).
@@ -6804,7 +6980,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let caps = binds.get(&jf.0).cloned().unwrap_or_default();
         let mut roles = Vec::new();
-        closure_roles(&mut self.sc, args, &mut roles);
+        closure_roles(&mut self.sc, def, args, &mut roles);
         match self.closure_reqs(def, &roles) {
             Some(reqs) => {
                 let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
@@ -6858,7 +7034,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some(c_out) = p.gx.closures.get(&def).map(|c| c.output) else { return };
         let caps = binds.get(&jf.0).cloned().unwrap_or_default();
         let mut roles = Vec::new();
-        closure_roles(&mut self.sc, args, &mut roles);
+        closure_roles(&mut self.sc, def, args, &mut roles);
         let mut ps = Vec::new();
         params_in(&p.tys, out_t, &mut ps);
         let mut ob = binds.clone();

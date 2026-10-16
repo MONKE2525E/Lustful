@@ -1044,6 +1044,16 @@ impl<'p> Lower<'p> {
                 let t = self.temp(self.ty(e));
                 Place::local(t)
             }
+            // A constant value used as a place in a shared context (the base
+            // of `&[1, 2][..]`, `&[1, 2][i]` and `&(1, 2).1`, the receiver of
+            // `[].as_slice()`) is promoted to `'static`, as rustc promotes the
+            // auto-borrowed operand; an empty array of any element type too.
+            // Never for a mutable use (`place_for_mut`).
+            _ if self.mut_index == 0 && (matches!(self.p.ast.expr(e), Expr::Array(es) if es.is_empty()) || self.promotable(e)) => {
+                let t = self.promoted_temp(self.ty(e));
+                self.expr_into(e, Some(&Place::local(t)));
+                Place::local(t)
+            }
             // A value expression goes into a temporary, and the mutable use
             // is of that temporary: the places inside the value (`s[i..]`
             // in `s[i..].chars().next()`) are read as usual.

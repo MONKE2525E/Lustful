@@ -210,6 +210,35 @@ impl<'p> Ctx<'p> {
         inputs.map(|i| (i, output))
     }
 
+    /// The strictest `Fn*` bound pending on a closure's expected type (an
+    /// inference var): `Fn` before `FnMut` before `FnOnce`. None when no
+    /// such bound names it.
+    fn expected_closure_kind(&mut self, expected: Option<Ty>) -> Option<ClosureKind> {
+        let want = self.resolve(expected?);
+        let TyKind::Infer(v) = self.kind(want) else { return None };
+        let lang = self.p.gx.lang;
+        let mut kind: Option<ClosureKind> = None;
+        for ob in self.obl.pending().to_vec() {
+            let obligations::Obligation::Trait { trait_ref, .. } = ob else { continue };
+            if !lang.is_fn_family(trait_ref.def) {
+                continue;
+            }
+            let self_ty = self.tys.args(trait_ref.args).first().and_then(|g| g.as_ty()).map(|t| self.resolve(t));
+            if !self_ty.is_some_and(|s| matches!(self.kind(s), TyKind::Infer(w) if w == v)) {
+                continue;
+            }
+            let k = if trait_ref.def == lang.fn_ {
+                ClosureKind::Fn
+            } else if trait_ref.def == lang.fn_mut {
+                ClosureKind::FnMut
+            } else {
+                ClosureKind::FnOnce
+            };
+            kind = Some(kind.map_or(k, |c| c.min(k)));
+        }
+        kind
+    }
+
     /// True when `t` has a `'static` reference region (kept only inside fn
     /// pointer types and `dyn Fn*` sugar, `Scope::static_refs`).
     fn has_static_region(&mut self, t: Ty) -> bool {
@@ -586,6 +615,11 @@ impl<'p> Ctx<'p> {
             Some(s) => s,
             None => self.capture_analysis(e, is_move, body, params, first_local),
         };
+        // rustc takes the kind of a closure passed for `Fn*` bounds from
+        // the strictest of them: one passed only for `FnOnce` is `FnOnce`,
+        // so its body may return a reborrow of a `&mut` capture
+        // (`ok.then(|| self.nodes.get_mut(i))`).
+        let kind = if self.expected_closure_kind(expected) == Some(ClosureKind::FnOnce) { ClosureKind::FnOnce } else { kind };
         let mut fields: Vec<GenericArg> = Vec::with_capacity(captures.len());
         for c in &captures {
             fields.push(GenericArg::Ty(capture_field_ty(&mut self.tys, c)));
