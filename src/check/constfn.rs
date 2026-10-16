@@ -423,6 +423,12 @@ impl Walk<'_, '_> {
                     self.err(span, format!("cannot call non-const {what} in a const function"), "Move the call out of the const function.");
                 }
             }
+            // A primitive's associated fn by path (`u64::from_le_bytes`).
+            Res::PrimAssoc { b, .. } => {
+                if !builtin_is_const(b) {
+                    self.err(span, format!("cannot call non-const {what} in a const function"), "Move the call out of the const function.");
+                }
+            }
             Res::Variant(..) | Res::OptSome | Res::OptNone | Res::ResOk | Res::ResErr | Res::ConstUsize(_) => {}
             Res::SizeOfVal { len, .. } => {
                 if !builtin_is_const(len) {
