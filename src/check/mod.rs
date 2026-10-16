@@ -8744,6 +8744,34 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// The value type `T` of `want` when it is the type builtin `b`
+    /// constructs from one value: `Box`, `Rc`, `Arc`, `Mutex`, `RwLock`,
+    /// `RefCell`, or `Cell` `::new`.
+    fn wrapper_value_ty(&self, b: Builtin, want: Ty) -> Option<Ty> {
+        match b {
+            Builtin::BoxNew => self.tys.boxed_elem(want),
+            Builtin::RcNew => (self.tys.builtin_of(want) == Some(BuiltinTy::Rc)).then(|| self.tys.rc_elem(want)).flatten(),
+            Builtin::Sync(sync::SyncOp::ArcNew) => {
+                (self.tys.builtin_of(want) == Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc))).then(|| self.tys.rc_elem(want)).flatten()
+            }
+            Builtin::Sync(sync::SyncOp::LockNew(k)) => self.tys.lock_elem(want).filter(|(w, _)| *w == k).map(|(_, t)| t),
+            Builtin::RefCellNew => self.tys.refcell_elem(want),
+            Builtin::CellNew => self.tys.cell_elem(want),
+            _ => None,
+        }
+    }
+
+    /// True when `t` is `Sized` as far as it is known: `is_sized`, also
+    /// through a `Mutex<T>` or `RwLock<T>` (builtins `is_sized` counts as
+    /// sized).
+    fn sized_value(&mut self, t: Ty) -> bool {
+        let t = self.deep(t);
+        if let Some((_, e)) = self.tys.lock_elem(t) {
+            return self.sized_value(e);
+        }
+        crate::check::sized::is_sized(self.p, &mut self.tys, t, &|_| true)
+    }
+
     /// The expected type when it is a pointer to a dyn type: a
     /// reference, or an owning `Box<dyn Tr>` or `Rc<dyn Tr>` (also an
     /// owning pointer to `RefCell<dyn Tr>`, `Mutex<dyn Tr>`, or `[T]`,
@@ -12964,6 +12992,26 @@ impl<'p> Ctx<'p> {
                 // so a failed try only rolls back.
                 if crate::check::hashmap::is_hash_ctor(b)
                     && let Some(want) = expected
+                {
+                    let snap = self.snapshot_vars();
+                    if !self.unify(ret, want) {
+                        self.rollback_vars(snap);
+                    }
+                }
+                // The same for the one-value wrappers (`Mutex::new(x)` where
+                // `Mutex<Option<Box<dyn Fn()>>>` is expected): the argument is
+                // then a coercion site for the expected value type, as
+                // rustc coerces to a sized expected input (`Some` does this
+                // in its own arm; a `dyn` value is the arm above; an unsized
+                // one such as `RefCell<dyn Tr>` is only a hint in rustc).
+                if written_self.is_none()
+                    && args.len() == 1
+                    && let Some(want) = expected.map(|t| self.resolve(t))
+                    && let Some(elem) = self.wrapper_value_ty(b, want)
+                    && self.sized_value(elem)
+                    // A `&T` to `*const T` coercion as the argument is not
+                    // lowered for these builtins yet: keep the old reject.
+                    && !matches!(self.kind(self.resolve(elem)), TyKind::RawPtr(..))
                 {
                     let snap = self.snapshot_vars();
                     if !self.unify(ret, want) {
