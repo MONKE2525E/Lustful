@@ -3998,9 +3998,31 @@ pub fn collect_reuse(
             }
             let mut progress = false;
             let mut first_err: Option<Diag> = None;
+            let waiting = pending.clone();
             pending.retain(|&si| {
                 let item = &ast.stmt_items[si as usize];
                 let ItemKind::Type(a) = &item.kind else { return false };
+                // A name of a still-pending alias visible here (its own
+                // name included) must wait for it: resolving now would
+                // read an outer item of that name instead (rustc reads the
+                // target in the alias's own block: `type u8 = u8;` there
+                // is a cycle, E0391).
+                let visible = visible_stmt_items(&p.item_blocks, item.span);
+                let blocked = waiting.iter().any(|&w| {
+                    visible.contains(&w)
+                        && matches!(&ast.stmt_items[w as usize].kind, ItemKind::Type(b) if ty_mentions(ast, a.ty, b.name))
+                });
+                if blocked {
+                    if first_err.is_none() {
+                        first_err = Some(Diag::new(
+                            "L0601",
+                            a.name_span,
+                            format!("cycle detected in type aliases: {}", interner.get(a.name)),
+                            "Break the cycle: an alias must not name itself, directly or through other aliases.",
+                        ));
+                    }
+                    return true;
+                }
                 let mut scope = generics::Scope::default();
                 apply_stmt_overlay(&p, &mut scope, item.span);
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
