@@ -4115,6 +4115,18 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
     }
 
+    /// True when a call target's declared return type is `!`.
+    fn diverges(&self, target: CallTarget) -> bool {
+        match target {
+            CallTarget::Fn(f) => self.p.fn_info(f).ret == NEVER,
+            CallTarget::Indirect(l) => match self.body.tys.kind(self.body.locals[l as usize].ty) {
+                TyKind::FnPtr(sig) => self.body.tys.sig(sig).value.output == NEVER,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn call(&mut self, target: CallTarget, args: &[Operand], dest: &Place) {
         let mut avs: Vec<(Ty, Vec<u32>)> = Vec::with_capacity(args.len());
         for o in args {
@@ -4123,7 +4135,12 @@ impl<'b, 'p> Builder<'b, 'p> {
             avs.push((t, v));
         }
         let (mut dv, mut d) = (Vec::new(), Vec::new());
-        let dt = self.place(dest, &mut dv, &mut d);
+        let mut dt = self.place(dest, &mut dv, &mut d);
+        // A callee that returns `!` never writes `dest`: nothing flows there.
+        if self.diverges(target) {
+            dv.clear();
+            dt = NEVER;
+        }
         // A call of an `impl Trait` fn: its value captures every argument
         // region. Any call carries the captures of the opaque values it
         // takes by value to an opaque result (`cap_var`). A callee that
