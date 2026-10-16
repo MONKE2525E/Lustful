@@ -1286,7 +1286,16 @@ impl FnGen<'_, '_> {
         if matches!(op, SyncOp::CondvarWaitWhile | SyncOp::CondvarWaitTimeoutWhile | SyncOp::OnceGetOrInit) {
             return self.closure_wait_or_init(op, ops, ci, loc, post);
         }
-        let callee = self.callee_of(&ops[ci]);
+        let mut callee = self.callee_of(&ops[ci]);
+        // A thread's `&F` of a `Fn` closure (`spawn_scoped(scope, &work)`;
+        // check/traitpath.rs allows no other reference): the reference is
+        // the body's `&self` env, passed as is.
+        if matches!(op, SyncOp::ThreadSpawn | SyncOp::ScopeSpawn | SyncOp::BuilderSpawn | SyncOp::BuilderSpawnScoped)
+            && matches!(self.body.tys.kind(self.callable_place_ty(&ops[ci])), TyKind::Ref(..))
+            && let Callee::Closure(f, false) = callee
+        {
+            callee = Callee::Closure(f, true);
+        }
         let once = !matches!(callee, Callee::Closure(_, false));
         let scope = match op {
             SyncOp::ScopeSpawn => self.operand(&ops[0], loc, post).0,

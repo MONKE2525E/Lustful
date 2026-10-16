@@ -631,7 +631,19 @@ impl<'p> Ctx<'p> {
                 // A `Box<dyn FnOnce() -> T>` is fine: the start calls its
                 // vtable's `call_once` (cgen/sync.rs `Callee::DynOnce`).
                 let boxed_once = self.tys.boxed_elem(t0).and_then(|d| crate::check::object::principal_of(&self.tys, d)).is_some_and(|pr| pr.def == p.gx.lang.fn_once);
-                if spawn && !boxed_once && (matches!(self.kind(t0), TyKind::Dyn(..) | TyKind::Ref(..)) || self.tys.boxed_elem(t0).is_some()) {
+                // A `&F` of a `Fn` closure is fine too (`spawn_scoped(scope,
+                // &work)`): the start calls the body with the reference as
+                // its env (cgen/sync.rs `callee_of_ty`).
+                let ref_fn_closure = match self.kind(t0) {
+                    TyKind::Ref(_, Mut::Shared, inner) => match { let d = self.deep(inner); self.kind(d) } {
+                        TyKind::Closure(def, _) => {
+                            self.closures.iter().any(|c| c.def == def && c.kind == crate::check::closure::ClosureKind::Fn)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if spawn && !boxed_once && !ref_fn_closure && (matches!(self.kind(t0), TyKind::Dyn(..) | TyKind::Ref(..)) || self.tys.boxed_elem(t0).is_some()) {
                     let span = self.span(a);
                     self.errs.push(generics::dyn_not_yet(span, "a `dyn FnOnce` value or a reference to a callable as a thread's function"));
                     continue;
