@@ -1,0 +1,12 @@
+entry a.txt RegularFile ino>0=true cookie!=0=true
+entry b.txt RegularFile ino>0=true cookie!=0=true
+entry sub Directory ino>0=true cookie!=0=true
+true
+["a.txt", "b.txt", "sub"]
+true
+true
+1
+Event { wd: 1, events: ReadFlags(CREATE), cookie: 0, file_name: Some("new.txt") }
+true true new.txt
+true
+ReadFlags(ACCESS | 0x80000000)

@@ -178,8 +178,10 @@ held, not the `&mut` borrow), `drop`, `forget`, `size_of`, `align_of`,
 `size_of_val`, `align_of_val` (a literal's open type is read at the body
 end), and `needs_drop` (a check-time constant; closures, iterator
 adapters, and trait objects reject with L0641). Not here yet:
-`discriminant` (0 ts-rust uses), `transmute`, `zeroed`, `ManuallyDrop`,
-`MaybeUninit`.
+`discriminant` (0 ts-rust uses), `transmute`, `ManuallyDrop`.
+`MaybeUninit<T>` is a synthetic Adt with the safe surface
+(`uninit`, `zeroed`, `new`, `write`, `as_ptr`, `as_mut_ptr`;
+the unsafe readers stay rejected).
 
 ## Intrinsics (`INTRINSICS` in src/ty/lang.rs)
 

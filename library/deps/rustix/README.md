@@ -53,11 +53,7 @@ Gate: `scripts/test-adapters.sh rustix`.
 
 ## Rejected (lust error, never a different answer)
 
-- `RawDir`, its entry type, and `fs::inotify::Reader`: their
-  buffer type is `core::mem::MaybeUninit`, which lust does
-  not have yet (the layout engine knows its size only). The
-  `sys_x_getdents` intrinsic RawDir needs is in place.
-  Every other module (`net`, `mount`, `thread`, `time`,
+- Every other module (`net`, `mount`, `thread`, `time`,
   `io_uring`, `pty`, `rand`, `shm`, `system`, and the rest),
   the `fs` and `process` items
   beyond the lists above (wait and exec forms included), and
@@ -65,5 +61,6 @@ Gate: `scripts/test-adapters.sh rustix`.
 - Debug of the flag types (upstream prints flag-name lists),
   upstream's `Arg` methods (`as_str`, `into_with_c_str`, ...;
   a user `Arg` impl rejects), `Statx::stx_attributes` (its
-  `StatxAttributes` type is not here), and the `MaybeUninit`
-  and `SpareCapacity` buffer forms.
+  `StatxAttributes` type is not here), and the `SpareCapacity`
+  buffer form beyond the `Vec::spare_capacity_mut` slices
+  `RawDir::new` takes.

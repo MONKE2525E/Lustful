@@ -645,11 +645,128 @@ pub fn fstatvfs<Fd: AsFd>(fd: Fd) -> Result<StatVfs> {
     Ok(statvfs_of(&rec))
 }
 
+/// A directory iterator implemented with getdents (`rustix::fs::RawDir`).
+/// The records are read through the `sys_x_getdents` intrinsic into a
+/// scratch Vec and mirrored into the caller's buffer, so the buffer
+/// holds the kernel bytes as upstream leaves them; entries parse from
+/// the scratch copy and borrow their names from it.
+pub struct RawDir<'buf, Fd: AsFd> {
+    fd: Fd,
+    buf: &'buf mut [std::mem::MaybeUninit<u8>],
+    raw: Vec<u8>,
+    initialized: usize,
+    offset: usize,
+}
+
+impl<'buf, Fd: AsFd> RawDir<'buf, Fd> {
+    /// A new iterator from the given file descriptor and buffer. The
+    /// buffer size may be trimmed to accommodate alignment (the
+    /// kernel's `linux_dirent64` is 8-byte aligned).
+    pub fn new(fd: Fd, buf: &'buf mut [std::mem::MaybeUninit<u8>]) -> Self {
+        let addr = buf.as_mut_ptr() as usize;
+        let offset = (8 - addr % 8) % 8;
+        let buf = if offset < buf.len() { &mut buf[offset..] } else { &mut [] };
+        RawDir { fd, buf, raw: Vec::new(), initialized: 0, offset: 0 }
+    }
+
+    /// Identical to `Iterator::next` except that the item borrows
+    /// from self (upstream's own words): the next record, refilling
+    /// the buffer with one getdents64 call when it is empty.
+    pub fn next(&mut self) -> Option<Result<RawDirEntry<'_>>> {
+        if self.is_buffer_empty() {
+            self.raw.clear();
+            let n = core::intrinsics::sys_x_getdents(self.fd.as_fd().as_raw_fd(), self.buf.len() as u64, &mut self.raw);
+            if n < 0 {
+                return Some(Err(Errno((-n) as i32)));
+            }
+            if n == 0 {
+                return None;
+            }
+            let n = n as usize;
+            for i in 0..n {
+                self.buf[i].write(self.raw[i]);
+            }
+            self.initialized = n;
+            self.offset = 0;
+        }
+        // linux_dirent64: ino u64, off i64, reclen u16, type u8, name.
+        let at = &self.raw[self.offset..self.initialized];
+        let word = |i: usize| u64::from_le_bytes([at[i], at[i + 1], at[i + 2], at[i + 3], at[i + 4], at[i + 5], at[i + 6], at[i + 7]]);
+        let reclen = u16::from_le_bytes([at[16], at[17]]) as usize;
+        let name_end = at[19..reclen].iter().position(|&b| b == 0).map(|p| 19 + p + 1).unwrap_or(reclen);
+        let name = std::ffi::CStr::from_bytes_with_nul(&at[19..name_end]).unwrap_or_default();
+        let ent = RawDirEntry { file_name: name, file_type: at[18], inode_number: word(0), next_entry_cookie: word(8) as i64 };
+        self.offset += reclen;
+        Some(Ok(ent))
+    }
+
+    /// Returns true if the internal buffer is empty and will be
+    /// refilled when calling `next`.
+    pub fn is_buffer_empty(&self) -> bool {
+        self.offset >= self.initialized
+    }
+}
+
+/// A raw directory entry, similar to `std::fs::DirEntry`.
+pub struct RawDirEntry<'a> {
+    file_name: &'a std::ffi::CStr,
+    file_type: u8,
+    inode_number: u64,
+    next_entry_cookie: i64,
+}
+
+impl<'a> RawDirEntry<'a> {
+    /// Returns the file name of this directory entry.
+    pub fn file_name(&self) -> &std::ffi::CStr {
+        self.file_name
+    }
+
+    /// Returns the type of this directory entry.
+    pub fn file_type(&self) -> FileType {
+        FileType::from_dirent_d_type(self.file_type)
+    }
+
+    /// Returns the inode number of this directory entry.
+    pub fn ino(&self) -> u64 {
+        self.inode_number
+    }
+
+    /// Returns the seek cookie to the next directory entry.
+    pub fn next_entry_cookie(&self) -> u64 {
+        self.next_entry_cookie as u64
+    }
+}
+
+impl core::fmt::Debug for RawDirEntry<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RawDirEntry")
+            .field("file_name", &self.file_name())
+            .field("file_type", &self.file_type())
+            .field("ino", &self.ino())
+            .field("next_entry_cookie", &self.next_entry_cookie())
+            .finish()
+    }
+}
+
+impl FileType {
+    /// The type of a directory entry's `d_type` byte.
+    pub const fn from_dirent_d_type(d_type: u8) -> FileType {
+        match d_type {
+            1 => FileType::Fifo,
+            2 => FileType::CharacterDevice,
+            4 => FileType::Directory,
+            6 => FileType::BlockDevice,
+            8 => FileType::RegularFile,
+            10 => FileType::Symlink,
+            12 => FileType::Socket,
+            _ => FileType::Unknown,
+        }
+    }
+}
+
 /// `rustix::fs::inotify`: inotify creation and watches, over
 /// sysx. Events are read with `rustix::io::read` on the fd, as
-/// ts-rust does. The `Reader` iterator is not here: its buffer
-/// type is `core::mem::MaybeUninit`, which lust does not have
-/// yet (README).
+/// ts-rust does. The `Reader` iterator at the end reads events the same way.
 pub mod inotify {
     use crate::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use crate::fs::path_bytes;
@@ -820,6 +937,52 @@ impl ReadFlags {
     pub const fn is_empty(&self) -> bool { self.0 == 0 }
 }
 
+/// The bitflags Debug form upstream prints for `ReadFlags`
+/// (known bits by name in declaration order, the rest as hex).
+/// Other flag types in this adapter stay without Debug (README).
+impl core::fmt::Debug for ReadFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const NAMES: &[(u32, &str)] = &[
+            (0x0000_0001, "ACCESS"),
+            (0x0000_0004, "ATTRIB"),
+            (0x0000_0010, "CLOSE_NOWRITE"),
+            (0x0000_0008, "CLOSE_WRITE"),
+            (0x0000_0100, "CREATE"),
+            (0x0000_0200, "DELETE"),
+            (0x0000_0400, "DELETE_SELF"),
+            (0x0000_0002, "MODIFY"),
+            (0x0000_0800, "MOVE_SELF"),
+            (0x0000_0040, "MOVED_FROM"),
+            (0x0000_0080, "MOVED_TO"),
+            (0x0000_0020, "OPEN"),
+            (0x0000_8000, "IGNORED"),
+            (0x4000_0000, "ISDIR"),
+            (0x0000_4000, "QUEUE_OVERFLOW"),
+            (0x0000_2000, "UNMOUNT"),
+        ];
+        let mut rest = self.0;
+        let mut first = true;
+        f.write_str("ReadFlags(")?;
+        for &(bit, name) in NAMES {
+            if rest & bit != 0 {
+                if !first {
+                    f.write_str(" | ")?;
+                }
+                f.write_str(name)?;
+                first = false;
+                rest &= !bit;
+            }
+        }
+        if rest != 0 || first {
+            if !first {
+                f.write_str(" | ")?;
+            }
+            write!(f, "{rest:#x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
 impl core::ops::BitOr for ReadFlags {
     type Output = ReadFlags;
     fn bitor(self, other: ReadFlags) -> ReadFlags { ReadFlags(self.0 | other.0) }
@@ -862,5 +1025,99 @@ impl core::ops::BitAnd for ReadFlags {
             return Err(Errno::from_raw_os_error(e));
         }
         Ok(())
+    }
+
+    /// An inotify event iterator implemented with the read syscall
+    /// (upstream's `Reader`, based on `RawDir`'s API). Records are
+    /// read through a scratch Vec and mirrored into the caller's
+    /// buffer; events parse from the scratch copy.
+    pub struct Reader<'buf, Fd: AsFd> {
+        fd: Fd,
+        buf: &'buf mut [std::mem::MaybeUninit<u8>],
+        raw: Vec<u8>,
+        initialized: usize,
+        offset: usize,
+    }
+
+    impl<'buf, Fd: AsFd> Reader<'buf, Fd> {
+        /// A new iterator from the given file descriptor and buffer.
+        pub fn new(fd: Fd, buf: &'buf mut [std::mem::MaybeUninit<u8>]) -> Self {
+            let addr = buf.as_mut_ptr() as usize;
+            let offset = (4 - addr % 4) % 4;
+            let buf = if offset < buf.len() { &mut buf[offset..] } else { &mut [] };
+            Reader { fd, buf, raw: Vec::new(), initialized: 0, offset: 0 }
+        }
+
+        /// Read the next inotify event (or fail with the read's
+        /// error, `Errno::AGAIN` included for a nonblocking fd).
+        pub fn next(&mut self) -> Result<Event<'_>> {
+            if self.is_buffer_empty() {
+                self.raw.clear();
+                let n = core::intrinsics::sys_fd_read(self.fd.as_fd().as_raw_fd(), self.buf.len() as u64, &mut self.raw);
+                if n < 0 {
+                    return Err(Errno((-n) as i32));
+                }
+                if n == 0 {
+                    return Err(Errno::INVAL);
+                }
+                let n = n as usize;
+                for i in 0..n {
+                    self.buf[i].write(self.raw[i]);
+                }
+                self.initialized = n;
+                self.offset = 0;
+            }
+            // inotify_event: wd i32, mask u32, cookie u32, len u32, name.
+            let at = &self.raw[self.offset..self.initialized];
+            let wd = i32::from_le_bytes([at[0], at[1], at[2], at[3]]);
+            let mask = u32::from_le_bytes([at[4], at[5], at[6], at[7]]);
+            let cookie = u32::from_le_bytes([at[8], at[9], at[10], at[11]]);
+            let len = u32::from_le_bytes([at[12], at[13], at[14], at[15]]) as usize;
+            let file_name = if len > 0 {
+                let end = at[16..16 + len].iter().position(|&b| b == 0).map(|p| 16 + p + 1).unwrap_or(16 + len);
+                Some(std::ffi::CStr::from_bytes_with_nul(&at[16..end]).unwrap_or_default())
+            } else {
+                None
+            };
+            self.offset += 16 + len;
+            Ok(Event { wd, events: ReadFlags::from_bits_retain(mask), cookie, file_name })
+        }
+
+        /// Returns true if the internal buffer is empty and will be
+        /// refilled when calling `next`.
+        pub fn is_buffer_empty(&self) -> bool {
+            self.offset >= self.initialized
+        }
+    }
+
+    /// An inotify event.
+    #[derive(Debug)]
+    pub struct Event<'a> {
+        wd: i32,
+        events: ReadFlags,
+        cookie: u32,
+        file_name: Option<&'a std::ffi::CStr>,
+    }
+
+    impl<'a> Event<'a> {
+        /// Returns the watch for which this event occurs.
+        pub fn wd(&self) -> i32 {
+            self.wd
+        }
+
+        /// Returns a description of the events.
+        pub fn events(&self) -> ReadFlags {
+            self.events
+        }
+
+        /// Returns the unique cookie associating related events.
+        pub fn cookie(&self) -> u32 {
+            self.cookie
+        }
+
+        /// Returns the file name of this event, if any.
+        pub fn file_name(&self) -> Option<&std::ffi::CStr> {
+            self.file_name
+        }
     }
 }
