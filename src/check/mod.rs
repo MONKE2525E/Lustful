@@ -346,6 +346,9 @@ pub enum Builtin {
     SliceCopyFromSlice,
     /// `[T]::clone_from_slice` for a non-Copy `T`: core's element-wise `clone_from`.
     SliceCloneFromSlice,
+    /// `x.extend(iter)` on a type parameter with an `Extend<A>` bound, in a
+    /// template check: instances resolve the concrete `extend` (check/extend.rs).
+    ExtendParam,
     /// `[T]::copy_within` (`T: Copy`): the range bounds travel as
     /// drain's four words (check/slice.rs, lower.rs).
     SliceCopyWithin,
@@ -2863,6 +2866,9 @@ impl<'p> Ctx<'p> {
                     r.synthetic == crate::traits::index::Synthetic::None
                         && r.head == crate::traits::index::SelfHead::Adt(def)
                         && (r.trait_def == lang.partial_eq || r.trait_def == lang.partial_ord || r.trait_def == lang.ord)
+                        // Keys compare with keys: `impl PartialEq<Name> for
+                        // String` (ts-rust core.rs) is not a key compare.
+                        && p.tys.args(r.trait_ref.args).get(1).and_then(|g| g.as_ty()).is_none_or(|rhs| matches!(p.tys.kind(rhs), TyKind::Param(_)) || p.tys.adt_parts(rhs).is_some_and(|(d, _)| d == def))
                         && !p.std_source_span(r.span)
                         // Std's own impls (the platform crate's `String:
                         // PartialEq<OsStr>`, W-SHIM) agree with its order.
@@ -16015,9 +16021,10 @@ impl<'p> Ctx<'p> {
             if let Some(ret) = self.convert_method(e, recv, rt, name, name_span, args, expected) {
                 return ret;
             }
-            // `extend` on Vec and String (check/extend.rs, W-STD-B).
+            // `extend` on Vec and String (check/extend.rs, W-STD-B), and on
+            // a type parameter through its `Extend<A>` bound.
             if self.p.interner.get(name) == "extend"
-                && let Some(ret) = self.seq_extend(e, recv, base, derefs, name_span, args)
+                && let Some(ret) = self.seq_extend(e, recv, base, derefs, name_span, args).or_else(|| self.param_extend(e, base, derefs, name_span, args))
             {
                 return ret;
             }
@@ -18460,6 +18467,9 @@ impl<'p> Ctx<'p> {
         }
         self.run_obligations(false);
         let span = self.span(iter);
+        // An `impl Iterator` value (a callee's opaque return): its bounds
+        // prove `Iterator` for it, as for a method call on it.
+        self.note_opaques(t);
         let args_id = self.tys.intern_args(&[GenericArg::Ty(t)]);
         let tr = TraitRef { def: p.gx.lang.into_iterator, args: args_id, bindings: EMPTY_BINDINGS };
         let lang = &p.gx.lang;
@@ -18489,6 +18499,8 @@ impl<'p> Ctx<'p> {
         // The iterator type and item type, normalized.
         let into_iter_proj = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_iter), args_id));
         let iter_ty = self.normalize_here(into_iter_proj);
+        let iter_ty = self.deep(iter_ty);
+        self.note_opaques(iter_ty);
         let item_proj = self.tys.intern(TyKind::Projection(AssocId(lang.assoc_into_item), args_id));
         let item_ty = self.normalize_here(item_proj);
         // next() on the iterator type.

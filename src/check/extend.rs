@@ -161,4 +161,42 @@ impl<'p> Ctx<'p> {
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::RefMut });
         Some(UNIT)
     }
+
+    /// `x.extend(iter)` where `x`'s type is a type parameter with one
+    /// `Extend<A>` bound (ts-rust frontend/core_ls_ext.rs copy_map_into): the
+    /// argument must be `IntoIterator<Item = A>`. Only a template check
+    /// meets a parameter receiver; its instances check the concrete
+    /// `extend` (Vec, String, maps and sets, or a written impl).
+    pub(super) fn param_extend(&mut self, e: ExprId, base: Ty, derefs: u8, name_span: Span, args: &[ExprId]) -> Option<Ty> {
+        if !matches!(self.kind(base), TyKind::Param(_)) {
+            return None;
+        }
+        let lang = self.p.gx.lang;
+        let items: Vec<Ty> = self
+            .env()
+            .iter()
+            .filter_map(|q| match q {
+                Predicate::Trait(b) if b.count == 0 && b.value.def == lang.extend && self.tys.args(b.value.args).first().and_then(|g| g.as_ty()) == Some(base) => {
+                    self.tys.args(b.value.args).get(1).and_then(|g| g.as_ty())
+                }
+                _ => None,
+            })
+            .collect();
+        let [a_ty] = items.as_slice() else { return None };
+        let a_ty = *a_ty;
+        let [a] = args else {
+            self.err("L0105", name_span, "`extend` takes 1 argument", "Pass the iterator.");
+            for &a in args {
+                self.expr(a, None);
+            }
+            return Some(ERROR);
+        };
+        let at = self.expr(*a, None);
+        let span = self.span(*a);
+        let targs = self.tys.intern_args(&[GenericArg::Ty(at)]);
+        self.obl.push(obligations::Obligation::Trait { trait_ref: TraitRef { def: lang.into_iterator, args: targs, bindings: EMPTY_BINDINGS }, span, depth: 0 });
+        self.obl.push(obligations::Obligation::AssocEq { eq: AssocEqData { assoc: lang.assoc_into_item, trait_args: targs, ty: a_ty }, span });
+        self.set_res(e, Res::BuiltinMethod { b: Builtin::ExtendParam, derefs, autoref: Autoref::RefMut });
+        Some(UNIT)
+    }
 }

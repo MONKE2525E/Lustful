@@ -2348,8 +2348,8 @@ impl<'p> Ctx<'p> {
                     via_shared |= m == Mut::Shared;
                     t = self.resolve(inner);
                 }
-                TyKind::Adt(..) if derefs < 8 && self.tys.smart_elem(t).is_some_and(|e| self.reaches_closure(e)) => {
-                    if self.tys.rc_elem(t).is_some() {
+                TyKind::Adt(..) if derefs < 8 && self.callee_smart_elem(t).is_some_and(|e| self.reaches_closure(e)) => {
+                    if self.tys.rc_elem(t).is_some() || arc_elem(&self.tys, t).is_some() {
                         via_rc = true;
                     } else {
                         via_box = true;
@@ -2357,7 +2357,7 @@ impl<'p> Ctx<'p> {
                     // A `Box<dyn FnOnce>` called by value moves the box.
                     box_by_value = via_box && derefs == 0;
                     derefs += 1;
-                    t = self.tys.smart_elem(t).map_or(ERROR, |e| self.resolve(e));
+                    t = self.callee_smart_elem(t).map_or(ERROR, |e| self.resolve(e));
                 }
                 // A `dyn Fn`-family value calls its vtable's one entry
                 // (ARCH 2.8, 2.9): through `&`/`Box`/`Rc` for `Fn`,
@@ -2450,16 +2450,26 @@ impl<'p> Ctx<'p> {
     /// the Fn traits `F` gives them).
     fn reaches_closure(&self, mut t: Ty) -> bool {
         for _ in 0..8 {
-            match self.kind(t) {
+            match self.kind(self.resolve(t)) {
                 TyKind::Closure(..) | TyKind::Dyn(..) => return true,
+                // A type parameter (or opaque) with an Fn bound behind a
+                // smart pointer (`Arc<F>`): the loop calls it through
+                // `fn_bound_call`.
+                TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) => return true,
                 TyKind::Ref(_, _, inner) => t = inner,
-                _ => match self.tys.smart_elem(t) {
+                _ => match self.callee_smart_elem(self.resolve(t)) {
                     Some(e) => t = e,
                     None => return false,
                 },
             }
         }
         false
+    }
+
+    /// The pointee of a `Box`, `Rc`, guard, or `Arc` callee (autoderef
+    /// to the callable).
+    fn callee_smart_elem(&self, t: Ty) -> Option<Ty> {
+        self.tys.smart_elem(t).or_else(|| arc_elem(&self.tys, t))
     }
 
     /// `t` through references and smart pointers down to a fn pointer
@@ -2859,4 +2869,9 @@ fn names_param_region(tys: &impl TyIntern, t: Ty) -> bool {
         }),
         _ => false,
     }
+}
+
+/// The `T` of an `Arc<T>`.
+fn arc_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    (crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::Arc)).then(|| tys.adt_first_ty_arg(t)).flatten()
 }

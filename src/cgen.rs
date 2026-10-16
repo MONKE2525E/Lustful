@@ -4300,6 +4300,7 @@ impl FnGen<'_, '_> {
         };
         match b {
             B::Sync(_) | B::RcNewCyclic => unreachable!("sync builtins and new_cyclic emit in cgen/sync.rs"),
+            B::ExtendParam => unreachable!("extend on a type parameter exists only in template checks"),
             B::OwnFrom(_) | B::OwnIntoString => unreachable!("owning pointer builtins emit in cgen/own.rs"),
             B::IntToLeBytes | B::IntToBeBytes | B::IntToNeBytes | B::IntFromLeBytes | B::IntFromBeBytes | B::IntFromNeBytes => {
                 unreachable!("byte conversions emit in cgen/bytes.rs")

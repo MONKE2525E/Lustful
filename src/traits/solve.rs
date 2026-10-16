@@ -614,10 +614,37 @@ impl Solver {
             if !ok {
                 continue;
             }
-            if is_global_bound(cx.tys(), b.value) {
+            // Global by its resolved args: a bound noted while an arg was
+            // still a variable (an opaque's) is the param's once it binds.
+            let resolved: Vec<GenericArg> = cx
+                .tys()
+                .args(b.value.args)
+                .to_vec()
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(t) => GenericArg::Ty(cx.deep_resolve(t)),
+                    g => g,
+                })
+                .collect();
+            let resolved = TraitRef { args: cx.tys().intern_args(&resolved), ..b.value };
+            if is_global_bound(cx.tys(), resolved) {
                 global_hit.get_or_insert(i);
             } else {
                 env_hits.push(i);
+            }
+        }
+        // Hits that name one trait ref once their variables resolve are
+        // one piece of evidence (an opaque's bounds noted before and
+        // after its args were inferred).
+        if env_hits.len() > 1 {
+            let key = |cx: &mut C, i: usize| -> Option<Vec<GenericArg>> {
+                let Predicate::Trait(b) = env[i] else { return None };
+                let args: Vec<GenericArg> = cx.tys().args(b.value.args).to_vec();
+                Some(args.into_iter().map(|g| match g { GenericArg::Ty(t) => GenericArg::Ty(cx.deep_resolve(t)), g => g }).collect())
+            };
+            let first = key(cx, env_hits[0]);
+            if first.is_some() && env_hits[1..].iter().all(|&i| key(cx, i) == first) {
+                env_hits.truncate(1);
             }
         }
         match env_hits.len() {

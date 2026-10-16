@@ -4881,6 +4881,7 @@ fn build_generics_owned(
         {
             let lhs = tys.intern(TyKind::Param(ParamId(idx)));
             for b in bounds {
+                errs.extend(bound_elided_ref(ast, interner, b).map(e0637));
                 bound_predicates(ast, interner, known, cx, tys, &rscope, lhs, b, &mut predicates, &mut relaxed, errs);
             }
             scope.assoc_srcs = assoc_srcs_of(cx, tys, &predicates);
@@ -4906,9 +4907,11 @@ fn build_generics_owned(
                 for (i, lt) in binder.iter().enumerate() {
                     bscope.alias_lifetimes.push((lt.name, Region::Bound(i as u32)));
                 }
+                errs.extend(elided_ref(ast, interner, *ty).map(e0637));
                 match resolve_scoped(ast, interner, known, cx, tys, *ty, &bscope) {
                     Ok(lhs) => {
                         for b in bounds {
+                            errs.extend(bound_elided_ref(ast, interner, b).map(e0637));
                             bound_predicates(ast, interner, known, cx, tys, &bscope, lhs, b, &mut predicates, &mut relaxed, errs);
                         }
                         scope.assoc_srcs = assoc_srcs_of(cx, tys, &predicates);
@@ -5991,6 +5994,25 @@ fn apit_param(
 /// written inside an `impl Trait` bound's generic args, not under `Fn`
 /// sugar, fn pointers, `dyn`, or a nested `impl Trait` (each has its own
 /// elision rules or its own check).
+/// An elided reference lifetime (`&T`, `'_`) in a bound's generic args
+/// (`C: Extend<&u8>`), not under `Fn(..)` sugar: rustc E0637 there.
+fn bound_elided_ref(ast: &Ast, interner: &Interner, b: &TraitBound) -> Option<Span> {
+    let TraitBound::Trait { trait_ref, .. } = b else { return None };
+    trait_ref.path.iter().find_map(|seg| match &seg.args {
+        ast::GenericArgs::Angle(args) => args.iter().find_map(|a| match a {
+            ast::GenericArg::Type(t) | ast::GenericArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => elided_ref(ast, interner, *t),
+            ast::GenericArg::Lifetime(l) if matches!(interner.get(l.name), "'_" | "_") => Some(l.span),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// rustc E0637 for an elided lifetime in a bound or where-clause type.
+fn e0637(span: Span) -> Diag {
+    Diag::new("L0203", span, "`&` without an explicit lifetime name cannot be used here", "Name the lifetime, or write `for<'a>` on the bound.")
+}
+
 fn elided_ref(ast: &Ast, interner: &Interner, id: ast::TyId) -> Option<Span> {
     match ast.ty(id) {
         TyExpr::Ref { lifetime, inner, .. } => match lifetime {
@@ -9338,6 +9360,38 @@ pub fn add_synthetic_impls(p: &mut Program) {
             let assoc = vec![(lang.assoc_into_item, item), (lang.assoc_into_iter, iter)];
             insert_synthetic(p, &mut ordinal, lang.into_iterator, s, &[], two.clone(), assoc, Synthetic::Lang, false, span);
         }
+        // std's `Extend` impls of the builtin collections, for bounds
+        // (`M: Extend<<M as IntoIterator>::Item>` in ts-rust's
+        // copy_map_into); a call on a concrete collection stays its
+        // builtin (check/extend.rs, check/hashmap.rs).
+        let bound = |p: &mut Program, tr: DefId, t: Ty| {
+            let a = p.tys.intern_args(&[GenericArg::Ty(t)]);
+            Predicate::Trait(Binder::plain(TraitRef { def: tr, args: a, bindings: EMPTY_BINDINGS }))
+        };
+        let with = |g: &Generics, preds: Vec<Predicate>| Generics { predicates: preds, ..g.clone() };
+        let one_t = Generics { parent: None, params: vec![ParamDef { name: p.interner.intern("T"), kind: ParamKind::Type, span }], predicates: Vec::new() };
+        let vec_p0 = p.tys.mk_vec(p0);
+        insert_synthetic(p, &mut ordinal, lang.extend, vec_p0, &[p0], one_t.clone(), Vec::new(), Synthetic::Lang, false, span);
+        let copy_p0 = bound(p, lang.copy, p0);
+        insert_synthetic(p, &mut ordinal, lang.extend, vec_p0, &[ref_p0], with(&one_t, vec![copy_p0]), Vec::new(), Synthetic::Lang, false, span);
+        let ref_char = p.tys.mk_ref(false, CHAR);
+        let box_str = p.tys.mk_boxed(STR);
+        let mut string_items = vec![CHAR, ref_char, REF_STR, STRING, box_str];
+        if let Some(cow) = p.tys.local_adt_of(cow_def()).map(|_| p.tys.mk_adt(cow_def(), &[GenericArg::Ty(STR)])) {
+            string_items.push(cow);
+        }
+        for item in string_items {
+            insert_synthetic(p, &mut ordinal, lang.extend, STRING, &[item], Generics::default(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        let (eq0, hash0, copy1, bh2) = (bound(p, lang.eq, p0), bound(p, lang.hash, p0), bound(p, lang.copy, p1), bound(p, lang.build_hasher, p2));
+        let kv = tup(p, p0, p1);
+        let ref_p1 = p.tys.mk_ref(false, p1);
+        let kv_ref = tup(p, ref_p0, ref_p1);
+        insert_synthetic(p, &mut ordinal, lang.extend, map, &[kv], with(&three, vec![eq0, hash0, bh2]), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.extend, map, &[kv_ref], with(&three, vec![eq0, hash0, copy_p0, copy1, bh2]), Vec::new(), Synthetic::Lang, false, span);
+        let bh1 = bound(p, lang.build_hasher, p1);
+        insert_synthetic(p, &mut ordinal, lang.extend, set, &[p0], with(&two, vec![eq0, hash0, bh1]), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.extend, set, &[ref_p0], with(&two, vec![eq0, hash0, copy_p0, bh1]), Vec::new(), Synthetic::Lang, false, span);
     }
 }
 
