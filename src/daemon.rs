@@ -24,7 +24,9 @@
 // requests the log gets a stats line (RSS, sessions, expansion tables).
 // Two safety nets watch the warm answers:
 //   - A panic in one request is caught. That crate's session is dropped, the request is
-//     answered by a fresh session at once, and the daemon keeps serving.
+//     answered by a fresh session at once, and the daemon keeps serving. A patch oracle
+//     failure (LUST_CHECK_ITEMPATCH, driver/item_oracle.rs) is never retried: the client
+//     gets it as an internal error (code 3), so a sweep sees it in the answer.
 //   - The fresh-session guard: when the incremental answer is an error, the client gets
 //     that answer at once and the request is redone in a fresh session in the background.
 //     If the answers differ, the event is logged loudly (lines starting with "guard:"),
@@ -491,7 +493,7 @@ impl GuardJobs {
                     return (GuardOutcome::Stale, None);
                 }
                 let mut fresh = Session::new(work_dir, true, req.session.clone());
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(&req, &mut fresh))) {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile_background(&req, &mut fresh))) {
                     Ok(resp) if same(&req) => (GuardOutcome::Fresh(resp), Some(fresh)),
                     Ok(_) => (GuardOutcome::Stale, None),
                     Err(_) => (GuardOutcome::Panicked, None),
@@ -576,6 +578,15 @@ fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
     }
 }
 
+/// The answer for a panic: an internal error (code 3) that names the
+/// patch oracle failure, or None for any other panic.
+fn oracle_answer(payload: &(dyn std::any::Any + Send), entry: &mut Entry, req: &Request) -> Option<Response> {
+    let line = driver::oracle_failure(payload)?;
+    eprintln!("lust daemon: patch oracle failure for {}; answered as an internal error, not retried", req.file.display());
+    replace_session(entry, &req.session);
+    Some(Response { stderr: format!("error: internal: {line}\n"), code: 3, ..Default::default() })
+}
+
 /// Compiles `req` in a brand-new session, which replaces the entry's. The
 /// bool is false when even the fresh compile panicked (the entry then holds
 /// another new empty session and the answer is the code 3 plain failure).
@@ -588,9 +599,12 @@ fn compile_fresh(entry: &mut Entry, req: &Request) -> (Response, bool) {
             let _ = std::fs::remove_dir_all(old.obj_dir());
             (r, true)
         }
-        Err(_) => {
-            eprintln!("guard: compile panicked in a fresh session for {}", req.file.display());
+        Err(payload) => {
             let _ = std::fs::remove_dir_all(fresh.obj_dir());
+            if let Some(r) = oracle_answer(&*payload, entry, req) {
+                return (r, false);
+            }
+            eprintln!("guard: compile panicked in a fresh session for {}", req.file.display());
             replace_session(entry, &req.session);
             (Response { stderr: "error: internal: compile failed in a fresh session\n".into(), code: 3, ..Default::default() }, false)
         }
@@ -631,7 +645,11 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
             }
             r
         }
-        Err(_) => {
+        Err(payload) => {
+            // An oracle failure is the answer: a retry would hide it.
+            if let Some(r) = oracle_answer(&*payload, entry, req) {
+                return r;
+            }
             // A panic has no answer to hand out and the session may be
             // corrupt: redo in a fresh session at once, as before.
             let (r, fresh_ok) = compile_fresh(entry, req);
