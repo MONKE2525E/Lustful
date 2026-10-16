@@ -988,9 +988,18 @@ fn scalar_lit(bits: u128, size: u64, signed: bool) -> String {
 /// one too. The fat-pointer and String/Vec pointer niches are sound
 /// because empty buffers and empty slices always carry the dangling
 /// aligned pointer (see lust_string_new and lust_vec_with_capacity),
-/// never null.
+/// never null. Each Adt's layout is computed once per call (`Seen::done`):
+/// a struct DAG whose fields share sub-types would otherwise cost one walk
+/// per path.
 fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
-    fn go(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> Option<Layout> {
+    /// The Adts on the walk (a by-value cycle has no layout) and the
+    /// finished ones.
+    #[derive(Default)]
+    struct Seen {
+        on: HashSet<AdtId>,
+        done: HashMap<AdtId, Layout>,
+    }
+    fn go(p: &Program, t: &CTy, seen: &mut Seen) -> Option<Layout> {
         match t {
             CTy::Unit => Some(layout::zst_layout(1)),
             CTy::Bool => Some(layout::bool_layout()),
@@ -1105,7 +1114,10 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 enum_is_exact(&l, 2).then_some(l)
             }
             CTy::Adt(a) => {
-                if !seen.insert(*a) {
+                if let Some(l) = seen.done.get(a) {
+                    return Some(l.clone());
+                }
+                if !seen.on.insert(*a) {
                     return None;
                 }
                 let adt = p.adt(*a);
@@ -1130,12 +1142,15 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                     }
                     layout::struct_layout(&fields, adt.repr).ok()
                 };
-                seen.remove(a);
+                seen.on.remove(a);
+                if let Some(l) = &r {
+                    seen.done.insert(*a, l.clone());
+                }
                 r
             }
         }
     }
-    go(p, t, &mut HashSet::new())
+    go(p, t, &mut Seen::default())
 }
 
 /// C integer type for an explicit enum tag or a niche scalar of `size`

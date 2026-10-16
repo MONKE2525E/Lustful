@@ -7120,7 +7120,7 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         && (p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
                             && p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
                             || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| is_copy(p, tys, f.ty)))
-                                && derive_args_all(p, a, &mut Vec::new(), &mut |x, _| is_copy(p, tys, x)))
+                                && derive_args_all(p, a, &mut GlueSeen::default(), &mut |x, _| is_copy(p, tys, x)))
                 }
                 None => false,
             }
@@ -7196,7 +7196,7 @@ fn match_impl_pat(p: &Program, tys: &impl TyIntern, pat: Ty, t: Ty, assign: &mut
 /// then does not count for glue, which can only keep a reject),
 /// except outlives predicates, which do not change what the glue
 /// calls (as in `prove_trait_ref`).
-fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assign: &[Option<Ty>], seen: &mut Vec<Ty>) -> bool {
+fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assign: &[Option<Ty>], seen: &mut GlueSeen) -> bool {
     let arg_ty = |g: &GenericArg| -> Option<Ty> {
         match g.as_ty().map(|t| p.tys.kind(t)) {
             Some(TyKind::Param(id)) => assign.get(id.0 as usize).copied().flatten(),
@@ -7232,7 +7232,7 @@ fn glue_impl_pred_holds(p: &Program, tys: &impl TyIntern, pred: &Predicate, assi
 
 /// A written glue impl's bound `self_ty: d` (with `Rhs = rhs` for
 /// `PartialEq` and `PartialOrd`), for a trait the glue walks know.
-fn glue_family_holds(p: &Program, tys: &impl TyIntern, d: DefId, self_ty: Ty, rhs: Option<Ty>, seen: &mut Vec<Ty>) -> bool {
+fn glue_family_holds(p: &Program, tys: &impl TyIntern, d: DefId, self_ty: Ty, rhs: Option<Ty>, seen: &mut GlueSeen) -> bool {
     let lang = &p.gx.lang;
     if d == lang.clone {
         glue_clone(p, tys, self_ty, seen)
@@ -7300,10 +7300,10 @@ fn written_glue_impl(
     trait_def: DefId,
     method: Option<&str>,
     bad_items: &[&str],
-    seen: &mut Vec<Ty>,
+    seen: &mut GlueSeen,
 ) -> bool {
     use crate::traits::index::{SelfHead, Synthetic};
-    if seen.contains(&t) {
+    if seen.on_walk(t) {
         return true;
     }
     let Some((def, _)) = tys.adt_parts(t) else { return false };
@@ -7344,11 +7344,11 @@ fn written_glue_impl(
 }
 
 pub fn has_clone(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_clone(p, tys, t, &mut Vec::new())
+    glue_clone(p, tys, t, &mut GlueSeen::default())
 }
 
 /// The walk behind `has_clone`; `seen` stops recursive generic types.
-fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     // `Cow<B>` clones its Owned value (`B: ToOwned` holds by its WF).
     if cow_arg(tys, t).is_some() {
         return true;
@@ -7408,7 +7408,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
             if p.gx.glue_methods.contains_key(&(a, p.gx.lang.clone)) {
                 return true;
             }
-            (p.adt(a).derives.clone && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
+            (p.adt(a).derives.clone && adt_instance_fields_all(p, a, t, GlueKey::Clone, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
                 || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen)
         }
         None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen),
@@ -7423,13 +7423,13 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
 /// A field type whose `PartialOrd` impl is written by hand needs
 /// that impl's method, which the glue cannot call: false.
 pub fn has_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_cmp(p, tys, t, false, &mut Vec::new())
+    glue_cmp(p, tys, t, false, &mut GlueSeen::default())
 }
 
 /// `has_ord` for `Ord`: the same shapes without floats, and Adts
 /// that derive `Ord`.
 pub fn has_total_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_cmp(p, tys, t, true, &mut Vec::new())
+    glue_cmp(p, tys, t, true, &mut GlueSeen::default())
 }
 
 /// True when `PartialOrd::lt` of `t` is exactly the `PCmp` glue:
@@ -7439,13 +7439,13 @@ pub fn has_total_ord(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
 /// Std's `sort` family compares with `lt`, so it needs both this
 /// and `has_total_ord`.
 pub fn has_partial_cmp(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_cmp_mode(p, tys, t, false, &mut Vec::new(), true)
+    glue_cmp_mode(p, tys, t, false, &mut GlueSeen::default(), true)
 }
 
 /// The structural walk behind `has_ord` and `has_total_ord`. `seen`
 /// holds the Adt types on the walk (a recursive type through `Box`
 /// or `Vec` compares by the same glue: the cycle adds no field type).
-fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec<Ty>) -> bool {
+fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut GlueSeen) -> bool {
     glue_cmp_mode(p, tys, t, total, seen, false)
 }
 
@@ -7453,7 +7453,7 @@ fn glue_cmp(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec
 /// in `pcmp_methods` also answers, and a parameter bound by `Ord`
 /// answers for its `PartialOrd` supertrait. Field walks that the
 /// derive rule sends to `Ord` (`fields_total`) use the plain walk.
-fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut Vec<Ty>, pcmp: bool) -> bool {
+fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mut GlueSeen, pcmp: bool) -> bool {
     // `Cow<B>` compares as the `B` it derefs to (W-STD-B).
     if let Some(b) = cow_arg(tys, t) {
         return glue_cmp_mode(p, tys, b, total, seen, pcmp);
@@ -7531,7 +7531,9 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                     let generic = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some())
                         || p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty());
                     let fields_total = total || (d.ord && !generic);
-                    adt_fields_all(p, a, t, seen, &mut |f, seen| glue_cmp_mode(p, tys, f, fields_total, seen, pcmp && !fields_total))
+                    adt_fields_all(p, a, t, GlueKey::Cmp(fields_total, pcmp && !fields_total), seen, &mut |f, seen| {
+                        glue_cmp_mode(p, tys, f, fields_total, seen, pcmp && !fields_total)
+                    })
                 }
                 None => false,
             }
@@ -7544,15 +7546,12 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
 /// template answers true (collect checked the derive's fields, and
 /// a template's instances answer for themselves). `seen` stops
 /// recursion through recursive generic types.
-fn adt_instance_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok: &mut dyn FnMut(Ty, &mut Vec<Ty>) -> bool) -> bool {
+fn adt_instance_fields_all(p: &Program, a: AdtId, t: Ty, key: GlueKey, seen: &mut GlueSeen, ok: &mut dyn FnMut(Ty, &mut GlueSeen) -> bool) -> bool {
     let instance = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some());
-    if !instance || seen.contains(&t) {
+    if !instance {
         return true;
     }
-    seen.push(t);
-    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen))) && derive_args_all(p, a, seen, ok);
-    seen.pop();
-    all
+    seen.fields_all(p, a, t, key, ok)
 }
 
 /// Rustc's derive bounds: a derived impl on a generic Adt bounds every
@@ -7561,7 +7560,7 @@ fn adt_instance_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok:
 /// `PhantomData<T>` field uses. True when `ok` holds for every type
 /// argument of instance `a` (always for std's `PhantomData`, whose
 /// impls have no bounds, and for non-instances).
-fn derive_args_all(p: &Program, a: AdtId, seen: &mut Vec<Ty>, ok: &mut dyn FnMut(Ty, &mut Vec<Ty>) -> bool) -> bool {
+fn derive_args_all(p: &Program, a: AdtId, seen: &mut GlueSeen, ok: &mut dyn FnMut(Ty, &mut GlueSeen) -> bool) -> bool {
     let Some(Some((tdef, args))) = p.gx.adt_instance_of.get(a.0 as usize) else { return true };
     if p.defs.local_adt(*tdef).is_some_and(|tmpl| p.is_phantom_adt(tmpl)) {
         return true;
@@ -7572,17 +7571,78 @@ fn derive_args_all(p: &Program, a: AdtId, seen: &mut Vec<Ty>, ok: &mut dyn FnMut
 /// True when `ok` holds for every field type of Adt `a` (the Adt of
 /// type `t`), or when the fields are a generic template's (a template
 /// body: its instances answer with their own substituted fields).
-/// `seen` stops recursion through recursive types.
-fn adt_fields_all(p: &Program, a: AdtId, t: Ty, seen: &mut Vec<Ty>, ok: &mut dyn FnMut(Ty, &mut Vec<Ty>) -> bool) -> bool {
+/// `seen` stops recursion through recursive types; `key` names `ok`
+/// for its memo (`GlueSeen`).
+fn adt_fields_all(p: &Program, a: AdtId, t: Ty, key: GlueKey, seen: &mut GlueSeen, ok: &mut dyn FnMut(Ty, &mut GlueSeen) -> bool) -> bool {
     let template = p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
         && p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty());
-    if template || seen.contains(&t) {
+    if template {
         return true;
     }
-    seen.push(t);
-    let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, seen))) && derive_args_all(p, a, seen, ok);
-    seen.pop();
-    all
+    seen.fields_all(p, a, t, key, ok)
+}
+
+/// Which field walk a `GlueSeen` memo entry answers: the glue trait,
+/// and for the ordering walk its `total` and `pcmp` flags.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GlueKey {
+    Hash,
+    Default,
+    Cmp(bool, bool),
+    Clone,
+    TotalEq,
+    Eq,
+    Debug,
+}
+
+/// The state of one glue walk (`has_clone`, `has_default`, ...): the
+/// Adt types on the walk (`stack`; one on it again counts as holding,
+/// which stops recursive types), and the answers of finished Adt field
+/// walks. A struct DAG (fields that share sub-types) walked without
+/// the memo costs one visit per path, which grows exponentially with
+/// its depth. An answer is kept only when its walk met no type on the
+/// stack (`hits` did not move): it then holds in every walk.
+#[derive(Default)]
+struct GlueSeen {
+    stack: Vec<Ty>,
+    memo: HashMap<(GlueKey, Ty), bool>,
+    hits: u32,
+}
+
+impl GlueSeen {
+    /// True when `t` is on the walk already (a cycle, which counts as
+    /// holding).
+    fn on_walk(&mut self, t: Ty) -> bool {
+        let on = self.stack.contains(&t);
+        self.hits += u32::from(on);
+        on
+    }
+
+    fn push(&mut self, t: Ty) {
+        self.stack.push(t);
+    }
+
+    fn pop(&mut self) {
+        self.stack.pop();
+    }
+
+    /// `ok` over every field type and derive arg of Adt `a` (type `t`).
+    fn fields_all(&mut self, p: &Program, a: AdtId, t: Ty, key: GlueKey, ok: &mut dyn FnMut(Ty, &mut GlueSeen) -> bool) -> bool {
+        if let Some(&r) = self.memo.get(&(key, t)) {
+            return r;
+        }
+        if self.on_walk(t) {
+            return true;
+        }
+        let hits = self.hits;
+        self.push(t);
+        let all = p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| ok(f.ty, self))) && derive_args_all(p, a, self, ok);
+        self.pop();
+        if self.hits == hits {
+            self.memo.insert((key, t), all);
+        }
+        all
+    }
 }
 
 /// An auto trait (`Send`, `Sync`, `Unpin`) of `t` by structure (ARCH
@@ -7764,10 +7824,10 @@ pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], 
 /// fields of such types. (Lust has no `Hasher` yet: this answers
 /// bounds, no hashing code exists.)
 pub fn has_hash(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_hash(p, tys, t, &mut Vec::new())
+    glue_hash(p, tys, t, &mut GlueSeen::default())
 }
 
-fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     if let Some(b) = cow_arg(tys, t) {
         return glue_hash(p, tys, b, seen);
     }
@@ -7795,7 +7855,7 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> boo
             match tys.local_adt(t) {
                 // A written impl the glue calls (`gx.written_hash`).
                 Some(a) if p.gx.written_hash.contains_key(&a) => true,
-                Some(a) if p.adt(a).derives.hash => adt_fields_all(p, a, t, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
+                Some(a) if p.adt(a).derives.hash => adt_fields_all(p, a, t, GlueKey::Hash, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
                 _ => false,
             }
         }
@@ -7808,10 +7868,10 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> boo
 /// of such types, `&str` and `&[T]`, and Adts that derive `Default`
 /// with fields of such types.
 pub fn has_default(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_default(p, tys, t, &mut Vec::new())
+    glue_default(p, tys, t, &mut GlueSeen::default())
 }
 
-fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     // `Cow<B>` defaults to `Owned(<B as ToOwned>::Owned::default())`
     // (std's impl): str and slices always qualify (String and Vec),
     // a sized `B` through itself, and any other `B` through the
@@ -7894,7 +7954,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
                         return false;
                     }
                     // An enum's default is its unit `#[default]` variant.
-                    adt.is_enum || adt_fields_all(p, a, t, seen, &mut |f, seen| glue_default(p, tys, f, seen))
+                    adt.is_enum || adt_fields_all(p, a, t, GlueKey::Default, seen, &mut |f, seen| glue_default(p, tys, f, seen))
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.default, Some("default"), &[], seen),
             }
@@ -7912,11 +7972,11 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> 
 /// heads); a derived `Eq`'s own field check stays with the solver
 /// in `check_derive_bounds`.
 pub fn has_total_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_total_eq(p, tys, t, &mut Vec::new())
+    glue_total_eq(p, tys, t, &mut GlueSeen::default())
 }
 
 /// The walk behind `has_total_eq`; `seen` stops recursive generic types.
-fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     if let Some(b) = cow_arg(tys, t) {
         return glue_total_eq(p, tys, b, seen);
     }
@@ -7960,7 +8020,7 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) ->
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.adt(a).derives.eq && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
+                    (p.adt(a).derives.eq && adt_instance_fields_all(p, a, t, GlueKey::TotalEq, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen),
@@ -7970,11 +8030,11 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) ->
 }
 
 pub fn has_eq(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_eq(p, tys, t, &mut Vec::new())
+    glue_eq(p, tys, t, &mut GlueSeen::default())
 }
 
 /// The walk behind `has_eq`; `seen` stops recursive generic types.
-fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     if let Some(b) = cow_arg(tys, t) {
         return glue_eq(p, tys, b, seen);
     }
@@ -8020,7 +8080,7 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
                 // A written non-generic impl: the glue calls its `eq`.
                 Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,
                 Some(a) => {
-                    (p.adt(a).derives.partial_eq && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
+                    (p.adt(a).derives.partial_eq && adt_instance_fields_all(p, a, t, GlueKey::Eq, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen),
@@ -8030,11 +8090,11 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool 
 }
 
 pub fn has_debug(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
-    glue_debug(p, tys, t, &mut Vec::new())
+    glue_debug(p, tys, t, &mut GlueSeen::default())
 }
 
 /// The walk behind `has_debug`; `seen` stops recursive generic types.
-fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bool {
+fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool {
     if let Some(b) = cow_arg(tys, t) {
         return glue_debug(p, tys, b, seen);
     }
@@ -8102,7 +8162,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut Vec<Ty>) -> bo
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
+                    (p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
                         || crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.debug)
                         // A conditional written impl (`impl<K: Debug>
                         // Debug for W<K>`) whose bounds the glue walks
