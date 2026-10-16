@@ -1172,6 +1172,19 @@ pub fn resolve_ty(
                     let b = resolve_ty(ast, interner, known, type_names, aliases, tys, *b, self_ty)?;
                     return Ok(tys.mk_adt(generics::bound_def(), &[GenericArg::Ty(b)]));
                 }
+                // `std::thread::Result<T>`: std's alias for
+                // `Result<T, Box<dyn Any + Send>>` (R26).
+                if path.len() == 3 && path[0] == "std" && path[1] == "thread" && path[2] == "Result" {
+                    let seg = segs.last().unwrap();
+                    let targs = seg.type_args();
+                    let [t] = targs.as_slice() else {
+                        return Err(Diag::new("L0110", span, "`thread::Result` takes one type argument", "Write `thread::Result<T>`."));
+                    };
+                    let t = resolve_ty(ast, interner, known, type_names, aliases, tys, *t, self_ty)?;
+                    let any = crate::check::unwind::dyn_any_send(tys, generics::any_trait_def());
+                    let err = tys.mk_boxed(any);
+                    return Ok(tys.mk_result(t, err));
+                }
                 // `std::borrow::Cow<'a, B>` (W-STD-B), regions erased.
                 if path.len() == 3 && path[1] == "borrow" && path[2] == "Cow" {
                     let seg = segs.last().unwrap();

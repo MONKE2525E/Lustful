@@ -1599,6 +1599,8 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/option/Option",
     "core/result/Result",
     "std/result/Result",
+    // std's alias `Result<T, Box<dyn Any + Send>>` (R26; check resolves it).
+    "std/thread/Result",
     "alloc/string/String",
     "std/string/String",
     "alloc/vec/Vec",

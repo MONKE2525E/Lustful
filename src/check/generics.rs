@@ -140,6 +140,13 @@ fn lang_trait(module: &[&str], name: &str) -> DefId {
     lang_def(module, crate::def::DefKind::Trait, name)
 }
 
+/// The def of `core::any::Any`, for type resolution outside a
+/// `LangTraits` (the flat resolver's `std::thread::Result`, R26).
+/// The same deterministic def `LangTraits::new` records.
+pub fn any_trait_def() -> DefId {
+    lang_trait(&["core", "any"], "Any")
+}
+
 fn lang_assoc(trait_def: DefId, name: &str) -> DefId {
     DefId { krate: BUILTIN_CRATE, hash: crate::def::child_hash(trait_def.hash, crate::def::DefKind::Assoc, name, 0) }
 }
@@ -3309,6 +3316,24 @@ pub(crate) fn resolve_path_ty(
                     return Err(Diag::new("L0110", span, "`TypeId` takes no generic arguments", "Remove the `<...>` part."));
                 }
                 return Ok(type_id_ty(tys));
+            }
+            // `std::thread::Result<T>`: std's alias for
+            // `Result<T, Box<dyn Any + Send>>` (R26).
+            if path.len() == 3 && path[0] == "std" && path[1] == "thread" && path[2] == "Result" {
+                let seg = segs.last().unwrap();
+                let GenericArgs::Angle(a) = &seg.args else {
+                    return Err(Diag::new("L0110", span, "`thread::Result` takes one type argument", "Write `thread::Result<T>`."));
+                };
+                let args: Vec<Ty> = resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, "thread::Result")?
+                    .into_iter()
+                    .filter_map(|g| g.as_ty())
+                    .collect();
+                let [t] = args.as_slice() else {
+                    return Err(Diag::new("L0110", span, "`thread::Result` takes one type argument", "Write `thread::Result<T>`."));
+                };
+                let any = crate::check::unwind::dyn_any_send(tys, cx.lang.any);
+                let err = tys.mk_boxed(any);
+                return Ok(tys.mk_result(*t, err));
             }
             // `std::borrow::Cow<'a, B>` (W-STD-B).
             if path.len() == 3 && path[1] == "borrow" && path[2] == "Cow" {
@@ -10274,7 +10299,14 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
     if !p.gx.user_generics {
         let user = |sp: &Span| !p.in_lang_methods(*sp);
         let closures = p.ast.exprs.iter().zip(&p.ast.expr_spans).any(|(e, sp)| matches!(e, ast::Expr::Closure { .. }) && user(sp));
-        let dyns = p.ast.tys.iter().zip(&p.ast.ty_spans).any(|(t, sp)| matches!(t, TyExpr::Dyn { .. }) && user(sp));
+        // `std::thread::Result<T>` names `Box<dyn Any + Send>` with no
+        // `dyn` in the text (R26).
+        let (thread, result) = (p.interner.intern("thread"), p.interner.intern("Result"));
+        let thread_result = |t: &TyExpr| match t {
+            TyExpr::Path(segs) => segs.len() >= 2 && segs[segs.len() - 1].name == result && segs[segs.len() - 2].name == thread,
+            _ => false,
+        };
+        let dyns = p.ast.tys.iter().zip(&p.ast.ty_spans).any(|(t, sp)| (matches!(t, TyExpr::Dyn { .. }) || thread_result(t)) && user(sp));
         let panic_any = p.interner.intern("panic_any");
         let panic_anys = p
             .ast
