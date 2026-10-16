@@ -2484,6 +2484,10 @@ pub(super) struct Builder<'b, 'p> {
     /// its first universals (the trait's lifetime params) take
     /// (`trait_lifetime_seeds`); empty otherwise.
     seed_univ: Vec<u32>,
+    /// Set by `call_sig_with` when every `Item = T` bound of the callee
+    /// was related exactly (`item_bound_flows`), so the call needs no
+    /// over-approximation for it.
+    item_bound_exact: bool,
     /// The closures `closure_created` has seen.
     created: FxMap<DefId, ()>,
     /// The last check of the fn whose closures `closure_reqs` lowers
@@ -2554,6 +2558,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             bound_linked: Vec::new(),
             out_proved: Vec::new(),
             seed_univ: Vec::new(),
+            item_bound_exact: false,
             created: FxMap::default(),
             root_check: None,
             bind_tys: FxMap::default(),
@@ -4479,7 +4484,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 // E0505 on a later move; this was a false accept, also
                 // behind `collect` into a BTreeSet). Over-approximate:
                 // every argument region may reach the result.
-                if ok && self.item_bound(f) {
+                if ok && self.item_bound(f) && !std::mem::take(&mut self.item_bound_exact) {
                     let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
                     self.flow_all(&all, &dv);
                 }
@@ -6828,6 +6833,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
             self.edge(x, y);
         }
+        self.item_bound_exact = ok && self.item_bound_flows(preds, &binds);
         // `T: Tr<'a>` for a trait with lifetime params: the type bound to
         // `T` implements `Tr` with exactly those lifetimes (trait args are
         // invariant), so its own (this body's bound on a type param, or the
@@ -7205,6 +7211,55 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// fn's own, an elided one a fresh region of this call (higher-ranked).
     /// False when no regioned bound pairs: the caller then takes the
     /// conservative rule, which ties the result to the receiver too.
+    /// `I: Iterator<Item = T>` (or `IntoIterator`) bounds of a callee
+    /// where `I` and `T` are type params and the argument bound to `I` is
+    /// an iterator whose items lust reads (`iter_items`): `T`'s regions
+    /// take exactly those items' (`suggest(name, v.iter().map(..), ..)`
+    /// returning `T` holds no loan the items do not hold). True when there
+    /// was at least one such bound and every one paired.
+    fn item_bound_flows(&mut self, preds: &[Predicate], binds: &FxMap<u32, Vec<u32>>) -> bool {
+        let p = self.p;
+        let item_of = |tr: DefId| {
+            p.gx.index.trait_record(tr).and_then(|r| r.assoc_items.iter().find(|a| p.interner.get(a.1) == "Item").map(|a| a.0))
+        };
+        let items: Vec<DefId> = [p.gx.lang.iterator, p.gx.lang.into_iterator].into_iter().filter_map(item_of).collect();
+        let mut pairs: Vec<(Ty, Ty)> = Vec::new();
+        for pr in preds {
+            match pr {
+                Predicate::AssocEq(b) if items.contains(&b.value.assoc) => {
+                    let Some(st) = p.tys.args(b.value.trait_args).first().and_then(|g| g.as_ty()) else { return false };
+                    pairs.push((st, b.value.ty));
+                }
+                Predicate::Trait(b) => {
+                    for &(d, t) in p.tys.bindings(b.value.bindings) {
+                        if items.contains(&d) {
+                            let (Some(st), Some(t)) = (p.tys.args(b.value.args).first().and_then(|g| g.as_ty()), t.as_ty()) else { return false };
+                            pairs.push((st, t));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if pairs.is_empty() {
+            return false;
+        }
+        for (st, t) in pairs {
+            let (TyKind::Param(ji), TyKind::Param(jt)) = (p.tys.kind(st), p.tys.kind(t)) else { return false };
+            let (Some(&it), Some(iv), Some(tv)) = (self.bind_tys.get(&ji.0), binds.get(&ji.0).cloned(), binds.get(&jt.0).cloned()) else { return false };
+            let mut cands = Vec::new();
+            if crate::ty::iter::iter_parts(&self.body.tys, it).is_none() || !self.iter_items(it, &iv, &mut cands) || cands.is_empty() || cands.iter().any(|c| c.len() != tv.len()) {
+                return false;
+            }
+            for c in cands {
+                for (&a, &b) in c.iter().zip(&tv) {
+                    self.edge(a, b);
+                }
+            }
+        }
+        true
+    }
+
     /// True when `f`'s template bounds an `Item` of `Iterator` or
     /// `IntoIterator` to a type (`call`'s over-approximation, W-STD-C).
     fn item_bound(&self, f: LocalDefId) -> bool {
