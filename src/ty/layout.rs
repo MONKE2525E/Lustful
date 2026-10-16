@@ -760,11 +760,14 @@ fn finish(mut l: Layout, repr: Repr) -> Result<Layout, ()> {
 
 /// The shape of one Adt for layout: its repr, each variant's field types in
 /// declaration order, and each variant's discriminant. A struct has one variant.
+/// `hide_niche`: the real type holds these fields in an `UnsafeCell` (a std
+/// cell type whose source form is plain), so its niche is not usable.
 pub struct AdtShape {
     pub repr: Repr,
     pub is_enum: bool,
     pub variants: Vec<Vec<Ty>>,
     pub discs: Vec<i128>,
+    pub hide_niche: bool,
 }
 
 /// Adt shapes by session-local id, supplied by collect's tables.
@@ -993,6 +996,12 @@ fn compute(
             // The futex locks (Linux): `Mutex<T>` is `{ futex: AtomicU32,
             // poison: AtomicBool, data: UnsafeCell<T> }`, `RwLock<T>` the
             // same with an 8-byte state (two `AtomicU32`).
+            // `OnceLock<T>`: `{ once: Once (an AtomicU32 futex), value:
+            // UnsafeCell<MaybeUninit<T>> }`.
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::OnceLock)) => {
+                let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
+                struct_layout(&[Layout::simple(4, 4, None), v], Repr::default())
+            }
             Some(BuiltinTy::Sync(k @ (crate::ty::sync::SyncTy::Mutex | crate::ty::sync::SyncTy::RwLock))) => {
                 let v = no_niche(go(tys, shapes, tys.adt_first_ty_arg(t).ok_or(())?, env, frames, memo, active)?);
                 let state = if k == crate::ty::sync::SyncTy::Mutex { 4 } else { 8 };
@@ -1035,11 +1044,12 @@ fn compute(
                     }
                     variants.push(fields);
                 }
-                if shape.is_enum {
+                let l = if shape.is_enum {
                     enum_layout(&variants, &shape.discs, shape.repr)
                 } else {
                     struct_layout(&variants.into_iter().next().unwrap_or_default(), shape.repr)
-                }
+                };
+                if shape.hide_niche { l.map(no_niche) } else { l }
             }
         },
         _ => Err(()),

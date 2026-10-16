@@ -8935,7 +8935,13 @@ impl crate::ty::layout::AdtShapes for UserLayout<'_> {
         // their source form, so no layout query may see them; the
         // field-less `PhantomData` (size 0, align 1) is exact, and
         // so is the unit-struct `System` allocator (size 0, align 1).
+        // `OnceCell<T>` is std's `UnsafeCell<Option<T>>`: its source
+        // fields (the `Option<T>` and a `PhantomData`) with the niche
+        // hidden.
         if p.std_source_span(adt.span) && !p.is_phantom_adt(id) && !p.is_known_allocator_adt(id) {
+            if p.display_path(adt.name) == "core::cell::OnceCell" {
+                return p.adt_shape(id).map(|s| crate::ty::layout::AdtShape { hide_niche: true, ..s });
+            }
             return None;
         }
         if let Some(a) = p.adapter_at(adt.span) {
@@ -8957,6 +8963,7 @@ impl crate::ty::layout::AdtShapes for Program {
             is_enum: adt.is_enum,
             variants: adt.variants.iter().map(|v| v.fields.iter().map(|f| f.ty).collect()).collect(),
             discs: adt.variants.iter().map(|v| v.disc).collect(),
+            hide_niche: false,
         })
     }
 }
