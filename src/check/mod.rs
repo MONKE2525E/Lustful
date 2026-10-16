@@ -1995,6 +1995,10 @@ struct Ctx<'p> {
     /// (`opaque::callee_closure_map`).
     opaque_calls: Vec<Ty>,
     closure_map: Vec<(Ty, DefId)>,
+    /// Body end: the bare inner iterators of builtin adapters that revealed
+    /// opaque calls left, with their replacements (`build_closure_map`,
+    /// `opaque::replace_iter_args`), which `zonk` applies.
+    iter_arg_map: Vec<(Ty, Ty)>,
     /// Per template closure that a revealed generic `impl Trait` call
     /// put in a type: the call's args for the definer's params, which
     /// the closure's signature names, and the closure type the call
@@ -2391,6 +2395,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         opaque_seen: Vec::new(),
         opaque_calls: Vec::new(),
         closure_map: Vec::new(),
+        iter_arg_map: Vec::new(),
         opaque_closure_args: Vec::new(),
         closure_order: None,
         iter_closure_args: std::collections::HashMap::new(),
@@ -5826,6 +5831,7 @@ impl<'p> Ctx<'p> {
     /// variables become i32.
     fn zonk(&mut self, t: Ty) -> Ty {
         let z = self.rebuild(t, true);
+        let z = if self.iter_arg_map.is_empty() { z } else { opaque::replace_iter_args(&mut self.tys, z, &self.iter_arg_map) };
         if self.closure_map.is_empty() {
             return z;
         }

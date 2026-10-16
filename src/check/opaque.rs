@@ -250,7 +250,7 @@ impl Ctx<'_> {
                     let mut cts = Vec::new();
                     collect_closures(&self.tys, h, &mut cts);
                     for ct in cts {
-                        let ct = reveal(&p.gx.opaque_hidden, &mut self.tys, ct, 0);
+                        let ct = self.reveal_here(ct);
                         if let TyKind::Closure(d, _) = self.tys.kind(ct)
                             && !self.opaque_closure_args.contains(&(d, args, ct))
                         {
@@ -266,7 +266,7 @@ impl Ctx<'_> {
         if !self.opaque_calls.contains(&t) {
             self.opaque_calls.push(t);
         }
-        reveal(&p.gx.opaque_hidden, &mut self.tys, t, 0)
+        self.reveal_here(t)
     }
 
     /// Body end: the closure map (`instance_closure_map`) of each generic
@@ -279,15 +279,24 @@ impl Ctx<'_> {
         let mut found: Vec<Ty> = Vec::new();
         // A literal's var (`mk(5)`) takes its default now, as the zonk
         // right after would: mono made the instance at that type.
+        let mut bare: Vec<Ty> = Vec::new();
         for t in std::mem::take(&mut self.opaque_calls) {
             self.default_literal_vars(t);
             let t = self.deep(t);
             collect_opaques_deep(&p.gx.opaque_hidden, &mut self.tys, t, &mut found);
+            let r = reveal(&p.gx.opaque_hidden, &mut self.tys, t, 0);
+            bare_iter_args(&self.tys, r, &mut bare);
         }
+        // The inner iterators the call types became once their args
+        // resolved (`reveal_here`); `zonk` replaces them first.
+        self.iter_arg_map = self.canon_iter_args(bare);
         let mut map: Vec<(Ty, DefId)> = Vec::new();
         // Per generic opaque met: its args and its hidden closure types.
         let mut met: Vec<(DefId, ArgsId, Vec<Ty>)> = Vec::new();
-        for o in found {
+        // Innermost first: an opaque's args can hold the value of
+        // another (`pass(def(4u8))` with `fn pass(it: impl Iterator)`),
+        // whose closures are mapped before this instance is looked up.
+        for o in found.into_iter().rev() {
             let TyKind::Opaque(od, args) = self.tys.kind(o) else { continue };
             // A method probe that lost records a call at vars nothing
             // decides; the call that stands has its args resolved.
@@ -299,7 +308,7 @@ impl Ctx<'_> {
             if p.gx.fn_templates.get(template.0 as usize).is_none_or(|t| t.is_none()) {
                 continue;
             }
-            let h = reveal(&p.gx.opaque_hidden, &mut self.tys, o, 0);
+            let h = self.reveal_here(o);
             let mut cts = Vec::new();
             collect_closures(&self.tys, h, &mut cts);
             if cts.is_empty() || met.iter().any(|(d, a, _)| *d == od && *a == args) {
@@ -316,6 +325,7 @@ impl Ctx<'_> {
             }
             met.push((od, args, cts));
             let args: Vec<GenericArg> = self.tys.args(args).to_vec();
+            let args: Vec<GenericArg> = args.into_iter().map(|g| map_arg_closures(&mut self.tys, g, &map)).collect();
             let Some(inst) = generics::instance_for(p, &self.tys, template, &args).filter(|&i| i != template) else {
                 self.out.closure_map_pending = true;
                 continue;
@@ -668,6 +678,14 @@ fn collect_closures(tys: &impl TyIntern, t: Ty, out: &mut Vec<Ty>) {
     }
 }
 
+/// `g` with `map_closure_defs` applied when it is a type.
+fn map_arg_closures(tys: &mut impl TyIntern, g: GenericArg, map: &[(Ty, DefId)]) -> GenericArg {
+    match g {
+        GenericArg::Ty(t) if !map.is_empty() => GenericArg::Ty(map_closure_defs(tys, t, map)),
+        g => g,
+    }
+}
+
 /// `t` with the def of each closure type `map` names replaced.
 pub(crate) fn map_closure_defs(tys: &mut impl TyIntern, t: Ty, map: &[(Ty, DefId)]) -> Ty {
     let args = |tys: &mut _, a: ArgsId| {
@@ -741,40 +759,271 @@ pub(crate) fn ty_contains(tys: &impl TyIntern, t: Ty, inner: Ty) -> bool {
     }
 }
 
+/// The args of builtin iterator kind `k` that hold its inner iterators.
+fn inner_iter_args(k: crate::ty::iter::IterKind) -> &'static [usize] {
+    use crate::ty::iter::IterKind as K;
+    match k {
+        K::Map
+        | K::Filter
+        | K::FilterMap
+        | K::Inspect
+        | K::Enumerate
+        | K::Take
+        | K::Skip
+        | K::Rev
+        | K::Copied
+        | K::Cloned
+        | K::TakeWhile
+        | K::SkipWhile
+        | K::StepBy
+        | K::Peekable
+        | K::Flatten => &[0],
+        K::Zip | K::Chain => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// The types in `t` that sit in an inner iterator arg of a builtin
+/// adapter and are no builtin iterator, each once (`canon_iter_args`).
+fn bare_iter_args(tys: &impl TyIntern, t: Ty, out: &mut Vec<Ty>) {
+    let in_args = |a: ArgsId, out: &mut Vec<Ty>| {
+        for g in tys.args(a) {
+            if let GenericArg::Ty(e) = *g {
+                bare_iter_args(tys, e, out);
+            }
+        }
+    };
+    match tys.kind(t) {
+        TyKind::Adt(_, a) => {
+            if let Some((k, args)) = crate::ty::iter::iter_parts(tys, t) {
+                for &i in inner_iter_args(k) {
+                    if let Some(&s) = args.get(i)
+                        && !crate::ty::iter::is_iter(tys, s)
+                        && !out.contains(&s)
+                    {
+                        out.push(s);
+                    }
+                }
+            }
+            in_args(a, out);
+        }
+        TyKind::Closure(_, a) => in_args(a, out),
+        TyKind::Ref(_, _, e) | TyKind::Slice(e) | TyKind::Array(e, _) => bare_iter_args(tys, e, out),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().for_each(|&e| bare_iter_args(tys, e, out)),
+        _ => {}
+    }
+}
+
+/// `t` with each inner iterator arg of a builtin adapter that `map`
+/// names replaced (`bare_iter_args`), at every depth.
+pub(super) fn replace_iter_args(tys: &mut impl TyIntern, t: Ty, map: &[(Ty, Ty)]) -> Ty {
+    let args = |tys: &mut _, a: ArgsId, slots: &[usize]| {
+        let old: Vec<GenericArg> = TyIntern::args(tys, a).to_vec();
+        let new: Vec<GenericArg> = old
+            .into_iter()
+            .enumerate()
+            .map(|(i, g)| match g {
+                GenericArg::Ty(e) => {
+                    let e = replace_iter_args(tys, e, map);
+                    let e = if slots.contains(&i) { map.iter().find(|(x, _)| *x == e).map_or(e, |&(_, y)| y) } else { e };
+                    GenericArg::Ty(e)
+                }
+                g => g,
+            })
+            .collect();
+        TyIntern::intern_args(tys, &new)
+    };
+    match tys.kind(t) {
+        TyKind::Adt(d, a) => {
+            let slots = crate::ty::iter::iter_parts(tys, t).map_or(&[][..], |(k, _)| inner_iter_args(k));
+            let a = args(tys, a, slots);
+            tys.intern(TyKind::Adt(d, a))
+        }
+        TyKind::Closure(d, a) => {
+            let a = args(tys, a, &[]);
+            tys.intern(TyKind::Closure(d, a))
+        }
+        TyKind::Ref(r, m, e) => {
+            let e = replace_iter_args(tys, e, map);
+            tys.intern(TyKind::Ref(r, m, e))
+        }
+        TyKind::Slice(e) => {
+            let e = replace_iter_args(tys, e, map);
+            tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Array(e, n) => {
+            let e = replace_iter_args(tys, e, map);
+            tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Tuple(ts) => {
+            let old: Vec<Ty> = tys.tys_of(ts).to_vec();
+            let new: Vec<Ty> = old.into_iter().map(|e| replace_iter_args(tys, e, map)).collect();
+            let ts = tys.intern_tys(&new);
+            tys.intern(TyKind::Tuple(ts))
+        }
+        _ => t,
+    }
+}
+
+/// `ByNext<s, item>`, the wrapper a revealed check gives user iterator `s`
+/// as an adapter's inner iterator (check/iter.rs `iter_method`), or None
+/// when its item type is not known.
+fn by_next_of(tys: &mut impl TyIntern, s: Ty, item: Ty) -> Option<Ty> {
+    if item == ERROR || tys.flags(item).contains_projection() {
+        return None;
+    }
+    Some(crate::ty::iter::mk_iter(tys, crate::ty::iter::IterKind::ByNext, &[s, item]))
+}
+
+/// `<s as Iterator>::Item` (`assoc_item` is the lang item), not normalized.
+fn item_proj(assoc_item: DefId, tys: &mut impl TyIntern, s: Ty) -> Ty {
+    let args = tys.intern_args(&[GenericArg::Ty(s)]);
+    tys.intern(TyKind::Projection(AssocId(assoc_item), args))
+}
+
+/// True when `s` may be a user iterator: an Adt that is no builtin type.
+fn maybe_user_iter(tys: &impl TyIntern, s: Ty) -> bool {
+    tys.local_adt(s).is_some() && tys.builtin_of(s).is_none()
+}
+
+/// `reveal` for a type the program keeps (`FnInfo::ret`), normalized,
+/// with each inner iterator of a builtin adapter typed as the defining
+/// body's revealed check types it: a std collection iterator struct as
+/// its inner builtin iterator (`collection_iter_inner`), and a user
+/// iterator wrapped once as `ByNext`. A hidden type from the opaque view
+/// or a template holds an opaque or a param there, so a plain reveal had
+/// the bare type: `fn pass() -> impl Iterator { mk().map(f) }` with `mk`
+/// returning `std::iter::from_fn(..)` has `Map<ByNext<FromFn<..>, T>, ..>`
+/// in its body, and lowering found no item type in `Map<FromFn<..>, ..>`.
+/// `Ctx::reveal_here` is the same inside a check.
+pub(crate) fn reveal_global(p: &mut Program, hidden: &FxMap<DefId, Ty>, t: Ty) -> Ty {
+    let t = reveal(hidden, &mut p.tys, t, 0);
+    let t = generics::normalize_global(p, t);
+    canon_global(p, t)
+}
+
+/// The inner iterator step of `reveal_global` alone. A user iterator
+/// whose item type is not known yet (a closure no check registered)
+/// stays bare.
+fn canon_global(p: &mut Program, t: Ty) -> Ty {
+    let mut bare = Vec::new();
+    bare_iter_args(&p.tys, t, &mut bare);
+    let mut map: Vec<(Ty, Ty)> = Vec::new();
+    for s in bare {
+        let inner = {
+            let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+            p.collection_iter_inner(&mut cx.tys, s).and_then(|i| generics::snapshot_ty(&cx.tys, i))
+        };
+        let c = match inner {
+            Some(o) => Some(generics::build_owned_ty(p, &o)),
+            None if maybe_user_iter(&p.tys, s) => {
+                // Mono's record of the Adt's `Iterator` impl has the item
+                // type of an impl with a closure bound (`FromFn<F>`), which
+                // the pure solver cannot normalize.
+                let made = p.tys.local_adt(s).and_then(|a| p.gx.iter_methods.get(&a)).and_then(|m| m.3);
+                let item = match made {
+                    Some(item) => item,
+                    None => {
+                        let proj = item_proj(p.gx.lang.assoc_item, &mut p.tys, s);
+                        generics::normalize_global(p, proj)
+                    }
+                };
+                by_next_of(&mut p.tys, s, item)
+            }
+            None => None,
+        };
+        if let Some(c) = c {
+            map.push((s, c));
+        }
+    }
+    if map.is_empty() { t } else { replace_iter_args(&mut p.tys, t, &map) }
+}
+
+impl Ctx<'_> {
+    /// `reveal` inside a check, with the inner iterators of builtin
+    /// adapters typed as `reveal_global` types them. A callee's args can
+    /// still be variables here (`pass(Cnt(0))`); body end fixes the slots
+    /// they become (`build_closure_map`, `iter_arg_map`).
+    pub(super) fn reveal_here(&mut self, t: Ty) -> Ty {
+        let t = reveal(&self.p.gx.opaque_hidden, &mut self.tys, t, 0);
+        let mut bare = Vec::new();
+        bare_iter_args(&self.tys, t, &mut bare);
+        let map = self.canon_iter_args(bare);
+        if map.is_empty() { t } else { replace_iter_args(&mut self.tys, t, &map) }
+    }
+
+    /// The replacement of each bare inner iterator in `bare` (see
+    /// `canon_global`). One whose item type is not known yet (a closure
+    /// of a body no check registered: `FromFn<F>`'s item comes from
+    /// `F`'s signature) makes the body check again, as for
+    /// `build_closure_map`.
+    fn canon_iter_args(&mut self, bare: Vec<Ty>) -> Vec<(Ty, Ty)> {
+        let p = self.p;
+        let mut map: Vec<(Ty, Ty)> = Vec::new();
+        for s in bare {
+            let c = match p.collection_iter_inner(&mut self.tys, s) {
+                Some(i) => Some(i),
+                None if maybe_user_iter(&self.tys, s) => {
+                    let proj = item_proj(p.gx.lang.assoc_item, &mut self.tys, s);
+                    let item = self.normalize_here(proj);
+                    let c = by_next_of(&mut self.tys, s, item);
+                    if c.is_none() {
+                        self.out.closure_map_pending = true;
+                    }
+                    c
+                }
+                None => None,
+            };
+            if let Some(c) = c {
+                map.push((s, c));
+            }
+        }
+        map
+    }
+}
+
 /// After mono: each `impl Trait` fn's revealed return type (`FnInfo::ret`,
-/// which its C signature uses) with the closures of the generic opaques
-/// nested in its hidden type mapped to their instances' closures, as the
-/// fn's body and callers see them (`build_closure_map`). `reveal_plain`
-/// and `fn_instance` reveal the return before those instances exist, so
-/// `fn pass() -> impl Iterator { def(5u8) }` kept `def`'s template closure.
-pub(crate) fn map_nested_ret_closures(p: &mut Program) {
+/// which its C signature uses) made again as the fn's body and callers
+/// see it: the closures of the generic opaques nested in its hidden type
+/// are their instances' (`build_closure_map`), and the inner iterators
+/// of builtin adapters are typed by `canon_global`, whose item types
+/// need the closures every check registered. `reveal_plain` and
+/// `fn_instance` reveal the return before those instances and closures
+/// exist, so `fn pass() -> impl Iterator { def(5u8) }` kept `def`'s
+/// template closure.
+pub(crate) fn finish_opaque_rets(p: &mut Program) {
     let mut fns: Vec<(LocalDefId, Ty)> = p.gx.opaque_ret_of.iter().map(|(&f, &o)| (f, o)).collect();
     fns.sort_by_key(|(f, _)| f.0);
     for (f, opaque) in fns {
         let ret = p.fns[f.0 as usize].ret;
-        if !mentions_template_closure(p, &p.tys, ret) {
+        let mut bare = Vec::new();
+        bare_iter_args(&p.tys, ret, &mut bare);
+        if bare.is_empty() && !mentions_template_closure(p, &p.tys, ret) {
             continue;
         }
         let hidden = std::mem::take(&mut p.gx.opaque_hidden);
+        let r = reveal(&hidden, &mut p.tys, opaque, 0);
+        let r = generics::normalize_global(p, r);
         let mut found: Vec<Ty> = Vec::new();
         collect_opaques_deep(&hidden, &mut p.tys, opaque, &mut found);
         let mut map: Vec<(Ty, DefId)> = Vec::new();
-        for o in found {
+        // Innermost first, as in `build_closure_map`.
+        for o in found.into_iter().rev() {
             let TyKind::Opaque(od, args) = p.tys.kind(o) else { continue };
             let Some(template) = p.gx.opaques.get(&od).and_then(|info| p.local_def(info.owner.hash)) else { continue };
             if p.gx.fn_templates.get(template.0 as usize).is_none_or(|t| t.is_none()) {
                 continue;
             }
             let args: Vec<GenericArg> = p.tys.args(args).to_vec();
+            let args: Vec<GenericArg> = args.into_iter().map(|g| map_arg_closures(&mut p.tys, g, &map)).collect();
             let Some(inst) = generics::instance_for(p, &p.tys, template, &args).filter(|&i| i != template) else { continue };
             let h = reveal(&hidden, &mut p.tys, o, 0);
             let h = generics::normalize_global(p, h);
             map.extend(instance_closure_map(p, &p.tys, h, template, p.def_id(inst)));
         }
         p.gx.opaque_hidden = hidden;
-        if !map.is_empty() {
-            p.fns[f.0 as usize].ret = map_closure_defs(&mut p.tys, ret, &map);
-        }
+        let r = if map.is_empty() { r } else { map_closure_defs(&mut p.tys, r, &map) };
+        p.fns[f.0 as usize].ret = canon_global(p, r);
     }
 }
 
@@ -912,6 +1161,6 @@ pub fn reveal_plain_rets(p: &mut Program) {
     let hidden = p.gx.opaque_hidden.clone();
     for f in revealed {
         let r = p.fns[f.0 as usize].ret;
-        p.fns[f.0 as usize].ret = reveal(&hidden, &mut p.tys, r, 0);
+        p.fns[f.0 as usize].ret = reveal_global(p, &hidden, r);
     }
 }

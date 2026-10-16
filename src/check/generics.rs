@@ -10587,11 +10587,11 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
     let ret = match opaque_ret {
         Some(o) => {
             let hidden = std::mem::take(&mut p.gx.opaque_hidden);
-            let r = crate::check::opaque::reveal(&hidden, &mut p.tys, o, 0);
-            p.gx.opaque_hidden = hidden;
             // A hidden type can name a projection of the params
-            // (`I::IntoIter`), which the args now decide.
-            normalize_global(p, r)
+            // (`I::IntoIter`), which the args now decide (normalized).
+            let r = crate::check::opaque::reveal_global(p, &hidden, o);
+            p.gx.opaque_hidden = hidden;
+            r
         }
         None => ret,
     };
@@ -11725,7 +11725,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         queue = next_queue;
     }
     p.gx.reuse = reuse;
-    crate::check::opaque::map_nested_ret_closures(p);
+    crate::check::opaque::finish_opaque_rets(p);
     p.gx.mono_done = true;
     // W-SHIM: instances whose behavior lust cannot make exact. A
     // `write_fmt` slot of an eager vtable runs only through a `dyn`
