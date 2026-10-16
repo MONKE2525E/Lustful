@@ -8409,13 +8409,21 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
 /// True when nothing in a value of type `t` can be written through a
 /// shared reference to it, at any depth: built only from primitives,
 /// `str`, references, `String`, `Vec`, `Box`, `Option`, tuples,
-/// arrays, slices, and the hash tables of such parts. Any other type
-/// (a `Cell` anywhere, a user Adt, `dyn`, a parameter) answers false.
+/// arrays, slices, the hash tables of such parts, and trait objects
+/// whose trait names no lifetime. Any other type (a `Cell` anywhere,
+/// a user Adt, a parameter) answers false.
 fn plain_shared(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Unit => true,
         TyKind::Ref(_, _, i) | TyKind::Array(i, _) | TyKind::Slice(i) => plain_shared(tys, i),
         TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| plain_shared(tys, e)),
+        // A trait object stores a borrow only through a lifetime its
+        // trait names: none here (no lifetime args, plain type args),
+        // so its object lifetime alone takes no capture.
+        TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_none_or(|pr| {
+            !tys.args(pr.value.args).iter().any(|g| matches!(g, GenericArg::Lifetime(_)))
+                && dyn_arg_tys(tys, t).into_iter().all(|e| plain_shared(tys, e))
+        }),
         TyKind::Adt(_, a) => {
             matches!(
                 tys.builtin_of(t),
