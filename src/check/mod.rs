@@ -14877,6 +14877,9 @@ impl<'p> Ctx<'p> {
                 } else {
                     self.check_args(&params, args, name_span);
                 }
+                if matches!(b, B::VecRetain | B::VecRetainMut | B::BoolThen) && self.adapter_callable_gap(args, &params, b == B::BoolThen) {
+                    return ERROR;
+                }
                 ret
             }
             None => {

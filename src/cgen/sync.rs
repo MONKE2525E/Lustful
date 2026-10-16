@@ -902,7 +902,18 @@ impl FnGen<'_, '_> {
     /// What a callable operand calls: a closure's body fn (and whether it
     /// takes its env by value), a fn item's instance, or a fn pointer.
     pub(super) fn callee_of(&self, o: &Operand) -> Callee {
-        let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a thread call takes a callable value") };
+        let mut t = self.callable_place_ty(o);
+        // A callable behind one reference (a by-ref capture of a
+        // `Copy` closure) calls what it points at.
+        if let TyKind::Ref(_, _, i) = self.body.tys.kind(t) {
+            t = i;
+        }
+        self.callee_of_ty(t)
+    }
+
+    /// The type of the place a callable operand reads.
+    pub(super) fn callable_place_ty(&self, o: &Operand) -> Ty {
+        let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a callable argument is a place") };
         // The callable may sit in a field: a closure held in a local
         // is a field of the enclosing closure's env, and a tuple or
         // struct field holds it the same way. Walk the place at the
@@ -945,11 +956,11 @@ impl FnGen<'_, '_> {
                 },
             };
         }
-        // A callable behind one reference (a by-ref capture of a
-        // `Copy` closure) calls what it points at.
-        if let TyKind::Ref(_, _, i) = tys.kind(t) {
-            t = i;
-        }
+        t
+    }
+
+    /// The callee a closure, fn item or fn pointer type calls.
+    pub(super) fn callee_of_ty(&self, t: Ty) -> Callee {
         match self.body.tys.kind(t) {
             TyKind::Closure(def, _) => {
                 let entry = &self.p.gx.closures[&def];
@@ -961,7 +972,7 @@ impl FnGen<'_, '_> {
                 let f = if gargs.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &gargs).expect("internal: no fn instance") };
                 Callee::Fn(f)
             }
-            TyKind::FnPtr(_) => Callee::Ptr(cty(&self.p.tys, t)),
+            TyKind::FnPtr(_) => Callee::Ptr(cty(&self.body.tys, t)),
             _ => panic!("internal: a thread call takes a closure, fn item, or fn pointer"),
         }
     }

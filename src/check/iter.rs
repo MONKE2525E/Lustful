@@ -827,6 +827,9 @@ impl<'p> Ctx<'p> {
         }
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
         self.check_args(&params, args, span);
+        if !matches!(b, B::SliceSort | B::SliceSortUnstable | B::SliceBinarySearch) && self.adapter_callable_gap(args, &params, false) {
+            return ERROR;
+        }
         ret
     }
 
@@ -1370,6 +1373,40 @@ impl<'p> Ctx<'p> {
             }
         }
         ret
+    }
+
+    /// A builtin whose C adapter calls its callable argument (the sort
+    /// and binary search `_by` family, `retain`, `bool::then`) calls a
+    /// closure, a fn item or a fn pointer, behind references or boxes
+    /// (cgen `adapter_callee`). A `dyn Fn` one meets the bound but has
+    /// no adapter yet: an error here, never a codegen failure. The
+    /// callable is the last argument. `once`: the builtin calls it as
+    /// `FnOnce` (`bool::then`), where a boxed closure would be moved out
+    /// of its box, which the adapter does not do.
+    pub(crate) fn adapter_callable_gap(&mut self, args: &[ExprId], params: &[Ty], once: bool) -> bool {
+        let (Some(&a), Some(&pt)) = (args.last(), params.last()) else { return false };
+        let mut t = self.deep(pt);
+        let mut boxed = false;
+        loop {
+            t = match self.kind(t) {
+                TyKind::Ref(_, _, i) => self.resolve(i),
+                _ if let Some(i) = self.tys.boxed_elem(t) => {
+                    boxed = true;
+                    self.resolve(i)
+                }
+                _ => break,
+            };
+        }
+        let what = if matches!(self.kind(t), TyKind::Dyn(..)) {
+            "a `dyn Fn` value as this method's callable"
+        } else if once && boxed {
+            "a boxed callable as `bool::then`'s fn"
+        } else {
+            return false;
+        };
+        let s = self.span(a);
+        self.errs.push(generics::dyn_not_yet(s, what));
+        true
     }
 
     /// True when `t` is an iterator only through a bound: a type

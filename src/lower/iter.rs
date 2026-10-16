@@ -5538,10 +5538,20 @@ impl Ex<'_, '_> {
         Ok(())
     }
 
-    /// The output type of a closure type.
+    /// The output type of a key fn type (`min_by_key`, `max_by_key`): a
+    /// closure, a fn pointer, or a local fn item, as `call_fn` calls them.
     fn closure_output(&self, fty: Ty) -> Result<Ty, String> {
-        let TyKind::Closure(def, _) = self.body.tys.kind(fty) else { return Err("iterator expansion: key fn is not a closure".into()) };
-        self.p.gx.closures.get(&def).map(|e| e.output).ok_or_else(|| "iterator expansion: closure not registered".into())
+        match self.body.tys.kind(fty) {
+            TyKind::Closure(def, _) => self.p.gx.closures.get(&def).map(|e| e.output).ok_or_else(|| "iterator expansion: closure not registered".into()),
+            TyKind::FnPtr(s) => Ok(self.body.tys.sig(s).value.output),
+            TyKind::FnDef(def, fargs) => {
+                let f = self.p.local_def(def.hash).ok_or("iterator expansion: a key fn item that is not a local fn")?;
+                let args = self.body.tys.args(fargs).to_vec();
+                let f = if args.is_empty() { f } else { crate::check::generics::instance_for(self.p, &self.body.tys, f, &args).ok_or("iterator expansion: no key fn instance")? };
+                Ok(self.p.fn_info(f).ret)
+            }
+            _ => Err("iterator expansion: key fn is not a closure, fn pointer, or fn item".into()),
+        }
     }
 
     /// A bool operand for `a > b` over an `Ord` type lust compares

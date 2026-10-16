@@ -3587,21 +3587,45 @@ impl FnGen<'_, '_> {
         }
     }
 
-    /// The closure body fn of a closure operand (a sort comparator or
-    /// key): check gives these builtins closure args only.
-    fn closure_arg(&self, o: &Operand) -> LocalDefId {
-        let (Operand::Move(pl) | Operand::Copy(pl)) = o else { panic!("internal: a sort comparator is a closure value") };
-        let mut t = self.body.locals[pl.local as usize].ty;
-        for pr in &pl.proj {
-            t = match (self.body.tys.kind(t), pr) {
-                (TyKind::Ref(_, _, i), Proj::Deref) => i,
-                _ => panic!("internal: a sort comparator place with projections"),
+    /// The callable argument of a builtin whose C adapter calls it (a sort
+    /// comparator or key, a `binary_search_by` probe, a `retain`
+    /// predicate, a `bool::then` fn): a closure, a fn item or a fn
+    /// pointer (`sync::Callee`; check rejects a `dyn` one), behind
+    /// `.1` references or boxes. Its value's C type is `.2`.
+    fn adapter_callee(&self, o: &Operand) -> (sync::Callee, u8, CTy) {
+        let mut t = self.callable_place_ty(o);
+        let mut derefs = 0;
+        loop {
+            t = match self.body.tys.kind(t) {
+                TyKind::Ref(_, _, i) => i,
+                _ if let Some(i) = self.body.tys.boxed_elem(t) => i,
+                _ => break,
             };
+            derefs += 1;
         }
-        match self.body.tys.kind(t) {
-            TyKind::Closure(def, _) => self.p.gx.closures[&def].body_fn,
-            _ => panic!("internal: a sort comparator is a closure value"),
+        (self.callee_of_ty(t), derefs, cty(&self.body.tys, t))
+    }
+
+    /// The C return type of an `adapter_callee`.
+    fn adapter_callee_ret(&self, c: &(sync::Callee, u8, CTy)) -> CTy {
+        match &c.0 {
+            sync::Callee::Closure(f, _) | sync::Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
+            sync::Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            sync::Callee::Ptr(_) => unreachable!("a fn pointer type"),
         }
+    }
+
+    /// A call of an `adapter_callee` whose value (or the first of its
+    /// references) is at pointer expression `at`, into a fresh variable
+    /// of its return type (written to `out`).
+    fn adapter_call_c(&mut self, out: &mut String, c: &(sync::Callee, u8, CTy), at: &str, args: &[String]) -> (String, CTy) {
+        let mut at = at.to_string();
+        for _ in 0..c.1 {
+            at = format!("(*(void**){at})");
+        }
+        collect_types(&c.2, &mut self.sig_types);
+        let value = format!("(*({}*){at})", ctype(&c.2));
+        (self.callee_call_c(out, &c.0, &value, args), self.adapter_callee_ret(c))
     }
 
     /// A call of closure body `f` on the env pointer `env` and the
@@ -3693,7 +3717,7 @@ impl FnGen<'_, '_> {
     /// for `sort`, `compare(a, b) == Less` for `sort_by`, and
     /// `f(a).lt(&f(b))` for `sort_by_key` (the keys drop after, in
     /// reverse order of creation, as Rust's temporaries do).
-    fn sort_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<LocalDefId>) -> String {
+    fn sort_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<(sync::Callee, u8, CTy)>) -> String {
         use Builtin as B;
         let name = format!("lust_less_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
         self.adapters += 1;
@@ -3702,12 +3726,12 @@ impl FnGen<'_, '_> {
         let mut body = String::new();
         match (b, clo) {
             (B::SliceSortBy | B::SliceSortUnstableBy, Some(f)) => {
-                let (r, rt) = self.closure_call_c(&mut body, f, "ctx", &[a, bb]);
+                let (r, rt) = self.adapter_call_c(&mut body, &f, "ctx", &[a, bb]);
                 let _ = writeln!(body, "  return {} == 0;", disc_call(self.p, &rt, &format!("(&{r})")));
             }
             (B::SliceSortByKey | B::SliceSortUnstableByKey, Some(f)) => {
-                let (ka, kt) = self.closure_call_c(&mut body, f, "ctx", &[a]);
-                let (kb, _) = self.closure_call_c(&mut body, f, "ctx", &[bb]);
+                let (ka, kt) = self.adapter_call_c(&mut body, &f, "ctx", &[a]);
+                let (kb, _) = self.adapter_call_c(&mut body, &f, "ctx", &[bb]);
                 let c = self.cmp3_c(&mut body, &kt, &format!("(&{ka})"), &format!("(&{kb})"), true);
                 if needs_drop_c(self.p, &kt) {
                     self.want(Glue::Drop, &kt);
@@ -3727,7 +3751,7 @@ impl FnGen<'_, '_> {
 
     /// The `cmp(ctx, p)` adapter of one binary search call: `p.cmp(x)`,
     /// `f(p)` as an Ordering, or `f(p).cmp(b)` with ctx `{&f, b}`.
-    fn search_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<LocalDefId>) -> String {
+    fn search_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<(sync::Callee, u8, CTy)>) -> String {
         use Builtin as B;
         let name = format!("lust_bcmp_{}_{}", self.slots[self.body.fn_id.0 as usize], self.adapters);
         self.adapters += 1;
@@ -3736,11 +3760,11 @@ impl FnGen<'_, '_> {
         let mut body = String::new();
         match (b, clo) {
             (B::SliceBinarySearchBy, Some(f)) => {
-                let (r, rt) = self.closure_call_c(&mut body, f, "ctx", &[p]);
+                let (r, rt) = self.adapter_call_c(&mut body, &f, "ctx", &[p]);
                 let _ = writeln!(body, "  return (int32_t){} - 1;", disc_call(self.p, &rt, &format!("(&{r})")));
             }
             (B::SliceBinarySearchByKey, Some(f)) => {
-                let (k, kt) = self.closure_call_c(&mut body, f, "((void**)ctx)[0]", &[p]);
+                let (k, kt) = self.adapter_call_c(&mut body, &f, "((void**)ctx)[0]", &[p]);
                 let kp = ctype(&CTy::Ref(Box::new(kt.clone())));
                 let c = self.cmp3_c(&mut body, &kt, &format!("(&{k})"), &format!("(({kp})((void**)ctx)[1])"), false);
                 if needs_drop_c(self.p, &kt) {
@@ -5051,7 +5075,7 @@ impl FnGen<'_, '_> {
             B::SliceSort | B::SliceSortUnstable | B::SliceSortBy | B::SliceSortUnstableBy | B::SliceSortByKey | B::SliceSortUnstableByKey => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let size = c_size_align(self.p, &e).0;
-                let clo = ops.get(1).map(|o| self.closure_arg(o));
+                let clo = ops.get(1).map(|o| self.adapter_callee(o));
                 let adapter = self.sort_adapter(b, &e, clo);
                 let ctx = match (vals.get(1), tys.get(1)) {
                     (Some(v), Some(t)) => {
@@ -5083,8 +5107,8 @@ impl FnGen<'_, '_> {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let size = c_size_align(self.p, &e).0;
                 let clo = match b {
-                    B::SliceBinarySearchBy => Some(self.closure_arg(&ops[1])),
-                    B::SliceBinarySearchByKey => Some(self.closure_arg(&ops[2])),
+                    B::SliceBinarySearchBy => Some(self.adapter_callee(&ops[1])),
+                    B::SliceBinarySearchByKey => Some(self.adapter_callee(&ops[2])),
                     _ => None,
                 };
                 let adapter = self.search_adapter(b, &e, clo);
@@ -5579,14 +5603,14 @@ impl FnGen<'_, '_> {
                 let CTy::Vec(e) = &**v else { unreachable!() };
                 let et = ctype(e);
                 let vv = &vals[0];
-                let f = self.closure_arg(&ops[1]);
+                let f = self.adapter_callee(&ops[1]);
                 let (w, r, c) = (self.tmp(), self.tmp(), self.tmp());
                 let mut body = String::new();
                 let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
                 let _ = writeln!(body, "    uint64_t {w} = 0;");
                 let _ = writeln!(body, "    for (uint64_t {r} = 0; {r} < {vv}->len; {r}++) {{");
                 let elem_r = format!("(&(({et}*){vv}->ptr)[{r}])");
-                let (keep, _) = self.closure_call_c(&mut body, f, &format!("&{c}"), &[elem_r]);
+                let (keep, _) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[elem_r]);
                 // A removed element drops as soon as it is rejected,
                 // before the predicate sees the next one, as in Rust.
                 let drop_rej = if needs_drop_c(self.p, e) {
@@ -5612,7 +5636,7 @@ impl FnGen<'_, '_> {
                 let elem = if b == B::BoolThenSome {
                     tys[1].clone()
                 } else {
-                    cty(&self.p.tys, self.p.fn_info(self.closure_arg(&ops[1])).ret)
+                    self.adapter_callee_ret(&self.adapter_callee(&ops[1]))
                 };
                 let opt = CTy::Option(Box::new(elem));
                 collect_types(&opt, &mut self.sig_types);
@@ -5633,17 +5657,22 @@ impl FnGen<'_, '_> {
                         let _ = writeln!(self.out, "    if (!{}) {{ {} {d} = {}; drop_{}(&{d}); }}", vals[0], ctype(&tys[1]), vals[1], mangle(&tys[1]));
                     }
                 } else {
-                    let f = self.closure_arg(&ops[1]);
+                    let f = self.adapter_callee(&ops[1]);
                     let c = self.tmp();
                     let mut body = String::new();
                     let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
                     let _ = writeln!(body, "    if ({}) {{", vals[0]);
-                    let (v, _) = self.closure_call_c(&mut body, f, &format!("&{c}"), &[]);
+                    let (v, _) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[]);
                     let _ = writeln!(body, "      {field} = {v};{some}");
                     let _ = writeln!(body, "    }}");
                     if needs_drop_c(self.p, &tys[1]) {
+                        // An `FnOnce` closure's call takes its env by value
+                        // (check rejects a boxed one here), so it drops
+                        // only when it did not run.
+                        let once = matches!(f.0, sync::Callee::Closure(_, true));
                         self.want(Glue::Drop, &tys[1]);
-                        let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
+                        let guard = if once { format!("if (!{}) ", vals[0]) } else { String::new() };
+                        let _ = writeln!(body, "    {guard}drop_{}(&{c});", mangle(&tys[1]));
                     }
                     let _ = write!(self.out, "{body}");
                 }
