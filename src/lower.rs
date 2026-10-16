@@ -1149,6 +1149,20 @@ impl<'p> Lower<'p> {
                 let root = self.apply_deref_steps(place, ty, steps, span);
                 if matches!(self.kind(target), TyKind::Ref(_, m, _) if m.is_mut()) { Operand::Move(root) } else { Operand::Copy(root) }
             }
+            // The user steps, then the `Vec`/`String` builtin deref.
+            Coerce::UserDerefTail(target) => {
+                let steps: Vec<crate::check::DerefRecv> = self.ck.deref_coerce(e).into_iter().cloned().collect();
+                let m = matches!(self.kind(target), TyKind::Ref(_, m, _) if m.is_mut());
+                let place = self.op_place(op, ty, span);
+                let root = self.apply_deref_steps(place, ty, steps, span);
+                let tmp = self.temp(target);
+                if matches!(self.kind(self.peel(target, 1)), TyKind::Str) {
+                    self.call_into(CallTarget::Builtin(Builtin::StringAsStr), vec![Operand::Copy(root)], Place::local(tmp), span);
+                } else {
+                    self.assign(Place::local(tmp), Rvalue::SliceOf(root.deref()), span);
+                }
+                if m { Operand::Move(Place::local(tmp)) } else { Operand::Copy(Place::local(tmp)) }
+            }
             // Only a method receiver has it, and `method_into` lowers it.
             Coerce::CowRecv(..) => op,
             // An iterator moved into its `next` wrapper (W-STD-B): for a
@@ -1212,7 +1226,7 @@ impl<'p> Lower<'p> {
         match self.ck.coerce(e) {
             Coerce::None => ty,
             Coerce::StrFromString | Coerce::CharPat => REF_STR,
-            Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::CowDeref(_, t) | Coerce::ReifyFn(t) | Coerce::RefToPtr(t) => t,
+            Coerce::Unsize(t) | Coerce::UserDeref(t) | Coerce::UserDerefTail(t) | Coerce::CowDeref(_, t) | Coerce::ReifyFn(t) | Coerce::RefToPtr(t) => t,
             // A receiver-only coercion: `operand` leaves the value as is.
             Coerce::CowRecv(..) => ty,
             Coerce::ByNext(w) | Coerce::IntoIterCall(w) => w,

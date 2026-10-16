@@ -1362,6 +1362,11 @@ pub enum Coerce {
     /// `Checked::deref_coerce`; the payload is the target reference
     /// type.
     UserDeref(Ty),
+    /// `UserDeref` whose last target is a `Vec<T>` or `String`, then
+    /// that type's builtin deref to `[T]` or `str` (`&LAZY` for a
+    /// `LazyLock<Vec<T>>` at `&[T]`). The payload is the target
+    /// reference type.
+    UserDerefTail(Ty),
     /// `&Cow<B>` (behind this many references in all) to `&B`, the
     /// payload's type (W-STD-B): the Cow's `Deref`.
     CowDeref(u8, Ty),
@@ -6633,6 +6638,29 @@ impl<'p> Ctx<'p> {
                     }
                 }
                 return Some(Coerce::UserDeref(self.tys.mk_ref(mutable, y)));
+            }
+            self.rollback_vars(inner_snap);
+            // The last user step reaches a `Vec<T>` or `String`: its
+            // builtin deref to `[T]` or `str` ends the chain.
+            let tail_ok = match (self.kind(self.resolve(target)), self.kind(self.resolve(y))) {
+                (_, TyKind::Slice(want)) => self.tys.vec_elem(self.resolve(target)).is_some_and(|el| self.unify(el, want)),
+                (_, TyKind::Str) => !mutable && self.tys.is_string_ty(self.resolve(target)),
+                _ => false,
+            };
+            if tail_ok {
+                let idx0 = self.out.deref_coerce.len();
+                for (i, (b, f, args, target)) in steps.into_iter().enumerate() {
+                    let target_ref = self.tys.mk_ref(mutable, target);
+                    let template = self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some());
+                    self.out.deref_coerce.push((
+                        e,
+                        DerefRecv { depth: i as u8, before: b, f, args: Vec::new(), f_mut: None, args_mut: Vec::new(), mutable, target_ref },
+                    ));
+                    if template {
+                        self.deref_sites.push((DerefTable::Coerce, idx0 + i, false, f, args));
+                    }
+                }
+                return Some(Coerce::UserDerefTail(self.tys.mk_ref(mutable, y)));
             }
             self.rollback_vars(inner_snap);
             t = target;
@@ -22271,11 +22299,11 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
         Some((adt, variant, ty))
     }
     fn struct_target(&mut self, path: &[ast::PathSeg]) -> Option<(AdtId, u32, Ty)> {
-        let (adt, variant) = variant_of(self.cx.p, path)?;
+        let (adt, variant) = self.self_variant_of(path)?;
         Some((adt, variant, self.cx.tys.adt_ty(adt)))
     }
     fn pattern_variant(&mut self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
-        variant_of(self.cx.p, segs)
+        self.self_variant_of(segs)
     }
     fn variant_fields(&self, adt: AdtId, variant: u32) -> Vec<(Sym, Ty)> {
         if adt.0 >= u32::MAX - 1 {
@@ -22353,6 +22381,26 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
 }
 
 /// The (Adt, variant) a path denotes in the compat tables.
+impl CheckCx<'_, '_> {
+    /// `variant_of`, with `Self` (`Self { .. }`, `Self::A`) naming the
+    /// Adt of the const fn being evaluated or of the body's impl.
+    fn self_variant_of(&self, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
+        let p = self.cx.p;
+        if let Some(first) = segs.first()
+            && first.name == p.known.self_type
+            && segs.len() <= 2
+        {
+            let a = self.cx.self_adt()?;
+            return match segs {
+                [_] => (!p.adt(a).is_enum).then_some((a, 0)),
+                [_, v] => p.adt(a).variants.iter().position(|x| x.name == v.name).map(|i| (a, i as u32)),
+                _ => None,
+            };
+        }
+        variant_of(p, segs)
+    }
+}
+
 fn variant_of(p: &Program, segs: &[ast::PathSeg]) -> Option<(AdtId, u32)> {
     // `std::borrow::Cow::Borrowed` and `Owned` (W-STD-B).
     if segs.len() == 4

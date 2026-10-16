@@ -1067,7 +1067,7 @@ impl<'p> Ctx<'p> {
             Coerce::BoxToRef(n, m) => (n as usize, if m { CaptureMode::MutRef } else { CaptureMode::Ref }),
             // A deref coercion through user `Deref` impls borrows the
             // place below the reference for the first impl's call.
-            Coerce::UserDeref(t) => {
+            Coerce::UserDeref(t) | Coerce::UserDerefTail(t) => {
                 let before = self.out.deref_coerce.iter().find(|(x, _)| *x == e).map_or(1, |(_, d)| d.before);
                 (before as usize, if matches!(self.kind(t), TyKind::Ref(_, m, _) if m.is_mut()) { CaptureMode::MutRef } else { CaptureMode::Ref })
             }
