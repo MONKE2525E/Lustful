@@ -4343,7 +4343,8 @@ impl<'b, 'p> Builder<'b, 'p> {
                 // The result holds what the body returns: per output slot,
                 // the captured and free argument slots its requirements
                 // name (`closure_reqs`), else every captured source (the
-                // contract). Higher-ranked inputs reach no output.
+                // contract). Higher-ranked inputs reach only the output
+                // slots its bound ties to them.
                 if let Some((et, ev)) = avs.first() {
                     let (ct, skip) = match self.body.tys.kind(*et) {
                         TyKind::Ref(_, _, inner) => (inner, 1),
@@ -4375,6 +4376,22 @@ impl<'b, 'p> Builder<'b, 'p> {
                                         for &y in &dv {
                                             self.edge(x, y);
                                         }
+                                    }
+                                }
+                            }
+                        }
+                        // A higher-ranked output slot of the closure's bound
+                        // (`ClosureEntry::bound_output`, a returned `impl
+                        // Fn(&u8) -> &u8`) holds what the call passes.
+                        let bo = self.p.gx.closures.get(&def).and_then(|c| c.bound_output.map(|b| (b, c.output)));
+                        if let Some((bo, out_t)) = bo {
+                            let mut named: Vec<Region> = Vec::new();
+                            let tied = regioned_slots(&mut self.sc, bo, out_t, &mut named) && named.len() == dv.len();
+                            let from: Vec<u32> = avs.iter().skip(1).flat_map(|(_, v)| v.iter().copied()).collect();
+                            for (k, &d) in dv.iter().enumerate() {
+                                if !tied || matches!(named[k], Region::Bound(_)) {
+                                    for &x in &from {
+                                        self.edge(x, d);
                                     }
                                 }
                             }

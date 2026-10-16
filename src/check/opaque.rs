@@ -120,16 +120,28 @@ impl Ctx<'_> {
     }
 
     /// True when hidden type `h` of opaque `od` is a closure checked with
-    /// no expected signature (`free_sig_closures`) whose unannotated
-    /// param holds a reference where an `Fn*` bound of the opaque takes a
-    /// higher-ranked one (`impl Fn(&u8) -> &u8` from `let f = |a| a; f`):
-    /// rustc "implementation of `Fn` is not general enough".
+    /// no expected signature (`free_sig_closures`) that cannot meet an
+    /// `Fn*` bound of the opaque (rustc "implementation of `Fn` is not
+    /// general enough"): an unannotated param holds a reference where the
+    /// bound takes a higher-ranked one (`let f = |a| a; f`), or its output
+    /// holds a region where the bound's output is the input's (its own
+    /// output region is one inferred region, never the input's). The
+    /// bound's `'static` output slots become the closure's
+    /// `output_region` otherwise.
     fn closure_not_general(&mut self, od: DefId, h: Ty) -> bool {
         let TyKind::Closure(def, _) = self.kind(h) else { return false };
         let Some(unannotated) = self.free_sig_closures.iter().find(|c| c.0 == def).map(|c| c.1.clone()) else { return false };
         let p = self.p;
         let Some(info) = p.gx.opaques.get(&od) else { return false };
-        let Some(inputs) = self.closures.iter().chain(&self.out.closures).find(|c| c.def == def).map(|c| c.inputs.clone()) else { return false };
+        let Some((inputs, output)) = self.closures.iter().chain(&self.out.closures).find(|c| c.def == def).map(|c| (c.inputs.clone(), c.output)) else {
+            return false;
+        };
+        let regions = |this: &mut Self, t: Ty| {
+            let t = this.deep(t);
+            let mut ts = Vec::new();
+            crate::borrowck::regions_of(&this.tys, t, &mut ts);
+            ts
+        };
         for b in &info.fn_outs {
             if b.inputs.len() != inputs.len() {
                 continue;
@@ -137,15 +149,21 @@ impl Ctx<'_> {
             for (i, &bt) in b.inputs.iter().enumerate() {
                 let mut rs = Vec::new();
                 crate::borrowck::regions_of(&p.tys, bt, &mut rs);
-                if !unannotated.get(i).copied().unwrap_or(false) || !rs.iter().any(|r| matches!(r, Region::Bound(_))) {
-                    continue;
-                }
-                let t = self.deep(inputs[i]);
-                let mut ts = Vec::new();
-                crate::borrowck::regions_of(&self.tys, t, &mut ts);
-                if !ts.is_empty() {
+                if unannotated.get(i).copied().unwrap_or(false) && rs.iter().any(|r| matches!(r, Region::Bound(_))) && !regions(self, inputs[i]).is_empty() {
                     return true;
                 }
+            }
+            let Some(bo) = b.output else { continue };
+            let mut outs = Vec::new();
+            crate::borrowck::regions_of(&p.tys, bo, &mut outs);
+            if outs.iter().any(|r| matches!(r, Region::Bound(_))) && !regions(self, output).is_empty() {
+                return true;
+            }
+            if outs.contains(&Region::Static)
+                && let Some(c) = self.out.closures.iter_mut().find(|c| c.def == def)
+                && c.output_region.is_none()
+            {
+                c.output_region = Some(bo);
             }
         }
         false
