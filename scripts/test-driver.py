@@ -68,6 +68,10 @@
 #      and remove std source modules (std::time, VecDeque, PhantomData,
 #      LazyLock, ControlFlow, Once) the root never names; every warm
 #      answer equals a cold one-shot build.
+#  23. fns nested in trait default bodies: each parse mode compiles them
+#      (once an internal DefPathHash collision, exit 3), their identity
+#      follows the trait method (an item added to another body rechecks
+#      none of them), and every warm answer equals a cold one-shot build.
 # Program stderr is compared with the OS thread id masked
 # (mask_stderr, as in scripts/case-pool.sh): rustc 1.99 and lust
 # print `thread 'main' (<os tid>) panicked at ...`, and the tid
@@ -1112,6 +1116,57 @@ def case_dep_std_edits():
     d.kill()
 
 
+def case_trait_default_nested():
+    # 23. Fns nested in trait default method bodies. The token scan skipped
+    # trait bodies, so the driver counted fewer AST fns than collect made
+    # and registered the nested ones again as instance slots: "internal:
+    # DefPathHash collision" (exit 3), cold and warm. Their def path also
+    # fell back to the body item index, which moves when an earlier body
+    # gains an item. Now they parent on the trait method: an item added to
+    # f0 rechecks f0 and its own nested fns only.
+    work = tempfile.mkdtemp(prefix="lust-driver-trait-nested-")
+    d = Daemon(work)
+    d.start()
+    src = os.path.join(work, "x.rs")
+    out, cold_out = os.path.join(work, "x"), os.path.join(work, "xc")
+
+    def text(extra, factor="10"):
+        return ("fn f0() -> i64 {\n" + extra + "    fn z() -> i64 { 7 }\n    9 + z()\n}\n"
+                "trait Tr {\n    fn t(&self) -> i64;\n    fn d(&self) -> i64 {\n"
+                "        fn h(x: &i64) -> bool { *x > 1 }\n        fn m(x: i64) -> i64 { x * " + factor + " }\n"
+                "        self.t() + [1i64, 2, 3].iter().copied().filter(h).map(m).sum::<i64>()\n    }\n}\n"
+                "trait Tr2 {\n    fn d(&self) -> i64 {\n        fn h(x: &i64) -> bool { *x > 2 }\n"
+                "        [1i64, 2, 3].iter().copied().filter(h).count() as i64\n    }\n}\n"
+                "impl Tr for i64 {\n    fn t(&self) -> i64 {\n        *self\n    }\n}\nimpl Tr2 for i64 {}\n"
+                'fn main() {\n    println!("{} {}", f0() + Tr::d(&5i64), Tr2::d(&0i64));\n}\n')
+
+    steps = (("base", text(""), "71 1"),
+             ("item added to another body", text("    fn y() -> i64 { 3 }\n"), "71 1"),
+             ("nested fn body edit in a default body", text("    fn y() -> i64 { 3 }\n", "100"), "521 1"),
+             ("back", text(""), "71 1"))
+    for i, (step, body, want) in enumerate(steps):
+        open(src, "w").write(body)
+        t = time.time() + 2 * (i + 1)
+        os.utime(src, (t, t))
+        c = d.run(["check", src], expect=None)
+        stats = parse_stats(c.stderr)
+        check(f"trait default nested, {step}: check", c.returncode == 0, c.stderr[-400:])
+        if step == "item added to another body":
+            # f0, its nested z (its enclosing body changed), and the new y.
+            check("trait default nested: other bodies keep their slots", stats.get("rechecked") == 3, str(stats))
+        b = d.run(["build", src, "-o", out], expect=None)
+        prog = run_prog(out) if b.returncode == 0 else None
+        cold_env = dict(d.env, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(work, f"cold{i}"))
+        cold = lust_run([LUST, "build", src, "-o", cold_out], cwd=work, env=cold_env,
+                        capture_output=True, text=True)
+        cprog = run_prog(cold_out) if cold.returncode == 0 else None
+        got = (b.returncode, prog.stdout.strip() if prog else b.stderr[-300:])
+        check(f"trait default nested, {step}: warm output", got == (0, want), str(got))
+        check(f"trait default nested, {step}: warm == cold",
+              cprog is not None and prog is not None and cprog.stdout == prog.stdout, cold.stderr[-300:])
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -1121,7 +1176,8 @@ def main():
              case_moved_instance_ids, case_new_empty_unit, case_nested_items,
              case_moved_and_revived_slots, case_instance_calls_moved_slot,
              case_nested_identity_and_shadowing, case_stable_instance_ids,
-             case_user_trait_impl_edits, case_inherent_impl_edits, case_dep_std_edits)
+             case_user_trait_impl_edits, case_inherent_impl_edits, case_dep_std_edits,
+             case_trait_default_nested)
     # One case that raises (a failed assert, a timeout, an OS error)
     # fails that case only: the rest still run, and the summary line
     # below is always the last line, as the gate's need_ok requires.

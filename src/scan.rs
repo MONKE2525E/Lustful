@@ -692,10 +692,25 @@ fn main() { println!(\"{}\", 1); }
 
     // The driver's fn table joins scan order to collect's LocalDefId order
     // positionally, so the scan's nested fns must be in the same order as
-    // the parser's `stmt_items` fns, also for a fn nested inside a nested fn.
+    // the parser's `stmt_items` fns, also for a fn nested inside a nested fn,
+    // in a trait default body, or in a block in a type.
     #[test]
     fn scan_nested_fn_order_matches_parser() {
-        let src = "fn main() {\n    fn a() -> i32 {\n        fn b() -> i32 { 10 }\n        b() + 1\n    }\n    fn c() -> i32 { 100 }\n    println!(\"{}\", a() + c());\n}\n";
+        let src = "\
+trait Tr {
+    fn r(&self) -> i32;
+    fn d(&self) -> [i32; 2] { fn h() -> i32 { fn h() -> i32 { 1 } h() } fn m(x: i32) -> i32 { x } [h(), m(2)] }
+}
+struct S { a: [u8; { fn z() -> usize { 3 } 3 }] }
+fn main() {
+    fn a() -> i32 {
+        fn b() -> i32 { 10 }
+        b() + 1
+    }
+    fn c() -> i32 { 100 }
+    println!(\"{}\", a() + c());
+}
+";
         let interner = Interner::default();
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let known = crate::intern::Known::new(&interner);
@@ -722,5 +737,7 @@ fn main() { println!(\"{}\", 1); }
             })
             .collect();
         assert_eq!(scan_order, parser_order, "scan nested order must match parser stmt_items order");
+        // Trait methods are not counted fns; `main` is the only top-level one.
+        assert_eq!(scanned.fns.iter().filter(|f| !f.nested).count(), 1);
     }
 }
