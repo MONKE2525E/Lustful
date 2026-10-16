@@ -2629,37 +2629,83 @@ impl<'p> Ctx<'p> {
         // A closure whose output is not the input's (`bound_output`
         // None: no expected signature, or one over a type param) has a
         // free output region in rustc, which a closure that captures
-        // nothing can only fill with `'static` borrows: two such join as
-        // a pointer that returns `'static` there, so it meets no bound
-        // whose output is the input's (E0308). A join of a free output
-        // with a tied one (another closure, a fn item or pointer) is
-        // rustc's higher-ranked LUB, which lust does not follow.
+        // nothing can only fill with `'static` borrows. rustc's join
+        // keeps the first side's signature and needs the second to be a
+        // subtype of it (`lub_out`): a free or `'static` output then a
+        // tied one is E0308; a free join returns `'static` there, so it
+        // meets no bound whose output is the input's.
         let out = self.deep(oa);
         if holds_region_slots(&self.p.gx.adt_lifetimes, &self.tys, out) {
-            let (fa, fb) = (self.closure_out_free(a), self.closure_out_free(b));
-            if fa != fb {
-                self.rollback_vars(snap);
-                return None;
-            }
-            if fa {
-                let Some(st) = static_output(&self.p.gx.adt_lifetimes, &mut self.tys, out) else {
+            match self.lub_out(a, b) {
+                Some(true) => {}
+                Some(false) => {
+                    if let Some(st) = static_output(&self.p.gx.adt_lifetimes, &mut self.tys, out) {
+                        return Some(self.fn_ptr_ty(&ia, st));
+                    }
                     self.rollback_vars(snap);
                     return None;
-                };
-                return Some(self.fn_ptr_ty(&ia, st));
+                }
+                None => {
+                    self.rollback_vars(snap);
+                    return None;
+                }
             }
         }
         Some(self.fn_ptr_ty(&ia, oa))
     }
 
-    /// True for a closure type whose output regions are free (its
-    /// `bound_output` is None); false for one tied to its input, and for
-    /// a fn item or pointer (its own signature).
-    fn closure_out_free(&self, t: Ty) -> bool {
-        let TyKind::Closure(def, _) = self.kind(self.resolve(t)) else { return false };
-        match self.closures.iter().find(|c| c.def == def) {
-            Some(c) => c.bound_output.is_none(),
-            None => self.p.gx.closures.get(&def).is_some_and(|g| g.bound_output.is_none()),
+    /// rustc's join of two callables whose outputs hold regions, as fn
+    /// pointers: it keeps the earlier side's signature `a`, and the later
+    /// side `b` must be a subtype of it. Some(true): the joined output is
+    /// the input's (`a` tied); Some(false): it is not (`a` free or
+    /// `'static`, `b` too); None: `b` ties where `a` does not (rustc
+    /// E0308), or a side's output is a mix or unknown.
+    pub(super) fn lub_out(&self, a: Ty, b: Ty) -> Option<bool> {
+        match (self.out_tied(a)?, self.out_tied(b)?) {
+            (true, _) => Some(true),
+            (false, false) => Some(false),
+            (false, true) => None,
+        }
+    }
+
+    /// Whether callable `t`'s output regions are its input's: Some(true)
+    /// for a closure with a tied `bound_output`, an elided fn pointer, a
+    /// fn item whose output lifetimes are late-bound input ones;
+    /// Some(false) for a closure with a free output, a fn item or pointer
+    /// returning `'static` or an early-bound or output-only lifetime.
+    /// None for a mix, or no signature.
+    pub(super) fn out_tied(&self, t: Ty) -> Option<bool> {
+        let p = self.p;
+        let all = |v: &[bool]| if v.iter().all(|&x| x) { Some(true) } else if v.iter().all(|&x| !x) { Some(false) } else { None };
+        match self.kind(self.resolve(t)) {
+            TyKind::Closure(def, _) => Some(match self.closures.iter().find(|c| c.def == def) {
+                Some(c) => c.bound_output.is_some(),
+                None => p.gx.closures.get(&def)?.bound_output.is_some(),
+            }),
+            TyKind::FnPtr(s) => {
+                let s = self.tys.sig(s).value;
+                if s.free_slots != 0 {
+                    return None;
+                }
+                let mut rs = Vec::new();
+                crate::borrowck::regions_of(&self.tys, s.output, &mut rs);
+                all(&rs.iter().map(|r| *r != Region::Static).collect::<Vec<bool>>())
+            }
+            TyKind::FnDef(def, _) => {
+                let sig = p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l))?;
+                let mut ins = Vec::new();
+                for &t in &sig.params {
+                    crate::borrowck::regions_of(&p.tys, t, &mut ins);
+                }
+                let mut outs = Vec::new();
+                crate::borrowck::regions_of(&p.tys, sig.ret, &mut outs);
+                let tied = |r: &Region| match *r {
+                    Region::Param(k) => !sig.early.get(k as usize).copied().unwrap_or(false) && ins.contains(r),
+                    _ => false,
+                };
+                all(&outs.iter().map(tied).collect::<Vec<bool>>())
+            }
+            _ => None,
         }
     }
 
@@ -2884,7 +2930,7 @@ fn truncate_for_optimization(mut pl: CPlace, mut mode: CaptureMode, tys: &impl T
 /// Adt lifetime args): the output of a joined pointer of closures with
 /// free outputs (`closure_lub`). None for a part that may hold a region
 /// it cannot rewrite (a fn pointer, an opaque or param type).
-fn static_output(lts: &crate::intern::FxMap<DefId, Vec<crate::intern::Sym>>, tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
+pub(crate) fn static_output(lts: &crate::intern::FxMap<DefId, Vec<crate::intern::Sym>>, tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
     Some(match tys.kind(t) {
         TyKind::Ref(_, m, inner) => {
             let i = static_output(lts, tys, inner)?;

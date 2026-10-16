@@ -8704,7 +8704,11 @@ impl<'p> Ctx<'p> {
                             && let Some(tail) = p.ast.block(*then).tail
                             && self.lub_flip(&[tail], t1, t2)
                         {
-                            self.out.after_tail.push(tail);
+                            // A place tail (`b`, `x.f`) makes no
+                            // temporary, so where it coerces is the same.
+                            if !matches!(p.ast.expr(tail), Expr::Path(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Deref(_)) {
+                                self.out.after_tail.push(tail);
+                            }
                             return t2;
                         }
                         {
@@ -8754,7 +8758,11 @@ impl<'p> Ctx<'p> {
                             && let Some(tail) = p.ast.block(*then).tail
                             && self.lub_flip(&[tail], t1, t2)
                         {
-                            self.out.after_tail.push(tail);
+                            // A place tail (`b`, `x.f`) makes no
+                            // temporary, so where it coerces is the same.
+                            if !matches!(p.ast.expr(tail), Expr::Path(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Deref(_)) {
+                                self.out.after_tail.push(tail);
+                            }
                             return t2;
                         }
                         {
@@ -10382,6 +10390,14 @@ impl<'p> Ctx<'p> {
         if self.ty_matchish(f, e) || self.ref_coercible(f, e) {
             return true;
         }
+        // A smart pointer to a sized value unsizes to one to a dyn type
+        // (`Box<u8>` to `Box<dyn Tr>`).
+        if let (Some(x), Some(y)) = (self.tys.smart_elem(self.resolve(f)), self.tys.smart_elem(self.resolve(e)))
+            && matches!(self.kind(self.resolve(y)), TyKind::Dyn(..))
+            && !matches!(self.kind(self.resolve(x)), TyKind::Dyn(..))
+        {
+            return true;
+        }
         let (TyKind::Ref(..), TyKind::Ref(_, em, y)) = (self.kind(f), self.kind(e)) else { return false };
         if matches!(self.kind(y), TyKind::Dyn(..)) {
             return true;
@@ -10391,7 +10407,7 @@ impl<'p> Ctx<'p> {
             && matches!(self.kind(inner), TyKind::Ref(..))
         {
             t = inner;
-            if !em.is_mut() && self.ty_matchish(t, e) {
+            if !em.is_mut() && (self.ty_matchish(t, e) || self.ref_coercible(t, e)) {
                 return true;
             }
         }
@@ -10425,7 +10441,23 @@ impl<'p> Ctx<'p> {
             if let (Some(sa), Some(sb)) = (self.callable_sig(a), self.callable_sig(b))
                 && sa == sb
             {
-                let fp = self.fn_ptr_ty(&sa.0, sa.1);
+                // rustc keeps the earlier side's signature, and the later
+                // one must be a subtype of it (`lub_out`): `if c { stat }
+                // else { tied }` is E0308, the other order joins as tied.
+                let out = self.deep(sa.1);
+                let mut fp = self.fn_ptr_ty(&sa.0, sa.1);
+                if crate::check::closure::holds_region_slots(&self.p.gx.adt_lifetimes, &self.tys, out)
+                    && let (Some(false), Some(true)) = (self.out_tied(a), self.out_tied(b))
+                {
+                    self.mismatch(span, a, b);
+                    return ERROR;
+                }
+                if crate::check::closure::holds_region_slots(&self.p.gx.adt_lifetimes, &self.tys, out)
+                    && self.lub_out(a, b) == Some(false)
+                    && let Some(st) = crate::check::closure::static_output(&self.p.gx.adt_lifetimes, &mut self.tys, out)
+                {
+                    fp = self.fn_ptr_ty(&sa.0, st);
+                }
                 if let Some(be) = be {
                     self.coerce_expr(be, b, fp);
                 }

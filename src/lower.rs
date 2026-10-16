@@ -308,8 +308,12 @@ impl<'p> Lower<'p> {
                     || (matches!(self.ck.res(e), Res::Variant(..)) && !matches!(self.kind(ty), TyKind::FnDef(..)))
             }
             Expr::StructLit { fields, update: None, .. } => fields.clone().iter().all(|f| self.promotable(f.2)),
-            // `&&1`: a shared borrow of a promotable value is a constant too.
-            Expr::Ref { mutable: false, raw: false, expr } => self.promotable(*expr),
+            // A shared reference to a promotable value (`&&5`, `&&C`), or
+            // a reborrow through one (`&&*"q"`), is a constant too.
+            Expr::Ref { mutable: false, raw: false, expr } => {
+                let inner = *expr;
+                self.promotable(inner) || matches!(self.p.ast.expr(inner), Expr::Deref(d) if self.promotable(*d))
+            }
             _ => false,
         }
     }
