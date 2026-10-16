@@ -499,6 +499,11 @@ pub(super) enum Callee {
     Fn(LocalDefId),
     /// A fn pointer of this C type, held in the operand.
     Ptr(CTy),
+    /// A `Box<dyn FnOnce() -> R>` (gopanic.rs `ThreadMain`): the call is
+    /// the vtable's word `.1` (`FnOnce::call_once`) on the box's data
+    /// pointer; that entry consumes the value and frees the box. `.0` is
+    /// the C type of `R`.
+    DynOnce(CTy, u32),
 }
 
 /// The runtime width suffix of an atomic (`1`, `2`, `4`, or `8`).
@@ -860,6 +865,7 @@ impl FnGen<'_, '_> {
         let ret = match &callee {
             Callee::Closure(f, _) | Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
             Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            Callee::DynOnce(r, _) => r.clone(),
             Callee::Ptr(_) => unreachable!("a fn pointer type"),
         };
         collect_types(&ret, &mut self.sig_types);
@@ -1089,7 +1095,18 @@ impl FnGen<'_, '_> {
                 Callee::Fn(f)
             }
             TyKind::FnPtr(_) => Callee::Ptr(cty(&self.body.tys, t)),
-            _ => panic!("internal: a thread call takes a closure, fn item, or fn pointer"),
+            _ if let Some(d) = self.body.tys.boxed_elem(t)
+                && let Some(pr) = crate::check::object::principal_of(&self.body.tys, d)
+                && pr.def == self.p.gx.lang.fn_once =>
+            {
+                let lang = &self.p.gx.lang;
+                let out_def = lang.output_of(lang.fn_once).expect("internal: FnOnce has an Output");
+                let out = self.body.tys.bindings(pr.bindings).iter().find(|(d, _)| *d == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
+                // The Fn family's call entry is the first after the header
+                // (check/closure.rs, a `dyn Fn*` call).
+                Callee::DynOnce(cty(&self.body.tys, out), crate::check::object::VT_HEADER)
+            }
+            _ => panic!("internal: a thread call takes a closure, fn item, fn pointer, or Box<dyn FnOnce>"),
         }
     }
 
@@ -1118,6 +1135,17 @@ impl FnGen<'_, '_> {
                 }
                 v
             }
+            Callee::DynOnce(r, word) => {
+                collect_types(r, &mut self.sig_types);
+                let v = self.tmp();
+                let rt = ctype(r);
+                if ret_by_out(self.p, r) {
+                    let _ = writeln!(out, "  {rt} {v}; ((void (*)({rt} *, void *))({env}.vt[{word}]))(&{v}, {env}.data);");
+                } else {
+                    let _ = writeln!(out, "  {rt} {v} = (({rt} (*)(void *))({env}.vt[{word}]))({env}.data);");
+                }
+                v
+            }
             Callee::Ptr(ft) => {
                 let CTy::FnPtr(_, r) = ft else { unreachable!("a fn pointer type") };
                 let v = self.tmp();
@@ -1141,7 +1169,7 @@ impl FnGen<'_, '_> {
     pub(super) fn thread_closure_call(&mut self, op: SyncOp, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
         let ci = match op {
             SyncOp::ScopeSpawn | SyncOp::OnceGetOrInit | SyncOp::BuilderSpawn => 1,
-            SyncOp::CondvarWaitWhile => 2,
+            SyncOp::CondvarWaitWhile | SyncOp::BuilderSpawnScoped => 2,
             _ => 0,
         };
         if matches!(op, SyncOp::CondvarWaitWhile | SyncOp::OnceGetOrInit) {
@@ -1149,12 +1177,17 @@ impl FnGen<'_, '_> {
         }
         let callee = self.callee_of(&ops[ci]);
         let once = !matches!(callee, Callee::Closure(_, false));
-        let scope = if op == SyncOp::ScopeSpawn { self.operand(&ops[0], loc, post).0 } else { "0".into() };
+        let scope = match op {
+            SyncOp::ScopeSpawn => self.operand(&ops[0], loc, post).0,
+            SyncOp::BuilderSpawnScoped => self.operand(&ops[1], loc, post).0,
+            _ => "0".into(),
+        };
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
         collect_types(&env_ty, &mut self.sig_types);
         let ret = match &callee {
             Callee::Closure(f, _) | Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
             Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            Callee::DynOnce(r, _) => r.clone(),
             Callee::Ptr(_) => unreachable!("a fn pointer type"),
         };
         collect_types(&ret, &mut self.sig_types);
@@ -1198,12 +1231,13 @@ impl FnGen<'_, '_> {
         let _ = writeln!(self.prelude, "static void {run}(lust_JoinHdr *hp) {{\n  {pk} *k = (void *)hp;\n{body}}}");
         let _ = writeln!(self.prelude, "static void {drop}(lust_JoinHdr *hp) {{ {drop_ret} }}");
         let h = self.tmp();
-        if op == SyncOp::BuilderSpawn {
-            // `Builder::spawn` (TRIAGE T5): the io::Result of the
-            // handle, or of the errno the spawn failed with (the
-            // packet and env drop then, as std drops the closure).
+        if matches!(op, SyncOp::BuilderSpawn | SyncOp::BuilderSpawnScoped) {
+            // `Builder::spawn` (TRIAGE T5) and `spawn_scoped`: the
+            // io::Result of the handle, or of the errno the spawn failed
+            // with (the packet and env drop then, as std drops the closure).
             let (bv, _) = self.operand(&ops[0], loc, post);
-            let jh = CTy::Sync(SyncTy::JoinHandle, Box::new(ret.clone()));
+            let hk = if op == SyncOp::BuilderSpawn { SyncTy::JoinHandle } else { SyncTy::ScopedJoinHandle };
+            let jh = CTy::Sync(hk, Box::new(ret.clone()));
             let err_a = AdtId(
                 self.p
                     .adts
@@ -1229,7 +1263,7 @@ impl FnGen<'_, '_> {
             };
             let _ = writeln!(
                 self.out,
-                "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = 0; {h}->env = {env}; lust_ThreadBuilder bv_ = {bv}; int32_t {e2} = lust_thread_spawn_builder(&{h}->h, &bv_); drop_{}(&bv_); {} {t}; if ({e2} == 0) {{ {} {okv} = &{h}->h; }} else {{ {drop_env2}lust_dealloc((void*){h}, sizeof({pk}), _Alignof({pk})); {} {errv} = ({}){{ }}; {osf} = {e2}; {} }}",
+                "    {pk} *{h} = (void *)lust_alloc(sizeof({pk}), _Alignof({pk})); {h}->h.run = {run}; {h}->h.drop_ret = {drop}; {h}->h.scope = {scope}; {h}->env = {env}; lust_ThreadBuilder bv_ = {bv}; int32_t {e2} = lust_thread_spawn_builder(&{h}->h, &bv_); drop_{}(&bv_); {} {t}; if ({e2} == 0) {{ {} {okv} = &{h}->h; }} else {{ {drop_env2}lust_dealloc((void*){h}, sizeof({pk}), _Alignof({pk})); {} {errv} = ({}){{ }}; {osf} = {e2}; {} }}",
                 mangle(&CTy::Sync(SyncTy::ThreadBuilder, Box::new(CTy::Unit))),
                 ctype(&res),
                 disc_set(self.p, &res, &t, 0),

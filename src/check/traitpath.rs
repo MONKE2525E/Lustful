@@ -546,16 +546,28 @@ impl<'p> Ctx<'p> {
                 (Res::Builtin(b), ast::Expr::Call { args, .. }) => (*b, args),
                 _ => continue,
             };
-            // A thread's main as a `dyn FnOnce` value (`Box<dyn FnOnce()
-            // -> T + Send>`, gopanic.rs): the thread start calls closures,
-            // fn items, and fn pointers only (cgen/sync.rs `callee_of_ty`).
+            // A thread's main as a `dyn` value other than `Box<dyn
+            // FnOnce() -> T>` (a `&dyn Fn`, a `Box<dyn Fn>`): the thread
+            // start calls closures, fn items, fn pointers, and boxed
+            // `dyn FnOnce` only (cgen/sync.rs `callee_of_ty`).
             let spawn = matches!(
                 b,
-                Builtin::Sync(crate::check::sync::SyncOp::ThreadSpawn | crate::check::sync::SyncOp::BuilderSpawn | crate::check::sync::SyncOp::ScopeSpawn)
+                Builtin::Sync(
+                    crate::check::sync::SyncOp::ThreadSpawn
+                        | crate::check::sync::SyncOp::BuilderSpawn
+                        | crate::check::sync::SyncOp::BuilderSpawnScoped
+                        | crate::check::sync::SyncOp::ScopeSpawn
+                )
             );
-            for &a in args {
+            for (k, &a) in args.iter().enumerate() {
+                // A spawn's function is its last argument (`spawn_scoped`
+                // takes the `&Scope` first).
+                let spawn = spawn && k + 1 == args.len();
                 let t0 = self.deep(self.out.expr_ty[self.ei(a)]);
-                if spawn && (matches!(self.kind(t0), TyKind::Dyn(..) | TyKind::Ref(..)) || self.tys.boxed_elem(t0).is_some()) {
+                // A `Box<dyn FnOnce() -> T>` is fine: the start calls its
+                // vtable's `call_once` (cgen/sync.rs `Callee::DynOnce`).
+                let boxed_once = self.tys.boxed_elem(t0).and_then(|d| crate::check::object::principal_of(&self.tys, d)).is_some_and(|pr| pr.def == p.gx.lang.fn_once);
+                if spawn && !boxed_once && (matches!(self.kind(t0), TyKind::Dyn(..) | TyKind::Ref(..)) || self.tys.boxed_elem(t0).is_some()) {
                     let span = self.span(a);
                     self.errs.push(generics::dyn_not_yet(span, "a `dyn FnOnce` value or a reference to a callable as a thread's function"));
                     continue;

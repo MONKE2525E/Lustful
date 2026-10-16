@@ -3757,6 +3757,7 @@ impl FnGen<'_, '_> {
         match &c.0 {
             sync::Callee::Closure(f, _) | sync::Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
             sync::Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            sync::Callee::DynOnce(r, _) => r.clone(),
             sync::Callee::Ptr(_) => unreachable!("a fn pointer type"),
         }
     }
@@ -4146,7 +4147,8 @@ impl FnGen<'_, '_> {
             | crate::check::sync::SyncOp::ThreadScope
             | crate::check::sync::SyncOp::CondvarWaitWhile
             | crate::check::sync::SyncOp::OnceGetOrInit
-            | crate::check::sync::SyncOp::BuilderSpawn),
+            | crate::check::sync::SyncOp::BuilderSpawn
+            | crate::check::sync::SyncOp::BuilderSpawnScoped),
         ) = b
         {
             return self.thread_closure_call(op, ops, loc, post);

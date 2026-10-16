@@ -1864,6 +1864,14 @@ struct Ctx<'p> {
     /// `std::io::copy` calls: the `&mut R` and `&mut W` argument types,
     /// checked once known (`platform::io_copy_diag`).
     deferred_io_copy: Vec<(Ty, Ty, Span)>,
+    /// The spans of a thread spawn's `F: 'static` obligation (check/sync.rs
+    /// `require_spawn_static`). There a `dyn` with an inferred object
+    /// lifetime (`let b: Box<dyn FnOnce() + Send> = ..` in a body) is the
+    /// borrow checker's to prove: its spawn rule makes every region of
+    /// the function `'static` (borrowck/regions.rs).
+    spawn_static: Vec<Span>,
+    /// Set while `static_bound_err` checks a `spawn_static` obligation.
+    static_dyn_inferred_ok: bool,
     /// The expression of the expression statement being checked (`e;`):
     /// `Vec::splice` is taken only there, where its `Splice` drops at once.
     stmt_expr: Option<ExprId>,
@@ -2256,6 +2264,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         private_inherent: Vec::new(),
         last_pick: None,
         deferred_try: Vec::new(),
+        spawn_static: Vec::new(),
+        static_dyn_inferred_ok: false,
         deferred_binops: Vec::new(),
         deferred_fmt: Vec::new(),
         deferred_layout: Vec::new(),
@@ -5125,7 +5135,10 @@ impl<'p> Ctx<'p> {
             if seen.contains(&span) {
                 continue;
             }
-            if let Some((code, msg)) = self.static_bound_err(ty, 0) {
+            self.static_dyn_inferred_ok = self.spawn_static.contains(&span);
+            let err = self.static_bound_err(ty, 0);
+            self.static_dyn_inferred_ok = false;
+            if let Some((code, msg)) = err {
                 seen.push(span);
                 self.err(code, span, msg, "Use a type that lives for `'static` here, or add a `'static` bound to the type parameter.");
             }
@@ -5175,8 +5188,9 @@ impl<'p> Ctx<'p> {
                 let name = name.unwrap_or_else(|| self.tn(t));
                 Some(("L0612", format!("the type `{name}` may not live long enough: this needs it to be `'static`")))
             }
-            TyKind::Dyn(..) => {
-                if !object::dyn_is_static(p, &self.tys, t) {
+            TyKind::Dyn(_, r) => {
+                let inferred = r == Region::Erased && self.static_dyn_inferred_ok;
+                if !inferred && !object::dyn_is_static(p, &self.tys, t) {
                     return Some(("L0705", format!("lust cannot prove that `{}` lives for `'static`, which this bound requires", self.tn(t))));
                 }
                 let pr = object::principal_of(&self.tys, t)?;

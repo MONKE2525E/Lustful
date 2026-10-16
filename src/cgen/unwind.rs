@@ -39,6 +39,7 @@ impl FnGen<'_, '_> {
         let ret = match &callee {
             sync::Callee::Closure(f, _) | sync::Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
             sync::Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            sync::Callee::DynOnce(r, _) => r.clone(),
             sync::Callee::Ptr(_) => unreachable!("a fn pointer type"),
         };
         let res = CTy::Result(Box::new(ret), Box::new(CTy::BoxDyn));

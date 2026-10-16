@@ -151,6 +151,8 @@ pub enum SyncOp {
     BuilderStackSize,
     /// `Builder::spawn(self, f)`.
     BuilderSpawn,
+    /// `Builder::spawn_scoped(self, scope, f)`.
+    BuilderSpawnScoped,
     /// `thread::available_parallelism`.
     AvailPar,
     /// `Condvar::new()`, `Barrier::new(n)`, `OnceLock::new()` (const fns).
@@ -192,7 +194,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 117] = [
+    pub const ALL: [SyncOp; 118] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -277,6 +279,7 @@ impl SyncOp {
         SyncOp::BuilderName,
         SyncOp::BuilderStackSize,
         SyncOp::BuilderSpawn,
+        SyncOp::BuilderSpawnScoped,
         SyncOp::AvailPar,
         SyncOp::SyncNew(SyncTy::Condvar),
         SyncOp::CondvarWait,
@@ -403,6 +406,7 @@ impl SyncOp {
             SyncOp::BuilderName => (&["std::thread::Builder"], &["name"], m),
             SyncOp::BuilderStackSize => (&["std::thread::Builder"], &["stack_size"], m),
             SyncOp::BuilderSpawn => (&["std::thread::Builder"], &["spawn"], m),
+            SyncOp::BuilderSpawnScoped => (&["std::thread::Builder"], &["spawn_scoped"], m),
             SyncOp::AvailPar => (&["std::thread"], &["available_parallelism"], f),
             SyncOp::SyncNew(_) => (&["std::sync::Condvar", "std::sync::Barrier", "std::sync::OnceLock<T>"], &["new"], a),
             SyncOp::CondvarWait => (&["std::sync::Condvar"], &["wait"], m),
@@ -738,7 +742,7 @@ impl<'p> Ctx<'p> {
                 let f = self.fn_once_param(&[], ret, span);
                 self.require_send(f, span);
                 self.require_send(ret, span);
-                self.require_static(f, span);
+                self.require_spawn_static(f, span);
                 self.require_static(ret, span);
                 (vec![f], sync_ty(&mut self.tys, SyncTy::JoinHandle, &[ret]))
             }
@@ -915,6 +919,14 @@ impl<'p> Ctx<'p> {
         self.obl.push(obligations::Obligation::TypeStatic { ty: t, span });
     }
 
+    /// `require_static` for a thread spawn's function (`F: 'static`): the
+    /// borrow checker proves an inferred `dyn` object lifetime in it
+    /// (`Ctx::spawn_static`).
+    fn require_spawn_static(&mut self, t: Ty, span: Span) {
+        self.spawn_static.push(span);
+        self.require_static(t, span);
+    }
+
     /// The pending obligation `t: Send`.
     pub(super) fn require_send(&mut self, t: Ty, span: Span) {
         let send = self.p.gx.lang.send;
@@ -985,13 +997,32 @@ impl<'p> Ctx<'p> {
                     self.check_args(&[USIZE], args, span);
                     return Some(sync_ty(&mut self.tys, SyncTy::ThreadBuilder, &[]));
                 }
+                // `Builder::spawn_scoped<'scope, 'env, F, T>(self, scope:
+                // &'scope Scope<'scope, 'env>, f: F) ->
+                // io::Result<ScopedJoinHandle<'scope, T>>`, `F: FnOnce() -> T
+                // + Send + 'scope, T: Send + 'scope` (the borrow checker's
+                // scope rule, as for `scope.spawn`).
+                (SyncTy::ThreadBuilder, "spawn_scoped") => {
+                    let ret = self.new_var(false);
+                    let f = self.fn_once_param(&[], ret, span);
+                    self.require_send(f, span);
+                    self.require_send(ret, span);
+                    let sc = sync_ty(&mut self.tys, SyncTy::Scope, &[]);
+                    let sr = self.tys.mk_ref(false, sc);
+                    let h = sync_ty(&mut self.tys, SyncTy::ScopedJoinHandle, &[ret]);
+                    let err = self.io_error_ty();
+                    self.check_packed_borrow(recv, span);
+                    self.set_res(e, Res::BuiltinMethod { b: Builtin::Sync(SyncOp::BuilderSpawnScoped), derefs, autoref: Autoref::None });
+                    self.check_args(&[sr, f], args, span);
+                    return Some(self.tys.mk_result(h, err));
+                }
                 // `Builder::spawn<F, T>(self, f) -> io::Result<JoinHandle<T>>`.
                 (SyncTy::ThreadBuilder, "spawn") => {
                     let ret = self.new_var(false);
                     let f = self.fn_once_param(&[], ret, span);
                     self.require_send(f, span);
                     self.require_send(ret, span);
-                    self.require_static(f, span);
+                    self.require_spawn_static(f, span);
                     self.require_static(ret, span);
                     let h = sync_ty(&mut self.tys, SyncTy::JoinHandle, &[ret]);
                     let err = self.io_error_ty();

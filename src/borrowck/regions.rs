@@ -4138,6 +4138,24 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             return;
         }
+        // `builder.spawn_scoped(scope, f)`: the `scope.spawn` rule with the
+        // `&Scope` as the second argument; the `io::Result`'s `Ok` handle
+        // has the `'s` slot first (its `Err` holds no borrows).
+        if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::BuilderSpawnScoped)) = target
+            && let Some(&r) = avs.get(1).and_then(|(_, v)| v.get(1))
+        {
+            for &x in avs.iter().skip(2).flat_map(|(_, v)| v).chain(&srcs).chain(dv.iter().skip(1)) {
+                self.edge(x, r);
+            }
+            if let Some(&h) = dv.first() {
+                self.edge(h, r);
+                self.edge(r, h);
+            }
+            if let Some(&b) = avs.get(1).and_then(|(_, v)| v.first()) {
+                self.edge(b, r);
+            }
+            return;
+        }
         // `mpsc::channel()`: both ends carry one `T` (W-THREADS).
         if let CallTarget::Builtin(crate::check::Builtin::Sync(crate::check::sync::SyncOp::Channel | crate::check::sync::SyncOp::SyncChannel)) = target {
             let n = dv.len() / 2;
