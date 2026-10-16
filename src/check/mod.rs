@@ -6653,8 +6653,8 @@ impl<'p> Ctx<'p> {
         if self.tys.local_adt(base).is_none() {
             return None;
         }
-        let (f, target, args) = self.user_deref_fn(lang.deref, base, "deref", span)?;
-        let (f_mut, args_mut) = match self.user_deref_fn(lang.deref_mut, base, "deref_mut", span) {
+        let (f, target, args) = self.user_deref_fn_lit(lang.deref, base, "deref", span, true)?;
+        let (f_mut, args_mut) = match self.user_deref_fn_lit(lang.deref_mut, base, "deref_mut", span, true) {
             Some((g, _, a)) => (Some(g), a),
             None => (None, Vec::new()),
         };
@@ -6823,6 +6823,14 @@ impl<'p> Ctx<'p> {
     }
 
     fn user_deref_fn(&mut self, trait_def: DefId, base: Ty, fname: &str, span: Span) -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
+        self.user_deref_fn_lit(trait_def, base, fname, span, false)
+    }
+
+    /// `user_deref_fn`; with `lit_ok` the target may be a literal's
+    /// open `{integer}` or `{float}` type (`*m` on a
+    /// `ManuallyDrop::new(5)`), as in rustc. Only place derefs pass
+    /// it: a method lookup on an open literal type is rustc's E0689.
+    fn user_deref_fn_lit(&mut self, trait_def: DefId, base: Ty, fname: &str, span: Span, lit_ok: bool) -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
         use crate::traits::index::Synthetic;
         let p = self.p;
         let args = self.tys.intern_args(&[GenericArg::Ty(base)]);
@@ -6838,8 +6846,10 @@ impl<'p> Ctx<'p> {
         let ret = self.normalize_here(ret);
         let TyKind::Ref(_, _, target) = self.kind(ret) else { return None };
         let target = self.resolve(target);
-        if matches!(self.kind(target), TyKind::Infer(_) | TyKind::Error) {
-            return None;
+        match self.kind(target) {
+            TyKind::Infer(v) if lit_ok && v.1 != InferKind::General => {}
+            TyKind::Infer(_) | TyKind::Error => return None,
+            _ => {}
         }
         Some((f, target, impl_args))
     }
