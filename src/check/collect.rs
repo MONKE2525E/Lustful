@@ -6553,6 +6553,24 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
             (c.value.clone(), c.ty)
         })
     }
+    fn const_item_ref(&self, name: Sym, at: Span) -> Option<(&crate::ty::consteval::ConstValue, Ty)> {
+        // The same lookup as `const_item`.
+        let i = match self.span_lookup(name, at).or_else(|| self.scope_lookup(name)) {
+            Some(ScopeItem::Pending(i)) => i,
+            Some(ScopeItem::Fn(_) | ScopeItem::Other) => return None,
+            None => match self.by_name.get(&name) {
+                Some(&i) => i,
+                None => {
+                    let c = &self.p.consts[*self.p.const_names.get(&name)? as usize];
+                    return Some((&c.value, c.ty));
+                }
+            },
+        };
+        match &self.pending[i] {
+            (it, PendingState::Done(v)) => Some((v, it.ty)),
+            _ => None,
+        }
+    }
     fn assoc_const_item(&mut self, segs: &[ast::PathSeg]) -> Option<crate::ty::consteval::TypedValue> {
         // The last two segments name the type and the const;
         // earlier segments are module anchors the resolver has

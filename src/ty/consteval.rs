@@ -200,6 +200,14 @@ pub trait ConstCx<'a> {
     /// body answers only inside its block scope, and shadows a
     /// module item of the same name there.
     fn const_item(&mut self, name: Sym, at: Span) -> Option<TypedValue>;
+    /// `const_item` without the clone, for an item already evaluated:
+    /// its value in place. An index into a table item reads one element
+    /// through it, so many `static X: &T = &TABLE[i]` items do not copy
+    /// the whole table each. None where the context does not keep
+    /// values (the caller then takes the `const_item` path).
+    fn const_item_ref(&self, _name: Sym, _at: Span) -> Option<(&ConstValue, Ty)> {
+        None
+    }
     /// An inherent associated const by its path (`Type::CONST`,
     /// module segments may lead), evaluating it if needed.
     fn assoc_const_item(&mut self, _segs: &[ast::PathSeg]) -> Option<TypedValue> {
@@ -1559,6 +1567,9 @@ impl Evaluator {
                 // (an `include_bytes!` blob) per element read would make
                 // a loop over it quadratic (W-CHECK-G3).
                 if let Some(got) = self.index_local(cx, env, *base, *index, span)? {
+                    return Ok(Flow::Val(got));
+                }
+                if let Some(got) = self.index_item(cx, env, *base, *index, span)? {
                     return Ok(Flow::Val(got));
                 }
                 let (v, t) = self.value_place(cx, env, *base, None)?;
@@ -3426,6 +3437,61 @@ impl Evaluator {
             ConstValue::Bytes(b) => b.as_slice().get(i).map(|&x| ConstValue::Int(x as i128)),
             ConstValue::Aggregate(_) | ConstValue::Repeat(..) => None,
             _ => return Ok(None),
+        };
+        match got {
+            Some(g) => Ok(Some((g, elem))),
+            None => Err(outside(span, "this index (out of bounds)")),
+        }
+    }
+
+    /// `ITEM[i]` for a const or static item base, read in place
+    /// (`ConstCx::const_item_ref`): the general path clones the whole
+    /// item value per read, so many statics that index one big table
+    /// were quadratic. Same answers as the general path; None (before
+    /// the index is evaluated) for any shape it does not cover.
+    fn index_item<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, base: ExprId, index: ExprId, span: Span) -> Result<Option<TypedValue>, Diag> {
+        let Expr::Path(segs) = cx.ast().expr(base) else { return Ok(None) };
+        let [seg] = segs.as_slice() else { return Ok(None) };
+        let (name, at) = (seg.name, cx.ast().expr_span(base));
+        if env.iter().any(|(n, _, _, _)| *n == name) {
+            return Ok(None);
+        }
+        // The value as `deref_value` sees it, and its element type.
+        fn peel<'v, T: TyIntern>(tys: &T, v: &'v ConstValue, t: Ty) -> Option<(&'v ConstValue, Ty)> {
+            let (v, t) = match (v, tys.kind(t)) {
+                (ConstValue::Ref(inner), TyKind::Ref(_, _, it)) => (&**inner, it),
+                _ => (v, t),
+            };
+            let elem = match tys.kind(t) {
+                TyKind::Array(el, _) | TyKind::Slice(el) => el,
+                TyKind::Ref(_, _, inner) => match tys.kind(inner) {
+                    TyKind::Array(el, _) | TyKind::Slice(el) => el,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            matches!(v, ConstValue::Aggregate(_) | ConstValue::Repeat(..) | ConstValue::Bytes(_)).then_some((v, elem))
+        }
+        // The first read evaluates the item (`const_item` reports its
+        // errors); later reads find it in place.
+        if cx.const_item_ref(name, at).is_none() && cx.const_item(name, at).is_none() {
+            return Ok(None);
+        }
+        let Some((v, t)) = cx.const_item_ref(name, at) else { return Ok(None) };
+        if peel(cx.tys_ref(), v, t).is_none() {
+            return Ok(None);
+        }
+        self.check_temp_drop(cx, env, base, t, span)?;
+        let (iv, _) = self.value(cx, env, index, Some(USIZE))?;
+        let ConstValue::Int(i) = iv else { return Err(outside(span, "this index")) };
+        let i = usize::try_from(i).map_err(|_| outside(span, "this index"))?;
+        let Some((v, t)) = cx.const_item_ref(name, at) else { return Ok(None) };
+        let Some((v, elem)) = peel(cx.tys_ref(), v, t) else { return Ok(None) };
+        let got = match v {
+            ConstValue::Aggregate(vals) => vals.get(i).cloned(),
+            ConstValue::Repeat(v, n) if (i as u64) < *n => Some((**v).clone()),
+            ConstValue::Bytes(b) => b.as_slice().get(i).map(|&x| ConstValue::Int(x as i128)),
+            _ => None,
         };
         match got {
             Some(g) => Ok(Some((g, elem))),
