@@ -491,6 +491,14 @@ impl GenReuse {
         e.src == src && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads)
     }
 
+    /// True when fn `f` has a stored discovery output made from its current
+    /// source and its last check stored it (its reads are not compared:
+    /// the derive delta's keyed walk proved them).
+    pub(crate) fn discovery_src_same(&self, p: &Program, f: LocalDefId) -> bool {
+        let def = p.def_id(f);
+        self.on && !self.unstored.contains_key(&def) && self.discovery.get(&def).is_some_and(|e| self.src_of(p, f) == Some(e.src))
+    }
+
     /// The stored discovery output of fn `f`, if it still holds.
     pub fn discovered(&mut self, p: &Program, f: LocalDefId) -> Option<Discovered> {
         if !self.on {

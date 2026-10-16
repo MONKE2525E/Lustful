@@ -450,7 +450,7 @@ fn replay_bodies(
             recheck_template(p, t, &[(lo, hi)], caches)?;
         }
         super::laps::mark("collect/delta replay templates");
-        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched)
+        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false)
     })();
     (p.record_reads, p.unwind) = (record_reads, unwind);
     out
@@ -460,7 +460,8 @@ fn replay_bodies(
 /// header delta above, the derive delta in driver/kept_derive.rs), as a
 /// collect with generic reuse runs them. A body stands when the program
 /// holds its entry (none stored after `Program::reuse_stamp`) and the entry
-/// reads no node `touched` names, or when its stored output still holds.
+/// reads no node `touched` names, or when its stored output still holds,
+/// or when the caller proved it (`stands`: the derive delta's keyed walk).
 /// An entry stored after the program's stamp (and before `start`, when the
 /// delta began) checks against the output the program keeps for it
 /// (`bases`). Every other body checks again and must give the output
@@ -475,6 +476,7 @@ pub(super) fn replay_discovery(
     start: u64,
     bases: &Bases,
     touched: &mut dyn FnMut(&Program, &ReadKey) -> bool,
+    stands: &dyn Fn(LocalDefId) -> bool,
 ) -> Result<(), &'static str> {
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
@@ -487,7 +489,7 @@ pub(super) fn replay_discovery(
             let own = bases.iter().find(|b| b.0 == g.0 as usize).map(|b| b.1.as_ref());
             let base = if reuse.newer(p, g, p.reuse_stamp, start) {
                 own.ok_or("sig mode")?.cloned()
-            } else if reuse.untouched(p, g, &mut |k| touched(p, k)) || reuse.discovery_holds(p, g) {
+            } else if stands(g) || reuse.untouched(p, g, &mut |k| touched(p, k)) || reuse.discovery_holds(p, g) {
                 continue;
             } else {
                 reuse.out_copy(p.def_id(g))

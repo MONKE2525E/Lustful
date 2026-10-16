@@ -67,7 +67,7 @@ pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches,
     // The keyed dirty walk: only the read keys the delta can move
     // (graph.rs `Program::derive_key_moves`) are compared, for the slots
     // that read them. The compile tail rechecks the dirty slots.
-    let (is_dirty, _) = {
+    let (is_dirty, has_checked) = {
         let prog: &Program = p;
         let mut moves = crate::driver::graph::DeriveMoves::new(&reach);
         let def_slot = |d: crate::def::DefId| prog.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
@@ -81,12 +81,29 @@ pub(super) fn apply_derives(p: &mut Program, front: &Front, caches: &mut Caches,
     if p.gx.user_generics {
         replay_templates(p, front, caches, &reach, keyed, start)?;
         crate::driver::laps::mark("kept/derive templates");
-        // A body whose entry reads no key the delta can move stands
-        // (`GenReuse::untouched`, as in the header delta); with other
-        // edits in the request every key counts as moved.
+        // A body's discovery reads are a subset of its check's, taken on
+        // the same program: a body whose stored check reads are all clean
+        // keeps its discovery output too (the keyed walk's dirty slots, no
+        // per-read scan). Not one with a `Checked` read (a collect checks
+        // it again each time), and its stored output must be of the body's
+        // current source. Else a body whose entry reads no key the delta
+        // can move stands (`GenReuse::untouched`, as in the header delta);
+        // with other edits in the request every key counts as moved.
+        let clean: Vec<bool> = (0..front.fn_loc.len() as u32)
+            .map(LocalDefId)
+            .map(|g| {
+                let s = front.fn_slot.get(g.0 as usize).map_or(usize::MAX, |&s| s as usize);
+                keyed
+                    && caches.slot_reads.get(s).is_some_and(Option::is_some)
+                    && !is_dirty[s]
+                    && !has_checked[s]
+                    && caches.gen_reuse.discovery_src_same(p, g)
+            })
+            .collect();
         let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
-        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched)?;
+        let stands = |g: LocalDefId| clean.get(g.0 as usize).copied().unwrap_or(false);
+        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands)?;
         crate::driver::laps::mark("kept/derive discovery");
     }
     caches.derive_dirty = Some(is_dirty);
