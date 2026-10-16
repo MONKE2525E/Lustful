@@ -149,8 +149,8 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
             // every shape itself, sync types by the default body.
             Glue::CloneFrom => unreachable!("clonefrom glue is in clonefrom.rs"),
             Glue::TlsInit | Glue::TlsDtor => unreachable!("TLS glue is per thread_local! key"),
-            // No hash glue reaches an Arc (its keys are not hashable here,
-            // `has_hash`).
+            // Hash glue is keyed by (value, hasher) tuples (cgen/hash.rs
+            // hashes an Arc as its value), never by an Arc itself.
             Glue::HashValue
             | Glue::HashKey
             | Glue::HashOf

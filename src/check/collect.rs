@@ -8518,8 +8518,9 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bo
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.hash, None),
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
-        // A raw pointer hashes its address as a usize (w-cinterop).
-        TyKind::RawPtr(..) => true,
+        // A raw pointer or fn pointer hashes its address as a usize
+        // (w-cinterop; core's `impl<F: FnPtr> Hash for F`).
+        TyKind::RawPtr(..) | TyKind::FnPtr(_) => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_hash(p, tys, e, seen),
         TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_hash(p, tys, e, seen)),
@@ -8544,7 +8545,10 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bo
                 // A written impl the glue calls (`gx.written_hash`).
                 Some(a) if p.gx.written_hash.contains_key(&a) => true,
                 Some(a) if p.derives_of(a).hash => adt_fields_all(p, a, t, GlueKey::Hash, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
-                _ => false,
+                // A written generic impl (`impl<T: Hash> Hash for
+                // VecDeque<T>`): the glue calls its instance
+                // (`gx.generic_hash`) when its bounds hold by glue.
+                _ => written_glue_impl(p, tys, t, p.gx.lang.hash, Some("hash"), &["hash_slice"], seen),
             }
         }
     }

@@ -5025,6 +5025,12 @@ pub struct GenTables {
     /// (W-STD-B; iface: W-CGEN reads `hash_impls`).
     pub written_hash: FxMap<AdtId, LocalDefId>,
     pub hash_impls: FxMap<AdtId, Vec<(Ty, LocalDefId)>>,
+    /// The written generic `Hash` impls of concrete Adt instances
+    /// (`impl<T: Hash> Hash for VecDeque<T>`): the impl's `hash` fn
+    /// and the impl args at the instance. `ensure_written_hash` makes
+    /// their `hash::<H>` instances into `hash_impls`, as for
+    /// `written_hash`.
+    pub generic_hash: FxMap<AdtId, (LocalDefId, Vec<GenericArg>)>,
     /// The written `Borrow::borrow` of a non-generic `impl Borrow<Q>`
     /// on a non-generic local Adt, by (Adt, Q): a map or set lookup by
     /// `&Q` calls it on each candidate key (W-STD-B; iface: W-CGEN
@@ -5163,6 +5169,7 @@ impl Default for GenTables {
             iter_methods: FxMap::default(),
             written_hash: FxMap::default(),
             hash_impls: FxMap::default(),
+            generic_hash: FxMap::default(),
             borrow_impls: FxMap::default(),
             has_generics: false,
             user_generics: false,
@@ -10548,13 +10555,45 @@ fn args_hold_refs(tys: &GlobalTys, t: Ty) -> bool {
     }
 }
 
+/// Records the written generic `Hash` impl of one concrete Adt
+/// instance (`gx.generic_hash`), on the terms of `compute_written_hash`
+/// (no own `hash_slice`), when the check side's glue walk also hashes
+/// the type through it (`has_hash`), so check and cgen agree.
+fn ensure_generic_hash(p: &mut Program, adt: AdtId) {
+    use crate::traits::index::Synthetic;
+    if p.gx.written_hash.contains_key(&adt) || p.gx.generic_hash.contains_key(&adt) {
+        return;
+    }
+    let Some(self_ty) = p.tys.full_adt_ty(adt) else { return };
+    if p.tys.flags(self_ty).contains_param() {
+        return;
+    }
+    let args_id = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
+    let tr = TraitRef { def: p.gx.lang.hash, args: args_id, bindings: EMPTY_BINDINGS };
+    let sel = {
+        let mut cx = crate::traits::solve::PureCx::new(&p.tys);
+        let mut solver = Solver::new();
+        solver.select(&mut cx, &p.gx.index, &[], tr)
+    };
+    let Selection::Impl { id, args: impl_args, .. } = sel else { return };
+    let record = p.gx.index.get(id);
+    if record.synthetic != Synthetic::None || record.generics.params.is_empty() {
+        return;
+    }
+    let named = |n: &str| record.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == n));
+    let (Some(f), None) = (named("hash"), named("hash_slice")) else { return };
+    if crate::check::collect::has_hash(p, &p.tys, self_ty) {
+        p.gx.generic_hash.insert(adt, (f, impl_args.to_vec()));
+    }
+}
+
 /// The `hash::<H>` instances of the written Hash impls
 /// (`written_hash`) for every hasher type the hash glue may feed them
 /// (W-STD-B): DefaultHasher and each concrete Adt with a written
 /// `Hasher` impl. Pairs made in an earlier pass stay.
 fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
     use crate::ty::hash::{HashTy, mk_hash};
-    if p.gx.written_hash.is_empty() {
+    if p.gx.written_hash.is_empty() && p.gx.generic_hash.is_empty() {
         return;
     }
     let mut user: Vec<AdtId> = p.gx.hasher_methods.keys().map(|&(a, _)| a).collect();
@@ -10562,15 +10601,18 @@ fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
     user.dedup();
     let mut hashers = vec![mk_hash(&mut p.tys, HashTy::DefaultHasher, &[])];
     hashers.extend(user.into_iter().filter_map(|a| p.tys.full_adt_ty(a)).filter(|&t| !p.tys.flags(t).contains_param()));
-    let mut adts: Vec<(AdtId, LocalDefId)> = p.gx.written_hash.iter().map(|(&a, &f)| (a, f)).collect();
-    adts.sort_by_key(|&(a, _)| a.0);
-    for (a, f) in adts {
+    let mut adts: Vec<(AdtId, LocalDefId, Vec<GenericArg>)> = p.gx.written_hash.iter().map(|(&a, &f)| (a, f, Vec::new())).collect();
+    adts.extend(p.gx.generic_hash.iter().map(|(&a, (f, args))| (a, *f, args.clone())));
+    adts.sort_by_key(|(a, _, _)| a.0);
+    for (a, f, impl_args) in adts {
         for &h in &hashers {
             if p.gx.hash_impls.get(&a).is_some_and(|v| v.iter().any(|&(t, _)| t == h)) {
                 continue;
             }
             let before = p.fns.len();
-            let inst = fn_instance(p, f, &[GenericArg::Ty(h)]);
+            let mut args = impl_args.clone();
+            args.push(GenericArg::Ty(h));
+            let inst = fn_instance(p, f, &args);
             if inst.0 as usize >= before {
                 queue.push(inst);
             }
@@ -10854,6 +10896,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                 ensure_fmt_methods(p, a, &mut next_queue);
                 ensure_glue_methods(p, a, &mut next_queue);
                 ensure_hash_methods(p, a, &mut next_queue);
+                ensure_generic_hash(p, a);
                 ensure_iter_methods(p, a, &mut next_queue);
             }
             ensure_written_hash(p, &mut next_queue);

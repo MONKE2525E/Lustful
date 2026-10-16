@@ -9425,7 +9425,8 @@ fn glue_def_value(
                     body.push_str(&seq(e, "a->v[i]", "b->v[i]", &n.to_string(), &mut need));
                     body.push_str("  return 0;\n");
                 }
-                CTy::Slice(e) => {
+                // A `Box<[T]>` orders as its slice (same fat form).
+                CTy::Slice(e) | CTy::BoxSlice(e) => {
                     body.push_str("  uint64_t n = a->len < b->len ? a->len : b->len;\n");
                     body.push_str(&seq(e, "a->ptr[i]", "b->ptr[i]", "n", &mut need));
                     body.push_str("  return a->len < b->len ? -1 : a->len > b->len;\n");

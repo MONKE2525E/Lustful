@@ -226,19 +226,21 @@ fn hash_stmts(p: &Program, slots: &[u32], t: &CTy, hc: &CTy, h: &str, v: &str, n
             let s = if *t == CTy::String { format!("lust_string_as_str({v})") } else { format!("(*{v})") };
             format!("{{ lust_str s_ = {s}; {} {} }}", call(write, &bytes("s_.ptr", "s_.len")), call(write_int(IntTy::U8), "0xff"))
         }
-        // A raw pointer hashes its address as a usize (w-cinterop).
-        CTy::Ptr(_) => call(write_int(IntTy::Usize), &format!("(uint64_t)(uintptr_t)(*{v})")),
+        // A raw pointer or fn pointer hashes its address as a usize
+        // (w-cinterop; core's `impl<F: FnPtr> Hash for F`).
+        CTy::Ptr(_) | CTy::FnPtr(..) => call(write_int(IntTy::Usize), &format!("(uint64_t)(uintptr_t)(*{v})")),
         CTy::Ref(inner) if **inner == CTy::Str => hash_stmts(p, slots, &CTy::Str, hc, h, v, need),
         CTy::Ref(inner) | CTy::Boxed(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(*{v})"), need),
-        CTy::Rc(inner) => hash_stmts(p, slots, inner, hc, h, &format!("(&(*{v})->v)"), need),
+        // Rc and Arc hash their value (`(**self).hash(state)`).
+        CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => hash_stmts(p, slots, inner, hc, h, &format!("(&(*{v})->v)"), need),
         // An owning fat pointer hashes its pointee (cgen/own.rs).
         CTy::Own(_, inner) => hash_stmts(p, slots, inner, hc, h, v, need),
         CTy::Tuple(es) => es.iter().enumerate().map(|(i, e)| hash_stmts(p, slots, e, hc, h, &format!("(&({v})->f{i})"), need)).collect(),
-        // [T], Vec<T>, [T; N]: write_length_prefix (write_usize), then
+        // [T], Box<[T]>, Vec<T>, [T; N]: write_length_prefix (write_usize), then
         // hash_slice: one write of all bytes for integers, else each.
-        CTy::Slice(e) | CTy::Vec(e) | CTy::Array(e, _) => {
+        CTy::Slice(e) | CTy::BoxSlice(e) | CTy::Vec(e) | CTy::Array(e, _) => {
             let (ptr, len) = match t {
-                CTy::Slice(_) => (format!("({v})->ptr"), format!("({v})->len")),
+                CTy::Slice(_) | CTy::BoxSlice(_) => (format!("({v})->ptr"), format!("({v})->len")),
                 CTy::Vec(_) => (format!("(({}*)({v})->ptr)", ctype(e)), format!("({v})->len")),
                 CTy::Array(_, n) => (format!("({v})->v"), format!("((uint64_t){n})")),
                 _ => unreachable!(),

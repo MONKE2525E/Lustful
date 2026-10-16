@@ -4528,6 +4528,8 @@ impl<'p> Ctx<'p> {
         match self.tys.kind(self_ty) {
             TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) => {}
             TyKind::Closure(..) if trait_def == lang.copy || trait_def == lang.clone => {}
+            // core's `impl<F: FnPtr> Hash for F` (the address).
+            TyKind::FnPtr(_) => return trait_def == lang.hash,
             // core's `impl Debug for !` (`catch_unwind` of a closure that
             // always panics gives `Result<!, _>`; W-UNWIND).
             TyKind::Never => return trait_def == lang.debug,
