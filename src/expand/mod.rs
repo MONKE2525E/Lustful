@@ -2320,6 +2320,37 @@ pub fn attr_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<AttrInfo> 
     Some(AttrInfo { path, inner, end: j + 1, span, inner_attr })
 }
 
+/// Checks a written `#[macro_export ..]` input: nothing or
+/// `(local_inner_macros)`. An `= v` input is malformed (rustc E0539);
+/// any other list is rustc's deny-by-default lint
+/// `invalid_macro_export_arguments` unless `leveled`.
+fn check_macro_export_input(trees: &[Tt], attr: &AttrInfo, leveled: bool, interner: &Interner) -> Result<(), Diag> {
+    let Some(Tt::Delim(Delim::Bracket, body, _)) = attr.end.checked_sub(1).and_then(|k| trees.get(k)) else { return Ok(()) };
+    let rest = body.get(1..).unwrap_or(&[]);
+    let ok = match rest {
+        [] => true,
+        [Tt::Delim(Delim::Paren, group, _)] => {
+            matches!(group.as_slice(), [Tt::Tok(t)] if seg_text(t.tok, interner).as_deref() == Some("local_inner_macros"))
+        }
+        _ => false,
+    };
+    if ok {
+        return Ok(());
+    }
+    if matches!(rest.first(), Some(Tt::Tok(t)) if t.tok == Tok::Eq) {
+        return Err(err("L0524", attr.span, "malformed `macro_export` attribute input", "Write `#[macro_export]` or `#[macro_export(local_inner_macros)]`."));
+    }
+    if leveled {
+        return Ok(());
+    }
+    Err(err(
+        "L0524",
+        attr.span,
+        "valid forms for the attribute are `macro_export` and `macro_export(local_inner_macros)`",
+        "Write `#[macro_export]` or `#[macro_export(local_inner_macros)]` (rustc `invalid_macro_export_arguments`).",
+    ))
+}
+
 /// A `macro_rules! name <group>` definition found in a tree list.
 pub struct DefStart {
     pub name: Sym,
@@ -3036,6 +3067,13 @@ impl<'a> Expander<'a> {
         // cfg_attr(cond, attr): keep, drop, or substitute. One level is
         // enough for the shapes in use; a substituted cfg is honored by
         // falling through to the cfg check below with its own trees.
+        // rustc's deny-by-default `invalid_macro_export_arguments`, lifted
+        // by a level on the same item (one written on a module or the
+        // crate is not read: a false reject).
+        let export_leveled = attrs.iter().any(|a| {
+            matches!(a.path.as_str(), "allow" | "warn" | "expect")
+                && a.inner.iter().any(|t| matches!(t, Tt::Tok(x) if matches!(seg_text(x.tok, self.ctx.interner).as_deref(), Some("invalid_macro_export_arguments" | "future_incompatible"))))
+        });
         let mut kept: Vec<(AttrInfo, usize)> = Vec::new();
         let mut pos = start;
         for attr in attrs {
@@ -3131,7 +3169,10 @@ impl<'a> Expander<'a> {
                 // Only a fn item drops: `#[test]` anywhere else is
                 // an error in every build, and the parser reports it.
                 "test" => off = !self.ctx.cfg.test && next_is_fn(trees, after),
-                "macro_export" => exported = true,
+                "macro_export" => {
+                    check_macro_export_input(trees, &attr, export_leveled, self.ctx.interner)?;
+                    exported = true;
+                }
                 "macro_use" => macro_use_attr = true,
                 _ => {}
             }

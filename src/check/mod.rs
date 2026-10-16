@@ -28,6 +28,7 @@ pub mod object;
 pub mod obligations;
 pub mod outlives;
 pub mod dropck;
+pub mod deny_lints;
 pub mod opaque;
 pub mod own;
 pub mod picks;
@@ -2193,7 +2194,7 @@ pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>)
         && matches!(class, generics::FnClass::Plain | generics::FnClass::Template)
         && !p.in_lang_methods(p.fn_def(fid).name_span)
         && p.fn_shipped_crate(fid).is_none()
-        && let Some(d) = dropck::check_body(p, fid, &mut ck)
+        && let Some(d) = deny_lints::check_body(p, fid, &ck).or_else(|| dropck::check_body(p, fid, &mut ck))
     {
         errs.push(d);
     }

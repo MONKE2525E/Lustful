@@ -70,6 +70,9 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0540](L0540.md) | arithmetic operation will overflow |
 | [L0541](L0541.md) | operation will panic at runtime |
 | [L0542](L0542.md) | invalid atomic memory ordering |
+| [L0543](L0543.md) | `drop` of a `ManuallyDrop` does nothing |
+| [L0544](L0544.md) | non-binding let on a synchronization lock |
+| [L0545](L0545.md) | text direction codepoint in a comment or literal |
 | [L0601](L0601.md) | type alias cycle |
 | [L0602](L0602.md) | this type form is not supported yet |
 | [L0603](L0603.md) | the `!` type is unstable outside a function return type |

@@ -68,6 +68,8 @@ pub(super) const T_FIELD: u8 = 8;
 pub(super) const T_PARAM: u8 = 16;
 pub(super) const T_UNION: u8 = 32;
 pub(super) const T_STATIC: u8 = 64;
+/// A trait impl block, or an item inside one (with `T_FN` for a method).
+pub(super) const T_TRAIT_IMPL: u8 = 128;
 
 /// Rejects a built-in attribute on a target rustc rejects it on.
 /// `what` names the target in rustc's words ("structs", "constants").
@@ -93,9 +95,21 @@ pub(super) fn check_target(attrs: &[Attr], what: &str, flags: u8, interner: &Int
             "non_exhaustive" => flags & (T_ADT | T_VARIANT | T_FIELD) == 0,
             // rustc: allocators must be statics.
             "global_allocator" => flags & T_STATIC == 0,
-            _ => false,
+            // rustc's `useless_deprecated` (a trait impl method or block)
+            // and its target check (an extern crate, `what` "extern crates").
+            "deprecated" => (flags & T_TRAIT_IMPL != 0 && (flags & T_FN != 0 || what == "trait impl blocks")) || what == "extern crates" || flags & T_PARAM != 0,
+            _ => flags & T_PARAM != 0 && !matches!(name, "allow" | "cfg" | "cfg_attr" | "deny" | "expect" | "forbid" | "warn"),
         };
+        if bad && flags & T_PARAM != 0 && !matches!(name, "inline" | "cold" | "ignore" | "should_panic" | "repr" | "non_exhaustive" | "global_allocator") {
+            return Err(Diag::new(
+                C_ATTR_USE,
+                a.span,
+                "allow, cfg, cfg_attr, deny, expect, forbid, and warn are the only allowed built-in attributes in function parameters",
+                format!("Remove the `#[{name}]` attribute."),
+            ));
+        }
         if bad {
+            let what = if name == "deprecated" && flags & T_FN != 0 { "trait methods in impl blocks" } else { what };
             return Err(Diag::new(
                 C_ATTR_USE,
                 a.span,

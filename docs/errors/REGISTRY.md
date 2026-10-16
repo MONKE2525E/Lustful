@@ -58,7 +58,10 @@ prints "reserved, not yet emitted".
 | L0540 | Known-value checks | check | in use | Arithmetic operation will overflow (rustc `arithmetic_overflow`) |
 | L0541 | Known-value checks | check | in use | Operation will panic at runtime (rustc `unconditional_panic`) |
 | L0542 | Known-value checks | W-THREADS | in use | Invalid atomic memory ordering (rustc `invalid_atomic_ordering`) |
-| L0543-L0549 | Known-value checks | check | reserved | |
+| L0543 | Known-value checks | tf-mdrop | in use | `drop` of a `ManuallyDrop` value does nothing (rustc `undropped_manually_drops`) |
+| L0544 | Known-value checks | tf-mdrop | in use | `let _ =` on a lock guard (rustc `let_underscore_lock`) |
+| L0545 | Known-value checks | tf-mdrop | in use | A codepoint that changes text direction in a comment or literal (rustc `text_direction_codepoint_in_comment`, `_in_literal`) |
+| L0546-L0549 | Known-value checks | check | reserved | |
 | L0601 | Types and aliases | W-RESOLVE | in use | Type alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
 | L0603 | Types and aliases | fx-scanfa | in use | Unstable type form: a written `!` outside a fn return type (rustc E0658) |

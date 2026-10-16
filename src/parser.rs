@@ -1951,14 +1951,22 @@ impl<'a> Parser<'a> {
     /// on fns (and, with a warning, on consts), never on types, and
     /// `repr` and `non_exhaustive` on none of them. The next token
     /// tells the item kind.
-    fn check_assoc_targets(&self, parsed: &ParsedAttrs) -> PResult<()> {
+    fn check_assoc_targets(&self, parsed: &ParsedAttrs, in_trait_impl: bool) -> PResult<()> {
         let is_type = self.peek() == Tok::Type || (self.peek() != Tok::Fn && self.peek_at(1) == Tok::Type);
+        let is_fn = !is_type && (self.peek() == Tok::Fn || self.peek_at(1) == Tok::Fn || self.peek_at(2) == Tok::Fn);
+        let trait_impl = if in_trait_impl && !self.lint_allowed(&parsed.attrs, "useless_deprecated") { attrs::T_TRAIT_IMPL } else { 0 };
         attrs::check_target(
             &parsed.attrs,
             if is_type { "associated types" } else { "associated items" },
-            if is_type { 0 } else { attrs::T_FN },
+            if is_type { trait_impl } else if is_fn { attrs::T_FN | trait_impl } else { attrs::T_FN },
             self.interner,
         )
+    }
+
+    /// True when `#[allow(name)]` is on these attributes or on an
+    /// enclosing `mod`, `impl`, or `trait` (`scope_allows`).
+    fn lint_allowed(&self, attrs: &[Attr], name: &str) -> bool {
+        attrs.iter().chain(&self.scope_allows).any(|a| crate::check::allow_attr(a, self.interner, name))
     }
 
     fn item(&mut self) -> PResult<Option<Item>> {
@@ -2094,10 +2102,12 @@ impl<'a> Parser<'a> {
             t => return Err(syntax(start, format!("expected an item, found {}", tok_name(t)))),
         };
         self.check_derive_test(&parsed, matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_)), matches!(kind, ItemKind::Fn(_)))?;
+        let trait_impl = matches!(&kind, ItemKind::Impl(d) if d.trait_ref.is_some());
         attrs::check_target(
             &parsed.attrs,
-            item_kind_plural(&kind),
+            if trait_impl { "trait impl blocks" } else { item_kind_plural(&kind) },
             match &kind {
+                ItemKind::Impl(_) if trait_impl && !self.lint_allowed(&parsed.attrs, "useless_deprecated") => attrs::T_TRAIT_IMPL,
                 ItemKind::Fn(_) => attrs::T_FN,
                 ItemKind::Struct(_) | ItemKind::Enum(_) => attrs::T_ADT,
                 ItemKind::Union(_) => attrs::T_UNION,
@@ -2725,6 +2735,21 @@ impl<'a> Parser<'a> {
                     return Err(syntax(param.span, "patterns are not allowed in functions without bodies"));
                 }
             }
+            // `mut x` is rustc's deny-by-default lint
+            // `patterns_in_fns_without_body`, lifted by an `#[allow]` on
+            // the fn or an enclosing scope.
+            let mut_span = params.iter().find(|p| p.mutable).map(|p| p.span).or(self_param.as_ref().filter(|s| s.mutable).map(|s| s.span));
+            if let Some(span) = mut_span
+                && !self.lint_allowed(&[], "patterns_in_fns_without_body")
+                && !self.lint_allowed(&[], "future_incompatible")
+            {
+                return Err(Diag::new(
+                    "L0524",
+                    span,
+                    "patterns aren't allowed in functions without bodies",
+                    "Remove the `mut`: a signature without a body takes plain names (rustc `patterns_in_fns_without_body`).",
+                ));
+            }
         }
         let exprs = (e0, self.ast.exprs.len() as u32);
         let pats = (p0, self.ast.pats.len() as u32);
@@ -2904,13 +2929,16 @@ impl<'a> Parser<'a> {
             let parsed = self.attributes()?;
             // A trait item is neither an ADT nor a free function.
             self.check_derive_test(&parsed, false, false)?;
-            self.check_assoc_targets(&parsed)?;
+            self.check_assoc_targets(&parsed, false)?;
             // Trait items are as visible as their trait.
             let vis_start = self.span();
             let vis = self.vis()?;
             if vis != Vis::Private && !self.cfg_syntax {
                 return Err(vis_not_permitted(vis_start.to(self.prev_span())));
             }
+            // The item's own `#[allow]`s scope over its signature checks.
+            let item_mark = self.scope_allows.len();
+            self.scope_allows.extend(parsed.attrs.iter().filter(|a| is_allow(a, self.known)).cloned());
             match self.peek() {
                 Tok::Fn => {
                     let mut def = self.fn_def_inner(true)?;
@@ -2949,6 +2977,7 @@ impl<'a> Parser<'a> {
                 Tok::Ident(_) | Tok::SelfUpper if self.at_path_macro_call() => return Err(macro_error(self.span())),
                 t => return Err(syntax(self.span(), format!("expected a trait item, found {}", tok_name(t)))),
             }
+            self.scope_allows.truncate(item_mark);
         }
         self.expect(Tok::RBrace, "`}`")?;
         self.scope_allows.truncate(scope_mark);
@@ -3013,7 +3042,7 @@ impl<'a> Parser<'a> {
             let parsed = self.attributes()?;
             // An impl item is neither an ADT nor a free function.
             self.check_derive_test(&parsed, false, false)?;
-            self.check_assoc_targets(&parsed)?;
+            self.check_assoc_targets(&parsed, trait_ref.is_some())?;
             // Trait impl items take the trait's visibility.
             let vis_start = self.span();
             let vis = self.vis()?;

@@ -749,6 +749,27 @@ fn push_doc_tokens(
 
 /// Lexes `src`, which starts at byte `base` of file `file`. Every token span names that
 /// file with the root context. Stops at the first error.
+/// rustc's deny-by-default lints `text_direction_codepoint_in_comment`
+/// (comments) and `text_direction_codepoint_in_literal` (string and
+/// char literals, doc comments): a raw codepoint that changes the visible
+/// direction of text. rustc lifts them only by a crate-level
+/// `#![allow]`, which lust does not read (a false reject).
+fn bidi_in(src: &str, start: usize, end: usize, what: &str, file: FileId, base: u32) -> Option<Diag> {
+    let text = &src[start..end];
+    // Every such codepoint encodes as E2 80 AA..AE or E2 81 A6..A9.
+    if !text.as_bytes().contains(&0xE2) {
+        return None;
+    }
+    let (at, c) = text.char_indices().find(|&(_, c)| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))?;
+    let at = (start + at) as u32;
+    Some(Diag::new(
+        "L0545",
+        Span::new(file, base + at, base + at + c.len_utf8() as u32),
+        format!("unicode codepoint changing visible direction of text present in {what}"),
+        format!("Remove the codepoint, or write it as the escape `\\u{{{:X}}}` in a literal (rustc `text_direction_codepoint_in_{}`).", c as u32, if what == "comment" { "comment" } else { "literal" }),
+    ))
+}
+
 pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
     let b = src.as_bytes();
     let mut tokens = Vec::with_capacity(src.len() / 4);
@@ -799,7 +820,11 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             // A doc comment is tokens (`#[doc = ...]`), not whitespace:
             // macro inputs count it as two token trees. `////` is plain.
             let inner = b.get(start + 2) == Some(&b'!');
-            if inner || (b.get(start + 2) == Some(&b'/') && b.get(start + 3) != Some(&b'/')) {
+            let doc = inner || (b.get(start + 2) == Some(&b'/') && b.get(start + 3) != Some(&b'/'));
+            if let Some(d) = bidi_in(src, start, i, if doc { "doc comment" } else { "comment" }, file, base) {
+                return Err(d);
+            }
+            if doc {
                 let content = src[start + 3..i].strip_suffix('\r').unwrap_or(&src[start + 3..i]);
                 if let Some(at) = bare_cr(content.as_bytes()) {
                     return Err(err(start + 3 + at, start + 4 + at, "bare CR not allowed in doc-comment"));
@@ -831,7 +856,11 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             // `/**/` are plain block comments.
             let inner = b.get(start + 2) == Some(&b'!');
             let outer = b.get(start + 2) == Some(&b'*') && b.get(start + 3) != Some(&b'*') && &b[start..i] != b"/**/";
-            if (inner || outer) && i >= start + 5 {
+            let doc = (inner || outer) && i >= start + 5;
+            if let Some(d) = bidi_in(src, start, i, if doc { "doc comment" } else { "comment" }, file, base) {
+                return Err(d);
+            }
+            if doc {
                 if let Some(at) = bare_cr(&b[start + 3..i - 2]) {
                     return Err(err(start + 3 + at, start + 4 + at, "bare CR not allowed in doc-comment"));
                 }
@@ -1142,6 +1171,11 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             i += n;
             t
         };
+        if matches!(tok, Tok::Str(..) | Tok::Char(..))
+            && let Some(d) = bidi_in(src, start, i, "literal", file, base)
+        {
+            return Err(d);
+        }
         tokens.push(Token { tok, span: Span::new(file, base + start as u32, base + i as u32) });
     }
     let end = base + b.len() as u32;
