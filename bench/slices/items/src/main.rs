@@ -3,6 +3,9 @@
 //! (cfg is not evaluated: a file that exists is listed).
 //! slice-items --bodies <file.rs>: every fn body (free fns, impl and trait methods),
 //! `open_line open_col close_line close_col start_line` (1-based columns of the braces).
+//! slice-items --tests <root.rs>: every `#[test]` fn in the module tree (scripts/tsrust_build.py):
+//! `test <file> <fn line> <module path>::<name> <ignore 0|1> <returns a value 0|1>`, after it
+//! one `mod <file> <line> <private 0|1> <name>` per module on its path (the line of `mod`).
 //!
 //! bench/slices/prune.py removes the innermost item that holds a lust or
 //! rustc error. Removable units: items at file level and inside inline
@@ -20,10 +23,21 @@ fn main() {
     if args.len() == 3 && args[1] == "--tree" {
         let root = Path::new(&args[2]).to_path_buf();
         let mut out = Vec::new();
-        tree(&root, root.parent().unwrap().to_path_buf(), &mut out);
-        for p in out {
+        tree(&root, root.parent().unwrap().to_path_buf(), &[], &mut out);
+        for (p, _) in out {
             println!("{}", p.display());
         }
+        return;
+    }
+    if args.len() == 3 && args[1] == "--tests" {
+        let root = Path::new(&args[2]).to_path_buf();
+        let mut files = Vec::new();
+        tree(&root, root.parent().unwrap().to_path_buf(), &[], &mut files);
+        let mut out = String::new();
+        for (p, steps) in &files {
+            tests(&parse(p).items, p, steps, &mut out);
+        }
+        print!("{out}");
         return;
     }
     if args.len() == 3 && args[1] == "--bodies" {
@@ -63,28 +77,71 @@ fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
     })
 }
 
-/// Adds `file` and every module file below it. `dir` is where its child `mod x;` files live.
-fn tree(file: &Path, dir: PathBuf, out: &mut Vec<PathBuf>) {
-    if out.iter().any(|p| p == file) {
+/// One module on the path from the crate root: its name and where its `mod` keyword is.
+#[derive(Clone)]
+struct Step {
+    name: String,
+    file: PathBuf,
+    line: usize,
+    private: bool,
+}
+
+fn step(m: &syn::ItemMod, file: &Path) -> Step {
+    let private = matches!(m.vis, syn::Visibility::Inherited);
+    Step { name: m.ident.to_string(), file: file.to_path_buf(), line: m.mod_token.span.start().line, private }
+}
+
+/// Adds `file` and every module file below it, each with its module path from the root (the
+/// first one when a file is mounted twice). `dir` is where its child `mod x;` files live.
+fn tree(file: &Path, dir: PathBuf, steps: &[Step], out: &mut Vec<(PathBuf, Vec<Step>)>) {
+    if out.iter().any(|(p, _)| p == file) {
         return;
     }
-    out.push(file.to_path_buf());
+    out.push((file.to_path_buf(), steps.to_vec()));
     let parsed = parse(file);
-    mods(&parsed.items, file, &dir, false, out);
+    mods(&parsed.items, file, &dir, false, steps, out);
+}
+
+/// `--tests`: the `#[test]` fns of one file's items, walking inline `mod` blocks.
+fn tests(list: &[Item], file: &Path, steps: &[Step], out: &mut String) {
+    for it in list {
+        match it {
+            Item::Fn(f) if f.attrs.iter().any(|a| a.path().is_ident("test")) => {
+                let path: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+                let ignore = f.attrs.iter().any(|a| a.path().is_ident("ignore"));
+                let value = !matches!(f.sig.output, syn::ReturnType::Default);
+                let full = if path.is_empty() { f.sig.ident.to_string() } else { format!("{}::{}", path.join("::"), f.sig.ident) };
+                out.push_str(&format!("test {} {} {full} {} {}\n", file.display(), f.sig.fn_token.span.start().line, ignore as u8, value as u8));
+                for s in steps {
+                    out.push_str(&format!("mod {} {} {} {}\n", s.file.display(), s.line, s.private as u8, s.name));
+                }
+            }
+            Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    let mut sub = steps.to_vec();
+                    sub.push(step(m, file));
+                    tests(inner, file, &sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `inline`: `list` is the body of an inline `mod m { .. }`. A `#[path]` there is relative to
 /// `dir`; outside inline blocks it is relative to the directory of `file` (the Reference rule).
-fn mods(list: &[Item], file: &Path, dir: &Path, inline: bool, out: &mut Vec<PathBuf>) {
+fn mods(list: &[Item], file: &Path, dir: &Path, inline: bool, steps: &[Step], out: &mut Vec<(PathBuf, Vec<Step>)>) {
     for it in list {
         let Item::Mod(m) = it else { continue };
         let name = m.ident.to_string();
+        let mut steps = steps.to_vec();
+        steps.push(step(m, file));
         if let Some((_, inner)) = &m.content {
             let sub = match path_attr(&m.attrs) {
                 Some(p) => dir.join(p),
                 None => dir.join(&name),
             };
-            mods(inner, file, &sub, true, out);
+            mods(inner, file, &sub, true, &steps, out);
             continue;
         }
         if let Some(p) = path_attr(&m.attrs) {
@@ -92,16 +149,16 @@ fn mods(list: &[Item], file: &Path, dir: &Path, inline: bool, out: &mut Vec<Path
             let f = if inline { dir.join(p) } else { file.parent().unwrap().join(p) };
             if f.exists() {
                 let d = f.parent().unwrap().to_path_buf();
-                tree(&f, d, out);
+                tree(&f, d, &steps, out);
             }
             continue;
         }
         let flat = dir.join(format!("{name}.rs"));
         let modrs = dir.join(&name).join("mod.rs");
         if flat.exists() {
-            tree(&flat, dir.join(&name), out);
+            tree(&flat, dir.join(&name), &steps, out);
         } else if modrs.exists() {
-            tree(&modrs, dir.join(&name), out);
+            tree(&modrs, dir.join(&name), &steps, out);
         }
     }
 }
