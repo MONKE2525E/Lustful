@@ -9,6 +9,7 @@ fn main() {
     }
     let step = base_step();
     println!("{:?} {:?} {}", step, right::words(), right::meters::<u8>(2.5).0);
+    println!("{:?} {:?}", right::first_long(&["ab", "abcd", "abcdef"], 3), right::first_long(&["ab"], 3));
 }
 
 fn base_step() -> std::time::Duration {

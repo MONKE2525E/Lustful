@@ -66,8 +66,8 @@
 #      inherent impl with an associated const still takes it.
 #  22. std modules in a dependency: edits in a source dependency add
 #      and remove std source modules (std::time, VecDeque, PhantomData,
-#      LazyLock) the root never names; every warm answer equals a cold
-#      one-shot build.
+#      LazyLock, ControlFlow, Once) the root never names; every warm
+#      answer equals a cold one-shot build.
 # Program stderr is compared with the OS thread id masked
 # (mask_stderr, as in scripts/case-pool.sh): rustc 1.99 and lust
 # print `thread 'main' (<os tid>) panicked at ...`, and the tid
@@ -1042,6 +1042,13 @@ def case_dep_std_edits():
          "pub fn timer() -> Timer<u8> {\n    Timer { at: Instant::now(), tag: PhantomData }\n}\n\n"
          "pub fn show() -> String {\n    let t = timer();\n"
          "    format!(\"{} {}\", *N, t.at.elapsed().as_secs() < 60)\n}\n", "7 true"),
+        ("ControlFlow and Once",
+         "use std::ops::ControlFlow;\nuse std::sync::Once;\n\nstatic INIT: Once = Once::new();\n\n"
+         "fn first_even(xs: &[u32]) -> ControlFlow<u32> {\n    for &x in xs {\n"
+         "        if x % 2 == 0 {\n            ControlFlow::Break(x)?;\n        }\n    }\n"
+         "    ControlFlow::Continue(())\n}\n\n"
+         "pub fn show() -> String {\n    INIT.call_once(|| {});\n"
+         "    format!(\"{:?} {}\", first_even(&[3, 8, 5]), INIT.is_completed())\n}\n", "Break(8) true"),
         ("std modules removed again", 'pub fn show() -> String {\n    format!("{}", 4)\n}\n', "4"),
     ]
     d = Daemon(work)
