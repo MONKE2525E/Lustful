@@ -1506,7 +1506,7 @@ impl<'a> Program {
     /// reads against the new program through this; `binding` is the only
     /// recording door. The resolver tables (W-RESOLVE) answer here
     /// first, so replays see the same answers as `binding`.
-    fn binding_res(&self, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
+    pub(crate) fn binding_res(&self, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
         // Spliced std source sees no user names (see `STD_MODULE`).
         if module == crate::ty::defs::STD_MODULE {
             return BindingRes::Absent;

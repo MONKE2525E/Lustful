@@ -2973,7 +2973,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         ast.lang_methods = std_methods;
     }
     // The kept program of the last request stands in for collect when
-    // only provable body edits happened since (`patch::reuse_kept`).
+    // only provable body edits happened since (`patch::reuse_kept`). Its
+    // laps (the signature delta's) count as collect laps.
+    super::laps::start();
     let kept = if gen_ok_here {
         super::patch::reuse_kept(front, caches, resolved_tables.as_ref(), req.cmd == Cmd::Build)
     } else {
@@ -3056,7 +3058,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             &std_routes,
         )
     };
-    super::laps::start();
     let collected = match kept {
         Some(r) => r,
         None => match collect(front, caches) {

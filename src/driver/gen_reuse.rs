@@ -432,6 +432,27 @@ impl GenReuse {
         self.templates.get(&def).is_some_and(|e| e.stamp > stamp) || self.discovery.get(&def).is_some_and(|e| e.stamp > stamp)
     }
 
+    /// True when fn `f`'s stored template check or discovery output was
+    /// made from its current source and read no node that `touched`
+    /// names: then, when it held for the program before an edit that
+    /// moves only the touched nodes, it still holds (the header delta's
+    /// fast path, driver/kept_delta.rs). False with no entry or a moved
+    /// source.
+    pub(crate) fn untouched(&self, p: &Program, f: LocalDefId, touched: &mut impl FnMut(&ReadKey) -> bool) -> bool {
+        let Some(src) = self.src_of(p, f).filter(|_| self.on) else { return false };
+        let def = p.def_id(f);
+        if self.unstored.contains_key(&def) {
+            return false;
+        }
+        let (lo, hi) = p.fn_def(f).exprs;
+        let reads = match (self.templates.get(&def), self.discovery.get(&def)) {
+            (Some(e), _) if e.src == src && e.n_exprs == hi - lo => &e.reads,
+            (None, Some(e)) if e.src == src => &e.reads,
+            _ => return false,
+        };
+        !reads.iter().any(|(k, _)| touched(k))
+    }
+
     /// True when fn `f`'s stored discovery output still holds
     /// (`discovered` without the copy).
     pub fn discovery_holds(&mut self, p: &Program, f: LocalDefId) -> bool {

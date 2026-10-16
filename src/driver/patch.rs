@@ -1911,6 +1911,7 @@ pub(super) fn reuse_kept(
     }
     // Item patch edits: the signature delta redoes each edited header
     // (its own template check and reveal included).
+    super::laps::mark("collect/kept shift");
     let headers: Vec<super::kept_delta::HeaderEdit> = edits
         .iter()
         .filter(|e| e.header)
@@ -2008,6 +2009,7 @@ pub(super) fn reuse_kept(
             (p.record_reads, p.unwind) = (record_reads, unwind);
         }
     }
+    super::laps::mark("collect/kept bodies");
     // Every stored entry now agrees with the program (`kept_delta`).
     p.reuse_stamp = crate::driver::gen_reuse::stamp_now();
     Ok((p, spans, template_errs))
