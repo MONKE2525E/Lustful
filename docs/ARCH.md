@@ -1975,6 +1975,18 @@ where output can observe it:
   spec grammar once; partial specs cause repeat work.
   `{:p}` prints a dev address; output that depends on
   it stays excluded by rule zero.
+- **Constant addresses.** Equal constants share one
+  address program-wide, keyed by rustc's rule for one
+  codegen unit: equal bytes, uninit runs and pointer
+  places, or equal bytes alone for a 4, 8, 16 or 32
+  byte constant with no pointer (the linker's merge).
+  Each promoted temp, byte string temp and str literal
+  site interns its bytes at its first use and caches
+  the address (runtime/kconst.c, cgen/kconst.rs); the
+  glue unit registers the pointees of statics before
+  main. Equality between fns is config-dependent in
+  rustc (DESIGN, rule zero), so only same-fn
+  comparisons are tested.
 - **HashMap order.** Rust `HashMap` (SipHash, random
   seed) has no stable order; lust keeps a fixed seed
   and the corpus rule that map order must not reach

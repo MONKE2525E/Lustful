@@ -1,0 +1,263 @@
+/* ---------- Constant storage ----------
+   rustc gives equal constants one address: promoted temps (`&1`),
+   literals (`"ab"`, `b"ab"`), and the pointees of const and static
+   values. A static itself is never shared. In one codegen unit, two
+   constants share storage when their LLVM constants are equal: the same
+   bytes, the same uninit runs, and pointers at the same places. The
+   linker also merges 4, 8, 16 and 32 byte constants that hold no
+   pointer by their bytes (an uninit byte is 0 in the object file), in
+   any unit. lust gives every constant of the program that address:
+   each site interns its bytes here at its first run and keeps the
+   canonical address in a slot of its own (cgen/kconst.rs), and the glue
+   unit registers the pointees
+   of statics at startup (lust_kreg). Zero-sized constants never come
+   here: their address is their alignment (cgen `const_zst_addr`).
+
+   A site's layout descriptor (cgen `kdesc`) says which bytes of its
+   value are init. Word 0 is the word count that follows; then ops:
+     1 off n            n init bytes
+     2 off              a pointer: a reloc when it is the address of a
+                        constant here, else plain bytes (a dangling
+                        zero-sized address, a static, a fn)
+     3 off count stride sublen sub[sublen]       an array
+     4 off size nvar disc[nvar] {sublen sub}*nvar
+                        an enum with a tag of `size` bytes at off
+     5 off noff nsize start dataful nvar {sublen sub}*nvar
+                        an enum whose tag is the niche scalar at off+noff
+                        (lust's encoding, cgen `niche_val`)
+   Offsets in a sub-descriptor count from the element or enum start.
+   A null descriptor means every byte is init. */
+
+const void *lust_kintern(const void **cache, const void *p, uint64_t n, uint64_t align, const uint64_t *desc);
+void lust_kreg(const void *p, uint64_t n, uint64_t align, const uint64_t *desc);
+
+#ifdef LUST_IMPL
+/* One interned constant: `kind` 1 is a mergeable 4/8/16/32 byte constant
+   with no pointer (the key is its bytes), 0 any other (the key is its
+   bytes, then its byte classes: 0 uninit, 1 init, 2 pointer). `align`
+   is the alignment its storage guarantees. */
+typedef struct lust_kent {
+    uint64_t hash, n, align;
+    const void *addr;
+    uint8_t kind;
+    uint8_t key[];
+} lust_kent;
+
+static lust_kent **lust_ktab;
+static uint64_t lust_ktab_cap, lust_ktab_len;
+/* The addresses of the entries, to tell a reloc from plain bytes. */
+static uintptr_t *lust_kaddr;
+static uint64_t lust_kaddr_cap;
+static int32_t lust_klock;
+
+static uint64_t lust_khash(const uint8_t *b, uint64_t n, uint64_t h) {
+    for (uint64_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+static uint64_t lust_kaddr_slot(uintptr_t a) { return (uint64_t)((a >> 3) * 0x9e3779b97f4a7c15ull); }
+
+static int lust_kis_entry(uintptr_t a) {
+    if (!lust_kaddr_cap || !a) return 0;
+    for (uint64_t i = lust_kaddr_slot(a) & (lust_kaddr_cap - 1);; i = (i + 1) & (lust_kaddr_cap - 1)) {
+        if (lust_kaddr[i] == a) return 1;
+        if (!lust_kaddr[i]) return 0;
+    }
+}
+
+static void lust_kaddr_add(uintptr_t a) {
+    if ((lust_ktab_len + 1) * 2 > lust_kaddr_cap) {
+        uint64_t cap = lust_kaddr_cap ? lust_kaddr_cap * 2 : 64;
+        uintptr_t *old = lust_kaddr;
+        uint64_t old_cap = lust_kaddr_cap;
+        lust_kaddr = (uintptr_t *)calloc(cap, sizeof(uintptr_t));
+        if (!lust_kaddr) lust_oom();
+        lust_kaddr_cap = cap;
+        for (uint64_t i = 0; i < old_cap; i++)
+            if (old[i]) lust_kaddr_add(old[i]);
+        free(old);
+    }
+    uint64_t i = lust_kaddr_slot(a) & (lust_kaddr_cap - 1);
+    while (lust_kaddr[i] && lust_kaddr[i] != a) i = (i + 1) & (lust_kaddr_cap - 1);
+    lust_kaddr[i] = a;
+}
+
+static uint64_t lust_kread(const uint8_t *p, uint64_t size) {
+    uint64_t v = 0;
+    for (uint64_t i = 0; i < size && i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+/* Marks the byte classes of the value at `v + base` by descriptor ops
+   `d[0..len)` into `cls`. */
+static void lust_kwalk(const uint8_t *v, uint8_t *cls, const uint64_t *d, uint64_t len, uint64_t base) {
+    uint64_t i = 0;
+    while (i < len) {
+        uint64_t op = d[i], off = base + d[i + 1];
+        if (op == 1) {
+            memset(cls + off, 1, d[i + 2]);
+            i += 3;
+        } else if (op == 2) {
+            uintptr_t a;
+            memcpy(&a, v + off, sizeof a);
+            memset(cls + off, lust_kis_entry(a) ? 2 : 1, sizeof a);
+            i += 2;
+        } else if (op == 3) {
+            uint64_t count = d[i + 2], stride = d[i + 3], sl = d[i + 4];
+            for (uint64_t k = 0; k < count; k++) lust_kwalk(v, cls, d + i + 5, sl, off + k * stride);
+            i += 5 + sl;
+        } else {
+            /* An enum: find the variant, mark its tag bytes, walk its fields. */
+            uint64_t nvar, j, var = 0;
+            if (op == 4) {
+                uint64_t size = d[i + 2], tag = lust_kread(v + off, size);
+                uint64_t mask = size >= 8 ? ~0ull : (1ull << (8 * size)) - 1;
+                nvar = d[i + 3];
+                for (uint64_t k = 0; k < nvar; k++)
+                    if ((d[i + 4 + k] & mask) == tag) var = k;
+                memset(cls + off, 1, size);
+                j = i + 4 + nvar;
+            } else {
+                uint64_t noff = d[i + 2], nsize = d[i + 3], start = d[i + 4], dataful = d[i + 5];
+                uint64_t mask = nsize >= 8 ? ~0ull : (1ull << (8 * nsize)) - 1;
+                uint64_t rel = (lust_kread(v + off + noff, nsize) - start) & mask;
+                nvar = d[i + 6];
+                var = dataful;
+                if (rel < nvar - 1) var = rel < dataful ? rel : rel + 1;
+                if (var != dataful) memset(cls + off + noff, 1, nsize);
+                j = i + 7;
+            }
+            for (uint64_t k = 0; k < nvar; k++) {
+                uint64_t sl = d[j];
+                if (k == var) lust_kwalk(v, cls, d + j + 1, sl, off);
+                j += 1 + sl;
+            }
+            i = j;
+        }
+    }
+}
+
+/* The key of the `n` bytes at `p` into `key` (2n bytes); returns the kind.
+   `key[0..n)` are the bytes with uninit ones 0; for kind 0, `key[n..2n)`
+   are the classes. As rustc (const_alloc_to_llvm), a run of bytes
+   between pointers with more than 16 init and uninit chunks is all init. */
+static uint8_t lust_kkey(const void *p, uint64_t n, const uint64_t *desc, uint8_t *key) {
+    uint8_t *cls = key + n;
+    memcpy(key, p, n);
+    if (desc) {
+        memset(cls, 0, n);
+        lust_kwalk((const uint8_t *)p, cls, desc + 1, desc[0], 0);
+    } else {
+        memset(cls, 1, n);
+    }
+    int reloc = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        if (!cls[i]) key[i] = 0;
+        if (cls[i] == 2) reloc = 1;
+    }
+    if (!reloc && (n == 4 || n == 8 || n == 16 || n == 32)) return 1;
+    for (uint64_t s = 0; s < n;) {
+        if (cls[s] == 2) {
+            s++;
+            continue;
+        }
+        uint64_t e = s, chunks = 1;
+        while (e + 1 < n && cls[e + 1] != 2) {
+            if (cls[e + 1] != cls[e]) chunks++;
+            e++;
+        }
+        if (chunks > 16) memset(cls + s, 1, e + 1 - s);
+        s = e + 1;
+    }
+    return 0;
+}
+
+/* The entry for the constant at `p`, added when there is none that fits
+   `align`: a copy (`copy`) or `p` itself (a static's pointee). */
+static const void *lust_kfind(const void *p, uint64_t n, uint64_t align, const uint64_t *desc, int copy) {
+    uint8_t small[256];
+    uint8_t *key = 2 * n <= sizeof small ? small : (uint8_t *)malloc(2 * n);
+    if (!key) lust_oom();
+    uint8_t kind = lust_kkey(p, n, desc, key);
+    uint64_t klen = kind ? n : 2 * n;
+    uint64_t h = lust_khash(key, klen, 0xcbf29ce484222325ull ^ n ^ ((uint64_t)kind << 63));
+    if ((lust_ktab_len + 1) * 2 > lust_ktab_cap) {
+        uint64_t cap = lust_ktab_cap ? lust_ktab_cap * 2 : 64;
+        lust_kent **t = (lust_kent **)calloc(cap, sizeof *t);
+        if (!t) lust_oom();
+        for (uint64_t i = 0; i < lust_ktab_cap; i++) {
+            lust_kent *e = lust_ktab[i];
+            if (!e) continue;
+            uint64_t j = e->hash & (cap - 1);
+            while (t[j]) j = (j + 1) & (cap - 1);
+            t[j] = e;
+        }
+        free(lust_ktab);
+        lust_ktab = t;
+        lust_ktab_cap = cap;
+    }
+    uint64_t i = h & (lust_ktab_cap - 1);
+    for (lust_kent *e; (e = lust_ktab[i]); i = (i + 1) & (lust_ktab_cap - 1)) {
+        if (e->hash == h && e->n == n && e->kind == kind && e->align >= align && !memcmp(e->key, key, klen)) {
+            if (key != small) free(key);
+            return e->addr;
+        }
+    }
+    lust_kent *e = (lust_kent *)malloc(sizeof *e + klen);
+    if (!e) lust_oom();
+    e->hash = h;
+    e->n = n;
+    e->kind = kind;
+    memcpy(e->key, key, klen);
+    if (copy) {
+        /* At least 16-aligned, so a later site of a stricter type (up to
+           16) finds this copy, as rustc raises a shared constant's
+           alignment to its strictest use. */
+        uint64_t al = align < 16 ? 16 : align;
+        void *c = aligned_alloc(al, (n + al - 1) / al * al);
+        if (!c) lust_oom_size(n);
+        memcpy(c, key, n);
+        e->addr = c;
+        e->align = al;
+    } else {
+        e->addr = p;
+        e->align = align;
+    }
+    if (key != small) free(key);
+    lust_ktab[i] = e;
+    lust_ktab_len++;
+    lust_kaddr_add((uintptr_t)e->addr);
+    return e->addr;
+}
+
+static void lust_klock_take(void) {
+    int32_t one = 1, old;
+    for (;;) {
+        __atomic_exchange(&lust_klock, &one, &old, 2);
+        if (!old) return;
+    }
+}
+
+static void lust_klock_give(void) {
+    int32_t zero = 0;
+    __atomic_store(&lust_klock, &zero, 3);
+}
+#endif
+
+/* The canonical address of the `n` bytes at `p`
+   (alignment `align`, descriptor `desc`), stored into `*cache`. */
+const void *lust_kintern(const void **cache, const void *p, uint64_t n, uint64_t align, const uint64_t *desc) LUST_BODY({
+    lust_klock_take();
+    const void *r = lust_kfind(p, n, align, desc, 1);
+    __atomic_store(cache, &r, 3);
+    lust_klock_give();
+    return r;
+})
+
+/* A static's pointee of `n` bytes at `p`, as the canonical storage of
+   its content (the glue unit's lust_kstatics_init, before main). */
+void lust_kreg(const void *p, uint64_t n, uint64_t align, const uint64_t *desc) LUST_BODY({
+    lust_klock_take();
+    (void)lust_kfind(p, n, align, desc, 0);
+    lust_klock_give();
+})

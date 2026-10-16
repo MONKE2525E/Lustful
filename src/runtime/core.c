@@ -194,6 +194,7 @@ uint8_t lust_str_eq(lust_str a, lust_str b) LUST_BODY({ return a.len == b.len &&
 
 #include "panic.c"
 #include "thread.c"
+#include "kconst.c"
 /* ---------- Formatting ---------- */
 
 void lust_fmt_u64(lust_String *out, uint64_t v) LUST_BODY({

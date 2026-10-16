@@ -113,14 +113,16 @@ sanitize_case() {
   fi
   # Under panic=unwind a panicking statement's C temporaries (a message
   # or format buffer) are not freed (known gap, W-UNWIND): no leak check.
+  # A huge malloc returns NULL, as glibc's does, so an allocation failure
+  # case runs its own abort path (ASan warns once; that line is ignored).
   if [ "${PANIC:-abort}" = unwind ]; then
-    ASAN_OPTIONS=detect_leaks=0 run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
+    ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1 run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
   else
-    run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
+    ASAN_OPTIONS=allocator_may_return_null=1 run_to "./$name.san" >"$name.san.out" 2>"$name.san.err"; st=$?
   fi
   # UBSan prints "file:line:col: runtime error"; Rust's own "fatal runtime
   # error: stack overflow" (panic_stack_overflow) is program output.
-  if grep -qE "[0-9]: runtime error|Sanitizer" "$name.san.err"; then
+  if grep -vE "WARNING: AddressSanitizer failed to allocate" "$name.san.err" | grep -qE "[0-9]: runtime error|Sanitizer"; then
     echo "sanitizer: $(grep -m2 -E "[0-9]: runtime error|Sanitizer" "$name.san.err")"
     return 1
   fi

@@ -21,6 +21,7 @@ mod bytes;
 mod unwind;
 mod own;
 mod slices;
+mod kconst;
 use unwind::Unw;
 
 /// A body-independent type, so glue can be shared across functions.
@@ -977,6 +978,10 @@ struct FnGen<'b, 'p> {
     unw: Option<Unw>,
     /// The value being assigned comes from a `Call` terminator.
     unw_call: bool,
+    /// Where the body's str literal caches go in `out` (the prologue's
+    /// end), and the cache of each distinct literal (cgen/kconst.rs).
+    kdecl_at: Option<usize>,
+    kstrs: HashMap<Vec<u8>, usize>,
 }
 
 /// A layout with no field or niche detail, for runtime struct types whose
@@ -1740,6 +1745,8 @@ impl<'b, 'p> FnGen<'b, 'p> {
             stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
             unw: None,
             unw_call: false,
+            kdecl_at: None,
+            kstrs: HashMap::new(),
         }
     }
 }
@@ -1866,6 +1873,10 @@ impl FnGen<'_, '_> {
                 // A promoted constant (`&5` borrowed for `'static`): static
                 // storage, written with the same value each time it runs.
                 let _ = writeln!(self.out, "  static {ct} {decl};");
+                if self.kconst_local(i) {
+                    let d = self.kconst_decls(i);
+                    self.out.push_str(&d);
+                }
             } else {
                 match by_type.iter_mut().find(|(c, _)| *c == ct) {
                     Some((_, v)) => v.push(decl),
@@ -1893,6 +1904,10 @@ impl FnGen<'_, '_> {
                 let ct = ctype(&self.local_cty[i]);
                 let init = if b.is_empty() { "{0}".to_string() } else { format!("{{ .v = {} }}", c_bytes_lit(b.as_slice())) };
                 let _ = writeln!(self.out, "  static {ct} l{i} = {init};");
+                if self.kconst_local(i) {
+                    let d = self.kconst_decls(i);
+                    self.out.push_str(&d);
+                }
             }
         }
         if !flags.is_empty() {
@@ -1905,6 +1920,7 @@ impl FnGen<'_, '_> {
             let _ = writeln!(self.out, "  lust_exc ex;
   if (lust_unw_pending && lust_unw_mine()) {}", self.unwind_return());
         }
+        self.kdecl_at = Some(self.out.len());
         let n = self.body.blocks.len();
         let mut reachable = vec![false; n];
         let mut stack = vec![0usize];
@@ -1940,6 +1956,7 @@ impl FnGen<'_, '_> {
             }
             self.term(&block.term, block.term_span, next);
         }
+        self.kstr_finish();
         self.out.push_str("}\n\n");
     }
 
@@ -2474,9 +2491,9 @@ impl FnGen<'_, '_> {
                 Const::Char(c) => (format!("((uint32_t){})", *c as u32), CTy::Char),
                 Const::Str(i) => {
                     let s = &self.p.ast.strings[*i as usize];
-                    (str_lit_c(s.as_bytes()), CTy::Ref(Box::new(CTy::Str)))
+                    (self.kstr(s.as_bytes()), CTy::Ref(Box::new(CTy::Str)))
                 }
-                Const::StrBytes(b) => (str_lit_c(b.as_slice()), CTy::Ref(Box::new(CTy::Str))),
+                Const::StrBytes(b) => (self.kstr(b.as_slice()), CTy::Ref(Box::new(CTy::Str))),
                 Const::Bytes(b) => {
                     let t = CTy::Array(Box::new(CTy::Int(IntTy::U8)), b.len() as u64);
                     (bytes_array_lit(self.p, &t, b.as_slice()), t)
@@ -3047,7 +3064,7 @@ impl FnGen<'_, '_> {
                     let (_, t) = self.place(pl, loc);
                     return format!("(({} *){a})", ctype(&t));
                 }
-                let (e, t) = self.place(pl, loc);
+                let (e, t) = self.kplace(pl, loc);
                 // A slice place (a deref of a fat value, or a bare-slice
                 // temporary from a range index) is already the fat value;
                 // a place holding a slice reference takes an address as usual.
@@ -3082,14 +3099,14 @@ impl FnGen<'_, '_> {
                 if t == CTy::Str || slice_place || dyn_place || cell_place { e } else { format!("(&{e})") }
             }
             Rvalue::SliceOf(pl) => {
-                let (e, t) = self.place(pl, loc);
+                let (e, t) = self.kplace(pl, loc);
                 if let (Some(a), CTy::Array(el, n)) = (self.const_zst_addr(pl), &t) {
                     return format!("(({}){{ ({} *){a}, {n} }})", ctype(&CTy::Slice(el.clone())), ctype(el));
                 }
                 self.slice_of(&e, &t)
             }
             Rvalue::Subslice { base, lo, hi, inclusive, .. } => {
-                let (e, t) = self.place(base, loc);
+                let (e, t) = self.kplace(base, loc);
                 let (ptr, len) = self.slice_ptr_len(&e, &t);
                 let (lo_v, _) = self.operand(lo, loc, post);
                 let ct = match &t {
@@ -7637,6 +7654,7 @@ fn runtime_source(with_impls: bool) -> String {
     src.push_str(core);
     let src = src.replacen("#include \"panic.c\"\n", panic, 1);
     let src = src.replacen("#include \"thread.c\"\n", include_str!("runtime/thread.c"), 1);
+    let src = src.replacen("#include \"kconst.c\"\n", include_str!("runtime/kconst.c"), 1);
     let src = src.replacen("#include \"float.h\"", &header, 1);
     let src = src.replacen("#include \"fmt.h\"", &fmt, 1);
     let src = src.replacen("#include \"sort.h\"", include_str!("runtime/sort.h"), 1);
@@ -8004,13 +8022,13 @@ pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -
         None => (String::new(), String::new()),
     };
     let mut c = unit_header();
-    c.push_str("void lust_loc_init(void);\n");
+    c.push_str("void lust_loc_init(void);\nvoid lust_kstatics_init(void);\n");
     for u in overlays {
         let _ = writeln!(c, "void lust_overlay_u{u}(void);");
     }
     let _ = writeln!(
         c,
-        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_loc_init();{}\n  lust_rt_init();\n  lust_base_init();",
+        "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_loc_init();{}\n  lust_rt_init();\n  lust_base_init();\n  lust_kstatics_init();",
         init
     );
     for u in overlays {
@@ -8146,7 +8164,7 @@ fn variant_lit(p: &Program, t: &CTy, variant: usize, vals: &[String]) -> String 
 
 /// The C initializer for one const value at the given C type. Referenced
 /// aggregates are promoted to file-scope constants first, written to `pre`.
-fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, counter: &mut u32, slots: &[u32], pos: Option<&str>) -> String {
+fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, cx: &mut kconst::StaticCx, slots: &[u32], pos: Option<&str>) -> String {
     if let (CV::Float(bits, f), CTy::Float(_)) = (v, t) {
         return match f {
             FloatTy::F64 => format!("(((union {{ uint64_t b; double d; }}){{ .b = {}ull }}).d)", bits),
@@ -8166,14 +8184,14 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         }
         (CV::Bool(b), _) => (*b as u8).to_string(),
         // A Cell's constant is its value's (its C form is the value's).
-        (_, CTy::Cell(inner)) => const_init(p, v, inner, pre, counter, slots, pos),
+        (_, CTy::Cell(inner)) => const_init(p, v, inner, pre, cx, slots, pos),
         // An atomic's constant is its value (cgen/sync.rs).
         // `Vec::new()` and `String::new()`: an empty buffer, its pointer
         // dangling at the element's alignment (W-THREADS).
         // `HashMap::with_hasher(s)` / `HashSet::with_hasher(s)`: an
         // empty table around the hasher.
         (CV::Aggregate(vals), CTy::Hash(k, _)) if hash::is_table(*k) && vals.len() == 1 => {
-            let s = const_init(p, &vals[0], &hash::builder_cty(t), pre, counter, slots, None);
+            let s = const_init(p, &vals[0], &hash::builder_cty(t), pre, cx, slots, None);
             hash::const_empty_table(t, &s, pre)
         }
         (CV::Aggregate(vals), CTy::Vec(e)) if vals.is_empty() => format!("{{(void*)(uintptr_t){}, 0, 0}}", c_size_align(p, e).1.max(1)),
@@ -8181,19 +8199,19 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         // A const lock: unlocked and unpoisoned around its value.
         (CV::Aggregate(vals), CTy::Sync(k, e)) if k.is_cell_struct() && vals.len() == 1 => {
             let words = vec!["0"; sync::cell_words(*k).len()].join(", ");
-            format!("{{{words}, {}}}", const_init(p, &vals[0], e, pre, counter, slots, None))
+            format!("{{{words}, {}}}", const_init(p, &vals[0], e, pre, cx, slots, None))
         }
         // An empty `OnceLock`, a `Condvar`, a `Barrier::new(n)` (W-THREADS).
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::OnceLock, _)) if vals.is_empty() => "{0}".into(),
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Condvar, _)) if vals.is_empty() => "0".into(),
         (CV::Aggregate(vals), CTy::Sync(crate::ty::sync::SyncTy::Barrier, _)) if vals.len() == 1 => {
-            format!("{{0, 0, 0, 0, {}}}", const_init(p, &vals[0], &CTy::Int(IntTy::Usize), pre, counter, slots, None))
+            format!("{{0, 0, 0, 0, {}}}", const_init(p, &vals[0], &CTy::Int(IntTy::Usize), pre, cx, slots, None))
         }
-        (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, counter, slots, None),
+        (CV::Int(i), CTy::Sync(k, _)) if let Some(crate::ty::sync::AtomicVal::Int(it)) = k.atomic_value() => const_init(p, &CV::Int(*i), &CTy::Int(it), pre, cx, slots, None),
         (CV::Char(c), _) => format!("((uint32_t){})", *c as u32),
         (CV::Unit, _) => "((lust_Unit){})".into(),
-        (CV::Str(i), _) => str_lit_c(p.ast.strings[*i as usize].as_bytes()),
-        (CV::StrBytes(b), _) => str_lit_c(b.as_slice()),
+        (CV::Str(i), _) => kconst::kstatic_str(cx, pre, p.ast.strings[*i as usize].as_bytes()),
+        (CV::StrBytes(b), _) => kconst::kstatic_str(cx, pre, b.as_slice()),
         (CV::StaticRef(idx), CTy::Slice(_)) => {
             let st = &p.statics[*idx as usize];
             let sct = cty(&p.tys, st.ty);
@@ -8208,7 +8226,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             Some((e, _)) => format!("(&{e})"),
             // A place cgen cannot name: a promoted copy of its value.
             None => match crate::ty::consteval::value_at(&p.statics[*idx as usize].value, path) {
-                Some(x) => const_init(p, &CV::Ref(Box::new(x.clone())), t, pre, counter, slots, None),
+                Some(x) => const_init(p, &CV::Ref(Box::new(x.clone())), t, pre, cx, slots, None),
                 None => panic!("internal: a static place {path:?} outside its static's value"),
             },
         },
@@ -8238,16 +8256,16 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             match &**inner {
                 CV::Aggregate(vals) => {
                     let at = CTy::Array(el.clone(), vals.len() as u64);
-                    let name = promoted_name(counter, pos);
-                    let init = const_init(p, inner, &at, pre, counter, slots, pos.map(|_| name.as_str()));
-                    let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+                    let name = promoted_name(cx, pos);
+                    let init = const_init(p, inner, &at, pre, cx, slots, pos.map(|_| name.as_str()));
+                    kconst::kdef(p, cx, pre, &name, inner, &at, &init);
                     format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
                 }
                 CV::Bytes(b) => {
                     let at = CTy::Array(el.clone(), b.len() as u64);
-                    let init = const_init(p, inner, &at, pre, counter, slots, None);
-                    let name = promoted_name(counter, pos);
-                    let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+                    let init = const_init(p, inner, &at, pre, cx, slots, None);
+                    let name = promoted_name(cx, pos);
+                    kconst::kdef(p, cx, pre, &name, inner, &at, &init);
                     format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
                 }
                 _ => zero_lit(p, t),
@@ -8259,9 +8277,9 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             format!("(({} *)(uintptr_t){})", ctype(inner_ct), c_size_align(p, inner_ct).1.max(1))
         }
         (CV::Ref(inner), CTy::Ref(inner_ct)) => {
-            let name = promoted_name(counter, pos);
-            let init = const_init(p, inner, inner_ct, pre, counter, slots, pos.map(|_| name.as_str()));
-            let _ = writeln!(pre, "static const {} {name} = {init};", ctype(inner_ct));
+            let name = promoted_name(cx, pos);
+            let init = const_init(p, inner, inner_ct, pre, cx, slots, pos.map(|_| name.as_str()));
+            kconst::kdef(p, cx, pre, &name, inner, inner_ct, &init);
             format!("(&{name})")
         }
         (CV::Aggregate(vals), CTy::Tuple(es)) => {
@@ -8269,7 +8287,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 zero_lit(p, t)
             } else {
                 let parts: Vec<String> =
-                    vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, counter, slots, sub(pos, i).as_deref()))).collect();
+                    vals.iter().enumerate().map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &es[i], pre, cx, slots, sub(pos, i).as_deref()))).collect();
                 format!("(({}){{ {} }})", ctype(t), parts.join(", "))
             }
         }
@@ -8277,7 +8295,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             if vals.is_empty() {
                 zero_lit(p, t)
             } else {
-                let parts: Vec<String> = vals.iter().enumerate().map(|(i, x)| const_init(p, x, e, pre, counter, slots, sub(pos, i).as_deref())).collect();
+                let parts: Vec<String> = vals.iter().enumerate().map(|(i, x)| const_init(p, x, e, pre, cx, slots, sub(pos, i).as_deref())).collect();
                 format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
             }
         }
@@ -8287,7 +8305,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             } else {
                 // Every element is the one value: a promoted reference in it is one
                 // allocation, named by element 0.
-                let one = const_init(p, x, e, pre, counter, slots, sub(pos, 0).as_deref());
+                let one = const_init(p, x, e, pre, cx, slots, sub(pos, 0).as_deref());
                 let parts: Vec<String> = (0..*n).map(|_| one.clone()).collect();
                 format!("(({}){{ .v = {{ {} }} }})", ctype(t), parts.join(", "))
             }
@@ -8300,7 +8318,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 let parts: Vec<String> = vals
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, counter, slots, sub(pos, i).as_deref())))
+                    .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, cx, slots, sub(pos, i).as_deref())))
                     .collect();
                 format!("((A{}){{ {} }})", a.0, parts.join(", "))
             }
@@ -8310,24 +8328,24 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let inits: Vec<String> = vals
                 .iter()
                 .enumerate()
-                .map(|(i, x)| const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, counter, slots, None))
+                .map(|(i, x)| const_init(p, x, &cty(&p.tys, adt.variants[*variant as usize].fields[i].ty), pre, cx, slots, None))
                 .collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Variant(variant, vals), CTy::Option(e)) => {
-            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots, None)).collect();
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, cx, slots, None)).collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Variant(variant, vals), CTy::Result(a, b)) => {
             let e = if *variant == 0 { a } else { b };
-            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, counter, slots, None)).collect();
+            let inits: Vec<String> = vals.iter().map(|x| const_init(p, x, e, pre, cx, slots, None)).collect();
             variant_lit(p, t, *variant as usize, &inits)
         }
         (CV::Aggregate(vals), CTy::Slice(e)) => {
             let at = CTy::Array(e.clone(), vals.len() as u64);
-            let name = promoted_name(counter, pos);
-            let init = const_init(p, v, &at, pre, counter, slots, pos.map(|_| name.as_str()));
-            let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+            let name = promoted_name(cx, pos);
+            let init = const_init(p, v, &at, pre, cx, slots, pos.map(|_| name.as_str()));
+            kconst::kdef(p, cx, pre, &name, v, &at, &init);
             format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
         }
         // One C array for the whole blob, at an array type; at a
@@ -8336,9 +8354,9 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         (CV::Bytes(b), CTy::Array(..)) => bytes_array_lit(p, t, b.as_slice()),
         (CV::Bytes(b), CTy::Slice(e)) => {
             let at = CTy::Array(e.clone(), b.len() as u64);
-            let init = const_init(p, v, &at, pre, counter, slots, None);
-            let name = promoted_name(counter, pos);
-            let _ = writeln!(pre, "static const {} {name} = {init};", ctype(&at));
+            let init = const_init(p, v, &at, pre, cx, slots, None);
+            let name = promoted_name(cx, pos);
+            kconst::kdef(p, cx, pre, &name, v, &at, &init);
             format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
         }
         _ => zero_lit(p, t),
@@ -8348,13 +8366,13 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
 /// The C name of a promoted value in static data. Inside a static's
 /// value (`pos` is the position's name, see `static_pos`) it is named by
 /// its path, so a `StaticPlace` in another static can name it
-/// (`static_place_c`); elsewhere it gets a counter name.
-fn promoted_name(counter: &mut u32, pos: Option<&str>) -> String {
+/// (`static_place_c`); elsewhere it gets a cx name.
+fn promoted_name(cx: &mut kconst::StaticCx, pos: Option<&str>) -> String {
     match pos {
         Some(at) => format!("{at}_d"),
         None => {
-            *counter += 1;
-            format!("lust_promoted_{counter}")
+            cx.counter += 1;
+            format!("lust_promoted_{}", cx.counter)
         }
     }
 }
@@ -8495,24 +8513,28 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
 fn static_defs(p: &Program, slots: &[u32]) -> String {
     let mut pre = static_decls(p);
     let mut out = String::new();
-    let mut counter = 0u32;
+    let mut cx = kconst::StaticCx::default();
     for (i, st) in p.statics.iter().enumerate() {
         let ct = cty(&p.tys, st.ty);
-        let init = const_init(p, &st.value, &ct, &mut pre, &mut counter, slots, Some(&static_pos(p, i as u32)));
+        let init = const_init(p, &st.value, &ct, &mut pre, &mut cx, slots, Some(&static_pos(p, i as u32)));
         let _ = writeln!(out, "{} {} = {init};", ctype(&ct), static_sym(p, i as u32));
     }
     // Tentative definitions of the path-named promoted values first: one
     // static's data can point into another's (`static_place_c`), in any order.
+    // So do the macros that name a pointee by an equal one (`kconst::kdef`).
     let mut fwd = String::new();
     for line in pre.lines() {
-        if let Some(rest) = line.strip_prefix("static const ")
+        if line.starts_with("#define lust_sp_") {
+            let _ = writeln!(fwd, "{line}");
+        } else if let Some(rest) = line.strip_prefix("static const ")
             && let Some((decl, _)) = rest.split_once(" = ")
             && decl.contains(" lust_sp_")
         {
             let _ = writeln!(fwd, "static const {decl};");
         }
     }
-    format!("{fwd}{pre}{out}")
+    let pre: String = pre.lines().filter(|l| !l.starts_with("#define lust_sp_")).flat_map(|l| [l, "\n"]).collect();
+    format!("{fwd}{pre}{out}{}", kconst::kstatics_init(&cx))
 }
 
 /// Extern declarations of the statics, for function units.
