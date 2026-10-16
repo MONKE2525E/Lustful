@@ -5235,7 +5235,7 @@ impl<'a> Parser<'a> {
             if needs_str && !matches!(self.peek(), Tok::Str(..)) {
                 return Err(syntax(self.span(), "expected a format string literal"));
             }
-            if let Tok::Str(si, _) = self.peek() {
+            if let Tok::Str(si, lit_text) = self.peek() {
                 let lit_span = self.bump().span;
                 let mut extra = Vec::new();
                 // `name = expr` arguments: (name, index in `extra`).
@@ -5259,6 +5259,30 @@ impl<'a> Parser<'a> {
                     extra.push(self.expr()?);
                 }
                 let s = self.ast.strings[(si + self.str_base) as usize].clone();
+                // std's `panic_2021!` has its own arm for exactly `"{}"` and
+                // one argument: `panic_display(&arg)` formats `*arg`, never an
+                // inlined literal, so `panic!("{}", "a")` has a `String`
+                // payload where `format_args!` would give a `&'static str`.
+                // `assert!`'s message takes the same arm. `*&lit` keeps the
+                // literal out of the inlining (lower.rs `inline_literal`).
+                // The arm matches the literal token `"{}"` only: a `concat!`
+                // result (its span is the whole call, not 4 bytes) or a
+                // `$f:literal` fragment (another span context than the macro
+                // name) does not take it. A `$($t:tt)*` forward is left out
+                // too (also another context), as before.
+                if matches!(kind, MacroKind::Panic | MacroKind::Assert)
+                    && lit_text.is_none()
+                    && lit_span.hi - lit_span.lo == 4
+                    && lit_span.ctxt == start.ctxt
+                    && s == "{}"
+                    && named.is_empty()
+                    && let [arg] = extra[..]
+                    && matches!(self.ast.expr(self.peel_refs(arg)), Expr::Str(_) | Expr::Int(..))
+                {
+                    let sp = self.ast.expr_span(arg);
+                    let r = self.push_expr(Expr::Ref { mutable: false, raw: false, expr: arg }, sp);
+                    extra[0] = self.push_expr(Expr::Deref(r), sp);
+                }
                 let base = args.len();
                 // A format string a macro produced (concat! and kin) may
                 // not capture variables, as in rustc.
@@ -5275,6 +5299,14 @@ impl<'a> Parser<'a> {
         }
         self.expect(close, "closing delimiter")?;
         Ok(self.push_expr(Expr::Macro { kind, args, fmt, repeat }, start.to(self.prev_span())))
+    }
+
+    /// `e` without its `&` borrows (not `&raw`).
+    fn peel_refs(&self, mut e: ExprId) -> ExprId {
+        while let Expr::Ref { raw: false, expr, .. } = self.ast.expr(e) {
+            e = *expr;
+        }
+        e
     }
 
     /// Splits a format string into pieces. `{name}` captures become extra path arguments.
