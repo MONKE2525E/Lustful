@@ -4522,7 +4522,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::VecRetain)) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
-            _ if let CallTarget::Builtin(b @ (crate::check::Builtin::MapInsert | crate::check::Builtin::MapRemove)) = target
+            _ if let CallTarget::Builtin(
+                b @ (crate::check::Builtin::MapInsert | crate::check::Builtin::MapRemove | crate::check::Builtin::MapRemoveEntry),
+            ) = target
                 && self.call_map_value(b, &avs, dt, &dv) => {}
             _ if let CallTarget::Builtin(crate::check::Builtin::MapGet | crate::check::Builtin::MapGetMut) = target
                 && self.call_map_get(&avs, dt, &dv) => {}
@@ -5333,6 +5335,18 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some((crate::ty::hash::HashTy::HashMap, margs)) = crate::ty::hash::hash_parts(&self.body.tys, map) else { return false };
         let (&[k, v, ..], Some(out)) = (&margs[..], self.body.tys.option_elem(dt)) else { return false };
         let (nk, nv) = (self.sc.slots(k) as usize, self.sc.slots(v) as usize);
+        // `remove_entry` hands back the stored `(K, V)`: the map's own key
+        // and value regions, not the receiver's loan.
+        if b == crate::check::Builtin::MapRemoveEntry {
+            let pair = matches!(self.body.tys.kind(out), TyKind::Tuple(ts) if self.body.tys.tys_of(ts) == [k, v]);
+            if !pair || dv.len() != nk + nv || v0.len() < 1 + nk + nv {
+                return false;
+            }
+            let (kv, vv) = (v0[1..1 + nk].to_vec(), v0[1 + nk..1 + nk + nv].to_vec());
+            self.relate(k, &kv, k, &dv[..nk], Variance::Co);
+            self.relate(v, &vv, v, &dv[nk..], Variance::Co);
+            return true;
+        }
         if out != v || dv.len() != nv || v0.len() < 1 + nk + nv {
             return false;
         }
