@@ -636,6 +636,17 @@ impl ResolvedTables {
     /// re-export subset check: everywhere (pub), the whole crate, or one
     /// module subtree.
     pub(super) fn vis_region(&self, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (u8, Option<ModuleId>) {
+        let region = self.vis_region_raw(vis, def_module, interner);
+        // A region rooted at a crate root is the whole crate: a private
+        // root item reaches as far as `pub(crate)`.
+        match region {
+            (0, Some(m)) if self.modules[m.0 as usize].parent.is_none() => (1, None),
+            _ => region,
+        }
+    }
+
+    /// `vis_region` before a crate-root region is widened to the crate.
+    fn vis_region_raw(&self, vis: &VisKind, def_module: ModuleId, interner: &Interner) -> (u8, Option<ModuleId>) {
         match vis {
             VisKind::Pub => (2, None),
             VisKind::Crate => (1, None),
@@ -718,6 +729,27 @@ impl ResolvedTables {
         }
         diags.push(reexport_diag(name, imp.span));
         false
+    }
+
+    /// The visibility and defining module of the binding a one-segment
+    /// `use name` reaches when it names extern crate `i`: the module's
+    /// own binding of `name` (an `extern crate` item, or a std alias such
+    /// as `use std as core;`), else the crate root's `extern crate` item,
+    /// which is the extern prelude's entry. None for a plain extern
+    /// prelude name.
+    fn extern_binding_vis(&self, module: ModuleId, name: Sym, i: u32) -> Option<(VisKind, ModuleId)> {
+        let key = (module, ns_index(Namespace::Type) as u8, name);
+        if let Some((avis, _)) = self.std_aliases.get(&key) {
+            return Some((avis.clone(), self.std_alias_def_module(key)));
+        }
+        for m in [module, self.root_of(module)] {
+            if let Some(BindState::One(b)) = self.lookup(m, Namespace::Type, name)
+                && b.target == Target::Extern(i)
+            {
+                return Some((b.vis.clone(), b.def_module));
+            }
+        }
+        None
     }
 
     /// The visibility a glob import gives one name, as rustc does: the
@@ -2915,6 +2947,19 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 && let PathRes::Done(Target::Extern(i)) =
                     tables.resolve_path(imp.module, path, Namespace::Type, PathMode::Use, imp.leading_colon, interner)
             {
+                // `extern crate core; pub use core as c;` and `use std as
+                // core; pub use core as c;`: the one segment is a binding
+                // (an `extern crate` item or a use) that cannot be
+                // re-exported wider than it is (rustc E0365). With no
+                // binding in the module, the extern prelude answers, and a
+                // root `extern crate` item is that prelude entry.
+                if imp.vis != VisKind::Priv
+                    && let Some((bvis, bmod)) = tables.extern_binding_vis(imp.module, path[0], i)
+                    && !tables.vis_within(&imp.vis, imp.module, &bvis, bmod, interner)
+                {
+                    diags.push(reexport_diag(interner.get(path[0]), imp.span));
+                    return TryOut::Done(false);
+                }
                 let mut inserted = false;
                 if let Some(why) = &tables.externs[i as usize].unsupported {
                     diags.push(unsupported_diag(why, imp.span));
@@ -2974,9 +3019,12 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 if tables.visible(&b.vis, b.def_module, imp.module, interner) {
                                     any = true;
                                     let is_macro = matches!(b.target, Target::Def(d) if tables.def_info.get(&d).is_some_and(|i| i.kind == ResKind::Macro));
+                                    // An `extern crate` item is a binding like any
+                                    // other: a private one cannot be re-exported
+                                    // wider (rustc E0365, deny-by-default lint
+                                    // pub_use_of_private_extern_crate).
                                     narrower |= imp.vis != VisKind::Priv
                                         && !is_macro
-                                        && !matches!(b.target, Target::Extern(_))
                                         && !tables.vis_within(&imp.vis, imp.module, &b.vis, b.def_module, interner);
                                     found.push((ns, Bind { target: b.target, vis: imp.vis.clone(), rank: 2, def_module: imp.module }));
                                 } else {
