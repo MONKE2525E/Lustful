@@ -347,6 +347,7 @@ fn dirty_check(
                     .iter()
                     .filter(|(k, stored)| match k {
                         ReadKey::Checked(d) => warm.local_def(d.hash).is_some_and(|l| checked.get(l.0 as usize).copied().unwrap_or(false)),
+                        ReadKey::Binding(b) if cold_p.read_fingerprint(k) != **stored => !pattern_read(cold_p, front, i, b),
                         _ => cold_p.read_fingerprint(k) != **stored,
                     })
                     .map(|(k, _)| format!("{k:?}"))
@@ -363,6 +364,21 @@ fn dirty_check(
         }
     }
     (0..fn_count).filter(|&i| !checked[i]).count()
+}
+
+/// True for a value binding read that names a fn the reused body never
+/// mentions (its idents hold no path to it): the check read it only to
+/// tell a binding pattern from a const or unit struct pattern (a
+/// parameter named like the fn). A signature edit moves its fingerprint
+/// but not that answer, which only an item kind change moves (an outline
+/// change, so full mode). Signatures mode walks only mentioning bodies.
+fn pattern_read(p: &Program, front: &Front, i: usize, b: &crate::driver::graph::BindingKey) -> bool {
+    let crate::driver::graph::BindingRes::Def(d) = p.binding(&mut crate::driver::graph::Reads::off(), b.module, b.ns, b.name) else {
+        return false;
+    };
+    let Some(f) = p.local_def(d.hash).filter(|l| p.def_id(*l) == d) else { return false };
+    let flat = p.fn_def(f).name;
+    front.chunks.first().and_then(|c| c.scan.body_idents.get(i)).is_some_and(|ids| !ids.contains(&flat))
 }
 
 /// The response half of the oracle: a patched check request compiles
