@@ -1630,6 +1630,21 @@ fn param_ctype(p: &Program, t: &CTy) -> String {
     if param_by_ptr(p, t) { format!("{}*", ctype(t)) } else { ctype(t) }
 }
 
+/// Declares local `l{i}` of C type `ct` whose alignment is over 16, with
+/// `decl` its declarator (`l{i}` or `l{i} = init`). tcc never realigns
+/// the stack, so a frame slot is only 16-aligned: the value lives at the
+/// first aligned address in a char buffer, and `l{i}` is a macro for it
+/// up to the `#undef` after the function (fx-overalign).
+fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str) {
+    let _ = writeln!(
+        out,
+        "  char l{i}_b[sizeof({ct}) + _Alignof({ct})]; {ct} *l{i}_p = ({ct} *)(((uintptr_t)l{i}_b + _Alignof({ct}) - 1) & ~(uintptr_t)(_Alignof({ct}) - 1));\n#define l{i} (*l{i}_p)"
+    );
+    if decl.contains('=') {
+        let _ = writeln!(out, "  {decl};");
+    }
+}
+
 /// True when `f` gets C of its own: a plain fn, an instance, or a
 /// closure body fn, with a source body. A template or a trait
 /// method stub is never generated, and an instance of a trait method
@@ -1979,6 +1994,8 @@ impl FnGen<'_, '_> {
         // after a write. Drop flags start at 0, except for parameters, which own their values.
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
         let mut flags = Vec::new();
+        // Locals with alignment over 16 (see `overaligned_local`).
+        let mut high: Vec<(usize, String, String)> = Vec::new();
         for (i, t) in self.local_cty.iter().enumerate() {
             // A byte string temp gets static storage below, not a frame local.
             if self.byte_blobs.get(i).is_some_and(|b| b.is_some()) {
@@ -2005,6 +2022,8 @@ impl FnGen<'_, '_> {
                     let d = self.kconst_decls(i);
                     self.out.push_str(&d);
                 }
+            } else if c_size_align(p, t).1 > 16 {
+                high.push((i, ct, decl));
             } else {
                 match by_type.iter_mut().find(|(c, _)| *c == ct) {
                     Some((_, v)) => v.push(decl),
@@ -2024,6 +2043,9 @@ impl FnGen<'_, '_> {
             let stars = &ct[base.len()..];
             let decls: Vec<String> = names.iter().map(|n| format!("{stars}{n}")).collect();
             let _ = writeln!(self.out, "  {base} {};", decls.join(", "));
+        }
+        for (i, ct, decl) in &high {
+            overaligned_local(&mut self.out, *i, ct, decl);
         }
         // Byte string temps: static storage, initialized once, never
         // assigned (the matching assignments are skipped in `stmt`).
@@ -2085,7 +2107,11 @@ impl FnGen<'_, '_> {
             self.term(&block.term, block.term_span, next);
         }
         self.kstr_finish();
-        self.out.push_str("}\n\n");
+        self.out.push_str("}\n");
+        for (i, ..) in &high {
+            let _ = writeln!(self.out, "#undef l{i}");
+        }
+        self.out.push('\n');
     }
 
     /// The unwind action of statement `si` of block `bi` (`si` equal to
