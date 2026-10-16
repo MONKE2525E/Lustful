@@ -639,6 +639,21 @@ impl Ctx<'_> {
         if inh == 0 {
             return StdShadow::None;
         }
+        // `clone` on an `Rc` or `Arc` receiver (a value, or one shared
+        // reference to it) is the pointer's own Clone at the first step,
+        // which the builtin clone dispatch gives: a `T::clone` at a deref
+        // step loses (ts-rust `Rc<ProjectCollection>`).
+        if self.name(name) == "clone"
+            && let Some(&s) = steps.first()
+        {
+            let s = match self.tys.kind(s) {
+                TyKind::Ref(_, Mut::Shared, inner) => self.resolve(inner),
+                _ => s,
+            };
+            if self.tys.rc_elem(s).is_some() {
+                return StdShadow::None;
+            }
+        }
         let item = self.name(name).to_string();
         let mut std_at: Option<usize> = None;
         for j in 0..steps.len() {
