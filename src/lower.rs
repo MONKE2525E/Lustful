@@ -4294,7 +4294,18 @@ impl<'p> Lower<'p> {
         if let Coerce::ByNext(w) = self.ck.coerce(recv)
             && self.cow_view.is_none_or(|(x, ..)| x != recv)
         {
-            let o = self.operand_raw(recv);
+            // A `&mut I` place receiver is reborrowed (`&mut *r`), as rustc
+            // adjusts a `&mut` method receiver; it is not moved.
+            let held = crate::ty::iter::iter_parts(&self.body.tys, w).and_then(|(_, a)| a.first().copied());
+            let o = match held {
+                Some(h) if matches!(self.kind(h), TyKind::Ref(_, Mut::Mut, _)) && self.is_place_expr(recv) => {
+                    let pl = self.place_for_mut(recv);
+                    let t = self.temp(h);
+                    self.assign(Place::local(t), Rvalue::Ref(true, pl.deref()), span);
+                    Operand::Move(Place::local(t))
+                }
+                _ => self.operand_raw(recv),
+            };
             let v = self.temp(w);
             self.assign(Place::local(v), Rvalue::TupleAgg(w, vec![o]), span);
             let saved = self.cow_view.replace((recv, v, w));
@@ -4629,6 +4640,13 @@ impl<'p> Lower<'p> {
             }
         };
         let d = self.call_dest(dest, self.ty(e));
+        // `by_ref()`: the `&mut Self` receiver itself, a plain reborrow (no
+        // call, so its loan ends where the reference's last use is).
+        if target == CallTarget::Builtin(Builtin::IterByRef) && !ops.is_empty() {
+            let r = ops.swap_remove(0);
+            self.assign(d, Rvalue::Use(r), span);
+            return;
+        }
         self.call_into(target, ops, d, span);
     }
 
@@ -5111,9 +5129,14 @@ impl<'p> Lower<'p> {
                 (iter_ty, it)
             };
             self.goto(head, span);
-            let mt = self.ref_ty(true, iter_ty);
+            // `it: &mut I` stepped by `I`'s own `next` (core's `impl
+            // Iterator for &mut I`, check `for_trait_iter`): the reference
+            // itself, reborrowed, is the receiver.
+            let by_mut = matches!(self.kind(iter_ty), TyKind::Ref(_, Mut::Mut, _))
+                && next_f.is_none_or(|f| p.fn_info(f).params.first().is_none_or(|&t| !matches!(self.kind(t), TyKind::Ref(_, Mut::Mut, x) if x == iter_ty)));
+            let (mt, recv) = if by_mut { (iter_ty, Place::local(it).deref()) } else { (self.ref_ty(true, iter_ty), Place::local(it)) };
             let r = self.temp(mt);
-            self.assign(Place::local(r), Rvalue::Ref(true, Place::local(it)), span);
+            self.assign(Place::local(r), Rvalue::Ref(true, recv), span);
             let (ot, target) = match next_f {
                 Some(f) => (p.fn_info(f).ret, CallTarget::Fn(f)),
                 None => (self.body.tys.mk_option(item_ty), CallTarget::Builtin(Builtin::IterNext)),
@@ -5198,7 +5221,17 @@ impl<'p> Lower<'p> {
                 TyKind::Array(el, _) => Some(crate::ty::iter::mk_iter(&mut self.body.tys, crate::ty::iter::IterKind::ArrayIntoIter, &[el, ity])),
                 _ => None,
             };
-            h.or(o).or(a).or_else(|| {
+            // `for x in &mut it` over a builtin iterator: core's `impl
+            // Iterator for &mut I`, a `ByNext` wrapper that steps `it` in
+            // place (lower/iter.rs `by_mut_builtin`).
+            let bm = match self.kind(ity) {
+                TyKind::Ref(_, Mut::Mut, inner) if crate::ty::iter::is_iter(&self.body.tys, inner) || self.body.tys.is_chars_ty(inner) => {
+                    let item = if self.body.tys.is_chars_ty(inner) { CHAR } else { crate::ty::iter::item_ty(&mut self.body.tys, inner).unwrap_or(ERROR) };
+                    Some(crate::ty::iter::mk_iter(&mut self.body.tys, crate::ty::iter::IterKind::ByNext, &[ity, item]))
+                }
+                _ => None,
+            };
+            h.or(o).or(a).or(bm).or_else(|| {
                 (crate::ty::iter::is_iter(&self.body.tys, ity) || self.body.tys.boxed_slice_elem(ity).is_some() || self.recv_iterable(ity).is_some())
                     .then_some(ERROR)
             })
@@ -5225,6 +5258,13 @@ impl<'p> Lower<'p> {
                     let src = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(src)));
                     self.call_into(CallTarget::Builtin(Builtin::IterOptRes), vec![Operand::Move(Place::local(src))], Place::local(it), span);
+                    (hash_it, it)
+                }
+                _ if crate::ty::iter::iter_parts(&self.body.tys, hash_it).is_some_and(|(k, _)| k == crate::ty::iter::IterKind::ByNext) => {
+                    let src = self.temp(self.ty(iter));
+                    self.expr_into(iter, Some(&Place::local(src)));
+                    let it = self.temp(hash_it);
+                    self.assign(Place::local(it), Rvalue::TupleAgg(hash_it, vec![Operand::Move(Place::local(src))]), span);
                     (hash_it, it)
                 }
                 _ if hash_it != ERROR => {

@@ -25,7 +25,6 @@ const DECLARED_ONLY: &[&str] = &[
     "map_while",
     "scan",
     "fuse",
-    "by_ref",
     "partition",
     "partition_in_place",
     "is_partitioned",
@@ -273,7 +272,14 @@ impl<'p> Ctx<'p> {
             // and the expansion wraps the reference (lower/iter.rs
             // `user_iter`). The rest move it into the wrapper.
             let borrowing = matches!(n.as_str(), "nth" | "any" | "all" | "find" | "find_map" | "try_fold" | "position" | "size_hint" | "len");
-            if (derefs > 0 && !borrowing) || n == "next" || !ITER_METHODS.contains(&n.as_str()) {
+            // `by_ref(&mut self) -> &mut Self`, and a by-value method on
+            // a `&mut I` receiver (core's `impl Iterator for &mut I`): the
+            // wrapper holds the reference and steps `*r` in place.
+            let by_ref = n == "by_ref";
+            let rt = self.out.expr_ty[self.ei(recv)];
+            let rt = self.deep(rt);
+            let by_mut = derefs == 1 && !borrowing && matches!(self.kind(rt), TyKind::Ref(_, Mut::Mut, inner) if inner == base);
+            if (derefs > 0 && !borrowing && !by_ref && !by_mut) || n == "next" || !(ITER_METHODS.contains(&n.as_str()) || by_ref) {
                 return None;
             }
             let item = self.by_next_item(base, name_span)?;
@@ -283,7 +289,17 @@ impl<'p> Ctx<'p> {
                 }
                 return Some(ERROR);
             }
-            let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[base, item]);
+            if by_ref {
+                if !turbofish.is_empty() {
+                    self.errs.push(not_yet("L0721", name_span, "turbofish on this iterator method"));
+                    return Some(self.iter_bail(args));
+                }
+                self.set_res(e, Res::BuiltinMethod { b: Builtin::IterByRef, derefs, autoref: Autoref::RefMut });
+                self.check_args(&[], args, name_span);
+                return Some(self.tys.mk_ref(true, base));
+            }
+            let held = if by_mut { rt } else { base };
+            let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[held, item]);
             if borrowing {
                 return Some(self.iter_call(e, recv, wrapped, wrapped, derefs, &n, name_span, args, turbofish, expected));
             }
@@ -292,8 +308,9 @@ impl<'p> Ctx<'p> {
             return Some(self.iter_call(e, recv, wrapped, wrapped, 0, &n, name_span, args, turbofish, expected));
         }
         let n = self.name(name).to_string();
-        // `Chars` keeps its own `next` and `count` builtins.
-        if self.tys.is_chars_ty(base) && (n == "next" || n == "count") {
+        // `Chars` keeps its own `next` and `count` builtins (`count`
+        // through `&mut Chars` counts in place, below).
+        if self.tys.is_chars_ty(base) && (n == "next" || (n == "count" && derefs == 0)) {
             return None;
         }
         // A range's derived `Hash::hash` is no iterator method: the
@@ -959,10 +976,22 @@ impl<'p> Ctx<'p> {
         let by_value = !matches!(
             n,
             "next" | "next_back" | "nth" | "any" | "all" | "find" | "find_map" | "try_fold" | "position" | "rposition" | "peek" | "size_hint" | "len"
-                | "as_slice" | "as_mut_slice" | "as_str" | "remainder"
+                | "as_slice" | "as_mut_slice" | "as_str" | "remainder" | "by_ref"
         );
-        // A by-value method through a reference would use `&mut I:
-        // Iterator` (`by_ref`), which lust does not model yet.
+        // A by-value method through `&mut I` uses core's `impl Iterator
+        // for &mut I`: the reference moves into a `ByNext` wrapper whose
+        // `next` steps `*r` in place (lower/iter.rs). Other forms through
+        // a reference (`&I`, `&&mut I`) stay out.
+        if by_value && derefs == 1 && actual_base == base && self.iter_method_known(n) {
+            let rt = self.out.expr_ty[self.ei(recv)];
+            let rt = self.deep(rt);
+            if matches!(self.kind(rt), TyKind::Ref(_, Mut::Mut, inner) if inner == base) {
+                let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[rt, item]);
+                let i = self.ei(recv);
+                self.out.coerce[i] = Coerce::ByNext(wrapped);
+                return self.iter_call(e, recv, wrapped, wrapped, 0, n, span, args, turbofish, expected);
+            }
+        }
         if by_value && derefs > 0 && self.iter_method_known(n) {
             self.err(
                 "L0640",
@@ -1197,6 +1226,8 @@ impl<'p> Ctx<'p> {
                 (B::IterInspect, vec![f], mk(self, K::Inspect, &[base, f]))
             }
             "count" => (B::IterCount, vec![], USIZE),
+            // `by_ref(&mut self) -> &mut Self`: the receiver reference.
+            "by_ref" => (B::IterByRef, vec![], self.tys.mk_ref(true, actual_base)),
             "last" => {
                 let o = self.tys.mk_option(item);
                 (B::IterLast, vec![], o)
@@ -1541,6 +1572,7 @@ impl<'p> Ctx<'p> {
         matches!(
             n,
             "rposition"
+                | "by_ref"
                 | "size_hint"
                 | "next_back"
                 | "flatten"
@@ -1895,7 +1927,13 @@ impl<'p> Ctx<'p> {
             | K::SetIntoIter => false,
             K::ArrayIntoIter | K::RepeatN => true,
             // A user iterator with a `DoubleEndedIterator` impl.
-            K::ByNext => by_next_fns(self.p, &self.tys, a[0]).is_ok_and(|f| f.next_back.is_some()),
+            // Through `&mut I` (core: `impl<I: DoubleEndedIterator + ?Sized>
+            // DoubleEndedIterator for &mut I`): as `I`.
+            K::ByNext => match self.kind(a[0]) {
+                TyKind::Ref(_, Mut::Mut, inner) if self.tys.is_chars_ty(inner) || it::iter_parts(&self.tys, inner).is_some() => self.double_ended(inner),
+                TyKind::Ref(_, Mut::Mut, inner) => by_next_fns(self.p, &self.tys, inner).is_ok_and(|f| f.next_back.is_some()),
+                _ => by_next_fns(self.p, &self.tys, a[0]).is_ok_and(|f| f.next_back.is_some()),
+            },
             // Forward only in lust so far.
             K::Flatten | K::TryCollect => false,
             K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => true,
@@ -1993,6 +2031,12 @@ impl<'p> Ctx<'p> {
             // written `ExactSizeIterator` impl takes the default
             // `len` over an honest `size_hint` (`ByNextFns::exact`),
             // or when the held type is bound-only exact evidence.
+            // Through `&mut I`: as `I` (core's `impl ExactSizeIterator for
+            // &mut I`).
+            K::ByNext if let TyKind::Ref(_, Mut::Mut, inner) = self.kind(a[0]) => match by_next_fns(self.p, &self.tys, inner) {
+                Ok(f) => f.exact,
+                Err(_) => self.exact_size(inner, span),
+            },
             K::ByNext => match by_next_fns(self.p, &self.tys, a[0]) {
                 Ok(f) => f.exact,
                 Err(_) => self.exact_size(a[0], span),

@@ -554,6 +554,8 @@ pub enum Builtin {
     /// `Iterator::eq` and `ne` (core's `iter_eq`, lower/iter.rs).
     IterEq,
     IterNe,
+    /// `Iterator::by_ref`: the `&mut Self` receiver itself.
+    IterByRef,
     IterLast,
     IterNth,
     IterAny,
@@ -16352,7 +16354,9 @@ impl<'p> Ctx<'p> {
                 let opt = self.tys.mk_option(CHAR);
                 if name == k.next {
                     Some((B::CharsNext, Autoref::RefMut, vec![], opt))
-                } else if name == k.count {
+                } else if name == k.count && derefs == 0 {
+                    // Through `&mut Chars` the iterator path counts in place
+                    // (core's `impl Iterator for &mut I`, check/iter.rs).
                     Some((B::CharsCount, Autoref::None, vec![], USIZE))
                 } else {
                     None
@@ -18434,6 +18438,12 @@ impl<'p> Ctx<'p> {
                 let r = self.deep(t);
                 self.iter_item(r)
             }
+            // `for x in &mut it` (or `it: &mut I`): core's `impl Iterator for
+            // &mut I` steps `it` in place (lower.rs wraps the reference).
+            TyKind::Ref(_, Mut::Mut, inner) if crate::ty::iter::is_iter(&self.tys, self.resolve(inner)) => {
+                let i = self.deep(inner);
+                self.iter_item(i)
+            }
             TyKind::Ref(r, m, inner) => {
                 let elem = match self.kind(self.resolve(inner)) {
                     TyKind::Slice(elem) | TyKind::Array(elem, _) => Some(elem),
@@ -18523,6 +18533,16 @@ impl<'p> Ctx<'p> {
         // next() on the iterator type.
         let iter_args_id = self.tys.intern_args(&[GenericArg::Ty(iter_ty)]);
         let tr2 = TraitRef { def: lang.iterator, args: iter_args_id, bindings: EMPTY_BINDINGS };
+        // `&mut I` (core's `impl Iterator for &mut I`, synthetic): the loop
+        // steps `*it` with `I`'s own `next` (lower.rs passes the reference
+        // itself, not a borrow of it).
+        let (tr2, iter_ty) = match (self.select_obligation(tr2), self.kind(iter_ty)) {
+            (Selection::Impl { id, .. }, TyKind::Ref(_, Mut::Mut, inner)) if p.gx.index.get(id).items.is_empty() && !crate::ty::iter::is_iter(&self.tys, self.resolve(iter_ty)) => {
+                let a = self.tys.intern_args(&[GenericArg::Ty(inner)]);
+                (TraitRef { def: lang.iterator, args: a, bindings: EMPTY_BINDINGS }, inner)
+            }
+            _ => (tr2, iter_ty),
+        };
         let next_local = match self.select_obligation(tr2) {
             // A builtin iterator (`type IntoIter = vec::IntoIter<T>`): its
             // `next` is the builtin call, marked by the sentinel id.

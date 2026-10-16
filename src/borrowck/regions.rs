@@ -3431,8 +3431,34 @@ impl<'b, 'p> Builder<'b, 'p> {
             Rvalue::Opt(_, Some(o)) => self.into_place(o, dest, &[Proj::Downcast(1), Proj::Field(0)]),
             Rvalue::Res(_, ok, o) => self.into_place(o, dest, &[Proj::Downcast(if *ok { 0 } else { 1 }), Proj::Field(0)]),
             Rvalue::TupleAgg(ty, ops) => {
-                for (i, o) in ops.iter().enumerate() {
-                    self.into_place(o, dest, &[Proj::Field(i as u32)]);
+                // A `ByNext` over `&mut I` (core's `impl Iterator for &mut
+                // I`): the reference flows into the held slots as a value
+                // of its own type (the loan region covariant, `I`
+                // invariant), so the loan ends where the wrapper's last
+                // use is. Field places of a builtin iterator do not pair.
+                let by_mut = match crate::ty::iter::iter_parts(&self.body.tys, *ty) {
+                    Some((crate::ty::iter::IterKind::ByNext, a)) if matches!(self.body.tys.kind(a[0]), TyKind::Ref(_, Mut::Mut, _)) => Some(a[0]),
+                    _ => None,
+                };
+                if let (Some(held), [o]) = (by_mut, ops.as_slice()) {
+                    let mut ov = Vec::new();
+                    let ot = self.operand(o, &mut ov);
+                    self.place(dest, &mut dv, &mut d);
+                    let own = adt_regions(self.p, &self.body.tys, *ty) as usize;
+                    let n0 = self.sc.slots(held) as usize;
+                    match dv.get(own..own + n0) {
+                        Some(hv) => {
+                            let hv = hv.to_vec();
+                            self.relate(ot, &ov, held, &hv, Variance::Co);
+                        }
+                        None => self.equate_all(&ov, &dv.clone()),
+                    }
+                    dv.clear();
+                    d.clear();
+                } else {
+                    for (i, o) in ops.iter().enumerate() {
+                        self.into_place(o, dest, &[Proj::Field(i as u32)]);
+                    }
                 }
                 // A `ByNext` wrapper (W-STD-B): its item type is not a
                 // field, so tie it here: the wrapped iterator's regions
@@ -4677,6 +4703,25 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// for example a `-> Option<Self::Item>` written with the projection.
     fn by_next_item(&mut self, it: Ty, src: &[u32], item_ty: Ty, item: &[u32]) -> bool {
         let p = self.p;
+        // `&mut I` over a builtin iterator (core's `impl Iterator for
+        // &mut I`): the item is `I`'s, so its slots follow `I`'s own
+        // (`item_slots`), not the reborrow's region.
+        if let TyKind::Ref(_, Mut::Mut, inner) = self.body.tys.kind(it)
+            && (crate::ty::iter::iter_parts(&self.body.tys, inner).is_some() || self.body.tys.is_chars_ty(inner))
+        {
+            let Some(inner_items) = self.item_slots(inner, src.get(1..).unwrap_or(&[])) else { return false };
+            if inner_items.len() != item.len() {
+                return false;
+            }
+            for (&x, &y) in inner_items.iter().zip(item) {
+                self.edge(x, y);
+            }
+            return true;
+        }
+        // `&mut U` over a user iterator: `U`'s own `next` signature.
+        if let TyKind::Ref(_, Mut::Mut, inner) = self.body.tys.kind(it) {
+            return self.by_next_item(inner, src.get(1..).unwrap_or(&[]), item_ty, item);
+        }
         let Ok(fns) = crate::check::iter::by_next_fns(p, &self.body.tys, it) else { return false };
         let Some(sig) = p.regions.body_sig(p, fns.next) else { return false };
         let Some(&self_r) = sig.params.first() else { return false };

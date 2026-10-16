@@ -8233,6 +8233,23 @@ pub fn add_synthetic_impls(p: &mut Program) {
     }
     // Lang facts for builtin types.
     let g0 = Generics::default();
+    // core's `impl<I: Iterator + ?Sized> Iterator for &mut I` (Item =
+    // I::Item), and its DoubleEndedIterator and ExactSizeIterator twins:
+    // `total(&mut it)`, `for x in &mut it` (lowered as a `ByNext` over the
+    // reference, lower/iter.rs `by_mut_builtin`).
+    {
+        let i0 = p.tys.intern(TyKind::Param(ParamId(0)));
+        let one_i = Generics { parent: None, params: vec![ParamDef { name: p.interner.intern("I"), kind: ParamKind::Type, span }], predicates: Vec::new() };
+        let ia = p.tys.intern_args(&[GenericArg::Ty(i0)]);
+        let self_pat = p.tys.intern(TyKind::Ref(Region::Erased, Mut::Mut, i0));
+        let item = p.tys.intern(TyKind::Projection(AssocId(lang.assoc_item), ia));
+        for tr in [lang.iterator, lang.double_ended_iterator, lang.exact_size_iterator] {
+            let pred = Predicate::Trait(Binder::plain(TraitRef { def: tr, args: ia, bindings: EMPTY_BINDINGS }));
+            let assoc = if tr == lang.iterator { vec![(lang.assoc_item, item)] } else { Vec::new() };
+            let g = Generics { predicates: vec![pred], ..one_i.clone() };
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &[], g, assoc, Synthetic::Lang, false, span);
+        }
+    }
     // core's `impl<A, F: Fn<A> + ?Sized> Fn<A> for &F` (and `FnMut`,
     // `FnOnce`) and `impl<A, F: FnMut<A> + ?Sized> FnMut<A> for &mut F`
     // (and `FnOnce`), with `Output = <F as FnOnce<A>>::Output`: a generic

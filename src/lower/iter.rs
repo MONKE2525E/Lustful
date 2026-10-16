@@ -1687,6 +1687,16 @@ impl Ex<'_, '_> {
         }
     }
 
+    /// The builtin iterator a `ByNext` wrapper reaches through the
+    /// `&mut I` it holds (core's `impl Iterator for &mut I`): it steps,
+    /// hints, and fuses as `I` itself, in place.
+    fn by_mut_builtin(&self, held: Ty) -> Option<Ty> {
+        match self.body.tys.kind(held) {
+            TyKind::Ref(_, Mut::Mut, inner) if self.kind_args(inner).is_some() || self.body.tys.is_chars_ty(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
     /// The inner iterator type when `ty` is a std source collection
     /// iterator struct (collect.rs `collection_iter_inner`): check
     /// typed its methods as the inner type's, so every expansion
@@ -2346,6 +2356,10 @@ impl Ex<'_, '_> {
                 self.goto(join);
             }
             // The wrapped iterator's own `next` (W-STD-B): forward only.
+            K::ByNext if let Some(inner) = self.by_mut_builtin(a[0]) => {
+                self.next(f(0).deref(), inner, dest, back)?;
+                self.goto(join);
+            }
             K::ByNext => {
                 let (inner, at) = self.by_next_held(a[0], f(0));
                 let fns = crate::check::iter::by_next_fns(self.p, &self.body.tys, inner)?;
@@ -4189,7 +4203,7 @@ impl Ex<'_, '_> {
     fn len_asserts(&self, ty: Ty) -> bool {
         use IterKind as K;
         match self.kind_args(ty) {
-            Some((K::ByNext, _)) => true,
+            Some((K::ByNext, a)) => self.by_mut_builtin(a[0]).is_none_or(|inner| self.len_asserts(inner)),
             Some((K::Map | K::Enumerate | K::Rev | K::Copied | K::Cloned | K::Peekable | K::Inspect, a)) => self.len_asserts(a[0]),
             _ => false,
         }
@@ -4309,6 +4323,12 @@ impl Ex<'_, '_> {
             K::Utf8Chunks | K::Utf8Chunk => {
                 self.assign(Place::local(lo), Rvalue::Use(Self::usize_c(0)));
                 self.none(&Place::local(hi), ou);
+            }
+            // `&mut I` over a builtin iterator: its own hint.
+            K::ByNext if let Some(inner) = self.by_mut_builtin(a[0]) => {
+                let (l, h) = self.hint(f(0).deref(), inner)?;
+                self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(l))));
+                self.assign(Place::local(hi), Rvalue::Use(Operand::Move(Place::local(h))));
             }
             // The wrapped iterator's own `size_hint`, else the trait's
             // default `(0, None)` (W-STD-B).
@@ -4816,6 +4836,8 @@ impl Ex<'_, '_> {
             // A user iterator may implement the unstable TrustedLen only
             // in std itself: of the std source iterators, core's `Once`
             // and `OnceWith` do (library/core/src/iter.rs).
+            // core: `impl<I: TrustedLen + ?Sized> TrustedLen for &mut I`.
+            K::ByNext if let Some(inner) = self.by_mut_builtin(a[0]) => self.trusted_len(inner),
             K::ByNext => self.std_trusted_len(a[0]),
             K::CharIndices | K::StrSplit | K::StrMatches | K::EncodeUtf16 => false,
             K::Windows | K::OptionIntoIter | K::OptionIter | K::OptionIterMut | K::ResultIter | K::ResultIterMut | K::ResultIntoIter => {
@@ -5862,7 +5884,8 @@ impl Ex<'_, '_> {
     fn fused(&self, t: Ty) -> bool {
         match self.kind_args(t) {
             None => true,
-            Some((IterKind::ByNext, _)) => false,
+            // core: `impl<I: FusedIterator + ?Sized> FusedIterator for &mut I`.
+            Some((IterKind::ByNext, a)) => self.by_mut_builtin(a[0]).is_some_and(|inner| self.fused(inner)),
             Some((_, a)) => a.iter().all(|&x| self.kind_args(x).is_none() || self.fused(x)),
         }
     }
