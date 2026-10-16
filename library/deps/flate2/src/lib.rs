@@ -19,8 +19,15 @@ mod inflate;
 
 /// Compression level (the read side has no use for it, but the
 /// type is part of the crate surface ts-rust names).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Compression(u32);
+
+/// Upstream's default level is 6.
+impl Default for Compression {
+    fn default() -> Compression {
+        Compression(6)
+    }
+}
 
 impl Compression {
     /// A level from 0 (none) to 9 (best); values above 9 clamp

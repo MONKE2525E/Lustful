@@ -9,9 +9,17 @@ use core::fmt;
 pub type Result<T> = core::result::Result<T, Errno>;
 
 /// An error number. The constants are the Linux values.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Errno(i32);
+
+/// Upstream derives `Hash` over its raw `u16`, the negated code
+/// (`ENOENT` hashes as `0xfffe`).
+impl core::hash::Hash for Errno {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        (self.0.wrapping_neg() as u16).hash(state);
+    }
+}
 
 impl Errno {
     /// `EPERM`

@@ -20,7 +20,9 @@ fn path_bytes<P: Arg>(path: &P) -> Result<Vec<u8>> {
 }
 
 /// `OFlags` flags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct OFlags(u32);
 
 impl OFlags {
@@ -68,7 +70,9 @@ impl core::ops::BitAnd for OFlags {
 }
 
 /// `Mode` flags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Mode(u32);
 
 impl Mode {
@@ -115,7 +119,9 @@ impl core::ops::BitAnd for Mode {
 }
 
 /// `AtFlags` flags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct AtFlags(i32);
 
 impl AtFlags {
@@ -156,7 +162,9 @@ impl core::ops::BitAnd for AtFlags {
 }
 
 /// `Access` flags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Access(u32);
 
 impl Access {
@@ -192,7 +200,9 @@ impl core::ops::BitAnd for Access {
 }
 
 /// `StatxFlags` flags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct StatxFlags(u32);
 
 impl StatxFlags {
@@ -252,23 +262,25 @@ impl Mode {
     }
 }
 
-/// A file type, from the mode bits or a directory entry.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// A file type, from the mode bits or a directory entry. Upstream has
+/// no `Hash`; its discriminants are the `S_IF*` bits (an `as` cast
+/// reads them).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileType {
     /// A regular file.
-    RegularFile,
+    RegularFile = 0o100000,
     /// A directory.
-    Directory,
+    Directory = 0o040000,
     /// A symbolic link.
-    Symlink,
+    Symlink = 0o120000,
     /// A FIFO (named pipe).
-    Fifo,
+    Fifo = 0o010000,
     /// A socket.
-    Socket,
+    Socket = 0o140000,
     /// A character device.
-    CharacterDevice,
+    CharacterDevice = 0o020000,
     /// A block device.
-    BlockDevice,
+    BlockDevice = 0o060000,
     /// Unknown (the file system gave no type).
     Unknown,
 }
@@ -304,7 +316,10 @@ impl FileType {
 }
 
 /// The result of `stat` and kin (Linux fields).
-#[derive(Copy, Clone, Debug, Default)]
+// Upstream: `Debug, Copy, Clone`, with spare and newer fields this
+// adapter does not carry, so its Debug differs: none here.
+#[derive(Copy, Clone)]
+#[non_exhaustive]
 pub struct Stat {
     pub st_dev: u64,
     pub st_ino: u64,
@@ -347,14 +362,20 @@ fn stat_of(rec: &[u8]) -> Stat {
 }
 
 /// A timestamp within `Statx`.
-#[derive(Copy, Clone, Debug, Default)]
+// Upstream: `Debug, Copy, Clone`, with spare and newer fields this
+// adapter does not carry, so its Debug differs: none here.
+#[derive(Copy, Clone)]
+#[non_exhaustive]
 pub struct StatxTimestamp {
     pub tv_sec: i64,
     pub tv_nsec: u32,
 }
 
 /// The result of `statx`.
-#[derive(Copy, Clone, Debug, Default)]
+// Upstream: `Debug, Copy, Clone`, with spare and newer fields this
+// adapter does not carry, so its Debug differs: none here.
+#[derive(Copy, Clone)]
+#[non_exhaustive]
 pub struct Statx {
     pub stx_mask: u32,
     pub stx_blksize: u32,
@@ -416,7 +437,8 @@ pub const UTIME_NOW: i64 = (1 << 30) - 1;
 pub const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 /// The two times of `utimensat`.
-#[derive(Copy, Clone, Debug, Default)]
+// Upstream: `Debug, Clone` only.
+#[derive(Clone, Debug)]
 pub struct Timestamps {
     pub last_access: Timespec,
     pub last_modification: Timespec,
@@ -528,7 +550,9 @@ pub fn fcntl_setfl<Fd: AsFd>(fd: Fd, flags: OFlags) -> Result<()> {
 }
 
 /// Mount flags of a `StatVfs` (`ST_*`, Linux values).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct StatVfsMountFlags(u64);
 
 impl StatVfsMountFlags {
@@ -642,7 +666,9 @@ pub mod inotify {
     use crate::path::Arg;
 
 /// `inotify_init1` flags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct CreateFlags(u32);
 
 impl CreateFlags {
@@ -678,7 +704,8 @@ impl core::ops::BitAnd for CreateFlags {
 }
 
 /// `inotify_add_watch` mask bits.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug: upstream prints the bitflags form, which this adapter lacks.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct WatchFlags(u32);
 
 impl WatchFlags {
@@ -752,7 +779,8 @@ impl core::ops::BitAnd for WatchFlags {
 }
 
 /// inotify event mask bits, as read from an event record.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug: upstream prints the bitflags form, which this adapter lacks.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ReadFlags(u32);
 
 impl ReadFlags {

@@ -62,7 +62,9 @@ pub mod low_level;
 
 /// An id of a registered action (upstream's `SigId`; unregister
 /// by id is not in this adapter).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+/// Upstream's is `SigId { signal, action }` with its own Debug, Hash,
+/// and Ord; this one keeps only the identity (`PartialEq`).
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct SigId(usize);
 
 /// The next SigId number.

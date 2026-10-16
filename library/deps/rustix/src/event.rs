@@ -9,7 +9,9 @@ pub use crate::fs::Timespec;
 use crate::io::{Errno, Result};
 
 /// Poll event flags (`POLL*`, Linux values).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct PollFlags(u16);
 
 impl PollFlags {
@@ -67,7 +69,9 @@ impl core::ops::BitOrAssign for PollFlags {
 }
 
 /// One fd to poll, with its requested and returned events.
-#[derive(Copy, Clone, Debug)]
+// Upstream: `Debug, Clone` (no Copy); its Debug prints the raw `u16`
+// events, which this adapter does not, so there is none here.
+#[derive(Clone)]
 pub struct PollFd<'fd> {
     fd: BorrowedFd<'fd>,
     events: PollFlags,

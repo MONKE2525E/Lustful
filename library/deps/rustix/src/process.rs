@@ -251,7 +251,7 @@ pub enum Resource {
 }
 
 /// Resource limits: `None` is no limit (infinity).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Rlimit {
     pub current: Option<u64>,
     pub maximum: Option<u64>,

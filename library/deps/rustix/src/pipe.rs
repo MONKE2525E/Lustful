@@ -5,7 +5,9 @@ use crate::io::{Errno, Result};
 use crate::rec_u64;
 
 /// Flags for `pipe_with` (`pipe2` flags, Linux values).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct PipeFlags(u32);
 
 impl PipeFlags {

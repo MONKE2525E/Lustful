@@ -13,7 +13,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 /// Mask for defining which events shall be listened with
 /// `Fanotify::mark` and for querying notifications.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct MaskFlags(u64);
 
 impl MaskFlags {
@@ -91,7 +93,9 @@ impl core::ops::BitAnd for MaskFlags {
 }
 
 /// Configuration options for `Fanotify::init`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct InitFlags(u32);
 
 impl InitFlags {
@@ -141,7 +145,9 @@ impl core::ops::BitAnd for InitFlags {
 }
 
 /// File status flags for fanotify events file descriptors.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct EventFFlags(u32);
 
 impl EventFFlags {
@@ -193,7 +199,9 @@ impl core::ops::BitAnd for EventFFlags {
 }
 
 /// Configuration options for `Fanotify::mark`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+// No Debug (upstream prints the bitflags form, which this adapter lacks)
+// and no Default (upstream has none).
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct MarkFlags(u32);
 
 impl MarkFlags {

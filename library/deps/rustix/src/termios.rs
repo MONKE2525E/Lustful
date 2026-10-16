@@ -4,7 +4,7 @@ use crate::fd::{AsFd, AsRawFd};
 use crate::io::{Errno, Result};
 
 /// A terminal window size.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Winsize {
     /// The number of rows the terminal has.
     pub ws_row: u16,

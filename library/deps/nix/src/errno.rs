@@ -9,8 +9,9 @@
 use core::fmt;
 
 /// An error number.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(i32)]
+#[non_exhaustive]
 pub enum Errno {
     UnknownErrno = 0,
     EPERM = 1,
