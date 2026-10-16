@@ -342,9 +342,14 @@ impl ImplIndex {
         self.shadows.push((rec, negative));
     }
 
-    /// One impl record by id.
+    /// One impl record by id. Handing out a derived record notes a read
+    /// of its Adt's derive list (check/derive_delta.rs).
     pub fn get(&self, id: ImplId) -> &ImplRecord {
-        &self.impls[id.0 as usize]
+        let rec = &self.impls[id.0 as usize];
+        if let (Synthetic::Derive(_), SelfHead::Adt(def)) = (rec.synthetic, rec.head) {
+            crate::check::derive_delta::note_def(def);
+        }
+        rec
     }
 
     /// One impl record by its def.

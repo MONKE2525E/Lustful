@@ -17,6 +17,7 @@ pub mod cow;
 pub mod extend;
 pub mod defaults;
 pub mod delta_audit;
+pub mod derive_delta;
 pub mod fmt;
 pub mod generics;
 pub mod into;
@@ -2092,6 +2093,13 @@ fn use_item_trait_layers(p: &Program, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>
 /// own entry reports any errors, so the closure fn reports none and
 /// marks the result poisoned instead.
 pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
+    // Derive lists the check reads become `Derives` reads (R12).
+    let ((mut ck, errs), noted) = derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid));
+    derive_delta::record(p, &mut ck.reads, &noted);
+    (ck, errs)
+}
+
+fn check_fn_noted<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
     if let Some(def) = p.gx.closure_fns.get(&fid)
         && let Some(entry) = p.gx.closures.get(def)
     {
@@ -17684,7 +17692,7 @@ impl<'p> Ctx<'p> {
             }
             (_, CV::Aggregate(_) | CV::Variant(..)) if self.tys.local_adt(t).is_some() => {
                 let a = self.tys.local_adt(t).unwrap_or(AdtId(0));
-                if !p.adt(a).derives.partial_eq {
+                if !p.derives_of(a).partial_eq {
                     self.non_structural_const(t, span);
                     return None;
                 }

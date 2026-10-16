@@ -771,7 +771,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
             let adt = p.adt(*a);
             // A non-generic Adt's derive was checked against its fields.
             let instance = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some());
-            adt.derives.copy && (!instance || adt.variants.iter().all(|v| v.fields.iter().all(|f| is_copy_c(p, &cty(&p.tys, f.ty)))))
+            p.derives_of(*a).copy && (!instance || adt.variants.iter().all(|v| v.fields.iter().all(|f| is_copy_c(p, &cty(&p.tys, f.ty)))))
         }
         _ => false,
     }
@@ -9356,8 +9356,8 @@ fn glue_def_value(
             // a type is its `Cmp` glue, field `Ord` compares included.
             if partial
                 && let CTy::Adt(adt_id) = t
-                && p.adt(*adt_id).derives.partial_ord
-                && p.adt(*adt_id).derives.ord
+                && p.derives_of(*adt_id).partial_ord
+                && p.derives_of(*adt_id).ord
                 && !p.gx.adt_instance_of.get(adt_id.0 as usize).is_some_and(|o| o.is_some())
                 && !p.gx.adt_generics.get(adt_id.0 as usize).is_some_and(|g| !g.params.is_empty())
             {
@@ -9569,7 +9569,7 @@ fn glue_def_value(
                 CTy::Adt(adt_id) => {
                     let adt = p.adt(*adt_id);
                     if adt.is_enum {
-                        let vi = adt.derives.default_variant.unwrap_or(0) as usize;
+                        let vi = p.derives_of(*adt_id).default_variant.unwrap_or(0) as usize;
                         let _ = writeln!(body, "  return {};", variant_lit(p, t, vi, &[]));
                     } else if adt.variants[0].fields.is_empty() {
                         let _ = writeln!(body, "  return {};", zero_lit(p, t));

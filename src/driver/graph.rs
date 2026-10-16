@@ -192,6 +192,12 @@ pub enum ReadKey {
     /// candidate trait. A `use` edit flips it without touching any
     /// binding the body names. The fingerprint is the answer.
     TraitInScope(ModuleId, DefId),
+    /// The derive list of one local Adt template (PLAN R12): every
+    /// `Program::derives_of` call inside a body check, and every trait
+    /// selection whose Self head is the Adt (a derived impl is a
+    /// synthetic record, which no `ImplSet` read covers). The
+    /// fingerprint is the list itself (`derives_fingerprint`).
+    Derives(DefId),
 }
 
 /// One recorded read: the fingerprint the node had when it was read, and
@@ -789,7 +795,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(
     adt.repr.int.hash(h);
     adt.repr.align.hash(h);
     adt.repr.pack.hash(h);
-    let d = adt.derives;
+    let d = adt.derives_unlogged();
     (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(h);
     // `#[non_exhaustive]` changes match exhaustiveness answers over
     // this type, which layout readers (a match's scrutinee type) see.
@@ -843,6 +849,18 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(
             hash_ty_refs(h, p, &p.tys, fd.ty, r);
         }
     }
+}
+
+/// The `Derives(def)` node's fingerprint: the derive list of the Adt
+/// with that def, or a fixed value when this program has no such Adt.
+fn derives_fingerprint(p: &Program, def: DefId) -> Fingerprint {
+    let mut h = FxHasher::default();
+    "derives-v1".hash(&mut h);
+    if let Some(a) = p.adt_by_def(def) {
+        let d = p.adt(a).derives_unlogged();
+        (d.debug, d.clone, d.copy, d.partial_eq, d.eq, d.hash, d.partial_ord, d.ord, d.default, d.default_variant).hash(&mut h);
+    }
+    Fingerprint(h.finish())
 }
 
 /// The `LayoutOf(adt)` node's fingerprint (section 8.1), separate from
@@ -1594,7 +1612,28 @@ impl<'a> Program {
         let set = self.impl_bucket(trait_, head);
         let key = ImplSetKey { trait_, head };
         reads.record_with(ReadKey::ImplSet(key), set.impls.is_empty(), || impl_set_fingerprint(self, &key, &set));
+        if let Head::Adt(def) = head
+            && self.adt_by_def(def).is_some()
+        {
+            self.record_derives(reads, def);
+        }
         set
+    }
+
+    /// The def a `Derives` read of Adt `a` keys on: the template's, for
+    /// an instance (instances copy their template's list). None for a
+    /// placeholder row.
+    pub(crate) fn derive_def(&self, a: AdtId) -> Option<DefId> {
+        match self.gx.adt_instance_of.get(a.0 as usize).copied().flatten() {
+            Some((template, _)) => Some(template),
+            None => self.gx.adt_info.get(a.0 as usize).map(|&(def, _)| def).filter(|&d| d != DefId::PLACEHOLDER),
+        }
+    }
+
+    /// Records a `Derives` read of the Adt template `def`.
+    /// check/derive_delta.rs calls it for each def a scope noted.
+    pub(crate) fn record_derives(&self, reads: &mut Reads, def: DefId) {
+        reads.record_with(ReadKey::Derives(def), self.adt_by_def(def).is_none(), || derives_fingerprint(self, def));
     }
 
     /// True for a trait whose impls fill `ImplSet` buckets, and so stay out
@@ -1745,6 +1784,7 @@ impl<'a> Program {
                 let ans = self.trait_in_module_answer(*module, *trait_def);
                 Read { fingerprint: trait_in_scope_fingerprint(ans), failed: !ans }
             }
+            ReadKey::Derives(def) => Read { fingerprint: derives_fingerprint(self, *def), failed: self.adt_by_def(*def).is_none() },
         }
     }
 
@@ -2563,6 +2603,26 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
             assert_ne!(sig_fingerprint(p, def), sig, "a method visibility edit moves Sig");
             assert!(p.reads_dirty(&stored) > 0, "the method caller is dirty");
         });
+    }
+
+    /// A body that copies an Adt only inside a tuple and clones it only
+    /// inside an Option names no signature that holds it, yet its answer
+    /// reads the Adt's derive list: it records a `Derives` read, which a
+    /// derive edit dirties and an unrelated derive edit does not (R12).
+    #[test]
+    fn derive_answers_record_derives_reads() {
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let src = "#[derive(Clone, Copy)]\nstruct A { x: u8 }\n#[derive(Clone)]\nstruct U;\n\
+                   fn main() { let t = (A { x: 1 }, 2u8); let u = t; let o = Some(A { x: 3 }); let p = o.clone(); \
+                   println!(\"{} {} {}\", t.0.x, u.0.x, p.unwrap().x); }\n";
+        let reads = main_reads(&interner, &known, src);
+        assert!(reads.keys().any(|k| matches!(k, ReadKey::Derives(_))), "a Derives read is recorded");
+        assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
+        let no_copy = src.replacen("#[derive(Clone, Copy)]", "#[derive(Clone)]", 1);
+        assert!(dirty_in(&interner, &known, &no_copy, &reads) >= 1, "-Copy on A dirties the tuple copy");
+        let unrelated = src.replacen("#[derive(Clone)]\nstruct U;", "#[derive(Clone, Copy)]\nstruct U;", 1);
+        assert_eq!(dirty_in(&interner, &known, &unrelated, &reads), 0, "+Copy on an Adt main never asks about stays clean");
     }
 
     /// A const def's `Sig` fingerprint folds its evaluated value: a

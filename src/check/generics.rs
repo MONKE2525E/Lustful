@@ -7653,7 +7653,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
     for a in 0..n_adts {
         let adt = AdtId(a as u32);
         let (def, n_params) = p.gx.adt_info[a];
-        let (derives, is_enum) = (p.adt(adt).derives, p.adt(adt).is_enum);
+        let (derives, is_enum) = (p.derives_of(adt), p.adt(adt).is_enum);
         let wanted: [(bool, DefId, Sym); 9] = [
             (derives.clone, lang.clone, names[0]),
             (derives.copy, lang.copy, names[1]),
@@ -9541,10 +9541,10 @@ fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId 
     let at = id.0 as usize;
     let (name, is_enum, derives, span, adt_ne) = {
         let src = p.adt(template);
-        (src.name, src.is_enum, src.derives, src.span, src.non_exhaustive)
+        (src.name, src.is_enum, p.derives_of(template), src.span, src.non_exhaustive)
     };
     p.adts[at] =
-        crate::check::collect::AdtDef { name, is_enum, variants, derives, span, repr: p.adt(template).repr, non_exhaustive: adt_ne };
+        crate::check::collect::AdtDef::new(name, is_enum, variants, derives, span, p.adt(template).repr, adt_ne);
     p.tys.register_adt_instance(def, args_id, id);
     p.defs.insert_adt_instance(def, id);
     p.gx.adt_info[at] = (def, args.len());
@@ -9574,15 +9574,8 @@ fn instance_adt_id(p: &mut Program, def: DefId, args: ArgsId) -> AdtId {
         key = key.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
     };
     while p.adts.len() <= at {
-        p.adts.push(crate::check::collect::AdtDef {
-            name: p.interner.intern(""),
-            is_enum: false,
-            variants: Vec::new(),
-            derives: Default::default(),
-            span: Span::default(),
-            repr: Default::default(),
-            non_exhaustive: false,
-        });
+        let name = p.interner.intern("");
+        p.adts.push(crate::check::collect::AdtDef::new(name, false, Vec::new(), Default::default(), Span::default(), Default::default(), false));
         p.gx.adt_info.push((DefId::PLACEHOLDER, 0));
         p.gx.adt_generics.push(Generics::default());
         p.gx.adt_envs.push(Vec::new());
@@ -11210,7 +11203,7 @@ fn prove_trait_ref(
                 } else if let Some(a) = cx.tys.local_adt(t) {
                     // A derived Adt: every field must hold, with
                     // this application's args substituted.
-                    let d = p.adt(a).derives;
+                    let d = p.derives_of(a);
                     let derived = if tr.def == lang.copy {
                         d.copy
                     } else if tr.def == lang.clone {
@@ -11624,7 +11617,7 @@ fn compute_glue_methods(p: &mut Program) {
         // copy it in some places and call its `clone` in others; the
         // glue does not model that, so such a field stays rejected.
         if rec.trait_def == lang.clone
-            && (p.adt(a).derives.copy
+            && (p.derives_of(a).copy
                 || p.gx.index.impls_of_trait(lang.copy).iter().any(|&id| p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)) == TyKind::Adt(d, EMPTY_ARGS)))
         {
             continue;
@@ -11656,7 +11649,7 @@ fn compute_glue_methods(p: &mut Program) {
         if rec.trait_def == lang.partial_ord
             && (["lt", "le", "gt", "ge"].iter().any(|m| has(m))
                 || p.tys.args(rec.trait_ref.args).get(1).and_then(|g| g.as_ty()) != Some(self_ty)
-                || p.adt(a).derives.ord
+                || p.derives_of(a).ord
                 || p.gx.index.impls_of_trait(lang.ord).iter().any(|&id| p.tys.kind(p.gx.index.get(id).self_ty(&p.tys)) == TyKind::Adt(d, EMPTY_ARGS)))
         {
             continue;
@@ -11729,7 +11722,7 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
         let (def, _) = p.gx.adt_info[idx];
         let (derives, span, is_enum, field_tys) = {
             let a = p.adt(adt_id);
-            (a.derives, a.span, a.is_enum, a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect::<Vec<Ty>>())
+            (p.derives_of(adt_id), a.span, a.is_enum, a.variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect::<Vec<Ty>>())
         };
         // A synthetic std Adt's derives are std's own, valid as written.
         if is_std_adt(&p.tys, adt_id) {

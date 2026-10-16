@@ -3358,13 +3358,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     work.retain(|&i| !program.check_skips(LocalDefId(i as u32)));
     let results = par_map(&work, |&i| {
         let f = LocalDefId(i as u32);
-        let (checked, mut errs) = check::check_fn(&program, f);
-        if !errs.is_empty() {
-            return (None, errs);
-        }
-        let body = lower::lower(&program, f, checked);
-        errs.extend(borrowck::borrowck(&program, &body));
-        (keep_bodies.then_some(body), errs)
+        // Lowering and borrowck read derive lists too (Copy operands,
+        // moves): their notes join the body's reads (check/derive_delta.rs).
+        let ((body, errs), noted) = check::derive_delta::scoped(program.record_reads, || {
+            let (checked, mut errs) = check::check_fn(&program, f);
+            if !errs.is_empty() {
+                return (None, errs);
+            }
+            let body = lower::lower(&program, f, checked);
+            errs.extend(borrowck::borrowck(&program, &body));
+            (Some(body), errs)
+        });
+        let body = body.filter(|_| keep_bodies).map(|mut b| {
+            check::derive_delta::record(&program, &mut b.reads, &noted);
+            b
+        });
+        (body, errs)
     });
     let mut diags: Vec<Diag> = Vec::new();
     for (k, &i) in work.iter().enumerate() {

@@ -63,7 +63,9 @@ pub struct AdtDef {
     pub is_enum: bool,
     /// A struct has exactly one variant, named after the struct.
     pub variants: Vec<Variant>,
-    pub derives: Derives,
+    /// Private: readers go through `Program::derives_of`, which logs the
+    /// read for the derive edit path (check/derive_delta.rs).
+    derives: Derives,
     pub span: Span,
     /// The `repr` of the type, in layout terms.
     pub repr: crate::ty::layout::Repr,
@@ -73,6 +75,27 @@ pub struct AdtDef {
     /// `..`, and an enum match needs a wildcard arm. Inside the
     /// defining crate it changes nothing.
     pub non_exhaustive: bool,
+}
+
+impl AdtDef {
+    /// An Adt with its derive list (the field is private, see `derives`).
+    pub fn new(
+        name: Sym,
+        is_enum: bool,
+        variants: Vec<Variant>,
+        derives: Derives,
+        span: Span,
+        repr: crate::ty::layout::Repr,
+        non_exhaustive: bool,
+    ) -> AdtDef {
+        AdtDef { name, is_enum, variants, derives, span, repr, non_exhaustive }
+    }
+
+    /// The derive list with no read noted: for fingerprints, which
+    /// hash it rather than answer from it (driver/graph.rs).
+    pub(crate) fn derives_unlogged(&self) -> Derives {
+        self.derives
+    }
 }
 
 /// One evaluated `const` item.
@@ -388,6 +411,14 @@ impl Program {
     }
     pub fn adt(&self, id: AdtId) -> &AdtDef {
         &self.adts[id.0 as usize]
+    }
+    /// The derive list of Adt `id` (an instance's is its template's).
+    /// Every reader of a derive list comes here: inside a body check it
+    /// notes a `Derives` read of the Adt (check/derive_delta.rs), so a
+    /// derive edit rechecks the bodies whose answers it can move.
+    pub fn derives_of(&self, id: AdtId) -> Derives {
+        crate::check::derive_delta::note(self, id);
+        self.adts[id.0 as usize].derives
     }
     pub fn fn_info(&self, id: LocalDefId) -> &FnInfo {
         &self.fns[id.0 as usize]
@@ -4411,7 +4442,7 @@ pub fn collect_reuse(
     let mut deferred_debug: Vec<(Ty, Span)> = Vec::new();
     for i in 0..p.adts.len() {
         let adt = &p.adts[i];
-        let d = adt.derives;
+        let d = p.derives_of(AdtId(i as u32));
         for v in &adt.variants {
             for f in &v.fields {
                 if p.tys.flags(f.ty).contains_param() {
@@ -7698,7 +7729,7 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    p.adt(a).derives.copy
+                    p.derives_of(a).copy
                         && (p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
                             && p.gx.adt_instance_of.get(a.0 as usize).is_none_or(|o| o.is_none())
                             || p.adt(a).variants.iter().all(|v| v.fields.iter().all(|f| is_copy(p, tys, f.ty)))
@@ -8030,7 +8061,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             if p.gx.glue_methods.contains_key(&(a, p.gx.lang.clone)) {
                 return true;
             }
-            (p.adt(a).derives.clone && adt_instance_fields_all(p, a, t, GlueKey::Clone, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
+            (p.derives_of(a).clone && adt_instance_fields_all(p, a, t, GlueKey::Clone, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
                 || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen)
         }
         None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen),
@@ -8137,13 +8168,13 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                 Some(_) if pcmp && !total && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, Some("partial_cmp"), &["lt"], seen) => true,
                 Some(a)
                     if no_ord
-                        && !p.adt(a).derives.ord
+                        && !p.derives_of(a).ord
                         && written_glue_impl(p, tys, t, p.gx.lang.partial_ord, Some("partial_cmp"), &["lt", "le", "gt", "ge"], seen) =>
                 {
                     true
                 }
                 Some(a) => {
-                    let d = p.adt(a).derives;
+                    let d = p.derives_of(a);
                     if !(if total { d.ord } else { d.partial_ord }) {
                         return false;
                     }
@@ -8501,7 +8532,7 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bo
             match tys.local_adt(t) {
                 // A written impl the glue calls (`gx.written_hash`).
                 Some(a) if p.gx.written_hash.contains_key(&a) => true,
-                Some(a) if p.adt(a).derives.hash => adt_fields_all(p, a, t, GlueKey::Hash, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
+                Some(a) if p.derives_of(a).hash => adt_fields_all(p, a, t, GlueKey::Hash, seen, &mut |f, seen| glue_hash(p, tys, f, seen)),
                 _ => false,
             }
         }
@@ -8596,7 +8627,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) ->
                         return true;
                     }
                     let adt = p.adt(a);
-                    if !adt.derives.default {
+                    if !p.derives_of(a).default {
                         return false;
                     }
                     // An enum's default is its unit `#[default]` variant.
@@ -8670,7 +8701,7 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.adt(a).derives.eq && adt_instance_fields_all(p, a, t, GlueKey::TotalEq, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
+                    (p.derives_of(a).eq && adt_instance_fields_all(p, a, t, GlueKey::TotalEq, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen),
@@ -8733,7 +8764,7 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool
                 // A written non-generic impl: the glue calls its `eq`.
                 Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,
                 Some(a) => {
-                    (p.adt(a).derives.partial_eq && adt_instance_fields_all(p, a, t, GlueKey::Eq, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
+                    (p.derives_of(a).partial_eq && adt_instance_fields_all(p, a, t, GlueKey::Eq, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen),
@@ -8822,7 +8853,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.adt(a).derives.debug && adt_instance_fields_all(p, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
+                    (p.derives_of(a).debug && adt_instance_fields_all(p, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
                         || crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.debug)
                         // A conditional written impl (`impl<K: Debug>
                         // Debug for W<K>`) whose bounds the glue walks
