@@ -15318,6 +15318,15 @@ impl<'p> Ctx<'p> {
         if let Some(ret) = self.prim_try_into_method(e, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
             return ret;
         }
+        // `try_into()` on a `Box<[T]>` value: alloc's `TryFrom<Box<[T]>>
+        // for Box<[T; N]>`, picked at the first autoderef step (by
+        // value), before the slice under the box (check/tryfrom.rs).
+        let rt_box = self.deep(rt);
+        if self.tys.boxed_slice_elem(rt_box).is_some()
+            && let Some(ret) = self.vec_try_into_method(e, rt_box, 0, name, name_span, args, turbofish, expected, builtin_only)
+        {
+            return ret;
+        }
         // `try_into()` from a slice to an array target (check/tryfrom.rs).
         if let Some(ret) = self.slice_try_into_method(e, rt, base, derefs, name, name_span, args, turbofish, expected, builtin_only) {
             return ret;

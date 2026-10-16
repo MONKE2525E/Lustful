@@ -65,11 +65,30 @@ pub fn slice_try_shape(tys: &impl crate::ty::TyIntern, src: Ty, dst: Ty) -> bool
     }
 }
 
-/// The shape of core's `TryFrom<Vec<T>> for [T; N]` (no
+/// The shape of alloc's owned-to-array `TryFrom` pairs (no
 /// unification), for the solver's `Error` normalization: the error
-/// is the Vec type itself.
+/// is the source type itself (`owned_try_parts`).
 pub fn vec_try_shape(tys: &impl crate::ty::TyIntern, src: Ty, dst: Ty) -> bool {
-    tys.builtin_of(src) == Some(BuiltinTy::Vec) && matches!(tys.kind(dst), TyKind::Array(el, _) if tys.adt_first_ty_arg(src) == Some(el))
+    owned_try_parts(tys, src, dst).is_some_and(|(se, de)| se == de)
+}
+
+/// The element types of alloc's owned-to-array `TryFrom` pairs, by
+/// shape: `TryFrom<Vec<T>> for [T; N]`, `TryFrom<Vec<T>> for Box<[T;
+/// N]>`, and `TryFrom<Box<[T]>> for Box<[T; N]>` (no bound on `T`;
+/// the source comes back in `Err` on a length miss). None for other
+/// pairs.
+pub fn owned_try_parts(tys: &impl crate::ty::TyIntern, src: Ty, dst: Ty) -> Option<(Ty, Ty)> {
+    let arr_el = |t: Ty| match tys.kind(t) {
+        TyKind::Array(el, _) => Some(el),
+        _ => None,
+    };
+    if tys.builtin_of(src) == Some(BuiltinTy::Vec) {
+        let se = tys.adt_first_ty_arg(src)?;
+        let de = arr_el(dst).or_else(|| arr_el(tys.boxed_elem(dst)?))?;
+        return Some((se, de));
+    }
+    let se = tys.boxed_slice_elem(src)?;
+    Some((se, arr_el(tys.boxed_elem(dst)?)?))
 }
 
 /// True for the concrete scalar kinds the pair table covers.
@@ -117,16 +136,13 @@ impl<'p> Ctx<'p> {
         Some(TryErr::Slice)
     }
 
-    /// Core's `TryFrom<Vec<T>> for [T; N]` (no bound on `T`): the
-    /// impl's `Error`, the Vec type itself, with the elements
+    /// Alloc's owned-to-array pairs (`owned_try_parts`: a Vec to an
+    /// array or a boxed array, a boxed slice to a boxed array): the
+    /// impl's `Error`, the source type itself, with the elements
     /// unified; None for any other pair.
     pub(super) fn vec_try_from(&mut self, src: Ty, dst: Ty) -> Option<Ty> {
-        let src = self.deep(src);
-        if self.tys.builtin_of(src) != Some(BuiltinTy::Vec) {
-            return None;
-        }
-        let el = self.tys.adt_first_ty_arg(src)?;
-        let TyKind::Array(el2, _) = self.kind(dst) else { return None };
+        let (src, dst) = (self.deep(src), self.deep(dst));
+        let (el, el2) = owned_try_parts(&self.tys, src, dst)?;
         if !self.unify(el, el2) {
             return None;
         }
@@ -584,9 +600,10 @@ impl<'p> Ctx<'p> {
     }
 
     /// `vec.try_into()` to an array target: core's `TryFrom<Vec<T>>
-    /// for [T; N]`, the checked cast res lowered by the destination
-    /// type, with the Vec back in `Err` on a length miss. Only a Vec
-    /// value receiver (rustc picks the blanket `TryInto` at the
+    /// for [T; N]` (and the boxed-array pairs from a Vec or a `Box<[T]>`,
+    /// `owned_try_parts`), the checked cast res lowered by the
+    /// destination type, with the source back in `Err` on a length
+    /// miss. Only a value receiver (rustc picks the blanket `TryInto` at the
     /// first autoderef step, so `(&v).try_into()` is no Vec pair).
     /// None for any other receiver or a known non-array target, so
     /// the trait search runs (user `TryFrom<Vec<..>>` impls).
@@ -605,7 +622,8 @@ impl<'p> Ctx<'p> {
     ) -> Option<Ty> {
         let p = self.p;
         let lang = &p.gx.lang;
-        if self.name(name) != "try_into" || !turbofish.is_empty() || derefs > 0 || self.tys.builtin_of(base) != Some(BuiltinTy::Vec) {
+        let owned_src = self.tys.builtin_of(base) == Some(BuiltinTy::Vec) || self.tys.boxed_slice_elem(base).is_some();
+        if self.name(name) != "try_into" || !turbofish.is_empty() || derefs > 0 || !owned_src {
             return None;
         }
         let replayed = self
@@ -615,7 +633,8 @@ impl<'p> Ctx<'p> {
         let exp_pair = expected.map(|t| self.deep(t)).and_then(|t| self.tys.result_args(t));
         let known = replayed.or_else(|| exp_pair.map(|(ok, _)| self.deep(ok)));
         if let Some(dst) = known {
-            if !matches!(self.kind(dst), TyKind::Array(..)) {
+            let boxed_arr = self.tys.boxed_elem(dst).is_some_and(|b| matches!(self.kind(b), TyKind::Array(..)));
+            if !matches!(self.kind(dst), TyKind::Array(..)) && !boxed_arr {
                 return None;
             }
             let Some(err) = self.vec_try_from(base, dst) else {

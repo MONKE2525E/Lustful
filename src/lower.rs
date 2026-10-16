@@ -3875,8 +3875,9 @@ impl<'p> Lower<'p> {
             TyKind::Ref(_, _, i) => matches!(self.kind(i), TyKind::Array(..)),
             _ => false,
         };
-        if matches!(self.kind(dst_ty), TyKind::Array(..)) && self.body.tys.builtin_of(src_ty) == Some(crate::ty::BuiltinTy::Vec) {
-            // Core's `TryFrom<Vec<T>> for [T; N]`: the Vec moves in.
+        if crate::check::tryfrom::owned_try_parts(&self.body.tys, src_ty, dst_ty).is_some() {
+            // Alloc's `TryFrom<Vec<T>> for [T; N]` and the boxed-array
+            // pairs: the source moves in.
             self.call_into(CallTarget::Builtin(Builtin::VecTryInto), vec![Operand::Move(Place::local(s))], d, span);
             return;
         }

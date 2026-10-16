@@ -2759,6 +2759,32 @@ impl FnGen<'_, '_> {
             // Core's `TryFrom<Vec<T>> for [T; N]`: on a length match the
             // elements move into the array and the emptied Vec drops
             // (its buffer frees); else the Vec moves into `Err`.
+            // Alloc's boxed-array pairs: on a length match the buffer
+            // becomes the box (a Vec's shrunk to its length first, as
+            // `into_boxed_slice` does); else the source moves into `Err`.
+            CallTarget::Builtin(Builtin::VecTryInto) if matches!(dest_cty, CTy::Result(ok, _) if matches!(**ok, CTy::Boxed(_))) => {
+                let (sv, sct) = self.operand(&args[0], loc, post);
+                let CTy::Result(ok, err) = dest_cty.clone() else { unreachable!() };
+                let CTy::Boxed(arr) = &*ok else { unreachable!() };
+                let CTy::Array(el, n) = &**arr else { unreachable!("a boxed array") };
+                let n = *n;
+                let res = CTy::Result(ok.clone(), err);
+                collect_types(&res, &mut self.sig_types);
+                let (t, v) = (self.tmp(), self.tmp());
+                let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
+                let (ok_d, err_d) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
+                let (elc, arrc) = (ctype(el), ctype(arr));
+                let _ = writeln!(self.out, "    {} {t}; {} {v} = {sv};", ctype(&res), ctype(&sct));
+                let buf = if matches!(sct, CTy::Vec(_)) {
+                    format!(
+                        "(({v}.cap != {n} && sizeof({elc}) != 0) ? lust_realloc({v}.ptr, {v}.cap * sizeof({elc}), _Alignof({elc}), {n} * sizeof({elc})) : {v}.ptr)"
+                    )
+                } else {
+                    format!("((void*){v}.ptr)")
+                };
+                let _ = writeln!(self.out, "    if ({v}.len == {n}) {{ {ok_f} = ({arrc}*){buf}; {ok_d} }} else {{ {err_f} = {v}; {err_d} }}");
+                t
+            }
             CallTarget::Builtin(Builtin::VecTryInto) => {
                 let (sv, sct) = self.operand(&args[0], loc, post);
                 let CTy::Result(ok, err) = dest_cty.clone() else { unreachable!() };
