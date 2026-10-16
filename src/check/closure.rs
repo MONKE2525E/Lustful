@@ -835,7 +835,7 @@ impl<'p> Ctx<'p> {
         let ety = self.out.expr_ty[self.ei(e)];
         // A place through a user `Deref` is the value of its `deref`
         // call, with the base borrowed (`cap_walk` records that borrow).
-        if matches!(p.ast.expr(e), Expr::Field { .. } | Expr::Deref(_) | Expr::Index { .. }) && self.out.deref_recv.iter().any(|(x, _)| *x == e) {
+        if matches!(p.ast.expr(e), Expr::Field { .. } | Expr::TupleField { .. } | Expr::Deref(_) | Expr::Index { .. }) && self.out.deref_recv.iter().any(|(x, _)| *x == e) {
             return Cat::Rvalue;
         }
         match (p.ast.expr(e), self.out.expr_res[self.ei(e)]) {
@@ -1400,7 +1400,7 @@ impl<'p> Ctx<'p> {
             // Through a user `Deref` impl: `deref(&base)`, or
             // `deref_mut(&mut base)` in a mutable use (an index then
             // reads its index as a value).
-            Expr::Field { base: inner, .. } | Expr::Deref(inner) | Expr::Index { base: inner, .. }
+            Expr::Field { base: inner, .. } | Expr::TupleField { base: inner, .. } | Expr::Deref(inner) | Expr::Index { base: inner, .. }
                 if let Some((before, has_mut)) =
                     self.out.deref_recv.iter().filter(|(x, _)| *x == e).min_by_key(|(_, d)| d.depth).map(|(_, d)| (d.before, d.f_mut.is_some())) =>
             {

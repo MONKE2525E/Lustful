@@ -804,7 +804,11 @@ impl<'p> Lower<'p> {
                 Self::derefs(b, derefs).project(Proj::Field(index))
             }
             (Expr::TupleField { base, .. }, Res::Field { derefs, index }) => {
-                let b = self.place(*base);
+                let span = self.span(e);
+                let b = match self.deref_steps(e, *base, span) {
+                    Some(root) => root,
+                    None => self.place(*base),
+                };
                 Self::derefs(b, derefs).project(Proj::Field(index))
             }
             (Expr::Index { base, index }, Res::SliceIndex { derefs }) => {

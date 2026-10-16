@@ -8868,7 +8868,24 @@ impl<'p> Ctx<'p> {
             Expr::TupleField { base, index } => {
                 let bt = self.expr(*base, None);
                 self.run_obligations(false);
-                let (derefs, inner) = self.autoderef_smart(bt);
+                let (mut derefs, mut inner) = self.autoderef_smart(bt);
+                // As for named fields, autoderef goes on through user
+                // `Deref` impls (`m.0` on a `ManuallyDrop<Newtype>`).
+                // A Cow base stays a reject (its view is check/cow.rs's).
+                for _ in 0..4 {
+                    let has = match self.kind(inner) {
+                        TyKind::Tuple(ts) => (*index as usize) < self.tys.tys_of(ts).len(),
+                        _ => self.tys.local_adt(inner).is_some_and(|a| {
+                            !p.adt(a).is_enum && p.adt(a).variants[0].shape == VariantShape::Tuple && (*index as usize) < p.adt(a).variants[0].fields.len()
+                        }),
+                    };
+                    if has || crate::check::collect::cow_arg(&self.tys, inner).is_some() {
+                        break;
+                    }
+                    let Some(target) = self.record_place_deref(e, inner, derefs, span) else { break };
+                    let tref = self.tys.mk_ref(false, target);
+                    (derefs, inner) = self.autoderef_smart(tref);
+                }
                 let field_ty = match self.kind(inner) {
                     TyKind::Tuple(ts) => self.tys.tys_of(ts).get(*index as usize).copied(),
                     _ => match self.tys.local_adt(inner) {
