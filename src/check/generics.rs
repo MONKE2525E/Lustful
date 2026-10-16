@@ -10317,7 +10317,7 @@ fn ensure_iter_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
     }
     let lang = p.gx.lang;
     let self_args = p.tys.intern_args(&[GenericArg::Ty(self_ty)]);
-    let select = |p: &Program, trait_def: DefId| {
+    let select = |p: &mut Program, trait_def: DefId| {
         let tr = TraitRef { def: trait_def, args: self_args, bindings: EMPTY_BINDINGS };
         let sel = {
             let mut cx = crate::traits::solve::PureCx::new(&p.tys);
@@ -10326,6 +10326,12 @@ fn ensure_iter_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
         };
         match sel {
             Selection::Impl { id, args, .. } if prove_goal(p, &[], tr) => Some((id, args)),
+            // The pure solver cannot prove an Fn-family bound on a
+            // closure (check proved it with the closure's signature).
+            Selection::Impl { id, .. } => {
+                let rec = p.gx.index.get(id).clone();
+                fn_bound_impl_args(p, &rec, self_ty).map(|args| (id, args))
+            }
             _ => None,
         }
     };
@@ -10367,6 +10373,98 @@ fn ensure_iter_methods(p: &mut Program, adt: AdtId, queue: &mut Vec<LocalDefId>)
                 && !rec.items.iter().any(|d| p.local_def(d.hash).is_some_and(|l| p.name(p.fn_info(l).name) == "len"))
         });
     p.gx.iter_methods.insert(adt, (next, size_hint, next_back, item, exact));
+}
+
+/// Impl args for `rec` at the concrete `self_ty` when the pure solver
+/// cannot prove the impl's Fn-family bounds (`impl<T, F: FnMut() ->
+/// Option<T>> Iterator for FromFn<F>`): Self binds what it can, each
+/// Fn-family bound on a closure or fn pointer binds the rest from that
+/// callable's signature (a closure's kind must fit the bound), and every
+/// other trait bound must prove at the bound args. None when a step
+/// fails or a parameter stays unbound.
+fn fn_bound_impl_args(p: &mut Program, rec: &crate::traits::index::ImplRecord, self_ty: Ty) -> Option<Vec<GenericArg>> {
+    use crate::check::closure::ClosureKind;
+    let lang = p.gx.lang;
+    let output = lang.output_of(lang.fn_once)?;
+    let mut binds: Vec<Option<GenericArg>> = vec![None; rec.generics.params.len()];
+    if !crate::check::iter::match_self_pat(p, &p.tys, rec.self_ty(&p.tys), self_ty, &mut binds) {
+        return None;
+    }
+    // A callable's (inputs, output), when its kind fits `trait_def`.
+    let callable = |p: &Program, t: Ty, trait_def: DefId| -> Option<(Vec<Ty>, Ty)> {
+        let (inputs, out) = match p.tys.kind(t) {
+            TyKind::Closure(def, _) => {
+                let e = p.gx.closures.get(&def)?;
+                let need = if trait_def == lang.fn_ { ClosureKind::Fn } else if trait_def == lang.fn_mut { ClosureKind::FnMut } else { ClosureKind::FnOnce };
+                let fits = matches!((e.kind, need), (ClosureKind::Fn, _) | (ClosureKind::FnMut, ClosureKind::FnMut | ClosureKind::FnOnce) | (ClosureKind::FnOnce, ClosureKind::FnOnce));
+                if !fits {
+                    return None;
+                }
+                (e.inputs.clone(), e.output)
+            }
+            TyKind::FnPtr(sig) => {
+                let s = p.tys.sig(sig).value;
+                (p.tys.tys_of(s.inputs).to_vec(), s.output)
+            }
+            _ => return None,
+        };
+        let concrete = inputs.iter().chain([&out]).all(|&x| !p.tys.flags(x).contains_param());
+        concrete.then_some((inputs, out))
+    };
+    // The bound's callee once Self or an earlier bound bound it.
+    let bound_ty = |pat: Ty, binds: &[Option<GenericArg>]| match p.tys.kind(pat) {
+        TyKind::Param(i) => binds.get(i.0 as usize).copied().flatten().and_then(|g| g.as_ty()),
+        _ if !p.tys.flags(pat).contains_param() => Some(pat),
+        _ => None,
+    };
+    let preds = rec.generics.predicates.clone();
+    let mut fn_pred = vec![false; preds.len()];
+    for _ in 0..=preds.len() {
+        let mut progress = false;
+        for (k, pred) in preds.iter().enumerate() {
+            let Predicate::Trait(b) = *pred else { continue };
+            if fn_pred[k] || !lang.is_fn_family(b.value.def) {
+                continue;
+            }
+            let args = p.tys.args(b.value.args).to_vec();
+            let (Some(callee_pat), Some(inputs_pat)) = (args.first().and_then(|g| g.as_ty()), args.get(1).and_then(|g| g.as_ty())) else {
+                return None;
+            };
+            let Some(callee) = bound_ty(callee_pat, &binds) else { continue };
+            let (inputs, out) = callable(p, callee, b.value.def)?;
+            let TyKind::Tuple(ts) = p.tys.kind(inputs_pat) else { return None };
+            let pats = p.tys.tys_of(ts).to_vec();
+            if pats.len() != inputs.len() || !pats.iter().zip(&inputs).all(|(&x, &y)| crate::check::iter::match_self_pat(p, &p.tys, x, y, &mut binds)) {
+                return None;
+            }
+            for &(assoc, g) in p.tys.bindings(b.value.bindings).to_vec().iter() {
+                if assoc != output {
+                    return None;
+                }
+                let Some(pat) = g.as_ty() else { return None };
+                if !crate::check::iter::match_self_pat(p, &p.tys, pat, out, &mut binds) {
+                    return None;
+                }
+            }
+            fn_pred[k] = true;
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    let args: Vec<GenericArg> = binds.into_iter().collect::<Option<Vec<_>>>()?;
+    for (k, &pred) in preds.iter().enumerate() {
+        match crate::traits::index::subst_predicate(&mut p.tys, pred, &args) {
+            _ if fn_pred[k] => {}
+            Predicate::Trait(b) if b.count == 0 && prove_goal(p, &[], b.value) => {}
+            // Regions are erased in mono; an equality or a bound this
+            // fallback cannot read keeps the old answer.
+            Predicate::Outlives(..) | Predicate::TypeOutlives(..) => {}
+            _ => return None,
+        }
+    }
+    Some(args)
 }
 
 /// True when a written fmt impl's where clauses hold for its selected

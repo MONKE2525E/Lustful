@@ -2605,7 +2605,7 @@ pub(crate) fn iter_impl_shape(p: &Program, rec: &crate::traits::index::ImplRecor
 /// each pattern parameter in `binds` (by parameter index). Only the
 /// shapes a written impl's Self type takes: parameters, Adts,
 /// references, tuples, slices, and arrays over them.
-fn match_self_pat(p: &Program, src: &dyn crate::ty::TyIntern, pat: Ty, t: Ty, binds: &mut Vec<Option<GenericArg>>) -> bool {
+pub(crate) fn match_self_pat(p: &Program, src: &dyn crate::ty::TyIntern, pat: Ty, t: Ty, binds: &mut Vec<Option<GenericArg>>) -> bool {
     match p.tys.kind(pat) {
         TyKind::Param(i) => {
             let i = i.0 as usize;
