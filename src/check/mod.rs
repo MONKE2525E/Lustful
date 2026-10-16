@@ -1601,6 +1601,14 @@ struct Ctx<'p> {
     /// for the by-path queries (`std_trait_imported`).
     trait_scopes: Vec<Vec<DefId>>,
     std_trait_scopes: Vec<Vec<Vec<Sym>>>,
+    /// Type items declared in enclosing blocks (R18), one layer of
+    /// stmt item indexes per block, pushed with `item_scopes`.
+    /// `body_scope`'s local tables are the base (from the fn's own
+    /// scope, for a nested fn) plus these layers, rebuilt on every
+    /// push and pop (`refresh_type_overlay`).
+    type_layers: Vec<Vec<u32>>,
+    /// `body_scope`'s local tables at body entry (the overlay base).
+    overlay_base: (Vec<(Sym, AdtId, Option<ast::Generics>)>, Vec<(Sym, Ty)>, Vec<(Sym, DefId)>),
     loops: Vec<LoopCtx>,
     errs: Vec<Diag>,
     negated_lits: Vec<ExprId>,
@@ -1634,7 +1642,7 @@ struct Ctx<'p> {
     /// entered: a const fn body names its own sibling items
     /// (`next_const_fn_sibs`, stashed by `call_target`), never the
     /// caller's block items.
-    const_fn_items_saved: Vec<(Vec<Vec<((Sym, CtxtId), u32)>>, Vec<usize>, Vec<Vec<DefId>>, Vec<Vec<Vec<Sym>>>)>,
+    const_fn_items_saved: Vec<(Vec<Vec<((Sym, CtxtId), u32)>>, Vec<usize>, Vec<Vec<DefId>>, Vec<Vec<Vec<Sym>>>, Vec<Vec<u32>>)>,
     next_const_fn_sibs: Option<Vec<u32>>,
     /// Trait method calls whose impl is selected at finish (see
     /// `method::confirm_deferred`).
@@ -2036,6 +2044,8 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         item_scope_starts: Vec::new(),
         trait_scopes: Vec::new(),
         std_trait_scopes: Vec::new(),
+        type_layers: Vec::new(),
+        overlay_base: (Vec::new(), Vec::new(), Vec::new()),
         loops: Vec::new(),
         errs: Vec::new(),
         negated_lits: Vec::new(),
@@ -2138,7 +2148,13 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         let (defs, paths) = use_item_trait_layers(p, sibs);
         cx.trait_scopes.push(defs);
         cx.std_trait_scopes.push(paths);
+        let type_layer: Vec<u32> = sibs.iter().copied().filter(|si| p.body_type_items.contains_key(si)).collect();
+        cx.type_layers.push(type_layer);
     }
+    // The fn scope's own local tables are the overlay base (a
+    // nested fn sees the type items around its definition).
+    cx.overlay_base = (cx.body_scope.local_types.clone(), cx.body_scope.local_aliases.clone(), cx.body_scope.local_traits.clone());
+    cx.refresh_type_overlay();
     // A template body keeps its `Param` types: the store answers
     // the structural trait queries on them from the env (`Tys::env`).
     cx.tys.env = p.gx.fn_scopes.get(fid.0 as usize).map_or(&[], |fs| fs.env.as_slice());
@@ -2623,6 +2639,24 @@ impl<'p> Ctx<'p> {
     // Cross-item reads go through the section 8.2 query functions on
     // `Program`, which record into this body's read set. Bodies ask in
     // their own module (the root in single-file programs).
+    /// Rebuilds `body_scope`'s local type tables from the overlay
+    /// base plus the type items of the enclosing blocks (R18).
+    fn refresh_type_overlay(&mut self) {
+        if self.type_layers.is_empty() && self.overlay_base.0.is_empty() && self.overlay_base.1.is_empty() && self.overlay_base.2.is_empty() {
+            return;
+        }
+        let (mut types, mut aliases, mut traits) = self.overlay_base.clone();
+        for layer in &self.type_layers {
+            let (t, a, tr) = crate::check::collect::overlay_of_items(self.p, layer.clone());
+            types.extend(t);
+            aliases.extend(a);
+            traits.extend(tr);
+        }
+        self.body_scope.local_types = types;
+        self.body_scope.local_aliases = aliases;
+        self.body_scope.local_traits = traits;
+    }
+
     /// The body item a name denotes in the enclosing blocks, innermost
     /// first. Items are not hygienic in `macro_rules!` expansions (only
     /// locals are), so the name alone matches: a macro body's `V` sees a
@@ -3771,8 +3805,27 @@ impl<'p> Ctx<'p> {
     /// E<u8>;`): value paths and patterns through the alias (`EA::A(3)`,
     /// `SA { .. }`) build or match that Adt at those args. None when
     /// `name` is not such an alias.
+    /// The Adt a type item of an enclosing block binds `name` to
+    /// (R18), innermost first.
+    fn local_adt_of(&self, name: Sym) -> Option<AdtId> {
+        self.body_scope.local_types.iter().rev().find(|(n, _, _)| *n == name).map(|e| e.1)
+    }
+
+    /// The Adt a bare type name denotes here: an enclosing block's
+    /// type item first, then the flat module table.
+    fn type_name_adt(&self, name: Sym) -> Option<AdtId> {
+        self.local_adt_of(name).or_else(|| self.p.type_names.get(&name).copied())
+    }
+
     fn alias_adt(&mut self, name: Sym) -> Option<(AdtId, Vec<GenericArg>)> {
         let p = self.p;
+        // An alias declared in an enclosing block shadows the
+        // module alias table (R18).
+        if let Some(&(_, t)) = self.body_scope.local_aliases.iter().rev().find(|(n, _)| *n == name) {
+            let (d, args) = p.tys.adt_parts(t)?;
+            let a = p.adt_by_def(d)?;
+            return Some((a, p.tys.args(args).to_vec()));
+        }
         if p.aliases.is_empty() {
             return None;
         }
@@ -6549,6 +6602,14 @@ impl<'p> Ctx<'p> {
             let (defs, paths) = use_item_trait_layers(self.p, &use_idxs);
             self.trait_scopes.push(defs);
             self.std_trait_scopes.push(paths);
+            let type_layer: Vec<u32> = block
+                .stmts
+                .iter()
+                .filter_map(|s| if let Stmt::Item(idx) = s { Some(*idx) } else { None })
+                .filter(|idx| self.p.body_type_items.contains_key(idx))
+                .collect();
+            self.type_layers.push(type_layer);
+            self.refresh_type_overlay();
         }
         let mut diverges = false;
         for stmt in &block.stmts {
@@ -6699,6 +6760,8 @@ impl<'p> Ctx<'p> {
         self.item_scope_starts.pop();
         self.trait_scopes.pop();
         self.std_trait_scopes.pop();
+        self.type_layers.pop();
+        self.refresh_type_overlay();
         t
     }
 
@@ -9247,7 +9310,7 @@ impl<'p> Ctx<'p> {
             if n != p.known.self_type {
                 self.binding(Namespace::Type, n);
             }
-            let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
+            let a = if n == p.known.self_type { self.self_adt() } else { self.type_name_adt(n) };
             match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0)) {
                 Some(v) => Some(v),
                 None => match self.pat_ident(n) {
@@ -10676,7 +10739,7 @@ impl<'p> Ctx<'p> {
         // Qualified builtin variant constructors: `Option::Some(..)`,
         // `Result::Ok(..)`, `Result::Err(..)`, unless a user type of
         // the name shadows std's.
-        let lang_ty = std_ty || !self.p.type_names.contains_key(&ty_name);
+        let lang_ty = std_ty || (!self.p.type_names.contains_key(&ty_name) && self.local_adt_of(ty_name).is_none());
         if ty_name == k.Option && item == k.Some && lang_ty {
             return Some(Res::OptSome);
         }
@@ -10728,8 +10791,11 @@ impl<'p> Ctx<'p> {
                 _ => None,
             }
         };
-        // A type alias of a user Adt (`EA::A(3)`, `SA::new()`, generic
-        // `A::make(5)`); `value_path_args` gives its args.
+        // A type item of an enclosing block (`E::A(3)` for a local
+        // enum), then a type alias of a user Adt (`EA::A(3)`,
+        // `SA::new()`, generic `A::make(5)`); `value_path_args`
+        // gives its args.
+        let adt = adt.or_else(|| self.local_adt_of(ty_name));
         let adt = adt.or_else(|| self.alias_adt_seg(&segs[segs.len() - 2], span).map(|(a, ..)| a));
         let Some(a) = adt else {
             self.err(
@@ -16018,7 +16084,7 @@ impl<'p> Ctx<'p> {
             if n != p.known.self_type {
                 self.binding(Namespace::Type, n);
             }
-            let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
+            let a = if n == p.known.self_type { self.self_adt() } else { self.type_name_adt(n) };
             let a = a.or_else(|| self.alias_adt(n).map(|(a, _)| a));
             match a.filter(|&a| !p.adt(a).is_enum).map(|a| (a, 0u32)) {
                 Some(v) => Some(v),
@@ -18126,7 +18192,7 @@ impl<'p> Ctx<'p> {
                     if n != p.known.self_type {
                         self.binding(Namespace::Type, n);
                     }
-                    let a = if n == p.known.self_type { self.self_adt() } else { p.type_names.get(&n).copied() };
+                    let a = if n == p.known.self_type { self.self_adt() } else { self.type_name_adt(n) };
                     // A struct pattern through a type alias (`SA { a }`);
                     // tuple-struct and unit patterns need the value
                     // namespace, which an alias does not fill (rustc E0532).
@@ -21329,23 +21395,29 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
             std::mem::take(&mut cx.item_scope_starts),
             std::mem::take(&mut cx.trait_scopes),
             std::mem::take(&mut cx.std_trait_scopes),
+            std::mem::take(&mut cx.type_layers),
         );
         cx.const_fn_items_saved.push(saved);
         cx.item_scopes.push(layer);
         cx.item_scope_starts.push(0);
         cx.trait_scopes.push(tdefs);
         cx.std_trait_scopes.push(tpaths);
+        let type_layer: Vec<u32> = sibs.iter().copied().filter(|si| cx.p.body_type_items.contains_key(si)).collect();
+        cx.type_layers.push(type_layer);
+        cx.refresh_type_overlay();
     }
     fn exit_const_fn(&mut self) {
         if let Some((o, t)) = self.cx.const_fn_saved.pop() {
             self.cx.const_fn_self = o;
             self.cx.body_scope.self_ty = t;
         }
-        if let Some((scopes, starts, tdefs, tpaths)) = self.cx.const_fn_items_saved.pop() {
+        if let Some((scopes, starts, tdefs, tpaths, tlayers)) = self.cx.const_fn_items_saved.pop() {
             self.cx.item_scopes = scopes;
             self.cx.item_scope_starts = starts;
             self.cx.trait_scopes = tdefs;
             self.cx.std_trait_scopes = tpaths;
+            self.cx.type_layers = tlayers;
+            self.cx.refresh_type_overlay();
         }
     }
 

@@ -94,6 +94,17 @@ pub enum BodyItem {
     Static(u32),
 }
 
+/// What one type item inside a function body resolved to, by
+/// `Ast::stmt_items` index (R18). Body checking turns the items of
+/// its enclosing blocks into the resolve scope's local tables.
+#[derive(Clone, Copy, Debug)]
+pub enum BodyTypeItem {
+    Adt(AdtId),
+    /// A non-generic alias, fully resolved.
+    Alias(Ty),
+    Trait(DefId),
+}
+
 /// The value name an item inside a function body binds, if any.
 pub(crate) fn stmt_item_name(ast: &Ast, idx: u32) -> Option<Sym> {
     match &ast.stmt_items[idx as usize].kind {
@@ -266,6 +277,8 @@ pub struct Program {
     pub static_names: HashMap<Sym, u32>,
     /// Items inside function bodies, by `Ast::stmt_items` index.
     pub body_items: HashMap<u32, BodyItem>,
+    /// Type items inside function bodies, by `Ast::stmt_items` index.
+    pub body_type_items: HashMap<u32, BodyTypeItem>,
     /// Every block that holds items: its span and its stmt item
     /// indexes. A name use inside a block's span sees that block's
     /// items (`stmt_item_in_blocks`); const contexts resolve their
@@ -3063,6 +3076,7 @@ pub fn collect_reuse(
         statics: Vec::new(),
         static_names: HashMap::default(),
         body_items: HashMap::default(),
+        body_type_items: HashMap::default(),
         item_blocks: Vec::new(),
         body_consts: Vec::new(),
         const_values: Vec::new(),
@@ -3168,11 +3182,50 @@ pub fn collect_reuse(
     generics::init_lang(&mut p);
     generics::collect_trait_defs(&mut p, &mut errs);
 
+    // Type items inside function bodies (R18): their identities are
+    // the enclosing fn's hash folded with their name (`def::
+    // nested_type_ids`, as nested fns fold), computed now because
+    // pass 1 ranks every Adt by hash. `p.item_blocks` also lands
+    // here; the nested-fn section below recomputes the same table.
+    p.item_blocks = ast
+        .blocks
+        .iter()
+        .filter(|b| b.stmts.iter().any(|s| matches!(s, ast::Stmt::Item(_))))
+        .map(|b| (b.span, b.stmts.iter().filter_map(|s| if let ast::Stmt::Item(i) = s { Some(*i) } else { None }).collect()))
+        .collect();
+    let early_top_hashes = top_fn_hashes(ast, interner, p.stable_crate);
+    let nested_fn_hashes: Vec<Option<crate::def::DefPathHash>> = crate::def::nested_fn_ids(
+        ast,
+        interner,
+        |b| early_top_hashes.get(&b).copied(),
+        |parent, name, disamb| crate::def::child_hash(*parent, crate::def::DefKind::Fn, name, disamb),
+        |seg, name| crate::def::free_fn_hash(p.stable_crate, &[seg], name),
+    );
+    let parent_hash_of = |parent: crate::def::NestParent| match parent {
+        crate::def::NestParent::Top(b) => early_top_hashes.get(&b).copied(),
+        crate::def::NestParent::Nested(k) => nested_fn_hashes.get(k as usize).copied().flatten(),
+        crate::def::NestParent::Unknown => None,
+    };
+    let stmt_type_parents = crate::def::nested_type_parents(ast);
+    let stmt_parent_hashes: Vec<Option<crate::def::DefPathHash>> = stmt_type_parents.iter().map(|&(par, _)| parent_hash_of(par)).collect();
+    let stmt_type_hashes: Vec<Option<crate::def::DefPathHash>> = crate::def::nested_type_ids(
+        ast,
+        interner,
+        |par| parent_hash_of(par),
+        |parent, kind, name, disamb| crate::def::child_hash(*parent, kind, name, disamb),
+        |seg, kind, name| crate::def::item_hash(p.stable_crate, &[seg], kind, name, 0),
+    );
+    let mut adt_id_of_stmt_item: Vec<Option<AdtId>> = vec![None; ast.stmt_items.len()];
+
     // Pass 1: type names, so fields can refer to types defined later.
     // AdtIds come from the session DefOrder (rank by DefPathHash
     // history), not from item order: compute every Adt's hash and
     // rank up front, then fill the tables at those indices.
     let adt_base = p.adts.len();
+    // The `adt_srcs` index tag of a type item inside a function
+    // body: its `Ast::stmt_items` index under this base (synthetic
+    // std Adts sit at the top of the range instead).
+    const STMT_ADT_BASE: usize = 1 << 62;
     let mut adt_srcs: Vec<(usize, Sym, Span, bool, crate::def::DefPathHash)> = Vec::new();
     {
         let mut counts: HashMap<Sym, u32> = HashMap::default();
@@ -3185,6 +3238,17 @@ pub fn collect_reuse(
             let disamb = *counts.entry(name).and_modify(|c| *c += 1).or_insert(0);
             let hash = crate::def::item_hash(crate_ids.stable, &[], crate::def::DefKind::Adt, interner.get(name), disamb);
             adt_srcs.push((idx, name, span, is_enum, hash));
+        }
+        // Structs and enums inside function bodies rank with every
+        // other Adt by their folded hash (R18).
+        for (idx, item) in ast.stmt_items.iter().enumerate() {
+            let (name, span, is_enum) = match &item.kind {
+                ItemKind::Struct(s) => (s.name, s.name_span, false),
+                ItemKind::Enum(e) => (e.name, e.name_span, true),
+                _ => continue,
+            };
+            let hash = stmt_type_hashes[idx].expect("every type item in a body has an identity");
+            adt_srcs.push((STMT_ADT_BASE + idx, name, span, is_enum, hash));
         }
     }
     // The synthetic std Adts (`generics::std_adts`): `core::cmp::Ordering`
@@ -3576,15 +3640,31 @@ pub fn collect_reuse(
             p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
             continue;
         }
-        let item = &ast.items[item_idx];
+        // A type item inside a function body takes the same record,
+        // but its name is block-scoped: it never enters the flat
+        // type table, and its def's parent is the enclosing fn so
+        // paths print through it (`crate::f::Local`).
+        let stmt_idx = item_idx.checked_sub(STMT_ADT_BASE);
+        let item = match stmt_idx {
+            Some(si) => &ast.stmt_items[si],
+            None => &ast.items[item_idx],
+        };
         let id = AdtId(adt_base as u32 + rank);
-        adt_id_of_item[item_idx] = Some(id);
-        // The first type of a name owns it; a duplicate keeps its own Adt
-        // record (below) but never replaces the name entry.
-        if p.type_names.contains_key(&name) || p.gx.trait_names.contains_key(&name) {
-            errs.push(dup(span, interner.get(name)));
-        } else {
-            p.type_names.insert(name, id);
+        match stmt_idx {
+            Some(si) => {
+                adt_id_of_stmt_item[si] = Some(id);
+                p.body_type_items.insert(si as u32, BodyTypeItem::Adt(id));
+            }
+            None => {
+                adt_id_of_item[item_idx] = Some(id);
+                // The first type of a name owns it; a duplicate keeps its own Adt
+                // record (below) but never replaces the name entry.
+                if p.type_names.contains_key(&name) || p.gx.trait_names.contains_key(&name) {
+                    errs.push(dup(span, interner.get(name)));
+                } else {
+                    p.type_names.insert(name, id);
+                }
+            }
         }
         let n_params = match &item.kind {
             ItemKind::Struct(st) => generics::ast_param_count(&st.generics),
@@ -3624,7 +3704,8 @@ pub fn collect_reuse(
         }
         p.tys.register_adt(def, id);
         let kind = if is_enum { DefsKind::Enum } else { DefsKind::Struct };
-        p.defs.insert_adt(def, id, DefData::skeleton(kind, None, name, Vis::Priv, span));
+        let parent = stmt_idx.and_then(|si| stmt_parent_hashes[si]).map(|hash| DefId { krate: p.krate, hash });
+        p.defs.insert_adt(def, id, DefData::skeleton(kind, parent, name, Vis::Priv, span));
         p.tys.intern(TyKind::Adt(def, EMPTY_ARGS));
     }
 
@@ -3776,8 +3857,21 @@ pub fn collect_reuse(
     // and fn signatures after this can name traits in bounds.
     generics::build_trait_tables(&mut p, &mut errs);
 
-    // Pass 2: fields, variants, derives.
+    // Pass 2: fields, variants, derives. Type items inside
+    // function bodies take the same pass (R18): the work list pairs
+    // every Adt item with the AdtId pass 1 numbered.
+    let mut adt_work: Vec<(&ast::Item, AdtId, Option<usize>)> = Vec::new();
     for (item_idx, item) in ast.items.iter().enumerate() {
+        if let Some(id) = adt_id_of_item[item_idx] {
+            adt_work.push((item, id, None));
+        }
+    }
+    for (si, item) in ast.stmt_items.iter().enumerate() {
+        if let Some(id) = adt_id_of_stmt_item[si] {
+            adt_work.push((item, id, Some(si)));
+        }
+    }
+    for (item, id, stmt_idx) in adt_work {
         type FieldSrc = (Sym, ast::TyId, Span);
         type VariantSrc = (Sym, Span, VariantShape, Vec<FieldSrc>, Option<ast::ExprId>, bool);
         let (variants_src, derives_src): (Vec<VariantSrc>, &Vec<(Sym, Span)>) = match &item.kind {
@@ -3799,7 +3893,7 @@ pub fn collect_reuse(
             }
             _ => continue,
         };
-        let id = adt_id_of_item[item_idx].expect("pass 1 numbered every Adt item");
+        // `id` comes from the work list (pass 1 numbered every Adt item).
         // The Adt's own generics scope its field types.
         {
             let (g_ast, w_ast) = match &item.kind {
@@ -3823,13 +3917,24 @@ pub fn collect_reuse(
             p.gx.adt_generics[id.0 as usize] = adt_generics;
             p.gx.adt_envs[id.0 as usize] = env;
             p.gx.adt_scopes[id.0 as usize] = adt_scope;
+            // A type item in a function body resolves its field
+            // types against the type items of its enclosing blocks,
+            // and may not use the enclosing functions' parameters.
+            if stmt_idx.is_some() {
+                let at = p.adts[id.0 as usize].span;
+                let mut sc = p.gx.adt_scopes[id.0 as usize].clone();
+                apply_stmt_overlay(&p, &mut sc, at);
+                p.gx.adt_scopes[id.0 as usize] = sc;
+            }
             // Mirror the generics into the def table record.
             let def = p.defs.def_of_adt(id).expect("ADT defs are recorded in pass 1");
             let name = p.adts[id.0 as usize].name;
             let is_enum_now = p.adts[id.0 as usize].is_enum;
             let mut data = DefData::skeleton(
                 if is_enum_now { DefsKind::Enum } else { DefsKind::Struct },
-                None,
+                // Pass 1 recorded the parent (the enclosing fn of a
+                // type item inside a function body); keep it.
+                p.defs.get(def).and_then(|d| d.parent),
                 name,
                 Vis::Priv,
                 p.adts[id.0 as usize].span,
@@ -4204,7 +4309,24 @@ pub fn collect_reuse(
     // Unused type and lifetime params, now that every Adt has its
     // fields (a use through another Adt reads that Adt's own uses).
     {
-        let templates: Vec<(AdtId, usize)> = adt_id_of_item.iter().enumerate().filter_map(|(i, a)| a.map(|a| (a, i))).collect();
+        let lt_spans = |item: &ast::Item| -> Vec<Span> {
+            let params = match &item.kind {
+                ItemKind::Struct(st) => &st.generics.params,
+                ItemKind::Enum(e) => &e.generics.params,
+                _ => return Vec::new(),
+            };
+            params.iter().filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.span) } else { None }).collect()
+        };
+        let mut templates: Vec<(AdtId, Vec<Span>)> = adt_id_of_item
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.map(|a| (a, lt_spans(&ast.items[i]))))
+            .collect();
+        for (si, item) in ast.stmt_items.iter().enumerate() {
+            if let Some(id) = adt_id_of_stmt_item[si] {
+                templates.push((id, lt_spans(item)));
+            }
+        }
         crate::check::variance::check_unused_params(&p, &templates, &mut errs);
     }
 
@@ -4885,7 +5007,7 @@ pub fn collect_reuse(
     // Items inside function bodies: nested fns join the fn table (their
     // names are block-scoped, so they stay out of `fn_names`); nested
     // consts and statics evaluate with the top-level pass below. Type
-    // items in bodies are not in the subset yet. A nested fn's identity
+    // items in bodies took passes 1 and 2 above. A nested fn's identity
     // is its parent fn's plus its name (section 1.7), as the driver's
     // slot keys compute it.
     let krate = p.stable_crate;
@@ -4900,11 +5022,34 @@ pub fn collect_reuse(
         match &item.kind {
             ItemKind::Fn(def) => {
                 let hash = nested_hashes[idx].expect("every nested fn has an identity");
-                let id = add_fn(&mut p, def, FnLoc::Nested(idx as u32), None, None, None, &plain_parent(), hash, &mut errs);
+                // The nested fn's signature resolves against the
+                // type items of its enclosing blocks, and may not
+                // use the outer functions' parameters (R18).
+                let mut parent = plain_parent();
+                apply_stmt_overlay(&p, &mut parent.scope, item.span);
+                let id = add_fn(&mut p, def, FnLoc::Nested(idx as u32), None, None, None, &parent, hash, &mut errs);
                 p.body_items.insert(idx as u32, BodyItem::Fn(id));
+                // The def parent chain names the enclosing fn, so
+                // paths print through it (`crate::f::inner::Local`);
+                // the generics parent stays empty (a nested fn may
+                // not use the outer fn's parameters).
+                {
+                    let parents = crate::def::nested_fn_parents(ast);
+                    let ph = match parents[idx].0 {
+                        crate::def::NestParent::Top(b) => top_hashes.get(&b).copied(),
+                        crate::def::NestParent::Nested(k) => nested_hashes[k as usize],
+                        crate::def::NestParent::Unknown => None,
+                    };
+                    if let Some(ph) = ph
+                        && let Some(data) = p.defs.get_mut(DefId { krate: p.krate, hash })
+                    {
+                        data.parent = Some(DefId { krate: p.krate, hash: ph });
+                    }
+                }
             }
             ItemKind::Use(_) => {}
             ItemKind::Const(_) | ItemKind::Static(_) => {}
+            ItemKind::Struct(_) | ItemKind::Enum(_) => {}
             _ => {
                 errs.push(not_yet("L0820", item.span, "type items inside function bodies"));
             }
@@ -5559,6 +5704,160 @@ fn install_const_items(
 /// in a body is its parent fn's hash, its name, and its ordinal among the
 /// same-name statics of that fn). The parent is the innermost fn whose
 /// body holds the item; edits elsewhere in the file do not move it.
+/// Top-level fn and method hashes by body block, computed exactly
+/// as the fn collect loop below computes them (free fns by name;
+/// methods by impl header ordinal and name). Pass 1 needs them
+/// before that loop runs, as parents of type items in bodies.
+pub(crate) fn top_fn_hashes(ast: &Ast, interner: &Interner, stable: crate::def::StableCrateHash) -> HashMap<ast::BlockId, crate::def::DefPathHash> {
+    let mut out: HashMap<ast::BlockId, crate::def::DefPathHash> = HashMap::default();
+    let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
+    for item in &ast.items {
+        match &item.kind {
+            ItemKind::Fn(def) => {
+                if let Some(b) = def.body {
+                    out.insert(b, crate::def::free_fn_hash(stable, &[], interner.get(def.name)));
+                }
+            }
+            ItemKind::Impl(imp) => {
+                if imp.is_negative {
+                    continue;
+                }
+                let header = match ast.ty(imp.self_ty) {
+                    TyExpr::Path(segs) if !segs.is_empty() => interner.get(segs[0].name).to_string(),
+                    _ => "<error>".to_string(),
+                };
+                let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
+                impl_ordinals.insert(header.clone(), ordinal + 1);
+                let parent = crate::def::impl_hash(stable, &[], &header, ordinal);
+                for def in &imp.fns {
+                    if let Some(b) = def.body {
+                        out.insert(b, crate::def::method_hash(parent, interner.get(def.name)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The stmt item indexes visible at `at`: the items of every block
+/// whose span holds `at`, outermost block first (so a later entry
+/// shadows an earlier one of the same name).
+fn visible_stmt_items(item_blocks: &[(Span, Vec<u32>)], at: Span) -> Vec<u32> {
+    let mut blocks: Vec<&(Span, Vec<u32>)> = item_blocks
+        .iter()
+        .filter(|(s, _)| s.file == at.file && s.ctxt == at.ctxt && s.lo <= at.lo && at.hi <= s.hi)
+        .collect();
+    blocks.sort_by_key(|(s, _)| std::cmp::Reverse(s.hi - s.lo));
+    blocks.iter().flat_map(|(_, idxs)| idxs.iter().copied()).collect()
+}
+
+/// The resolve-scope overlay of the type items visible at `at`
+/// (R18): every type item of every block holding `at`, outermost
+/// first, split by kind for `generics::Scope`'s local tables.
+fn stmt_type_overlay(
+    p: &Program,
+    at: Span,
+) -> (Vec<(Sym, AdtId, Option<ast::Generics>)>, Vec<(Sym, Ty)>, Vec<(Sym, DefId)>) {
+    overlay_of_items(p, visible_stmt_items(&p.item_blocks, at))
+}
+
+/// The overlay entries of the given stmt items, in order.
+pub(crate) fn overlay_of_items(
+    p: &Program,
+    idxs: Vec<u32>,
+) -> (Vec<(Sym, AdtId, Option<ast::Generics>)>, Vec<(Sym, Ty)>, Vec<(Sym, DefId)>) {
+    let (mut types, mut aliases, mut traits) = (Vec::new(), Vec::new(), Vec::new());
+    for si in idxs {
+        let Some(bti) = p.body_type_items.get(&si) else { continue };
+        let item = &p.ast.stmt_items[si as usize];
+        match *bti {
+            BodyTypeItem::Adt(id) => {
+                let (name, g) = match &item.kind {
+                    ItemKind::Struct(s) => (s.name, Some(s.generics.clone())),
+                    ItemKind::Enum(e) => (e.name, Some(e.generics.clone())),
+                    _ => continue,
+                };
+                types.push((name, id, g));
+            }
+            BodyTypeItem::Alias(t) => {
+                if let ItemKind::Type(a) = &item.kind {
+                    aliases.push((a.name, t));
+                }
+            }
+            BodyTypeItem::Trait(d) => {
+                if let ItemKind::Trait(t) = &item.kind {
+                    traits.push((t.name, d));
+                }
+            }
+        }
+    }
+    (types, aliases, traits)
+}
+
+/// Sets the body-local overlay of `scope` for an item or signature
+/// at `at`, plus the generic parameter names of every enclosing
+/// function (which an item in a body may not use, E0401).
+pub(crate) fn apply_stmt_overlay(p: &Program, scope: &mut generics::Scope, at: Span) {
+    let (types, aliases, traits) = stmt_type_overlay(p, at);
+    scope.local_types = types;
+    scope.local_aliases = aliases;
+    scope.local_traits = traits;
+    scope.outer_params = outer_param_names(&p.ast, at);
+}
+
+/// The type and const generic parameter names of every function
+/// whose body span holds `at` (impl generics included for methods).
+fn outer_param_names(ast: &Ast, at: Span) -> Vec<Sym> {
+    let mut out: Vec<Sym> = Vec::new();
+    let mut take = |g: &ast::Generics, out: &mut Vec<Sym>| {
+        for p in &g.params {
+            match p {
+                ast::GenericParam::Type { name, .. } => out.push(*name),
+                ast::GenericParam::Const { name, .. } => out.push(*name),
+                ast::GenericParam::Lifetime { .. } => {}
+            }
+        }
+    };
+    let holds = |b: Option<ast::BlockId>| {
+        b.is_some_and(|b| {
+            let s = ast.block(b).span;
+            s.file == at.file && s.ctxt == at.ctxt && s.lo <= at.lo && at.hi <= s.hi && (s.lo != at.lo || s.hi != at.hi || s.lo != s.hi)
+        })
+    };
+    for item in &ast.items {
+        match &item.kind {
+            ItemKind::Fn(f) if holds(f.body) => take(&f.generics, &mut out),
+            ItemKind::Impl(imp) => {
+                for f in &imp.fns {
+                    if holds(f.body) {
+                        take(&imp.generics, &mut out);
+                        take(&f.generics, &mut out);
+                    }
+                }
+            }
+            ItemKind::Trait(t) => {
+                for f in &t.fns {
+                    if holds(f.body) {
+                        take(&t.generics, &mut out);
+                        take(&f.generics, &mut out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for item in &ast.stmt_items {
+        if let ItemKind::Fn(f) = &item.kind
+            && holds(f.body)
+        {
+            take(&f.generics, &mut out);
+        }
+    }
+    out
+}
+
 fn nested_static_hash(p: &Program, sidx: u32, name: Sym) -> crate::def::DefPathHash {
     let ast = &*p.ast;
     let at = ast.stmt_items[sidx as usize].span;

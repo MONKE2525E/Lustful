@@ -938,7 +938,22 @@ fn tn_def_path(p: &Program, def: DefId, flat: Sym) -> Option<String> {
         return Some(s.to_string());
     }
     let tables = p.resolved.as_ref()?;
-    let info = tables.def_info.get(&def)?;
+    // A def inside a function body has no resolver row: its module
+    // is the enclosing fn's, found by walking the def parents.
+    let mut info = tables.def_info.get(&def);
+    let mut local = false;
+    if info.is_none() {
+        local = true;
+        let mut data = p.defs.get(def)?;
+        while let Some(parent) = data.parent {
+            if let Some(i) = tables.def_info.get(&parent) {
+                info = Some(i);
+                break;
+            }
+            data = p.defs.get(parent)?;
+        }
+    }
+    let info = info?;
     let module = tables.modules.get(info.module.0 as usize)?;
     // A type from the shipped std source splice: its display path
     // is a std path, and only the verified rows above may print.
@@ -968,6 +983,19 @@ fn tn_def_path(p: &Program, def: DefId, flat: Sym) -> Option<String> {
         }
     }
     mid.reverse();
+    // A fn-local def's display name is bare: its path is the
+    // enclosing fn's module path plus the name.
+    let display = if local {
+        let mut s = String::new();
+        for seg in &module.path {
+            s.push_str(crate::intern::source_name(p.interner.get(*seg)));
+            s.push_str("::");
+        }
+        s.push_str(&display);
+        s
+    } else {
+        display
+    };
     let base = if module.krate_root.0 == 0 {
         let krate = crate::intern::source_name(p.interner.get(tables.modules[0].name)).replace('-', "_");
         format!("{krate}::{display}")

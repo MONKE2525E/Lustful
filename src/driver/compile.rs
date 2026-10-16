@@ -1058,6 +1058,40 @@ fn predicted_def_ids(
             _ => {}
         }
     }
+    // Structs and enums inside function bodies rank with the other
+    // Adts (collect pass 1 folds the same hashes).
+    {
+        let top = collect::top_fn_hashes(ast, interner, stable);
+        let fn_ids = def::nested_fn_ids(
+            ast,
+            interner,
+            |b| top.get(&b).copied(),
+            |parent, name, disamb| def::child_hash(*parent, def::DefKind::Fn, name, disamb),
+            |seg, name| def::free_fn_hash(stable, &[seg], name),
+        );
+        let parent_of = |par: def::NestParent| match par {
+            def::NestParent::Top(b) => top.get(&b).copied(),
+            def::NestParent::Nested(k) => fn_ids.get(k as usize).copied().flatten(),
+            def::NestParent::Unknown => None,
+        };
+        let type_ids = def::nested_type_ids(
+            ast,
+            interner,
+            |par| parent_of(par),
+            |parent, kind, name, disamb| def::child_hash(*parent, kind, name, disamb),
+            |seg, kind, name| def::item_hash(stable, &[seg], kind, name, 0),
+        );
+        for (idx, item) in ast.stmt_items.iter().enumerate() {
+            if matches!(item.kind, ItemKind::Struct(_) | ItemKind::Enum(_))
+                && let Some(h) = type_ids[idx]
+            {
+                adt_hashes.push(h);
+            }
+        }
+        // A type item in a body can shift derived indexes like a
+        // nested static does: growth there still clears.
+        fragile |= ast.stmt_items.iter().any(|item| matches!(item.kind, ItemKind::Struct(_) | ItemKind::Enum(_)));
+    }
     fragile |= ast.stmt_items.iter().any(|item| matches!(item.kind, ItemKind::Static(_)));
     // Collect also numbers the synthetic std Adts (check/collect.rs
     // pass 1), always (a user type of the same name only shadows its

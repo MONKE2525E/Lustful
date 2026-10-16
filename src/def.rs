@@ -411,6 +411,118 @@ pub fn nested_fn_ids<T: Clone>(
     ids
 }
 
+/// The name a type item inside a function body binds (a struct,
+/// enum, trait, or type alias), if this item is one.
+fn type_item_name(kind: &crate::ast::ItemKind) -> Option<crate::intern::Sym> {
+    use crate::ast::ItemKind;
+    match kind {
+        ItemKind::Struct(s) => Some(s.name),
+        ItemKind::Enum(e) => Some(e.name),
+        ItemKind::Trait(t) => Some(t.name),
+        ItemKind::Type(a) => Some(a.name),
+        _ => None,
+    }
+}
+
+/// The `DefKind` of one type item inside a function body.
+pub fn type_item_kind(kind: &crate::ast::ItemKind) -> Option<DefKind> {
+    use crate::ast::ItemKind;
+    match kind {
+        ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_) => Some(DefKind::Adt),
+        ItemKind::Trait(_) => Some(DefKind::Trait),
+        ItemKind::Type(_) => Some(DefKind::TypeAlias),
+        _ => None,
+    }
+}
+
+/// The parent and disambiguator of each type item inside a function
+/// body, by `Ast::stmt_items` index, like `nested_fn_parents` (the
+/// span walk is the same; the disambiguator counts the same-name
+/// type items of that parent).
+pub fn nested_type_parents(ast: &crate::ast::Ast) -> Vec<(NestParent, u32)> {
+    use crate::ast::ItemKind;
+    let mut out = vec![(NestParent::Unknown, 0u32); ast.stmt_items.len()];
+    if !ast.stmt_items.iter().any(|it| type_item_name(&it.kind).is_some()) {
+        return out;
+    }
+    let mut spans: Vec<(crate::diag::Span, Option<NestParent>, u32)> = Vec::new();
+    let body = |spans: &mut Vec<_>, f: &crate::ast::FnDef, nested: Option<u32>| {
+        if let Some(b) = f.body {
+            let parent = nested.map_or(NestParent::Top(b), NestParent::Nested);
+            spans.push((ast.block(b).span, Some(parent), 0));
+        }
+    };
+    for item in &ast.items {
+        match &item.kind {
+            ItemKind::Fn(f) => body(&mut spans, f, None),
+            ItemKind::Impl(imp) => imp.fns.iter().for_each(|f| body(&mut spans, f, None)),
+            ItemKind::Trait(t) => t.fns.iter().for_each(|f| body(&mut spans, f, None)),
+            _ => {}
+        }
+    }
+    for (j, it) in ast.stmt_items.iter().enumerate() {
+        if let ItemKind::Fn(f) = &it.kind {
+            body(&mut spans, f, Some(j as u32));
+        }
+        if type_item_name(&it.kind).is_some() {
+            spans.push((it.span, None, j as u32));
+        }
+    }
+    spans.retain(|s| s.0.ctxt == crate::diag::CtxtId::ROOT);
+    spans.sort_by_key(|s| (s.0.file.0, s.0.lo, std::cmp::Reverse(s.0.hi)));
+    let mut open: Vec<(crate::diag::Span, NestParent)> = Vec::new();
+    for (span, parent, j) in spans {
+        while open.last().is_some_and(|(s, _)| s.file != span.file || s.hi <= span.lo) {
+            open.pop();
+        }
+        match parent {
+            Some(p) => open.push((span, p)),
+            None => {
+                if let Some(&(s, p)) = open.last()
+                    && span.hi <= s.hi
+                {
+                    out[j as usize].0 = p;
+                }
+            }
+        }
+    }
+    let mut seen: crate::intern::FxMap<(NestParent, crate::intern::Sym), u32> = Default::default();
+    for (j, it) in ast.stmt_items.iter().enumerate() {
+        if let Some(name) = type_item_name(&it.kind) {
+            let n = seen.entry((out[j].0, name)).or_insert(0);
+            out[j].1 = *n;
+            *n += 1;
+        }
+    }
+    out
+}
+
+/// The identity of each type item inside a function body, folded
+/// like `nested_fn_ids`: `child(parent id, name, disambiguator)`
+/// with the item's kind folded by the caller's closure through
+/// `kind`, or `fallback(segment, name)`. A type item's parent fn
+/// identity comes from `nested_fn_ids` over the same parents, so
+/// `top` and the nested-fn fold must agree with that call.
+pub fn nested_type_ids<T: Clone>(
+    ast: &crate::ast::Ast,
+    interner: &crate::intern::Interner,
+    parent_of: impl Fn(NestParent) -> Option<T>,
+    child: impl Fn(&T, DefKind, &str, u32) -> T,
+    fallback: impl Fn(&str, DefKind, &str) -> T,
+) -> Vec<Option<T>> {
+    let nest = nested_type_parents(ast);
+    let mut ids: Vec<Option<T>> = vec![None; ast.stmt_items.len()];
+    for (j, it) in ast.stmt_items.iter().enumerate() {
+        let (Some(name), Some(kind)) = (type_item_name(&it.kind), type_item_kind(&it.kind)) else { continue };
+        let name = interner.get(name);
+        ids[j] = Some(match parent_of(nest[j].0) {
+            Some(p) => child(&p, kind, name, nest[j].1),
+            None => fallback(&format!("#nested{j}"), kind, name),
+        });
+    }
+    ids
+}
+
 /// Two distinct def paths with one hash. This is an internal error, not a user
 /// error: the caller stops the compile (the driver answers with code 3). No
 /// collision-resolution scheme is added; the check makes the 64-bit hash safe

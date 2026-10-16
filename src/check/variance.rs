@@ -23,8 +23,8 @@ struct Used {
 
 /// Rejects every type or lifetime parameter of the given Adt templates
 /// that no field type uses in a non-recursive way. `adts` are the
-/// templates of this collect with their item indexes.
-pub fn check_unused_params(p: &Program, adts: &[(AdtId, usize)], errs: &mut Vec<Diag>) {
+/// templates of this collect with their lifetime parameter spans.
+pub fn check_unused_params(p: &Program, adts: &[(AdtId, Vec<crate::diag::Span>)], errs: &mut Vec<Diag>) {
     let fields: Vec<Vec<Ty>> = adts.iter().map(|&(id, _)| field_tys(p, id)).collect();
     let mut used: Vec<Used> = adts
         .iter()
@@ -70,7 +70,8 @@ pub fn check_unused_params(p: &Program, adts: &[(AdtId, usize)], errs: &mut Vec<
             break;
         }
     }
-    for (i, &(id, item_idx)) in adts.iter().enumerate() {
+    for (i, (id, spans)) in adts.iter().enumerate() {
+        let id = *id;
         // A field type that did not resolve has its own error already.
         if fields[i].contains(&ERROR) {
             continue;
@@ -104,13 +105,7 @@ pub fn check_unused_params(p: &Program, adts: &[(AdtId, usize)], errs: &mut Vec<
         }
         let def = p.gx.adt_info[id.0 as usize].0;
         let Some(names) = p.gx.adt_lifetimes.get(&def) else { continue };
-        let generics_ast = match &p.ast.items[item_idx].kind {
-            ItemKind::Struct(st) => &st.generics.params,
-            ItemKind::Enum(e) => &e.generics.params,
-            _ => &[][..],
-        };
-        let spans: Vec<crate::diag::Span> =
-            generics_ast.iter().filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.span) } else { None }).collect();
+        let spans = spans;
         for (k, n) in names.iter().enumerate() {
             if !used[i].lts[k] {
                 errs.push(Diag::new(

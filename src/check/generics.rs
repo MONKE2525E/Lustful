@@ -1322,6 +1322,21 @@ pub struct Scope {
     /// args): their outlives requirements are implied bounds of the impl
     /// and its methods (`check::outlives`).
     pub header_regioned: Vec<Ty>,
+    /// Type items declared in enclosing function-body blocks (R18),
+    /// outermost first: a name here shadows the flat module tables
+    /// for a written type in this scope. The generics AST rides
+    /// along for argument kinds and defaults.
+    pub local_types: Vec<(Sym, AdtId, Option<ast::Generics>)>,
+    /// Type aliases declared in enclosing function-body blocks,
+    /// already resolved (non-generic only; a generic local alias
+    /// has no entry and its name stays unknown).
+    pub local_aliases: Vec<(Sym, Ty)>,
+    /// Traits declared in enclosing function-body blocks.
+    pub local_traits: Vec<(Sym, DefId)>,
+    /// Generic parameter names of enclosing functions: an item in
+    /// a body may not use them (rustc E0401). A name here that is
+    /// not one of this scope's own params is that error.
+    pub outer_params: Vec<Sym>,
 }
 
 /// How lifetimes resolve under a scope (W-BORROW, ARCH 5). Collect
@@ -2767,7 +2782,15 @@ pub fn resolve_trait_ref(
     tref: &ast::TraitRefExpr,
     span: Span,
 ) -> Result<TraitRef, Diag> {
-    let trait_def = trait_def_of_path(cx, interner, known, &tref.path, span)?;
+    // A trait declared in an enclosing function-body block shadows
+    // the flat trait tables (R18).
+    let trait_def = match tref.path.as_slice() {
+        [only] => match scope.local_traits.iter().rev().find(|(n, _)| *n == only.name) {
+            Some(&(_, d)) => d,
+            None => trait_def_of_path(cx, interner, known, &tref.path, span)?,
+        },
+        _ => trait_def_of_path(cx, interner, known, &tref.path, span)?,
+    };
     let seg = tref.path.last().unwrap();
     resolve_trait_path_args(ast, interner, known, cx, tys, scope, trait_def, seg, self_ty, span)
 }
@@ -3353,6 +3376,14 @@ pub(crate) fn resolve_path_ty(
             }
             return Ok(tys.intern(TyKind::Param(ParamId(i))));
         }
+        if scope.outer_params.contains(&name) {
+            return Err(Diag::new(
+                "L0110",
+                span,
+                format!("can't use generic parameters from an outer function: `{}`", interner.get(name)),
+                "Move the item out of the function, or give it its own generic parameter.",
+            ));
+        }
         if name == known.self_type {
             if seg.has_args() {
                 return Err(Diag::new("L0110", span, "`Self` takes no generic arguments", "Remove the `<...>` part."));
@@ -3395,7 +3426,7 @@ pub(crate) fn resolve_path_ty(
     let std_path = segs.len() > 1;
     // A user type named `Rc` shadows std's (which needs a `use`), and
     // so does a user `Option` or `Result` (prelude names, as in Rust).
-    let shadowed = !std_path && cx.type_names.contains_key(&name);
+    let shadowed = !std_path && (cx.type_names.contains_key(&name) || scope.local_types.iter().any(|(n, _, _)| *n == name));
     if name == known.Vec || (name == known.Option && !shadowed) || name == known.Box || (name == known.Rc && !shadowed) {
         let args = match &seg.args {
             GenericArgs::Angle(a) => resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, interner.get(name))?,
@@ -3559,6 +3590,17 @@ pub(crate) fn resolve_path_ty(
     if std_path && cx.type_names.get(&name).is_none_or(|&a| !is_std_adt(tys, a)) {
         return Err(crate::check::collect::std_path_shadowed(interner, name, span));
     }
+    // A type alias declared in an enclosing function-body block
+    // shadows the module alias tables (R18).
+    if segs.len() == 1
+        && let Some(&(_, alias_ty)) = scope.local_aliases.iter().rev().find(|(n, _)| *n == name)
+    {
+        return if seg.has_args() {
+            Err(Diag::new("L0110", span, "this alias takes no generic arguments", "Remove the `<...>` part."))
+        } else {
+            Ok(alias_ty)
+        };
+    }
     if segs.len() == 1
         && let Some(la) = cx.generic_aliases.get(&name)
     {
@@ -3615,12 +3657,18 @@ pub(crate) fn resolve_path_ty(
         }
         return Ok(subst(tys, alias_ty, &args));
     }
-    if let Some(&adt) = cx.type_names.get(&name) {
+    // A type item declared in an enclosing function-body block
+    // shadows the flat module table (R18).
+    let local_adt = scope.local_types.iter().rev().find(|(n, _, _)| *n == name);
+    if let Some(&adt) = local_adt.map_or_else(|| cx.type_names.get(&name), |e| Some(&e.1)) {
         let (def, n_params) = cx.adt_info_of(adt);
         // Declared parameter kinds and defaults from the Adt's own item:
         // its built generics may not exist yet when an earlier item's
         // fields name it.
-        let g_ast = crate::check::defaults::type_generics(ast, cx, name);
+        let g_ast = match local_adt {
+            Some(e) => e.2.as_ref(),
+            None => crate::check::defaults::type_generics(ast, cx, name),
+        };
         let arity = || {
             Diag::new(
                 "L0110",
