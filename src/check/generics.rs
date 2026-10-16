@@ -1980,6 +1980,181 @@ fn obj_default(tys: &mut impl TyIntern, t: Ty, under_ref: bool) -> Ty {
     }
 }
 
+/// Object lifetimes put back from the written types, for the signature
+/// compare of `check_lang_method`. Erased types keep only a written
+/// `'static` on a dyn, so `dyn K + 'a` and an unwritten `dyn K` look the
+/// same there. Walking the type with its AST (`ast_t`, None where no
+/// written form lines up), each dyn region becomes: `'static` (written,
+/// or rustc's default outside a reference); `Region::Param(sym)` for a
+/// named lifetime, and for an elided one in the impl header (`header`:
+/// each is its own early-bound lifetime, numbered down from u32::MAX by
+/// `anon`); or `Erased` for an elided method lifetime (late-bound). A
+/// dyn right under a reference takes that reference's lifetime. `Self`
+/// (written, or unwritten where the type is the raw Self) becomes
+/// `self_canon`. Equal forms agree in rustc; rustc's wider matches
+/// (an elided parameter lifetime) stay rejects.
+#[allow(clippy::too_many_arguments)]
+fn canon_dyn(
+    p: &mut Program,
+    ast_t: Option<ast::TyId>,
+    t: Ty,
+    outer: Option<Region>,
+    header: bool,
+    self_raw: Ty,
+    self_canon: Option<Ty>,
+    anon: &mut u32,
+) -> Ty {
+    let mut ast_t = ast_t;
+    while let Some(TyExpr::Paren(inner)) = ast_t.map(|a| p.ast.ty(a)) {
+        ast_t = Some(*inner);
+    }
+    let node = ast_t.map(|a| p.ast.ty(a).clone());
+    let is_self_path = matches!(&node, Some(TyExpr::Path(segs)) if segs.len() == 1 && segs[0].name == p.known.self_type);
+    if let Some(sc) = self_canon
+        && t == self_raw
+        && (node.is_none() || is_self_path)
+    {
+        return sc;
+    }
+    let lt_region = |p: &Program, lt: ast::Lifetime, anon: &mut u32| match p.interner.get(lt.name) {
+        "static" => Region::Static,
+        "_" if header => {
+            *anon -= 1;
+            Region::Param(*anon)
+        }
+        "_" => Region::Erased,
+        _ => Region::Param(lt.name.0),
+    };
+    match p.tys.kind(t) {
+        TyKind::Dyn(b, Region::Erased) => {
+            let written = match &node {
+                Some(TyExpr::Dyn { bounds, lifetime, .. }) => {
+                    lifetime.or_else(|| bounds.iter().find_map(|b| if let TraitBound::Lifetime(lt) = b { Some(*lt) } else { None }))
+                }
+                _ => None,
+            };
+            let r = match written {
+                Some(lt) => lt_region(p, lt, anon),
+                None => outer.unwrap_or(Region::Static),
+            };
+            p.tys.intern(TyKind::Dyn(b, r))
+        }
+        TyKind::Ref(r, m, inner) => {
+            let (inner_ast, ref_r) = match &node {
+                Some(TyExpr::Ref { lifetime, inner, .. }) => {
+                    let ref_r = match lifetime {
+                        Some(lt) => lt_region(p, *lt, anon),
+                        None if header => {
+                            *anon -= 1;
+                            Region::Param(*anon)
+                        }
+                        None => Region::Erased,
+                    };
+                    (Some(*inner), ref_r)
+                }
+                _ => (None, Region::Erased),
+            };
+            let i = canon_dyn(p, inner_ast, inner, Some(ref_r), header, self_raw, self_canon, anon);
+            p.tys.intern(TyKind::Ref(r, m, i))
+        }
+        TyKind::Tuple(ts) => {
+            let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
+            let asts: Vec<Option<ast::TyId>> = match &node {
+                Some(TyExpr::Tuple(xs)) if xs.len() == elems.len() => xs.iter().map(|&x| Some(x)).collect(),
+                _ => vec![None; elems.len()],
+            };
+            let out: Vec<Ty> = elems.iter().zip(asts).map(|(&e, a)| canon_dyn(p, a, e, None, header, self_raw, self_canon, anon)).collect();
+            let id = p.tys.intern_tys(&out);
+            p.tys.intern(TyKind::Tuple(id))
+        }
+        TyKind::Array(e, n) => {
+            let a = if let Some(TyExpr::Array { inner, .. }) = &node { Some(*inner) } else { None };
+            let e = canon_dyn(p, a, e, None, header, self_raw, self_canon, anon);
+            p.tys.intern(TyKind::Array(e, n))
+        }
+        TyKind::Slice(e) => {
+            let a = if let Some(TyExpr::Slice(inner)) = &node { Some(*inner) } else { None };
+            let e = canon_dyn(p, a, e, None, header, self_raw, self_canon, anon);
+            p.tys.intern(TyKind::Slice(e))
+        }
+        TyKind::Adt(d, a) => {
+            let args: Vec<GenericArg> = p.tys.args(a).to_vec();
+            let n_tys = args.iter().filter(|g| g.as_ty().is_some()).count();
+            // The written type args line up only when they are all there.
+            let written: Vec<ast::TyId> = match &node {
+                Some(TyExpr::Path(segs)) => match segs.last().map(|s| &s.args) {
+                    Some(GenericArgs::Angle(xs)) => xs.iter().filter_map(|g| if let AstArg::Type(t) = g { Some(*t) } else { None }).collect(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            let mut asts = (written.len() == n_tys).then(|| written.into_iter());
+            let out: Vec<GenericArg> = args
+                .into_iter()
+                .map(|g| match g {
+                    GenericArg::Ty(e) => {
+                        let a = asts.as_mut().and_then(|it| it.next());
+                        GenericArg::Ty(canon_dyn(p, a, e, None, header, self_raw, self_canon, anon))
+                    }
+                    x => x,
+                })
+                .collect();
+            p.tys.mk_adt(d, &out)
+        }
+        _ => t,
+    }
+}
+
+/// True when a lang trait impl method's signature type `got` may stand
+/// for the trait's `want` (both from `canon_dyn`): equal, or different
+/// only in dyn object lifetimes where rustc's subtyping allows it. In the
+/// return (`ret`) got must be a subtype, so a `'static` object fits any
+/// want. In a parameter want must be a subtype of got: a `'static` want
+/// object fits, and so does an elided got object when `free` (its
+/// late-bound lifetime can be as short as needed). Only covariant places
+/// take part (`cov`: shared references, `Box`, tuples, arrays, slices);
+/// anywhere else the types must be equal.
+#[allow(clippy::too_many_arguments)]
+fn dyn_sub_ok(tys: &impl TyIntern, want: Ty, got: Ty, ret: bool, cov: bool, free: bool, boxed: DefId) -> bool {
+    if want == got {
+        return true;
+    }
+    let go = |w: Ty, g: Ty, c: bool| dyn_sub_ok(tys, w, g, ret, c, free, boxed);
+    match (tys.kind(want), tys.kind(got)) {
+        (TyKind::Dyn(bw, rw), TyKind::Dyn(bg, rg)) if bw == bg && cov => {
+            if ret { rg == Region::Static } else { rw == Region::Static || (free && rg == Region::Erased) }
+        }
+        (TyKind::Ref(r1, m1, a), TyKind::Ref(r2, m2, b)) if r1 == r2 && m1 == m2 => go(a, b, cov && m1 == Mut::Shared),
+        (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+            let (a, b) = (tys.tys_of(a), tys.tys_of(b));
+            a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| go(x, y, cov))
+        }
+        (TyKind::Array(a, n), TyKind::Array(b, m)) if n == m => go(a, b, cov),
+        (TyKind::Slice(a), TyKind::Slice(b)) => go(a, b, cov),
+        (TyKind::Adt(d1, a1), TyKind::Adt(d2, a2)) if d1 == d2 => {
+            let (a1, a2) = (tys.args(a1), tys.args(a2));
+            a1.len() == a2.len()
+                && a1.iter().zip(a2).all(|(&x, &y)| match (x, y) {
+                    (GenericArg::Ty(x), GenericArg::Ty(y)) => go(x, y, cov && d1 == boxed),
+                    _ => x == y,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// True when `t` holds a reference anywhere.
+fn mentions_ref(tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(..) => true,
+        TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => mentions_ref(tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| mentions_ref(tys, e)),
+        TyKind::Adt(_, a) | TyKind::Projection(_, a) => tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| mentions_ref(tys, e))),
+        TyKind::Dyn(..) | TyKind::FnPtr(_) | TyKind::Opaque(..) | TyKind::Param(_) => true,
+        _ => false,
+    }
+}
+
 /// `t` with every reference region and dyn object lifetime `'static`:
 /// the region form of a type alias body, which may only use `'static`
 /// (W-BORROW, increment 1), and of a `thread_local!` value type
@@ -5467,6 +5642,25 @@ pub fn collect_trait_defs(p: &mut Program, errs: &mut Vec<Diag>) {
     }
 }
 
+/// rustc's receiver rule without `arbitrary_self_types` (E0307,
+/// E0658): a typed `self` is `Self`, or `&`, `&mut`, `Box`, `Rc` or
+/// `Arc` of a valid receiver (`self: &Arc<Self>`). In a trait, Self is
+/// the trait's, so `self: Rc<S>` there is invalid.
+fn valid_receiver(tys: &impl TyIntern, t: Ty, self_ty: Ty) -> bool {
+    if t == self_ty {
+        return true;
+    }
+    let first = |a: ArgsId| tys.args(a).iter().find_map(|g| g.as_ty());
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) => valid_receiver(tys, e, self_ty),
+        TyKind::Adt(d, a) if d == tys.builtins().boxed || d == tys.builtins().rc => first(a).is_some_and(|e| valid_receiver(tys, e, self_ty)),
+        TyKind::Adt(_, a) if crate::ty::sync::sync_kind(tys, t) == Some(crate::ty::sync::SyncTy::Arc) => {
+            first(a).is_some_and(|e| valid_receiver(tys, e, self_ty))
+        }
+        _ => false,
+    }
+}
+
 /// Resolves one fn signature in template form: self parameter,
 /// params, and return, under the combined scope. Handles
 /// `impl Trait` argument sugar by growing the generics. Returns
@@ -5506,10 +5700,22 @@ pub fn resolve_fn_sig(
             ast::SelfKind::Ref => tys.mk_ref(false, st),
             ast::SelfKind::RefMut => tys.mk_ref(true, st),
             ast::SelfKind::Typed => match sp.ty {
-                Some(t) => resolve_scoped(ast, interner, known, cx, tys, t, &scope).unwrap_or_else(|d| {
-                    errs.push(d);
-                    ERROR
-                }),
+                Some(t) => match resolve_scoped(ast, interner, known, cx, tys, t, &scope) {
+                    Ok(rt) if !valid_receiver(tys, rt, st) => {
+                        errs.push(Diag::new(
+                            "L0110",
+                            ast.ty_span(t),
+                            "invalid `self` parameter type: it must be `Self`, or a reference, `Box`, `Rc` or `Arc` of a valid receiver",
+                            "Write `self: Self`, `&Self`, `Box<Self>`, `Rc<Self>` or `Arc<Self>`.",
+                        ));
+                        ERROR
+                    }
+                    Ok(rt) => rt,
+                    Err(d) => {
+                        errs.push(d);
+                        ERROR
+                    }
+                },
                 None => st,
             },
         });
@@ -6633,6 +6839,43 @@ pub(crate) fn insert_synthetic(
 /// against the trait. Called from collect's fn pass after the
 /// impl's methods are in `fns`.
 #[allow(clippy::too_many_arguments)]
+/// `trait Tr: 'static` and `type A: 'static` in the trait: the impl's
+/// Self type and its binding of `A`, in region form (the impl scope's
+/// `self_ty_regioned` and `assoc_regioned`), must name no lifetime but
+/// `'static` (rustc E0477, E0478). The erased check in
+/// `check_impl_obligations` sees no lifetime args of an Adt
+/// (`impl<'a> Tr for S<'a>`). A `'a: 'static` bound is not read, so
+/// such an impl is a false reject.
+fn static_header_regions(p: &mut Program, imp: &ast::ImplDef, rec: &TraitRecord, scope: &Scope, errs: &mut Vec<Diag>) {
+    let self_param = p.tys.intern(TyKind::Param(ParamId(0)));
+    let mut wants: Vec<Ty> = Vec::new();
+    for pred in &rec.generics.predicates {
+        let Predicate::TypeOutlives(x, Region::Static) = *pred else { continue };
+        if x == self_param {
+            wants.extend(scope.self_ty_regioned);
+        } else if let TyKind::Projection(assoc, a) = p.tys.kind(x)
+            && p.tys.args(a).first().and_then(|g| g.as_ty()) == Some(self_param)
+            && let Some(&(_, name, _)) = rec.assoc_items.iter().find(|(d, _, _)| *d == assoc.0)
+        {
+            wants.extend(scope.assoc_regioned.iter().filter(|(n, _)| *n == name).map(|&(_, t)| t));
+        }
+    }
+    for t in wants {
+        let mut rs = Vec::new();
+        crate::borrowck::regions_of(&p.tys, t, &mut rs);
+        if rs.iter().any(|r| matches!(r, Region::Param(_))) {
+            let tname = p.display_path(rec.name);
+            errs.push(Diag::new(
+                "L0612",
+                imp.span,
+                format!("this impl of `{tname}` does not satisfy the `'static` bound the trait requires: a lifetime in it is not `'static`"),
+                "Implement the trait for a type without references, or add `'static` bounds to the impl's type parameters.",
+            ));
+            return;
+        }
+    }
+}
+
 pub fn finish_trait_impl(
     p: &mut Program,
     imp: &ast::ImplDef,
@@ -6646,6 +6889,7 @@ pub fn finish_trait_impl(
 ) {
     use crate::traits::index::{ImplRecord, Synthetic, pattern_head};
     let Some(rec) = p.gx.index.trait_record(tr.def).cloned() else { return };
+    static_header_regions(p, imp, &rec, scope, errs);
     // One impl may define each associated name once (rustc E0201): types
     // in the type namespace, consts and methods in the value namespace.
     {
@@ -6839,7 +7083,7 @@ pub fn finish_trait_impl(
             // A lang trait's method has no template (`fmt` is checked
             // by check_fmt_impl).
             if tr.def != p.gx.lang.debug && tr.def != p.gx.lang.display {
-                check_lang_method(p, tr, *method_def, *mname, found, impl_parent_n, &assoc_tys, imp.span, errs);
+                check_lang_method(p, imp, tr, *method_def, *mname, found, impl_parent_n, &assoc_tys, imp.span, errs);
             }
             continue;
         };
@@ -7210,6 +7454,7 @@ fn lang_provided(lang: &LangTraits, tr: DefId, name: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn check_lang_method(
     p: &mut Program,
+    imp: &ast::ImplDef,
     tr: TraitRef,
     method_def: DefId,
     name: Sym,
@@ -7343,21 +7588,51 @@ fn check_lang_method(
         }
     }
     let mut args: Vec<GenericArg> = p.tys.args(tr.args).to_vec();
-    let self_ty = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
+    let self_raw = args.first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
     // rustc's object lifetime defaults: a `dyn` written with no bound is
-    // `'static` in an associated type or a trait argument, and takes the
-    // lifetime of a reference right above it. Erased signatures keep
-    // only a written `'static`, so each side takes the default where it
-    // was written, before substitution (`impl Deref` with `Target = dyn
-    // Tr` must return `&(dyn Tr + 'static)`, not `&dyn Tr`).
-    let assoc_tys: Vec<(DefId, Ty)> = assoc_tys.iter().map(|&(d, t)| (d, obj_default(&mut p.tys, t, false))).collect();
-    for g in args.iter_mut().skip(1) {
+    // `'static` in the impl's Self type, an associated type or a trait
+    // argument, and takes the lifetime of a reference right above it.
+    // Erased signatures keep only a written `'static`, so each side
+    // gets its object lifetimes back from what it wrote (`canon_dyn`):
+    // `impl Deref` with `Target = dyn Tr` must return `&(dyn Tr +
+    // 'static)`, not `&dyn Tr`; `Borrow<dyn K + 'a>` returns `&(dyn K
+    // + 'a)`.
+    let mut anon = u32::MAX;
+    let self_ty = canon_dyn(p, Some(imp.self_ty), self_raw, None, true, self_raw, None, &mut anon);
+    let sc = Some(self_ty);
+    let written: Vec<ast::TyId> = match imp.trait_ref.as_ref().and_then(|t| t.path.last()).map(|s| &s.args) {
+        Some(GenericArgs::Angle(xs)) => xs.iter().filter_map(|g| if let AstArg::Type(t) = g { Some(*t) } else { None }).collect(),
+        _ => Vec::new(),
+    };
+    for (i, g) in args.iter_mut().enumerate() {
         if let GenericArg::Ty(t) = *g {
-            *g = GenericArg::Ty(obj_default(&mut p.tys, t, false));
+            // An omitted arg is its default (`Rhs = Self`): Self's form.
+            *g = GenericArg::Ty(match i {
+                0 => self_ty,
+                _ => canon_dyn(p, written.get(i - 1).copied(), t, None, true, self_raw, sc, &mut anon),
+            });
         }
     }
-    let got_params: Vec<Ty> = got_params.iter().map(|&t| obj_default(&mut p.tys, t, false)).collect();
-    let got_ret = obj_default(&mut p.tys, got_ret, false);
+    let trec = p.gx.index.trait_record(tr.def).cloned();
+    let assoc_tys: Vec<(DefId, Ty)> = assoc_tys
+        .iter()
+        .map(|&(d, t)| {
+            let a = imp.types.iter().find(|at| trec.as_ref().and_then(|r| r.assoc_by_name(at.name)) == Some(d)).and_then(|at| at.default);
+            (d, canon_dyn(p, a, t, None, true, self_raw, sc, &mut anon))
+        })
+        .collect();
+    let (param_asts, ret_ast) = {
+        let def = p.fn_info(local).def(&p.ast);
+        let mut v: Vec<Option<ast::TyId>> = Vec::new();
+        if let Some(sp) = &def.self_param {
+            v.push(sp.ty);
+        }
+        v.extend(def.params.iter().map(|x| Some(x.ty)));
+        (v, def.ret)
+    };
+    let got_params: Vec<Ty> =
+        got_params.iter().enumerate().map(|(i, &t)| canon_dyn(p, param_asts.get(i).copied().flatten(), t, None, false, self_raw, sc, &mut anon)).collect();
+    let got_ret = canon_dyn(p, ret_ast, got_ret, None, false, self_raw, sc, &mut anon);
     if (is_hash || is_extend) && let Some(h) = h_impl {
         args.push(GenericArg::Ty(h));
     }
@@ -7381,7 +7656,14 @@ fn check_lang_method(
     let mut cx = PureCx::new(&p.tys);
     let mut solver = Solver::new();
     let mut norm = |t: Ty| normalize(&mut solver, &mut cx, &p.gx.index, &env, t);
-    let same = want_params.iter().zip(&got_params).all(|(&w, &g)| norm(w) == norm(g)) && norm(want_ret) == norm(got_ret);
+    // An elided param lifetime is free (late-bound) unless the return
+    // can borrow from it: no `self` and a reference in the return.
+    let free_params = f_self_kind.is_some() || !mentions_ref(&p.tys, got_ret);
+    let boxed = p.tys.builtins().boxed;
+    let pairs: Vec<(Ty, Ty)> = want_params.iter().zip(&got_params).map(|(&w, &g)| (norm(w), norm(g))).collect();
+    let ret_pair = (norm(want_ret), norm(got_ret));
+    let same = pairs.iter().all(|&(w, g)| dyn_sub_ok(&p.tys, w, g, false, true, free_params, boxed))
+        && dyn_sub_ok(&p.tys, ret_pair.0, ret_pair.1, true, true, false, boxed);
     if !same {
         errs.push(Diag::new("L0110", f_name_span, format!("method `{n}` has an incompatible type for the trait"), fix));
     } else if elided_ret_takes_self_lifetime(p, local, sig.ret) {
@@ -11627,6 +11909,19 @@ pub(crate) fn prove_inst_trait_ref(p: &Program, tr: TraitRef, args: &[GenericArg
         return false;
     }
     let mut solver = crate::traits::solve::Solver::new();
+    // A bound on a projection (`A::Item: Clone` with `A = [u8; 4]`) is
+    // proven at the projection's normal form.
+    let args: Vec<GenericArg> = cx
+        .tys
+        .args(tr.args)
+        .to_vec()
+        .into_iter()
+        .map(|g| match g {
+            GenericArg::Ty(t) => GenericArg::Ty(crate::traits::solve::normalize(&mut solver, &mut cx, &p.gx.index, &[], t)),
+            g => g,
+        })
+        .collect();
+    let tr = TraitRef { args: cx.tys.intern_args(&args), ..tr };
     prove_trait_ref(p, &mut solver, &mut cx, &[], tr, 0, &mut Vec::new())
 }
 
@@ -11681,9 +11976,10 @@ fn check_impl_obligations(p: &mut Program, errs: &mut Vec<Diag>) {
         let mut statics: Vec<Ty> = Vec::new();
         for &pred in &trec.generics.predicates {
             let pred = subst_predicate(&mut p.tys, pred, &subst_args);
-            // `trait Tr: 'static`: the impl's Self type must be `'static`.
+            // `trait Tr: 'static`: the impl's Self type must be `'static`;
+            // `type Req: 'static`: the impl's binding of `Req` must be.
             if let Predicate::TypeOutlives(t, Region::Static) = pred {
-                statics.push(t);
+                statics.push(rewrite_impl_projections(p, t, self_ty, &rec.assoc_tys));
                 continue;
             }
             let Predicate::Trait(b) = pred else { continue };

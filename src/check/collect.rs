@@ -901,8 +901,26 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
         let Ok(t) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, aty, &ks) else { continue };
         let mut used: Vec<Region> = Vec::new();
         crate::borrowck::regions_of(&p.tys, t, &mut used);
+        // A dyn's object lifetime is not in the region form: read it as written.
+        let mut used_dyn: Vec<Sym> = Vec::new();
+        dyn_lifetimes(ast, aty, &mut used_dyn);
         for &(n, i) in scope.lifetimes.iter().take(named as usize) {
-            if used.contains(&Region::Param(i)) && !in_header.contains(&Region::Param(i)) {
+            let in_dyn_header = || {
+                let mut hs: Vec<Sym> = Vec::new();
+                dyn_lifetimes(ast, imp.self_ty, &mut hs);
+                for seg in imp.trait_ref.iter().flat_map(|t| &t.path) {
+                    if let ast::GenericArgs::Angle(args) = &seg.args {
+                        for g in args {
+                            if let ast::GenericArg::Type(t) = g {
+                                dyn_lifetimes(ast, *t, &mut hs);
+                            }
+                        }
+                    }
+                }
+                hs.contains(&n)
+            };
+            let uses = used.contains(&Region::Param(i)) || used_dyn.contains(&n);
+            if uses && !in_header.contains(&Region::Param(i)) && !in_dyn_header() {
                 errs.push(Diag::new(
                     "L0110",
                     ast.ty_span(aty),
@@ -912,6 +930,54 @@ fn impl_regions(p: &mut Program, imp: &ast::ImplDef, impl_def: DefId, scope: &mu
             }
         }
         scope.assoc_regioned.push((at.name, t));
+    }
+}
+
+/// The lifetime names written as dyn object bounds anywhere in `t`
+/// (`dyn K + 'a`, `Box<dyn K + 'a>`): the region form erases them.
+fn dyn_lifetimes(ast: &Ast, t: ast::TyId, out: &mut Vec<Sym>) {
+    let args = |segs: &[ast::PathSeg], out: &mut Vec<Sym>| {
+        for seg in segs {
+            match &seg.args {
+                ast::GenericArgs::Angle(xs) => {
+                    for g in xs {
+                        match g {
+                            ast::GenericArg::Type(t) => dyn_lifetimes(ast, *t, out),
+                            ast::GenericArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => dyn_lifetimes(ast, *t, out),
+                            _ => {}
+                        }
+                    }
+                }
+                ast::GenericArgs::Parenthesized { inputs, output } => {
+                    for &t in inputs.iter().chain(output) {
+                        dyn_lifetimes(ast, t, out);
+                    }
+                }
+                ast::GenericArgs::None => {}
+            }
+        }
+    };
+    match ast.ty(t) {
+        TyExpr::Dyn { bounds, lifetime, .. } => {
+            out.extend(lifetime.map(|l| l.name));
+            for b in bounds {
+                match b {
+                    ast::TraitBound::Lifetime(l) => out.push(l.name),
+                    ast::TraitBound::Trait { trait_ref, .. } => args(&trait_ref.path, out),
+                }
+            }
+        }
+        TyExpr::Path(segs) => args(segs, out),
+        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) | TyExpr::Ptr { inner, .. } | TyExpr::Array { inner, .. } => {
+            dyn_lifetimes(ast, *inner, out)
+        }
+        TyExpr::Tuple(ts) => ts.iter().for_each(|&e| dyn_lifetimes(ast, e, out)),
+        TyExpr::QPath { self_ty, trait_path, segs } => {
+            dyn_lifetimes(ast, *self_ty, out);
+            args(trait_path, out);
+            args(segs, out);
+        }
+        _ => {}
     }
 }
 
@@ -1862,6 +1928,63 @@ fn dty_of_ty(ast: &Ast, known: &Known, ty: ast::TyId) -> DTy {
     }
 }
 
+/// The discriminant of `E::V` (as the scalar evaluator values `E::V as
+/// int`), typed by E's repr integer. E must be the one item of that
+/// type name in the crate (resolved paths carry unique flat names; a
+/// struct, alias, trait, block item, or `use` of the same name makes it
+/// None) and a unit-only enum without generics. None when any
+/// discriminant does not evaluate or overflows (rustc E0370).
+fn unit_variant_discr(ast: &Ast, interner: &Interner, known: &Known, segs: &[ast::PathSeg]) -> Option<SVal> {
+    let [e, v] = segs else { return None };
+    if e.has_args() || v.has_args() {
+        return None;
+    }
+    fn binds_use(t: &ast::UseTree, name: Sym) -> bool {
+        match &t.kind {
+            ast::UseKind::Simple { rename } => rename.or(t.prefix.last().map(|s| s.name)) == Some(name),
+            ast::UseKind::Glob => false,
+            ast::UseKind::Group(ts) => ts.iter().any(|c| binds_use(c, name)),
+        }
+    }
+    fn scan<'a>(items: &'a [ast::Item], name: Sym, found: &mut Vec<&'a ast::Item>, other: &mut bool) {
+        for item in items {
+            match &item.kind {
+                ItemKind::Enum(d) if d.name == name => found.push(item),
+                ItemKind::Struct(d) if d.name == name => *other = true,
+                ItemKind::Union(d) if d.name == name => *other = true,
+                ItemKind::Trait(d) if d.name == name => *other = true,
+                ItemKind::Type(d) if d.name == name => *other = true,
+                ItemKind::Use(u) if binds_use(&u.tree, name) => *other = true,
+                ItemKind::Mod(m) => scan(m.body.as_deref().unwrap_or(&[]), name, found, other),
+                _ => {}
+            }
+        }
+    }
+    let (mut found, mut other) = (Vec::new(), false);
+    scan(&ast.items, e.name, &mut found, &mut other);
+    let mut in_blocks = Vec::new();
+    scan(&ast.stmt_items, e.name, &mut in_blocks, &mut other);
+    let ([item], false, true) = (found.as_slice(), other, in_blocks.is_empty()) else { return None };
+    let ItemKind::Enum(d) = &item.kind else { return None };
+    if !d.generics.params.is_empty() || d.variants.iter().any(|x| !matches!(x.fields, ast::VariantFields::Unit)) {
+        return None;
+    }
+    let it = disc_want_ty(interner, &item.attrs);
+    let mut next: i128 = 0;
+    for x in &d.variants {
+        let disc = match x.discriminant {
+            Some(de) => eval_const_int_exp(ast, interner, known, de, Some(it))?,
+            None if next >= 0 && next as u128 > it.max128() => return None,
+            None => next,
+        };
+        if x.name == v.name {
+            return Some(SVal::Int(disc, Some(it)));
+        }
+        next = disc.checked_add(1)?;
+    }
+    None
+}
+
 /// The discriminant type of an enum: the repr integer when written,
 /// else `isize`. Reads the first integer hint in the repr lists;
 /// `parse_repr` reports conflicting hints separately.
@@ -2458,7 +2581,13 @@ impl<'x> ScalarEval<'x> {
         } else {
             None
         };
-        let v = self.val(env, expr, src_exp, depth + 1)?;
+        let v = match (ast.expr(expr), target) {
+            (ast::Expr::Path(segs), SExp::Int(_)) if segs.len() >= 2 => match unit_variant_discr(ast, self.interner, self.known, segs) {
+                Some(v) => v,
+                None => self.val(env, expr, src_exp, depth + 1)?,
+            },
+            _ => self.val(env, expr, src_exp, depth + 1)?,
+        };
         match (v, target) {
             (SVal::Int(x, _), SExp::Int(it)) => Some(SVal::Int(trunc(x, it), Some(it))),
             (SVal::Bool(b), SExp::Int(it)) => Some(SVal::Int(b as i128, Some(it))),
@@ -4872,11 +5001,20 @@ pub fn collect_reuse(
                 // A header dyn whose object lifetime is `'static` (a dyn
                 // Self outside a reference, a dyn trait argument, or a
                 // written `dyn Tr + 'static` anywhere in the header).
+                // A written trait arg `dyn Tr + 'a` takes any lifetime, and
+                // so does a default arg that is Self (`Rhs = Self`).
+                let written: Vec<ast::TyId> = match imp.trait_ref.as_ref().and_then(|t| t.path.last()).map(|s| &s.args) {
+                    Some(ast::GenericArgs::Angle(xs)) => xs.iter().filter_map(|g| if let ast::GenericArg::Type(t) = g { Some(*t) } else { None }).collect(),
+                    _ => Vec::new(),
+                };
                 let static_dyn = crate::check::object::header_dyn_is_static(ast, interner, imp.self_ty)
                     || p.tys.flags(self_pat).contains_static_region()
                     || trait_ref.is_some_and(|tr| {
-                        p.tys.args(tr.args).iter().skip(1).any(|g| {
-                            g.as_ty().is_some_and(|t| matches!(p.tys.kind(t), TyKind::Dyn(..)) || p.tys.flags(t).contains_static_region())
+                        p.tys.args(tr.args).iter().skip(1).enumerate().any(|(i, g)| {
+                            g.as_ty().is_some_and(|t| {
+                                let dyn_static = written.get(i).map_or(t != self_pat, |&a| crate::check::object::header_dyn_is_static(ast, interner, a));
+                                (matches!(p.tys.kind(t), TyKind::Dyn(..)) && dyn_static) || p.tys.flags(t).contains_static_region()
+                            })
                         })
                     });
                 if static_dyn {

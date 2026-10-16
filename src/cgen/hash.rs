@@ -467,10 +467,10 @@ fn borrow_expr(p: &Program, slots: &[u32], k: &CTy, q: &CTy, kp: &str) -> String
         && let Some((_, &f)) = p.gx.borrow_impls.iter().find(|((b, t), _)| b == a && cty(&p.tys, *t) == *q)
     {
         let call = format!("({}lust_fns[{}])({kp})", fn_ptr_cast(p, f), slots[f.0 as usize]);
-        // `&str` and `&[T]` come back as fat values: point at a temporary.
+        // `&str`, `&[T]` and `&dyn Tr` come back as fat values: point at a temporary.
         return match q {
             CTy::Str => format!("((lust_str[]){{ {call} }})"),
-            CTy::Slice(_) => format!("(({}[]){{ {call} }})", ctype(q)),
+            CTy::Slice(_) | CTy::Dyn => format!("(({}[]){{ {call} }})", ctype(q)),
             _ => call,
         };
     }

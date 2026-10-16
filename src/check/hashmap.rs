@@ -115,7 +115,15 @@ impl<'p> Ctx<'p> {
         }
         let p = self.p;
         let glue = |cx: &Self, t: Ty| has_hash(p, &cx.tys, t) && has_eq(p, &cx.tys, t);
-        if !(glue(self, q) || !crate::check::fmt::mentions_local_adt(&self.tys, q)) {
+        if crate::check::object::mentions_dyn(&self.tys, q) {
+            let tn = self.tn(q);
+            self.errs.push(Diag::new(
+                "L0640",
+                span,
+                format!("a map or set lookup by `{tn}` (a `dyn` type) is not supported yet: the hash glue cannot call its `Hash` and `PartialEq` impls"),
+                "Look up by the key type itself.",
+            ));
+        } else if !(glue(self, q) || !crate::check::fmt::mentions_local_adt(&self.tys, q)) {
             let tn = self.tn(q);
             self.errs.push(Diag::new(
                 "L0640",

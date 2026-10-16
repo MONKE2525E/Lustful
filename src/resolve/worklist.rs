@@ -5081,6 +5081,10 @@ impl Rewrite<'_> {
     fn fn_def_in(&mut self, ast: &mut Ast, def: &mut FnDef, module: ModuleId, outer: &[Frame]) {
         let mark = self.push_params(&def.generics);
         self.generics(ast, &mut def.generics, &mut def.where_clause, module);
+        // A typed receiver (`self: &Arc<Self>`) names types as a param does.
+        if let Some(t) = def.self_param.as_ref().and_then(|sp| sp.ty) {
+            self.ty(ast, t, module, outer);
+        }
         for p in &def.params {
             let t = p.ty;
             self.ty(ast, t, module, outer);
