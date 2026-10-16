@@ -12,7 +12,10 @@
 # both modes), warm != cold, wrong output, hang (a lust timeout; never a
 # reject). Exit 1 on any false accept, warm != cold, wrong output, or hang.
 #
-# Usage: python3 scripts/derive_sweep.py [--count N] [--seed S] [--jobs J] [--keep DIR]
+# Usage: python3 scripts/derive_sweep.py [--count N] [--seed S] [--jobs J] [--keep DIR] [--resolver]
+# --resolver adds a `const` item to every program, so the daemon takes the resolver path (with
+# its body patch) instead of the single-file chunk path; only that path runs the patch oracle
+# (LUST_CHECK_ITEMPATCH=1).
 # Env: LUST_BIN (default target/release/lust).
 import argparse, os, random, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ProcessPoolExecutor
@@ -75,9 +78,9 @@ ADTS = [
 FULL = ["Clone", "Copy", "Debug", "PartialEq"]
 
 
-def program(adt, derives, shapes):
+def program(adt, derives, shapes, resolver=False):
     defn, mk, show = adt
-    out = []
+    out = ["const _ROUTE: u8 = 0;\n"] if resolver else []
     if derives:
         out.append(f"#[derive({', '.join(derives)})]\n")
     out.append(defn)
@@ -113,11 +116,11 @@ def versions(rng):
     return seq
 
 
-def gen(seed):
+def gen(seed, resolver=False):
     rng = random.Random(seed)
     adt = rng.choice(ADTS)
     shapes = rng.sample(sorted(SHAPES), rng.randint(2, 5))
-    return [program(adt, d, shapes) for d in versions(rng)]
+    return [program(adt, d, shapes, resolver) for d in versions(rng)]
 
 
 def first_code(stderr):
@@ -134,8 +137,8 @@ def run(cmd, cwd, env):
 
 
 def case(args):
-    seed, keep = args
-    vs = gen(seed)
+    seed, keep, resolver = args
+    vs = gen(seed, resolver)
     work = tempfile.mkdtemp(prefix=f"lust-dsweep-{seed}-")
     sock = os.path.join(work, "d.sock")
     env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
@@ -208,11 +211,12 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--keep", default="")
+    ap.add_argument("--resolver", action="store_true", help="route every program to the resolver path")
     a = ap.parse_args()
     if not os.path.exists(LUST):
         print(f"{LUST} missing; run scripts/build.sh", file=sys.stderr)
         return 2
-    seeds = [(a.seed + i, a.keep) for i in range(a.count)]
+    seeds = [(a.seed + i, a.keep, a.resolver) for i in range(a.count)]
     with ProcessPoolExecutor(max_workers=a.jobs) as pool:
         results = list(pool.map(case, seeds))
     tot = {"versions": 0, "fa": 0, "fr": 0, "wc": 0, "wrong": 0, "hang": 0, "rustc_rejects": 0}
