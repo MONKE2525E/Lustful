@@ -98,8 +98,9 @@ pub struct ClosureInfo {
     /// (`'static`, an argument's region) is the creator's to prove
     /// (`closure_requirements`), not an error in the body.
     pub call_out: bool,
-    /// W-BORROW: checked with no expected signature (a `let` closure):
-    /// each region of its output is one free inferred region, never an
+    /// W-BORROW: checked with no expected signature (a `let` closure), or
+    /// for a bound whose output is a callee type param (`call_out`): each
+    /// region of its output is one free inferred region, never an
     /// argument's, so it cannot meet `F: Fn(&T) -> &U` or `dyn Fn(&T) ->
     /// &U`, whose output is the input's (rustc E0308).
     pub free_sig: bool,
@@ -937,7 +938,7 @@ impl<'p> Ctx<'p> {
         let ty = self.tys.intern_args(&fields);
         let ty = self.tys.intern(TyKind::Closure(def, ty));
         let captures_any = !captures.is_empty();
-        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs, call_out, free_sig: no_sig });
+        self.closures.push(ClosureInfo { def, expr: e, kind, inputs, output, captures, ty, free_args, scope_body, input_regions, output_region, bound_output, bound_inputs, call_out, free_sig: no_sig || call_out });
         if let Some((fp, _, _)) = to_fn_ptr {
             if captures_any {
                 self.err(
@@ -2634,14 +2635,14 @@ impl<'p> Ctx<'p> {
         // with a tied one (another closure, a fn item or pointer) is
         // rustc's higher-ranked LUB, which lust does not follow.
         let out = self.deep(oa);
-        if may_hold_region(&self.tys, out) {
+        if holds_region_slots(&self.p.gx.adt_lifetimes, &self.tys, out) {
             let (fa, fb) = (self.closure_out_free(a), self.closure_out_free(b));
             if fa != fb {
                 self.rollback_vars(snap);
                 return None;
             }
             if fa {
-                let Some(st) = static_output(&mut self.tys, out) else {
+                let Some(st) = static_output(&self.p.gx.adt_lifetimes, &mut self.tys, out) else {
                     self.rollback_vars(snap);
                     return None;
                 };
@@ -2883,33 +2884,36 @@ fn truncate_for_optimization(mut pl: CPlace, mut mode: CaptureMode, tys: &impl T
 /// Adt lifetime args): the output of a joined pointer of closures with
 /// free outputs (`closure_lub`). None for a part that may hold a region
 /// it cannot rewrite (a fn pointer, an opaque or param type).
-fn static_output(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
+fn static_output(lts: &crate::intern::FxMap<DefId, Vec<crate::intern::Sym>>, tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
     Some(match tys.kind(t) {
         TyKind::Ref(_, m, inner) => {
-            let i = static_output(tys, inner)?;
+            let i = static_output(lts, tys, inner)?;
             tys.intern(TyKind::Ref(crate::ty::Region::Static, m, i))
         }
         TyKind::Dyn(b, _) => tys.intern(TyKind::Dyn(b, crate::ty::Region::Static)),
         TyKind::Tuple(ts) => {
-            let elems = tys.tys_of(ts).to_vec().into_iter().map(|e| static_output(tys, e)).collect::<Option<Vec<Ty>>>()?;
+            let elems = tys.tys_of(ts).to_vec().into_iter().map(|e| static_output(lts, tys, e)).collect::<Option<Vec<Ty>>>()?;
             let id = tys.intern_tys(&elems);
             tys.intern(TyKind::Tuple(id))
         }
         TyKind::Array(e, n) => {
-            let e = static_output(tys, e)?;
+            let e = static_output(lts, tys, e)?;
             tys.intern(TyKind::Array(e, n))
         }
         TyKind::Slice(e) => {
-            let e = static_output(tys, e)?;
+            let e = static_output(lts, tys, e)?;
             tys.intern(TyKind::Slice(e))
         }
+        // An Adt's lifetime args are not in check's types: no way to
+        // write `'static` there.
+        TyKind::Adt(_, a) if crate::borrowck::adt_region_count(lts, tys, t) > 0 && !tys.args(a).iter().any(|g| matches!(g, GenericArg::Lifetime(_))) => return None,
         TyKind::Adt(d, a) => {
             let args = tys
                 .args(a)
                 .to_vec()
                 .into_iter()
                 .map(|g| match g {
-                    GenericArg::Ty(e) => static_output(tys, e).map(GenericArg::Ty),
+                    GenericArg::Ty(e) => static_output(lts, tys, e).map(GenericArg::Ty),
                     GenericArg::Lifetime(_) => Some(GenericArg::Lifetime(crate::ty::Region::Static)),
                     x => Some(x),
                 })
@@ -2919,6 +2923,19 @@ fn static_output(tys: &mut impl TyIntern, t: Ty) -> Option<Ty> {
         _ if may_hold_region(tys, t) => return None,
         _ => t,
     })
+}
+
+/// True when `t` has region slots in borrowck's layout: `may_hold_region`,
+/// or an Adt with lifetime params (check's types do not write those).
+pub(crate) fn holds_region_slots(lts: &crate::intern::FxMap<DefId, Vec<crate::intern::Sym>>, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| holds_region_slots(lts, tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => holds_region_slots(lts, tys, e),
+        TyKind::Adt(_, a) => {
+            crate::borrowck::adt_region_count(lts, tys, t) > 0 || tys.args(a).iter().any(|g| matches!(g, GenericArg::Lifetime(_)) || g.as_ty().is_some_and(|e| holds_region_slots(lts, tys, e)))
+        }
+        _ => may_hold_region(tys, t),
+    }
 }
 
 pub(crate) fn may_hold_region(tys: &impl TyIntern, t: Ty) -> bool {

@@ -115,7 +115,7 @@ impl Ctx<'_> {
                 );
                 continue;
             }
-            if self.ptr_not_general(od, h) {
+            if self.ptr_not_general(od, h) || self.item_not_general(od, h) {
                 self.err(
                     "L0735",
                     span,
@@ -139,12 +139,17 @@ impl Ctx<'_> {
     /// `output_region` otherwise.
     fn closure_not_general(&mut self, od: DefId, h: Ty) -> bool {
         let TyKind::Closure(def, _) = self.kind(h) else { return false };
-        let Some(unannotated) = self.free_sig_closures.iter().find(|c| c.0 == def).map(|c| c.1.clone()) else { return false };
+        let unannotated = self.free_sig_closures.iter().find(|c| c.0 == def).map(|c| c.1.clone()).unwrap_or_default();
         let p = self.p;
         let Some(info) = p.gx.opaques.get(&od) else { return false };
-        let Some((inputs, output)) = self.closures.iter().chain(&self.out.closures).find(|c| c.def == def).map(|c| (c.inputs.clone(), c.output)) else {
+        let Some((inputs, output, free_out)) =
+            self.closures.iter().chain(&self.out.closures).find(|c| c.def == def).map(|c| (c.inputs.clone(), c.output, c.free_sig))
+        else {
             return false;
         };
+        if !free_out {
+            return false;
+        }
         let regions = |this: &mut Self, t: Ty| {
             let t = this.deep(t);
             let mut ts = Vec::new();
@@ -165,7 +170,8 @@ impl Ctx<'_> {
             let Some(bo) = b.output else { continue };
             let mut outs = Vec::new();
             crate::borrowck::regions_of(&p.tys, bo, &mut outs);
-            if outs.iter().any(|r| matches!(r, Region::Bound(_))) && !regions(self, output).is_empty() {
+            let out_d = self.deep(output);
+            if outs.iter().any(|r| matches!(r, Region::Bound(_))) && crate::check::closure::holds_region_slots(&p.gx.adt_lifetimes, &self.tys, out_d) {
                 return true;
             }
             if outs.contains(&Region::Static)
@@ -212,6 +218,33 @@ impl Ctx<'_> {
             }
         }
         false
+    }
+
+    /// True when hidden type `h` of opaque `od` is a fn item whose output
+    /// slot is `'static`, or a lifetime that is early-bound or no input's,
+    /// where an `Fn*` bound of the opaque returns its input's lifetime
+    /// (rustc "implementation of `Fn` is not general enough").
+    fn item_not_general(&mut self, od: DefId, h: Ty) -> bool {
+        let TyKind::FnDef(def, _) = self.kind(h) else { return false };
+        let p = self.p;
+        let (Some(info), Some(sig)) = (p.gx.opaques.get(&od), p.local_def(def.hash).and_then(|l| p.regions.body_sig(p, l))) else { return false };
+        let mut ins = Vec::new();
+        for &t in &sig.params {
+            crate::borrowck::regions_of(&p.tys, t, &mut ins);
+        }
+        let mut outs = Vec::new();
+        crate::borrowck::regions_of(&p.tys, sig.ret, &mut outs);
+        let fixed = |r: Region| match r {
+            Region::Static => true,
+            Region::Param(k) => sig.early.get(k as usize).copied().unwrap_or(false) || !ins.contains(&r),
+            _ => false,
+        };
+        info.fn_outs.iter().any(|b| {
+            let Some(bo) = b.output.filter(|_| b.inputs.len() == sig.params.len()) else { return false };
+            let mut brs = Vec::new();
+            crate::borrowck::regions_of(&p.tys, bo, &mut brs);
+            brs.len() == outs.len() && brs.iter().zip(&outs).any(|(br, &r)| matches!(br, Region::Bound(_)) && fixed(r))
+        })
     }
 
     /// Rejects a value of an opaque type in a body that gets code

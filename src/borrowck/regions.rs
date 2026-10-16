@@ -1241,13 +1241,37 @@ fn root_fn(p: &Program, f: LocalDefId) -> LocalDefId {
 }
 
 /// True when a call in `body` may pass a type param with a regioned `Fn`
-/// bound (the fn holding it has one) or a fn item to a generic fn, which
-/// proves the callee's bound from its signature (`entail_bound`) even in
-/// a body with no loans.
+/// bound (the fn holding it has one), a fn item, or a closure with its
+/// own signature (`free_sig_bound`) to a generic fn, which proves the
+/// callee's bound from its signature (`entail_bound`) even in a body
+/// with no loans.
 pub(super) fn may_entail_bounds(p: &Program, body: &Body) -> bool {
     p.regions.body_sig(p, root_fn(p, body.fn_id)).is_some_and(|s| !s.fn_bounds.is_empty())
         || body.blocks.iter().any(|b| b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Assign(_, Rvalue::FnValue(..)))))
-        || body.locals.iter().any(|l| mentions_fn_ptr(&body.tys, l.ty))
+        || body.locals.iter().any(|l| mentions_fn_ptr(&body.tys, l.ty) || free_sig_closure(p, &body.tys, l.ty))
+}
+
+/// True for a closure type (also behind references) whose output holds
+/// regions: passed for a bound, its output must match the bound's
+/// (`free_sig_bound`).
+fn free_sig_closure(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) => free_sig_closure(p, tys, e),
+        TyKind::Closure(def, _) => p.gx.closures.get(&def).is_some_and(|c| holds_slots(p, &p.tys, c.output)),
+        _ => false,
+    }
+}
+
+/// True when erased type `t` has region slots: a reference, a dyn type,
+/// or an Adt with lifetime params (which check's types do not write).
+fn holds_slots(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(..) | TyKind::Dyn(..) => true,
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().any(|&e| holds_slots(p, tys, e)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => holds_slots(p, tys, e),
+        TyKind::Adt(_, a) => adt_regions(p, tys, t) > 0 || tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| holds_slots(p, tys, e))),
+        _ => crate::check::closure::may_hold_region(tys, t),
+    }
 }
 
 /// True when type `t` holds a fn pointer (W-BORROW3: a body with one runs
@@ -1326,27 +1350,6 @@ fn type_params_in(tys: &impl TyIntern, t: Ty, out: &mut Vec<u32>) {
     }
 }
 
-/// The pairs of regions at the same places of two regioned types (a
-/// callee's bound and the argument's signature, `entail_bound`); a type
-/// param or projection on either side (an instantiation) pairs nothing.
-/// False when the shapes differ.
-/// True when builtin iterator type `t`, or an iterator inside it, is a
-/// library or user one (`IterKind::ByNext`), or `t` is no builtin one.
-fn by_next_inside(tys: &impl TyIntern, t: Ty) -> bool {
-    match crate::ty::iter::iter_parts(tys, t) {
-        None => !tys.is_chars_ty(t),
-        Some((crate::ty::iter::IterKind::ByNext, _)) => true,
-        Some((_, a)) => a.into_iter().any(|x| crate::ty::iter::iter_parts(tys, x).is_some_and(|_| by_next_inside(tys, x)) || adt_iterish(tys, x)),
-    }
-}
-
-/// True for an Adt type that is no builtin iterator but may be a user one
-/// (`by_next_inside`): any user Adt. Coarse: a user element type
-/// (`slice::Iter<'_, Node>`) also skips the item check.
-fn adt_iterish(tys: &impl TyIntern, t: Ty) -> bool {
-    matches!(tys.kind(t), TyKind::Adt(..)) && tys.builtin_of(t).is_none()
-}
-
 /// The regions of `b` in the places where `a` (the same shape, as for
 /// `region_pairs`) has a type param or a projection.
 fn param_covered_regions(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<Region>) {
@@ -1372,6 +1375,10 @@ fn param_covered_regions(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<Region
     }
 }
 
+/// The pairs of regions at the same places of two regioned types (a
+/// callee's bound and the argument's signature, `entail_bound`); a type
+/// param or projection on either side (an instantiation) pairs nothing.
+/// False when the shapes differ.
 fn region_pairs(tys: &impl TyIntern, a: Ty, b: Ty, out: &mut Vec<(Region, Region)>) -> bool {
     match (tys.kind(a), tys.kind(b)) {
         (TyKind::Param(_) | TyKind::Projection(..), _) | (_, TyKind::Param(_) | TyKind::Projection(..)) => true,
@@ -3431,48 +3438,36 @@ impl<'b, 'p> Builder<'b, 'p> {
             Rvalue::Opt(_, Some(o)) => self.into_place(o, dest, &[Proj::Downcast(1), Proj::Field(0)]),
             Rvalue::Res(_, ok, o) => self.into_place(o, dest, &[Proj::Downcast(if *ok { 0 } else { 1 }), Proj::Field(0)]),
             Rvalue::TupleAgg(ty, ops) => {
-                // A `ByNext` over `&mut I` (core's `impl Iterator for &mut
-                // I`): the reference flows into the held slots as a value
-                // of its own type (the loan region covariant, `I`
-                // invariant), so the loan ends where the wrapper's last
-                // use is. Field places of a builtin iterator do not pair.
-                let by_mut = match crate::ty::iter::iter_parts(&self.body.tys, *ty) {
-                    Some((crate::ty::iter::IterKind::ByNext, a)) if matches!(self.body.tys.kind(a[0]), TyKind::Ref(_, Mut::Mut, _)) => Some(a[0]),
-                    _ => None,
-                };
-                if let (Some(held), [o]) = (by_mut, ops.as_slice()) {
-                    let mut ov = Vec::new();
-                    let ot = self.operand(o, &mut ov);
-                    self.place(dest, &mut dv, &mut d);
-                    let own = adt_regions(self.p, &self.body.tys, *ty) as usize;
-                    let n0 = self.sc.slots(held) as usize;
-                    match dv.get(own..own + n0) {
-                        Some(hv) => {
-                            let hv = hv.to_vec();
-                            self.relate(ot, &ov, held, &hv, Variance::Co);
-                        }
-                        None => self.equate_all(&ov, &dv.clone()),
-                    }
-                    dv.clear();
-                    d.clear();
-                } else {
-                    for (i, o) in ops.iter().enumerate() {
-                        self.into_place(o, dest, &[Proj::Field(i as u32)]);
-                    }
-                }
-                // A `ByNext` wrapper (W-STD-B): its item type is not a
-                // field, so tie it here: the wrapped iterator's regions
-                // outlive the item's.
-                if let Some((crate::ty::iter::IterKind::ByNext, a)) = crate::ty::iter::iter_parts(&self.body.tys, *ty) {
+                // A `ByNext` wrapper (W-STD-B) is no program Adt, so its
+                // one field (the wrapped iterator, also a `&mut I` over
+                // core's `impl Iterator for &mut I`: the loan region
+                // covariant, `I` invariant) flows into its inner part as
+                // a value of its own type, and its item type, which is not
+                // a field, is tied through the iterator's `next`: else the
+                // wrapped iterator's regions outlive the item's.
+                if let Some((crate::ty::iter::IterKind::ByNext, a)) = crate::ty::iter::iter_parts(&self.body.tys, *ty)
+                    && let [o] = &ops[..]
+                {
                     self.place(dest, &mut dv, &mut d);
                     let own = adt_regions(self.p, &self.body.tys, *ty) as usize;
                     let n0 = self.sc.slots(a[0]) as usize;
                     let n1 = self.sc.slots(a[1]) as usize;
                     if let (Some(src), Some(item)) = (dv.get(own..own + n0), dv.get(own + n0..own + n0 + n1)) {
                         let (src, item) = (src.to_vec(), item.to_vec());
+                        let mut ov = Vec::new();
+                        let ot = self.operand(o, &mut ov);
+                        if !ov.is_empty() {
+                            self.relate(ot, &ov, a[0], &src, Variance::Co);
+                        }
                         if !self.by_next_item(a[0], &src, a[1], &item) {
                             self.flow_all(&src, &item);
                         }
+                    } else {
+                        self.into_place(o, dest, &[Proj::Field(0)]);
+                    }
+                } else {
+                    for (i, o) in ops.iter().enumerate() {
+                        self.into_place(o, dest, &[Proj::Field(i as u32)]);
                     }
                 }
                 if let TyKind::Closure(def, args) = self.body.tys.kind(*ty) {
@@ -4689,7 +4684,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             _ if matches!(target, CallTarget::Builtin(_)) && self.closure_only_call(&avs, dt) => {}
             _ => {
                 match target {
-                    CallTarget::Fn(f) if self.returns_opaque(f) => self.call_opaque_from(&avs, &all, dt, &dv),
+                    CallTarget::Fn(f) if self.returns_opaque(f) => {
+                        let fixed = self.opaque_static_items(f, dt, &dv);
+                        let dv: Vec<u32> = dv.iter().copied().filter(|v| !fixed.contains(v)).collect();
+                        self.call_opaque_from(&avs, &all, dt, &dv)
+                    }
                     _ => self.call_opaque(&avs, dt, &dv),
                 }
                 if matches!(target, CallTarget::Fn(_)) {
@@ -5357,7 +5356,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 Some(v) => cands.push(v.to_vec()),
                 None => return,
             }
-        } else if by_next_inside(&self.body.tys, t) || !self.iter_items(t, &vars, &mut cands) {
+        } else if !self.iter_items(t, &vars, &mut cands) {
             // A library or user iterator's items come through flows lust
             // keeps coarse (a generic method's result holds its receiver's
             // loan): not checked.
@@ -6194,6 +6193,18 @@ impl<'b, 'p> Builder<'b, 'p> {
                 let nf = self.sc.slots(f) as usize;
                 let nb = self.sc.slots(bt) as usize;
                 let Some(caps) = vars.get(n0..n0 + nf).map(<[u32]>::to_vec) else { return false };
+                // A closure made in another body (a revealed `impl
+                // Iterator` value): its argument vars are not this body's,
+                // so the items are the value's own `B` slots.
+                if !self.closure_args.contains_key(&def) {
+                    return match vars.get(n0 + nf..n0 + nf + nb) {
+                        Some(v) => {
+                            out.push(v.to_vec());
+                            true
+                        }
+                        None => false,
+                    };
+                }
                 let mut roles = Vec::new();
                 closure_roles(&mut self.sc, def, cargs, &mut roles);
                 let Some(reqs) = self.closure_reqs(def, &roles) else { return false };
@@ -6509,6 +6520,36 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// The conservative call rule: the result may hold any argument's
     /// regions (equal to them when it holds a `&mut`), and each `&mut`
     /// argument's target may receive every other argument's regions.
+    /// The item slot vars of a call's revealed `impl Iterator<Item = T>`
+    /// value (type `dt`, vars `dv`) where `T` writes `'static`: the
+    /// definer's check proves its items outlive `T`'s lifetimes
+    /// (`rpit_item_edges`), and rustc's caller sees only `T`, so those
+    /// slots take no argument's loan (`let names: Vec<&'static str> =
+    /// c.file_names().collect()`).
+    fn opaque_static_items(&mut self, f: LocalDefId, dt: Ty, dv: &[u32]) -> Vec<u32> {
+        let p = self.p;
+        let ot = p.gx.opaque_ret_of.get(&f).copied().unwrap_or(p.fn_info(f).ret);
+        let TyKind::Opaque(od, _) = p.tys.kind(ot) else { return Vec::new() };
+        let Some(item) = p.gx.opaques.get(&od).and_then(|i| i.item_out) else { return Vec::new() };
+        let mut rs = Vec::new();
+        regions_of(&p.tys, item, &mut rs);
+        if !rs.contains(&Region::Static) {
+            return Vec::new();
+        }
+        let mut cands = Vec::new();
+        if !self.iter_items(dt, dv, &mut cands) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for c in cands {
+            if c.len() != rs.len() {
+                return Vec::new();
+            }
+            out.extend(c.iter().zip(&rs).filter(|(_, r)| **r == Region::Static).map(|(&v, _)| v));
+        }
+        out
+    }
+
     /// True when `f` returns an `impl Trait` value. A template callee
     /// (`lust check` makes no instances) keeps its opaque return in
     /// `FnInfo::ret`.
@@ -7321,11 +7362,12 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
     }
 
-    /// A closure checked with no expected signature (`ClosureEntry::
-    /// free_sig`, also behind `&`) passed for `F: Fn*(..) -> O` where `O`
-    /// holds a higher-ranked region: its output region is one free
-    /// region, never the input's, so it does not implement the bound
-    /// (rustc E0308 "one type is more general than the other").
+    /// A closure with a free output (`ClosureEntry::free_sig`, also behind
+    /// `&`) passed for `F: Fn*(..) -> O` where `O` holds a higher-ranked
+    /// region: its output region is one free region, never the input's,
+    /// so it does not implement the bound (rustc E0308 "one type is more
+    /// general than the other"); and a closure whose output is its
+    /// input's where `O` fixes that slot.
     fn free_sig_bound(&mut self, trait_args: ArgsId, sig: &RegionSig, univ: &[u32]) {
         let p = self.p;
         let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
@@ -7338,26 +7380,33 @@ impl<'b, 'p> Builder<'b, 'p> {
             ft = inner;
         }
         let TyKind::Closure(def, _) = self.body.tys.kind(ft) else { return };
-        let Some(c_out) = p.gx.closures.get(&def).filter(|c| c.free_sig).map(|c| c.output) else { return };
-        let mut rs = Vec::new();
-        regions_of(&p.tys, out_t, &mut rs);
-        if !rs.iter().any(|r| matches!(r, Region::Bound(_))) {
-            return;
-        }
+        let Some((c_out, free)) = p.gx.closures.get(&def).map(|c| (c.output, c.free_sig)) else { return };
         let mut outs: Vec<BoundSlot> = Vec::new();
         self.bound_slots(out_t, c_out, univ, &mut outs);
-        if outs.contains(&BoundSlot::Hr) {
+        if free {
+            let mut rs = Vec::new();
+            regions_of(&p.tys, out_t, &mut rs);
+            if rs.iter().any(|r| matches!(r, Region::Bound(_))) && outs.contains(&BoundSlot::Hr) {
+                self.free_output_not_general();
+            }
+            return;
+        }
+        // The other way: an output slot the closure's own bound made its
+        // input's (`tie(|a: &u8| &G)`) meets a fixed one (`'static`, a
+        // named lifetime, a type param's), which no binder can be.
+        let hr = self.bound_hr_out_slots(def);
+        if hr.iter().any(|&k| outs.get(k as usize).is_some_and(|&o| o != BoundSlot::Hr)) {
             self.free_output_not_general();
         }
     }
 
-    /// L0735 for a closure with no expected signature whose output must
-    /// be its argument's (`free_sig_bound`, `dyn_fn_coercion`).
+    /// L0735 for a closure whose output lifetime is not the one the bound
+    /// it meets returns (`free_sig_bound`, `dyn_fn_coercion`).
     fn free_output_not_general(&mut self) {
         self.errs.push(Diag::new(
             "L0735",
             self.span,
-            "this closure is not general enough for the bound it meets: its return lifetime is one inferred lifetime, but the bound's return borrows from its argument",
+            "this closure is not general enough for the bound it meets: its return lifetime and the bound's differ (one is its argument's, the other is not)",
             "Pass the closure where it is written (`f(|x: &T| ..)`), so it takes the bound's signature.",
         ));
     }
