@@ -5992,11 +5992,18 @@ impl Ex<'_, '_> {
     /// `try_fold` steps, as in `search`.
     #[allow(clippy::too_many_arguments)]
     fn try_fold(&mut self, itp: Place, ty: Ty, init: Operand, fpl: Place, fty: Ty, dest: Place, dest_ty: Ty) -> R {
-        let (acc_ty, is_res) = match self.body.tys.option_elem(dest_ty) {
-            Some(t) => (t, false),
-            None => (self.body.tys.result_args(dest_ty).ok_or("iterator expansion: `try_fold` result is not an Option or a Result")?.0, true),
+        // `core::ops::ControlFlow<B, C>` (std source): the accumulator is
+        // `C`, and `Continue` is variant 0.
+        let flow = self.body.tys.local_adt(dest_ty).filter(|&a| self.p.is_control_flow_adt(a));
+        let (acc_ty, is_res) = match (self.body.tys.option_elem(dest_ty), flow) {
+            (Some(t), _) => (t, false),
+            (None, Some(_)) => {
+                let c = self.body.tys.adt_parts(dest_ty).and_then(|(_, a)| self.body.tys.args(a).get(1).and_then(|g| g.as_ty()));
+                (c.ok_or("iterator expansion: `try_fold` into a ControlFlow without its `C`")?, true)
+            }
+            (None, None) => (self.body.tys.result_args(dest_ty).ok_or("iterator expansion: `try_fold` result is not an Option or a Result")?.0, true),
         };
-        // `Some` is discriminant 1 and `Ok` 0; the payload is field 0.
+        // `Some` is discriminant 1, `Ok` and `Continue` 0; the payload is field 0.
         let (go_d, go_v) = if is_res { (0, 0) } else { (1, 1) };
         let acc = self.local(acc_ty);
         self.assign(Place::local(acc), Rvalue::Use(init));
@@ -6025,7 +6032,9 @@ impl Ex<'_, '_> {
         self.goto(join);
         self.cur = n;
         let aa = self.take(Place::local(acc), acc_ty);
-        if is_res {
+        if let Some(adt) = flow {
+            self.assign(dest, Rvalue::Aggregate(adt, 0, vec![aa]));
+        } else if is_res {
             self.assign(dest, Rvalue::Res(dest_ty, true, aa));
         } else {
             self.some(&dest, dest_ty, aa);

@@ -4962,16 +4962,24 @@ impl<'b, 'p> Builder<'b, 'p> {
         self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, dt, dv, Variance::Co))
     }
 
-    /// `try_fold(init, f)` into `Option<B>` or `Result<B, E>`: as `fold`,
-    /// the accumulator `B` (the result's leading slots) is the initial
-    /// value or what the body returns, and `E` only what the body returns;
+    /// `try_fold(init, f)` into `Option<B>`, `Result<B, E>` or
+    /// `ControlFlow<X, B>`: as `fold`, the accumulator `B` (the result's
+    /// leading slots, after `X`'s for a ControlFlow) is the initial value
+    /// or what the body returns, and `E` (`X`) only what the body returns;
     /// the `&mut` borrow of the iterator reaches neither. False when the
     /// shapes differ or the closure's body does not solve.
     fn call_try_fold(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
         let [_, (it, iv), (ct, _)] = avs else { return false };
         let TyKind::Closure(def, args) = self.body.tys.kind(*ct) else { return false };
-        let Some(acc) = self.body.tys.option_elem(dt).or_else(|| self.body.tys.result_args(dt).map(|(t, _)| t)) else { return false };
-        let Some(av) = dv.get(..self.sc.slots(acc) as usize) else { return false };
+        let flow = self.body.tys.local_adt(dt).is_some_and(|a| self.p.is_control_flow_adt(a));
+        let (acc, skip) = match self.body.tys.adt_parts(dt).map(|(_, a)| self.body.tys.args(a).iter().filter_map(|g| g.as_ty()).collect::<Vec<Ty>>()) {
+            Some(xs) if flow && xs.len() == 2 => (xs[1], self.sc.slots(xs[0]) as usize),
+            _ => match self.body.tys.option_elem(dt).or_else(|| self.body.tys.result_args(dt).map(|(t, _)| t)) {
+                Some(t) => (t, 0),
+                None => return false,
+            },
+        };
+        let Some(av) = dv.get(skip..skip + self.sc.slots(acc) as usize) else { return false };
         let mut roles = Vec::new();
         closure_roles(&mut self.sc, def, args, &mut roles);
         self.closure_reqs(def, &roles).is_some() && (iv.is_empty() || self.relate(*it, iv, acc, av, Variance::Co))

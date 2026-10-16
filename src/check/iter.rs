@@ -1288,7 +1288,8 @@ impl<'p> Ctx<'p> {
             // whatever the closure returns, then its output must be the
             // accumulator, as rustc's projection fixes it before the
             // literal fallback (`try_fold(0, |v, &c| ..)` -> `Option<u32>`
-            // makes `0` a `u32`). Only `Option` and `Result` are modeled.
+            // makes `0` a `u32`). `Option`, `Result` and `ControlFlow<B,
+            // C>` (whose output is `C`) are modeled.
             "try_fold" => {
                 if args.len() != 2 {
                     self.err("L0105", span, "`try_fold` takes 2 arguments", "Pass the initial value and the closure.");
@@ -1311,11 +1312,11 @@ impl<'p> Ctx<'p> {
                     self.run_obligations(false);
                 }
                 let r = self.resolve(ret);
-                let out = self.tys.option_elem(r).or_else(|| self.tys.result_args(r).map(|(t, _)| t));
+                let out = self.tys.option_elem(r).or_else(|| self.tys.result_args(r).map(|(t, _)| t)).or_else(|| self.control_flow_args(r).map(|(_, _, c)| c));
                 let Some(out) = out else {
                     if r != ERROR {
                         let tn = self.tn(r);
-                        self.err("L0640", span, format!("`try_fold` with a closure result of type `{tn}` is not implemented yet"), "Return an `Option` or a `Result` from the closure.");
+                        self.err("L0640", span, format!("`try_fold` with a closure result of type `{tn}` is not implemented yet"), "Return an `Option`, a `Result` or a `ControlFlow` from the closure.");
                     }
                     return ERROR;
                 };
