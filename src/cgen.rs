@@ -41,6 +41,10 @@ pub enum CTy {
     /// A raw pointer (w-cinterop): the same C pointer as `Ref`, but its
     /// glue compares, orders, hashes, and prints the address itself.
     Ptr(Box<CTy>),
+    /// A raw pointer to `str`, `[T]` or `dyn Tr` (tf-fatptr): the same C
+    /// struct as the reference (`Str`, `Slice(T)` or `Dyn` inside), but
+    /// no niche, and glue that compares the address and the metadata.
+    FatPtr(Box<CTy>),
     Adt(AdtId),
     Chars,
     /// A tuple, emitted as a generated struct with fields f0, f1, ... (W-CORELANG).
@@ -247,10 +251,12 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
         TyKind::Slice(e) => CTy::Slice(Box::new(cty(tys, e))),
         TyKind::Dyn(..) => CTy::Dyn,
         TyKind::Ref(_, _, e) => ref_cty(tys, e),
-        // A raw pointer to `str`, `[T]` or `dyn Tr` is fat, laid out as
-        // the reference (check/mod.rs `fat_raw_vals` limits its uses).
-        TyKind::RawPtr(_, e) if matches!(tys.kind(e), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) => ref_cty(tys, e),
-        TyKind::RawPtr(_, e) => CTy::Ptr(Box::new(cty(tys, e))),
+        TyKind::RawPtr(_, e) => match tys.kind(e) {
+            TyKind::Str => CTy::FatPtr(Box::new(CTy::Str)),
+            TyKind::Slice(el) => CTy::FatPtr(Box::new(CTy::Slice(Box::new(cty(tys, el))))),
+            TyKind::Dyn(..) => CTy::FatPtr(Box::new(CTy::Dyn)),
+            _ => CTy::Ptr(Box::new(cty(tys, e))),
+        },
         // An unsized newtype is laid out as its field (W-SHIM).
         TyKind::Adt(d, _) if let Some(f) = tys.unsized_field(d) => match tys.local_adt(t) {
             Some(a) => CTy::Unsized(a, Box::new(cty(tys, f))),
@@ -312,27 +318,24 @@ pub fn cty(tys: &impl TyIntern, t: Ty) -> CTy {
     }
 }
 
-/// The C form of a reference to `e`: a slice or dyn reference is its
-/// fat value, a reference to an unsized newtype is the newtype's own
-/// fat form (W-SHIM), anything else a pointer.
-/// The address of a fat pointer value of C type `t` (`&str`, `&[T]`,
-/// `&dyn Tr` and their raw forms); None for a thin one.
-fn fat_addr(v: &str, t: &CTy) -> Option<String> {
+/// The address of a raw pointer value `v` of C type `t` as a `void*`:
+/// the data word of a fat pointer (tf-fatptr), the pointer itself
+/// otherwise.
+fn ptr_addr(v: &str, t: &CTy) -> String {
     match t {
-        CTy::Dyn => Some(format!("(({v}).data)")),
-        CTy::Slice(_) | CTy::Str => Some(format!("((void*)({v}).ptr)")),
-        CTy::Ref(inner) if **inner == CTy::Str => Some(format!("((void*)({v}).ptr)")),
-        _ => None,
+        CTy::FatPtr(e) if **e == CTy::Dyn => format!("(({v}).data)"),
+        CTy::FatPtr(_) => format!("((void*)({v}).ptr)"),
+        _ => format!("((void*)({v}))"),
     }
 }
 
-/// True when `t` is a reference to an owning pointer whose value is the
-/// fat view of its data (`Rc<dyn Tr>`, `Rc<str>`, `Arc<[T]>`): its
-/// `as_ptr` is that value.
+/// True when `t` is a reference to an owning pointer whose C value is
+/// the fat view of its data (`Rc<dyn Tr>`, `Box<dyn Tr>`, `Rc<str>`,
+/// `Arc<[T]>`): its `as_ptr` is a copy of that value.
 fn owning_fat_ref(t: &CTy) -> bool {
     match t {
         CTy::Ref(inner) => match &**inner {
-            CTy::RcDyn => true,
+            CTy::RcDyn | CTy::BoxDyn | CTy::BoxSlice(_) => true,
             CTy::Own(_, x) => matches!(**x, CTy::Str | CTy::Slice(_) | CTy::Dyn),
             _ => false,
         },
@@ -340,6 +343,9 @@ fn owning_fat_ref(t: &CTy) -> bool {
     }
 }
 
+/// The C form of a reference to `e`: a slice or dyn reference is its
+/// fat value, a reference to an unsized newtype is the newtype's own
+/// fat form (W-SHIM), anything else a pointer.
 fn ref_cty(tys: &impl TyIntern, e: Ty) -> CTy {
     match tys.kind(e) {
         TyKind::Slice(el) => CTy::Slice(Box::new(cty(tys, el))),
@@ -562,6 +568,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Guard(inner, _) => format!("RCL_{}*", mangle(inner)),
         CTy::Ref(inner) => format!("{}*", ctype(inner)),
         CTy::Ptr(inner) => format!("{}*", ctype(inner)),
+        CTy::FatPtr(inner) => ctype(inner),
         CTy::Adt(a) => format!("A{}", a.0),
         CTy::Option(_) => format!("O_{}", mangle(t)),
         CTy::Result(..) => format!("R_{}", mangle(t)),
@@ -668,6 +675,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Sync(k, e) => tok(s, &format!("Sy{}", *k as u32), &[e]),
         CTy::Ref(e) => tok(s, "R", &[e]),
         CTy::Ptr(e) => tok(s, "P", &[e]),
+        CTy::FatPtr(e) => tok(s, "FP", &[e]),
         CTy::Option(e) => tok(s, "O", &[e]),
         CTy::Result(a, b) => tok(s, "Re", &[a, b]),
         CTy::Slice(e) => tok(s, "sl", &[e]),
@@ -720,7 +728,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
         }
         // A raw pointer names its pointee (`A2480*` for `*const Mapper`): its
         // forward typedef must be in the unit too.
-        CTy::Vec(e) | CTy::Ref(e) | CTy::Ptr(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) | CTy::Own(_, e) | CTy::WeakOwn(_, e) => {
+        CTy::Vec(e) | CTy::Ref(e) | CTy::Ptr(e) | CTy::FatPtr(e) | CTy::Boxed(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Cell(e) | CTy::Unsized(_, e) | CTy::Own(_, e) | CTy::WeakOwn(_, e) => {
             collect_types(e, out)
         }
         CTy::ArrayIter(e, n) => {
@@ -783,7 +791,7 @@ fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
         // no forward form (a closure capturing a fn pointer by ref, a
         // `Box<fn()>` inside an `Option` or a lock).
         CTy::Ref(inner) | CTy::Boxed(inner) if matches!(**inner, CTy::FnPtr(..) | CTy::Ref(_) | CTy::Boxed(_)) => by_value_deps(inner, out),
-        CTy::Unsized(_, inner) => by_value_deps(inner, out),
+        CTy::Unsized(_, inner) | CTy::FatPtr(inner) => by_value_deps(inner, out),
         CTy::Hash(k, _) if hash::has_struct(*k) => out.push(t.clone()),
         _ => {}
     }
@@ -803,6 +811,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         | CTy::FnPtr(..)
         | CTy::Ref(_)
         | CTy::Ptr(_)
+        | CTy::FatPtr(_)
         | CTy::ExitCode
         | CTy::AccessError
         | CTy::Chars
@@ -1203,6 +1212,8 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Ref(_) => Some(layout::ptr_layout()),
             // A raw pointer may be null: no niche (w-cinterop).
             CTy::Ptr(_) => Some(layout::raw_ptr_layout()),
+            CTy::FatPtr(e) if **e == CTy::Dyn => Some(layout::dyn_raw_ptr_layout()),
+            CTy::FatPtr(_) => Some(layout::fat_raw_ptr_layout()),
             CTy::Slice(_) | CTy::BoxSlice(_) | CTy::Own(..) | CTy::WeakOwn(..) | CTy::DynCell | CTy::DynGuard(_) | CTy::DynLock(_) | CTy::Dyn | CTy::Unsized(..) => {
                 Some(layout::fat_ptr_layout())
             }
@@ -1464,6 +1475,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
             CTy::BoxDyn | CTy::RcDyn | CTy::WeakDyn(_) => (16, 8),
             CTy::Boxed(_) | CTy::Rc(_) => (8, 8),
             CTy::Ref(_) | CTy::Ptr(_) => (8, 8),
+            CTy::FatPtr(_) => (16, 8),
             CTy::Option(e) => {
                 let (es, ea) = go(p, e, seen);
                 let align = ea.max(4);
@@ -3225,11 +3237,10 @@ impl FnGen<'_, '_> {
             Rvalue::Cast(o, to) => {
                 let (a, from) = self.operand(o, loc, post);
                 let to = cty(&self.body.tys, *to);
-                // A fat raw pointer cast to a thin one keeps its address.
-                if matches!(to, CTy::Ptr(_))
-                    && let Some(addr) = fat_addr(&a, &from)
-                {
-                    return format!("(({}){addr})", ctype(&to));
+                // A fat raw pointer (tf-fatptr): to a fat one of the same
+                // pointee it is a copy, to a thin one its address.
+                if let CTy::FatPtr(_) = from {
+                    return if matches!(to, CTy::FatPtr(_)) { a } else { format!("(({}){})", ctype(&to), ptr_addr(&a, &from)) };
                 }
                 // Casts to or from a 128-bit struct value are not C casts.
                 match (&from, &to) {
@@ -4581,6 +4592,8 @@ impl FnGen<'_, '_> {
             // operand's drop flag is already clear, and the
             // pointer value is the `&mut T` result.
             B::BoxLeak => vals[0].clone(),
+            // The box's C value is the payload pointer, thin or fat.
+            B::BoxAsPtr => format!("(*{})", vals[0]),
             B::RcNew => {
                 let it = format!("RcI_{}", mangle(&tys[0]));
                 let t = self.tmp();
@@ -6363,21 +6376,22 @@ impl FnGen<'_, '_> {
             // the C address itself.
             B::PtrFromRef => vals[0].clone(),
             B::PtrNull => "((void*)0)".into(),
-            // Fat operands: `addr_eq` compares the addresses, `eq` the
-            // address and the length (check/mod.rs allows no dyn `eq`).
-            B::PtrEqFn | B::PtrAddrEqFn if fat_addr(&vals[0], &tys[0]).is_some() || fat_addr(&vals[1], &tys[1]).is_some() => {
-                let addr = |i: usize| fat_addr(&vals[i], &tys[i]).unwrap_or_else(|| format!("((void*)({}))", vals[i]));
-                // `eq` of two fat slice or str pointers also compares the
-                // lengths (check/mod.rs allows no dyn `eq`).
-                let len = if b == B::PtrEqFn { format!(" && ({}).len == ({}).len", vals[0], vals[1]) } else { String::new() };
-                format!("({} == {}{len})", addr(0), addr(1))
-            }
-            B::PtrEqFn | B::PtrAddrEqFn => format!("((void*)({}) == (void*)({}))", vals[0], vals[1]),
-            B::PtrIsNull => format!("(({}) == 0)", vals[0]),
-            B::PtrCast => format!("((void*)({}))", fat_addr(&vals[0], &tys[0]).unwrap_or_else(|| vals[0].clone())),
-            B::PtrAddr => format!("((uint64_t)(uintptr_t)({}))", fat_addr(&vals[0], &tys[0]).unwrap_or_else(|| vals[0].clone())),
+            // A fat operand (tf-fatptr): `eq` compares the address and
+            // the metadata (check rejects it for dyn pointers),
+            // `addr_eq` the addresses only.
+            B::PtrEqFn if let CTy::FatPtr(e) = &tys[0] => match **e {
+                CTy::Dyn => format!("(({0}).data == ({1}).data && ({0}).vt == ({1}).vt)", vals[0], vals[1]),
+                _ => format!("((void*)({0}).ptr == (void*)({1}).ptr && ({0}).len == ({1}).len)", vals[0], vals[1]),
+            },
+            B::PtrEqFn | B::PtrAddrEqFn => format!("({} == {})", ptr_addr(&vals[0], &tys[0]), ptr_addr(&vals[1], &tys[1])),
+            B::PtrIsNull => format!("({} == 0)", ptr_addr(&vals[0], &tys[0])),
+            B::PtrCast => ptr_addr(&vals[0], &tys[0]),
+            B::PtrCastMut => vals[0].clone(),
+            B::PtrLen => format!("(({}).len)", vals[0]),
+            B::PtrAddr => format!("((uint64_t)(uintptr_t){})", ptr_addr(&vals[0], &tys[0])),
             B::PtrWithAddr => format!("((void*)(uintptr_t)({}))", vals[1]),
-            // `Rc::as_ptr`: the payload behind the counts.
+            // `Rc::as_ptr`: the payload behind the counts. An `Rc<dyn
+            // Tr>`, `Rc<str>` or `Rc<[T]>` is already the fat view of it.
             B::SmartAsPtr if owning_fat_ref(&tys[0]) => format!("(*{})", vals[0]),
             B::SmartAsPtr => format!("(&(*{})->v)", vals[0]),
             B::SeqAsPtr => slice_like(&tys[0], &vals[0]).1,
@@ -9844,6 +9858,11 @@ fn glue_def_value(
                     CTy::Unit | CTy::AccessError => "1".into(),
                     CTy::Int(i) if is128(*i) => format!("(({x}).lo == ({y}).lo && ({x}).hi == ({y}).hi)"),
                     CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) | CTy::ExitCode | CTy::Ptr(_) => format!("({x} == {y})"),
+                    // A fat raw pointer: address and metadata (check
+                    // rejects `==` on dyn pointers, whose vtable addresses
+                    // rustc does not fix).
+                    CTy::FatPtr(e) if **e == CTy::Dyn => format!("(({x}).data == ({y}).data && ({x}).vt == ({y}).vt)"),
+                    CTy::FatPtr(_) => format!("((void*)({x}).ptr == (void*)({y}).ptr && ({x}).len == ({y}).len)"),
                     _ => {
                         need(Glue::Eq, t);
                         format!("eq_{}(&{x}, &{y})", mangle(t))
@@ -9861,6 +9880,11 @@ fn glue_def_value(
                     let ((rb, da), (_, db)) = (cow.0.clone().unwrap(), cow.1.clone().unwrap());
                     let c = eq_of(&rb, "va", "vb", &mut need);
                     let _ = writeln!(body, "  {da}\n  {db}\n  return {c};");
+                }
+                // A fat raw pointer: address and metadata (tf-fatptr).
+                CTy::FatPtr(_) => {
+                    let c = eq_of(t, "(*a)", "(*b)", &mut need);
+                    let _ = writeln!(body, "  return {c};");
                 }
                 CTy::String => body.push_str("  return lust_str_eq(lust_string_as_str(a), lust_string_as_str(b));\n"),
                 CTy::Ref(inner) if **inner == CTy::Str => body.push_str("  return lust_str_eq(*a, *b);\n"),

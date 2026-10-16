@@ -186,6 +186,18 @@ pub fn raw_ptr_layout() -> Layout {
     Layout::simple(8, 8, None)
 }
 
+/// A raw pointer to `str` or `[T]`: two words, no niche (tf-fatptr).
+pub fn fat_raw_ptr_layout() -> Layout {
+    Layout::simple(16, 8, None)
+}
+
+/// A raw pointer to `dyn Tr`: the data word may be null, the vtable
+/// word may not, so it keeps that niche (rustc's `Option<*const dyn
+/// Tr>` is 16 bytes).
+pub fn dyn_raw_ptr_layout() -> Layout {
+    Layout::simple(16, 8, Some(Niche { offset: 8, scalar_size: 8, free: 1, start: 0 }))
+}
+
 /// A fat pointer (slice, str, or dyn reference): the data word keeps the
 /// non-null niche.
 pub fn fat_ptr_layout() -> Layout {
@@ -944,7 +956,11 @@ fn compute(
             TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) => Ok(fat_ptr_layout()),
             _ => Ok(ptr_layout()),
         },
-        TyKind::RawPtr(_, _) => Ok(raw_ptr_layout()),
+        TyKind::RawPtr(_, e) => match tys.kind(peel_param(tys, e, env, frames).0) {
+            TyKind::Slice(_) | TyKind::Str => Ok(fat_raw_ptr_layout()),
+            TyKind::Dyn(..) => Ok(dyn_raw_ptr_layout()),
+            _ => Ok(raw_ptr_layout()),
+        },
         TyKind::FnPtr(_) => Ok(ptr_layout()),
         TyKind::FnDef(..) => Ok(zst_layout(1)),
         TyKind::Array(e, c) => {

@@ -3339,11 +3339,14 @@ pub fn resolve_scoped(
         }
         TyExpr::Ptr { mutable, inner } => {
             let e = resolve_scoped(ast, interner, known, cx, tys, *inner, scope)?;
-            // A raw pointer to an unsized pointee is a fat pointer in
-            // Rust (address plus metadata); lust's raw pointers are thin
-            // addresses (w-cinterop), so the fat forms reject here.
-            if matches!(tys.kind(e), TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..)) {
-                return Err(not_yet("L0602", span, "a raw pointer to an unsized type"));
+            // A raw pointer to `str`, `[T]` or `dyn Tr` is a fat pointer
+            // (tf-fatptr): address plus length or vtable, with a narrow set
+            // of operations (check/mod.rs `ptr_method`, casts, `ptr::eq`).
+            // A struct with an unsized tail stays out.
+            if let TyKind::Adt(d, _) = tys.kind(e)
+                && tys.unsized_field(d).is_some()
+            {
+                return Err(not_yet("L0602", span, "a raw pointer to an unsized struct"));
             }
             Ok(tys.intern(TyKind::RawPtr(Mut::from_bool(*mutable), e)))
         }
@@ -8605,14 +8608,30 @@ pub fn add_synthetic_impls(p: &mut Program) {
     let ref_p0 = p.tys.mk_ref(false, p0);
     insert_synthetic(p, &mut ordinal, lang.copy, ref_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     insert_synthetic(p, &mut ordinal, lang.clone, ref_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
-    // Raw pointers (w-cinterop): Copy, Clone, Eq, Ord, Hash, and Debug
-    // unconditionally, as in core: they act on the address alone.
-    for self_pat in [p.tys.intern(TyKind::RawPtr(Mut::Shared, p0)), p.tys.intern(TyKind::RawPtr(Mut::Mut, p0))] {
-        for tr in [lang.copy, lang.clone, lang.eq, lang.hash, lang.ord, lang.debug] {
+    // Raw pointers (w-cinterop): Copy and Clone for every pointee, as in
+    // core. Eq, Ord, Hash, and Debug act on the address of a sized
+    // pointee only; a fat pointer (tf-fatptr) has `PartialEq`/`Eq` for
+    // `str` and `[T]` (address and length) and none of the rest: lust
+    // does not build them, and a dyn pointer's `==` compares vtable
+    // addresses, which rustc does not fix. So a `T: ?Sized` generic
+    // `*const T` has none of them either.
+    let one_sized = Generics { predicates: vec![pred_on(p, lang.sized, p0)], ..one.clone() };
+    for m in [Mut::Shared, Mut::Mut] {
+        let self_pat = p.tys.intern(TyKind::RawPtr(m, p0));
+        for tr in [lang.copy, lang.clone] {
             insert_synthetic(p, &mut ordinal, tr, self_pat, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
+        for tr in [lang.eq, lang.hash, lang.ord, lang.debug] {
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &[], one_sized.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
         for tr in [lang.partial_eq, lang.partial_ord] {
-            insert_synthetic(p, &mut ordinal, tr, self_pat, &[self_pat], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, tr, self_pat, &[self_pat], one_sized.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        let slice_p0 = p.tys.intern(TyKind::Slice(p0));
+        for (pointee, g) in [(STR, g0.clone()), (slice_p0, one.clone())] {
+            let fat = p.tys.intern(TyKind::RawPtr(m, pointee));
+            insert_synthetic(p, &mut ordinal, lang.eq, fat, &[], g.clone(), Vec::new(), Synthetic::Lang, false, span);
+            insert_synthetic(p, &mut ordinal, lang.partial_eq, fat, &[fat], g, Vec::new(), Synthetic::Lang, false, span);
         }
     }
     // Display: the std scalars, str, and String, and `&T` and `&mut T`

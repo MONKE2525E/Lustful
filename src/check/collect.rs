@@ -8242,6 +8242,21 @@ fn env_proves(tys: &impl TyIntern, t: Ty, trait_def: DefId, rhs: Option<Ty>) -> 
     })
 }
 
+/// True when a raw pointer to `e` has glue for an operation (tf-fatptr):
+/// a sized pointee (a generic one by its `Sized` bound), or `str` and
+/// `[T]` when `slice_ok` (they compare by address and length). A dyn
+/// pointer has none: rustc compares vtable addresses, which it does not
+/// fix.
+fn raw_glue_ok(p: &Program, tys: &impl TyIntern, e: Ty, slice_ok: bool) -> bool {
+    match tys.kind(e) {
+        TyKind::Dyn(..) => false,
+        TyKind::Str | TyKind::Slice(_) => slice_ok,
+        TyKind::Adt(d, _) => tys.unsized_field(d).is_none(),
+        TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, e, p.gx.lang.sized, None),
+        _ => true,
+    }
+}
+
 pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.copy, None),
@@ -8796,8 +8811,9 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
             }
         }
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
-        // Raw pointers order by address (w-cinterop).
-        TyKind::RawPtr(..) => true,
+        // Raw pointers order by address (w-cinterop); fat ones are not
+        // built (tf-fatptr).
+        TyKind::RawPtr(_, e) => raw_glue_ok(p, tys, e, false),
         TyKind::Float(_) => !total,
         TyKind::Infer(v) => v.is_int() || (v.is_float() && !total),
         TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_cmp_mode(p, tys, e, total, seen, pcmp),
@@ -9191,8 +9207,10 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bo
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.hash, None),
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         // A raw pointer or fn pointer hashes its address as a usize
-        // (w-cinterop; core's `impl<F: FnPtr> Hash for F`).
-        TyKind::RawPtr(..) | TyKind::FnPtr(_) => true,
+        // (w-cinterop; core's `impl<F: FnPtr> Hash for F`). Fat raw
+        // pointers have no Hash glue (tf-fatptr).
+        TyKind::RawPtr(_, e) => raw_glue_ok(p, tys, e, false),
+        TyKind::FnPtr(_) => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) => glue_hash(p, tys, e, seen),
         TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_hash(p, tys, e, seen)),
@@ -9351,7 +9369,8 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -
     }
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.eq, None),
-        TyKind::FnPtr(_) | TyKind::RawPtr(..) => true,
+        TyKind::FnPtr(_) => true,
+        TyKind::RawPtr(_, e) => raw_glue_ok(p, tys, e, true),
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int(),
         TyKind::Ref(_, _, e) => glue_total_eq(p, tys, e, seen),
@@ -9415,8 +9434,10 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.partial_eq, Some(t)),
         // Fn pointers compare by address in Rust; fn items do not.
         TyKind::FnPtr(_) => true,
-        // Raw pointers compare by address, for every pointee (w-cinterop).
-        TyKind::RawPtr(..) => true,
+        // Raw pointers compare by address (w-cinterop), a `str` or `[T]`
+        // pointer by address and length; a dyn pointer's vtable address
+        // is not fixed by rustc, so it has no `==` (tf-fatptr).
+        TyKind::RawPtr(_, e) => raw_glue_ok(p, tys, e, true),
         TyKind::Float(_) => true,
         TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Str | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
@@ -9483,8 +9504,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.debug, None),
         TyKind::Opaque(..) => crate::check::opaque::opaque_bound_holds(p, tys, t, p.gx.lang.debug),
         TyKind::Float(_) => true,
-        // A raw pointer's Debug is its address (w-cinterop).
-        TyKind::RawPtr(..) => true,
+        // A raw pointer's Debug is its address (w-cinterop); not built
+        // for fat ones (tf-fatptr).
+        TyKind::RawPtr(_, e) => raw_glue_ok(p, tys, e, false),
         // Core implements Debug for every fn pointer signature,
         // higher-ranked ones included (the address, like a raw pointer).
         TyKind::FnPtr(_) => true,

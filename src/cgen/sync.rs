@@ -1593,7 +1593,7 @@ impl FnGen<'_, '_> {
     fn arc_builtin(&mut self, op: SyncOp, vals: &[String], tys: &[CTy]) -> String {
         use SyncOp as S;
         // `Arc::as_ptr` of an `Arc<[T]>`, `Arc<str>` or `Arc<dyn Tr>`: the
-        // owning value is the fat view of its data.
+        // owning value is the fat view of its data (tf-fatptr).
         if op == S::ArcAsPtr && super::owning_fat_ref(&tys[0]) {
             return format!("(*{})", vals[0]);
         }

@@ -730,7 +730,10 @@ impl<'p> Ctx<'p> {
             }
             SyncOp::ArcStrongCount | SyncOp::ArcWeakCount => (vec![arc_ref], USIZE),
             SyncOp::ArcPtrEq => (vec![arc_ref, arc_ref], BOOL),
-            SyncOp::ArcAsPtr => (vec![arc_ref], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, elem))),
+            SyncOp::ArcAsPtr => {
+                self.deferred_raw.push((elem, span, super::RawUse::Pointee));
+                (vec![arc_ref], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, elem)))
+            }
             SyncOp::ArcDowngrade => (vec![arc_ref], weak),
             SyncOp::ArcGetMut => {
                 let r = self.tys.mk_ref(true, elem);

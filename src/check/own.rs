@@ -278,7 +278,6 @@ impl<'p> Ctx<'p> {
                 | Builtin::RcUnwrapOrClone
                 | Builtin::Sync(S::ArcTryUnwrap | S::ArcIntoInner | S::ArcUnwrapOrClone)
         );
-        // `as_ptr` of these is a fat raw pointer (check/mod.rs `fat_raw_vals`).
         let not_yet = matches!(b, Builtin::RcDowngrade | Builtin::Sync(S::ArcDowngrade));
         if !sized_only && !not_yet {
             return false;

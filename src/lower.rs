@@ -1504,6 +1504,25 @@ impl<'p> Lower<'p> {
             self.assign(Place::local(out), rv, span);
             return Operand::Move(Place::local(out));
         }
+        // A reference or thin raw pointer to a fat raw pointer (tf-fatptr):
+        // the address plus the array length or the vtable.
+        if let TyKind::RawPtr(_, to) = self.kind(target) {
+            let src = match self.kind(found) {
+                TyKind::Ref(_, _, s) | TyKind::RawPtr(_, s) => s,
+                _ => unreachable!(),
+            };
+            let rv = match (object::principal_of(&self.body.tys, src), object::principal_of(&self.body.tys, to)) {
+                (Some(from), Some(dst)) => {
+                    let path = object::upcast_path(self.p, &mut self.body.tys, from, dst).unwrap_or_default();
+                    if path.is_empty() { Rvalue::Use(op) } else { Rvalue::DynUpcast { ptr: op, path } }
+                }
+                _ if matches!(self.body.tys.kind(src), TyKind::Dyn(..)) => Rvalue::Use(op),
+                _ => Rvalue::MakeDyn { ptr: op, src, dyn_ty: to },
+            };
+            let out = self.temp(target);
+            self.assign(Place::local(out), rv, span);
+            return Operand::Copy(Place::local(out));
+        }
         let TyKind::Ref(_, tm, dyn_ty) = self.kind(target) else { unreachable!() };
         let m = tm.is_mut();
         let place = self.op_place(op, found, span);

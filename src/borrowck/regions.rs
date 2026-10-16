@@ -4361,10 +4361,12 @@ impl<'b, 'p> Builder<'b, 'p> {
         {
             return;
         }
-        // `Rc::as_ptr(&rc)` and `Arc::as_ptr(&arc)` give `*const T`: a raw
+        // `Rc::as_ptr(&rc)`, `Arc::as_ptr(&arc)` and `Box::as_ptr(&b)` give `*const T`: a raw
         // pointer holds no loan of the reference, so only the element's
-        // slots (a `dyn Tr`'s object lifetime) reach the result.
-        if let CallTarget::Builtin(crate::check::Builtin::SmartAsPtr | crate::check::Builtin::Sync(crate::check::sync::SyncOp::ArcAsPtr)) = target
+        // slots (a `dyn Tr`'s object lifetime) reach the result (tf-front).
+        if let CallTarget::Builtin(
+            crate::check::Builtin::SmartAsPtr | crate::check::Builtin::BoxAsPtr | crate::check::Builtin::Sync(crate::check::sync::SyncOp::ArcAsPtr),
+        ) = target
             && let [(at, av)] = &avs[..]
             && let TyKind::Ref(_, _, owner) = self.body.tys.kind(*at)
             && let Some(elem) = self.body.tys.adt_first_ty_arg(owner)

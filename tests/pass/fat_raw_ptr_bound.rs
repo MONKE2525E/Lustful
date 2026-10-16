@@ -1,6 +1,5 @@
-// expect: L0641
-// A raw pointer to a dyn value kept in a binding: lust builds fat raw
-// pointers only for an operand read at once (cast, addr, addr_eq, eq).
+// A raw pointer to a dyn value kept in a binding (tf-fatptr; a lust
+// reject under the first, read-at-once R14).
 use std::rc::Rc;
 trait Host {}
 struct H;

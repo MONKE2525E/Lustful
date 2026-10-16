@@ -115,12 +115,10 @@ impl<'p> Ctx<'p> {
                 let r = self.tys.mk_ref(false, rc);
                 (vec![r, r], BOOL)
             }
-            // `Rc::as_ptr(&rc) -> *const T` (w-cinterop).
-            // A direct call with a fat result (`Rc<dyn Tr>`, `Rc<str>`) drops
-            // this entry for `fat_raw_vals` (check/mod.rs `call`); a fn value
-            // keeps it.
+            // `Rc::as_ptr(&rc) -> *const T` (w-cinterop); fat for `str`,
+            // `[T]` and `dyn Tr` (tf-fatptr).
             Builtin::SmartAsPtr => {
-                self.deferred_sized.push((elem, self.p.ast.expr_span(callee)));
+                self.deferred_raw.push((elem, self.p.ast.expr_span(callee), super::RawUse::Pointee));
                 let rc = self.tys.mk_rc(elem);
                 let r = self.tys.mk_ref(false, rc);
                 (vec![r], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, elem)))

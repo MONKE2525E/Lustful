@@ -489,6 +489,9 @@ pub enum Builtin {
     StrGetRange,
     BoxNew,
     BoxLeak,
+    /// `Box::as_ptr(&b) -> *const T` and `as_mut_ptr(&mut b) -> *mut T`
+    /// (tf-fatptr): the payload address, fat for `str`, `[T]` and `dyn Tr`.
+    BoxAsPtr,
     /// `Box::new_uninit` and `Box::new_zeroed`: a fresh allocation
     /// of `MaybeUninit<T>` (cgen; zero bytes for both).
     BoxNewUninit,
@@ -666,16 +669,20 @@ pub enum Builtin {
     PtrFromRef,
     /// `core::ptr::null` and `null_mut`: the zero address.
     PtrNull,
-    /// `core::ptr::eq` and `addr_eq`: address equality of two raw
-    /// pointers (references coerce at the call).
+    /// `core::ptr::eq`: equality of two raw pointers (references
+    /// coerce at the call), address and metadata for fat ones.
     PtrEqFn,
-    /// `ptr::addr_eq`: `PtrEqFn` that compares addresses only.
+    /// `core::ptr::addr_eq`: address equality only.
     PtrAddrEqFn,
     /// Raw pointer methods by value (w-cinterop): `is_null`.
     PtrIsNull,
-    /// `cast`, `cast_mut`, and `cast_const`: the address at a new
-    /// pointee or mutability.
+    /// `cast`: the address at a new (sized) pointee.
     PtrCast,
+    /// `cast_mut` and `cast_const`: the same pointer at the other
+    /// mutability (a fat one keeps its metadata).
+    PtrCastMut,
+    /// `<*const [T]>::len` (tf-fatptr): a slice pointer's length.
+    PtrLen,
     /// `addr` and `expose_provenance`: the address as a `usize`.
     PtrAddr,
     /// `with_addr`: the pointer at a new address.
@@ -1452,6 +1459,20 @@ enum DerefTable {
     Index,
 }
 
+/// What a raw pointer use allows of its pointee (tf-fatptr,
+/// `Ctx::deferred_raw`). lust builds fat raw pointers to `str`, `[T]`
+/// and `dyn Tr` only; a struct with an unsized tail stays out.
+#[derive(Clone, Copy, Debug)]
+enum RawUse {
+    /// Sized, or one of the three fat pointees.
+    Pointee,
+    /// Sized only: an operation lust builds for thin pointers only.
+    Thin(&'static str),
+    /// As `Pointee`, but no `dyn Tr`: rustc compares vtable addresses,
+    /// which it does not fix (one vtable per codegen unit, merged ones).
+    NotDyn(&'static str),
+}
+
 /// A coercion applied where a value meets an expected type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coerce {
@@ -2005,19 +2026,14 @@ struct Ctx<'p> {
     /// `vec![x; n]` element types still open at the macro: their Clone
     /// check runs at body end.
     deferred_vec_clone: Vec<(Ty, Span)>,
-    /// `Rc::as_ptr`/`Arc::as_ptr` calls and their pointee: a raw pointer
-    /// to `str`, `[T]` or `dyn Tr` is a fat value lust builds only for an
-    /// operand consumed at once (`fat_raw_used`): `.cast::<U>()`, `.addr()`,
-    /// `as *const U` to a sized `U`, `ptr::addr_eq`, `ptr::eq`. Body end
-    /// rejects any other use.
-    fat_raw_vals: Vec<(ExprId, Ty, Span)>,
-    fat_raw_used: Vec<ExprId>,
-    /// `ptr::eq`/`addr_eq` pointee types (true for `eq`), checked at body end.
-    ptr_eq_pointees: Vec<(Ty, bool, Span)>,
     /// Element types of Rc fns that lust only has for a sized `T`
     /// (by-value `try_unwrap` and `into_inner`, `get_mut`, and
     /// `downgrade`, whose `Weak` is a thin pointer).
     deferred_sized: Vec<(Ty, Span)>,
+    /// Raw pointer pointees and casts checked at body end (tf-fatptr):
+    /// which fat pointees (`str`, `[T]`, `dyn Tr`) a use allows.
+    deferred_raw: Vec<(Ty, Span, RawUse)>,
+    deferred_raw_casts: Vec<(Ty, Ty, Span)>,
     /// `Rc::downgrade` element types: sized, or a plain dyn value.
     deferred_downgrade: Vec<(Ty, Span)>,
     /// The pointee of an `Rc::make_mut`/`get_mut` (`Arc::make_mut`) call
@@ -2475,10 +2491,9 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_vec_clone: Vec::new(),
-        fat_raw_vals: Vec::new(),
-        fat_raw_used: Vec::new(),
-        ptr_eq_pointees: Vec::new(),
         deferred_sized: Vec::new(),
+        deferred_raw: Vec::new(),
+        deferred_raw_casts: Vec::new(),
         deferred_downgrade: Vec::new(),
         deferred_make_mut: Vec::new(),
         deferred_hash_key: Vec::new(),
@@ -6437,6 +6452,35 @@ impl<'p> Ctx<'p> {
         // `&dyn Tr` needs `&S: Tr`), so neither does this.
         let dyn_target = matches!(ek, TyKind::Ref(_, _, y) if matches!(self.kind(y), TyKind::Dyn(..)));
         let c = match (fk, ek) {
+            // A reference or thin raw pointer unsizes to a fat raw pointer
+            // (tf-fatptr): `*const [T; N]` to `*const [T]` and `*const S`
+            // to `*const dyn Tr`, by the rules of the reference forms.
+            (TyKind::Ref(_, fm, x) | TyKind::RawPtr(fm, x), TyKind::RawPtr(em, y))
+                if (!em.is_mut() || fm.is_mut()) && {
+                    let (x, y) = (self.deep(x), self.deep(y));
+                    match (self.kind(x), self.kind(y)) {
+                        (TyKind::Array(..), TyKind::Slice(_)) => true,
+                        (TyKind::Dyn(..), _) => false,
+                        (TyKind::Infer(v), _) if !v.is_int() && !v.is_float() => false,
+                        (_, TyKind::Dyn(..)) => true,
+                        _ => false,
+                    }
+                } =>
+            {
+                let (x, y) = (self.deep(x), self.deep(y));
+                if let (TyKind::Array(xe, _), TyKind::Slice(ye)) = (self.kind(x), self.kind(y)) {
+                    if !self.unify(xe, ye) {
+                        self.mismatch(span, expected, found);
+                        return false;
+                    }
+                    Coerce::Unsize(expected)
+                } else {
+                    match self.unsize_coercion(x, y, found, expected, span, e) {
+                        Some(c) => c,
+                        None => return false,
+                    }
+                }
+            }
             // A reference to a raw pointer, and `*mut T` to `*const T`
             // (w-cinterop): safe coercions in Rust; the address stays.
             (TyKind::Ref(_, fm, x), TyKind::RawPtr(em, y)) if (!em.is_mut() || fm.is_mut()) && self.unify(x, y) => {
@@ -9328,22 +9372,6 @@ impl<'p> Ctx<'p> {
                     && !self.has_unbound_deep(target);
                 let exp = if crate::ty::consteval::is_unsuffixed_lit(&p.ast, *expr) || closure_ptr { Some(target) } else { None };
                 let t = self.expr(*expr, exp);
-                // A fat raw pointer casts to a thin one (its address); not
-                // to an integer (rustc E0606).
-                if let TyKind::RawPtr(_, from) = self.kind(self.resolve(t))
-                    && let from = self.deep(from)
-                    && matches!(self.kind(from), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..))
-                {
-                    match self.kind(target) {
-                        TyKind::RawPtr(_, to) if self.sized_value(to) => self.fat_raw_used.push(*expr),
-                        TyKind::Int(_) => {
-                            let tn = self.tn(t);
-                            self.err("L0116", span, format!("cannot cast the fat pointer `{tn}` as an integer"), "Cast it to a thin pointer first (`p as *const ()`).");
-                            return target;
-                        }
-                        _ => {}
-                    }
-                }
                 let coerce_cast = matches!(
                     (self.kind(t), self.kind(target)),
                     (TyKind::Ref(..), TyKind::Ref(..)) | (TyKind::Ref(..), TyKind::RawPtr(..))
@@ -9447,9 +9475,12 @@ impl<'p> Ctx<'p> {
                         // of any pointee or mutability, and between a raw
                         // pointer and an integer, as in Rust. A reference
                         // to a raw pointer is the coercion cast above.
-                        (TyKind::RawPtr(..), TyKind::RawPtr(..)) => true,
-                        (TyKind::RawPtr(..), TyKind::Int(_)) => true,
-                        (TyKind::Int(_), TyKind::RawPtr(..)) => true,
+                        // A fat pointer's casts are checked at body end
+                        // (`deferred_raw_casts`, tf-fatptr).
+                        (TyKind::RawPtr(..), TyKind::RawPtr(..)) | (TyKind::RawPtr(..), TyKind::Int(_)) | (TyKind::Int(_), TyKind::RawPtr(..)) => {
+                            self.deferred_raw_casts.push((t, target, span));
+                            true
+                        }
                         (TyKind::Bool, TyKind::Bool) => true,
                         (TyKind::Error, _) | (_, TyKind::Error) => true,
                         _ => false,
@@ -12352,6 +12383,7 @@ impl<'p> Ctx<'p> {
                 "new_zeroed" => return Some(Res::Builtin(Builtin::BoxNewZeroed)),
                 "new_uninit_slice" | "new_zeroed_slice" => return Some(Res::Builtin(Builtin::BoxNewUninitSlice)),
                 "write" => return Some(Res::Builtin(Builtin::BoxWrite)),
+                "as_ptr" | "as_mut_ptr" => return Some(Res::Builtin(Builtin::BoxAsPtr)),
                 _ => {}
             }
             if item == k.from {
@@ -12361,7 +12393,7 @@ impl<'p> Ctx<'p> {
                 "L0104",
                 span,
                 format!("no function `Box::{}`", self.name(item)),
-                "Lust supports Box::new, Box::leak, Box::new_uninit, Box::new_zeroed, their _slice forms, and Box::write.",
+                "Lust supports Box::new, Box::leak, Box::as_ptr, Box::as_mut_ptr, Box::new_uninit, Box::new_zeroed, their _slice forms, and Box::write.",
             );
             return None;
         }
@@ -14759,6 +14791,24 @@ impl<'p> Ctx<'p> {
                         let r = self.tys.mk_ref(true, elem);
                         (vec![bx], r)
                     }
+                    // `Box::as_ptr(&b)`, `Box::as_mut_ptr(&mut b)`: the written
+                    // name gives the mutability, as for `ptr::from_ref`.
+                    Builtin::BoxAsPtr => {
+                        let elem = self.new_var(false);
+                        self.deferred_raw.push((elem, span, RawUse::Pointee));
+                        let m = match p.ast.expr(callee) {
+                            Expr::Path(segs) => segs.last().is_some_and(|s| self.name(s.name) == "as_mut_ptr"),
+                            _ => false,
+                        };
+                        if let Some(want) = written_self.take() {
+                            let bx = self.tys.mk_boxed(elem);
+                            if !self.unify(bx, want) {
+                                self.mismatch(span, want, bx);
+                            }
+                        }
+                        let bx = self.tys.mk_boxed(elem);
+                        (vec![self.tys.mk_ref(m, bx)], self.tys.intern(TyKind::RawPtr(Mut::from_bool(m), elem)))
+                    }
                     // The written Self is `Box<T>` for these two but the
                     // result is `Box<MaybeUninit<T>>`, so the written T
                     // is the element here, not a unify of the result.
@@ -14933,7 +14983,7 @@ impl<'p> Ctx<'p> {
                     // mutability, as for `slice::from_ref`.
                     Builtin::PtrFromRef => {
                         let t = self.callee_turbo_ty(callee, span);
-                        self.deferred_sized.push((t, span));
+                        self.deferred_raw.push((t, span, RawUse::Pointee));
                         let m = match p.ast.expr(callee) {
                             Expr::Path(segs) => segs.last().is_some_and(|s| self.name(s.name) == "from_mut"),
                             _ => false,
@@ -14953,7 +15003,8 @@ impl<'p> Ctx<'p> {
                     }
                     // `ptr::eq` (w-cinterop): two raw pointers of one
                     // pointee; references coerce. `addr_eq::<T, U>`
-                    // compares the addresses of two pointee types.
+                    // compares the addresses of two pointee types. A dyn
+                    // pointee has no `eq` (`RawUse::NotDyn`).
                     Builtin::PtrEqFn | Builtin::PtrAddrEqFn => {
                         let seg = match p.ast.expr(callee) {
                             Expr::Path(segs) => segs.last(),
@@ -14975,12 +15026,9 @@ impl<'p> Ctx<'p> {
                         };
                         let is_eq = !seg.is_some_and(|s| self.name(s.name) == "addr_eq");
                         let ps = pointees.map(|t| {
-                            self.ptr_eq_pointees.push((t, is_eq, span));
+                            self.deferred_raw.push((t, span, if is_eq { RawUse::NotDyn("`ptr::eq`") } else { RawUse::Pointee }));
                             self.tys.intern(TyKind::RawPtr(Mut::Shared, t))
                         });
-                        // Its operands are compared at once (a fat
-                        // `Rc::as_ptr` result included).
-                        self.fat_raw_used.extend(args.iter().copied());
                         (ps.to_vec(), BOOL)
                     }
                     // `Option::iter(&o)`, `Result::into_iter(r)`, and
@@ -15126,15 +15174,9 @@ impl<'p> Ctx<'p> {
                     }
                 }
                 self.check_args(&params, args, span);
-                // `Rc::as_ptr`/`Arc::as_ptr`: a fat result must be consumed
-                // at once (`fat_raw_vals`, body end).
-                if matches!(b, Builtin::SmartAsPtr | Builtin::Sync(crate::check::sync::SyncOp::ArcAsPtr))
-                    && let TyKind::RawPtr(_, pointee) = self.kind(ret)
-                {
-                    let cs = p.ast.expr_span(callee);
-                    self.deferred_sized.retain(|&(t, sp)| !(t == pointee && sp == cs));
-                    self.fat_raw_vals.push((e, pointee, span));
-                } else if self.own_call_guard(b, &params, span) {
+                // The Rc and Arc fns that need a sized value, or that lust
+                // has not built for `str` and `[T]` (check/own.rs).
+                if self.own_call_guard(b, &params, span) {
                     return ERROR;
                 }
                 // `Rc::try_unwrap` needs `T: Sized` (rustc E0277), and
@@ -16508,13 +16550,7 @@ impl<'p> Ctx<'p> {
         // the general kind in the second; user Adts were handled above.
         let found: Option<(B, Autoref, Vec<Ty>, Ty)> = match (self.tys.builtin_of(base), bk) {
             // The safe raw pointer methods (w-cinterop).
-            (None, TyKind::RawPtr(m, inner)) => {
-                // `.cast::<U>()` and `.addr()` read a fat pointer's address.
-                if derefs == 0 && matches!(self.p.interner.get(name), "cast" | "addr") {
-                    self.fat_raw_used.push(recv);
-                }
-                self.ptr_method(name, m, inner, &explicit, name_span)
-            }
+            (None, TyKind::RawPtr(m, inner)) => self.ptr_method(name, m, inner, &explicit, name_span),
             (Some(BuiltinTy::String), _) => {
                 if name == k.len {
                     Some((B::StringLen, Autoref::Ref, vec![], USIZE))
@@ -17618,7 +17654,13 @@ impl<'p> Ctx<'p> {
         match n {
             "is_null" => Some((B::PtrIsNull, Autoref::None, vec![], BOOL)),
             "addr" | "expose_provenance" => Some((B::PtrAddr, Autoref::None, vec![], USIZE)),
-            "with_addr" => Some((B::PtrWithAddr, Autoref::None, vec![USIZE], self_ty)),
+            // A fat pointer's `with_addr` keeps its metadata: not built.
+            "with_addr" => {
+                self.deferred_raw.push((inner, name_span, RawUse::Thin("`with_addr`")));
+                Some((B::PtrWithAddr, Autoref::None, vec![USIZE], self_ty))
+            }
+            // `<*const [T]>::len` (tf-fatptr).
+            "len" if { let d = self.deep(inner); matches!(self.kind(d), TyKind::Slice(_)) } => Some((B::PtrLen, Autoref::None, vec![], USIZE)),
             // `cast::<U>()` keeps the mutability; `cast_mut` and
             // `cast_const` keep the pointee.
             "cast" => {
@@ -17626,8 +17668,8 @@ impl<'p> Ctx<'p> {
                 self.deferred_sized.push((u, name_span));
                 Some((B::PtrCast, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(m, u))))
             }
-            "cast_mut" => Some((B::PtrCast, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, inner)))),
-            "cast_const" => Some((B::PtrCast, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, inner)))),
+            "cast_mut" => Some((B::PtrCastMut, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(Mut::Mut, inner)))),
+            "cast_const" => Some((B::PtrCastMut, Autoref::None, vec![], self.tys.intern(TyKind::RawPtr(Mut::Shared, inner)))),
             _ => None,
         }
     }
@@ -18326,6 +18368,57 @@ impl<'p> Ctx<'p> {
             TyKind::Adt(d, _) if self.tys.unsized_field(d).is_some() => Some(false),
             _ if crate::check::own::dyn_cell_elem(&self.tys, t).is_some() || crate::check::own::dyn_lock_elem(&self.tys, t).is_some() => Some(false),
             _ => None,
+        }
+    }
+
+    /// Body end (tf-fatptr): the raw pointer pointees and casts
+    /// recorded in `deferred_raw` and `deferred_raw_casts`.
+    fn check_deferred_raw(&mut self) {
+        for (t, span, u) in std::mem::take(&mut self.deferred_raw) {
+            let fat = self.fat_pointee(t);
+            let is_dyn = { let d = self.deep(t); matches!(self.kind(d), TyKind::Dyn(..)) };
+            let what = match (u, fat) {
+                (_, None) => continue,
+                (_, Some(false)) => "a raw pointer to this unsized type",
+                (RawUse::Pointee, Some(true)) => continue,
+                (RawUse::NotDyn(_), Some(true)) if !is_dyn => continue,
+                (RawUse::Thin(w) | RawUse::NotDyn(w), Some(true)) => w,
+            };
+            let fix = if is_dyn { "Compare addresses with `std::ptr::addr_eq`, or cast to a thin pointer first (`p.cast::<()>()`)." } else { "Cast to a thin pointer first (`p.cast::<u8>()`)." };
+            self.err("L0602", span, format!("{what} on a raw pointer to an unsized type is not supported yet"), fix);
+        }
+        for (from, to, span) in std::mem::take(&mut self.deferred_raw_casts) {
+            let (from, to) = (self.deep(from), self.deep(to));
+            let pointee = |cx: &mut Self, t: Ty| match cx.kind(t) {
+                TyKind::RawPtr(_, e) => Some(cx.fat_pointee(e)),
+                _ => None,
+            };
+            let (a, b) = (pointee(self, from), pointee(self, to));
+            let err = match (a, b) {
+                // A fat pointer to an integer, or an integer to one
+                // (rustc E0606).
+                (Some(Some(_)), None) | (None, Some(Some(_))) => Some("L0116"),
+                // Thin to thin, and fat to thin (the address).
+                (Some(_), Some(None)) => None,
+                // Thin to fat is no cast (E0607); a coercion cast does not get here.
+                (Some(None), Some(Some(_))) => Some("L0116"),
+                // Fat to fat: the same pointee at another mutability.
+                (Some(Some(true)), Some(Some(true))) => {
+                    let (TyKind::RawPtr(_, x), TyKind::RawPtr(_, y)) = (self.kind(from), self.kind(to)) else { unreachable!() };
+                    if self.unify(x, y) { None } else { Some("L0602") }
+                }
+                (Some(Some(_)), Some(Some(_))) => Some("L0602"),
+                _ => None,
+            };
+            if let Some(code) = err {
+                let (a, b) = (self.tn(from), self.tn(to));
+                let (msg, fix) = if code == "L0116" {
+                    (format!("cannot cast `{a}` as `{b}`"), "A fat raw pointer casts only to a thin raw pointer (`p as *const u8`), then to an integer.")
+                } else {
+                    (format!("the raw pointer cast `{a}` as `{b}` is not supported yet"), "Cast to a thin raw pointer instead (`p as *const u8`).")
+                };
+                self.err(code, span, msg, fix);
+            }
         }
     }
 
@@ -23925,49 +24018,6 @@ impl<'p> Ctx<'p> {
                 self.record_glue_reads(self.p.gx.lang.default, t);
             }
         }
-        let used = std::mem::take(&mut self.fat_raw_used);
-        let producers = std::mem::take(&mut self.fat_raw_vals);
-        for &(e, pointee, span) in &producers {
-            match self.fat_pointee(pointee) {
-                Some(true) if used.contains(&e) => {}
-                Some(_) => self.errs.push(not_yet("L0641", span, "this `Rc` function on an unsized type")),
-                None => {}
-            }
-        }
-        // Any other value of a fat raw pointer type (a `&x[..] as *const _`,
-        // a coercion to `*const [T]`, a generic instance's `*const T`) is
-        // consumed at once too, or rejected: lust lays it out but builds
-        // no other operation on it.
-        for i in 0..self.out.expr_ty.len() {
-            let e = ExprId(self.out.expr_base + i as u32);
-            if used.contains(&e) || producers.iter().any(|&(x, ..)| x == e) {
-                continue;
-            }
-            let t = self.out.expr_ty[i];
-            let coerced = match self.out.coerce[i] {
-                Coerce::RefToPtr(target) => Some(target),
-                _ => None,
-            };
-            for t in std::iter::once(t).chain(coerced) {
-                let t = self.deep(t);
-                if let TyKind::RawPtr(_, pointee) = self.kind(t)
-                    && self.fat_pointee(pointee).is_some()
-                {
-                    let span = self.p.ast.expr_span(e);
-                    self.errs.push(not_yet("L0602", span, "this use of a raw pointer to an unsized type"));
-                    break;
-                }
-            }
-        }
-        for (t, is_eq, span) in std::mem::take(&mut self.ptr_eq_pointees) {
-            match self.fat_pointee(t) {
-                None => {}
-                // A dyn pointer's `eq` compares vtable addresses, which
-                // lust does not lay out as rustc does.
-                Some(true) if !(is_eq && { let d = self.deep(t); matches!(self.kind(d), TyKind::Dyn(..)) }) => {}
-                Some(_) => self.errs.push(not_yet("L0641", span, "`ptr::eq` of this unsized pointee")),
-            }
-        }
         for (t, span) in std::mem::take(&mut self.deferred_vec_clone) {
             let t = self.deep(t);
             if !has_clone(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error) {
@@ -23988,6 +24038,7 @@ impl<'p> Ctx<'p> {
                 self.errs.push(not_yet("L0641", span, "this `Rc` function on an unsized type"));
             }
         }
+        self.check_deferred_raw();
         for (t, span) in std::mem::take(&mut self.deferred_debug) {
             // A projection (`<T as TryFrom<U>>::Error` from a
             // deferred `try_into`, fx-tryfrom) reads through its
