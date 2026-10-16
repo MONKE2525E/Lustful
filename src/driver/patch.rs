@@ -819,7 +819,7 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         &base.tables,
         &front.interner,
         base.local_names.as_ref().ok_or("state")?,
-        base.tables.std_splice_lo,
+        moved_splice_lo(base, edit),
         &mut body_ast,
         &scratch,
         outer,
@@ -1087,6 +1087,9 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
         if own > def.attrs.len() || sub.is_none() && new_item.attrs.len() != own_old {
             return Err(Some("item: attrs"));
         }
+        // A free fn's parse seeded its own allows after its attributes;
+        // the old fn's tail holds the scope's and those, in cold order.
+        new_def.attrs.truncate(own);
         new_def.attrs.extend_from_slice(&def.attrs[own..]);
         new_def.name = def.name;
         if new_def.qual.is_const {
@@ -1102,7 +1105,7 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
             &base.tables,
             &front.interner,
             base.local_names.as_ref().ok_or(Some("state"))?,
-            base.tables.std_splice_lo,
+            moved_splice_lo(base, edit),
             &mut item_ast,
             &mut scratch,
             outer,
@@ -1116,6 +1119,15 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     item_ast.items.push(new_item);
     let old_exprs = def.exprs;
     Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs })
+}
+
+/// Where the std splice starts in the new text: the new body or fn is
+/// lexed at its new positions, and the rewrite tells std code from user
+/// code by this offset. An edit in the root file before the splice moves
+/// it (a fn just before the splice grew past the old offset, and its
+/// paths rewrote as std code: the patch oracle found it on tsrust-all4).
+fn moved_splice_lo(base: &PatchBase, edit: Edit) -> Option<u32> {
+    base.tables.std_splice_lo.map(|lo| if edit.file == FileId(0) && lo >= edit.b { (lo as i64 + edit.d) as u32 } else { lo })
 }
 
 /// The items (`stmt_items` indexes, in parse order) of the old fn body at
@@ -3292,6 +3304,33 @@ pub fn run() -> i64 {
         ];
         for &(old, new, path) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The last fn of the root file sits right before the std splice: an
+    /// edit that grows it (its header, then its body) must rewrite it as
+    /// user code, as a full resolve does (the splice start moves with the
+    /// edit).
+    #[test]
+    fn edit_before_std_splice_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-splice-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        std::fs::write(dir.join("m0.rs"), ITEMS).unwrap();
+        let tail = "\n#[allow(dead_code)]\npub(crate) fn sx(x: u32) -> u64 { x as u64 }\n";
+        let text = std::fs::read_to_string(&root).unwrap() + tail;
+        std::fs::write(&root, text).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        assert!(!warm.front.ast.shipped.is_empty(), "the root has a std splice");
+        let steps: &[(&str, &str, &str)] = &[
+            ("fn sx(x: u32) -> u64 { x as u64 }", "fn sx(x: u8) -> u16 { x as u16 }", "item"),
+            ("fn sx(x: u8) -> u16 { x as u16 }", "fn sx(x: u8) -> u16 { let y = x as u16; y + y }", "patch"),
+            ("fn sx(x: u8) -> u16 { let y = x as u16; y + y }", "fn sx(x: u32) -> u64 { x as u64 }", "item"),
+        ];
+        for &(old, new, path) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &root, old, new);
             assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
         }
         let _ = std::fs::remove_dir_all(&dir);
