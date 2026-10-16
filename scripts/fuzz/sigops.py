@@ -22,6 +22,10 @@
 #                  only programs with user generics): a generic fn first,
 #                  sometimes an RPIT user or a const closure of a fresh fn,
 #                  then two header edits in a row, back, and the files
+#   sig_impl       method header edits the header delta takes in impls: a
+#                  user trait's impl (concrete and generic), and an inherent
+#                  impl with an associated const; callers through the type,
+#                  a generic bound, UFCS and the trait path; two edits, back
 # `External` adds verdicts from rustc 1.99 and a pinned baseline lust for
 # the op states (`--rustc`, `--baseline`): a state where the warm answer
 # disagrees with rustc fails unless the baseline gives the same answer
@@ -30,7 +34,7 @@
 import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
-       "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic"]
+       "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -277,6 +281,46 @@ def sig_generic(rng, fs):
         op = rng.choice([sig_where, sig_param, sig_ret])
         states = op(rng, cur)
         return states[0] if states else cur
+
+    s1 = edit(a)
+    s2 = edit(s1)
+    return [a, s1, s2, a, fs]
+
+
+def sig_impl(rng, fs):
+    """A: the files with a user trait, a concrete and a generic impl of it,
+    an inherent impl with an associated const, and their callers at the
+    end of the root file; then one method header edit, a second on top,
+    back to A, and the files."""
+    k = rng.randrange(10**6)
+    items = (f"\ntrait Zt{k} {{\n    type Out: std::fmt::Debug;\n    fn zm{k}(&self, x: u32) -> u32;\n    fn zn{k}(&self) -> Self::Out;\n}}\n"
+             f"struct Zs{k}(u32);\n"
+             f"impl Zs{k} {{\n    const C: u32 = 3;\n    fn zh{k}(&self, x: u32) -> u32 {{\n        x + Self::C + self.0\n    }}\n}}\n"
+             f"impl Zt{k} for Zs{k} {{\n    type Out = u32;\n    fn zm{k}(&self, x: u32) -> u32 {{\n        x + self.0\n    }}\n"
+             f"    fn zn{k}(&self) -> Self::Out {{\n        self.0\n    }}\n}}\n"
+             f"impl<T: Clone> Zt{k} for Vec<T> {{\n    type Out = usize;\n    fn zm{k}(&self, x: u32) -> u32 {{\n        x\n    }}\n"
+             f"    fn zn{k}(&self) -> usize {{\n        self.len()\n    }}\n}}\n"
+             f"fn zt{k}_gen<T: Zt{k}>(t: &T) -> u32 {{ t.zm{k}(1) }}\n"
+             f"#[allow(dead_code)]\nfn zt{k}_use() -> u32 {{\n    let s = Zs{k}(2);\n"
+             f"    let _ = format!(\"{{:?}}{{:?}}\", s.zn{k}(), vec![1u8].zn{k}());\n"
+             f"    s.zm{k}(3) + zt{k}_gen(&s) + Zt{k}::zm{k}(&vec![1u8], 4) + s.zh{k}(1) + <Zs{k} as Zt{k}>::zm{k}(&s, 0)\n}}\n")
+    root = _root(fs)
+    a = dict(fs)
+    a[root] = fs[root] + items
+
+    def edit(cur):
+        own = [(rel, m) for rel, m in _heads(cur) if m.group("name") in (f"zm{k}", f"zn{k}", f"zh{k}")]
+        if not own:
+            return cur
+        rel, m = rng.choice(own)
+        if m.group("name") == f"zn{k}":
+            new = rng.choice([_header(m, ret="u32"), _header(m, ret="usize"), _header(m, ret="Self::Out"),
+                              _header(m, where=" where u32: Copy"), _header(m, ret="u64")])
+        else:
+            new = rng.choice([_header(m, where=" where u32: Copy"), _header(m, where=" where String: Copy"),
+                              _header(m, params=m.group("params").replace("x: u32", "mut x: u32")), _header(m, params=m.group("params").replace("x: u32", "x: u64")),
+                              _header(m, ret="u64"), _header(m, gen="<'a>", params=m.group("params").replace("&self", "&'a self"))])
+        return _swap(cur, rel, m.start(), m.end(), new)
 
     s1 = edit(a)
     s2 = edit(s1)
