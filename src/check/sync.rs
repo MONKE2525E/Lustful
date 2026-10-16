@@ -135,6 +135,8 @@ pub enum SyncOp {
     ChanTryRecv,
     /// `SyncSender::try_send` (TRIAGE T5).
     ChanTrySend,
+    /// `Arc::new_cyclic(data_fn)` (TRIAGE T5).
+    ArcNewCyclic,
     /// `Condvar::wait_timeout` (TRIAGE T5).
     CondvarWaitTimeout,
     /// `Condvar::wait_timeout_ms` (deprecated in std, same form).
@@ -180,7 +182,7 @@ pub enum SyncOp {
 
 impl SyncOp {
     /// One of each op, for the capabilities table.
-    pub const ALL: [SyncOp; 111] = [
+    pub const ALL: [SyncOp; 112] = [
         SyncOp::AtomicNew(SyncTy::AtomicUsize),
         SyncOp::AtomicFrom(SyncTy::AtomicUsize),
         SyncOp::AtomicDefault(SyncTy::AtomicUsize),
@@ -257,6 +259,7 @@ impl SyncOp {
         SyncOp::ChanRecv,
         SyncOp::ChanTryRecv,
         SyncOp::ChanTrySend,
+        SyncOp::ArcNewCyclic,
         SyncOp::CondvarWaitTimeout,
         SyncOp::CondvarWaitTimeoutMs,
         SyncOp::WaitTimedOut,
@@ -377,6 +380,7 @@ impl SyncOp {
             SyncOp::ChanRecv => (&["std::sync::mpsc::Receiver<T>"], &["recv"], m),
             SyncOp::ChanTryRecv => (&["std::sync::mpsc::Receiver<T>"], &["try_recv"], m),
             SyncOp::ChanTrySend => (&["std::sync::mpsc::SyncSender<T>"], &["try_send"], m),
+            SyncOp::ArcNewCyclic => (&["alloc::sync::Arc<T>"], &["new_cyclic"], a),
             SyncOp::CondvarWaitTimeout => (&["std::sync::Condvar"], &["wait_timeout"], m),
             SyncOp::CondvarWaitTimeoutMs => (&["std::sync::Condvar"], &["wait_timeout_ms"], m),
             SyncOp::WaitTimedOut => (&["std::sync::WaitTimeoutResult"], &["timed_out"], m),
@@ -526,6 +530,7 @@ impl<'p> Ctx<'p> {
             (_, Some(_), "default") => SyncOp::AtomicDefault(k),
             (SyncTy::Arc | SyncTy::ArcWeak, _, "clone") => return Some(Some(Res::Builtin(Builtin::Clone))),
             (SyncTy::Arc, _, "new") => SyncOp::ArcNew,
+            (SyncTy::Arc, _, "new_cyclic") => SyncOp::ArcNewCyclic,
             // `Arc::default()`: the default glue, as for `Rc` and `Box`.
             (SyncTy::Arc, _, "default") => return None,
             (SyncTy::Arc, _, "from") => return Some(Some(Res::Builtin(Builtin::OwnFrom(crate::check::own::Owner::Arc)))),
@@ -617,6 +622,12 @@ impl<'p> Ctx<'p> {
         let weak_ref = self.tys.mk_ref(false, weak);
         match op {
             SyncOp::ArcNew => (vec![elem], arc),
+            // `Arc::new_cyclic<F: FnOnce(&Weak<T>) -> T>(data_fn)`.
+            SyncOp::ArcNewCyclic => {
+                let wref = self.tys.mk_ref(false, weak);
+                let f = self.fn_once_param(&[wref], elem, span);
+                (vec![f], arc)
+            }
             SyncOp::ArcStrongCount | SyncOp::ArcWeakCount => (vec![arc_ref], USIZE),
             SyncOp::ArcPtrEq => (vec![arc_ref, arc_ref], BOOL),
             SyncOp::ArcAsPtr => (vec![arc_ref], self.tys.intern(TyKind::RawPtr(crate::ty::Mut::Shared, elem))),

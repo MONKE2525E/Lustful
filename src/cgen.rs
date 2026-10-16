@@ -3800,6 +3800,9 @@ impl FnGen<'_, '_> {
         if b == B::Sync(crate::check::sync::SyncOp::CatchUnwind) {
             return self.catch_unwind_call(ops, loc, post);
         }
+        if b == B::Sync(crate::check::sync::SyncOp::ArcNewCyclic) {
+            return self.arc_new_cyclic(ops, loc, post);
+        }
         let mut vals = Vec::new();
         let mut tys = Vec::new();
         for o in ops {

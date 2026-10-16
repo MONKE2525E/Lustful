@@ -778,6 +778,44 @@ impl FnGen<'_, '_> {
         t
     }
 
+    /// `Arc::new_cyclic(data_fn)` (TRIAGE T5): allocate the counted
+    /// header with strong count 0 (so `upgrade` inside `data_fn`
+    /// fails, as in std), run the closure with a Weak to it, store
+    /// its value, then publish strong count 1 and drop the
+    /// temporary Weak. A panic in `data_fn` under unwind leaves the
+    /// allocation uninitialized with strong 0: std drops it once
+    /// the last Weak goes; lust's weak drop only frees through the
+    /// header, so it can leak in that case.
+    pub(super) fn arc_new_cyclic(&mut self, ops: &[Operand], loc: &str, post: &mut Vec<String>) -> String {
+        let callee = self.callee_of(&ops[0]);
+        let once = !matches!(callee, Callee::Closure(_, false));
+        let (env, env_ty) = self.operand(&ops[0], loc, post);
+        collect_types(&env_ty, &mut self.sig_types);
+        let ret = match &callee {
+            Callee::Closure(f, _) | Callee::Fn(f) => cty(&self.p.tys, self.p.fn_info(*f).ret),
+            Callee::Ptr(CTy::FnPtr(_, r)) => (**r).clone(),
+            Callee::Ptr(_) => unreachable!("a fn pointer type"),
+        };
+        collect_types(&ret, &mut self.sig_types);
+        let it = format!("RcI_{}", mangle(&ret));
+        let (h, ev, w) = (self.tmp(), self.tmp(), self.tmp());
+        let _ = writeln!(
+            self.out,
+            "    {it} *{h} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {h}->strong = 0; {h}->weak = 1; lust_arc_downgrade((uint64_t*){h}); {} {ev} = {env}; {it} *{w} = {h};",
+            ctype(&env_ty)
+        );
+        let mut body = String::new();
+        let v = self.callee_call_c(&mut body, &callee, &ev, &[format!("&{w}")]);
+        self.out.push_str(&body);
+        if !once && needs_drop_c(self.p, &env_ty) {
+            self.want(Glue::Drop, &env_ty);
+            let _ = writeln!(self.out, "    drop_{}(&{ev});", mangle(&env_ty));
+        }
+        let _ = writeln!(self.out, "    {h}->v = {v}; lust_arc_inc(&({h})->strong); (void)lust_arc_dec(&({h})->weak);");
+        let _ = loc;
+        format!("({h})")
+    }
+
     /// `mpsc::channel()` or `sync_channel(cap)` into the C pair type
     /// `pair` (`(Sender<T>, Receiver<T>)`): one runtime channel that both
     /// ends point at, with `T`'s drop glue for values left queued.
