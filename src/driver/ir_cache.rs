@@ -112,10 +112,13 @@ fn hash_fmt(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, parts: &[FmtPart
                 0u8.hash(h);
                 s.hash(h);
             }
-            FmtPart::Arg { value, ty, debug, spec } => {
+            FmtPart::Arg { value, ty, debug, spec, width, prec } => {
                 (1u8, debug).hash(h);
                 spec.hash(h);
                 hash_operand(h, p, tys, value, seen);
+                for c in [width, prec].into_iter().flatten() {
+                    hash_operand(h, p, tys, c, seen);
+                }
                 graph::hash_ty_deep(h, p, tys, *ty, seen);
             }
         }
@@ -570,7 +573,7 @@ enum CachedConst {
 #[derive(Clone, Debug)]
 enum CachedFmt {
     Lit(String),
-    Arg { value: CachedOperand, ty: u32, debug: bool, spec: FmtSpec },
+    Arg { value: CachedOperand, ty: u32, debug: bool, spec: FmtSpec, width: Option<CachedOperand>, prec: Option<CachedOperand> },
 }
 
 #[derive(Clone, Debug)]
@@ -875,9 +878,14 @@ fn cache_fmt(b: &mut TreeBuilder, p: &Program, parts: &[FmtPart]) -> Vec<CachedF
         .iter()
         .map(|part| match part {
             FmtPart::Lit(s) => CachedFmt::Lit(s.clone()),
-            FmtPart::Arg { value, ty, debug, spec } => {
-                CachedFmt::Arg { value: cache_operand(b, p, value), ty: b.ty(*ty), debug: *debug, spec: *spec }
-            }
+            FmtPart::Arg { value, ty, debug, spec, width, prec } => CachedFmt::Arg {
+                value: cache_operand(b, p, value),
+                ty: b.ty(*ty),
+                debug: *debug,
+                spec: *spec,
+                width: width.as_ref().map(|o| cache_operand(b, p, o)),
+                prec: prec.as_ref().map(|o| cache_operand(b, p, o)),
+            },
         })
         .collect()
 }
@@ -1033,8 +1041,19 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             .iter()
             .map(|part| match part {
                 CachedFmt::Lit(s) => Some(FmtPart::Lit(s.clone())),
-                CachedFmt::Arg { value, ty, debug, spec } => {
-                    Some(FmtPart::Arg { value: operand(intern, tys, strings, value)?, ty: intern.ty(tys, *ty)?, debug: *debug, spec: *spec })
+                CachedFmt::Arg { value, ty, debug, spec, width, prec } => {
+                    let count = |intern: &mut TreeIntern, tys: &mut Tys, c: &Option<CachedOperand>| match c {
+                        Some(c) => operand(intern, tys, strings, c).map(Some),
+                        None => Some(None),
+                    };
+                    Some(FmtPart::Arg {
+                        value: operand(intern, tys, strings, value)?,
+                        ty: intern.ty(tys, *ty)?,
+                        debug: *debug,
+                        spec: *spec,
+                        width: count(intern, tys, width)?,
+                        prec: count(intern, tys, prec)?,
+                    })
                 }
             })
             .collect()

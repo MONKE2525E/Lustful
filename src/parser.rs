@@ -661,10 +661,18 @@ fn token_trees(toks: &[Token]) -> Vec<TokenTree> {
     build(toks, &mut pos, None, 0)
 }
 
-/// Parses one format spec (the text after the `:`). `Err(true)` is a
-/// form Rust has but the subset does not (dynamic width or precision,
-/// pointer format); `Err(false)` is invalid in Rust.
-fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
+/// A width or precision a format spec takes from an argument: `name$`,
+/// `N$`, or (precision only) `*`, the next positional argument.
+enum FmtCount {
+    Name(String),
+    Index(usize),
+    Next,
+}
+
+/// Parses one format spec (the text after the `:`), with the width and
+/// precision it takes from arguments. `Err(true)` is a form Rust has but
+/// the subset does not; `Err(false)` is invalid in Rust.
+fn parse_fmt_spec(fmt: &str) -> Result<(FmtSpec, Option<FmtCount>, Option<FmtCount>), bool> {
     let mut s = FmtSpec::default();
     let cs: Vec<char> = fmt.chars().collect();
     let mut i = 0usize;
@@ -699,47 +707,55 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
         s.alt = true;
         i += 1;
     }
-    // [0]
-    if i < cs.len() && cs[i] == '0' {
+    // [0] (but `0$` is a width from argument 0)
+    if i < cs.len() && cs[i] == '0' && cs.get(i + 1) != Some(&'$') {
         s.zero = true;
         i += 1;
     }
-    // A width or precision from a named argument (`{:>w$}`, `{:.p$}`)
-    // is valid Rust the subset does not have.
-    let named_arg = |cs: &[char], j: usize| {
+    // A count from an argument: `name$` or `N$`, with its end.
+    let count_arg = |cs: &[char], j: usize| -> Option<(FmtCount, usize)> {
         let mut k = j;
         while k < cs.len() && (cs[k].is_alphanumeric() || cs[k] == '_') {
             k += 1;
         }
-        j < cs.len() && (cs[j].is_alphabetic() || cs[j] == '_') && cs.get(k) == Some(&'$')
-    };
-    if named_arg(&cs, i) {
-        return Err(true);
-    }
-    // [width]
-    if i < cs.len() && cs[i].is_ascii_digit() {
-        let (w, j) = digit_run(&cs, i);
-        if j < cs.len() && cs[j] == '$' {
-            return Err(true);
+        if k == j || cs.get(k) != Some(&'$') {
+            return None;
         }
+        let text: String = cs[j..k].iter().collect();
+        if cs[j].is_ascii_digit() {
+            text.parse().ok().map(|n| (FmtCount::Index(n), k + 1))
+        } else {
+            Some((FmtCount::Name(text), k + 1))
+        }
+    };
+    // [width]
+    let mut width_arg = None;
+    if let Some((c, j)) = count_arg(&cs, i) {
+        width_arg = Some(c);
+        i = j;
+    } else if i < cs.len() && cs[i].is_ascii_digit() {
+        let (w, j) = digit_run(&cs, i);
         s.width = w;
         i = j;
     }
     // [.precision]
+    let mut precision_arg = None;
     if i < cs.len() && cs[i] == '.' {
         i += 1;
-        if i < cs.len() && cs[i] == '*' || named_arg(&cs, i) {
-            return Err(true);
+        if cs.get(i) == Some(&'*') {
+            precision_arg = Some(FmtCount::Next);
+            i += 1;
+        } else if let Some((c, j)) = count_arg(&cs, i) {
+            precision_arg = Some(c);
+            i = j;
+        } else {
+            let (p, j) = digit_run(&cs, i);
+            if p.is_none() {
+                return Err(false);
+            }
+            s.precision = p;
+            i = j;
         }
-        let (p, j) = digit_run(&cs, i);
-        if p.is_none() {
-            return Err(false);
-        }
-        if j < cs.len() && cs[j] == '$' {
-            return Err(true);
-        }
-        s.precision = p;
-        i = j;
     }
     // [kind]
     let kind = match cs.get(i) {
@@ -778,14 +794,17 @@ fn parse_fmt_spec(fmt: &str) -> Result<FmtSpec, bool> {
             i += 1;
             FmtKind::UpperExp
         }
-        Some('p') => return Err(true),
+        Some('p') => {
+            i += 1;
+            FmtKind::Pointer
+        }
         Some(_) => return Err(false),
     };
     if i != cs.len() {
         return Err(false);
     }
     s.kind = kind;
-    Ok(s)
+    Ok((s, width_arg, precision_arg))
 }
 
 fn syntax(span: Span, msg: impl Into<String>) -> Diag {
@@ -5164,12 +5183,23 @@ impl<'a> Parser<'a> {
             if let Tok::Str(si, _) = self.peek() {
                 let lit_span = self.bump().span;
                 let mut extra = Vec::new();
+                // `name = expr` arguments: (name, index in `extra`).
+                let mut named: Vec<(Sym, usize)> = Vec::new();
                 while self.eat(Tok::Comma) {
                     if self.peek() == close {
                         break;
                     }
-                    if matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == Tok::Eq {
-                        return Err(self.reject(C_LIT, "named format arguments"));
+                    if let Tok::Ident(name) = self.peek()
+                        && self.peek_at(1) == Tok::Eq
+                    {
+                        let name_span = self.bump().span;
+                        self.bump();
+                        if named.iter().any(|(n, _)| *n == name) {
+                            return Err(syntax(name_span, format!("duplicate argument named `{}`", self.interner.get(name))));
+                        }
+                        named.push((name, extra.len()));
+                    } else if !named.is_empty() {
+                        return Err(syntax(self.span(), "positional arguments cannot follow named arguments"));
                     }
                     extra.push(self.expr()?);
                 }
@@ -5177,7 +5207,7 @@ impl<'a> Parser<'a> {
                 let base = args.len();
                 // A format string a macro produced (concat! and kin) may
                 // not capture variables, as in rustc.
-                fmt = self.format_string(&s, lit_span, base, &mut extra, !crate::diag::is_no_capture(lit_span.ctxt))?;
+                fmt = self.format_string(&s, lit_span, base, &mut extra, &named, !crate::diag::is_no_capture(lit_span.ctxt))?;
                 // An empty format string is still a message (`panic!("")`
                 // prints an empty one, not "explicit panic").
                 if fmt.is_empty() {
@@ -5195,13 +5225,23 @@ impl<'a> Parser<'a> {
     /// Splits a format string into pieces. `{name}` captures become extra path arguments.
     /// With `allow_capture` false (a macro-produced format string), a named
     /// capture is an error, as in rustc.
-    fn format_string(&mut self, s: &str, span: Span, base: usize, extra: &mut Vec<ExprId>, allow_capture: bool) -> PResult<Vec<FmtPiece>> {
+    fn format_string(
+        &mut self,
+        s: &str,
+        span: Span,
+        base: usize,
+        extra: &mut Vec<ExprId>,
+        named: &[(Sym, usize)],
+        allow_capture: bool,
+    ) -> PResult<Vec<FmtPiece>> {
         let mut pieces = Vec::new();
         let mut lit = String::new();
         let mut next = 0usize;
         let mut chars = s.chars().peekable();
         let explicit = extra.len();
         let mut used = vec![false; explicit];
+        // Captured names, each one argument however often it is named.
+        let mut captured: Vec<(Sym, usize)> = Vec::new();
         while let Some(c) = chars.next() {
             if c == '{' && chars.peek() == Some(&'{') {
                 chars.next();
@@ -5219,34 +5259,60 @@ impl<'a> Parser<'a> {
                     }
                 }
                 let (name, fmt) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
-                let fspec = match parse_fmt_spec(fmt) {
+                let (mut fspec, width_arg, precision_arg) = match parse_fmt_spec(fmt) {
                     Ok(s) => s,
                     Err(true) => return Err(not_yet(C_LIT, span, &format!("format spec `{{:{fmt}}}`"))),
                     Err(false) => return Err(syntax(span, format!("invalid format specification `{{:{fmt}}}`"))),
                 };
                 let debug = fspec.kind == FmtKind::Debug;
+                // The argument a name refers to: a named argument, else a
+                // captured variable (once per name).
+                let mut by_name = |this: &mut Self, name: &str, extra: &mut Vec<ExprId>, used: &mut Vec<bool>| -> PResult<usize> {
+                    let sym = this.interner.intern(name);
+                    if let Some(&(_, i)) = named.iter().chain(captured.iter()).find(|(n, _)| *n == sym) {
+                        return Ok(i);
+                    }
+                    if !allow_capture {
+                        return Err(syntax(
+                            span,
+                            format!("there is no argument named `{name}`: a format string expanded from a macro cannot capture variables"),
+                        ));
+                    }
+                    let e = this.push_expr(Expr::Path(vec![PathSeg::plain(sym)]), span);
+                    extra.push(e);
+                    used.push(true);
+                    captured.push((sym, extra.len() - 1));
+                    Ok(extra.len() - 1)
+                };
+                // `.*` takes the next positional argument before the value.
+                let mut counts = [None, None];
+                for (slot, count) in [width_arg, precision_arg].into_iter().enumerate() {
+                    counts[slot] = match count {
+                        None => None,
+                        Some(FmtCount::Index(n)) => Some(n),
+                        Some(FmtCount::Next) => {
+                            next += 1;
+                            Some(next - 1)
+                        }
+                        Some(FmtCount::Name(n)) => Some(by_name(self, &n, extra, &mut used)?),
+                    };
+                }
                 let index = if name.is_empty() {
                     next += 1;
                     next - 1
                 } else if let Ok(n) = name.parse::<usize>() {
                     n
-                } else if !allow_capture {
-                    return Err(syntax(
-                        span,
-                        format!("there is no argument named `{name}`: a format string expanded from a macro cannot capture variables"),
-                    ));
                 } else {
-                    let sym = self.interner.intern(name);
-                    let seg = PathSeg::plain(sym);
-                    let e = self.push_expr(Expr::Path(vec![seg]), span);
-                    extra.push(e);
-                    used.push(true);
-                    extra.len() - 1
+                    by_name(self, name, extra, &mut used)?
                 };
-                if index >= extra.len() {
-                    return Err(syntax(span, "format string refers to a missing argument"));
+                for i in counts.iter().flatten().chain([&index]) {
+                    if *i >= extra.len() {
+                        return Err(syntax(span, "format string refers to a missing argument"));
+                    }
+                    used[*i] = true;
                 }
-                used[index] = true;
+                fspec.width_arg = counts[0].map(|i| (base + i) as u32);
+                fspec.precision_arg = counts[1].map(|i| (base + i) as u32);
                 if !lit.is_empty() {
                     pieces.push(FmtPiece::Lit(std::mem::take(&mut lit)));
                 }

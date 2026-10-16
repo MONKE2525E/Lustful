@@ -3714,9 +3714,9 @@ impl Ex<'_, '_> {
         let parts = vec![
             FmtPart::Lit("assertion `left == right` failed".into()),
             FmtPart::Lit("\n  left: ".into()),
-            FmtPart::Arg { value: Operand::Copy(Place::local(lref)), ty: ou, debug: true, spec: dbg },
+            FmtPart::Arg { value: Operand::Copy(Place::local(lref)), ty: ou, debug: true, spec: dbg, width: None, prec: None },
             FmtPart::Lit("\n right: ".into()),
-            FmtPart::Arg { value: Operand::Copy(Place::local(rref)), ty: ou, debug: true, spec: dbg },
+            FmtPart::Arg { value: Operand::Copy(Place::local(rref)), ty: ou, debug: true, spec: dbg, width: None, prec: None },
         ];
         self.term(Terminator::Panic(parts));
         self.body.blocks[self.cur.0 as usize].term_span = Span::std_site(13, 122, 9);

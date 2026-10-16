@@ -1,7 +1,5 @@
-// expect: L0641
-// Valid Rust: a width or precision read from a named argument (`w$`,
-// `p$`, captured from scope as in rustc). lust has only literal widths
-// and precisions, so this is "not supported yet", not a syntax error.
+// A width or precision read from a named argument (`w$`, `p$`), captured
+// from scope as in rustc.
 fn main() {
     let w = 6;
     let p = 2;

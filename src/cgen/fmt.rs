@@ -16,6 +16,8 @@ use super::*;
 pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn FnMut(Glue, &CTy)) -> String {
     let debug = kind == FmtKind::Debug;
     match t {
+        // `{:p}`: the address a thin pointer holds (check admits no other).
+        _ if kind == FmtKind::Pointer => format!("lust_f_pointer({f}, (const void*)(*{v}))"),
         CTy::Int(i) => int_expr(*i, kind, f, &format!("(*{v})")),
         CTy::Float(fl) => {
             let mode = match kind {
@@ -521,6 +523,31 @@ pub(super) fn estimated_capacity(parts: &[FmtPart]) -> usize {
 }
 
 impl FnGen<'_, '_> {
+    /// `spec_words` with a width or precision taken from an argument:
+    /// C expressions that read the `&usize` operand when the placeholder
+    /// is formatted (`lust_f_count` panics past `u16::MAX`, as std does).
+    fn spec_words_dyn(
+        &mut self,
+        spec: &FmtSpec,
+        width: &Option<Operand>,
+        prec: &Option<Operand>,
+        loc: &str,
+        post: &mut Vec<String>,
+    ) -> (u32, u32, u32, String, String) {
+        let (fill, align, mut flags, w, p) = spec_words(spec);
+        let mut count = |this: &mut Self, c: &Option<Operand>, lit: u32, flag: u32| match c {
+            Some(c) => {
+                flags |= flag;
+                let (v, _) = this.operand(c, loc, post);
+                format!("lust_f_count(*{v}, {loc})")
+            }
+            None => lit.to_string(),
+        };
+        let w = count(self, width, w, 64);
+        let p = count(self, prec, p, 128);
+        (fill, align, flags, w, p)
+    }
+
     /// Emits the formatting of `parts` into a new String temp (with
     /// Rust's capacity for `format!`) and returns the temp's name. A
     /// fmt impl error panics with the message of `what` (see
@@ -587,7 +614,7 @@ impl FnGen<'_, '_> {
                         let _ = writeln!(self.out, "    {guard}lust_f_write(&{s}f, {}, {});", c_string_lit(text.as_bytes()), text.len());
                     }
                 }
-                FmtPart::Arg { value, ty, spec, .. } => {
+                FmtPart::Arg { value, ty, spec, width, prec, .. } => {
                     let (v, vt) = self.operand(value, loc, post);
                     let t = cty(&self.body.tys, *ty);
                     // An unsized `str` or `[T]` argument arrives as its
@@ -604,7 +631,7 @@ impl FnGen<'_, '_> {
                     for (g, t) in want {
                         self.want(g, &t);
                     }
-                    let (fill, align, flags, width, prec) = spec_words(spec);
+                    let (fill, align, flags, width, prec) = self.spec_words_dyn(spec, width, prec, loc, post);
                     let guard = if fallible { format!("if (!{s}e) ") } else { String::new() };
                     let _ = writeln!(self.out, "    {guard}{{ lust_f_set(&{s}f, {fill}, {align}, {flags}, {width}, {prec}); {s}e = {e}; }}");
                     fallible |= may_fail(&t);
@@ -1013,7 +1040,7 @@ impl FnGen<'_, '_> {
                         let _ = writeln!(self.out, "    if (!{s}e) {s}e = lust_f_write(&{s}f, {}, {});", c_string_lit(text.as_bytes()), text.len());
                     }
                 }
-                FmtPart::Arg { value, ty, spec, .. } => {
+                FmtPart::Arg { value, ty, spec, width, prec, .. } => {
                     let (v, vt) = self.operand(value, loc, post);
                     let t = cty(&self.body.tys, *ty);
                     let ptr = if self.unsized_arg(*ty) {
@@ -1028,7 +1055,7 @@ impl FnGen<'_, '_> {
                     for (g, t) in want {
                         self.want(g, &t);
                     }
-                    let (fill, align, flags, width, prec) = spec_words(spec);
+                    let (fill, align, flags, width, prec) = self.spec_words_dyn(spec, width, prec, loc, post);
                     let _ = writeln!(self.out, "    if (!{s}e) {{ lust_f_set(&{s}f, {fill}, {align}, {flags}, {width}, {prec}); {s}e = {e}; }}");
                     // As in `print`: a fmt impl that panicked under
                     // unwind stops the formatting; the parts before it

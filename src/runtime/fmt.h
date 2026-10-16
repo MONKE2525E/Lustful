@@ -156,6 +156,8 @@ int lust_f_dbg_char(lust_Formatter *f, uint32_t c);
 int lust_f_dbg_str(lust_Formatter *f, lust_str s);
 int lust_f_unit(lust_Formatter *f);
 int lust_f_fnptr(lust_Formatter *f, const void *p);
+int lust_f_pointer(lust_Formatter *f, const void *p);
+uint32_t lust_f_count(uint64_t n, lust_loc loc);
 
 /* The builders. A `*_field`/`*_entry`/`*_key`/`*_value` call returns the
    Formatter the value writes to (the builder's own, or a PadAdapter in

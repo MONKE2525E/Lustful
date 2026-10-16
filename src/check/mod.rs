@@ -15787,6 +15787,23 @@ impl<'p> Ctx<'p> {
                     Some("UpperExp")
                 }
             }
+            // `Pointer` is on the pointer itself, never through a deref:
+            // references, raw pointers, and fn pointers. A fat pointer
+            // prints its metadata too, and the std smart pointers have it;
+            // lust prints neither.
+            FmtKind::Pointer => match self.kind(t) {
+                TyKind::Ref(_, _, inner) | TyKind::RawPtr(_, inner)
+                    if !matches!(self.kind(inner), TyKind::Dyn(..) | TyKind::Str | TyKind::Slice(_)) =>
+                {
+                    None
+                }
+                TyKind::FnPtr(_) => None,
+                _ if self.tys.builtin_of(t).is_some() || matches!(self.kind(t), TyKind::Ref(..) | TyKind::RawPtr(..)) => {
+                    self.errs.push(not_yet("L0641", span, "pointer format of this type"));
+                    return;
+                }
+                _ => Some("Pointer"),
+            },
         };
         if let Some(what) = what {
             if self.kind(t) != TyKind::Error {
@@ -15891,6 +15908,10 @@ impl<'p> Ctx<'p> {
         };
         for piece in fmt {
             if let FmtPiece::Arg { index, spec, .. } = piece {
+                // A width or precision argument is a `usize`.
+                for c in [spec.width_arg, spec.precision_arg].into_iter().flatten() {
+                    self.expect_expr(args[c as usize], USIZE);
+                }
                 let a = args[*index];
                 let t = self.expr(a, None);
                 let t = self.deep(t);
@@ -15913,7 +15934,11 @@ impl<'p> Ctx<'p> {
         }
         // Arguments not referenced by the format string (only possible in assert macros).
         for (i, &a) in args.iter().enumerate() {
-            if i >= fixed && !fmt.iter().any(|p| matches!(p, FmtPiece::Arg { index, .. } if *index == i)) {
+            let referenced = |p: &FmtPiece| match p {
+                FmtPiece::Arg { index, spec, .. } => *index == i || [spec.width_arg, spec.precision_arg].contains(&Some(i as u32)),
+                FmtPiece::Lit(_) => false,
+            };
+            if i >= fixed && !fmt.iter().any(referenced) {
                 self.expr(a, None);
             }
         }

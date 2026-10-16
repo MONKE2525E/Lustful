@@ -3621,7 +3621,7 @@ impl<'p> Lower<'p> {
                         let rt = this.ref_ty(false, ty);
                         let r = this.temp(rt);
                         this.assign(Place::local(r), Rvalue::Ref(false, Place::local(v)), span);
-                        FmtPart::Arg { value: Operand::Copy(Place::local(r)), ty, debug: true, spec: dbg }
+                        FmtPart::Arg { value: Operand::Copy(Place::local(r)), ty, debug: true, spec: dbg, width: None, prec: None }
                     };
                     let (lo, hi) = (arg(self, vals[1]), arg(self, vals[2]));
                     vec![FmtPart::Lit("min > max. min = ".into()), lo, FmtPart::Lit(", max = ".into()), hi]
@@ -6129,18 +6129,40 @@ impl<'p> Lower<'p> {
             Some(FmtPart::Lit(prev)) => prev.push_str(text),
             _ => parts.push(FmtPart::Lit(text.to_string())),
         };
+        // As in rustc, each argument the pieces use is evaluated once, in
+        // argument order, before any of it is formatted; a literal rustc
+        // inlines needs no evaluation.
+        let inlined = |this: &Self, index: usize, spec: &FmtSpec| -> Option<String> {
+            if *spec == FmtSpec::default() { this.inline_literal(args[index]) } else { None }
+        };
+        let mut wanted: Vec<usize> = Vec::new();
+        for piece in fmt {
+            if let FmtPiece::Arg { index, spec, .. } = piece {
+                if inlined(self, *index, spec).is_none() {
+                    wanted.push(*index);
+                }
+                wanted.extend([spec.width_arg, spec.precision_arg].into_iter().flatten().map(|c| c as usize));
+            }
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut borrowed: crate::intern::FxMap<usize, (Operand, Ty)> = Default::default();
+        for i in wanted {
+            let b = self.borrow_of(args[i], 0);
+            borrowed.insert(i, b);
+        }
         for piece in fmt {
             match piece {
                 FmtPiece::Lit(s) => push_lit(&mut parts, s),
                 FmtPiece::Arg { index, debug, spec } => {
-                    if *spec == FmtSpec::default()
-                        && let Some(text) = self.inline_literal(args[*index])
-                    {
+                    if let Some(text) = inlined(self, *index, spec) {
                         push_lit(&mut parts, &text);
                         continue;
                     }
-                    let (value, ty) = self.borrow_of(args[*index], 0);
-                    parts.push(FmtPart::Arg { value, ty, debug: *debug, spec: *spec });
+                    let (value, ty) = borrowed[index].clone();
+                    let count = |c: Option<u32>| c.map(|c| borrowed[&(c as usize)].0.clone());
+                    let (width, prec) = (count(spec.width_arg), count(spec.precision_arg));
+                    parts.push(FmtPart::Arg { value, ty, debug: *debug, spec: *spec, width, prec });
                 }
             }
         }
@@ -6337,9 +6359,9 @@ impl<'p> Lower<'p> {
                 }
                 parts.push(FmtPart::Lit("\n  left: ".into()));
                 let dbg = FmtSpec { kind: FmtKind::Debug, ..FmtSpec::default() };
-                parts.push(FmtPart::Arg { value: a, ty: t, debug: true, spec: dbg });
+                parts.push(FmtPart::Arg { value: a, ty: t, debug: true, spec: dbg, width: None, prec: None });
                 parts.push(FmtPart::Lit("\n right: ".into()));
-                parts.push(FmtPart::Arg { value: b, ty: tb, debug: true, spec: dbg });
+                parts.push(FmtPart::Arg { value: b, ty: tb, debug: true, spec: dbg, width: None, prec: None });
                 self.terminate(Terminator::Panic(parts), span);
                 self.cur = ok;
                 self.unit(dest, span);

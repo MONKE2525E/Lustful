@@ -597,6 +597,28 @@ int lust_f_dbg_str(lust_Formatter *f, lust_str s) {
 
 int lust_f_unit(lust_Formatter *f) { return lust_f_pad(f, lust_cstr("()")); }
 
+/* fmt::Pointer (pointer_fmt_inner): the address as `{:#x}`; with `#`
+   it is zero-padded, to 18 places when no width is set. */
+int lust_f_pointer(lust_Formatter *f, const void *p) {
+    lust_Formatter g = *f;
+    if (g.flags & LUST_FLAG_ALT) {
+        g.flags |= LUST_FLAG_ZERO;
+        if (!(g.flags & LUST_FLAG_WIDTH)) {
+            g.flags |= LUST_FLAG_WIDTH;
+            g.width = 18;
+        }
+    }
+    g.flags |= LUST_FLAG_ALT;
+    return lust_f_radix(&g, (uint64_t)(uintptr_t)p, 0, 1);
+}
+
+/* A width or precision taken from a `usize` argument: Rust 1.99 keeps
+   them in u16 and panics past it. */
+uint32_t lust_f_count(uint64_t n, lust_loc loc) {
+    if (n > 0xffffu) lust_panic_cstr("Formatting argument out of range", loc);
+    return (uint32_t)n;
+}
+
 int lust_f_fnptr(lust_Formatter *f, const void *p) {
     lust_String tmp;
     lust_String *out = lust_f_out_begin(f, &tmp);

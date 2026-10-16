@@ -1385,7 +1385,6 @@ const REJECTED: &[(&str, &str)] = &[
     ("items other than `use` inside function bodies", "L0820"),
     ("closures as `dyn Fn` values", "L0820"),
     ("captured-variable uses outside the closure capture analysis (named in the message)", "L0820"),
-    ("named format arguments", "L0641"),
     ("format spec forms other than {} and {:?} (named in the message)", "L0641"),
     ("#[test] functions inside impl blocks", "L9001"),
     ("inferred expressions (`_`)", "L0820"),

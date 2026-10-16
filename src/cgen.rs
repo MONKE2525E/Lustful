@@ -9489,7 +9489,7 @@ mod tests {
             kind: StmtKind::Print {
                 stderr: false,
                 newline: true,
-                parts: vec![FmtPart::Arg { value: Operand::Copy(Place::local(l)), ty, debug: false, spec: FmtSpec::default() }],
+                parts: vec![FmtPart::Arg { value: Operand::Copy(Place::local(l)), ty, debug: false, spec: FmtSpec::default(), width: None, prec: None }],
             },
             span,
         };

@@ -944,8 +944,8 @@ pub enum MacroKind {
 
 /// One parsed format spec (the text after `:` in a placeholder), as
 /// Rust's grammar gives it: `[[fill]align][sign][#][0][width][.prec][kind]`.
-/// Dynamic width and precision (`w$`, `.*`) and pointer format (`p`)
-/// reject in the parser, so every field here is a literal.
+/// A width or precision from an argument (`w$`, `1$`, `.*`) is the index
+/// of that `usize` argument in the macro's argument list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FmtSpec {
     pub kind: FmtKind,
@@ -963,6 +963,8 @@ pub struct FmtSpec {
     pub debug_hex: u8,
     pub width: Option<u32>,
     pub precision: Option<u32>,
+    pub width_arg: Option<u32>,
+    pub precision_arg: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -975,6 +977,8 @@ pub enum FmtKind {
     Binary,
     LowerExp,
     UpperExp,
+    /// `{:p}`: the address a reference or raw pointer holds.
+    Pointer,
 }
 
 impl Default for FmtSpec {
@@ -990,6 +994,8 @@ impl Default for FmtSpec {
             debug_hex: 0,
             width: None,
             precision: None,
+            width_arg: None,
+            precision_arg: None,
         }
     }
 }

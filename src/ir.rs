@@ -74,7 +74,9 @@ pub enum Operand {
 #[derive(Clone, Debug)]
 pub enum FmtPart {
     Lit(String),
-    Arg { value: Operand, ty: Ty, debug: bool, spec: FmtSpec },
+    /// `width` and `prec` are `&usize` operands for a width or precision
+    /// taken from an argument (`spec.width_arg`, `spec.precision_arg`).
+    Arg { value: Operand, ty: Ty, debug: bool, spec: FmtSpec, width: Option<Operand>, prec: Option<Operand> },
 }
 
 #[derive(Clone, Debug)]
