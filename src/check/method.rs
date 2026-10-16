@@ -148,44 +148,62 @@ fn trait_in_scope(cx: &mut Ctx, trait_def: DefId) -> bool {
         lang.as_mut,
         lang.to_owned,
         lang.to_string,
-        lang.deref,
-        lang.deref_mut,
-        lang.index,
-        lang.index_mut,
-        // The operator traits are not in rustc's prelude (a method
-        // call needs the trait in scope), but no record of
-        // `use std::ops::..` reaches check today, and bounds and
-        // impl headers already resolve these traits by flat name
-        // (`trait_by_name`), with or without the use. Method calls
-        // follow the same flat rule until resolver use-scope for
-        // lang traits lands (W-RESOLVE).
-        lang.add,
-        lang.sub,
-        lang.mul,
-        lang.div,
-        lang.rem,
-        lang.neg,
-        lang.not,
-        lang.bit_and,
-        lang.bit_or,
-        lang.bit_xor,
-        lang.shl,
-        lang.shr,
-        lang.add_assign,
-        lang.sub_assign,
-        lang.mul_assign,
-        lang.div_assign,
-        lang.rem_assign,
-        lang.bit_and_assign,
-        lang.bit_or_assign,
-        lang.bit_xor_assign,
-        lang.shl_assign,
-        lang.shr_assign,
     ]
     .contains(&trait_def)
     {
         return true;
     }
+    // The operator traits, `Deref`, and `Index` are not in the prelude: a
+    // method call by name (`1i32.add(2)`, `s.deref()`) needs the trait
+    // imported, by name or by a glob of `std::ops`. Operator syntax and
+    // bounds do not ask.
+    if let Some(name) = ops_trait_name(lang, trait_def) {
+        return cx.std_trait_imported("ops", name) || cx.std_ops_glob() || in_env_or_template(cx, trait_def);
+    }
+    if in_env_or_template(cx, trait_def) {
+        return true;
+    }
+    false
+}
+
+/// The `core::ops` name of lang trait `d` when it is one of the operator,
+/// `Deref`, or `Index` traits.
+fn ops_trait_name(lang: &crate::check::generics::LangTraits, d: DefId) -> Option<&'static str> {
+    let table = [
+        (lang.deref, "Deref"),
+        (lang.deref_mut, "DerefMut"),
+        (lang.index, "Index"),
+        (lang.index_mut, "IndexMut"),
+        (lang.add, "Add"),
+        (lang.sub, "Sub"),
+        (lang.mul, "Mul"),
+        (lang.div, "Div"),
+        (lang.rem, "Rem"),
+        (lang.neg, "Neg"),
+        (lang.not, "Not"),
+        (lang.bit_and, "BitAnd"),
+        (lang.bit_or, "BitOr"),
+        (lang.bit_xor, "BitXor"),
+        (lang.shl, "Shl"),
+        (lang.shr, "Shr"),
+        (lang.add_assign, "AddAssign"),
+        (lang.sub_assign, "SubAssign"),
+        (lang.mul_assign, "MulAssign"),
+        (lang.div_assign, "DivAssign"),
+        (lang.rem_assign, "RemAssign"),
+        (lang.bit_and_assign, "BitAndAssign"),
+        (lang.bit_or_assign, "BitOrAssign"),
+        (lang.bit_xor_assign, "BitXorAssign"),
+        (lang.shl_assign, "ShlAssign"),
+        (lang.shr_assign, "ShrAssign"),
+    ];
+    table.iter().find(|&&(t, _)| t == d).map(|&(_, n)| n)
+}
+
+/// True when a bound in this body's env (or its template's, for an
+/// instance) names trait `trait_def`, which brings it in scope.
+fn in_env_or_template(cx: &mut Ctx, trait_def: DefId) -> bool {
+    let p = cx.p;
     let in_env = |preds: &[Predicate]| preds.iter().any(|pred| matches!(pred, Predicate::Trait(b) if b.value.def == trait_def));
     // An opaque type's bounds count like a where clause (check/opaque.rs).
     if in_env(&cx.solve_env()) {
