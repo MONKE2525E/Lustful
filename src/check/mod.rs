@@ -19726,6 +19726,7 @@ impl<'p> Ctx<'p> {
                 cap.place_ty = self.zonk(cap.place_ty);
             }
             c.ty = self.zonk(c.ty);
+            c.bound_output = c.bound_output.map(|t| self.zonk(t));
             self.out.closures.push(c);
         }
     }

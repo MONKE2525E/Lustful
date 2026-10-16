@@ -253,18 +253,23 @@ impl<'p> Ctx<'p> {
         }
     }
 
-    /// The output of fn pointer type `t` with every region the one input
-    /// region's (`ClosureInfo::bound_output`), when it has exactly one
-    /// higher-ranked input slot and the type writes every output slot as
-    /// that one (`FnSig::own_out`: `for<'a> fn(&'a D) -> Option<L<'a>>`,
-    /// or the elided form). None when an output slot is `'static`, the
-    /// enclosing item's lifetime (`FnSig::free_slots`), or a substituted
-    /// type parameter's (`fn(&u8) -> T` with `T = &'x u8`): a closure body
-    /// must not return its argument there.
+    /// The output of fn pointer type `t` with each region slot of
+    /// `FnSig::own_out` the one input region's (`ClosureInfo::bound_output`),
+    /// when it has exactly one higher-ranked input slot (`for<'a> fn(&'a D)
+    /// -> Option<L<'a>>`, or the elided form). None when no output slot is
+    /// the input's, or when the output's slots no longer line up with the
+    /// written ones (a type parameter substituted with `&'x u8` in `fn(&u8)
+    /// -> T`): a closure body must not return its argument there. An infer
+    /// var has no slot yet; what it later resolves to keeps erased regions
+    /// (not the input's), so the rebound slots stay the written ones.
     fn fn_ptr_bound_output(&mut self, t: Ty) -> Option<Ty> {
         let TyKind::FnPtr(sig) = self.kind(t) else { return None };
         let s = self.tys.sig(sig).value;
-        if !s.own_out {
+        if s.own_out == 0 || s.free_slots != 0 {
+            return None;
+        }
+        let out = self.deep(s.output);
+        if self.tys.flags(out).contains_projection() {
             return None;
         }
         let al = &self.p.gx.adt_lifetimes;
@@ -273,11 +278,71 @@ impl<'p> Ctx<'p> {
             crate::borrowck::paired_slot_regions(al, &self.tys, i, i, &mut ins);
         }
         let mut outs = Vec::new();
-        crate::borrowck::paired_slot_regions(al, &self.tys, s.output, s.output, &mut outs);
-        let free = |k: usize| k < 32 && s.free_slots >> k & 1 == 1;
-        let hr = ins.iter().enumerate().filter(|&(k, r)| *r != Region::Static && !free(k)).count();
-        let out_ok = !outs.is_empty() && !outs.contains(&Region::Static) && (ins.len()..ins.len() + outs.len()).all(|k| !free(k));
-        (hr == 1 && out_ok).then(|| self.rebind_bound(s.output))
+        crate::borrowck::paired_slot_regions(al, &self.tys, out, out, &mut outs);
+        let hr = ins.iter().filter(|r| **r != Region::Static).count();
+        (hr == 1 && outs.len() == s.out_slots as usize).then(|| self.rebind_own(out, s.own_out, &mut 0))
+    }
+
+    /// `t` with region slot `k` (counted from `*k`, in
+    /// `paired_slot_regions` order) `Region::Bound(0)` when bit `k` of
+    /// `mask` is set (`fn_ptr_bound_output`). Slots inside `dyn`, raw
+    /// pointer and fn pointer types, and std types with regions of their
+    /// own (`Chars`, slice iterators), are counted, never rebound.
+    fn rebind_own(&mut self, t: Ty, mask: u32, k: &mut usize) -> Ty {
+        let own = |k: usize| k < 32 && mask >> k & 1 == 1;
+        let b = Region::Bound(0);
+        match self.kind(t) {
+            TyKind::Ref(r, m, e) => {
+                let r = if own(*k) { b } else { r };
+                *k += 1;
+                let e = self.rebind_own(e, mask, k);
+                self.tys.intern(TyKind::Ref(r, m, e))
+            }
+            TyKind::Tuple(ts) => {
+                let mut es = Vec::new();
+                for e in self.tys.tys_of(ts).to_vec() {
+                    es.push(self.rebind_own(e, mask, k));
+                }
+                let ts = self.tys.intern_tys(&es);
+                self.tys.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Slice(e) => {
+                let e = self.rebind_own(e, mask, k);
+                self.tys.intern(TyKind::Slice(e))
+            }
+            TyKind::Array(e, n) => {
+                let e = self.rebind_own(e, mask, k);
+                self.tys.intern(TyKind::Array(e, n))
+            }
+            TyKind::Adt(d, args)
+                if crate::borrowck::adt_region_count(&self.p.gx.adt_lifetimes, &self.tys, t) as usize
+                    == self.p.gx.adt_lifetimes.get(&d).map_or(0, |v| v.len()) =>
+            {
+                let n = self.p.gx.adt_lifetimes.get(&d).map_or(0, |v| v.len());
+                let old: Vec<GenericArg> = self.tys.args(args).to_vec();
+                let lts: Vec<Region> = old.iter().filter_map(|g| if let GenericArg::Lifetime(x) = g { Some(*x) } else { None }).collect();
+                let mut new: Vec<GenericArg> = Vec::new();
+                for i in 0..n {
+                    new.push(GenericArg::Lifetime(if own(*k + i) { b } else { lts.get(i).copied().unwrap_or(Region::Erased) }));
+                }
+                *k += n;
+                for g in old {
+                    match g {
+                        GenericArg::Ty(e) => new.push(GenericArg::Ty(self.rebind_own(e, mask, k))),
+                        GenericArg::Lifetime(_) => {}
+                        c => new.push(c),
+                    }
+                }
+                let a = self.tys.intern_args(&new);
+                self.tys.intern(TyKind::Adt(d, a))
+            }
+            _ => {
+                let mut rs = Vec::new();
+                crate::borrowck::paired_slot_regions(&self.p.gx.adt_lifetimes, &self.tys, t, t, &mut rs);
+                *k += rs.len();
+                t
+            }
+        }
     }
 
     /// The parts of a `dyn Fn(A, B) -> R` type (any of the Fn family):

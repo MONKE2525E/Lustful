@@ -1765,11 +1765,15 @@ fn fn_ptr_free_name(ast: &Ast, interner: &Interner, id: ast::TyId) -> Result<Opt
     Ok(w.found)
 }
 
-/// `FnSig::own_out` of a fn pointer type with output `ret` (erased: `out`):
-/// the output resolves again with regions kept (an elided lifetime is the
-/// one input's, `Region::Bound(0)`), and every slot must be such a
-/// signature region: not `'static`, and not an erased region of a type
-/// parameter, projection, or alias argument.
+/// `FnSig::own_out` and `FnSig::out_slots` of a fn pointer type with
+/// inputs `in_tys` and output `ret` (erased: `out`): the types resolve
+/// again with regions kept (an elided lifetime is `Region::Bound(0)`, a
+/// `for<'a>` one its own region), and each output slot that is the one
+/// input region sets its bit (an elided output slot is that region). A
+/// `'static` slot, and an erased one of an alias argument, does not. A
+/// type parameter adds no slot (`fn(&D, usize) -> &T` is mask 1 of 1
+/// slot). (0, 0) when the inputs have no or several regions, the output
+/// holds a projection or an infer var, or it has more than 32 slots.
 #[allow(clippy::too_many_arguments)]
 fn fn_ptr_own_output(
     ast: &Ast,
@@ -1778,22 +1782,34 @@ fn fn_ptr_own_output(
     cx: &ResolveCx,
     tys: &mut impl TyIntern,
     scope: &Scope,
+    in_tys: &[ast::TyId],
     ret: Option<ast::TyId>,
     out: Ty,
-) -> bool {
-    let Some(r) = ret else { return false };
+) -> (u32, u8) {
+    let Some(r) = ret else { return (0, 0) };
     let f = tys.flags(out);
-    if f.contains_param() || f.contains_projection() || f.contains_infer() {
-        return false;
+    if f.contains_projection() || f.contains_infer() {
+        return (0, 0);
     }
     let mut ts = scope.clone();
     ts.fn_ptr_free = false;
     ts.regions = RegionMode::Keep { next: None, elided: Some(Region::Bound(0)) };
-    let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, r, &ts) else { return false };
+    let mut lts: Vec<Region> = Vec::new();
+    for &t in in_tys {
+        let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, t, &ts) else { return (0, 0) };
+        crate::borrowck::elision_regions(tys, twin, &mut lts);
+    }
+    lts.retain(|r| !matches!(r, Region::Erased | Region::Static));
+    lts.dedup();
+    let [own] = lts[..] else { return (0, 0) };
+    ts.regions = RegionMode::Keep { next: None, elided: Some(own) };
+    let Ok(twin) = resolve_scoped(ast, interner, known, cx, tys, r, &ts) else { return (0, 0) };
     let mut slots: Vec<Region> = Vec::new();
-    crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, twin, out, &mut slots)
-        && !slots.is_empty()
-        && slots.iter().all(|r| !matches!(r, Region::Erased | Region::Static))
+    if !crate::borrowck::paired_slot_regions(cx.adt_lifetimes, tys, twin, out, &mut slots) || slots.len() > 32 {
+        return (0, 0);
+    }
+    let mask = slots.iter().enumerate().filter(|(_, r)| **r == own).fold(0u32, |m, (k, _)| m | 1 << k);
+    (mask, slots.len() as u8)
 }
 
 /// The `FnSig::free_slots` of a fn pointer type whose free lifetime is
@@ -3054,9 +3070,9 @@ pub fn resolve_scoped(
                 Some((lt, r)) => (fn_ptr_free_mask(ast, interner, known, cx, tys, outer, &in_tys, *ret, lt, &ins, out)?, r),
                 None => (0, Region::Erased),
             };
-            let own_out = free_slots == 0 && fn_ptr_own_output(ast, interner, known, cx, tys, outer, *ret, out);
+            let (own_out, out_slots) = if free_slots == 0 { fn_ptr_own_output(ast, interner, known, cx, tys, outer, &in_tys, *ret, out) } else { (0, 0) };
             let inputs = tys.intern_tys(&ins);
-            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, ..FnSig::plain(inputs, out) }));
+            let sig = tys.intern_sig(Binder::plain(FnSig { free_slots, free_region, own_out, out_slots, ..FnSig::plain(inputs, out) }));
             Ok(tys.intern(TyKind::FnPtr(sig)))
         }
         TyExpr::QPath { self_ty, trait_path, segs } => {
