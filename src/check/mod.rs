@@ -9539,7 +9539,8 @@ impl<'p> Ctx<'p> {
                         _ => 2,
                     };
                     let const_val = self.repeat_const_operand(*value);
-                    if n > 1 && !const_val && !is_copy(p, &self.tys, self.resolve(elem)) {
+                    let elem_d = self.deep(elem);
+                    if n > 1 && !const_val && !is_copy(p, &self.tys, elem_d) {
                         self.err(
                             "L0110",
                             span,
@@ -9577,7 +9578,8 @@ impl<'p> Ctx<'p> {
                 match n {
                     Some(n) => {
                         let const_val = self.repeat_const_operand(*value);
-                        if n > 1 && !const_val && !is_copy(p, &self.tys, self.resolve(elem)) {
+                        let elem_d = self.deep(elem);
+                        if n > 1 && !const_val && !is_copy(p, &self.tys, elem_d) {
                             self.err(
                                 "L0110",
                                 span,

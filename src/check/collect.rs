@@ -4707,7 +4707,10 @@ pub fn collect_reuse(
                 // `Clone` fields are checked in finish_collect
                 // (`check_derive_bounds`): a field type with a written
                 // `Clone` impl needs the impl index first.
-                if d.copy {
+                // A field of a local type may be `Copy` through a written
+                // impl, which needs the impl index: `check_derive_bounds`
+                // proves it.
+                if d.copy && !crate::check::fmt::mentions_local_adt(&p.tys, f.ty) {
                     checks[n_checks] = (is_copy(&p, &p.tys, f.ty), "Copy");
                     n_checks += 1;
                 }
@@ -8133,6 +8136,10 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             if let Some((a, b)) = tys.result_args(t) {
                 return is_copy(p, tys, a) && is_copy(p, tys, b);
             }
+            // A written `where K<T>: Copy` bound, and a written `impl Copy`.
+            if (tys.flags(t).contains_param() && env_proves(tys, t, p.gx.lang.copy, None)) || written_copy(p, tys, t) {
+                return true;
+            }
             match tys.local_adt(t) {
                 // A generic Adt whose instance does not exist yet (a
                 // closure capture checked before collect made `W<u8>`):
@@ -8159,6 +8166,31 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             }
         }
     }
+}
+
+/// True when a written (not derived) `impl Copy` applies to user Adt
+/// type `t`: its header matches and its bounds hold, as rustc selects
+/// it (`impl<T> Copy for Key<T> {}` has no `T: Copy` bound, unlike the
+/// derive). `check_copy_impls` makes every field `Copy` (E0204), so a
+/// copy is a plain value copy with no drop.
+fn written_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    use crate::traits::index::{SelfHead, Synthetic};
+    let Some((def, _)) = tys.adt_parts(t) else { return false };
+    if tys.local_adt(t).is_none() {
+        return false;
+    }
+    p.gx.index.bucket(p.gx.lang.copy, SelfHead::Adt(def)).iter().any(|&id| {
+        let rec = p.gx.index.get(id);
+        if rec.synthetic != Synthetic::None {
+            return false;
+        }
+        let mut assign: Vec<Option<Ty>> = Vec::new();
+        if !match_impl_pat(p, tys, rec.self_ty(&p.tys), t, &mut assign) {
+            return false;
+        }
+        let mut seen = GlueSeen::default();
+        rec.generics.predicates.iter().all(|pred| glue_impl_pred_holds(p, tys, pred, &assign, &mut seen))
+    })
 }
 
 /// Matches one impl pattern type (in the global store) against a

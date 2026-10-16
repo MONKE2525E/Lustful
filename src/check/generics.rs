@@ -12195,6 +12195,8 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
                             == crate::check::collect::cow_arg(&p.tys, ty))
                 })
         }
+        // core: `&T` is `Clone` and `Copy` for every `T`; `&mut T` is neither.
+        TyKind::Ref(_, m, _) if trait_def == lang.copy || trait_def == lang.clone => !m.is_mut(),
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
         // `Box`, `Rc`, and `Arc` of `str` or `[T]` follow the pointee for
         // the comparison and hash traits, as std's `T: ?Sized` impls do
@@ -12720,6 +12722,23 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>) {
                 });
             if !has_clone_impl {
                 errs.push(Diag::new("L0112", span, "deriving Copy requires Clone", "Add Clone to the derive list."));
+            }
+            // A field of a local type collect left for the impl index
+            // (a written `impl Copy` on it).
+            for &ft in &field_tys {
+                if !p.tys.flags(ft).contains_param()
+                    && crate::check::fmt::mentions_local_adt(&p.tys, ft)
+                    && !crate::check::collect::is_copy(p, &p.tys, ft)
+                {
+                    let tn = crate::check::collect::ty_name(p, &p.tys, ft);
+                    errs.push(Diag::new(
+                        "L0112",
+                        span,
+                        format!("cannot derive Copy: field type `{tn}` does not implement Copy"),
+                        "Derive Copy on the field type too, or remove Copy from the derive list.",
+                    ));
+                    break;
+                }
             }
         }
         if derives.partial_eq {
