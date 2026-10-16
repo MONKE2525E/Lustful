@@ -1308,6 +1308,9 @@ impl<'p> Ctx<'p> {
                     }
                     // `cmp`, `partial_cmp`, `lt`, and kin take `&self`.
                     Res::PrimCmp { derefs, .. } => self.cap_receiver(*recv, derefs, Autoref::Ref, w),
+                    // `x.eq(y)` as the operator `Self == R` (check's
+                    // `cmp_cross_eq`): borrows the receiver at depth `ld`.
+                    Res::Bin { ld, .. } => self.cap_receiver(*recv, ld, Autoref::Ref, w),
                     // A call that failed to resolve already reported its error.
                     Res::None if !self.errs.is_empty() => {}
                     _ => self.cap_bad_if_upvar(*recv, w),

@@ -4160,6 +4160,16 @@ impl<'p> Lower<'p> {
             self.get_range_into(e, recv, args, derefs, dest, span, mutable);
             return;
         }
+        // `x.eq(y)` / `x.ne(y)` across std types (check's `cmp_cross_eq`):
+        // the operator `Self == R`, with depths from `recv` and the arg.
+        if let Res::Bin { .. } = self.ck.res(e)
+            && let Expr::MethodCall { name, .. } = self.p.ast.expr(e)
+            && let [arg] = args
+        {
+            let op = if self.p.name(*name) == "ne" { BinOp::Ne } else { BinOp::Eq };
+            self.binary_into(e, op, recv, *arg, dest, span);
+            return;
+        }
         if let Res::PrimCmp { kind, derefs } = self.ck.res(e) {
             self.prim_cmp_into(e, recv, args, dest, span, kind, derefs);
             return;

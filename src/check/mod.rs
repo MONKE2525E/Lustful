@@ -2475,6 +2475,16 @@ fn string_eq_ok(ld: u8, lk: StrKind, rd: u8, rk: StrKind) -> bool {
         || pair((0, Cow), (0, Cow))
 }
 
+/// How `cmp_arg` handled a comparison call's argument.
+enum CmpArg {
+    /// Not at all: the plain argument check (a coercion to `&base`) is rustc's.
+    Plain,
+    /// Checked and coerced to `&base` (or reported).
+    Checked,
+    /// The call is the operator `Self == R` (`cmp_cross_eq`), recorded as `Res::Bin`.
+    Cross,
+}
+
 /// The std string types `string_eq_ok` compares (`Cow` is `Cow<str>`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StrKind {
@@ -13660,8 +13670,11 @@ impl<'p> Ctx<'p> {
         }
         self.check_packed_borrow(recv, name_span);
         let other_ty = self.tys.mk_ref(false, base);
-        if !self.cmp_arg(recv, base, trait_def, args, name) {
-            self.check_args(&[other_ty], args, name_span);
+        match self.cmp_arg(e, recv, base, trait_def, args, name) {
+            CmpArg::Plain => self.check_args(&[other_ty], args, name_span),
+            CmpArg::Checked => {}
+            // `x.eq(y)` as the operator `Self == R` (`cmp_cross_eq`).
+            CmpArg::Cross => return Some(BOOL),
         }
         self.set_res(e, Res::PrimCmp { kind, derefs });
         Some(match kind {
@@ -13680,20 +13693,76 @@ impl<'p> Ctx<'p> {
     /// coercion to `&base`) is rustc's: `Self` is `base` with one impl.
     /// `s.eq(&&s)` on a `String` is E0277 (several impls: no deref
     /// coercion); `Box::new(5).eq(&5)` is E0308 (`Rhs` is the Box).
-    fn cmp_arg(&mut self, recv: ExprId, base: Ty, trait_def: DefId, args: &[ExprId], name: Sym) -> bool {
-        let [a] = args else { return false };
+    fn cmp_arg(&mut self, e: ExprId, recv: ExprId, base: Ty, trait_def: DefId, args: &[ExprId], name: Sym) -> CmpArg {
+        let [a] = args else { return CmpArg::Plain };
         let rt = self.out.expr_ty[self.ei(recv)];
         let rt = self.deep(rt);
         let self_ty = self.cmp_self_ty(rt);
         let open = trait_def != self.p.gx.lang.ord && self.cmp_rhs_open(self_ty, trait_def);
         if !open && self_ty == base {
-            return false;
+            return CmpArg::Plain;
         }
         let want = self.tys.mk_ref(false, self_ty);
         let at = self.expr(*a, Some(want));
+        if open && self.cmp_cross_eq(e, rt, self_ty, at, name) {
+            return CmpArg::Cross;
+        }
         if self.cmp_arg_rule(rt, at, trait_def, *a, name) {
             let to = self.tys.mk_ref(false, base);
             self.coerce_expr(*a, at, to);
+        }
+        CmpArg::Checked
+    }
+
+    /// `x.eq(y)` or `x.ne(y)` when `Self` has several `PartialEq` impls
+    /// and the argument is `&R` with `R` not `Self`: rustc selects
+    /// `Self: PartialEq<R>`, which is the operator `Self == R`. The
+    /// std pairs the operator knows are taken here: the string types
+    /// (`string_eq_ok`: `String` with `str`, `&str`, `Cow<str>`, ...)
+    /// and the sequence forms (`seq_cmp`: `Vec<T>` with `[T]`,
+    /// `&[T]`, `[T; N]`, ...). The call records `Res::Bin` with
+    /// depths from the receiver's and the argument's own types, so
+    /// lowering emits the operator. False leaves the call to
+    /// `cmp_arg_rule` (Rhs = Self, or its L0612).
+    fn cmp_cross_eq(&mut self, e: ExprId, rt: Ty, self_ty: Ty, at: Ty, name: Sym) -> bool {
+        let op = match self.name(name) {
+            "eq" => BinOp::Eq,
+            "ne" => BinOp::Ne,
+            _ => return false,
+        };
+        let r = match self.kind(at) {
+            TyKind::Ref(_, _, u) => self.resolve(u),
+            _ => return false,
+        };
+        let self_ty = self.deep(self_ty);
+        let r = self.deep(r);
+        if self.unbound_general(r) || self.unbound_general(self_ty) {
+            return false;
+        }
+        let snap = self.snapshot_vars();
+        let same = self.unify(r, self_ty);
+        self.rollback_vars(snap);
+        if same {
+            return false;
+        }
+        // The receiver's place reaches `Self` after one peeled
+        // reference (`cmp_self_ty`); the argument is `&R`.
+        let peel = u8::from(matches!(self.kind(rt), TyKind::Ref(_, Mut::Shared, _)));
+        let (ld, lb) = self.autoderef(self_ty);
+        let (rd, rb) = self.autoderef(r);
+        if let (Some(lk), Some(rk)) = (self.str_kind(lb, true), self.str_kind(rb, true)) {
+            if !string_eq_ok(ld, lk, rd, rk) {
+                return false;
+            }
+            self.set_res(e, Res::Bin { ld: ld + peel, rd: rd + 1 });
+            return true;
+        }
+        let span = self.span(e);
+        if self.seq_cmp(e, op, self_ty, r, ld, lb, rd, rb, span).is_none() {
+            return false;
+        }
+        if let Res::Bin { ld, rd } = self.out.expr_res[self.ei(e)] {
+            self.set_res(e, Res::Bin { ld: ld + peel, rd: rd + 1 });
         }
         true
     }
