@@ -1006,6 +1006,21 @@ fn resolve_item_ty(p: &mut Program, id: ast::TyId, self_ty: Option<Ty>) -> Resul
     })
 }
 
+/// `resolve_item_ty` for the type of a const or static inside a fn
+/// body: with block type items in scope (R18), it resolves in their
+/// overlay (an alias `type G = Box<dyn Send>;` or a block struct), and
+/// the enclosing fns' generic params are the E0401 error there.
+fn resolve_stmt_item_ty(p: &mut Program, id: ast::TyId, at: Span) -> Result<Ty, Diag> {
+    let mut scope = generics::Scope::default();
+    apply_stmt_overlay(p, &mut scope, at);
+    if scope.local_types.is_empty() && scope.local_aliases.is_empty() && scope.local_traits.is_empty() {
+        return resolve_item_ty(p, id, None);
+    }
+    let (ast, interner, known) = (&p.ast, &p.interner, &p.known);
+    let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+    generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, id, &scope)
+}
+
 /// The span of a path to a user Adt with lifetime params that writes none
 /// (a hidden lifetime), anywhere in a written type.
 fn hidden_lifetime(p: &Program, id: ast::TyId, params: &[Sym]) -> Option<Span> {
@@ -5705,7 +5720,11 @@ fn eval_pending_items(
         };
         let Some(value) = value else { continue };
         let tls = if is_static.is_some() { super::tls::key_form(&item.attrs, &p.interner) } else { None };
-        let ty = match resolve_item_ty(p, ty_id, None) {
+        let resolved = match stmt_idx {
+            Some(_) => resolve_stmt_item_ty(p, ty_id, item.span),
+            None => resolve_item_ty(p, ty_id, None),
+        };
+        let ty = match resolved {
             Ok(t) => generics::normalize_item_ty(p, t),
             Err(d) => {
                 errs.push(d);

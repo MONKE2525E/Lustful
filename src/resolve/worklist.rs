@@ -6960,6 +6960,29 @@ impl Rewrite<'_> {
         {
             return;
         }
+        // `use E as V;` binds the item under the new name in every
+        // namespace the item has (ts_goport `use ParsingContext as PC;`).
+        // `use E;` names an item already in scope and binds nothing new.
+        if name != seg {
+            let mut any = false;
+            let mut dup = false;
+            for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+                if let PathRes::Done(target) = self.tables.resolve_path(module, path, ns, PathMode::Use, leading, self.interner) {
+                    any = true;
+                    if self.interner.get(name) == "_" {
+                        continue;
+                    }
+                    let bn = crate::resolve::imports::import_bind_name(name, target, self.interner);
+                    dup |= insert_local(scopes, bn, ns, LocalBind::Target(target), 2);
+                }
+            }
+            if dup {
+                self.push_local_dup(span, name);
+            }
+            if any {
+                return;
+            }
+        }
         let mut saw_private = false;
         for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
             match self.tables.resolve_path(module, path, ns, PathMode::Use, leading, self.interner) {
