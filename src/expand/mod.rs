@@ -2386,20 +2386,29 @@ fn starts_item(trees: &[Tt], interner: &Interner) -> bool {
             _ => break,
         }
     }
-    let trees: &[Tt] = &flat;
     let mut i = 0;
     // Skip attributes and item qualifiers to the item keyword. An
     // attribute whose body is a fragment (`#[$m]`) has no readable
     // path for attr_at; skip its two trees directly.
     loop {
-        if let Some(attr) = attr_at(trees, i, interner) {
+        if let Some(attr) = attr_at(&flat, i, interner) {
             i = attr.end;
-        } else if tok_at(trees, i).map(|t| t.tok) == Some(Tok::Pound) && matches!(trees.get(i + 1), Some(Tt::Delim(Delim::Bracket, _, _))) {
+        } else if tok_at(&flat, i).map(|t| t.tok) == Some(Tok::Pound) && matches!(flat.get(i + 1), Some(Tt::Delim(Delim::Bracket, _, _))) {
             i += 2;
         } else {
             break;
         }
     }
+    // A vis fragment after the attributes (`#[must_use] $v:vis fn`)
+    // splices in place as a leading one does.
+    while let Some(Tt::Frag(kind, inner, _)) = flat.get(i) {
+        if *kind == FragKind::Item {
+            return true;
+        }
+        let inner = inner.clone();
+        flat.splice(i..i + 1, inner);
+    }
+    let trees: &[Tt] = &flat;
     loop {
         match tok_at(trees, i).map(|t| t.tok) {
             Some(Tok::Pub) => {

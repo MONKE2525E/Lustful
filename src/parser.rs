@@ -98,10 +98,12 @@ pub struct Parser<'a> {
     /// True while a cfg syntax check parses one foreign item of an
     /// extern block, where a variadic `...` parameter is grammar.
     cfg_foreign: bool,
-    /// The `=` half of a `>=` token consumed as the `>` that closes
-    /// generic arguments (its span), still to be read. The lexer
-    /// makes `>=` one token; rustc splits it in this position.
-    split_eq: Option<Span>,
+    /// The second half of a token split in two, still to be read: the
+    /// `=` of a `>=` consumed as the `>` that closes generic arguments,
+    /// or the second `<` of a `<<` consumed as the `<` that opens them
+    /// (`Extend<<T as Tr>::Item>`). The lexer makes each one token;
+    /// rustc splits it in these positions.
+    split: Option<(Tok, Span)>,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
@@ -147,7 +149,7 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
-        split_eq: None,
+        split: None,
     };
     match p.inner_attributes() {
         Ok(inner) => inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect(),
@@ -227,7 +229,7 @@ fn parse_tokens(
         depths: Depths::default(),
         cfg_syntax,
         cfg_foreign: false,
-        split_eq: None,
+        split: None,
     };
     p.ast.strings = strings;
     // Inner attributes are permitted only here, before the first item
@@ -341,7 +343,7 @@ pub fn parse_body(tokens: &[Token], strings: &[String], ast: &mut Ast, interner:
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
-        split_eq: None,
+        split: None,
     };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     // A fn body block permits inner attributes at its start.
@@ -386,7 +388,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
-        split_eq: None,
+        split: None,
     };
     f(&mut p)
 }
@@ -425,7 +427,7 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
         depths: Depths::default(),
         cfg_syntax: false,
         cfg_foreign: false,
-        split_eq: None,
+        split: None,
     };
     match p.expr() {
         Ok(_) => Ok(p.pos),
@@ -949,22 +951,22 @@ fn lifetime_error(span: Span) -> Diag {
 
 impl<'a> Parser<'a> {
     fn peek(&self) -> Tok {
-        if self.split_eq.is_some() {
-            return Tok::Eq;
+        if let Some((t, _)) = self.split {
+            return t;
         }
         self.toks[self.pos].tok
     }
     fn peek_at(&self, n: usize) -> Tok {
-        if self.split_eq.is_some() {
+        if let Some((t, _)) = self.split {
             if n == 0 {
-                return Tok::Eq;
+                return t;
             }
             return self.toks.get(self.pos + n - 1).map_or(Tok::Eof, |t| t.tok);
         }
         self.toks.get(self.pos + n).map_or(Tok::Eof, |t| t.tok)
     }
     fn span(&self) -> Span {
-        if let Some(sp) = self.split_eq {
+        if let Some((_, sp)) = self.split {
             return sp;
         }
         self.toks[self.pos].span
@@ -973,8 +975,8 @@ impl<'a> Parser<'a> {
         self.toks[self.pos.saturating_sub(1)].span
     }
     fn bump(&mut self) -> Token {
-        if let Some(sp) = self.split_eq.take() {
-            return Token { tok: Tok::Eq, span: sp };
+        if let Some((tok, span)) = self.split.take() {
+            return Token { tok, span };
         }
         let t = self.toks[self.pos];
         if t.tok != Tok::Eof {
@@ -986,16 +988,37 @@ impl<'a> Parser<'a> {
     /// leaving its `=` half for the next read. Only `eat` and
     /// `expect` of `Tok::Gt` split this way.
     fn eat_split_ge(&mut self) -> Option<Span> {
-        if self.split_eq.is_none() && self.toks[self.pos].tok == Tok::Ge {
+        if self.split.is_none() && self.toks[self.pos].tok == Tok::Ge {
             let t = self.bump();
-            self.split_eq = Some(t.span);
+            self.split = Some((Tok::Eq, t.span));
             Some(t.span)
         } else {
             None
         }
     }
+    /// Consumes a `<<` token as the `<` opening generic arguments or a
+    /// qualified path, leaving its second `<` for the next read. Only
+    /// `eat` and `expect` of `Tok::Lt` split this way.
+    fn eat_split_shl(&mut self) -> Option<Span> {
+        if self.split.is_none() && self.toks[self.pos].tok == Tok::Shl {
+            let t = self.bump();
+            let mid = t.span.lo + 1;
+            self.split = Some((Tok::Lt, Span { lo: mid, ..t.span }));
+            Some(Span { hi: mid, ..t.span })
+        } else {
+            None
+        }
+    }
+    /// True at a `<` that may open generic arguments or a qualified
+    /// path, including the first half of a `<<`.
+    fn at_lt(&self) -> bool {
+        matches!(self.peek(), Tok::Lt | Tok::Shl)
+    }
     fn eat(&mut self, t: Tok) -> bool {
         if t == Tok::Gt && self.eat_split_ge().is_some() {
+            return true;
+        }
+        if t == Tok::Lt && self.eat_split_shl().is_some() {
             return true;
         }
         if self.peek() == t {
@@ -1008,6 +1031,11 @@ impl<'a> Parser<'a> {
     fn expect(&mut self, t: Tok, what: &str) -> PResult<Span> {
         if t == Tok::Gt
             && let Some(sp) = self.eat_split_ge()
+        {
+            return Ok(sp);
+        }
+        if t == Tok::Lt
+            && let Some(sp) = self.eat_split_shl()
         {
             return Ok(sp);
         }
@@ -3200,7 +3228,7 @@ impl<'a> Parser<'a> {
                 self.ty()
             }
             Tok::Extern => Err(not_yet(C_TY, start, "extern function types")),
-            Tok::Lt => {
+            Tok::Lt | Tok::Shl => {
                 let (self_ty, trait_path, segs) = self.qpath_parts()?;
                 Ok(self.push_ty(TyExpr::QPath { self_ty, trait_path, segs }, start.to(self.prev_span())))
             }
@@ -3335,8 +3363,8 @@ impl<'a> Parser<'a> {
                 }
                 _ => self.ident()?.0,
             };
-            let turbofish = self.peek() == Tok::PathSep && self.peek_at(1) == Tok::Lt;
-            let args = if (in_type && self.peek() == Tok::Lt) || turbofish {
+            let turbofish = self.peek() == Tok::PathSep && matches!(self.peek_at(1), Tok::Lt | Tok::Shl);
+            let args = if (in_type && self.at_lt()) || turbofish {
                 if turbofish {
                     self.bump();
                 }
@@ -4425,7 +4453,7 @@ impl<'a> Parser<'a> {
                     }
                     let (name, name_span) = self.ident()?;
                     let mut generic_args = Vec::new();
-                    if self.peek() == Tok::PathSep && self.peek_at(1) == Tok::Lt {
+                    if self.peek() == Tok::PathSep && matches!(self.peek_at(1), Tok::Lt | Tok::Shl) {
                         self.bump();
                         generic_args = self.generic_args()?;
                     }
@@ -4527,8 +4555,33 @@ impl<'a> Parser<'a> {
                     let pat = self.pattern()?;
                     let guard = if self.eat(Tok::If) { Some(self.expr()?) } else { None };
                     self.expect(Tok::FatArrow, "`=>`")?;
-                    let block_body = self.peek() == Tok::LBrace;
-                    let body = if block_body { self.block_like_expr(false)? } else { self.expr()? };
+                    // A block-like body (block, labeled block, `if`,
+                    // `match`, a loop, `const { .. }`) ends the arm at its
+                    // `}` and needs no `,`, as in rustc; a `.` or `?`
+                    // after it continues one expression that does.
+                    let labeled = matches!(self.peek(), Tok::Lifetime(_)) && self.peek_at(1) == Tok::Colon;
+                    let const_block = self.peek() == Tok::Const && self.peek_at(1) == Tok::LBrace;
+                    let mut block_body =
+                        labeled || const_block || matches!(self.peek(), Tok::LBrace | Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For);
+                    let body = if !block_body {
+                        self.expr()?
+                    } else {
+                        let e = if const_block {
+                            let start = self.span();
+                            self.bump();
+                            let b = self.block()?;
+                            self.push_expr(Expr::ConstBlock(b), start.to(self.prev_span()))
+                        } else {
+                            self.primary(false, false)?
+                        };
+                        if matches!(self.peek(), Tok::Dot | Tok::Question) {
+                            block_body = false;
+                            let e = self.postfix(e)?;
+                            self.binary_rest(e, 0, false)?
+                        } else {
+                            e
+                        }
+                    };
                     arms.push(Arm { attrs: aattrs.attrs, pat, guard, body });
                     if !self.eat(Tok::Comma) && !block_body && self.peek() != Tok::RBrace {
                         return Err(syntax(self.span(), "expected `,` after match arm"));
