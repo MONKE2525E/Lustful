@@ -1,6 +1,6 @@
 // `lust test <file.rs> [filter]`: finds `#[test]` functions, builds one test binary, and runs
-// each test in its own child process with a timeout. Lust builds with panic=abort, so a panicking
-// test kills its child only, never the run.
+// each test in its own child process with a timeout. A panicking test ends its child only (it
+// unwinds, as under `rustc --test`, and exits 101), never the run.
 //
 // The test binary is the user file plus a generated `main` that dispatches on
 // `std::env::args().count()`: the runner passes i+1 dummy arguments to run test i. With no extra

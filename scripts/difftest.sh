@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Differential tests against rustc (the oracle). Two modes (ARCH 9.3
+# Differential tests against rustc (the oracle). Three modes (ARCH 9.3
 # runner table):
 #   rustc runs with its default lint levels (only -A warnings), so a deny-by-default lint
 #   rejects a case; a case that needs an allow carries it in its source.
-#   Default (abort mode, -C panic=abort):
+#   Default: each compiler with its own defaults (`rustc --edition 2024 -A warnings`, no -C
+#   flags: a debug build, panics unwind, overflow checks on; lust build with no -C flags),
+#   so this mode compares what a user gets from plain `rustc file.rs` and `lust build file.rs`.
+#   PANIC=abort: the same cases with -C panic=abort -C overflow-checks=on on both sides (a
+#   profile that asks for abort; a panic exits by SIGABRT, not 101).
+#   Both of these modes:
 #     tests/pass/*.rs: rustc and lust must both build. Stdout, exit status, and stderr
 #                      must match (stderr with the thread id masked and the case path as
 #                      @CASE@: panic text and location byte for byte, W-PANIC).
@@ -77,6 +82,10 @@ require_dir() {
 
 # Extra lust build flags of this mode (the sanitized build uses them too).
 lust_flags=()
+case "${PANIC:-}" in
+  ""|abort|unwind) ;;
+  *) echo "FAIL: PANIC must be unset, abort or unwind, not '$PANIC'"; exit 1 ;;
+esac
 san_flags=(-O1 -w -Werror=incompatible-pointer-types -fno-sanitize-recover=undefined -fsanitize=address,undefined)
 # san_obj: this run's gcc objects of the generated C units, named by a hash of the unit's
 # bytes. The runtime unit is the same in most cases and is the slow one to build, so each
@@ -207,7 +216,15 @@ require_dir tests/reject
 # rustc's default lint levels decide acceptance (rule zero): a deny-by-default lint such as
 # unconditional_panic rejects the case here. -A warnings lowers only warn-level lints; it
 # turns no error off. A case that needs an allow says so in its own source, with a comment.
-rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
+if [ "${PANIC:-}" = abort ]; then
+  lust_flags=(-C panic=abort)
+  rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
+else
+  rustc_flags=(--edition 2024 -A warnings)
+fi
+# A panic while panicking makes Rust print a backtrace; lust prints only its header, so
+# both sides drop the frame lines (as in PANIC=unwind mode).
+no_frames() { sed -E '/^ +[0-9]+: /d; /^ +at /d'; }
 
 # pass_case <name> <file>: one tests/pass case (see the header).
 pass_case() {
@@ -216,7 +233,7 @@ pass_case() {
   if [ "$(cat rustc.cc)" -ne 0 ]; then
     report bad "$name" "rustc rejected it: $(head -3 rustc.err)"; return
   fi
-  if ! run_lust "$lust" build "$f" -o "$name.lust" 2>"$name.lust.err"; then
+  if ! run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" 2>"$name.lust.err"; then
     report bad "$name" "lust rejected it: $(head -5 "$name.lust.err")"; return
   fi
   panic_expect=$(sed -n 's|.*// panic: ||p' "$f" | head -1 | sed 's/[[:space:]]*$//')
@@ -226,8 +243,8 @@ pass_case() {
     report bad "$name" "exit status rustc=$rs lust=$ls"
   elif ! diff -q rustc.out "$name.lust.out" >/dev/null; then
     report bad "$name" "stdout differs:"; diff rustc.out "$name.lust.out" | head -10
-  elif ! cmp -s <(mask_stderr rustc.stderr) <(lust_stderr "$f" "$name.lust.stderr"); then
-    report bad "$name" "stderr differs:"; diff <(mask_stderr rustc.stderr) <(lust_stderr "$f" "$name.lust.stderr") | head -10
+  elif ! cmp -s <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames); then
+    report bad "$name" "stderr differs:"; diff <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames) | head -10
   elif [ -n "$panic_expect" ] && ! grep -qF "$panic_expect" "$name.lust.stderr"; then
     report bad "$name" "lust stderr lacks panic text '$panic_expect': $(head -3 "$name.lust.stderr")"
   elif [ "${SANITIZE:-0}" = 1 ]; then
@@ -255,12 +272,12 @@ neg_case() {
   if [[ "$f" == */reject/* && $rustc_ok -ne 0 ]]; then
     report bad "$name" "rustc rejected it, so it belongs in tests/fail"; return
   fi
-  out=$(run_lust "$lust" check --json "$f" 2>&1)
+  out=$(run_lust "$lust" check --json "${lust_flags[@]}" "$f" 2>&1)
   if [ $? -eq 0 ]; then
     report bad "$name" "lust accepted it (expected $expect)"
   elif ! grep -q "\"code\":\"$expect\"" <<<"$out"; then
     report bad "$name" "expected $expect, got: $(grep -o '"code":"L[0-9]*"' <<<"$out" | tr '\n' ' ')"
-  elif run_lust "$lust" build "$f" -o "$name.lust" >/dev/null 2>&1; then
+  elif run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" >/dev/null 2>&1; then
     # `build` checks bodies after mono, where a call can reach an
     # instance directly: it must reject what `check` rejects.
     report bad "$name" "lust check rejected it, but lust build accepted it"
@@ -278,5 +295,5 @@ if [ $seen -eq 0 ]; then
   exit 1
 fi
 shard_line
-echo "difftest: $pass passed, $fail failed"
+echo "difftest${PANIC:+ (PANIC=$PANIC)}: $pass passed, $fail failed"
 [ $fail -eq 0 ]

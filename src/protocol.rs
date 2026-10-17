@@ -50,9 +50,11 @@ pub struct CrateKey {
 
 /// The profile values that can change program output (section 1.1). They enter
 /// every session and cache key, so a profile change never reuses a session or
-/// a disk entry built under other flags. A single-file compile uses `DEV`; a
-/// Cargo package (`--manifest-path` and the other crate flags) uses the dev
-/// profile Cargo would apply (`dev_profile`), with `-C panic=` on top.
+/// a disk entry built under other flags. A single-file compile uses `DEV_UNWIND`
+/// (plain `rustc file.rs`: panics unwind); a Cargo package (`--manifest-path`
+/// and the other crate flags) uses the dev profile Cargo would apply
+/// (`dev_profile`, also unwinding unless it says `panic = "abort"`), with
+/// `-C panic=` on top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProfileFlags {
     pub panic_abort: bool,
@@ -61,9 +63,10 @@ pub struct ProfileFlags {
 }
 
 impl ProfileFlags {
-    /// The single-file dev profile (the rustc parity flags in DESIGN.md).
+    /// The dev flags with `-C panic=abort`.
     pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true };
-    /// Cargo's default dev profile: as `DEV`, but panics unwind.
+    /// rustc's and Cargo's dev defaults (panics unwind): a single-file compile
+    /// and a Cargo dev profile that does not set `panic`.
     pub const DEV_UNWIND: ProfileFlags = ProfileFlags { panic_abort: false, ..ProfileFlags::DEV };
 }
 
@@ -124,7 +127,7 @@ impl SessionKey {
             default_features: true,
             all_features: false,
             target_triple: String::new(),
-            profile: ProfileFlags::DEV,
+            profile: ProfileFlags::DEV_UNWIND,
             cargo_net: CargoNet::default(),
         }
     }
@@ -1230,12 +1233,12 @@ pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug
         std::process::exit(0);
     }
     // No Cargo.toml: rustc on the single file, with DESIGN.md's release oracle flags at
-    // rustc's default lint levels, so deny-by-default lints (unconditional_panic,
+    // rustc's default lint levels and its default panic strategy (unwind), so deny-by-default lints (unconditional_panic,
     // arithmetic_overflow) reject as they do for any rustc user; a source `#[allow]` still works.
     let fallback = PathBuf::from(file.file_stem().unwrap_or_default());
     let out: &Path = out.unwrap_or(&fallback);
     let mut cmd = std::process::Command::new("rustc");
-    cmd.args(["--edition", "2024", "-C", "panic=abort"]);
+    cmd.args(["--edition", "2024"]);
     if dev {
         cmd.args(["-C", "overflow-checks=on"]);
     } else {
@@ -1270,7 +1273,7 @@ pub fn run_rustc_check(file: &Path) -> ! {
     let status = run_streamed(
         "rustc",
         std::process::Command::new("rustc")
-            .args(["--edition", "2024", "-C", "panic=abort", "-C", "overflow-checks=on", "--emit=obj", "-o"])
+            .args(["--edition", "2024", "-C", "overflow-checks=on", "--emit=obj", "-o"])
             .arg(&obj)
             .arg(file),
     );

@@ -17,7 +17,7 @@ fail=0
 report() {
   if [ "$1" = ok ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $2: $3"; fi
 }
-rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
+rustc_flags=(--edition 2024 -C overflow-checks=on -A warnings)
 
 # 0. Registry: ranges, collisions, reserved codes, explain rows (no build needed).
 if ! "$root/scripts/check-codes.sh" "$root"; then

@@ -104,7 +104,7 @@ debug assertions) enter every session and cache key. A Cargo
 crate target reads them as Cargo does for its dev profile
 (`protocol::dev_profile`: `CARGO_PROFILE_DEV_*`, then the
 `.cargo/config.toml` chain, then the workspace root manifest);
-a single file uses the rustc parity flags (panic=abort).
+a single file uses rustc's defaults (panic=unwind, as plain `rustc file.rs`).
 
 Terms:
 
@@ -3783,7 +3783,8 @@ These parts differ from the plan, and why:
 - Mode. `-C panic=unwind` sets `ProfileFlags::panic_abort` false; a
   Cargo package follows its workspace's `[profile.dev] panic` (Cargo's
   default unwinds, as ts-rust's dev profile does). A single file
-  without the flag stays panic=abort. The profile is part
+  without the flag unwinds too, as plain rustc does (fx-promtuple round 5;
+  it was panic=abort before, so its panics differed from rustc's). The profile is part
   of the session key, so the daemon keeps one session per mode and
   never mixes their IR or C. `Program::unwind` carries the mode to
   lowering and codegen; `cfg(panic)` follows it. Under panic=abort
@@ -4349,7 +4350,7 @@ dir no runner can execute is not a gate.
 
 | Runner | Runs | Oracle |
 |---|---|---|
-| `scripts/difftest.sh` | `tests/pass`, `tests/fail`, `tests/reject` in abort mode, as today (`-C panic=abort`) | rustc, same flags |
+| `scripts/difftest.sh` | `tests/pass`, `tests/fail`, `tests/reject` with each compiler's defaults (panics unwind); `PANIC=abort` runs them with `-C panic=abort` on both sides | rustc with its defaults (or `-C panic=abort`) |
 | `PANIC=unwind scripts/difftest.sh` | `tests/unwind/` plus panic cases in `tests/pass` | rustc with `-C panic=unwind`, overflow checks on. Needed because abort mode cannot test recovered panics, poison, or unwind drops. |
 | `scripts/test-crates.sh` | `tests/crates/*`: multi-file Cargo fixtures, each built by Cargo and by lust, stdout and exit compared. Sets target and features per fixture. | Cargo |
 | `scripts/test-macros.sh` | `tests/macros/`: token compare, executable hygiene cases, both-reject cases | `rustc -Zunpretty=expanded` tokens; rustc run output |

@@ -24,7 +24,7 @@ source "$root/scripts/case-pool.sh"
 # runtest_case <name> <file>: one tests/pass case, in its own dir.
 runtest_case() {
   local name=$1 f=$2 rs bs ms probe mode want_mode
-  rustc_oracle run "$f" --edition 2024 -C panic=abort -C overflow-checks=on -A warnings
+  rustc_oracle run "$f" --edition 2024 -C overflow-checks=on -A warnings
   [ "$(cat rustc.cc)" -eq 0 ] || { report bad "$name" "rustc rejected it"; return; }
   run_lust "$lust" build "$f" -o "$name.lust" 2>"$name.build.err" || { report bad "$name" "lust build rejected it"; return; }
   rs=$(cat rustc.rs)

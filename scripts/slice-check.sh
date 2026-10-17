@@ -148,7 +148,7 @@ PY
     unset IFS
   fi
   export LUST_CACHE_DIR="$w/cold-cache"
-  if run_step rustc-oracle bash -c 'p=$1 e=$2 o=$3; shift 3; rustc --edition 2024 -C panic=abort -C overflow-checks=on -A warnings "$@" -o "$p" "$e" && "$p" > "$o"' _ "$w/prog-rustc" "$entry" "$w/rustc.out" "${rustc_cfg[@]}"; then
+  if run_step rustc-oracle bash -c 'p=$1 e=$2 o=$3; shift 3; rustc --edition 2024 -C overflow-checks=on -A warnings "$@" -o "$p" "$e" && "$p" > "$o"' _ "$w/prog-rustc" "$entry" "$w/rustc.out" "${rustc_cfg[@]}"; then
     # This step runs alone, so the lust build and the program run get the
     # long solo limit directly; a timeout here is a hang and fails the step.
     if run_step lust-build-run bash -c 't=$1 l=$2 e=$3 p=$4 o=$5; shift 5; timeout -k 5 "$t" "$l" build "$e" "$@" -o "$p" && timeout -k 5 "$t" "$p" > "$o"' _ "$retry_secs" "$lust" "$entry" "$w/prog-lust" "$w/lust.out" "${lust_args[@]}"; then

@@ -242,7 +242,7 @@ def scenario(srcdir):
                 wrc, wout, werr = run([LUST, "run", main, "-o", os.path.join(work, "w.bin")], work, wenv)
             else:
                 wrc, wout, werr = crc, cout, cerr
-            rrc, rout, _ = run(["rustc", "--edition", "2024", "-C", "panic=abort",
+            rrc, rout, _ = run(["rustc", "--edition", "2024",
                                 "-C", "overflow-checks=on", main, "-o", os.path.join(work, "r.bin")], work, wenv)
             rustc_ok = rrc == 0
             if rustc_ok:

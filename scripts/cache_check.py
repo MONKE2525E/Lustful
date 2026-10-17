@@ -258,7 +258,7 @@ def check_seq(idx, srcs, threads, args, work):
         where = f"seq {idx} step {step}" + (f" threads={t}" if t else "")
         outs = {}
         if args.rustc:
-            r = build(["rustc", "--edition", "2024", "-C", "panic=abort", "-C", "overflow-checks=on", "-A", "warnings",
+            r = build(["rustc", "--edition", "2024", "-C", "overflow-checks=on", "-A", "warnings",
                        "main.rs", "-o", "rustc.bin"], base, d)
             if r != "ok":
                 stats["invalid"] += 1

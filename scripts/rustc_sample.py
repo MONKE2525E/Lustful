@@ -19,7 +19,7 @@
 import concurrent.futures, hashlib, os, random, re, shutil, subprocess, sys, tempfile, time
 from collections import Counter
 
-FLAGS = ["--edition", "2024", "--crate-type", "bin", "-C", "panic=abort", "-C", "overflow-checks=on", "-A", "warnings"]
+FLAGS = ["--edition", "2024", "--crate-type", "bin", "-C", "overflow-checks=on", "-A", "warnings"]
 
 
 class Sample:

@@ -557,7 +557,7 @@ def case(args):
             cck = run([LUST, "check", main], work, cold_env)
             wr = run([LUST, "run", main, "-o", os.path.join(work, "w.bin")], work, env)
             cr = run([LUST, "run", main, "-o", os.path.join(work, "c.bin")], work, cold_env)
-            rr = run(["rustc", "--edition", "2024", "-C", "panic=abort", main, "-o", os.path.join(work, "r.bin")], work, env)
+            rr = run(["rustc", "--edition", "2024", main, "-o", os.path.join(work, "r.bin")], work, env)
             rustc_ok = rr[0] == 0
             rout = run([os.path.join(work, "r.bin")], work, env) if rustc_ok else None
             res["rustc_rejects"] += 0 if rustc_ok else 1

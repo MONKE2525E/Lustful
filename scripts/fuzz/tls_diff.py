@@ -2,7 +2,7 @@
 # Differential fuzz for thread_local! (W-TLS): random programs with lazy and
 # const keys over Cell, RefCell, Vec, and a Drop type whose destructor
 # touches other keys (so destruction order and AccessError show in the
-# output), run with rustc -C panic=abort and with lust. Stdout and exit
+# output), run with rustc and with lust (both with their default panic=unwind). Stdout and exit
 # status must match. Rustc is the oracle; a program rustc rejects is
 # skipped.
 # Usage: python3 scripts/fuzz/tls_diff.py [first_seed] [count]   (exit 0 = no mismatch)
@@ -95,7 +95,7 @@ def main():
         with open(src, "w") as f:
             f.write(program(seed))
         exe = os.path.join(work, f"p{seed}")
-        if run(["rustc", "--edition", "2024", "-C", "panic=abort", "-o", exe, src])[0] != 0:
+        if run(["rustc", "--edition", "2024", "-o", exe, src])[0] != 0:
             skipped += 1
             continue
         want = run([exe])

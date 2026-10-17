@@ -245,7 +245,7 @@ def main():
     for k in ("gostring-amalgam", "json-amalgam", "scanner-amalgam"):
         entry = os.path.join(ROOT, "tests/kernels", k, "src/main.rs")
         n = sum(1 for _ in open(entry))
-        rt, rr = run(["rustc", "--edition", "2024", "-C", "panic=abort", "-C", "overflow-checks=on",
+        rt, rr = run(["rustc", "--edition", "2024", "-C", "overflow-checks=on",
                       "-A", "warnings", "--emit=metadata", "-o", os.path.join(work, "slice.rmeta"), entry])
         lt, lr = run([LUST, "check", entry])
         first = next((l for l in lr.stderr.splitlines() if l.startswith("error")), "")

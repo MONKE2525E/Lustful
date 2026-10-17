@@ -144,7 +144,7 @@ corpus_require_dir() {
   return 0
 }
 
-corpus_rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
+corpus_rustc_flags=(--edition 2024 -C overflow-checks=on -A warnings)
 
 corpus_pass_dir() {
   # $1 = dir relative to the repo root holding runnable cases
