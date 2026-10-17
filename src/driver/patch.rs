@@ -2266,26 +2266,41 @@ pub(super) fn reuse_kept(
     let mut derives: Vec<usize> = edits.iter().filter_map(|e| e.derive).collect();
     derives.sort_unstable();
     derives.dedup();
-    if !derives.is_empty()
-        && let Err((why, intact)) = super::kept_derive::apply_derives(&mut p, front, caches, &derives, walk_instances)
-    {
-        // A refused derive delta undid its writes: the program is as it
-        // was, with its spans moved, and stays for the next request (a
-        // rejected derive edit, then its revert). Not after a header delta
-        // of this request: its writes stand.
-        if intact && headers.is_empty() {
-            front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: false });
+    let mut derive_reach = None;
+    if !derives.is_empty() {
+        match super::kept_derive::apply_derives(&mut p, front, caches, &derives, walk_instances) {
+            Ok(reach) => derive_reach = reach,
+            Err((why, intact)) => {
+                // A refused derive delta undid its writes: the program is as it
+                // was, with its spans moved, and stays for the next request (a
+                // rejected derive edit, then its revert). Not after a header delta
+                // of this request: its writes stand.
+                if intact && headers.is_empty() {
+                    front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: false });
+                }
+                return Err(why);
+            }
         }
-        return Err(why);
     }
     // Const and static initializers are checked as bodies at the end of
     // collect (check/const_body.rs) and read fn signatures and derive
     // lists as fn bodies do: after a header or derive delta the ones whose
     // reads moved check again, and any error sends the request to the
-    // full path.
+    // full path. Only the keys the deltas can move compare (the header
+    // delta's `Touched`, the derive delta's reach); the oracle proves each
+    // keyed clean set with the full compare.
     if !headers.is_empty() || !derives.is_empty() {
         let mut errs = Vec::new();
-        crate::check::const_body::check_dirty(&mut p, &mut errs);
+        let mut touched = caches.header_moves.as_mut();
+        let mut dmoves = derive_reach.as_ref().map(crate::driver::graph::DeriveMoves::new);
+        let mut moved = |q: &crate::check::collect::Program, k: &crate::driver::graph::ReadKey| {
+            touched.as_mut().is_some_and(|t| t.hit(q, k)) || dmoves.as_mut().is_some_and(|m| q.derive_key_moves(m, k))
+        };
+        let unproven = crate::check::const_body::check_dirty(&mut p, &mut errs, &mut moved, super::item_oracle::on());
+        if unproven > 0 {
+            super::item_oracle::fail("keyed clean const body has dirty reads", "item", &unproven.to_string());
+        }
+        super::laps::mark("collect/kept const bodies");
         if !errs.is_empty() {
             return Err("const body");
         }

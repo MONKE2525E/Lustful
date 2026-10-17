@@ -41,14 +41,16 @@ use crate::def::LocalDefId;
 /// `p` is as it was: a refusal before the replays undoes the derive
 /// delta's writes (`derive_delta::Undo`), so the program can stay for the
 /// next request; after a replay wrote template or discovery state, `p` is
-/// half edited and must be dropped.
+/// half edited and must be dropped. Ok holds the reach of the moved
+/// derive flags (None: no flag moved), for the const body check's keyed
+/// walk (`const_body::check_dirty`).
 pub(super) fn apply_derives(
     p: &mut Program,
     front: &Front,
     caches: &mut Caches,
     items: &[usize],
     walk_instances: bool,
-) -> Result<(), (&'static str, bool)> {
+) -> Result<Option<crate::check::derive_delta::Reach>, (&'static str, bool)> {
     if walk_instances {
         return Err(("derive build", false));
     }
@@ -78,7 +80,7 @@ pub(super) fn apply_derives(
     // undone): no read key moved either.
     let Some(reach) = moved else {
         caches.derive_dirty = Some(vec![false; caches.slot_reads.len()]);
-        return Ok(());
+        return Ok(None);
     };
     // The keyed dirty walk: only the read keys the delta can move
     // (graph.rs `Program::derive_key_moves`) are compared, for the slots
@@ -129,7 +131,7 @@ pub(super) fn apply_derives(
         crate::driver::laps::mark("kept/derive discovery");
     }
     caches.derive_dirty = Some(is_dirty);
-    Ok(())
+    Ok(Some(reach))
 }
 
 /// The derive delta of one struct or enum item (`ast.items` index `item`):

@@ -49,6 +49,10 @@
 #   sig_samename   inherent methods of the same name on two Adts, a free fn
 #                  and a trait method of that name: header edits of one of
 #                  them (the header delta's readers key by Adt and def)
+#   sig_constinit  const and static initializers (items, an impl const, a
+#                  const in a fn body) that call a const fn, coerce a fn to
+#                  a fn pointer, or copy a derived type: header edits of the
+#                  fns and derive drops (const_body::check_dirty's keyed walk)
 # `External` adds verdicts from rustc 1.99 and a pinned baseline lust for
 # the op states (`--rustc`, `--baseline`): a state where the warm answer
 # disagrees with rustc fails unless the baseline gives the same answer
@@ -58,7 +62,8 @@ import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
        "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl",
-       "sig_apit", "sig_umacro", "sig_umbody", "sig_implmac", "sig_tdefault", "sig_dyn", "sig_samename"]
+       "sig_apit", "sig_umacro", "sig_umbody", "sig_implmac", "sig_tdefault", "sig_dyn", "sig_samename",
+       "sig_constinit"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -557,6 +562,47 @@ def sig_samename(rng, fs):
                 f"    pub fn {g}(x: String) -> u32 {{\n        let x = x.len() as u32;\n"]}
     head = rng.choice(sorted(heads))
     return _header_walk(rng, fs, items, head, heads[head])
+
+
+def sig_constinit(rng, fs):
+    """A const fn, a plain fn, and a derived struct that const and static
+    initializers read (a const fn call, fn pointer coercions, a copy), an
+    unrelated const, an impl const, a const in a fn body, and a fn no const
+    names; header edits of one fn, and a derive drop with a header edit on
+    top."""
+    k = rng.randrange(10**6)
+    derive = "#[derive(Clone, Copy, Debug)]"
+    fhead = f"const fn zi{k}_f(x: u32) -> u32 {{"
+    hhead = f"fn zi{k}_h(x: u32) -> u32 {{"
+    ohead = f"fn zi{k}_o(x: u32) -> u32 {{"
+    items = (f"\n{derive}\nstruct Zk{k}(u32);\n{fhead}\n    x + 1\n}}\n{hhead}\n    x * 2\n}}\n{ohead}\n    x\n}}\n"
+             f"const ZI{k}_A: u32 = zi{k}_f(1);\n"
+             f"const ZI{k}_P: (Zk{k}, Zk{k}) = {{\n    let q = Zk{k}(2);\n    (q, q)\n}};\n"
+             f"const ZI{k}_FP: fn(u32) -> u32 = zi{k}_h;\n"
+             f"static ZI{k}_T: [fn(u32) -> u32; 2] = [zi{k}_h, zi{k}_h];\n"
+             f"const ZI{k}_Q: u32 = 9;\n"
+             f"struct Zw{k};\nimpl Zw{k} {{\n    const D: u32 = zi{k}_f(2) + 1;\n}}\n"
+             f"#[allow(dead_code)]\nfn zi{k}_use() -> u32 {{\n    const N: fn(u32) -> u32 = zi{k}_h;\n"
+             f"    ZI{k}_A + ZI{k}_P.0.0 + ZI{k}_P.1.0 + ZI{k}_FP(1) + ZI{k}_T[1](2) + ZI{k}_Q + Zw{k}::D + N(3) + zi{k}_o(4)\n}}\n")
+    pick = rng.randrange(3)
+    if pick == 0:
+        head = fhead
+        edits = [f"const fn zi{k}_f(x: u32) -> u64 {{", f"const fn zi{k}_f(x: u64) -> u32 {{", f"fn zi{k}_f(x: u32) -> u32 {{",
+                 f"const fn zi{k}_f(x: u32) -> u32 where u32: Copy {{", f"const fn zi{k}_f(x: u32, ) -> u32 {{",
+                 f"const fn zi{k}_f(x: u32, _y: u8) -> u32 {{"]
+    elif pick == 1:
+        # No const names zi_o: the header delta takes its edits, and the
+        # const bodies take the keyed walk.
+        head = ohead
+        edits = [f"fn zi{k}_o(x: u32) -> u64 {{", f"fn zi{k}_o(x: u64) -> u32 {{", f"fn zi{k}_o(x: u32, ) -> u32 {{",
+                 f"fn zi{k}_o(x: u32) -> u32 where u32: Copy {{", f"fn zi{k}_o(mut x: u32) -> u32 {{"]
+    else:
+        head = hhead
+        edits = [f"fn zi{k}_h(x: u32) -> u64 {{", f"fn zi{k}_h(x: u64) -> u32 {{", f"const fn zi{k}_h(x: u32) -> u32 {{",
+                 f"fn zi{k}_h(x: u32) -> u32 where u32: Copy {{", f"unsafe fn zi{k}_h(x: u32) -> u32 {{",
+                 f"fn zi{k}_h(x: u32, _y: u8) -> u32 {{", f"fn zi{k}_h(x: u32) -> u32 where String: Copy {{"]
+    drops = [(derive, derive.replace(t, "")) for t in ("Copy, ", ", Debug", "Clone, Copy, ")]
+    return _header_walk(rng, fs, items, head, edits, drops)
 
 
 def sig_states(rng, fs):

@@ -30,6 +30,7 @@ use super::generics::{self, ConstScalar, FnClass, FnScope, FnTemplate};
 use crate::ast::{self, ItemKind};
 use crate::def::{DefId, LocalDefId};
 use crate::diag::{Diag, Span};
+use crate::driver::graph::ReadKey;
 use crate::ty::defs::{DefData, DefKind, ModuleId, SigData, Vis};
 use crate::ty::{AdtId, GenericArg, Region, Ty, TyIntern, TyKind};
 
@@ -67,17 +68,55 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
 /// the bodies whose stored reads moved check again, and the ones with no
 /// stored reads (an anonymous const of an edited signature); all of them
 /// when the program records no reads.
-pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>) {
+///
+/// `moved` says which read keys the deltas can move (`kept_delta::Touched`,
+/// `Program::derive_key_moves`). A program that holds its verified-at mark
+/// (`Program::verified`: a compile tail kept it, and no request took it
+/// since) compares only those keys and `Checked` reads (which never hold
+/// by fingerprint): every stored set held against that program, since only
+/// `check_all` and this fn write them. Any other program compares every
+/// read. With `prove` (the item oracle) every keyed clean set also takes
+/// the full compare; the return is the count it finds dirty.
+pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>, moved: &mut dyn FnMut(&Program, &ReadKey) -> bool, prove: bool) -> usize {
     if !p.record_reads {
-        return check_all(p, errs);
+        check_all(p, errs);
+        return 0;
     }
     let mut memo = crate::intern::FxMap::default();
     let reads = std::mem::take(&mut p.const_body_reads);
     let known: std::collections::HashSet<FnLoc> = reads.iter().map(|(l, _)| *l).collect();
-    let (dirty, clean): (Vec<_>, Vec<_>) = reads.into_iter().partition(|(_, r)| p.reads_dirty_memo(r, &mut memo) != 0);
-    p.const_body_reads = clean;
-    let dirty: std::collections::HashSet<FnLoc> = dirty.into_iter().map(|(l, _)| l).collect();
-    check_sites(p, errs, &|l| dirty.contains(&l) || !known.contains(&l));
+    let mut unproven = 0;
+    let dirty: Vec<bool> = if p.verified != 0 {
+        let mut hit: crate::intern::FxMap<ReadKey, bool> = crate::intern::FxMap::default();
+        let mut out = Vec::with_capacity(reads.len());
+        for (_, r) in &reads {
+            let mut d = false;
+            for (k, stored) in r.iter() {
+                let h = *hit.entry(*k).or_insert_with(|| matches!(k, ReadKey::Checked(_)) || moved(p, k));
+                if h && *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) != *stored {
+                    d = true;
+                    break;
+                }
+            }
+            if !d && prove && p.reads_dirty_memo(r, &mut memo) != 0 {
+                unproven += 1;
+            }
+            out.push(d);
+        }
+        out
+    } else {
+        reads.iter().map(|(_, r)| p.reads_dirty_memo(r, &mut memo) != 0).collect()
+    };
+    let mut locs = std::collections::HashSet::new();
+    for ((l, r), d) in reads.into_iter().zip(dirty) {
+        if d {
+            locs.insert(l);
+        } else {
+            p.const_body_reads.push((l, r));
+        }
+    }
+    check_sites(p, errs, &|l| locs.contains(&l) || !known.contains(&l));
+    unproven
 }
 
 /// Checks the initializer bodies `keep` selects and stores their reads.
