@@ -8920,7 +8920,7 @@ pub fn mentions_hash_table(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             return walk(p, tys, e, seen);
         }
         match tys.local_adt(t) {
-            Some(a) => !adt_instance_fields_all(p, a, t, GlueKey::HashTable, seen, &mut |f, seen| !walk(p, tys, f, seen)),
+            Some(a) => !adt_instance_fields_all(p, tys, a, t, GlueKey::HashTable, seen, &mut |f, seen| !walk(p, tys, f, seen)),
             None => false,
         }
     }
@@ -8996,7 +8996,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             if p.gx.glue_methods.contains_key(&(a, p.gx.lang.clone)) {
                 return true;
             }
-            (p.derive_has(a, crate::check::derive_delta::bit::CLONE) && adt_instance_fields_all(p, a, t, GlueKey::Clone, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
+            (p.derive_has(a, crate::check::derive_delta::bit::CLONE) && adt_instance_fields_all(p, tys, a, t, GlueKey::Clone, seen, &mut |f, seen| glue_clone(p, tys, f, seen)))
                 || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen)
         }
         None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen),
@@ -9204,10 +9204,29 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
 /// template answers true (collect checked the derive's fields, and
 /// a template's instances answer for themselves). `seen` stops
 /// recursion through recursive generic types.
-fn adt_instance_fields_all(p: &Program, a: AdtId, t: Ty, key: GlueKey, seen: &mut GlueSeen, ok: &mut dyn FnMut(Ty, &mut GlueSeen) -> bool) -> bool {
+fn adt_instance_fields_all(
+    p: &Program,
+    tys: &impl TyIntern,
+    a: AdtId,
+    t: Ty,
+    key: GlueKey,
+    seen: &mut GlueSeen,
+    ok: &mut dyn FnMut(Ty, &mut GlueSeen) -> bool,
+) -> bool {
     let instance = p.gx.adt_instance_of.get(a.0 as usize).is_some_and(|o| o.is_some());
     if !instance {
-        return true;
+        // A generic Adt whose instance does not exist yet (collect's
+        // derive field checks run before materialize; `Cow<Table>` in a
+        // non-generic Adt): the template's fields are checked at its own
+        // definition, so the derive's bounds on this type's args decide
+        // (`impl<T: Debug> Debug for Cow<T>`), as `is_copy` asks them.
+        // An arg that still holds an inference var keeps the old answer.
+        let generic = p.gx.adt_generics.get(a.0 as usize).is_some_and(|g| !g.params.is_empty());
+        if key == GlueKey::HashTable || !generic || p.is_phantom_adt(a) {
+            return true;
+        }
+        let Some((_, args)) = tys.adt_parts(t) else { return true };
+        return tys.args(args).iter().filter_map(|g| g.as_ty()).all(|x| tys.flags(x).contains_infer() || ok(x, seen));
     }
     seen.fields_all(p, a, t, key, ok)
 }
@@ -9729,7 +9748,7 @@ fn glue_total_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.derive_has(a, crate::check::derive_delta::bit::EQ) && adt_instance_fields_all(p, a, t, GlueKey::TotalEq, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
+                    (p.derive_has(a, crate::check::derive_delta::bit::EQ) && adt_instance_fields_all(p, tys, a, t, GlueKey::TotalEq, seen, &mut |f, seen| glue_total_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.eq, None, &[], seen),
@@ -9794,7 +9813,7 @@ fn glue_eq(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bool
                 // A written non-generic impl: the glue calls its `eq`.
                 Some(a) if p.gx.glue_methods.contains_key(&(a, p.gx.lang.partial_eq)) => true,
                 Some(a) => {
-                    (p.derive_has(a, crate::check::derive_delta::bit::PARTIAL_EQ) && adt_instance_fields_all(p, a, t, GlueKey::Eq, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
+                    (p.derive_has(a, crate::check::derive_delta::bit::PARTIAL_EQ) && adt_instance_fields_all(p, tys, a, t, GlueKey::Eq, seen, &mut |f, seen| glue_eq(p, tys, f, seen)))
                         || written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen)
                 }
                 None => written_glue_impl(p, tys, t, p.gx.lang.partial_eq, Some("eq"), &["ne"], seen),
@@ -9884,7 +9903,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             }
             match tys.local_adt(t) {
                 Some(a) => {
-                    (p.derive_has(a, crate::check::derive_delta::bit::DEBUG) && adt_instance_fields_all(p, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
+                    (p.derive_has(a, crate::check::derive_delta::bit::DEBUG) && adt_instance_fields_all(p, tys, a, t, GlueKey::Debug, seen, &mut |f, seen| glue_debug(p, tys, f, seen)))
                         || crate::check::fmt::user_impl_holds(p, tys, t, p.gx.lang.debug)
                         // A conditional written impl (`impl<K: Debug>
                         // Debug for W<K>`) whose bounds the glue walks
