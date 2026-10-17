@@ -84,6 +84,10 @@ pub(crate) struct Front {
     /// passing body is a read-set candidate, as for `rpit_edit`. Cleared by
     /// the next request.
     pub(crate) kept_put_back: bool,
+    /// The templates whose check failed in the request that `reuse_kept`
+    /// answered with their errors: `patch::keep` gives them to the kept
+    /// program (`KeptProgram::recheck`).
+    pub(crate) template_recheck: Vec<usize>,
     /// Set by a full resolve whose collect failed: its slot update left the
     /// per-slot caches consistent (changed bodies lost their passing mark),
     /// so the next slot update keeps them in full mode and the read-set
@@ -412,6 +416,7 @@ impl Session {
                 revalue_consts: false,
                 rpit_edit: false,
                 kept_put_back: false,
+                template_recheck: Vec::new(),
                 walk_after_reject: false,
                 walk_pending: Vec::new(),
                 pending_derive_only: false,

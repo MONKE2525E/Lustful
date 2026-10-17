@@ -521,6 +521,10 @@ pub(crate) struct KeptProgram {
     /// `keep_err` leaves this one in place. A clean answer's program
     /// replaces it (`keep`).
     prefer: bool,
+    /// Templates whose last check in this program had errors (an error
+    /// answer that kept it, `Front::template_recheck`): every later patch
+    /// checks them again, as a collect would, until they pass.
+    recheck: Vec<usize>,
 }
 
 impl PatchBase {
@@ -552,7 +556,8 @@ pub(crate) fn keep(front: &mut Front, mut program: crate::check::collect::Progra
     // The request is done: every entry stored so far agrees with the
     // program (its collect stored or replayed it, `kept_delta`).
     program.reuse_stamp = crate::driver::gen_reuse::stamp_now();
-    front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new(), prefer: false });
+    let recheck = std::mem::take(&mut front.template_recheck);
+    front.kept[slot] = Some(KeptProgram { program, edits: None, bases: Vec::new(), prefer: false, recheck });
 }
 
 /// `keep` for a request that answers with errors: a program `reuse_kept`
@@ -2200,6 +2205,11 @@ pub(super) fn reuse_kept(
     let k = front.kept[usize::from(walk_instances)].take().ok_or(if front.kept.iter().any(Option::is_some) { "mode" } else { "none" })?;
     front.kept_put_back = k.prefer;
     let mut bases = k.bases;
+    let recheck = k.recheck;
+    // A build's instances replay its templates' checks.
+    if walk_instances && !recheck.is_empty() {
+        return Err("template errors");
+    }
     let mut edits = match k.edits {
         Some(e) => e,
         None if Arc::ptr_eq(&k.program.ast, &front.ast) => Vec::new(),
@@ -2267,6 +2277,14 @@ pub(super) fn reuse_kept(
         .filter(|e| e.header)
         .filter_map(|e| Some(super::kept_delta::HeaderEdit { fn_index: e.fn_index?, old_exprs: e.old_exprs }))
         .collect();
+    // The header delta checks the templates that read an edited header
+    // again under the old derive lists, and the derive delta after it takes
+    // those fresh checks as standing: a derive edit that removes a trait
+    // such a template uses would pass (a program kept after a refused
+    // derive delta, then a header edit). Both kinds collect in full.
+    if !headers.is_empty() && edits.iter().any(|e| e.derive.is_some()) {
+        return Err("header and derive");
+    }
     if !headers.is_empty() {
         let reach = front.patch.as_ref().and_then(|b| b.reach.as_ref());
         if let Err((why, intact)) = super::kept_delta::apply_headers(&mut p, front, caches, reach, &headers, walk_instances, &mut bases) {
@@ -2274,7 +2292,7 @@ pub(super) fn reuse_kept(
             // for the next request, which redoes these headers with its
             // own (sigedit R9: a rejected header edit, then its fix).
             if intact {
-                front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true });
+                front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true, recheck });
             }
             return Err(why);
         }
@@ -2294,7 +2312,7 @@ pub(super) fn reuse_kept(
                 // rejected derive edit, then its revert). Not after a header delta
                 // of this request: its writes stand.
                 if intact && headers.is_empty() {
-                    front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: false });
+                    front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: false, recheck });
                 }
                 return Err(why);
             }
@@ -2341,17 +2359,20 @@ pub(super) fn reuse_kept(
         (p.record_reads, p.unwind) = (record_reads, unwind);
         if !stands {
             if headers.is_empty() && derives.is_empty() {
-                put_back(front, p, edits, bases);
+                put_back(front, p, edits, bases, recheck);
             }
             return Err("hidden type");
         }
     }
     // An edited template checks again as collect's template check does:
     // its old picks and closure call kinds go, the check records new ones.
+    // So does a template whose last check had errors (`KeptProgram::recheck`):
+    // its error stands until a check passes, as in a collect.
     let mut template_errs = Vec::new();
     let mut seen: Vec<usize> = Vec::new();
-    for e in &edits {
-        let Some(fn_index) = e.fn_index else { continue };
+    let mut errored: Vec<usize> = Vec::new();
+    let edited = edits.iter().filter_map(|e| e.fn_index);
+    for fn_index in edited.chain(recheck.iter().copied()) {
         let header = edits.iter().any(|x| x.header && x.fn_index == Some(fn_index));
         if header || p.gx.fn_class.get(fn_index) != Some(&FnClass::Template) || seen.contains(&fn_index) {
             continue;
@@ -2361,7 +2382,10 @@ pub(super) fn reuse_kept(
         if !crate::check::generics::template_closures_stand(&mut p, f) {
             return Err("closures");
         }
-        let ranges: Vec<(u32, u32)> = edits.iter().filter(|x| x.fn_index == e.fn_index).map(|x| x.old_exprs).collect();
+        let mut ranges: Vec<(u32, u32)> = edits.iter().filter(|x| x.fn_index == Some(fn_index)).map(|x| x.old_exprs).collect();
+        if ranges.is_empty() {
+            ranges.push(p.fn_def(f).exprs);
+        }
         p.gx.trait_picks.retain(|x, _| !ranges.iter().any(|r| x.0 >= r.0 && x.0 < r.1));
         p.gx.template_closures.retain(|k, _| k.0 != f);
         p.gx.template_calls.retain(|k, _| k.0 != f);
@@ -2372,7 +2396,11 @@ pub(super) fn reuse_kept(
         // callers reveal, which must stand as for a plain fn.
         let od = crate::check::generics::opaque_def(p.def_id(f));
         let hidden = p.gx.opaque_hidden.get(&od).copied();
-        template_errs.extend(crate::check::generics::check_template(&mut p, f, &mut caches.gen_reuse));
+        let errs = crate::check::generics::check_template(&mut p, f, &mut caches.gen_reuse);
+        if !errs.is_empty() {
+            errored.push(fn_index);
+        }
+        template_errs.extend(errs);
         (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
         if p.gx.opaque_hidden.get(&od).copied() != hidden {
             return Err("hidden type");
@@ -2449,11 +2477,13 @@ pub(super) fn reuse_kept(
     (p.record_reads, p.unwind) = (record_reads, unwind);
     if let Some(why) = refused {
         if intact {
-            put_back(front, p, edits, bases);
+            put_back(front, p, edits, bases, recheck);
         }
         return Err(why);
     }
     super::laps::mark("collect/kept bodies");
+    // The caller keeps the program with these errors (`keep`).
+    front.template_recheck = errored;
     Ok((p, spans, template_errs))
 }
 
@@ -2462,9 +2492,9 @@ pub(super) fn reuse_kept(
 /// collects in full, and when that answers with errors the program stays
 /// for the next request (`keep_err`), as after a refused header delta (an
 /// edit with a body error, then its fix or revert).
-fn put_back(front: &mut Front, p: crate::check::collect::Program, edits: Vec<KeptEdit>, bases: Vec<KeptBase>) {
+fn put_back(front: &mut Front, p: crate::check::collect::Program, edits: Vec<KeptEdit>, bases: Vec<KeptBase>, recheck: Vec<usize>) {
     let slot = usize::from(p.gx.walk_instances);
-    front.kept[slot] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true });
+    front.kept[slot] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true, recheck });
 }
 
 /// True when discovery makes instances from a body's requests: in a
