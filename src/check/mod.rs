@@ -5282,6 +5282,12 @@ impl<'p> Ctx<'p> {
             TyKind::FnPtr(_) => return trait_def == lang.hash || trait_def == lang.copy || trait_def == lang.clone,
             TyKind::FnDef(..) => return trait_def == lang.copy || trait_def == lang.clone,
             // A builtin iterator std makes Clone (`iter_clone_is_copy`).
+            // std's owning iterators (vec, option, result `IntoIter`):
+            // Debug and Clone by the glue walks, and `vec::IntoIter`'s
+            // Default (cgen's `CTy::VecIter` and `CTy::OptIter` glue).
+            TyKind::Adt(..)
+                if ((trait_def == lang.clone || trait_def == lang.debug) && crate::check::collect::owning_iter_elem(&self.tys, self_ty).is_some())
+                    || (trait_def == lang.default && crate::check::collect::vec_into_iter_elem(&self.tys, self_ty).is_some()) => {}
             TyKind::Adt(..) if trait_def == lang.clone && (self.tys.is_chars_ty(self_ty) || crate::ty::iter::iter_parts(&self.tys, self_ty).is_some()) => {
                 return crate::check::collect::iter_clone_is_copy(p, &self.tys, self_ty);
             }

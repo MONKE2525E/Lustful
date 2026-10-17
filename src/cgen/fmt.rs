@@ -221,6 +221,36 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dy
             let et = ctype(e);
             let _ = writeln!(body, "  {}", builder_list("p->len", &format!("&(({et}*)p->ptr)[i]"), e, need));
         }
+        // core's derived Debug of `option::IntoIter { inner: Item { opt } }`
+        // and `result::IntoIter { inner }`.
+        CTy::OptIter(result, e) => {
+            let ot = CTy::Option(e.clone());
+            let field = if *result {
+                format!("lust_dstruct_field_end(&b, &s, {});", fmt_expr(&ot, FmtKind::Debug, "w", "(&p->f0)", need))
+            } else {
+                let opt = fmt_expr(&ot, FmtKind::Debug, "w2", "(&p->f0)", need);
+                format!(
+                    "{{ lust_DebugStruct b2; lust_fmt_slot s2; lust_Formatter *w2; lust_dstruct_new(&b2, w, {}); if ((w2 = lust_dstruct_field(&b2, &s2, {}))) lust_dstruct_field_end(&b2, &s2, {opt}); lust_dstruct_field_end(&b, &s, lust_dstruct_finish(&b2)); }}",
+                    lit("Item"),
+                    lit("opt")
+                )
+            };
+            let _ = writeln!(
+                body,
+                "  {{ lust_DebugStruct b; lust_fmt_slot s; lust_Formatter *w; lust_dstruct_new(&b, f, {}); if ((w = lust_dstruct_field(&b, &s, {}))) {field} return lust_dstruct_finish(&b); }}",
+                lit("IntoIter"),
+                lit("inner")
+            );
+        }
+        // alloc's `vec::IntoIter` Debug:
+        // `f.debug_tuple("IntoIter").field(&self.as_slice()).finish()`.
+        CTy::VecIter(e) => {
+            let et = ctype(e);
+            let st = CTy::Slice(e.clone());
+            types.push(st.clone());
+            let _ = writeln!(body, "  {} s_; s_.ptr = (({et}*)p->ptr) + p->front; s_.len = p->len - p->front;", ctype(&st));
+            let _ = writeln!(body, "  {}", builder_fields("IntoIter", false, &[(String::new(), "(&s_)".to_string(), st)], need));
+        }
         CTy::Unsized(a, _) => {
             let call = user_fmt_call(p, *a, FmtKind::Debug, slots, "*p", types).expect("an unsized newtype formatted with {:?} has a written Debug");
             let _ = writeln!(body, "  {call}");

@@ -12839,6 +12839,18 @@ fn prove_trait_ref(
             // The solver has no records for these heads.
             TyKind::FnPtr(_) if !is_default => Some(Vec::new()),
             TyKind::RawPtr(..) => Some(Vec::new()),
+            // std's owning iterators (vec, option, result `IntoIter`):
+            // `Debug` and `Clone` from `T`'s; `vec::IntoIter` is `Default`
+            // for every `T`; no `Copy` or `Hash` (no records).
+            _ if let Some(e) = crate::check::collect::owning_iter_elem(&cx.tys, t) => {
+                if is_default {
+                    crate::check::collect::vec_into_iter_elem(&cx.tys, t).map(|_| Vec::new())
+                } else if tr.def == lang.debug || tr.def == lang.clone {
+                    Some(vec![e])
+                } else {
+                    None
+                }
+            }
             _ if !containers => None,
             _ => {
                 let elem = if is_copy {

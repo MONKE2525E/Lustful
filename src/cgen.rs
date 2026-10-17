@@ -105,6 +105,11 @@ pub enum CTy {
     /// still owns (`f0`, `f1`, `f2`, as the tuple form held them).
     /// Its own type so drop and clone glue touch only that range.
     ArrayIter(Box<CTy>, u64),
+    /// An `option::IntoIter<T>` (false) or `result::IntoIter<T>` (true):
+    /// a generated struct of the one stored `Option<T>` (`f0`, as the
+    /// tuple form held it). Its own type so its Debug glue writes core's
+    /// text (`IntoIter { inner: Item { opt: .. } }`), not a tuple's.
+    OptIter(bool, Box<CTy>),
     /// A `vec::Drain<T>`: the runtime's `lust_VecDrain`, a pointer to
     /// the drained Vec plus its range bookkeeping.
     VecDrain(Box<CTy>),
@@ -371,6 +376,9 @@ fn iter_cty(tys: &impl TyIntern, t: Ty, k: IterKind) -> CTy {
     if k == IterKind::VecIntoIter {
         return CTy::VecIter(Box::new(cty(tys, arg(0))));
     }
+    if k == IterKind::OptionIntoIter || k == IterKind::ResultIntoIter {
+        return CTy::OptIter(k == IterKind::ResultIntoIter, Box::new(cty(tys, arg(0))));
+    }
     if k == IterKind::ArrayIntoIter {
         let n = match tys.kind(arg(1)) {
             crate::ty::TyKind::Array(_, c) => match tys.const_kind(c) {
@@ -565,6 +573,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Rc(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::VecIter(_) => "lust_VecIter".into(),
         CTy::ArrayIter(..) => format!("AI_{}", mangle(t)),
+        CTy::OptIter(..) => format!("OI_{}", mangle(t)),
         CTy::VecDrain(_) | CTy::StrDrain => "lust_VecDrain".into(),
         CTy::Weak(inner) => format!("RcI_{}*", mangle(inner)),
         CTy::RefCell(inner) => format!("RCL_{}", mangle(inner)),
@@ -664,6 +673,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Rc(e) => tok(s, "Rc", &[e]),
         CTy::VecIter(e) => tok(s, "VI", &[e]),
         CTy::ArrayIter(e, n) => tok(s, &format!("AI{n}"), &[e]),
+        CTy::OptIter(r, e) => tok(s, if *r { "RI" } else { "OI" }, &[e]),
         CTy::VecDrain(e) => tok(s, "VD", &[e]),
         CTy::StrDrain => tok(s, "SDr", &[]),
         CTy::Weak(e) => tok(s, "Wk", &[e]),
@@ -739,6 +749,10 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
             out.insert(t.clone());
             collect_types(&CTy::Array(e.clone(), *n), out);
         }
+        CTy::OptIter(_, e) => {
+            out.insert(t.clone());
+            collect_types(&CTy::Option(e.clone()), out);
+        }
         CTy::Weak(e) => {
             out.insert(CTy::Rc(e.clone()));
             collect_types(e, out);
@@ -780,7 +794,7 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
-        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) | CTy::ArrayIter(..) => {
+        CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) | CTy::ArrayIter(..) | CTy::OptIter(..) => {
             out.push(t.clone())
         }
         // `Rc`, `Weak`, and the `RefCell` guards are pointers to forward-
@@ -828,7 +842,7 @@ fn is_copy_c(p: &Program, t: &CTy) -> bool {
         CTy::Result(a, b) => is_copy_c(p, a) && is_copy_c(p, b),
         CTy::Tuple(es) => es.iter().all(|e| is_copy_c(p, e)),
         CTy::Array(e, _) => is_copy_c(p, e),
-        CTy::ArrayIter(e, _) => is_copy_c(p, e),
+        CTy::ArrayIter(e, _) | CTy::OptIter(_, e) => is_copy_c(p, e),
         CTy::Adt(a) => {
             let adt = p.adt(*a);
             // A non-generic Adt's derive was checked against its fields.
@@ -847,7 +861,7 @@ fn is_freeze_c(p: &Program, t: &CTy, seen: &mut HashSet<AdtId>) -> bool {
         // Every sync type holds an `UnsafeCell` inline.
         CTy::Sync(..) => false,
         CTy::Tuple(es) => es.iter().all(|e| is_freeze_c(p, e, seen)),
-        CTy::Array(e, _) | CTy::Option(e) | CTy::ArrayIter(e, _) => is_freeze_c(p, e, seen),
+        CTy::Array(e, _) | CTy::Option(e) | CTy::ArrayIter(e, _) | CTy::OptIter(_, e) => is_freeze_c(p, e, seen),
         CTy::Result(a, b) => is_freeze_c(p, a, seen) && is_freeze_c(p, b, seen),
         CTy::Adt(a) => {
             if !seen.insert(*a) {
@@ -874,7 +888,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
         CTy::Tuple(es) => es.iter().any(|e| needs_drop_c(p, e)),
         CTy::Array(e, _) => needs_drop_c(p, e),
-        CTy::ArrayIter(e, _) => needs_drop_c(p, e),
+        CTy::ArrayIter(e, _) | CTy::OptIter(_, e) => needs_drop_c(p, e),
         CTy::Adt(a) if p.is_manually_drop_adt(*a) => false,
         // `MaybeUninit<T>` never drops its bytes (a union in core).
         CTy::Adt(a) if p.def_of_adt(*a) == crate::ty::maybe_uninit_def() => false,
@@ -1237,6 +1251,8 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 let arr = go(p, &CTy::Array(e.clone(), *n), seen)?;
                 layout::tuple_layout(&[arr, layout::int_layout(IntTy::Usize), layout::int_layout(IntTy::Usize)]).ok()
             }
+            // As the one-field tuple form it replaces.
+            CTy::OptIter(_, e) => go(p, &CTy::Tuple(vec![CTy::Option(e.clone())]), seen),
             CTy::Array(e, 0) => Some(plain_layout(0, go(p, e, seen).map_or(1, |l| l.align))),
             CTy::Array(e, n) => layout::array_layout(&go(p, e, seen)?, *n).ok(),
             CTy::Option(e) => {
@@ -1567,6 +1583,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 let (es, ea) = go(p, e, seen);
                 (es * (*n).max(1), ea)
             }
+            CTy::OptIter(_, e) => go(p, &CTy::Tuple(vec![CTy::Option(e.clone())]), seen),
             CTy::ArrayIter(e, n) => {
                 let (es, ea) = go(p, e, seen);
                 let align = ea.max(8);
@@ -2322,6 +2339,10 @@ impl FnGen<'_, '_> {
                     e = format!("{e}.f{i}");
                     t = es.get(i as usize)?.clone();
                 }
+                (Step::Field(0), CTy::OptIter(_, el)) => {
+                    e = format!("{e}.f0");
+                    t = CTy::Option(el);
+                }
                 (Step::Field(i), CTy::ArrayIter(el, n)) => {
                     e = format!("{e}.f{i}");
                     t = match i {
@@ -2503,6 +2524,7 @@ impl FnGen<'_, '_> {
             _ => {
                 let n = match t {
                     CTy::Tuple(es) => es.len(),
+                    CTy::OptIter(..) => 1,
                     CTy::Adt(a) => self.p.adt(*a).variants.get(variant.unwrap_or(0)).map_or(0, |v| v.fields.len()),
                     CTy::Option(_) => usize::from(variant == Some(1)),
                     CTy::Result(..) => usize::from(variant.is_some()),
@@ -2587,6 +2609,10 @@ impl FnGen<'_, '_> {
                 (Proj::Field(i), CTy::Tuple(es)) => {
                     e = format!("{e}.f{i}");
                     t = es[*i as usize].clone();
+                }
+                (Proj::Field(0), CTy::OptIter(_, el)) => {
+                    e = format!("{e}.f0");
+                    t = CTy::Option(el);
                 }
                 (Proj::Field(i), CTy::ArrayIter(el, n)) => {
                     e = format!("{e}.f{i}");
@@ -9351,6 +9377,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
             CTy::Array(e, _) => collect_types(e, &mut inner),
             CTy::ArrayIter(e, n) => collect_types(&CTy::Array(e.clone(), *n), &mut inner),
+            CTy::OptIter(_, e) => collect_types(&CTy::Option(e.clone()), &mut inner),
             CTy::Slice(e) => collect_types(e, &mut inner),
             CTy::Rc(e) | CTy::RefCell(e) => collect_types(e, &mut inner),
             CTy::FnPtr(ps, r) => {
@@ -9379,7 +9406,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
         // Every struct-typed C type too: a closure env holds references
         // (`&(captures..)`, `&Result<..>`) that can sit in a type emitted
         // before the referenced type's own definition.
-        if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) | CTy::ArrayIter(..) = t {
+        if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) | CTy::ArrayIter(..) | CTy::OptIter(..) = t {
             let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
         }
         match t {
@@ -9416,6 +9443,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
             CTy::Array(e, _) => by_value_deps(e, &mut deps),
             CTy::ArrayIter(e, n) => by_value_deps(&CTy::Array(e.clone(), *n), &mut deps),
+            CTy::OptIter(_, e) => by_value_deps(&CTy::Option(e.clone()), &mut deps),
             // A slice holds `e*` only: every struct type has a forward
             // typedef above, so only a fn pointer typedef must come
             // first. Counting `e` itself made a false cycle for a
@@ -9538,6 +9566,20 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                     }
                 }
             },
+            CTy::OptIter(_, e) => {
+                let ot = CTy::Option(e.clone());
+                let ct = ctype(t);
+                match c_layout(p, t) {
+                    Some(l) => {
+                        let fields = vec![(format!("{} f0", ctype(&ot)), field_layout(p, &ot), l.field_offsets[0])];
+                        let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
+                        layout_assert(out, &ct, &l);
+                    }
+                    None => {
+                        let _ = writeln!(out, "typedef struct {ct} {{ {} f0; }} {ct};", ctype(&ot));
+                    }
+                }
+            }
             CTy::Slice(e) => {
                 let _ = writeln!(out, "typedef struct {0} {{ {1}* ptr; uint64_t len; }} {0};", ctype(t), ctype(e));
                 if let Some(l) = c_layout(p, t) {
@@ -9946,6 +9988,13 @@ fn glue_def_value(
                         let _ = writeln!(body, "  for (uint64_t i = p->f1; i < p->f2; i++) drop_{}(&p->f0.v[i]);", mangle(e));
                     }
                 }
+                CTy::OptIter(_, e) => {
+                    let ot = CTy::Option(e.clone());
+                    if needs_drop_c(p, &ot) {
+                        need(Glue::Drop, &ot);
+                        let _ = writeln!(body, "  drop_{}(&p->f0);", mangle(&ot));
+                    }
+                }
                 CTy::Adt(a) => {
                     // A user `Drop` impl runs before the fields drop
                     // (W-TRAITS-CORE through W-CGEN: the glue reads
@@ -10094,6 +10143,17 @@ fn glue_def_value(
                 // `array::IntoIter`'s Clone clones only the elements
                 // it still owns; the moved-out slots keep stale bytes
                 // the clone's own range never drops.
+                // core's derived Clone of `option::IntoIter` and
+                // `result::IntoIter`: a clone of the stored Option.
+                CTy::OptIter(_, e) => {
+                    let ot = CTy::Option(e.clone());
+                    let _ = writeln!(body, "  {ct} r = *p;");
+                    if !is_copy_c(p, &ot) || written(e) {
+                        let c = clone_of(&ot, "p->f0", &mut need);
+                        let _ = writeln!(body, "  r.f0 = {c};");
+                    }
+                    body.push_str("  return r;\n");
+                }
                 CTy::ArrayIter(e, _) => {
                     let _ = writeln!(body, "  {ct} r = *p;");
                     if !is_copy_c(p, e) || written(e) {
@@ -10101,6 +10161,17 @@ fn glue_def_value(
                         let _ = writeln!(body, "  for (uint64_t i = p->f1; i < p->f2; i++) r.f0.v[i] = {c};");
                     }
                     body.push_str("  return r;\n");
+                }
+                // `vec::IntoIter::clone`: std's `as_slice().to_vec()` into
+                // a new IntoIter, so only `front..len` is cloned, into a
+                // fresh buffer of exactly that length.
+                CTy::VecIter(e) => {
+                    let et = ctype(e);
+                    let c = clone_of(e, &format!("(({et}*)p->ptr)[p->front + i]"), &mut need);
+                    let _ = writeln!(
+                        body,
+                        "  uint64_t n = p->len - p->front;\n  lust_Vec v = lust_vec_with_capacity(n, sizeof({et}), _Alignof({et}));\n  for (uint64_t i = 0; i < n; i++) (({et}*)v.ptr)[i] = {c};\n  lust_VecIter r; r.ptr = v.ptr; r.len = n; r.cap = v.cap; r.front = 0;\n  return r;"
+                    );
                 }
                 CTy::Vec(e) => {
                     let et = ctype(e);
@@ -10493,6 +10564,14 @@ fn glue_def_value(
                 CTy::Vec(e) => {
                     let et = ctype(e);
                     let _ = writeln!(body, "  return lust_vec_with_capacity(0, sizeof({et}), _Alignof({et}));");
+                }
+                // alloc's `IntoIter::default()`: the iterator of an empty Vec.
+                CTy::VecIter(e) => {
+                    let et = ctype(e);
+                    let _ = writeln!(
+                        body,
+                        "  lust_Vec v = lust_vec_with_capacity(0, sizeof({et}), _Alignof({et}));\n  lust_VecIter r; r.ptr = v.ptr; r.len = 0; r.cap = v.cap; r.front = 0;\n  return r;"
+                    );
                 }
                 CTy::Option(_) => {
                     let _ = writeln!(body, "  return {};", variant_lit(p, t, 0, &[]));

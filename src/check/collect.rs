@@ -8603,6 +8603,13 @@ pub fn is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             if let Some((a, b)) = tys.result_args(t) {
                 return is_copy(p, tys, a) && is_copy(p, tys, b);
             }
+            // core's `RangeTo`, `RangeToInclusive`, and `RangeFull` are Copy
+            // (`Range`, `RangeFrom`, `RangeInclusive` are not).
+            if let Some((crate::ty::iter::IterKind::RangeTo | crate::ty::iter::IterKind::RangeToInclusive | crate::ty::iter::IterKind::RangeFull, a)) =
+                crate::ty::iter::iter_parts(tys, t)
+            {
+                return a.iter().all(|&x| is_copy(p, tys, x));
+            }
             // A written `where K<T>: Copy` bound, and a written `impl Copy`.
             if (tys.flags(t).contains_param() && env_proves(tys, t, p.gx.lang.copy, None)) || written_copy(p, tys, t) {
                 return true;
@@ -8986,6 +8993,9 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
     if let Some((a, b)) = tys.result_args(t) {
         return glue_clone(p, tys, a, seen) && glue_clone(p, tys, b, seen);
     }
+    if let Some(e) = owning_iter_elem(tys, t) {
+        return glue_clone(p, tys, e, seen);
+    }
     // A builtin iterator std makes Clone, when a bitwise copy is its
     // clone (`iter_clone_is_copy`).
     if tys.is_chars_ty(t) || crate::ty::iter::iter_parts(tys, t).is_some() {
@@ -9001,6 +9011,28 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
                 || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen)
         }
         None => is_copy(p, tys, t) || written_glue_impl(p, tys, t, p.gx.lang.clone, Some("clone"), &[], seen),
+    }
+}
+
+/// The element of a `vec::IntoIter<T>` (W-STD-A), whose Debug, Clone,
+/// and Default std writes over what it still owns (cgen `CTy::VecIter`
+/// glue): `IntoIter([..])`, a fresh buffer of clones, an empty one.
+pub(crate) fn vec_into_iter_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    match crate::ty::iter::iter_parts(tys, t)? {
+        (crate::ty::iter::IterKind::VecIntoIter, a) => a.first().copied(),
+        _ => None,
+    }
+}
+
+/// The element of a std owning iterator whose Debug and Clone hold
+/// exactly when its element's do and that cgen writes as core does:
+/// `vec::IntoIter<T>` (`CTy::VecIter`), `option::IntoIter<T>` and
+/// `result::IntoIter<T>` (`CTy::OptIter`).
+pub(crate) fn owning_iter_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
+    use crate::ty::iter::IterKind as K;
+    match crate::ty::iter::iter_parts(tys, t)? {
+        (K::VecIntoIter | K::OptionIntoIter | K::ResultIntoIter, a) => a.first().copied(),
+        _ => None,
     }
 }
 
@@ -9024,6 +9056,7 @@ pub fn iter_clone_is_copy(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     let part = |t: Ty| if crate::ty::iter::is_iter(tys, t) { iter_clone_is_copy(p, tys, t) } else { is_copy(p, tys, t) };
     let ok_kind = match k {
         K::SliceIter | K::Range | K::RangeInclusive | K::Map | K::Filter | K::Enumerate | K::Rev | K::Take | K::Skip | K::Chain | K::Zip => true,
+        K::RangeFrom | K::RangeTo | K::RangeToInclusive | K::RangeFull => true,
         K::Copied | K::Cloned | K::FilterMap | K::MapWhile | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::RepeatN | K::ByNext => true,
         K::Windows | K::CharIndices | K::Flatten | K::OptionIntoIter | K::OptionIter | K::ResultIter | K::ResultIntoIter => true,
         K::StrSplit | K::StrMatches | K::EncodeUtf16 | K::Chunks | K::ChunksExact | K::Utf8Chunks => true,
@@ -9620,7 +9653,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) ->
             _ => false,
         },
         _ => {
-            if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() {
+            if tys.is_string_ty(t) || tys.vec_elem(t).is_some() || tys.option_elem(t).is_some() || vec_into_iter_elem(tys, t).is_some() {
                 return true;
             }
             // std's empty `Box<str>`, `Rc<str>`, `Arc<[T]>`, kin (check/own.rs).
@@ -9881,7 +9914,7 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             if let Some(e) = tys.cell_elem(t) {
                 return is_copy(p, tys, e) && glue_debug(p, tys, e, seen);
             }
-            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.refcell_elem(t)) {
+            if let Some(e) = tys.vec_elem(t).or_else(|| tys.option_elem(t)).or_else(|| tys.smart_elem(t)).or_else(|| tys.refcell_elem(t)).or_else(|| owning_iter_elem(tys, t)) {
                 return glue_debug(p, tys, e, seen);
             }
             // HashMap and HashSet print their keys and values (W-STD-B).
