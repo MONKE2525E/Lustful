@@ -1036,6 +1036,32 @@ pub fn flex_int_expr(ast: &Ast, e: ExprId) -> bool {
 /// used for literal widths and array element types.
 pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
     check_macro_forms(cx.ast(), e)?;
+    // A literal local pinned only after a write held wide values
+    // before the pin: the evaluation runs again with that local typed
+    // at its `let` (see `FlexLocal`). Each run adds a pin, so the loop
+    // ends.
+    let mut pins: Vec<(PatId, Ty)> = Vec::new();
+    loop {
+        let (r, rerun) = eval_once(cx, e, expected, std::mem::take(&mut pins));
+        match rerun {
+            Some(p) if p.len() <= MAX_FLEX_RERUNS => pins = p,
+            _ => return r,
+        }
+    }
+}
+
+/// Bounds the re-runs of one const evaluation (one per literal local
+/// pinned after a write).
+const MAX_FLEX_RERUNS: usize = 64;
+
+/// One run of `eval` with the given literal-local pins. Returns the
+/// pins to run again with when a dirty literal local got pinned.
+fn eval_once<'a, C: ConstCx<'a>>(
+    cx: &mut C,
+    e: ExprId,
+    expected: Option<Ty>,
+    pins: Vec<(PatId, Ty)>,
+) -> (Result<TypedValue, Diag>, Option<Vec<(PatId, Ty)>>) {
     let mut ev = Evaluator {
         steps: 0,
         extra_cap: 0,
@@ -1049,26 +1075,39 @@ pub fn eval<'a, C: ConstCx<'a>>(cx: &mut C, e: ExprId, expected: Option<Ty>) -> 
         self_sym: None,
         ref_bind: false,
         mut_arg: None,
+        flex_locals: Vec::new(),
+        next_flex_group: 0,
+        pins,
+        rerun: false,
     };
-    let mut env: Env = Vec::new();
-    let span = cx.ast().expr_span(e);
-    ev.mark_extending(cx, e);
-    match ev.expr(cx, &mut env, e, expected)? {
-        Flow::Val(v) => {
-            // An unpinned literal that no context ever pinned falls back
-            // to i32 in rustc: one outside i32's range is an error there,
-            // however it escaped (a cast of the local it was bound to, a
-            // tuple element nobody reads).
-            if let Some(&d) = ev.flex_debt.first() {
-                return Err(Diag::new(C_OUTSIDE, cx.ast().expr_span(d), "integer literal out of range in const", "Change the literal or the type."));
+    let r = ev.run(cx, e, expected);
+    let rerun = ev.rerun.then_some(ev.pins);
+    (r, rerun)
+}
+
+impl Evaluator {
+    /// Evaluates the const expression `e` from an empty env.
+    fn run<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, e: ExprId, expected: Option<Ty>) -> Result<TypedValue, Diag> {
+        let mut env: Env = Vec::new();
+        let span = cx.ast().expr_span(e);
+        self.mark_extending(cx, e);
+        match self.expr(cx, &mut env, e, expected)? {
+            Flow::Val(v) => {
+                // An unpinned literal that no context ever pinned falls back
+                // to i32 in rustc: one outside i32's range is an error there,
+                // however it escaped (a cast of the local it was bound to, a
+                // tuple element nobody reads).
+                if let Some(&d) = self.flex_debt.first() {
+                    return Err(Diag::new(C_OUTSIDE, cx.ast().expr_span(d), "integer literal out of range in const", "Change the literal or the type."));
+                }
+                // The final value stands for the item's whole life: a
+                // borrow of a temporary inside it must be promotable
+                // (E0492/E0764).
+                check_final_refs(cx, &v.0, v.1, span)?;
+                Ok(v)
             }
-            // The final value stands for the item's whole life: a
-            // borrow of a temporary inside it must be promotable
-            // (E0492/E0764).
-            check_final_refs(cx, &v.0, v.1, span)?;
-            Ok(v)
+            _ => Err(outside(span, "control flow out of a const expression")),
         }
-        _ => Err(outside(span, "control flow out of a const expression")),
     }
 }
 
@@ -1125,6 +1164,55 @@ struct Evaluator {
     /// The call argument being evaluated when it is a `&mut` borrow:
     /// the only place a `&mut` value may be made (`mut_ref_outside`).
     mut_arg: Option<ExprId>,
+    /// The literal locals of the current frame whose integer type no
+    /// use has pinned yet (see `FlexLocal`).
+    flex_locals: Vec<FlexLocal>,
+    next_flex_group: u32,
+    /// The integer type of each literal local pinned so far, by its
+    /// `let` pattern: a re-run types the local at its `let`.
+    pins: Vec<(PatId, Ty)>,
+    /// Set when a literal local was pinned after a write: its earlier
+    /// arithmetic ran wide, so `eval` runs again with the pin.
+    rerun: bool,
+}
+
+/// A local bound by `let x = <unsuffixed literal>;` with no written
+/// type (`let mut hash = 0;`). Rust infers its type from later uses;
+/// the evaluator holds it wide (i128) until the first use that pins
+/// an integer type (a typed operand, a typed call argument, a typed
+/// `let`, an index, a return), then retypes it. Locals that meet each
+/// other in arithmetic share a group and are pinned together, as
+/// inference unifies them. A local still holding its literal is
+/// re-evaluated at the pinned type in place; one written since then
+/// ran wide arithmetic, so the whole evaluation runs again with the
+/// pin applied at the `let` (`Evaluator::rerun`).
+#[derive(Clone)]
+struct FlexLocal {
+    /// The env slot and name of the binding.
+    slot: usize,
+    name: Sym,
+    pat: PatId,
+    /// The literal expression the slot still holds, or None once the
+    /// slot was written with another value.
+    init: Option<ExprId>,
+    group: u32,
+}
+
+/// An unsuffixed literal expression with no names: re-evaluating it
+/// at another type gives the value it has at that type.
+fn pure_int_lit(ast: &Ast, e: ExprId) -> bool {
+    match ast.expr(e) {
+        Expr::Int(_, suffix) => suffix.is_none(),
+        Expr::Unary { op: UnOp::Neg | UnOp::Not, expr } => pure_int_lit(ast, *expr),
+        Expr::Binary { op, lhs, rhs } => {
+            !op.is_cmp() && !matches!(op, BinOp::And | BinOp::Or) && pure_int_lit(ast, *lhs) && pure_int_lit(ast, *rhs)
+        }
+        Expr::Block(b) => {
+            let b = ast.block(*b);
+            b.stmts.is_empty() && b.tail.is_some_and(|t| pure_int_lit(ast, t))
+        }
+        _ => false,
+    }
 }
 
 /// Steps one blob byte grants. A hash loop body (index, xor or
@@ -1231,6 +1319,111 @@ impl Evaluator {
             });
         }
         Ok(())
+    }
+
+    /// The literal local (`FlexLocal`) a path expression names, as an
+    /// index into `flex_locals`.
+    fn flex_index<'a, C: ConstCx<'a>>(&self, cx: &C, env: &Env, e: ExprId) -> Option<usize> {
+        let Expr::Path(segs) = cx.ast().expr(e) else { return None };
+        let [seg] = segs.as_slice() else { return None };
+        let slot = env.iter().rposition(|(n, _, _, _)| *n == seg.name)?;
+        self.flex_locals.iter().position(|f| f.slot == slot && f.name == seg.name)
+    }
+
+    /// True when the type of `e` is still open: it is built only from
+    /// unsuffixed literals and literal locals. Pushes the groups of
+    /// those locals to `out` (the caller drops them on false).
+    fn flex_parts<'a, C: ConstCx<'a>>(&self, cx: &C, env: &Env, e: ExprId, out: &mut Vec<u32>) -> bool {
+        match cx.ast().expr(e) {
+            Expr::Int(_, suffix) => suffix.is_none(),
+            Expr::Path(_) => match self.flex_index(cx, env, e) {
+                Some(i) => {
+                    out.push(self.flex_locals[i].group);
+                    true
+                }
+                None => false,
+            },
+            Expr::Unary { op: UnOp::Neg | UnOp::Not, expr } => self.flex_parts(cx, env, *expr, out),
+            Expr::Binary { op, lhs, rhs } => {
+                if op.is_cmp() || matches!(op, BinOp::And | BinOp::Or) {
+                    false
+                } else if matches!(op, BinOp::Shl | BinOp::Shr) {
+                    self.flex_parts(cx, env, *lhs, out)
+                } else {
+                    self.flex_parts(cx, env, *lhs, out) && self.flex_parts(cx, env, *rhs, out)
+                }
+            }
+            Expr::Block(b) => {
+                let b = cx.ast().block(*b);
+                b.stmts.is_empty() && b.tail.is_some_and(|t| self.flex_parts(cx, env, t, out))
+            }
+            _ => false,
+        }
+    }
+
+    /// The literal-local groups of `e` when its type is still open,
+    /// else None.
+    fn flex_groups<'a, C: ConstCx<'a>>(&self, cx: &C, env: &Env, e: ExprId) -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        self.flex_parts(cx, env, e, &mut out).then_some(out)
+    }
+
+    /// Merges literal-local groups that meet in arithmetic (inference
+    /// gives them one type). Returns the merged group.
+    fn unify_flex(&mut self, groups: &[u32]) -> Option<u32> {
+        let &g0 = groups.first()?;
+        for f in &mut self.flex_locals {
+            if groups.contains(&f.group) {
+                f.group = g0;
+            }
+        }
+        Some(g0)
+    }
+
+    /// Gives every literal local of the groups the integer type `t`
+    /// (see `FlexLocal`). A local still holding its literal is
+    /// re-evaluated at `t`; a written one sets `rerun` and stops this run.
+    fn pin_flex<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, groups: &[u32], t: Ty, span: Span) -> Result<(), Diag> {
+        // A literal local is held as an i128 already; an i128 context
+        // (often the wide type of another open operand) changes nothing.
+        if !self.pins_to(cx, t) {
+            return Ok(());
+        }
+        while let Some(i) = self.flex_locals.iter().position(|f| groups.contains(&f.group)) {
+            let f = self.flex_locals.remove(i);
+            if f.slot >= env.len() || env[f.slot].0 != f.name {
+                continue;
+            }
+            if !self.pins.iter().any(|&(p, _)| p == f.pat) {
+                self.pins.push((f.pat, t));
+            }
+            self.clear_local_debt(f.name);
+            let Some(init) = f.init else {
+                self.rerun = true;
+                return Err(outside(span, "this integer local (its type is known only after a write)"));
+            };
+            let (v, _) = self.value(cx, env, init, Some(t))?;
+            env[f.slot].1 = (v, t);
+        }
+        Ok(())
+    }
+
+    /// True when `t` is an integer type a literal local takes (any but
+    /// i128, the type it is held at).
+    fn pins_to<'a, C: ConstCx<'a>>(&self, cx: &C, t: Ty) -> bool {
+        self.int_ty_of(cx, t).is_some_and(|it| it != IntTy::I128)
+    }
+
+    /// Pins the literal locals of `e` to the type `t` of the other side
+    /// of an operation, when `e`'s type is still open and `other` has a
+    /// type of its own. True when it pinned any.
+    fn pin_against<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, e: ExprId, other: ExprId, t: Ty, span: Span) -> Result<bool, Diag> {
+        let Some(groups) = self.flex_groups(cx, env, e) else { return Ok(false) };
+        if groups.is_empty() || self.flex_groups(cx, env, other).is_some() || !self.pins_to(cx, t) {
+            return Ok(false);
+        }
+        self.pin_flex(cx, env, &groups, t, span)?;
+        Ok(true)
     }
 
     fn int_ty_of<'a, C: ConstCx<'a>>(&self, cx: &C, t: Ty) -> Option<IntTy> {
@@ -2000,13 +2193,58 @@ impl Evaluator {
                 return Ok(Flow::Return(v));
             }
             Expr::Assign { lhs, rhs } => {
-                let (v, _) = self.value_moved(cx, env, *rhs, None)?;
+                // A whole integer local gives the value its type.
+                let place_int = match cx.ast().expr(*lhs) {
+                    Expr::Path(segs) if segs.len() == 1 && self.flex_index(cx, env, *lhs).is_none() => {
+                        env.iter().rev().find(|(n, _, _, _)| *n == segs[0].name).map(|s| s.1.1).filter(|&t| t != super::int(IntTy::I128) && self.int_ty_of(cx, t).is_some())
+                    }
+                    _ => None,
+                };
+                let (v, vt) = self.value_moved(cx, env, *rhs, place_int)?;
+                // Writing a literal local: a typed value pins it; an open
+                // one joins its group and is what the slot now holds.
+                if let Some(i) = self.flex_index(cx, env, *lhs) {
+                    let g = self.flex_locals[i].group;
+                    match self.flex_groups(cx, env, *rhs) {
+                        None => self.pin_flex(cx, env, &[g], vt, span)?,
+                        Some(gs) => {
+                            self.unify_flex(&[vec![g], gs].concat());
+                            if let Some(i) = self.flex_index(cx, env, *lhs) {
+                                self.flex_locals[i].init = pure_int_lit(cx.ast(), *rhs).then_some(*rhs);
+                            }
+                        }
+                    }
+                }
                 self.assign_place(cx, env, *lhs, v, span)?;
                 (ConstValue::Unit, UNIT)
             }
             Expr::AssignOp { op, lhs, rhs } => {
+                let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+                // `x op= y` on a literal local: a typed `y` pins it (not
+                // a shift amount); otherwise the result is a write.
+                let mut flex_rv = None;
+                if let Some(i) = self.flex_index(cx, env, *lhs) {
+                    let g = self.flex_locals[i].group;
+                    let (rv, rt) = self.value(cx, env, *rhs, None)?;
+                    match self.flex_groups(cx, env, *rhs) {
+                        None if !shift => self.pin_flex(cx, env, &[g], rt, span)?,
+                        gs => {
+                            if !shift {
+                                self.unify_flex(&[vec![g], gs.unwrap_or_default()].concat());
+                            }
+                            if let Some(i) = self.flex_index(cx, env, *lhs) {
+                                self.flex_locals[i].init = None;
+                            }
+                        }
+                    }
+                    flex_rv = Some(rv);
+                }
                 let cur = self.value(cx, env, *lhs, None)?;
-                let (rv, _) = self.value(cx, env, *rhs, Some(cur.1))?;
+                let rv = match flex_rv {
+                    Some(rv) => rv,
+                    None if shift && self.flex_groups(cx, env, *rhs).is_some_and(|g| !g.is_empty()) => self.value(cx, env, *rhs, None)?.0,
+                    None => self.value(cx, env, *rhs, Some(cur.1))?.0,
+                };
                 let ct = cur.1;
                 let out = self.int_op(cx, *op, cur, (rv, ct), span)?;
                 self.assign_place(cx, env, *lhs, out.0, span)?;
@@ -2146,7 +2384,11 @@ impl Evaluator {
         let (steps, flex, local) = (self.steps, self.flex_debt.len(), self.local_debt.len());
         let depth = self.call_depth;
         let mut env2 = env.clone();
+        // The scan's writes and pins of literal locals are not real.
+        let fsave = (self.flex_locals.clone(), self.pins.len(), self.rerun);
         let r = self.block(cx, &mut env2, b, None);
+        (self.flex_locals, self.rerun) = (fsave.0, fsave.2);
+        self.pins.truncate(fsave.1);
         self.steps = steps;
         self.call_depth = depth;
         self.flex_debt.truncate(flex);
@@ -2165,7 +2407,11 @@ impl Evaluator {
         let (steps, flex, local) = (self.steps, self.flex_debt.len(), self.local_debt.len());
         let depth = self.call_depth;
         let mut env2 = env.clone();
+        // The scan's writes and pins of literal locals are not real.
+        let fsave = (self.flex_locals.clone(), self.pins.len(), self.rerun);
         let r = self.expr(cx, &mut env2, e, None);
+        (self.flex_locals, self.rerun) = (fsave.0, fsave.2);
+        self.pins.truncate(fsave.1);
         self.steps = steps;
         self.call_depth = depth;
         self.flex_debt.truncate(flex);
@@ -2416,12 +2662,18 @@ impl Evaluator {
     fn block<'a, C: ConstCx<'a>>(&mut self, cx: &mut C, env: &mut Env, b: ast::BlockId, expected: Option<Ty>) -> Result<Flow, Diag> {
         let block = cx.ast().block(b);
         let saved = env.len();
+        // Literal locals of slots this env no longer has are stale.
+        self.flex_locals.retain(|f| f.slot < saved);
         let mut out = (ConstValue::Unit, UNIT);
         for stmt in &block.stmts {
             match stmt {
                 ast::Stmt::Let { pat, ty, init, els, .. } => {
                     let Some(init) = init else { return Err(outside(cx.ast().pat_span(*pat), "an uninitialized binding")) };
-                    let exp = ty.map(|t| cx.resolve_ty(t));
+                    // A literal local pinned in an earlier run is typed
+                    // at its `let` (see `FlexLocal`).
+                    let plain = matches!(cx.ast().pat(*pat), Pat::Binding { by_ref: false, .. });
+                    let pinned = if ty.is_none() && plain { self.pins.iter().find(|&&(p, _)| p == *pat).map(|&(_, t)| t) } else { None };
+                    let exp = ty.map(|t| cx.resolve_ty(t)).or(pinned);
                     let debt_before = self.flex_debt.clone();
                     let mut v = self.value_moved(cx, env, *init, exp)?;
                     // The initializer coerces to the written type, or
@@ -2476,6 +2728,19 @@ impl Evaluator {
                         for &d in &debts {
                             self.local_debt.push((name, d));
                         }
+                    }
+                    // `let x = <literal>;` with no type: a literal local
+                    // (its groups are read before the binding shadows).
+                    let flex = if exp.is_none() && plain && v.1 == super::int(IntTy::I128) { self.flex_groups(cx, env, *init) } else { None };
+                    let slot = env.len();
+                    self.flex_locals.retain(|f| f.slot < slot);
+                    if let (Some(groups), [(name, _, _, _)]) = (flex, binds.as_slice()) {
+                        let group = self.unify_flex(&groups).unwrap_or_else(|| {
+                            self.next_flex_group += 1;
+                            self.next_flex_group
+                        });
+                        let init = pure_int_lit(cx.ast(), *init).then_some(*init);
+                        self.flex_locals.push(FlexLocal { slot, name: *name, pat: *pat, init, group });
                     }
                     env.extend(binds);
                 }
@@ -2534,6 +2799,14 @@ impl Evaluator {
     ) -> Result<TypedValue, Diag> {
         if segs.len() == 1 {
             let name = segs[0].name;
+            // A read at an integer type pins a literal local.
+            if let Some(t) = expected
+                && let Some(slot) = env.iter().rposition(|(n, _, _, _)| *n == name)
+                && let Some(i) = self.flex_locals.iter().position(|f| f.name == name && f.slot == slot)
+            {
+                let g = self.flex_locals[i].group;
+                self.pin_flex(cx, env, &[g], t, span)?;
+            }
             if let Some(slot) = env.iter_mut().rev().find(|(n, _, _, _)| *n == name) {
                 if self.move_read {
                     slot.3 = true;
@@ -2776,7 +3049,11 @@ impl Evaluator {
         // type is sound: it has no name, call, or suffix to disagree.
         let lhs_exp = if op.is_cmp() { None } else { expected };
         let (mut lv, mut lt) = self.value(cx, env, lhs, lhs_exp)?;
-        let (mut rv, mut rt) = self.value(cx, env, rhs, Some(lt))?;
+        // A shift amount's type is its own: the shifted value's type
+        // does not pin a literal local there.
+        let shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let rhs_exp = if shift && self.flex_groups(cx, env, rhs).is_some_and(|g| !g.is_empty()) { None } else { Some(lt) };
+        let (mut rv, mut rt) = self.value(cx, env, rhs, rhs_exp)?;
         let both_int = matches!(lv, ConstValue::Int(_)) && matches!(rv, ConstValue::Int(_));
         // A shift's operands have independent types in Rust: the
         // amount's type never pins the shifted value's (`4 << S`
@@ -2816,6 +3093,17 @@ impl Evaluator {
                 {
                     self.clear_local_debt(segs[0].name);
                 }
+            }
+        }
+        // A literal local meets a typed operand: it takes that type, as
+        // inference does. Two open sides share one type.
+        if both_int && !shift {
+            if self.pin_against(cx, env, lhs, rhs, rt, span)? {
+                (lv, lt) = self.value(cx, env, lhs, Some(rt))?;
+            } else if self.pin_against(cx, env, rhs, lhs, lt, span)? {
+                (rv, rt) = self.value(cx, env, rhs, Some(lt))?;
+            } else if let (Some(a), Some(b)) = (self.flex_groups(cx, env, lhs), self.flex_groups(cx, env, rhs)) {
+                self.unify_flex(&[a, b].concat());
             }
         }
         let _ = rt;
@@ -3594,10 +3882,13 @@ impl Evaluator {
             body.ret
         };
         cx.enter_const_fn(body.owner);
+        // The callee's literal locals index its own env.
+        let caller_flex = std::mem::take(&mut self.flex_locals);
         let flow = match bind_err {
             Some(d) => Err(d),
             None => self.block(cx, &mut fenv, body.body, Some(body.ret)),
         };
+        self.flex_locals = caller_flex;
         cx.exit_const_fn();
         self.call_depth -= 1;
         // A parameter of a drop type that the body did not
