@@ -1,4 +1,5 @@
 // One level below rustc's recursion limit: all compile (rustc 1.99).
+// rustc-timeout: 240 (rustc needs ~12 s alone here; under gate load it passed the 30 s default and read as a reject)
 #![allow(dead_code)]
 trait Tr {
     fn d(&self) -> u32;
