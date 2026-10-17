@@ -660,6 +660,11 @@ impl GenReuse {
         self.templates.values().flat_map(|e| e.reads.iter().map(|(k, _)| k)).chain(closures)
     }
 
+    /// True when template `t` has a stored plain check (a log line).
+    pub(crate) fn has_template_entry(&self, p: &Program, t: LocalDefId) -> bool {
+        self.templates.contains_key(&p.def_id(t))
+    }
+
     /// `template_holds` when only the read keys `moves` takes can have
     /// moved since the stored check (a derive-only request, sigedit P3.2,
     /// and a header delta, driver/kept_delta.rs): the other reads are not

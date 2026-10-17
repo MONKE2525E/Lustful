@@ -582,6 +582,11 @@ fn rpit_namers(
     Ok((plain, tmpl))
 }
 
+/// `GenReuse::newer` for template `t` against the program's stamp (a log line).
+fn reuse_newer(caches: &Caches, p: &Program, t: LocalDefId, start: u64) -> bool {
+    caches.gen_reuse.newer(p, t, p.reuse_stamp, start)
+}
+
 /// Mono's body checks that read the edited signatures, as a collect with
 /// generic reuse runs them (`materialize`, `template_check`): a stored
 /// result that no longer holds checks again, and a plain body must give
@@ -654,10 +659,24 @@ fn replay_bodies(
         if !again.is_empty() && walk_instances {
             return Err("sig template");
         }
+        let mut times: Vec<(f64, LocalDefId)> = Vec::new();
         for t in again {
             let (lo, hi) = p.fn_def(t).exprs;
+            let t0 = std::time::Instant::now();
             recheck_undoable(p, t, &[(lo, hi)], caches, undos)?;
+            times.push((t0.elapsed().as_secs_f64() * 1e3, t));
         }
+        crate::check::derive_delta::log(&|| {
+            let mut slow = times.clone();
+            slow.sort_by(|x, y| y.0.total_cmp(&x.0));
+            let why = |t: LocalDefId| match (reuse_newer(caches, p, t, start), caches.gen_reuse.has_template_entry(p, t)) {
+                (true, _) => "newer",
+                (false, true) => "entry moved",
+                (false, false) => "no entry",
+            };
+            let list = slow.iter().take(8).map(|&(ms, t)| format!("{} {ms:.1} ({})", p.display_name(p.fn_def(t).name), why(t))).collect::<Vec<_>>();
+            format!("replay templates: {} again; {}\n", times.len(), list.join(", "))
+        });
         super::laps::mark("collect/delta replay templates");
         replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers))
     })();
