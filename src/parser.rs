@@ -1701,6 +1701,11 @@ impl<'a> Parser<'a> {
                     _ => break,
                 }
             }
+            // rustc's attribute grammar holds in enabled code too:
+            // `#[derive(Debug) x]` is a syntax error, not a derive.
+            if !self.cfg_syntax {
+                self.cfg_attr_grammar(start, body_start, body_end)?;
+            }
             if self.cfg_syntax && path.is_empty() {
                 // A path this loop does not read (`::a`, `self::a`,
                 // `unsafe(..)`): the grammar check below judges it.
@@ -1856,7 +1861,8 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// The attribute grammar rustc checks in cfg-disabled code, on the
+    /// The attribute grammar rustc checks on every attribute, cfg-disabled
+    /// code included, on the
     /// body tokens `lo..hi` (between `#[` and `]`): `unsafe(item)` or an
     /// item, where an item is a path (`::`-separated names, an optional
     /// leading `::`) followed by nothing, one delimited token group, or
@@ -1908,12 +1914,20 @@ impl<'a> Parser<'a> {
             Tok::LParen | Tok::LBracket | Tok::LBrace if close_of(i) == Some(hi - 1) => Ok(()),
             // A doc comment (`doc = DocStr`), which no expression parse takes.
             Tok::Eq if i + 2 == hi && matches!(at(i + 1), Tok::DocStr(_)) => Ok(()),
+            // One literal, the usual value (`doc = "..."`, `path = "a.rs"`).
+            Tok::Eq if i + 2 == hi && matches!(at(i + 1), Tok::Str(..) | Tok::Int(..) | Tok::Float(..) | Tok::True | Tok::False) => {
+                Ok(())
+            }
             Tok::Eq if i + 1 < hi => {
                 let saved = self.pos;
+                // A trial parse: an unsupported-form reject it defers is
+                // not this attribute's verdict.
+                let deferred = self.deferred.take();
                 self.pos = i + 1;
                 let parsed = self.expr();
                 let end = self.pos;
                 self.pos = saved;
+                self.deferred = deferred;
                 match parsed {
                     Ok(_) if end == hi => Ok(()),
                     Ok(_) => Err(syntax(self.toks[end.min(hi)].span, "expected `]` after the attribute value")),

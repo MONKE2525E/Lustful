@@ -2712,6 +2712,15 @@ pub fn attr_at(trees: &[Tt], i: usize, interner: &Interner) -> Option<AttrInfo> 
     if segs.is_empty() {
         return None;
     }
+    // After the path: nothing, one group, or `= value`. Anything else
+    // (`#[cfg(all()) x]`) is not an attribute the expander acts on; the
+    // parser reports its grammar error.
+    match body.get(k) {
+        None => {}
+        Some(Tt::Delim(..)) if k + 1 == body.len() => {}
+        Some(Tt::Tok(t)) if t.tok == Tok::Eq => {}
+        _ => return None,
+    }
     // cfg and friends read only the group's trees; a `path(...)` attr
     // keeps the group as its input, a `path = v` keeps from the `=` on.
     let inner = match body.get(k) {
