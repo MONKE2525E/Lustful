@@ -1540,12 +1540,12 @@ fn expand_pure(
 /// a dependency other than a cfg-dropped node.
 fn expand_by_file(front: &Front, base: &PatchBase, text: &str, edit: Edit, body: (u32, u32), raw: &lexer::Lexed) -> Result<lexer::Lexed, &'static str> {
     let file = edit.file;
-    let fx = base.file_exp.as_ref().ok_or("body macro")?;
+    let fx = base.file_exp.as_ref().ok_or("body macro: no expander")?;
     if file == FileId(0) || fx.splices_after(file, edit.a) || raw.tokens.iter().any(|t| t.tok == Tok::Static) {
-        return Err("body macro");
+        return Err("body macro: shape");
     }
     if crate::resolve::worklist::check_cfg_names(raw, fx.env(), &front.interner).is_err() {
-        return Err("body macro");
+        return Err("body macro: cfg");
     }
     // The other written fn bodies of the file, at their new places.
     let ast = &front.ast;
@@ -1566,20 +1566,23 @@ fn expand_by_file(front: &Front, base: &PatchBase, text: &str, edit: Edit, body:
         .collect();
     blank.sort_unstable();
     blank.dedup();
+    // A range that would cover the edited body never blanks.
+    blank.retain(|&(lo, hi)| !(lo <= body.0 && body.1 <= hi));
     if blank.windows(2).any(|w| w[0].1 > w[1].0) {
         blank.clear();
     }
     let (out, deps) = match fx.expand(file, text, &blank, &front.interner, &front.known, &front.client) {
         Some(Ok(x)) => x,
-        _ => return Err("body macro"),
+        Some(Err(_)) => return Err("body macro: expand error"),
+        None => return Err("body macro: no file"),
     };
     if !deps.iter().all(|d| matches!(d, crate::expand::Dep::Dropped { .. })) {
-        return Err("body macro");
+        return Err("body macro: deps");
     }
     // The expander gives both delimiters of a group the group's span.
     let span = crate::diag::Span { file, lo: body.0, hi: body.1, ctxt: CtxtId::ROOT };
-    let i0 = out.tokens.iter().position(|t| t.tok == Tok::LBrace && t.span == span).ok_or("body macro")?;
-    let n = out.tokens[i0..].iter().position(|t| t.tok == Tok::RBrace && t.span == span).ok_or("body macro")?;
+    let i0 = out.tokens.iter().position(|t| t.tok == Tok::LBrace && t.span == span).ok_or("body macro: cut open")?;
+    let n = out.tokens[i0..].iter().position(|t| t.tok == Tok::RBrace && t.span == span).ok_or("body macro: cut close")?;
     let mut tokens = out.tokens[i0..=i0 + n].to_vec();
     tokens.push(lexer::Token { tok: Tok::Eof, span: crate::diag::Span { lo: body.1, ..span } });
     Ok(lexer::Lexed { tokens, strings: out.strings })
@@ -3822,7 +3825,9 @@ pub fn run() -> i64 {
     /// the same file (one defined after the edit, whose definition moves),
     /// another file by `$crate` path, hygienic locals, a closure in a
     /// duplicated `$body`, an error and its fix; another body's local
-    /// `macro_rules!` of the same name stays its own. Refused: an undefined
+    /// `macro_rules!` of the same name stays its own; `thread_local!`
+    /// statics after the edit (their hidden init fns have no `{ .. }`
+    /// body of their own to blank). Refused: an undefined
     /// macro, a `macro_rules!` or a `static` in the body. Each state is the
     /// cold answer.
     #[test]
@@ -3846,7 +3851,10 @@ pub fn run() -> i64 {
                    pub fn shadow() -> i64 {\n    macro_rules! tw {\n        ($e:expr) => { $e * 100 };\n    }\n    tw!(1)\n}\n\n\
                    macro_rules! late {\n    ($e:expr) => { $e - 1 };\n}\n\n\
                    pub fn after(n: i64) -> i64 {\n    late!(n) + tw!(n)\n}\n\n\
-                   pub fn run() -> i64 {\n    calc(3) + pick(4) + after(5) + shadow()\n}\n";
+                   thread_local! {\n    static CELL: std::cell::Cell<i64> = std::cell::Cell::new(1);\n    \
+                   static CELL2: std::cell::Cell<i64> = std::cell::Cell::new(2);\n}\n\n\
+                   pub fn cells() -> i64 {\n    CELL.with(|c| c.get()) + CELL2.with(|c| c.get())\n}\n\n\
+                   pub fn run() -> i64 {\n    calc(3) + pick(4) + after(5) + shadow() + cells()\n}\n";
         std::fs::write(&m0, src).unwrap();
         let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
         assert_eq!(check(&mut warm, &root).0, 0);

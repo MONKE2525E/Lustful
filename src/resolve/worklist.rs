@@ -746,8 +746,10 @@ pub struct ResolveCache {
 /// `lexed` without the inner tokens of each fn body range in `blank`
 /// (`{` through `}`, by bytes), for the body patch: only the body it
 /// edits needs its expansion, and what the expander does in one fn body
-/// reaches no other (a body's macros, `use`s and items are its block's),
-/// with two exceptions that keep a body: a `macro_rules!` or
+/// reaches no other (a body's macros, `use`s and items are its block's).
+/// A range blanks only when it is one `{ .. }` group of `text` (a hidden
+/// fn that holds a hoisted `static` init closure has a body span that is
+/// not), and three things keep a body: a `macro_rules!` or
 /// `macro_export` in it (a `#[macro_export]` definition in a body is
 /// visible by path from anywhere), and a body inside a macro call's input
 /// (the macro reads its tokens).
@@ -756,9 +758,11 @@ fn blank_bodies(lexed: lexer::Lexed, blank: &[(u32, u32)], text: &str) -> lexer:
     if blank.is_empty() {
         return lexed;
     }
-    // Byte ranges of macro call inputs: `name!` then a group.
+    // Byte ranges of macro call inputs (`name!` then a group), and of
+    // every `{ .. }` group by its `{` start.
     let toks = &lexed.tokens;
     let mut calls: Vec<(u32, u32)> = Vec::new();
+    let mut braces: FxMap<u32, u32> = FxMap::default();
     let mut open: Vec<(usize, bool)> = Vec::new();
     for (i, t) in toks.iter().enumerate() {
         match t.tok {
@@ -767,16 +771,22 @@ fn blank_bodies(lexed: lexer::Lexed, blank: &[(u32, u32)], text: &str) -> lexer:
                 open.push((i, call));
             }
             Tok::RParen | Tok::RBracket | Tok::RBrace => {
-                if let Some((o, true)) = open.pop() {
-                    calls.push((toks[o].span.lo, t.span.hi));
+                if let Some((o, call)) = open.pop() {
+                    if call {
+                        calls.push((toks[o].span.lo, t.span.hi));
+                    }
+                    if toks[o].tok == Tok::LBrace && t.tok == Tok::RBrace {
+                        braces.insert(toks[o].span.lo, t.span.hi);
+                    }
                 }
             }
             _ => {}
         }
     }
+    // Only an exact `{ .. }` group of this text blanks.
     let keep_body = |&(lo, hi): &(u32, u32)| {
         let inner = text.get(lo as usize..hi as usize).unwrap_or("macro_rules");
-        inner.contains("macro_rules") || inner.contains("macro_export") || calls.iter().any(|&(a, b)| a <= lo && hi <= b)
+        braces.get(&lo) != Some(&hi) || inner.contains("macro_rules") || inner.contains("macro_export") || calls.iter().any(|&(a, b)| a <= lo && hi <= b)
     };
     let ranges: Vec<(u32, u32)> = blank.iter().copied().filter(|r| !keep_body(r)).collect();
     let mut k = 0;
