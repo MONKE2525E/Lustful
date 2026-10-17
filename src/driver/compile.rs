@@ -357,8 +357,12 @@ fn fold_fn_text(sc: &mut scan::ChunkScan, lexed: &lexer::Lexed, src: &str) {
 /// True when the chunk path's bodies mode can take a request exactly.
 /// The request's one edit (old bytes `edit.0..edit.1`, now `delta` bytes
 /// longer) moves every span edge at or after `edit.1` and no edge before
-/// it, so a kept node with an edge inside the window would land wrong: a
-/// moving edit must sit strictly inside one changed fn's body. And each
+/// it, so a kept node with an edge inside the window would land wrong: an
+/// edit must sit strictly inside one changed fn's body. That holds for a
+/// window with `delta` 0 too: two edits in two fns whose lengths cancel
+/// move every item between them (realish seed 112: a later body blank
+/// then wiped a method signature there). Only a request with no text
+/// change (failed fns checked again) needs no window. And each
 /// changed fn must have no node between its parameters and its body
 /// (parameter patterns, expressions in parameter or return types):
 /// `FnDef::exprs` and `pats` start there in a cold parse, and the new
@@ -370,7 +374,8 @@ fn bodies_mode_ok(ast: &Ast, fn_loc: &[(usize, Option<usize>)], changed: &[usize
         fn_def_at(ast, item, sub).body.map(|b| ast.block(b).span)
     };
     let inside = |sp: diag::Span| sp.file == ROOT_FILE && (sp.lo as usize) < edit.0 && edit.1 < sp.hi as usize;
-    if delta != 0 && !changed.iter().any(|&i| body_span(i).is_some_and(inside)) {
+    let text_changed = delta != 0 || edit.0 < edit.1;
+    if text_changed && !changed.iter().any(|&i| body_span(i).is_some_and(inside)) {
         return false;
     }
     changed.iter().all(|&i| {
