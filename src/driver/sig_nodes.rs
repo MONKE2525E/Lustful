@@ -39,7 +39,12 @@ impl SigNodes {
 /// the first one inside `body`) into `into`, an empty Ast, from index 0.
 /// None when the segment is empty; Err when a node is not provably copied.
 pub(super) fn copy(ast: &Ast, def: &FnDef, body: Span, into: &mut Ast) -> Result<Option<SigNodes>, &'static str> {
-    let inside = |s: Span| s.file == body.file && body.lo <= s.lo && s.hi <= body.hi;
+    // A node a macro expanded counts by its call site: its own span can
+    // name the macro's definition, outside the body that called it.
+    let inside = |s: Span| {
+        let s = if s.ctxt == crate::diag::CtxtId::ROOT { s } else { crate::diag::call_site_span(s) };
+        s.file == body.file && body.lo <= s.lo && s.hi <= body.hi
+    };
     let first_inside = |(first, end): (u32, u32), spans: &[Span]| (first..end).find(|&i| spans.get(i as usize).is_some_and(|&s| inside(s)));
     let e_end = first_inside(def.exprs, &ast.expr_spans).unwrap_or(def.exprs.1);
     let p_end = first_inside(def.pats, &ast.pat_spans).unwrap_or(def.pats.1);

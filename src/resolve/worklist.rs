@@ -735,6 +735,139 @@ pub struct ResolveCache {
     /// reader that saw this value when it read a file's expansion knows
     /// the entry is still that expansion while the value stands.
     expansions: u64,
+    /// Counts resolves (`begin`): `file_expander` is the last one's only
+    /// when its own count matches.
+    resolves: u64,
+    /// The local crate's per-file expander from the last resolve that
+    /// got past expansion (see `FileExpander`).
+    file_expander: Option<std::sync::Arc<FileExpander>>,
+}
+
+/// `lexed` without the inner tokens of each fn body range in `blank`
+/// (`{` through `}`, by bytes), for the body patch: only the body it
+/// edits needs its expansion, and what the expander does in one fn body
+/// reaches no other (a body's macros, `use`s and items are its block's),
+/// with two exceptions that keep a body: a `macro_rules!` or
+/// `macro_export` in it (a `#[macro_export]` definition in a body is
+/// visible by path from anywhere), and a body inside a macro call's input
+/// (the macro reads its tokens).
+fn blank_bodies(lexed: lexer::Lexed, blank: &[(u32, u32)], text: &str) -> lexer::Lexed {
+    use crate::lexer::Tok;
+    if blank.is_empty() {
+        return lexed;
+    }
+    // Byte ranges of macro call inputs: `name!` then a group.
+    let toks = &lexed.tokens;
+    let mut calls: Vec<(u32, u32)> = Vec::new();
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t.tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                let call = i >= 2 && toks[i - 1].tok == Tok::Bang && matches!(toks[i - 2].tok, Tok::Ident(_));
+                open.push((i, call));
+            }
+            Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                if let Some((o, true)) = open.pop() {
+                    calls.push((toks[o].span.lo, t.span.hi));
+                }
+            }
+            _ => {}
+        }
+    }
+    let keep_body = |&(lo, hi): &(u32, u32)| {
+        let inner = text.get(lo as usize..hi as usize).unwrap_or("macro_rules");
+        inner.contains("macro_rules") || inner.contains("macro_export") || calls.iter().any(|&(a, b)| a <= lo && hi <= b)
+    };
+    let ranges: Vec<(u32, u32)> = blank.iter().copied().filter(|r| !keep_body(r)).collect();
+    let mut k = 0;
+    let tokens = lexed
+        .tokens
+        .into_iter()
+        .filter(|t| {
+            while k < ranges.len() && ranges[k].1 <= t.span.lo {
+                k += 1;
+            }
+            // Inside: after the `{` and before the `}`.
+            !(k < ranges.len() && ranges[k].0 < t.span.lo && t.span.hi < ranges[k].1)
+        })
+        .collect();
+    lexer::Lexed { tokens, strings: lexed.strings }
+}
+
+/// What the body patch needs to expand one file of the local crate again
+/// as the full resolve's last expansion round did (driver/patch.rs): that
+/// round's macro environment and the expander's per-file inputs. A body
+/// edit changes neither (it defines no macro and no module), so the new
+/// text expands under them as a cold resolve would expand it.
+pub struct FileExpander {
+    /// `ResolveCache::resolves` of the resolve that built it.
+    resolve: u64,
+    menv: MacroEnv,
+    magic: Sym,
+    env: CfgEnv,
+    cargo_env: Vec<(String, String)>,
+    crate_name: String,
+    display_root: Option<PathBuf>,
+    /// Per file: its index in `menv`'s per-file tables, module path, and path.
+    files: FxMap<FileId, (usize, Vec<Sym>, PathBuf)>,
+}
+
+impl FileExpander {
+    /// The expansion of `text` as the new text of `file` (raw lex, textual
+    /// splice, seeded expansion with the dependency record), as the
+    /// resolve's expansion round runs it. None for a file it does not
+    /// know (another crate's). `blank` holds byte ranges of `{ .. }` fn
+    /// bodies (sorted, disjoint) whose inner tokens go before expansion
+    /// (see `blank_bodies`).
+    pub fn expand(
+        &self,
+        file: FileId,
+        text: &str,
+        blank: &[(u32, u32)],
+        interner: &Interner,
+        known: &Known,
+        client: &crate::expand::ClientView,
+    ) -> Option<Result<(lexer::Lexed, Vec<crate::expand::Dep>), Diag>> {
+        let (di, module_path, path) = self.files.get(&file)?;
+        let lexed = match lex_file(text, file, interner) {
+            Ok(l) => blank_bodies(l, blank, text),
+            Err(d) => return Some(Err(d)),
+        };
+        let ects = crate::expand::ExpandCtx {
+            interner,
+            known,
+            file_path: match self.display_root.as_deref().and_then(|r| path.strip_prefix(r).ok()) {
+                Some(rel) => rel.to_string_lossy().to_string(),
+                None => path.to_string_lossy().to_string(),
+            },
+            real_path: path.clone(),
+            cargo_env: self.cargo_env.clone(),
+            src: text,
+            cfg: expand_cfg(&self.env),
+            module_path: module_path.clone(),
+            crate_name: Some(self.crate_name.clone()),
+            client,
+        };
+        let spliced = self.menv.splice(*di, lexed, self.magic);
+        let seeds: Vec<crate::expand::MacroSeed> = match self.menv.glob_seeds.get(*di) {
+            Some(extra) if !extra.is_empty() => self.menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
+            _ => self.menv.seeds.clone(),
+        };
+        Some(crate::expand::expand_lexed_seeded_with_deps(spliced, &ects, &seeds))
+    }
+
+    /// The cfg environment the expansions ran under.
+    pub fn env(&self) -> &CfgEnv {
+        &self.env
+    }
+
+    /// True when the textual splice of `file` puts definitions after an
+    /// item at or past byte `at` (a `#[macro_use]` module): an edit before
+    /// it moves the offset the splice finds the item by.
+    pub fn splices_after(&self, file: FileId, at: u32) -> bool {
+        let Some((di, _, _)) = self.files.get(&file) else { return true };
+        self.menv.after_mods.get(*di).is_some_and(|a| a.iter().any(|(lo, _, _)| *lo >= at))
+    }
 }
 
 struct CachedFile {
@@ -888,6 +1021,7 @@ impl ResolveCache {
             self.files.clear();
             self.expansions += 1;
         }
+        self.resolves += 1;
         if let Some((key, text_hash, lexed)) = self.seed.take() {
             self.entry(&key, text_hash, FileId(0)).raw = Some(lexed);
         }
@@ -977,6 +1111,11 @@ impl ResolveCache {
     /// The `expansions` count (see there).
     pub fn expansions(&self) -> u64 {
         self.expansions
+    }
+
+    /// The last resolve's `FileExpander`, when that resolve built one.
+    pub fn file_expander(&self) -> Option<std::sync::Arc<FileExpander>> {
+        self.file_expander.clone().filter(|x| x.resolve == self.resolves)
     }
 
     /// The stored expansion of the file lexed as `file_id` with text
@@ -2845,7 +2984,7 @@ impl MacroEnv {
     /// expander registers them in textual order and strips them from
     /// its output, so the parsed items are unaffected. Source
     /// strings are remapped into this file's string table.
-    fn splice(&self, di: usize, lexed: lexer::Lexed, job: &CrateJob) -> lexer::Lexed {
+    fn splice(&self, di: usize, lexed: lexer::Lexed, magic: Sym) -> lexer::Lexed {
         use crate::lexer::{Tok, Token};
         let start_srcs: &[usize] = self.inherited.get(di).map(Vec::as_slice).unwrap_or(&[]);
         let after: &[(u32, Vec<usize>, bool)] = self.after_mods.get(di).map(Vec::as_slice).unwrap_or(&[]);
@@ -2856,7 +2995,7 @@ impl MacroEnv {
         let mut offsets: FxMap<usize, u32> = FxMap::default();
         let materialize = |idx: usize, strings: &mut Vec<String>, offsets: &mut FxMap<usize, u32>| -> Vec<Token> {
             let src = &self.owned_all[idx];
-            let base = if src.magic != job.magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
+            let base = if src.magic != magic { rewrite_dollar_crate(&src.tokens, src.magic) } else { src.tokens.clone() };
             let offset = *offsets.entry(idx).or_insert_with(|| {
                 let at = strings.len() as u32;
                 strings.extend(src.strings.iter().cloned());
@@ -3056,7 +3195,7 @@ fn resolve_one(
                 crate_name: Some(input.crate_name.clone()),
                 client,
             };
-            let spliced = menv.splice(di, orig, job);
+            let spliced = menv.splice(di, orig, job.magic);
             let seeds: Vec<crate::expand::MacroSeed> = match menv.glob_seeds.get(di) {
                 Some(extra) if !extra.is_empty() => menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
                 _ => menv.seeds.clone(),
@@ -3127,6 +3266,12 @@ fn resolve_one(
             });
         }
     }
+    // The local crate's files for its `FileExpander` (stored at the end).
+    let keep_expander = job.root_module == ROOT_MODULE && !job.std_splice && !cache.one_shot;
+    let seen_files: Vec<(FileId, (usize, Vec<Sym>, PathBuf))> = match keep_expander {
+        true => discs.iter().enumerate().map(|(di, d)| (d.file_id, (di, tables.modules[d.module.0 as usize].path.clone(), d.path.clone()))).collect(),
+        false => Vec::new(),
+    };
     // Each file's textual macro scope by definition, for `use name;`
     // imports (`macro_scope`). A dependency's macro has no local def.
     let mut def_of: Vec<Option<DefId>> = vec![None; menv.owned_all.len()];
@@ -3604,6 +3749,22 @@ fn resolve_one(
         use std::hash::Hasher;
         structure.finish()
     };
+    let exported_macros = menv.exported_sources();
+    // The local crate keeps its last round's environment for the body
+    // patch (a daemon session only).
+    if keep_expander {
+        let files = seen_files.into_iter().collect();
+        cache.file_expander = Some(std::sync::Arc::new(FileExpander {
+            resolve: cache.resolves,
+            menv,
+            magic: job.magic,
+            env: input.env.clone(),
+            cargo_env: input.cargo_env.clone(),
+            crate_name: input.crate_name.clone(),
+            display_root: input.display_root.clone(),
+            files,
+        }));
+    }
     let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
     lap!("resolve: chunk scan+concat");
     Ok(CrateOut {
@@ -3617,7 +3778,7 @@ fn resolve_one(
         structure_hash,
         seen,
         std_asks,
-        exported_macros: menv.exported_sources(),
+        exported_macros,
         expand_deps: file_deps.into_iter().flatten().collect(),
         timings,
         scans,

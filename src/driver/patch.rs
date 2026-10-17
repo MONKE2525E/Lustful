@@ -177,6 +177,8 @@ pub(crate) struct PatchBase {
     /// expansion whose tokens or contexts name one may hold spans the
     /// patches moved since (`kept_body`).
     edited: Vec<FileId>,
+    /// The full resolve's per-file expander (`expand_by_file`).
+    file_exp: Option<Arc<crate::resolve::worklist::FileExpander>>,
 }
 
 /// One cfg-disabled node the last full resolve dropped (`Dep::Dropped`).
@@ -343,6 +345,7 @@ impl PatchBase {
             expansions: front.resolve_cache.expansions(),
             kept_bodies: Vec::new(),
             edited: Vec::new(),
+            file_exp: front.resolve_cache.file_expander(),
         }
     }
 
@@ -815,21 +818,35 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let new_hi = (hi as i64 + d) as usize;
     let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo as u32, &front.interner).ok()).ok_or("body lex");
     let (old_body, new_body) = (lex(old.get(lo..hi))?, lex(text.get(lo..new_hi))?);
-    let (old_calls, old_pure) = body_tokens_ok(&old_body, lo, hi, &front.interner)?;
-    let (new_calls, new_pure) = body_tokens_ok(&new_body, lo, new_hi, &front.interner)?;
-    if (old_calls || new_calls) && base.shadowed || (old_pure || new_pure) && base.expand.is_none() {
-        return Err("macro in body");
+    let (old_ok, new_ok) = (body_tokens_ok(&old_body, lo, hi, &front.interner), body_tokens_ok(&new_body, lo, new_hi, &front.interner));
+    // A user macro (or a builtin that is not pure) is the last reason:
+    // any other refusal of either body wins.
+    for r in [&old_ok, &new_ok] {
+        if let Err(why) = r
+            && *why != "body macro"
+        {
+            return Err(why);
+        }
     }
     // Parse and rewrite the new body on its own: an error there (a
     // half-typed edit) gives up before any state changes, so the base
     // stands for the next request. Its pure builtin macros expand first,
     // and a static's init closure hoists into a hidden fn, as the
-    // resolver's token passes do.
+    // resolver's token passes do. A body with other macros takes its
+    // expansion from its whole file's (`expand_by_file`).
     let module = *base.tables.fn_module.get(fn_index).ok_or("state")?;
     let raw = lexer::Lexed { tokens: new_body.tokens.clone(), strings: new_body.strings.clone() };
-    let hoisted = match new_pure {
-        true => expand_pure(front, base, file, text, module, raw)?,
-        false => crate::expand::lazy::hoist_static_closures(raw, &front.interner),
+    let hoisted = match (old_ok, new_ok) {
+        (Ok((old_calls, old_pure)), Ok((new_calls, new_pure))) => {
+            if (old_calls || new_calls) && base.shadowed || (old_pure || new_pure) && base.expand.is_none() {
+                return Err("macro in body");
+            }
+            match new_pure {
+                true => expand_pure(front, base, file, text, module, raw)?,
+                false => crate::expand::lazy::hoist_static_closures(raw, &front.interner),
+            }
+        }
+        _ => expand_by_file(front, base, text, edit, (lo as u32, new_hi as u32), &raw)?,
     };
     let toks = &hoisted.tokens[..hoisted.tokens.len() - 1];
     // A whole parse seeds each nested fn's attributes with the enclosing
@@ -1490,6 +1507,64 @@ fn expand_pure(
         Ok((out, deps)) if deps.iter().all(|d| matches!(d, crate::expand::Dep::Dropped { .. })) => Ok(out),
         _ => Err("body macro"),
     }
+}
+
+/// The expanded tokens (`{` through `}`, then `Eof`) of a new fn body at
+/// bytes `body` of `text` that the patch cannot expand alone (a user macro,
+/// or a builtin that is not pure): the whole new text of the file expands
+/// under the last full resolve's macro environment (`FileExpander`), as a
+/// cold resolve expands it, and the body's tokens are cut out of the
+/// result. A body edit defines no macro and no module (`body_tokens_ok`),
+/// so that environment stands. Gives up (the request resolves in full) on
+/// no expander for the file, the crate root file (std splice), a
+/// `#[macro_use]` module after the edit, a `static` (its init closure
+/// would hoist out of the body), a cfg name error, an expansion error, or
+/// a dependency other than a cfg-dropped node.
+fn expand_by_file(front: &Front, base: &PatchBase, text: &str, edit: Edit, body: (u32, u32), raw: &lexer::Lexed) -> Result<lexer::Lexed, &'static str> {
+    let file = edit.file;
+    let fx = base.file_exp.as_ref().ok_or("body macro")?;
+    if file == FileId(0) || fx.splices_after(file, edit.a) || raw.tokens.iter().any(|t| t.tok == Tok::Static) {
+        return Err("body macro");
+    }
+    if crate::resolve::worklist::check_cfg_names(raw, fx.env(), &front.interner).is_err() {
+        return Err("body macro");
+    }
+    // The other written fn bodies of the file, at their new places.
+    let ast = &front.ast;
+    let at = |s: crate::diag::Span| if s.lo >= edit.b { ((s.lo as i64 + edit.d) as u32, (s.hi as i64 + edit.d) as u32) } else { (s.lo, s.hi) };
+    let mut blank: Vec<(u32, u32)> = base
+        .fns_by_file
+        .get(file.0 as usize)
+        .into_iter()
+        .flatten()
+        .filter_map(|&i| {
+            let (item, sub) = *front.fn_loc.get(i as usize)?;
+            if item == usize::MAX || item >= ast.items.len() {
+                return None;
+            }
+            let span = ast.blocks[fn_def_at(ast, item, sub).body?.0 as usize].span;
+            (span.file == file && span.ctxt == CtxtId::ROOT && span.lo != body.0).then(|| at(span))
+        })
+        .collect();
+    blank.sort_unstable();
+    blank.dedup();
+    if blank.windows(2).any(|w| w[0].1 > w[1].0) {
+        blank.clear();
+    }
+    let (out, deps) = match fx.expand(file, text, &blank, &front.interner, &front.known, &front.client) {
+        Some(Ok(x)) => x,
+        _ => return Err("body macro"),
+    };
+    if !deps.iter().all(|d| matches!(d, crate::expand::Dep::Dropped { .. })) {
+        return Err("body macro");
+    }
+    // The expander gives both delimiters of a group the group's span.
+    let span = crate::diag::Span { file, lo: body.0, hi: body.1, ctxt: CtxtId::ROOT };
+    let i0 = out.tokens.iter().position(|t| t.tok == Tok::LBrace && t.span == span).ok_or("body macro")?;
+    let n = out.tokens[i0..].iter().position(|t| t.tok == Tok::RBrace && t.span == span).ok_or("body macro")?;
+    let mut tokens = out.tokens[i0..=i0 + n].to_vec();
+    tokens.push(lexer::Token { tok: Tok::Eof, span: crate::diag::Span { lo: body.1, ..span } });
+    Ok(lexer::Lexed { tokens, strings: out.strings })
 }
 
 /// The expanded tokens of an unchanged fn body (the old text's bytes
@@ -3621,7 +3696,8 @@ pub fn run() -> i64 {
     /// patch when the body text stands: the body's stored expansion parses
     /// and rewrites with the new header (a param rename, an error and its
     /// fix, a hygienic local in the macro). A body edit in the macro's
-    /// input, a macro definition edit, a header and body edit together,
+    /// input takes the body patch. A macro definition edit, a header and
+    /// body edit together,
     /// or another such fn's header edit after a patch of its file resolve
     /// (a patch of another file does not); the header
     /// edit after the definition edit patches with the new expansion.
@@ -3667,8 +3743,8 @@ pub fn run() -> i64 {
             // patches.
             (tw, tw_w, "resolve", 0),
             (tw_w, tw, "item", 0),
-            (call, call_3, "resolve", 0),
-            (call_3, call, "resolve", 0),
+            (call, call_3, "patch", 0),
+            (call_3, call, "patch", 0),
             (&format!("{ch}\n{call}"), &format!("{ch_w}\n{call_3}"), "resolve", 0),
             (&format!("{ch_w}\n{call_3}"), &format!("{ch}\n{call}"), "resolve", 0),
             (def, def_2, "resolve", 0),
@@ -3679,6 +3755,71 @@ pub fn run() -> i64 {
         for (old, new, path, code) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
             assert_eq!(field(&v, "path"), *path, "{new:?}: {v}");
+            assert_eq!(check(&mut warm, &root).0, *code, "{new:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body edit in a fn that calls user macros takes the body patch:
+    /// its file expands again under the full resolve's macro environment
+    /// (`expand_by_file`). Macros from the crate root (textual scope),
+    /// the same file (one defined after the edit, whose definition moves),
+    /// another file by `$crate` path, hygienic locals, a closure in a
+    /// duplicated `$body`, an error and its fix; another body's local
+    /// `macro_rules!` of the same name stays its own. Refused: an undefined
+    /// macro, a `macro_rules!` or a `static` in the body. Each state is the
+    /// cold answer.
+    #[test]
+    fn user_macro_body_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-umacro-body-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("main.rs");
+        let main = "macro_rules! sq {\n    ($e:expr) => { $e * $e };\n}\n\nmod m0;\nmod m1;\n\n\
+                    fn main() {\n    let t = m0::run() + m1::run();\n    println!(\"{t}\");\n}\n";
+        std::fs::write(&root, main).unwrap();
+        let m1 = "#[macro_export]\nmacro_rules! with_val {\n    ($v:expr, |$d:ident| $body:expr) => {{\n        let v__: i64 = $v;\n        \
+                  match v__ {\n            0 => {\n                let $d = v__;\n                $body\n            }\n            \
+                  _ => (|$d: i64| $body)(v__),\n        }\n    }};\n}\n\npub fn helper(x: i64) -> i64 {\n    x + 1\n}\n\n\
+                  pub fn run() -> i64 {\n    helper(2)\n}\n";
+        std::fs::write(dir.join("m1.rs"), m1).unwrap();
+        let m0 = dir.join("m0.rs");
+        let src = "macro_rules! tw {\n    ($e:expr) => {{ let t = $e; t + t }};\n}\n\n\
+                   pub fn calc(a: i64) -> i64 {\n    let v = tw!(a);\n    v + sq!(a)\n}\n\n\
+                   pub fn pick(n: i64) -> i64 {\n    crate::with_val!(n, |d| d + 1)\n}\n\n\
+                   pub fn shadow() -> i64 {\n    macro_rules! tw {\n        ($e:expr) => { $e * 100 };\n    }\n    tw!(1)\n}\n\n\
+                   macro_rules! late {\n    ($e:expr) => { $e - 1 };\n}\n\n\
+                   pub fn after(n: i64) -> i64 {\n    late!(n) + tw!(n)\n}\n\n\
+                   pub fn run() -> i64 {\n    calc(3) + pick(4) + after(5) + shadow()\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let v0 = "    let v = tw!(a);\n";
+        let steps: &[(&str, &str, &str, i32)] = &[
+            (v0, "    let v = tw!(a + 1);\n", "patch", 0),
+            ("    let v = tw!(a + 1);\n", v0, "patch", 0),
+            // More lines: `late`'s definition after the edit moves.
+            (v0, "    let v = tw!(a);\n    let _w: u32 = tw!(1u32);\n", "patch", 0),
+            ("    let _w: u32 = tw!(1u32);\n", "    let _w: u32 = tw!(1u64);\n", "patch", 1),
+            ("    let _w: u32 = tw!(1u64);\n", "    let _w: u32 = tw!(1u32);\n", "patch", 0),
+            ("    late!(n) + tw!(n)\n", "    late!(n * 2) + tw!(sq!(n))\n", "patch", 0),
+            ("crate::with_val!(n, |d| d + 1)", "crate::with_val!(n, |d| d * 2 + sq!(d))", "patch", 0),
+            ("crate::with_val!(n, |d| d * 2 + sq!(d))", "crate::with_val!(n, |d| d * 2 + t)", "patch", 1),
+            // Hygiene: the macro's own `t` is not the body's.
+            ("crate::with_val!(n, |d| d * 2 + t)", "let t = 7;\n    crate::with_val!(n, |d| d * 2 + t) + tw!(t)", "patch", 0),
+            // A resolve error writes no visits line (`-`: not checked).
+            ("    let _w: u32 = tw!(1u32);\n", "    let _w: u32 = nope!(1u32);\n", "-", 1),
+            ("    let _w: u32 = nope!(1u32);\n", "    let _w: u32 = tw!(1u32);\n", "patch", 0),
+            (v0, "    macro_rules! m2 {\n        () => { 2 };\n    }\n    let v = tw!(a) + m2!();\n", "resolve", 0),
+            ("    let v = tw!(a) + m2!();\n", "    let v = tw!(a) + m2!() + sq!(2);\n", "resolve", 0),
+            ("    macro_rules! m2 {\n        () => { 2 };\n    }\n    let v = tw!(a) + m2!() + sq!(2);\n", v0, "resolve", 0),
+            ("    late!(n * 2) + tw!(sq!(n))\n", "    static S: i64 = 1;\n    late!(n * 2) + S\n", "resolve", 0),
+            ("    static S: i64 = 1;\n    late!(n * 2) + S\n", "    late!(n) + tw!(n)\n", "resolve", 0),
+            (v0, "    let v = tw!(a) - 1;\n", "patch", 0),
+        ];
+        for (old, new, path, code) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert!(*path == "-" || field(&v, "path") == *path, "{new:?}: {v}");
             assert_eq!(check(&mut warm, &root).0, *code, "{new:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);

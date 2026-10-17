@@ -32,6 +32,10 @@
 #   sig_umacro     a fn whose body calls a user macro: header edits with the
 #                  same body (the item patch reuses the body's expansion),
 #                  then a macro input or macro definition edit
+#   sig_umbody     body edits in fns that call user macros (one from the
+#                  same module file, one `#[macro_export]` from the root by
+#                  `crate::` path): the body patch expands the file again
+#                  (`expand_by_file`); errors, hygiene, refused shapes
 #   sig_tdefault   trait default bodies (templates after the AST fns) that
 #                  call a fn and use a derived type: header edits of the fn,
 #                  and a derive drop of a trait a default body uses
@@ -50,7 +54,7 @@ import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
        "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl",
-       "sig_apit", "sig_umacro", "sig_tdefault", "sig_dyn", "sig_samename"]
+       "sig_apit", "sig_umacro", "sig_umbody", "sig_tdefault", "sig_dyn", "sig_samename"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -415,6 +419,43 @@ def sig_umacro(rng, fs):
              (mdef, "{ [$(format!(\"{}\", $x)),*].to_vec() }"),
              (mdef, "{ vec![$($x),*] }")]
     return _header_walk(rng, fs, items, head, edits, extra)
+
+
+def sig_umbody(rng, fs):
+    """Fns whose bodies call user macros, in a module file when the crate
+    has one (the body patch refuses the root file): a textual macro of
+    that file and a root `#[macro_export]` one whose `$body` runs twice
+    (once in a closure). A: the items; then two body edits in a row (the
+    second on the first's text when its anchor stands), back to A, then
+    the files."""
+    k = rng.randrange(10**6)
+    root = _root(fs)
+    mods = [r for r in sorted(fs) if r != root and r.endswith(".rs")]
+    tgt = rng.choice(mods) if mods else root
+    tw, wv = f"zv{k}_tw", f"zv{k}_with"
+    a = dict(fs)
+    a[root] = fs[root] + (f"\n#[macro_export]\nmacro_rules! {wv} {{\n    ($v:expr, |$d:ident| $body:expr) => {{{{\n"
+                          f"        let v__: i64 = $v;\n        match v__ {{\n            0 => {{\n                let $d = v__;\n"
+                          f"                $body\n            }}\n            _ => (|$d: i64| $body)(v__),\n        }}\n    }}}};\n}}\n")
+    a[tgt] = a[tgt] + (f"\nmacro_rules! {tw} {{\n    ($e:expr) => {{{{ let t = $e; t + t }}}};\n}}\n"
+                       f"#[allow(dead_code)]\nfn zv{k}_a(a: i64) -> i64 {{\n    let v = {tw}!(a);\n    v + 1\n}}\n"
+                       f"#[allow(dead_code)]\nfn zv{k}_b(n: i64) -> i64 {{\n    crate::{wv}!(n, |d| d + 1)\n}}\n")
+    va, vb, tail = f"let v = {tw}!(a);", f"crate::{wv}!(n, |d| d + 1)", "    v + 1\n"
+    edits = [(va, f"let v = {tw}!(a + 2);"), (va, f"let v = {tw}!(a);\n    let _w: u32 = {tw}!(1u32);"),
+             (va, f"let v: u32 = {tw}!(a);"), (va, f"let t = 3;\n    let v = {tw}!(a) + t;"),
+             (va, f"let v = {tw}!(a) + {tw}!({tw}!(a));"), (va, f"let v = {tw}!(a) + zv{k}_nope!(1);"),
+             (va, f"macro_rules! zv{k}_in {{\n        () => {{ 4 }};\n    }}\n    let v = {tw}!(a) + zv{k}_in!();"),
+             (vb, f"crate::{wv}!(n, |d| d * 2 + {tw}!(d))"), (vb, f"crate::{wv}!(n, |d| d + t)"),
+             (vb, f"crate::{wv}!(n, |d| d + 1) + {tw}!(n as u8) as i64"),
+             (tail, f"    v + format!(\"{{}}\", {tw}!(1)).len() as i64\n"), (tail, "    v + line!() as i64\n")]
+    def swap(cur, old, new):
+        out = dict(cur)
+        out[tgt] = cur[tgt].replace(old, new, 1)
+        return out
+    e1, e2 = rng.choice(edits), rng.choice(edits)
+    s1 = swap(a, *e1)
+    s2 = swap(s1 if e2[0] in s1[tgt] else a, *e2)
+    return [a, s1, s2, a, fs]
 
 
 def sig_tdefault(rng, fs):
