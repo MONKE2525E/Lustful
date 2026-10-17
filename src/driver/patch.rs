@@ -2437,9 +2437,12 @@ pub(super) fn reuse_kept(
                     let out = crate::check::generics::discovery_out(&p, &checked, &discarded);
                     // An output that differs only in types that make Adt
                     // instances stands when those were made before (`made_before`).
+                    // A body with errors too: collect uses its output as well
+                    // (and notes it unstored), and the driver's check answers
+                    // the errors.
                     let makers = match base.as_ref() {
                         Some(b) if b.same(&p, &out, walk_instances) => Some((Vec::new(), Vec::new())),
-                        Some(b) if discarded.is_empty() && !walks_requests(&p) => b.makers(&out),
+                        Some(b) if !walks_requests(&p) => b.makers(&out),
                         _ => None,
                     };
                     let Some(makers) = makers else {
@@ -2459,9 +2462,13 @@ pub(super) fn reuse_kept(
                         }
                         crate::check::derive_delta::log(&|| format!("kept bases {}: types made before its turn\n", p.display_name(p.fn_def(f).name)));
                     }
+                    let (adt_tys, reqs, closures, vts) = &out;
                     if clean {
-                        let (adt_tys, reqs, closures, vts) = &out;
                         caches.gen_reuse.store_discovered(&p, f, &reads, adt_tys, reqs, closures, vts);
+                    } else if makers.0 != makers.1 {
+                        // As collect notes a body with errors: the program holds this
+                        // output now, not the stored one (`GenReuse::out_copy`).
+                        caches.gen_reuse.note_unstored(&p, f, adt_tys, reqs, closures, vts, None);
                     }
                     caches.gen_reuse.discovery_checked += 1;
                     // Every body type enters the global store, as discovery's
