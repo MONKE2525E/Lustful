@@ -1168,6 +1168,47 @@ def glue_detour(h, rng, text, a):
     return op, failures
 
 
+CONST_FN_LIT = re.compile(r"\bconst\s+fn\s+\w+\s*\(\s*\)\s*->\s*\w+\s*\{\s*(-?\d+)\s*\}")
+
+
+def const_reject_detour(h, rng, text, a):
+    """From `text` (which passed `check`): run it, then break one const
+    fn's literal body (`"bad"`, a reject) and check, give it a new value
+    and check, then run. The last run must show the new value in every
+    const, static and body that reads it (hunt11 21:29: a run after a
+    rejected const fn edit and a passing check kept old values). `text`
+    is written back and checked at the end, so the main stream is the
+    same. Returns (op name, failure count)."""
+    hits = [(m.start(1), m.end(1)) for m in CONST_FN_LIT.finditer(text)]
+    if not hits:
+        return "const_reject_skip", 0
+    s, e = rng.choice(hits)
+    fixed = text[:s] + str(int(text[s:e]) + rng.choice([1, 7, 22])) + text[e:]
+    steps = [(text, "run"), (text[:s] + '"bad"' + text[e:], "check"), (fixed, "check"), (fixed, "run"), (text, "check")]
+    prev = text
+    for i, (v, cmd) in enumerate(steps):
+        if i == 0 or v != prev:
+            h.write(v)
+        ok, why, da, co = compare(h, cmd, a.strict)
+        if ok and why == "program hang":
+            h.kill_daemon()
+            h.start_daemon()
+        if not ok:
+            save_pair(a.out, f"constrej-{i}-{cmd}", prev, v)
+            print(f"FAIL[{cmd} {why}] detour const_reject step {i}\n"
+                  f"  daemon={da[0]} out={da[1][:160]!r} err={da[2][:160]!r}\n"
+                  f"  cold  ={co[0] if co else '-'} out={(co[1][:160] if co else '')!r} "
+                  f"err={(co[2][:160] if co else '')!r}", flush=True)
+            if why in ("daemon hang", "daemon died") or not h.daemon_alive():
+                h.kill_daemon()
+                h.start_daemon()
+            h.write(text)
+            h.run_cmd("check", True)
+            return "const_reject", 1
+        prev = v
+    return "const_reject", 0
+
+
 def crate_text(kind, modules):
     if kind == "small":
         return SMALL_CRATE
@@ -1207,6 +1248,8 @@ def cmd_run(a):
     # Glue gap detours (glue_detour) on their own RNG; they end on the
     # text they started from, so the main stream stays as it was.
     grng = random.Random(a.seed ^ 0x61E6)
+    # Const reject detours (const_reject_detour), the same way.
+    crng = random.Random(a.seed ^ 0xC0C5)
     # `main` return-type edits (make_main_ret_edit) on their own RNG.
     mrng = random.Random(a.seed ^ 0x4D41)
     # Signature-edit pulses (--sig-ops) on their own RNG.
@@ -1332,6 +1375,14 @@ def cmd_run(a):
                 if gf:
                     failures += gf
                     bad_ops[gop] += gf
+                    if a.stop_first:
+                        break
+            if it % 20 == 13 and da[0] == 0:
+                cop, cf = const_reject_detour(h, crng, text, a)
+                ops[cop] += 1
+                if cf:
+                    failures += cf
+                    bad_ops[cop] += cf
                     if a.stop_first:
                         break
             if a.sig_ops and it % 5 == 2:

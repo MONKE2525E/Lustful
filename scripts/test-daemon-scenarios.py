@@ -202,15 +202,26 @@ def scenario(srcdir):
             # consumes the edit, so the build request after it sees an
             # unchanged file. Built state (statics, glue) must still be
             # current (this ordering caught a real statics bug).
-            wkc, _, wkerr = run([LUST, "check", main], work, wenv)
+            # `vN.ops` next to `vN.rs`: the warm requests for this version,
+            # `check`, `run` or both (the default). The cold and rustc
+            # answers are always computed; they do not touch the daemon.
+            ops_path = vpath.removesuffix(".rs") + ".ops"
+            ops = open(ops_path).read().split() if os.path.isfile(ops_path) else ["check", "run"]
+            if "check" in ops:
+                wkc, _, wkerr = run([LUST, "check", main], work, wenv)
             cold_env = dict(wenv, LUST_NO_DAEMON="1")
             ckc, _, ckerr = run([LUST, "check", main], work, cold_env)
+            if "check" not in ops:
+                wkc, wkerr = ckc, ckerr
             # Same rule as the edit fuzzer: both accept, or both reject with the same first code.
             if (wkc == 0) != (ckc == 0) or first_code(wkerr) != first_code(ckerr):
                 problems.append(f"{name} {v}: warm check != cold check: warm rc={wkc} {wkerr[:160]!r}, "
                                 f"cold rc={ckc} {ckerr[:160]!r}")
-            wrc, wout, werr = run([LUST, "run", main, "-o", os.path.join(work, "w.bin")], work, wenv)
             crc, cout, cerr = run([LUST, "run", main, "-o", os.path.join(work, "c.bin")], work, cold_env)
+            if "run" in ops:
+                wrc, wout, werr = run([LUST, "run", main, "-o", os.path.join(work, "w.bin")], work, wenv)
+            else:
+                wrc, wout, werr = crc, cout, cerr
             rrc, rout, _ = run(["rustc", "--edition", "2024", "-C", "panic=abort",
                                 "-C", "overflow-checks=on", main, "-o", os.path.join(work, "r.bin")], work, wenv)
             rustc_ok = rrc == 0
