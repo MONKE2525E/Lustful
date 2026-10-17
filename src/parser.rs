@@ -2074,6 +2074,9 @@ impl<'a> Parser<'a> {
             Tok::LBrace if qual.abi.is_some() && self.cfg_syntax => ItemKind::Mod(self.extern_block_cfg(start)?),
             Tok::LBrace if qual.abi.is_some() => return Err(not_yet(C_EXTERN, start, "extern blocks")),
             Tok::Crate if qual.abi.is_some() => ItemKind::ExternCrate(self.extern_crate_def()?),
+            // In cfg-removed code `const` with no item after it (`const C =
+            // 1;`, a bare `const`) is a grammar error, as in rustc.
+            _ if qual.is_const && self.cfg_syntax => return Err(syntax(start, "expected an item after `const`")),
             _ if qual.is_const => return Err(not_yet(C_CONST, start, "const and static items")),
             _ if qual.is_async => return Err(async_error(start)),
             _ if qual.is_unsafe => return Err(unsafe_error(start)),
@@ -3421,6 +3424,11 @@ impl<'a> Parser<'a> {
             Tok::LBrace => self.block_like_expr(false),
             Tok::Int(..) | Tok::Str(..) | Tok::Char(..) | Tok::True | Tok::False | Tok::Ident(_) | Tok::SelfUpper => {
                 self.primary(false, false)
+            }
+            // A token that starts no expression is a grammar error, also
+            // in cfg-removed code (`<const N: u8 = ;>`).
+            Tok::Semi | Tok::Comma | Tok::Gt | Tok::Eq | Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Eof => {
+                Err(syntax(self.span(), format!("expected a const argument, found {}", tok_name(self.peek()))))
             }
             _ => Err(self.reject(C_CONST, "const generic arguments in this form")),
         }
@@ -5140,7 +5148,9 @@ impl<'a> Parser<'a> {
                 if self.peek() == Tok::LBrace {
                     Expr::ConstBlock(self.block()?)
                 } else {
-                    return Err(not_yet(C_CONST, start, "inline const blocks"));
+                    // No expression starts `const` without a block: a
+                    // grammar error, also in cfg-removed code (rustc).
+                    return Err(syntax(self.span(), format!("expected `{{` after `const`, found {}", tok_name(self.peek()))));
                 }
             }
             Tok::Let if self.let_ok => {
