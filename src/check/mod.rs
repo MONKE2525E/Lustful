@@ -1650,6 +1650,10 @@ pub struct Checked<'g> {
     /// The const value of an expression the checker evaluated (a const item
     /// reference or an inline const block), parallel to `expr_ty`.
     pub const_exprs: Vec<Option<crate::ty::consteval::ConstValue>>,
+    /// The anonymous consts of written types and paths in this body that
+    /// the checker typed as code (`Ctx::type_anon_const`): lowering
+    /// borrow-checks each as a body of its own.
+    pub anon_exprs: Vec<ExprId>,
     /// The promotion qualifs of const item paths (`ty::constqual`),
     /// by expression; a const path with none qualifies by its type
     /// (a trait associated const: rustc does not look inside it).
@@ -2240,6 +2244,10 @@ struct Ctx<'p> {
     /// bindings between the mark and the end of `scopes` belong
     /// to that one pattern and may not repeat a name.
     pat_marks: Vec<usize>,
+    /// Inside a const context (an inline const, a repeat count, an
+    /// anonymous const of a written type): the number of locals declared
+    /// before it, which it may not name (rustc E0435). 0 outside.
+    const_floor: u32,
 }
 
 /// One name bound by a pattern alternative, with the checker
@@ -2445,6 +2453,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             pat_base: def.pats.0,
             expr_ty: vec![ERROR; n_exprs],
             const_exprs: vec![None; n_exprs],
+            anon_exprs: Vec::new(),
             const_quals: Default::default(),
             expr_res: vec![Res::None; n_exprs],
             coerce: vec![Coerce::None; n_exprs],
@@ -2594,6 +2603,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         or_frames: Vec::new(),
         or_log: None,
         pat_marks: Vec::new(),
+        const_floor: 0,
     };
     if let Some(sibs) = p.fn_siblings.get(&fid) {
         let layer: Vec<((Sym, CtxtId), u32)> = sibs
@@ -2763,6 +2773,14 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         } else {
             cx.coerce_at(body_ty, fn_ret, body_span, None);
         }
+    }
+    // An anonymous const's value gets the evaluator's static
+    // const-context checks, as a const item's does (`const_scan`).
+    if matches!(cx.f.loc, FnLoc::AnonConst(_))
+        && let Some(tail) = def.body.and_then(|b| p.ast.block(b).tail)
+    {
+        let want = cx.fn_ret;
+        cx.const_scan(tail, Some(want));
     }
     cx.push_opaque_bounds(ret_span);
     cx.finish();
@@ -3162,6 +3180,58 @@ impl<'p> Ctx<'p> {
             return None;
         }
         Some(self.scopes[at].1)
+    }
+
+    /// Runs `f` in a const context: the locals declared so far are out
+    /// of its scope (`const_floor`).
+    fn in_const<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = std::mem::replace(&mut self.const_floor, self.out.locals.len() as u32);
+        let r = f(self);
+        self.const_floor = outer;
+        r
+    }
+
+    /// rustc E0435: a const context names a local of the fn around it.
+    fn non_const_local(&mut self, span: Span) -> Ty {
+        self.err(
+            "L0634",
+            span,
+            "attempt to use a non-constant value in a constant",
+            "Use a `const` item, or compute the value outside the const context.",
+        );
+        ERROR
+    }
+
+    /// Types an anonymous const of a written type or path in this body
+    /// (an array length, a const argument) as code in a const context,
+    /// once, with type `want` when known. Lowering borrow-checks it as a
+    /// body of its own (`Checked::anon_exprs`). Literals and plain names
+    /// need neither.
+    fn type_anon_const(&mut self, e: ExprId, want: Option<Ty>) {
+        if self.p.ast.is_plain_const(e) || self.out.anon_exprs.contains(&e) {
+            return;
+        }
+        self.out.anon_exprs.push(e);
+        self.in_const(|cx| match want {
+            Some(t) => cx.expect_expr(e, t),
+            None => cx.expr(e, None),
+        });
+        self.const_scan(e, want);
+    }
+
+    /// Runs the bounded evaluator over const expression `e` for its
+    /// static const-context errors only: a call to a non-const fn or a
+    /// destructor run, dead branches included (rustc E0015, E0493). The
+    /// value and any other evaluator limit stay with the scalar paths.
+    fn const_scan(&mut self, e: ExprId, want: Option<Ty>) {
+        let errs = self.errs.len();
+        let mut ccx = CheckCx { cx: self };
+        if let Err(d) = crate::ty::consteval::eval(&mut ccx, e, want)
+            && (crate::ty::consteval::is_nonconst_call_diag(&d) || crate::ty::consteval::is_drop_diag(&d))
+            && self.errs.len() == errs
+        {
+            self.errs.push(d);
+        }
     }
 
     // Cross-item reads go through the section 8.2 query functions on
@@ -4749,6 +4819,7 @@ impl<'p> Ctx<'p> {
                             self.errs.push(d);
                             return self.error_args(&generics);
                         }
+                        self.type_anon_const(*e, Some(want.ty()));
                     }
                     Some(g)
                 }
@@ -8227,7 +8298,14 @@ impl<'p> Ctx<'p> {
         }
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let span = p.ast.ty_span(t);
-        match generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, t, &self.body_scope.clone()) {
+        let resolved = generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, t, &self.body_scope.clone());
+        if resolved.is_ok() {
+            for (e, want) in crate::check::const_body::written_anon_consts(p, t) {
+                let want = want.map(|w| w.ty());
+                self.type_anon_const(e, want);
+            }
+        }
+        match resolved {
             Ok(t) => {
                 let t = self.instantiate_infers(t);
                 if let Some(d) = object::dyn_type_diag(p, &self.tys, t, span) {
@@ -8533,7 +8611,11 @@ impl<'p> Ctx<'p> {
                         continue;
                     }
                     let scope = &self.body_scope;
-                    generics::check_const_expr_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, scope, *x, *c, want, span, "").is_ok()
+                    let fits = generics::check_const_expr_ty(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, scope, *x, *c, want, span, "").is_ok();
+                    if fits {
+                        self.type_anon_const(*x, Some(want.ty()));
+                    }
+                    fits
                 }
                 // A bare name in a const position (`f::<L>`).
                 ast::GenericArg::Type(t) => match p.ast.ty(*t) {
@@ -8804,6 +8886,7 @@ impl<'p> Ctx<'p> {
             }
             Expr::Unit => UNIT,
             Expr::SelfValue => match self.lookup(p.known.self_value, span.ctxt) {
+                Some(l) if l < self.const_floor => self.non_const_local(span),
                 Some(l) => {
                     self.set_res(e, Res::Local(l));
                     self.out.locals[l as usize].ty
@@ -9837,7 +9920,7 @@ impl<'p> Ctx<'p> {
                 let elem = self.expr(*value, exp_elem);
                 self.reject_unsized_value(*value);
                 let errs_before = self.errs.len();
-                self.expect_expr(*len, USIZE);
+                self.in_const(|cx| cx.expect_expr(*len, USIZE));
                 // A const param length (`[x; N]`): symbolic in the template
                 // check, the instance's value in an instance. The element
                 // must be Copy or a const, as for any length above 1.
@@ -9881,7 +9964,11 @@ impl<'p> Ctx<'p> {
                 // The scalar subset first; then the full bounded
                 // evaluator, so size_of calls, const items, and const
                 // fn calls all give lengths in expression position.
-                let n = crate::check::collect::eval_array_len(&p.ast, &p.interner, &p.known, *len).or_else(|| {
+                let scalar = crate::check::collect::eval_array_len(&p.ast, &p.interner, &p.known, *len);
+                if scalar.is_some() && self.errs.len() == errs_before && !p.ast.is_plain_const(*len) {
+                    self.const_scan(*len, Some(USIZE));
+                }
+                let n = scalar.or_else(|| {
                     if self.errs.len() != errs_before {
                         return None;
                     }
@@ -9986,7 +10073,7 @@ impl<'p> Ctx<'p> {
                         // The block is typed as code too: lowering
                         // borrow-checks it as a body of its own
                         // (lower.rs `check_anon_consts`).
-                        let bt = self.block(b, Some(t));
+                        let bt = self.in_const(|cx| cx.block(b, Some(t)));
                         self.unify(bt, t);
                         t
                     }
@@ -9996,7 +10083,7 @@ impl<'p> Ctx<'p> {
                     // instance evaluates it with its own types (a failing
                     // assert is then a build error, as rustc's post-mono
                     // error is).
-                    Err(d) if d.code == "L0652" && ccx.cx.is_template_check() => self.block(b, expected),
+                    Err(d) if d.code == "L0652" && ccx.cx.is_template_check() => self.in_const(|cx| cx.block(b, expected)),
                     Err(d) => {
                         ccx.cx.errs.push(d);
                         ERROR
@@ -11531,6 +11618,9 @@ impl<'p> Ctx<'p> {
         if segs.len() == 1 {
             let name = segs[0].name;
             if let Some(l) = self.lookup(name, span.ctxt) {
+                if l < self.const_floor {
+                    return self.non_const_local(span);
+                }
                 self.set_res(e, Res::Local(l));
                 return self.out.locals[l as usize].ty;
             }

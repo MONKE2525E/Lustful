@@ -5104,9 +5104,16 @@ impl Rewrite<'_> {
                         self.ty(ast, d, module, &[]);
                     }
                 }
-                crate::ast::GenericParam::Const { ty, .. } => {
+                crate::ast::GenericParam::Const { ty, default, .. } => {
                     let ty = *ty;
                     self.ty(ast, ty, module, &[]);
+                    // A default with a body of its own resolves like a
+                    // const argument (`check/const_body.rs` checks it).
+                    if let Some(d) = *default
+                        && anon_const_module(ast, d, module)
+                    {
+                        self.expr(ast, d, module, &mut vec![Frame::default()]);
+                    }
                 }
                 crate::ast::GenericParam::Lifetime { .. } => {}
             }
@@ -5168,6 +5175,7 @@ impl Rewrite<'_> {
                     self.gen_params.truncate(mark);
                     let mut scopes = vec![Frame::default()];
                     for d in discs {
+                        anon_const_module(ast, d, module);
                         self.expr(ast, d, module, &mut scopes);
                     }
                 }
@@ -5931,6 +5939,7 @@ impl Rewrite<'_> {
         // A const argument's paths resolve like an array length's:
         // in this module, with no locals in scope.
         for e in consts {
+            anon_const_module(ast, e, module);
             let mut scopes = vec![Frame::default()];
             self.expr(ast, e, module, &mut scopes);
         }
@@ -6166,6 +6175,7 @@ impl Rewrite<'_> {
             TyExpr::Array { inner, len } => {
                 let (inner, len) = (*inner, *len);
                 self.ty(ast, inner, module, scopes);
+                anon_const_module(ast, len, module);
                 let mut scopes = vec![Frame::default()];
                 self.expr(ast, len, module, &mut scopes);
             }
@@ -6338,6 +6348,7 @@ impl Rewrite<'_> {
                 }
                 self.gen_params.truncate(mark);
                 for d in discs {
+                    anon_const_module(ast, d, module);
                     let mut scopes = outer.to_vec();
                     self.expr(ast, d, module, &mut scopes);
                 }
@@ -7728,6 +7739,14 @@ fn has_let(ast: &Ast, e: ExprId) -> bool {
         Expr::Binary { op: BinOp::And, lhs, rhs } => has_let(ast, *lhs) || has_let(ast, *rhs),
         _ => false,
     }
+}
+
+/// Records `module` on the anonymous const whose value is `e`, if it
+/// has an `Ast::anon_consts` entry. Returns whether it has one.
+fn anon_const_module(ast: &mut Ast, e: crate::ast::ExprId, module: ModuleId) -> bool {
+    let Some(i) = ast.anon_const(e) else { return false };
+    ast.anon_consts[i as usize].module = Some(module);
+    true
 }
 
 /// The generic-argument const expr ids under one segment's args.

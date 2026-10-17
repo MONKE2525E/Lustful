@@ -104,6 +104,9 @@ pub struct Parser<'a> {
     /// (`Extend<<T as Tr>::Item>`). The lexer makes each one token;
     /// rustc splits it in these positions.
     split: Option<(Tok, Span)>,
+    /// True inside a fn body or a const value: an anonymous const there
+    /// is checked with its body, so it gets no `Ast::anon_consts` entry.
+    in_body: bool,
 }
 
 /// The deepest nesting lust parses (parentheses, prefix operators, blocks, types,
@@ -151,6 +154,7 @@ pub fn leading_allows(lexed: &Lexed, interner: &Interner, known: &Known) -> Vec<
         cfg_syntax: false,
         cfg_foreign: false,
         split: None,
+        in_body: false,
     };
     match p.inner_attributes() {
         Ok(inner) => inner.attrs.iter().filter(|a| is_allow(a, known)).cloned().collect(),
@@ -231,6 +235,7 @@ fn parse_tokens(
         cfg_syntax,
         cfg_foreign: false,
         split: None,
+        in_body: false,
     };
     p.ast.strings = strings;
     p.ast.reserve_for_tokens(toks.len());
@@ -360,10 +365,12 @@ pub fn parse_body_seeded(
         cfg_syntax: false,
         cfg_foreign: false,
         split: None,
+        in_body: false,
     };
     let (e0, p0) = (p.ast.exprs.len() as u32, p.ast.pats.len() as u32);
     // A fn body block permits inner attributes at its start.
     p.block_inner_ok = true;
+    p.in_body = true;
     let body = p.block();
     let ranges = ((e0, p.ast.exprs.len() as u32), (p0, p.ast.pats.len() as u32));
     let deferred = p.deferred.take();
@@ -405,6 +412,7 @@ fn probe_with(toks: &[Token], strings: &[String], interner: &Interner, known: &K
         cfg_syntax: false,
         cfg_foreign: false,
         split: None,
+        in_body: false,
     };
     f(&mut p)
 }
@@ -444,6 +452,7 @@ pub fn probe_expr_end(toks: &[Token], strings: &[String], interner: &Interner, k
         cfg_syntax: false,
         cfg_foreign: false,
         split: None,
+        in_body: false,
     };
     match p.expr() {
         Ok(_) => Ok(p.pos),
@@ -1976,6 +1985,14 @@ impl<'a> Parser<'a> {
     }
 
     fn item(&mut self) -> PResult<Option<Item>> {
+        let outer = std::mem::replace(&mut self.in_body, false);
+        let item = self.item_here();
+        self.in_body = outer;
+        item
+    }
+
+    /// `item` with `in_body` cleared.
+    fn item_here(&mut self) -> PResult<Option<Item>> {
         let start = self.span();
         let parsed = self.attributes()?;
         let derives = parsed.derives.clone();
@@ -2295,12 +2312,24 @@ impl<'a> Parser<'a> {
             return Ok((None, None));
         }
         let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
-        let value = self.expr()?;
+        let outer = std::mem::replace(&mut self.in_body, true);
+        let value = self.expr();
+        self.in_body = outer;
+        let value = value?;
+        let def = self.value_body(name, name_span, value, e0, p0);
+        Ok((Some(value), Some(Box::new(def))))
+    }
+
+    /// A fn with no parameters over the expr and pat ids from `e0` and
+    /// `p0` on, whose body is a block with `value` as its tail: the
+    /// check-only body of a const value (`ConstDef::init_fn`,
+    /// `AnonConst::def`).
+    fn value_body(&mut self, name: Sym, name_span: Span, value: ExprId, e0: u32, p0: u32) -> FnDef {
         let exprs = (e0, self.ast.exprs.len() as u32);
         let pats = (p0, self.ast.pats.len() as u32);
         let span = self.ast.expr_span(value);
         let body = self.push_block(Block { inner_attrs: Vec::new(), stmts: Vec::new(), tail: Some(value), tail_attrs: Vec::new(), span });
-        let def = FnDef {
+        FnDef {
             name,
             name_span,
             is_test: false,
@@ -2316,8 +2345,24 @@ impl<'a> Parser<'a> {
             body: Some(body),
             exprs,
             pats,
-        };
-        Ok((Some(value), Some(Box::new(def))))
+        }
+    }
+
+    /// Parses an anonymous const's expression with `parse`. Outside fn
+    /// bodies, one that is no literal or one-segment path also becomes
+    /// a body of its own (`Ast::anon_consts`).
+    fn anon_const(&mut self, parse: impl FnOnce(&mut Self) -> PResult<ExprId>) -> PResult<ExprId> {
+        let (e0, p0) = (self.ast.exprs.len() as u32, self.ast.pats.len() as u32);
+        let outer = std::mem::replace(&mut self.in_body, true);
+        let value = parse(self);
+        self.in_body = outer;
+        let value = value?;
+        if !outer && !self.ast.is_plain_const(value) && !self.cfg_syntax {
+            let span = self.ast.expr_span(value);
+            let def = self.value_body(Sym(0), span, value, e0, p0);
+            self.ast.anon_consts.push(AnonConst { value, def, module: None });
+        }
+        Ok(value)
     }
 
     /// A `static` item: `static [mut] NAME: Ty = value;`.
@@ -2765,7 +2810,10 @@ impl<'a> Parser<'a> {
             self.block_inner_ok = false;
             None
         } else {
-            Some(self.block()?)
+            let outer = std::mem::replace(&mut self.in_body, true);
+            let body = self.block();
+            self.in_body = outer;
+            Some(body?)
         };
         // Patterns are not allowed in functions without bodies
         // (rustc E0642): a trait signature takes plain names and
@@ -2902,7 +2950,7 @@ impl<'a> Parser<'a> {
                 Tok::LBrace => VariantFields::Struct(self.fields()?),
                 _ => VariantFields::Unit,
             };
-            let discriminant = if self.eat(Tok::Eq) { Some(self.expr()?) } else { None };
+            let discriminant = if self.eat(Tok::Eq) { Some(self.anon_const(|p| p.expr())?) } else { None };
             variants.push(VariantDef { name: vname, attrs: vattrs.attrs, fields, discriminant, span });
             if !self.eat(Tok::Comma) {
                 break;
@@ -3240,7 +3288,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let inner = self.ty()?;
                 if self.eat(Tok::Semi) {
-                    let len = self.expr()?;
+                    let len = self.anon_const(|p| p.expr())?;
                     self.expect(Tok::RBracket, "`]`")?;
                     Ok(self.push_ty(TyExpr::Array { inner, len }, start.to(self.prev_span())))
                 } else {
@@ -3419,6 +3467,11 @@ impl<'a> Parser<'a> {
     /// block. Anything that would need an operator must be braced,
     /// as in Rust, so `>` is never eaten as a comparison here.
     fn const_arg_expr(&mut self) -> PResult<ExprId> {
+        self.anon_const(|p| p.const_arg_form())
+    }
+
+    /// `const_arg_expr` without the anonymous const entry.
+    fn const_arg_form(&mut self) -> PResult<ExprId> {
         match self.peek() {
             Tok::Minus => self.prefix(false),
             Tok::LBrace => self.block_like_expr(false),

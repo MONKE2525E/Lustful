@@ -10,6 +10,14 @@
 // checker, lowering and borrowck on it, and removes the entries again, so
 // nothing after collect (mono, the driver, codegen) sees them.
 //
+// Anonymous consts outside fn bodies (array lengths in types, const
+// generic arguments and defaults, enum discriminants) are bodies too
+// (`ast::AnonConst`): collect records the ones it meets in signatures
+// with the type their position gives (`GenTables::anon_wants`), and each
+// is checked here the same way, so a dead branch the scalar evaluator
+// skips still gets type, mutability and borrow errors. Anonymous consts
+// inside bodies are checked with their body (lower.rs `anon_consts`).
+//
 // Lowering knows these bodies by their location (`FnLoc::is_const_init`):
 // the temporaries the value extends (`&Vec::new()`, `&S { .. }`) live in
 // static storage, as rustc's do in a const initializer, so a borrow of one
@@ -18,7 +26,7 @@
 // calls only) stay with the evaluator.
 
 use super::collect::{FnInfo, FnLoc, ParentGen, Program, apply_stmt_overlay};
-use super::generics::{self, FnClass, FnScope, FnTemplate};
+use super::generics::{self, ConstScalar, FnClass, FnScope, FnTemplate};
 use crate::ast::{self, ItemKind};
 use crate::def::{DefId, LocalDefId};
 use crate::diag::{Diag, Span};
@@ -29,12 +37,22 @@ use crate::ty::{AdtId, GenericArg, Region, Ty, TyIntern, TyKind};
 /// generics and scope it is checked under, and its item's span.
 struct Site {
     loc: FnLoc,
-    ty: ast::TyId,
+    ty: SiteTy,
     parent: ParentGen,
     owner: Option<AdtId>,
     /// The trait of a trait default: the body may use `Self: Trait`.
     trait_def: Option<DefId>,
+    /// The body items an anonymous const inside a body item may name.
+    loc_sibs: Option<Vec<u32>>,
     span: Span,
+}
+
+/// The type an initializer body returns: its item's written type, or the
+/// type of an anonymous const's position (None: the position gives none;
+/// the scalar checks in collect type the value then).
+enum SiteTy {
+    Written(ast::TyId),
+    Scalar(Option<ConstScalar>),
 }
 
 /// Type- and borrow-checks every const and static initializer of the
@@ -46,20 +64,20 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
 }
 
 /// `check_all` for a kept program after a header or derive delta: only
-/// the bodies whose stored reads moved check again (all of them when the
-/// program records no reads).
+/// the bodies whose stored reads moved check again, and the ones with no
+/// stored reads (an anonymous const of an edited signature); all of them
+/// when the program records no reads.
 pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>) {
     if !p.record_reads {
         return check_all(p, errs);
     }
     let mut memo = crate::intern::FxMap::default();
     let reads = std::mem::take(&mut p.const_body_reads);
+    let known: std::collections::HashSet<FnLoc> = reads.iter().map(|(l, _)| *l).collect();
     let (dirty, clean): (Vec<_>, Vec<_>) = reads.into_iter().partition(|(_, r)| p.reads_dirty_memo(r, &mut memo) != 0);
     p.const_body_reads = clean;
-    let dirty: Vec<FnLoc> = dirty.into_iter().map(|(l, _)| l).collect();
-    if !dirty.is_empty() {
-        check_sites(p, errs, &|l| dirty.contains(&l));
-    }
+    let dirty: std::collections::HashSet<FnLoc> = dirty.into_iter().map(|(l, _)| l).collect();
+    check_sites(p, errs, &|l| dirty.contains(&l) || !known.contains(&l));
 }
 
 /// Checks the initializer bodies `keep` selects and stores their reads.
@@ -130,6 +148,7 @@ pub fn module_of(p: &Program, f: LocalDefId) -> Option<ModuleId> {
             _ => return root,
         },
         FnLoc::NestedConst(i) => item_span(&p.ast.stmt_items[i as usize])?,
+        FnLoc::AnonConst(i) => return p.ast.anon_consts[i as usize].module.or(root),
         _ => return None,
     };
     if let Some(&m) = tables.const_init_module.get(&span) {
@@ -163,7 +182,7 @@ fn item_span(item: &ast::Item) -> Option<Span> {
 /// checked as a fn already.
 fn sites(p: &Program) -> Vec<Site> {
     let ast = &*p.ast;
-    let plain = |loc, ty, span| Site { loc, ty, parent: ParentGen::default(), owner: None, trait_def: None, span };
+    let plain = |loc, ty, span| Site { loc, ty: SiteTy::Written(ty), parent: ParentGen::default(), owner: None, trait_def: None, loc_sibs: None, span };
     let tls = |item: &ast::Item| super::tls::key_form(&item.attrs, &p.interner).is_some();
     let mut out = Vec::new();
     for (i, item) in ast.items.iter().enumerate() {
@@ -176,7 +195,7 @@ fn sites(p: &Program) -> Vec<Site> {
                 let owner = parent.scope.self_ty.and_then(|t| p.tys.local_adt(t));
                 for (k, c) in imp.consts.iter().enumerate().filter(|(_, c)| c.init_fn.is_some()) {
                     let loc = FnLoc::ImplConst(i, k as u32);
-                    out.push(Site { loc, ty: c.ty, parent: parent.clone(), owner, trait_def: None, span: c.span });
+                    out.push(Site { loc, ty: SiteTy::Written(c.ty), parent: parent.clone(), owner, trait_def: None, loc_sibs: None, span: c.span });
                 }
             }
             ItemKind::Trait(t) if t.consts.iter().any(|c| c.init_fn.is_some()) => {
@@ -185,7 +204,7 @@ fn sites(p: &Program) -> Vec<Site> {
                 let parent = ParentGen { generics: rec.generics.clone(), scope: scope.clone(), impl_item: None };
                 for (k, c) in t.consts.iter().enumerate().filter(|(_, c)| c.init_fn.is_some()) {
                     let loc = FnLoc::TraitConst(i, k as u32);
-                    out.push(Site { loc, ty: c.ty, parent: parent.clone(), owner: None, trait_def: Some(td), span: c.span });
+                    out.push(Site { loc, ty: SiteTy::Written(c.ty), parent: parent.clone(), owner: None, trait_def: Some(td), loc_sibs: None, span: c.span });
                 }
             }
             _ => {}
@@ -201,19 +220,279 @@ fn sites(p: &Program) -> Vec<Site> {
         apply_stmt_overlay(p, &mut site.parent.scope, item.span);
         out.push(site);
     }
+    out.extend(anon_sites(p));
     out.retain(|s| p.shipped_crate_at(s.span).is_none() && !p.in_lang_methods(s.span));
     out
+}
+
+/// The anonymous consts written in live items' signatures (`SigWalk`).
+/// One inside a non-generic impl sees its `Self` (rustc allows no
+/// generic `Self` or parameter there); one in an item inside a fn body
+/// sees the items of the blocks around it, as a nested const does. A
+/// const argument or default takes the type collect saw for it
+/// (`GenTables::anon_wants`).
+fn anon_sites(p: &Program) -> Vec<Site> {
+    let ast = &*p.ast;
+    if ast.anon_consts.is_empty() {
+        return Vec::new();
+    }
+    let wants = p.gx.anon_wants.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut out = Vec::new();
+    let mut push = |roots: Vec<(ast::ExprId, Option<ConstScalar>)>, parent: &ParentGen, sibs: Option<&Vec<u32>>| {
+        for (e, want) in roots {
+            let Some(i) = ast.anon_const(e) else { continue };
+            let want = want.or_else(|| wants.get(&e.0).copied().flatten());
+            out.push(Site {
+                loc: FnLoc::AnonConst(i),
+                ty: SiteTy::Scalar(want),
+                parent: parent.clone(),
+                owner: parent.scope.self_ty.and_then(|t| p.tys.local_adt(t)),
+                trait_def: None,
+                loc_sibs: sibs.cloned(),
+                span: ast.expr_span(e),
+            });
+        }
+    };
+    for (k, item) in ast.items.iter().enumerate() {
+        let roots = SigWalk::roots(ast, &p.interner, item);
+        if roots.is_empty() {
+            continue;
+        }
+        let parent = match &item.kind {
+            ItemKind::Impl(imp) if imp.generics.params.is_empty() => p.impl_parents.get(&(k as u32)).cloned().unwrap_or_default(),
+            _ => ParentGen::default(),
+        };
+        push(roots, &parent, None);
+    }
+    for (k, item) in ast.stmt_items.iter().enumerate() {
+        let roots = SigWalk::roots(ast, &p.interner, item);
+        if roots.is_empty() {
+            continue;
+        }
+        let mut parent = ParentGen::default();
+        apply_stmt_overlay(p, &mut parent.scope, item.span);
+        push(roots, &parent, p.scope_of_stmt.get(&(k as u32)));
+    }
+    out
+}
+
+/// Walks one item's signature (generics, field, parameter and alias
+/// types, impl and trait headers, discriminants) for the values of
+/// anonymous consts with a body (`Ast::anon_consts`): an array length
+/// is a `usize`, a discriminant its repr type, a const argument or
+/// default unknown here. Bodies are not walked: their anonymous consts
+/// are checked with them.
+struct SigWalk<'a> {
+    ast: &'a ast::Ast,
+    /// Also the values with no entry (a type written in a body).
+    all: bool,
+    out: Vec<(ast::ExprId, Option<ConstScalar>)>,
+}
+
+/// The anonymous consts of a type written in a body (`let x: [u8; ..]`),
+/// with the type each must have when known: the body checker types them
+/// (`Ctx::type_anon_const`). A const argument takes the type its
+/// parameter gave when the type resolved (`GenTables::anon_wants`).
+pub(crate) fn written_anon_consts(p: &Program, t: ast::TyId) -> Vec<(ast::ExprId, Option<ConstScalar>)> {
+    let mut w = SigWalk { ast: &p.ast, all: true, out: Vec::new() };
+    w.ty(t);
+    if w.out.iter().any(|(_, want)| want.is_none()) {
+        let wants = p.gx.anon_wants.lock().unwrap_or_else(|e| e.into_inner());
+        for (e, want) in &mut w.out {
+            *want = want.or_else(|| wants.get(&e.0).copied().flatten());
+        }
+    }
+    w.out
+}
+
+impl SigWalk<'_> {
+    fn roots(ast: &ast::Ast, interner: &crate::intern::Interner, item: &ast::Item) -> Vec<(ast::ExprId, Option<ConstScalar>)> {
+        let mut w = SigWalk { ast, all: false, out: Vec::new() };
+        w.item(interner, item);
+        w.out
+    }
+
+    fn root(&mut self, e: ast::ExprId, want: Option<ConstScalar>) {
+        if if self.all { !self.ast.is_plain_const(e) } else { self.ast.anon_const(e).is_some() } {
+            self.out.push((e, want));
+        }
+    }
+
+    fn item(&mut self, interner: &crate::intern::Interner, item: &ast::Item) {
+        let fields = |w: &mut Self, vf: &ast::VariantFields| {
+            if let ast::VariantFields::Tuple(fs) | ast::VariantFields::Struct(fs) = vf {
+                fs.iter().for_each(|f| w.ty(f.ty));
+            }
+        };
+        match &item.kind {
+            ItemKind::Fn(d) => self.fn_sig(d),
+            ItemKind::Struct(s) => {
+                self.generics(&s.generics, &s.where_clause);
+                fields(self, &s.fields);
+            }
+            ItemKind::Union(u) => {
+                self.generics(&u.generics, &u.where_clause);
+                u.fields.iter().for_each(|f| self.ty(f.ty));
+            }
+            ItemKind::Enum(e) => {
+                self.generics(&e.generics, &e.where_clause);
+                let repr = ConstScalar::Int(super::collect::disc_want_ty(interner, &item.attrs));
+                for v in &e.variants {
+                    fields(self, &v.fields);
+                    if let Some(d) = v.discriminant {
+                        self.root(d, Some(repr));
+                    }
+                }
+            }
+            ItemKind::Type(a) => {
+                self.generics(&a.generics, &a.where_clause);
+                self.ty(a.ty);
+            }
+            ItemKind::Const(c) => self.ty(c.ty),
+            ItemKind::Static(s) => self.ty(s.ty),
+            ItemKind::Impl(imp) => {
+                self.generics(&imp.generics, &imp.where_clause);
+                if let Some(tr) = &imp.trait_ref {
+                    self.segs(&tr.path);
+                }
+                self.ty(imp.self_ty);
+                imp.fns.iter().for_each(|f| self.fn_sig(f));
+                imp.consts.iter().for_each(|c| self.ty(c.ty));
+                for t in &imp.types {
+                    self.generics(&t.generics, &t.where_clause);
+                    self.bounds(&t.bounds);
+                    t.default.into_iter().for_each(|d| self.ty(d));
+                }
+            }
+            ItemKind::Trait(t) => {
+                self.generics(&t.generics, &t.where_clause);
+                self.bounds(&t.bounds);
+                t.fns.iter().for_each(|f| self.fn_sig(f));
+                t.consts.iter().for_each(|c| self.ty(c.ty));
+                for a in &t.types {
+                    self.generics(&a.generics, &a.where_clause);
+                    self.bounds(&a.bounds);
+                    a.default.into_iter().for_each(|d| self.ty(d));
+                }
+            }
+            ItemKind::ExternBlock(b) => {
+                for fi in &b.items {
+                    match fi {
+                        ast::ForeignItem::Fn(d) => self.fn_sig(d),
+                        ast::ForeignItem::Static(s) => self.ty(s.ty),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn fn_sig(&mut self, d: &ast::FnDef) {
+        self.generics(&d.generics, &d.where_clause);
+        if let Some(t) = d.self_param.as_ref().and_then(|s| s.ty) {
+            self.ty(t);
+        }
+        d.params.iter().for_each(|p| self.ty(p.ty));
+        d.ret.into_iter().for_each(|t| self.ty(t));
+    }
+
+    fn generics(&mut self, g: &ast::Generics, w: &ast::WhereClause) {
+        for param in &g.params {
+            match param {
+                ast::GenericParam::Type { bounds, default, .. } => {
+                    self.bounds(bounds);
+                    default.into_iter().for_each(|&t| self.ty(t));
+                }
+                ast::GenericParam::Const { ty, default, .. } => {
+                    self.ty(*ty);
+                    default.into_iter().for_each(|&e| self.root(e, None));
+                }
+                ast::GenericParam::Lifetime { .. } => {}
+            }
+        }
+        for pred in &w.preds {
+            if let ast::WherePred::Type { ty, bounds, .. } = pred {
+                self.ty(*ty);
+                self.bounds(bounds);
+            }
+        }
+    }
+
+    fn bounds(&mut self, bounds: &[ast::TraitBound]) {
+        for b in bounds {
+            if let ast::TraitBound::Trait { trait_ref, .. } = b {
+                self.segs(&trait_ref.path);
+            }
+        }
+    }
+
+    fn segs(&mut self, segs: &[ast::PathSeg]) {
+        for s in segs {
+            match &s.args {
+                ast::GenericArgs::Angle(args) => {
+                    for a in args {
+                        match a {
+                            ast::GenericArg::Type(t) => self.ty(*t),
+                            ast::GenericArg::Const(e) => self.root(*e, None),
+                            ast::GenericArg::Binding { kind, .. } => match kind {
+                                ast::BindingKind::EqTy(t) => self.ty(*t),
+                                ast::BindingKind::EqConst(e) => self.root(*e, None),
+                                ast::BindingKind::Constraint(b) => self.bounds(b),
+                            },
+                            ast::GenericArg::Lifetime(_) => {}
+                        }
+                    }
+                }
+                ast::GenericArgs::Parenthesized { inputs, output } => {
+                    inputs.iter().for_each(|&t| self.ty(t));
+                    output.iter().for_each(|&t| self.ty(t));
+                }
+                ast::GenericArgs::None => {}
+            }
+        }
+    }
+
+    fn ty(&mut self, t: ast::TyId) {
+        let ast = self.ast;
+        match ast.ty(t) {
+            ast::TyExpr::Path(segs) => self.segs(segs),
+            ast::TyExpr::Ref { inner, .. } | ast::TyExpr::Slice(inner) | ast::TyExpr::Ptr { inner, .. } | ast::TyExpr::Paren(inner) => {
+                self.ty(*inner)
+            }
+            ast::TyExpr::Tuple(ts) => ts.iter().for_each(|&t| self.ty(t)),
+            ast::TyExpr::Array { inner, len } => {
+                self.ty(*inner);
+                self.root(*len, Some(ConstScalar::Int(crate::ty::IntTy::Usize)));
+            }
+            ast::TyExpr::FnPtr { inputs, ret, .. } => {
+                inputs.iter().for_each(|p| self.ty(p.ty));
+                ret.iter().for_each(|&t| self.ty(t));
+            }
+            ast::TyExpr::Dyn { bounds, .. } | ast::TyExpr::ImplTrait { bounds, .. } => self.bounds(bounds),
+            ast::TyExpr::QPath { self_ty, trait_path, segs } => {
+                self.ty(*self_ty);
+                self.segs(trait_path);
+                self.segs(segs);
+            }
+            ast::TyExpr::Unit | ast::TyExpr::Never | ast::TyExpr::Infer | ast::TyExpr::MacroCall(_) => {}
+        }
+    }
 }
 
 /// Adds the transient fn entry of one initializer body. None when its
 /// written type does not resolve here (the evaluator reports that).
 fn install(p: &mut Program, site: Site) -> Option<LocalDefId> {
-    let Site { loc, ty, parent, owner, trait_def, .. } = site;
+    let Site { loc, ty, parent, owner, trait_def, loc_sibs, .. } = site;
     let scope = parent.scope;
-    let ret = {
-        let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
-        let t = generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, ty, &scope).ok()?;
-        generics::normalize_item_ty(p, t)
+    let ret = match ty {
+        SiteTy::Written(ty) => {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            let t = generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, ty, &scope).ok()?;
+            generics::normalize_item_ty(p, t)
+        }
+        SiteTy::Scalar(Some(s)) => s.ty(),
+        SiteTy::Scalar(None) => crate::ty::ERROR,
     };
     // Every region in a const's or static's type is `'static` (an impl
     // lifetime in an associated const's type is taken as `'static` too):
@@ -261,9 +540,11 @@ fn install(p: &mut Program, site: Site) -> Option<LocalDefId> {
     p.regions.fns.insert(id, sig);
     // A const in a fn body names its block's items and the enclosing
     // blocks' items, as a nested fn does.
-    if let FnLoc::NestedConst(i) = loc
-        && let Some(sibs) = p.scope_of_stmt.get(&i).cloned()
-    {
+    let sibs = match loc {
+        FnLoc::NestedConst(i) => p.scope_of_stmt.get(&i).cloned(),
+        _ => loc_sibs,
+    };
+    if let Some(sibs) = sibs {
         p.fn_siblings.insert(id, sibs);
     }
     Some(id)

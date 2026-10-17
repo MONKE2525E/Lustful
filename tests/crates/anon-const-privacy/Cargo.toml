@@ -1,0 +1,6 @@
+# Constant privacy across a crate boundary (Sol review 3, L4): a private
+# associated const of a dependency, read in a dead branch of an array
+# length, is an error (rustc E0624).
+[workspace]
+members = ["base", "app"]
+resolver = "2"

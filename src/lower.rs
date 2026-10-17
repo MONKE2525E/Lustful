@@ -345,6 +345,8 @@ fn anon_consts(p: &Program, f: LocalDefId, ck: &Checked) -> Vec<ExprId> {
             _ => {}
         }
     }
+    // The anonymous consts of written types the checker typed.
+    out.extend(ck.anon_exprs.iter().copied());
     out.retain(|&e| ck.ty(e) != ERROR);
     if out.is_empty() {
         return out;

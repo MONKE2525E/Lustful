@@ -170,6 +170,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         opaque_ret_of: _,
         opaque_hidden: _,
         iter_methods: _,
+        anon_wants: _,
     } = gx;
     index.for_each_span(&mut |s| sp(s));
     trait_methods.values_mut().for_each(|t| shift_generics(&mut t.generics, sp));

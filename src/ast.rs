@@ -68,6 +68,25 @@ pub struct Ast {
     /// (the type parser returns the inner type directly, so a
     /// `(N)` generic argument is otherwise indistinguishable).
     pub paren_tys: Vec<u32>,
+    /// Anonymous consts written outside fn bodies, by value id
+    /// (`AnonConst`, `Ast::anon_const`).
+    pub anon_consts: Vec<AnonConst>,
+}
+
+/// An anonymous const outside fn bodies (an array length in a type, a
+/// const generic argument or default, an enum discriminant) with its
+/// expression as a body of its own, as `ConstDef::init_fn`: collect
+/// type- and borrow-checks it (check/const_body.rs). Ordered by
+/// `value`; looked up by the value's id, so the entry of a node a daemon
+/// patch left behind is never read. Literals and one-segment paths have
+/// none (the scalar checks in collect cover them).
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone)]
+pub struct AnonConst {
+    pub value: ExprId,
+    pub def: FnDef,
+    /// The module its names resolve in, set by the resolver's rewrite.
+    pub module: Option<crate::ty::defs::ModuleId>,
 }
 
 /// One trait a function-local `use` resolved to (`Ast::use_traits`).
@@ -1648,6 +1667,7 @@ impl Ast {
             use_traits: Vec::new(),
             paren_exprs: Vec::new(),
             paren_tys: Vec::new(),
+            anon_consts: Vec::new(),
         };
         for mut c in chunks {
             out.inner_attrs.append(&mut c.inner_attrs);
@@ -1665,8 +1685,30 @@ impl Ast {
             out.use_traits.append(&mut c.use_traits);
             out.paren_exprs.append(&mut c.paren_exprs);
             out.paren_tys.append(&mut c.paren_tys);
+            out.anon_consts.append(&mut c.anon_consts);
         }
         out
+    }
+
+    /// True for an anonymous const value with no body of its own: a
+    /// literal or a one-segment path, braced or not (the scalar checks
+    /// cover it).
+    pub fn is_plain_const(&self, e: ExprId) -> bool {
+        match self.expr(e) {
+            Expr::Int(..) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_) => true,
+            Expr::Path(segs) => segs.len() == 1 && matches!(segs[0].args, GenericArgs::None),
+            // `{ N }` names a const param as `N` does (rustc).
+            Expr::Block(b) => {
+                let b = self.block(*b);
+                b.stmts.is_empty() && b.tail.is_some_and(|t| matches!(self.expr(t), Expr::Path(segs) if segs.len() == 1))
+            }
+            _ => false,
+        }
+    }
+
+    /// The `anon_consts` index of the anonymous const whose value is `e`.
+    pub fn anon_const(&self, e: ExprId) -> Option<u32> {
+        self.anon_consts.binary_search_by_key(&e.0, |a| a.value.0).ok().map(|i| i as u32)
     }
 
     /// Moves another chunk's arena nodes into this AST (shifting their indexes) and returns
@@ -1700,6 +1742,7 @@ impl Ast {
         self.use_traits.append(&mut o.use_traits);
         self.paren_exprs.append(&mut o.paren_exprs);
         self.paren_tys.append(&mut o.paren_tys);
+        self.anon_consts.append(&mut o.anon_consts);
         (o.items, o.stmt_items, o.inner_attrs)
     }
 
@@ -1711,6 +1754,10 @@ impl Ast {
         }
         for id in &mut o.paren_tys {
             *id += sh.t;
+        }
+        for a in &mut o.anon_consts {
+            a.value = sh.e(a.value);
+            sh.fn_def(&mut a.def);
         }
         sh.attrs(&mut o.inner_attrs);
         for item in o.items.iter_mut().chain(o.stmt_items.iter_mut()) {

@@ -226,6 +226,9 @@ pub enum FnLoc {
     TraitConst(u32, u32),
     /// Of the const or static at `ast.stmt_items[i]`.
     NestedConst(u32),
+    /// Of the anonymous const `ast.anon_consts[i]` (an array length, a
+    /// const generic argument or default, a discriminant).
+    AnonConst(u32),
 }
 
 impl FnLoc {
@@ -258,13 +261,14 @@ impl FnLoc {
                 _ => None,
             },
             FnLoc::NestedConst(i) => item_init_fn(&ast.stmt_items[i as usize]),
+            FnLoc::AnonConst(i) => ast.anon_consts.get(i as usize).map(|a| &a.def),
         };
         def.expect("a fn location names a fn of its Ast")
     }
 
     /// True for the initializer body of a const or static item.
     pub fn is_const_init(self) -> bool {
-        matches!(self, FnLoc::ConstItem(_) | FnLoc::ImplConst(..) | FnLoc::TraitConst(..) | FnLoc::NestedConst(_))
+        matches!(self, FnLoc::ConstItem(_) | FnLoc::ImplConst(..) | FnLoc::TraitConst(..) | FnLoc::NestedConst(_) | FnLoc::AnonConst(_))
     }
 }
 
@@ -2055,7 +2059,7 @@ fn unit_variant_discr(ast: &Ast, interner: &Interner, known: &Known, segs: &[ast
 /// The discriminant type of an enum: the repr integer when written,
 /// else `isize`. Reads the first integer hint in the repr lists;
 /// `parse_repr` reports conflicting hints separately.
-fn disc_want_ty(interner: &Interner, attrs: &[ast::Attr]) -> IntTy {
+pub(crate) fn disc_want_ty(interner: &Interner, attrs: &[ast::Attr]) -> IntTy {
     use crate::lexer::{Tok, TokenTree};
     for attr in attrs {
         if attr.path.len() != 1 || interner.get(attr.path[0].name) != "repr" {

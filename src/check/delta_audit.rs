@@ -195,6 +195,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         opaques,                  // replace
         opaque_ret_of,            // rerun (reveal)
         opaque_hidden,            // rerun (reveal)
+        anon_wants: _,            // same (an anon const edit refuses reuse_kept)
     } = gx;
     out.extend([
         ("fn_templates", h(fn_templates)),

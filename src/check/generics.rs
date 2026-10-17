@@ -1488,6 +1488,30 @@ pub struct ResolveCx<'x> {
     pub lang: &'x LangTraits,
     /// `GenTables::item_index`.
     pub item_index: &'x FxMap<Sym, u32>,
+    /// `GenTables::anon_wants`; None for std source.
+    pub(crate) anon_wants: Option<&'x AnonWants>,
+}
+
+/// The anonymous consts (`ast::Ast::anon_consts`) that collect met in
+/// signatures, by value id, with the type each must have when the
+/// position gives one. check/const_body.rs checks each as a body.
+pub(crate) type AnonWants = std::sync::Mutex<FxMap<u32, Option<ConstScalar>>>;
+
+/// Records that collect (or a body check) met anonymous const `e`, with
+/// type `want` when known (`GenTables::anon_wants`). Consts with no
+/// `Ast::anon_consts` entry (literals, plain names) are not recorded.
+pub(crate) fn note_anon_const(ast: &Ast, sink: Option<&AnonWants>, e: ast::ExprId, want: Option<ConstScalar>) {
+    let Some(sink) = sink else { return };
+    // A body's own braced const argument is recorded too: its checker
+    // reads the type here (`const_body::written_anon_consts`).
+    if ast.anon_const(e).is_none() && !matches!(ast.expr(e), ast::Expr::Block(_)) {
+        return;
+    }
+    let mut m = sink.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = m.entry(e.0).or_insert(None);
+    if want.is_some() {
+        *slot = want;
+    }
 }
 
 impl ResolveCx<'_> {
@@ -2450,7 +2474,11 @@ fn check_const_arg_types(
     for ((param, arg), form) in decls.zip(vals).zip(forms) {
         let (ast::GenericParam::Const { ty, .. }, GenericArg::Const(c)) = (param, arg) else { continue };
         let mut typer = ConstTyper { ast, interner, known, cx, tys: &mut *tys, scope, lets: Vec::new() };
-        let Some(want) = typer.written(*ty) else { continue };
+        let want = typer.written(*ty);
+        if let AstArg::Const(e) = form {
+            note_anon_const(ast, cx.anon_wants, *e, want);
+        }
+        let Some(want) = want else { continue };
         let typed = match form {
             AstArg::Const(e) => typer.expr(*e, Some(want)).is_ok(),
             // A bare name in a const position (`Arr<N>`).
@@ -2603,6 +2631,15 @@ impl ConstScalar {
             TyKind::Bool => Some(ConstScalar::Bool),
             TyKind::Char => Some(ConstScalar::Char),
             _ => None,
+        }
+    }
+
+    /// The type itself.
+    pub(crate) fn ty(self) -> Ty {
+        match self {
+            ConstScalar::Int(it) => crate::ty::int(it),
+            ConstScalar::Bool => crate::ty::BOOL,
+            ConstScalar::Char => crate::ty::CHAR,
         }
     }
 
@@ -2957,6 +2994,7 @@ pub(crate) fn check_const_expr_ty(
     span: Span,
     what: &str,
 ) -> Result<(), Diag> {
+    note_anon_const(ast, cx.anon_wants, e, Some(want));
     let mut typer = ConstTyper { ast, interner, known, cx, tys: &mut *tys, scope, lets: Vec::new() };
     if typer.expr(e, Some(want)).is_ok() && want.holds(tys, c) {
         return Ok(());
@@ -5579,6 +5617,8 @@ pub struct GenTables {
     /// fn's params (check/opaque.rs): from `reveal_plain` and the
     /// template check. A revealed check substitutes a use's args.
     pub opaque_hidden: FxMap<DefId, Ty>,
+    /// The anonymous consts of signatures (`note_anon_const`).
+    pub(crate) anon_wants: AnonWants,
 }
 
 impl Default for GenTables {
@@ -5659,6 +5699,7 @@ impl Default for GenTables {
             opaques: FxMap::default(),
             opaque_ret_of: FxMap::default(),
             opaque_hidden: FxMap::default(),
+            anon_wants: Default::default(),
         }
     }
 }
@@ -5686,6 +5727,7 @@ impl GenTables {
             index: &self.index,
             lang: &self.lang,
             item_index: &NO_ITEMS,
+            anon_wants: None,
         }
     }
 
@@ -5700,6 +5742,7 @@ impl GenTables {
             index: &self.index,
             lang: &self.lang,
             item_index: &self.item_index,
+            anon_wants: Some(&self.anon_wants),
         }
     }
 }

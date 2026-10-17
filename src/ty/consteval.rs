@@ -6068,13 +6068,13 @@ fn check_macro_forms(ast: &Ast, e: ExprId) -> Result<(), Diag> {
 
 /// True for an E0493 diagnostic from `drop_diag` (the only errors
 /// a dead-branch scan propagates).
-fn is_drop_diag(d: &Diag) -> bool {
+pub(crate) fn is_drop_diag(d: &Diag) -> bool {
     d.code == C_NONCONST && d.message.starts_with("destructor of ")
 }
 
 /// True for the E0015 of a call to a non-const fn or method. rustc
 /// checks it statically, so a dead branch scan keeps it too.
-fn is_nonconst_call_diag(d: &Diag) -> bool {
+pub(crate) fn is_nonconst_call_diag(d: &Diag) -> bool {
     d.code == C_NONCONST && d.message.starts_with("cannot call non-const function")
 }
 
