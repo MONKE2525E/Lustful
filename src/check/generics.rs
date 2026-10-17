@@ -12850,8 +12850,16 @@ fn prove_trait_ref(
                         derived_adt = true;
                         let args: Vec<GenericArg> = cx.tys.adt_parts(t).map(|(_, a)| cx.tys.args(a).to_vec()).unwrap_or_default();
                         let raw: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
-                        let fields: Vec<Ty> =
+                        let mut fields: Vec<Ty> =
                             raw.into_iter().map(|f| if args.is_empty() { f } else { subst(&mut cx.tys, f, &args) }).collect();
+                        // The derive bounds every type param by the trait
+                        // (`impl<T: Debug> Debug for G<T>`), so each type arg
+                        // must hold too, even one only a `fn() -> T` or
+                        // `PhantomData<T>` field names. std's PhantomData
+                        // impls have no bounds.
+                        if !p.is_phantom_adt(a) {
+                            fields.extend(args.iter().filter_map(|g| g.as_ty()));
+                        }
                         Some(fields)
                     } else {
                         None
