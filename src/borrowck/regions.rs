@@ -4552,10 +4552,17 @@ impl<'b, 'p> Builder<'b, 'p> {
         // its output every region (`output_tied`; then the signature
         // says what reaches the result).
         // `Box::new(x)` and `Rc::new(x)` hold `x` itself: its slots are
-        // the result's, one to one (a closure's captures included).
-        if let CallTarget::Builtin(crate::check::Builtin::BoxNew | crate::check::Builtin::RcNew) = target
+        // the result's, one to one (a closure's captures included). So do
+        // `RefCell::new(x)` and `Cell::new(x)` (the cell's `T` is chosen at
+        // the call: `x` flows into it).
+        let cell_inner = match target {
+            CallTarget::Builtin(crate::check::Builtin::BoxNew | crate::check::Builtin::RcNew) => self.body.tys.smart_elem(dt),
+            CallTarget::Builtin(crate::check::Builtin::RefCellNew) => self.body.tys.refcell_elem(dt),
+            CallTarget::Builtin(crate::check::Builtin::CellNew) => self.body.tys.cell_elem(dt),
+            _ => None,
+        };
+        if let Some(inner) = cell_inner
             && let [(at, av)] = &avs[..]
-            && let Some(inner) = self.body.tys.smart_elem(dt)
             && (av.is_empty() && dv.is_empty() || self.relate(*at, av, inner, &dv, Variance::Co))
         {
             return;
