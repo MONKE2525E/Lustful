@@ -4813,7 +4813,7 @@ impl FnGen<'_, '_> {
             B::StrSplitNext | B::StrSplitNextBack | B::StrSplitUpper | B::StrSplitOnce | B::StrRSplitOnce | B::StrMatchesNext | B::StrMatchesNextBack | B::StrPatFind | B::StrPatRfind | B::StrPatContains | B::StrPatStartsWith | B::StrPatEndsWith | B::StrPatStripPrefix | B::StrPatStripSuffix | B::StrTrimMatches | B::StrTrimStartMatches | B::StrTrimEndMatches | B::StrPatReplace | B::StrPatReplacen => {
                 unreachable!("split builtins emit in cgen/split.rs")
             }
-            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::ArrayIterAsSlice | B::ArrayFromFn | B::ArrayMap | B::StrMatches | B::StrEncodeUtf16 | B::StrParse => {
+            B::HashExtend | B::VecExtend | B::StringExtend | B::IterArrayIntoIter | B::IterRepeatN | B::SliceJoinBorrow | B::SliceConcatBorrow | B::SliceCloneFromWritten | B::ArrayIterAsSlice | B::ArrayFromFn | B::ArrayMap | B::StrMatches | B::StrEncodeUtf16 | B::StrParse => {
                 unreachable!("expanded with its iterator (lower/iter.rs)")
             }
             B::ConvInto => unreachable!("expanded per conversion (lower/iter.rs)"),
@@ -6242,9 +6242,12 @@ impl FnGen<'_, '_> {
                 // Core's exact capacity: the sum of the parts (and
                 // separators) is reserved once, then copied in.
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
+                // `Box<str>`, `Rc<str>`, and `Arc<str>` are the fat `str`
+                // value itself; a `Cow<str>` views its variant.
                 let view = |el: &str| -> String {
                     match &e {
                         CTy::String => format!("lust_string_as_str(&{el})"),
+                        CTy::Adt(_) => fmt::cow_view_expr(self.p, &e, &format!("(&{el})")).expect("a Cow<str> part").1,
                         _ => el.to_string(),
                     }
                 };

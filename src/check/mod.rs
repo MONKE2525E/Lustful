@@ -399,6 +399,18 @@ pub enum Builtin {
     /// boxed slices), with core's exact capacities (tf-slice).
     SliceJoinStr,
     SliceConcatStr,
+    /// `[S]::join(sep)` and `concat()` over an element with a written
+    /// `Borrow<str>` impl: lowering adds that impl's `borrow` fn as a
+    /// last operand, and lower/iter.rs expands the call as core's
+    /// `join_generic_copy` (the first part borrowed once, the others
+    /// twice).
+    SliceJoinBorrow,
+    SliceConcatBorrow,
+    /// `[T]::clone_from_slice` for a Copy `T` with a written `Clone`:
+    /// lowering adds the impl's `clone_from` (or `clone`) fn as a last
+    /// operand; lower/iter.rs expands core's length assert and
+    /// per-element `clone_from`.
+    SliceCloneFromWritten,
     SliceConcatVec,
     SliceJoinVecElem,
     SliceJoinVecSlice,
@@ -1722,7 +1734,9 @@ pub struct Checked<'g> {
     /// The steps of each `Coerce::UserDeref`, by coerced expression,
     /// outermost first.
     pub deref_coerce: Vec<(ExprId, DerefRecv)>,
-    /// Written-`Index` places, by the index expression.
+    /// Written-`Index` places, by the index expression; also the
+    /// written `Borrow<str>::borrow` fn of a `[S]::join`/`concat`
+    /// element (`f` only), by the method call (`SliceJoinBorrow`).
     pub index_recv: Vec<(ExprId, IndexRecv)>,
     pub locals: Vec<LocalInfo>,
     /// Locals bound to the function parameters, in order (including `self`).

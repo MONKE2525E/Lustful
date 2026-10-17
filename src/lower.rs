@@ -5071,6 +5071,23 @@ impl<'p> Lower<'p> {
         {
             ops.extend(self.tls_operands(recv, span));
         }
+        // `[S]::join`/`concat` over a written `Borrow<str>` element also
+        // takes that impl's `borrow` fn (lower/iter.rs `join_borrow`);
+        // `clone_from_slice` on a Copy type with a written Clone, the
+        // impl's `clone_from` or `clone` fn.
+        if let Callee::Builtin(Builtin::SliceJoinBorrow | Builtin::SliceConcatBorrow | Builtin::SliceCloneFromWritten) = callee
+            && let Some(rec) = self.ck.index_recv(e).cloned()
+        {
+            let f = if rec.args.is_empty() { rec.f } else { crate::check::generics::instance_for(self.p, &self.body.tys, rec.f, &rec.args).unwrap_or(rec.f) };
+            let info = self.p.fn_info(f);
+            let (params, ret) = (info.params.clone(), info.ret);
+            let inputs = self.body.tys.intern_tys(&params);
+            let sig = self.body.tys.intern_sig(Binder::plain(FnSig::plain(inputs, ret)));
+            let fp = self.body.tys.intern(TyKind::FnPtr(sig));
+            let l = self.temp(fp);
+            self.assign(Place::local(l), Rvalue::FnValue(f, fp), span);
+            ops.push(Operand::Copy(Place::local(l)));
+        }
         let target = match callee {
             Callee::Fn(f) => CallTarget::Fn(self.resolve_generic_fn(e, f)),
             Callee::Builtin(b) => CallTarget::Builtin(b),

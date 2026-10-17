@@ -159,17 +159,23 @@ impl<'p> Ctx<'p> {
             // type whose Clone is core's or derived): that runs
             // `copy_from_slice`, panic message included. Any other
             // `T: Clone` runs `clone_from` per element after its own
-            // length assert. A Copy type with a written Clone stays out
-            // (the glue does not call such impls, see `glue_methods`).
+            // length assert. The glue does not call a Copy type's written
+            // Clone (see `glue_methods`): its `clone_from` (or `clone`)
+            // fn goes in `index_recv`, and lowering calls it
+            // (`SliceCloneFromWritten`, lower/iter.rs).
             "clone_from_slice" => {
                 let el = self.deep(elem);
                 let r = needle(self);
                 if crate::check::collect::is_copy(self.p, &self.tys, el) {
                     if !trivial_clone(self.p, &self.tys, el) {
-                        self.errs.push(not_yet("L0640", name_span, "`clone_from_slice` on a Copy type with a written `Clone` impl"));
-                        return Some(self.slice_bail(args));
+                        if self.written_clone_fn(e, el, name_span).is_none() {
+                            self.errs.push(not_yet("L0640", name_span, "`clone_from_slice` on a Copy type with a written `Clone` impl"));
+                            return Some(self.slice_bail(args));
+                        }
+                        (B::SliceCloneFromWritten, Autoref::RefMut, vec![r], UNIT)
+                    } else {
+                        (B::SliceCopyFromSlice, Autoref::RefMut, vec![r], UNIT)
                     }
-                    (B::SliceCopyFromSlice, Autoref::RefMut, vec![r], UNIT)
                 } else {
                     if crate::check::collect::mentions_hash_table(self.p, &self.tys, el) {
                         self.errs.push(not_yet("L0640", name_span, "`clone_from_slice` on a slice of a type holding a hash table"));
@@ -517,14 +523,61 @@ impl<'p> Ctx<'p> {
             }
             return Some(STRING);
         }
-        // Another `Borrow<str>` element (`Box<str>`, `Cow<str>`, a user
-        // type; also an instance of a `S: Borrow<str>` template, which
-        // `check` accepted): core's join, which lust does not build.
+        // Another `Borrow<str>` element (also an instance of a `S:
+        // Borrow<str>` template, which `check` accepted): std's
+        // `Box<str>`, `Rc<str>`, `Arc<str>`, `Cow<str>`, and `&mut str`
+        // take the str builtin (their `borrow` is a plain view); a
+        // written impl's `borrow` fn goes in `index_recv` for lowering,
+        // which calls it as core's join does (lower/iter.rs
+        // `join_borrow`).
         let borrow_str = TraitRef { def: self.p.gx.lang.borrow, args: self.tys.intern_args(&[GenericArg::Ty(elem), GenericArg::Ty(STR)]), bindings: EMPTY_BINDINGS };
-        if !matches!(self.kind(elem), TyKind::Param(_) | TyKind::Infer(_)) && matches!(self.select_obligation(borrow_str), Selection::Impl { .. }) {
-            let (tn, m) = (self.tn(elem), if is_join { "join" } else { "concat" });
-            self.err("L0640", name_span, format!("`{m}` over `{tn}` elements is not implemented yet"), "Map the parts to `&str` first, as in `parts.iter().map(|p| p.borrow()).collect::<Vec<&str>>()`.");
-            return Some(self.slice_bail(args));
+        if !matches!(self.kind(elem), TyKind::Param(_) | TyKind::Infer(_))
+            && let Selection::Impl { id, args: impl_args, .. } = self.select_obligation(borrow_str)
+        {
+            let rec = self.p.gx.index.get(id).clone();
+            let (b, ok) = if rec.synthetic != crate::traits::index::Synthetic::None {
+                let b = if is_join { B::SliceJoinStr } else { B::SliceConcatStr };
+                (b, self.std_borrow_str_elem(elem))
+            } else {
+                let b = if is_join { B::SliceJoinBorrow } else { B::SliceConcatBorrow };
+                let p = self.p;
+                let f = rec.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == "borrow"));
+                if let Some(f) = f {
+                    let idx = self.out.index_recv.len();
+                    self.out.index_recv.push((e, IndexRecv { f, args: Vec::new(), f_mut: None, args_mut: Vec::new() }));
+                    if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+                        self.deref_sites.push((DerefTable::Index, idx, false, f, impl_args));
+                    }
+                }
+                (b, f.is_some())
+            };
+            // `concat` has no separator to pick the form: an element that
+            // is also `Borrow<[T]>` fits both of core's `Concat` impls
+            // (rustc E0284). An instance of a `S: Borrow<str>` template
+            // keeps the `str` form its template chose.
+            if !is_join && !self.is_instance_check() && self.borrows_a_slice(elem) {
+                let tn = self.tn(elem);
+                self.err(
+                    "L0610",
+                    name_span,
+                    format!("type annotations needed: `concat` over `{tn}` fits both `Concat<str>` and `Concat<T>` (`{tn}` is `Borrow<str>` and `Borrow<[T]>`)"),
+                    "Call `join(\"\")`: its `&str` separator picks the `str` form.",
+                );
+                return Some(self.slice_bail(args));
+            }
+            if !ok {
+                let (tn, m) = (self.tn(elem), if is_join { "join" } else { "concat" });
+                self.err("L0640", name_span, format!("`{m}` over `{tn}` elements is not implemented yet"), "Map the parts to `&str` first, as in `parts.iter().map(|p| p.borrow()).collect::<Vec<&str>>()`.");
+                return Some(self.slice_bail(args));
+            }
+            self.check_packed_borrow(recv, name_span);
+            self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+            if is_join {
+                self.check_args(&[REF_STR], args, name_span);
+            } else {
+                self.check_args(&[], args, name_span);
+            }
+            return Some(STRING);
         }
         let inner = match self.kind(elem) {
             TyKind::Array(el, _) => Some(el),
@@ -573,6 +626,54 @@ impl<'p> Ctx<'p> {
         self.coerce_expr(arg, t, param);
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
         Some(ret)
+    }
+
+    /// The written `Clone` impl's `clone_from` fn of a Copy type `el`
+    /// (its `clone` when it has no `clone_from`), recorded in
+    /// `index_recv` for the call `e`. None when the impl is not a
+    /// written one.
+    fn written_clone_fn(&mut self, e: ExprId, el: Ty, span: Span) -> Option<LocalDefId> {
+        let tr = TraitRef { def: self.p.gx.lang.clone, args: self.tys.intern_args(&[GenericArg::Ty(el)]), bindings: EMPTY_BINDINGS };
+        let Selection::Impl { id, args: impl_args, .. } = self.select_obligation_at(tr, span, 0) else { return None };
+        let rec = self.p.gx.index.get(id).clone();
+        if rec.synthetic != crate::traits::index::Synthetic::None {
+            return None;
+        }
+        let p = self.p;
+        let named = |n: &str| rec.items.iter().copied().find_map(|d| p.local_def(d.hash).filter(|&l| p.name(p.fn_info(l).name) == n));
+        let f = named("clone_from").or_else(|| named("clone"))?;
+        let idx = self.out.index_recv.len();
+        self.out.index_recv.push((e, IndexRecv { f, args: Vec::new(), f_mut: None, args_mut: Vec::new() }));
+        if self.p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some()) {
+            self.deref_sites.push((DerefTable::Index, idx, false, f, impl_args));
+        }
+        Some(f)
+    }
+
+    /// True when `elem: Borrow<[T]>` holds for some `T` (or may hold):
+    /// core's `Concat<T>` for `[V: Borrow<[T]>]` then fits too.
+    fn borrows_a_slice(&mut self, elem: Ty) -> bool {
+        let snap = self.snapshot_vars();
+        let obl_len = self.obl_len();
+        let v = self.new_var(false);
+        let sl = self.tys.intern(TyKind::Slice(v));
+        let tr = TraitRef { def: self.p.gx.lang.borrow, args: self.tys.intern_args(&[GenericArg::Ty(elem), GenericArg::Ty(sl)]), bindings: EMPTY_BINDINGS };
+        let fits = matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::Ambiguous | Selection::ParamEvidence(_));
+        self.rollback_vars(snap);
+        self.obl_truncate(obl_len);
+        fits
+    }
+
+    /// True for the std `Borrow<str>` elements whose C value cgen's
+    /// str join reads as a `&str` view: `&mut str`, `Box<str>`,
+    /// `Rc<str>`, `Arc<str>`, and `Cow<str>`.
+    fn std_borrow_str_elem(&self, elem: Ty) -> bool {
+        let arc = |t: Ty| (self.tys.builtin_of(t) == Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc))).then(|| self.tys.adt_first_ty_arg(t)).flatten();
+        matches!(self.kind(elem), TyKind::Ref(_, Mut::Mut, i) if i == STR)
+            || self.tys.boxed_elem(elem) == Some(STR)
+            || self.tys.rc_elem(elem) == Some(STR)
+            || arc(elem) == Some(STR)
+            || crate::check::collect::cow_arg(&self.tys, elem) == Some(STR)
     }
 
     /// A type parameter whose `Borrow` bounds all name `str` (`S:

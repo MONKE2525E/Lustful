@@ -133,6 +133,9 @@ pub(crate) fn expands(b: Builtin) -> bool {
             | B::IterArrayIntoIter
             | B::ArrayIterAsSlice
             | B::IterRepeatN
+            | B::SliceJoinBorrow
+            | B::SliceConcatBorrow
+            | B::SliceCloneFromWritten
             | B::ArrayFromFn
             | B::ArrayMap
             | B::IterOptRes
@@ -625,6 +628,16 @@ impl Ex<'_, '_> {
             B::ConvInto => {
                 let x = arg()?;
                 return self.conv(x, dest, dest_ty);
+            }
+            B::SliceJoinBorrow | B::SliceConcatBorrow => {
+                let r = arg()?;
+                let sep = if b == B::SliceJoinBorrow { Some(arg()?) } else { None };
+                let f = arg()?;
+                return self.join_borrow(r, sep, f, dest);
+            }
+            B::SliceCloneFromWritten => {
+                let (d, s, f) = (arg()?, arg()?, arg()?);
+                return self.clone_from_written(d, s, f, dest);
             }
             // `slice.windows(size)` (W-STD-B): std's `NonZero::new(size).expect(..)`
             // panic first, then (the whole slice, size).
@@ -4524,6 +4537,204 @@ impl Ex<'_, '_> {
             }
             _ => self.advance_loop(itp, ty, n, false),
         }
+    }
+
+    /// `dst.clone_from_slice(src)` for a Copy `T` with a written Clone,
+    /// as core's non-`TrivialClone` form: the length assert, then
+    /// `dst[i].clone_from(&src[i])` in order through `f`, the impl's
+    /// `clone_from` (two params), or `dst[i] = src[i].clone()` when the
+    /// impl has only `clone` (core's default `clone_from`).
+    fn clone_from_written(&mut self, d: Operand, s: Operand, f: Operand, dest: Place) -> R {
+        use crate::ast::BinOp::*;
+        let slice_of = |this: &mut Self, o: Operand, m: bool| -> Result<(Local, Ty), String> {
+            let ot = this.op_ty(&o)?;
+            let el = match this.body.tys.kind(ot) {
+                TyKind::Ref(_, _, inner) => match this.body.tys.kind(inner) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => e,
+                    _ => this.body.tys.vec_elem(inner).ok_or("clone_from_slice expansion: not a slice")?,
+                },
+                _ => return Err("clone_from_slice expansion: not a reference".into()),
+            };
+            let op = this.op_place(o, ot);
+            let sl = this.body.tys.intern(TyKind::Slice(el));
+            let r = this.body.tys.mk_ref(m, sl);
+            let l = this.local(r);
+            this.assign(Place::local(l), Rvalue::SliceOf(op.deref()));
+            Ok((l, el))
+        };
+        let (dl, el) = slice_of(self, d, true)?;
+        let (sl, _) = slice_of(self, s, false)?;
+        let ft = self.op_ty(&f)?;
+        let fl = self.local(ft);
+        self.assign(Place::local(fl), Rvalue::Use(f));
+        let by_clone_from = match self.body.tys.kind(ft) {
+            TyKind::FnPtr(sig) => self.body.tys.tys_of(self.body.tys.sig(sig).value.inputs).len() == 2,
+            _ => false,
+        };
+        let (n, m) = (self.local(USIZE), self.local(USIZE));
+        self.assign(Place::local(n), Rvalue::LenOf(Place::local(dl).deref()));
+        self.assign(Place::local(m), Rvalue::LenOf(Place::local(sl).deref()));
+        let c = self.cmp(Ne, Operand::Copy(Place::local(n)), Operand::Copy(Place::local(m)));
+        let (bad, good) = self.branch(c);
+        self.cur = bad;
+        self.term(Terminator::Panic(vec![FmtPart::Lit("destination and source slices have different lengths".into())]));
+        self.cur = good;
+        let i = self.local(USIZE);
+        self.assign(Place::local(i), Rvalue::Use(Self::usize_c(0)));
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let c = self.cmp(Lt, Operand::Copy(Place::local(i)), Operand::Copy(Place::local(n)));
+        let (body, done) = self.branch(c);
+        self.cur = body;
+        let sr = self.ref_to(false, Place::local(sl).deref().project(Proj::Index(i)), el);
+        if by_clone_from {
+            let dr = self.ref_to(true, Place::local(dl).deref().project(Proj::Index(i)), el);
+            let u = self.local(UNIT);
+            self.call(CallTarget::Indirect(fl), vec![Operand::Move(Place::local(dr)), Operand::Move(Place::local(sr))], Place::local(u));
+        } else {
+            let v = self.local(el);
+            self.call(CallTarget::Indirect(fl), vec![Operand::Move(Place::local(sr))], Place::local(v));
+            self.assign(Place::local(dl).deref().project(Proj::Index(i)), Rvalue::Use(Operand::Copy(Place::local(v))));
+        }
+        self.assign(Place::local(i), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+        self.goto(lp);
+        self.cur = done;
+        self.assign(dest, Rvalue::Use(Operand::Const(Const::Unit)));
+        Ok(())
+    }
+
+    /// `[S]::join(sep)` (`concat` with no `sep`) over an element with a
+    /// written `Borrow<str>` impl, whose `borrow` fn is `f`: alloc's
+    /// `join_generic_copy`. The first part is borrowed once; each other
+    /// part is borrowed for the length, then again for its copy. The
+    /// String has exactly the reserved capacity; a separator or part
+    /// that no longer fits (a `borrow` that grew between its two calls)
+    /// panics as core's `split_at_mut` does, at the join's
+    /// `specialize_for_lengths!` site. A length sum past `usize::MAX`
+    /// (core's `expect` panic) needs about `usize::MAX` parts and is
+    /// not modeled.
+    fn join_borrow(&mut self, r: Operand, sep: Option<Operand>, f: Operand, dest: Place) -> R {
+        use crate::ast::BinOp::*;
+        let rt = self.op_ty(&r)?;
+        let elem = match self.body.tys.kind(rt) {
+            TyKind::Ref(_, _, inner) => match self.body.tys.kind(inner) {
+                TyKind::Slice(e) | TyKind::Array(e, _) => e,
+                _ => self.body.tys.vec_elem(inner).ok_or("join expansion: not a slice receiver")?,
+            },
+            _ => return Err("join expansion: not a reference receiver".into()),
+        };
+        let rp = self.op_place(r, rt);
+        let sl = self.body.tys.intern(TyKind::Slice(elem));
+        let slr = self.body.tys.mk_ref(false, sl);
+        let s = self.local(slr);
+        self.assign(Place::local(s), Rvalue::SliceOf(rp.deref()));
+        let n = self.local(USIZE);
+        self.assign(Place::local(n), Rvalue::LenOf(Place::local(s).deref()));
+        let ft = self.op_ty(&f)?;
+        let fl = self.local(ft);
+        self.assign(Place::local(fl), Rvalue::Use(f));
+        let sep_len = self.local(USIZE);
+        let sep = match sep {
+            Some(o) => {
+                let l = self.local(REF_STR);
+                self.assign(Place::local(l), Rvalue::Use(o));
+                self.call_builtin(Builtin::StrLen, vec![Operand::Copy(Place::local(l))], Place::local(sep_len));
+                Some(l)
+            }
+            None => {
+                self.assign(Place::local(sep_len), Rvalue::Use(Self::usize_c(0)));
+                None
+            }
+        };
+        let str_len = |this: &mut Self, v: Local| -> Local {
+            let l = this.local(USIZE);
+            this.call_builtin(Builtin::StrLen, vec![Operand::Copy(Place::local(v))], Place::local(l));
+            l
+        };
+        // `borrow(&s[i])`, as a new `&str` local.
+        let borrow = |this: &mut Self, i: Local| -> Local {
+            let er = this.ref_to(false, Place::local(s).deref().project(Proj::Index(i)), elem);
+            let out = this.local(REF_STR);
+            this.call(CallTarget::Indirect(fl), vec![Operand::Move(Place::local(er))], Place::local(out));
+            out
+        };
+        // `mid > len` at alloc/src/str.rs:200:22 (`STD_FILES` 34) when `len` bytes do not
+        // fit in the `remain` left.
+        let fits = |this: &mut Self, len: Operand, remain: Local| {
+            let c = this.cmp(Gt, len, Operand::Copy(Place::local(remain)));
+            let (bad, good) = this.branch(c);
+            this.cur = bad;
+            this.term(Terminator::Panic(vec![FmtPart::Lit("mid > len".into())]));
+            this.body.blocks[this.cur.0 as usize].term_span = crate::diag::Span::std_site(34, 200, 22);
+            this.cur = good;
+        };
+        let join = self.block();
+        let z = self.cmp(Eq, Operand::Copy(Place::local(n)), Self::usize_c(0));
+        let (empty, go) = self.branch(z);
+        self.cur = empty;
+        self.call_builtin(Builtin::StringNew, vec![], dest.clone());
+        self.goto(join);
+        self.cur = go;
+        let zero = self.copy_local(Self::usize_c(0), USIZE);
+        let first = borrow(self, zero);
+        let first_len = str_len(self, first);
+        // reserved = sep_len * (n - 1) + first.len() + the other parts' lengths.
+        let res = self.local(USIZE);
+        let n1 = self.local(USIZE);
+        self.assign(Place::local(n1), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Self::usize_c(1)));
+        self.assign(Place::local(res), Rvalue::Bin(Mul, Operand::Copy(Place::local(sep_len)), Operand::Copy(Place::local(n1))));
+        self.assign(Place::local(res), Rvalue::Bin(Add, Operand::Copy(Place::local(res)), Operand::Copy(Place::local(first_len))));
+        let i = self.local(USIZE);
+        // Pass 1: the lengths of parts 1..n.
+        self.assign(Place::local(i), Rvalue::Use(Self::usize_c(1)));
+        let lp = self.block();
+        self.goto(lp);
+        self.cur = lp;
+        let c = self.cmp(Lt, Operand::Copy(Place::local(i)), Operand::Copy(Place::local(n)));
+        let (body, done) = self.branch(c);
+        self.cur = body;
+        let b = borrow(self, i);
+        let bl = str_len(self, b);
+        self.assign(Place::local(res), Rvalue::Bin(Add, Operand::Copy(Place::local(res)), Operand::Copy(Place::local(bl))));
+        self.assign(Place::local(i), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+        self.goto(lp);
+        self.cur = done;
+        let out = self.local(STRING);
+        self.call_builtin(Builtin::StringWithCapacity, vec![Operand::Copy(Place::local(res))], Place::local(out));
+        let push = |this: &mut Self, v: Local| {
+            let m = this.ref_to(true, Place::local(out), STRING);
+            let u = this.local(UNIT);
+            this.call_builtin(Builtin::StringPushStr, vec![Operand::Move(Place::local(m)), Operand::Copy(Place::local(v))], Place::local(u));
+        };
+        push(self, first);
+        let remain = self.local(USIZE);
+        self.assign(Place::local(remain), Rvalue::Bin(Sub, Operand::Copy(Place::local(res)), Operand::Copy(Place::local(first_len))));
+        // Pass 2: each other part borrowed again, after its separator.
+        self.assign(Place::local(i), Rvalue::Use(Self::usize_c(1)));
+        let lp2 = self.block();
+        self.goto(lp2);
+        self.cur = lp2;
+        let c = self.cmp(Lt, Operand::Copy(Place::local(i)), Operand::Copy(Place::local(n)));
+        let (body, done) = self.branch(c);
+        self.cur = body;
+        let b = borrow(self, i);
+        if let Some(sep) = sep {
+            fits(self, Operand::Copy(Place::local(sep_len)), remain);
+            push(self, sep);
+            self.assign(Place::local(remain), Rvalue::Bin(Sub, Operand::Copy(Place::local(remain)), Operand::Copy(Place::local(sep_len))));
+        }
+        let bl = str_len(self, b);
+        fits(self, Operand::Copy(Place::local(bl)), remain);
+        push(self, b);
+        self.assign(Place::local(remain), Rvalue::Bin(Sub, Operand::Copy(Place::local(remain)), Operand::Copy(Place::local(bl))));
+        self.assign(Place::local(i), Rvalue::Bin(Add, Operand::Copy(Place::local(i)), Self::usize_c(1)));
+        self.goto(lp2);
+        self.cur = done;
+        self.assign(dest, Rvalue::Use(Operand::Move(Place::local(out))));
+        self.goto(join);
+        self.cur = join;
+        Ok(())
     }
 
     /// core's `RepeatN::advance_by(n)` (no clones): the count drops by
