@@ -789,7 +789,14 @@ pub(super) fn replay_discovery(
             format!("discovery replay: {a} stand, {b} untouched, {c} hold, {n} check; walk {walk_ms:.1} ms, all {ms:.1} ms; {slow}\n")
         });
         for ((g, base, newer), (out, reads, pending, ..)) in work.into_iter().zip(checked) {
-            if !base.same(p, &out, walk_instances) {
+            // An output that differs only in types whose instances were all
+            // made before the body's turn makes what collect makes (a caller
+            // with an error, or one that names a new type); bodies in fn order.
+            let same = base.same(p, &out, walk_instances);
+            let made = !same
+                && !super::patch::walks_requests(p)
+                && base.makers(&out).is_some_and(|(old, new)| super::patch::made_before(p, g, &old, &new));
+            if !same && !made {
                 crate::check::derive_delta::log(&|| {
                     format!("discovery {}: output differs (pending {pending}, newer {newer}): {}\n", p.display_name(p.fn_def(g).name), base.differs(p, &out))
                 });

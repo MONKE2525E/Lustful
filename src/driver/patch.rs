@@ -2518,7 +2518,7 @@ fn put_back(front: &mut Front, p: crate::check::collect::Program, edits: Vec<Kep
 /// True when discovery makes instances from a body's requests: in a
 /// build, and in a check of a program with generic associated consts
 /// (`materialize`). An edited body's requests must then stay the same.
-fn walks_requests(p: &crate::check::collect::Program) -> bool {
+pub(super) fn walks_requests(p: &crate::check::collect::Program) -> bool {
     p.gx.walk_instances || !p.gx.assoc_const_tmpls.is_empty()
 }
 
@@ -2531,7 +2531,7 @@ fn walks_requests(p: &crate::check::collect::Program) -> bool {
 /// exist when `x`'s turn begins. Its turn makes nothing from a type left
 /// out, and the same instances, in the same order, from the rest: the
 /// program holds the instances a cold collect makes, in its order.
-fn made_before(p: &mut crate::check::collect::Program, x: crate::def::LocalDefId, old: &[crate::check::generics::OwnedTy], new: &[crate::check::generics::OwnedTy]) -> bool {
+pub(super) fn made_before(p: &mut crate::check::collect::Program, x: crate::def::LocalDefId, old: &[crate::check::generics::OwnedTy], new: &[crate::check::generics::OwnedTy]) -> bool {
     let mut open = |ts: &[crate::check::generics::OwnedTy]| -> Vec<usize> {
         (0..ts.len())
             .filter(|&i| {
