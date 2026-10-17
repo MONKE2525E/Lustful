@@ -7281,21 +7281,49 @@ impl<'p> Ctx<'p> {
         if em.is_mut() && !fm.is_mut() {
             return false;
         }
-        match self.kind(y) {
-            TyKind::Slice(ye) => match self.kind(x) {
-                TyKind::Array(xe, _) | TyKind::Slice(xe) => self.ty_matchish(xe, ye),
+        // Unsizing (`&[T; N]` to `&[T]`), then a deref coercion: `y` on
+        // `x`'s autoderef chain (`&Box<[T]>`, `&Vec<T>`, `&Box<Vec<T>>`
+        // to `&[T]`; `&String`, `&Box<str>`, `&Rc<String>` to `&str`).
+        if let (TyKind::Array(xe, _), TyKind::Slice(ye)) = (self.kind(x), self.kind(y)) {
+            return self.ty_matchish(xe, ye);
+        }
+        self.deref_reaches(x, y, em.is_mut())
+    }
+
+    /// True when `y` is on the builtin autoderef chain of `x` (`x`
+    /// itself, then through references, `Box`, `Rc`, `Arc`, the cell
+    /// and lock guards, `String` to `str`, `Vec<T>` to `[T]`, and `Cow<B>`
+    /// to `B`): the deref coercion `&x` to `&y`. With `mutable` (a `&mut
+    /// y` target) only `DerefMut` steps count: `&mut`, `Box`, `String`,
+    /// `Vec`, and the guards that hand out `&mut`. A user `Deref` step
+    /// is not followed (the coercion sites check it themselves). Pure.
+    fn deref_reaches(&self, x: Ty, y: Ty, mutable: bool) -> bool {
+        let mut t = self.resolve(x);
+        for _ in 0..16 {
+            if self.ty_matchish(t, y) {
+                return true;
+            }
+            // `Vec<T>` derefs to `[T]`, the end of its chain.
+            if let Some(e) = self.tys.vec_elem(t) {
+                return matches!(self.kind(y), TyKind::Slice(ye) if self.ty_matchish(e, ye));
+            }
+            let next = match self.kind(t) {
+                TyKind::Ref(_, m, inner) if !mutable || m.is_mut() => Some(inner),
+                TyKind::Ref(..) => None,
+                _ if self.tys.is_string_ty(t) => Some(STR),
+                _ if mutable => self.tys.boxed_elem(t).or_else(|| self.tys.guard_elem(t).filter(|g| g.1).map(|g| g.0)),
                 _ => self
                     .tys
-                    .vec_elem(self.resolve(x))
-                    .or_else(|| self.tys.smart_elem(self.resolve(x)).and_then(|b| self.tys.vec_elem(self.resolve(b))))
-                    .is_some_and(|xe| self.ty_matchish(xe, ye)),
-            },
-            TyKind::Str => {
-                self.tys.is_string_ty(self.resolve(x))
-                    || self.tys.smart_elem(self.resolve(x)).is_some_and(|e| self.tys.is_string_ty(self.resolve(e)))
+                    .smart_elem(t)
+                    .or_else(|| (self.tys.builtin_of(t) == Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc))).then(|| self.tys.adt_first_ty_arg(t)).flatten())
+                    .or_else(|| crate::check::collect::cow_arg(&self.tys, t)),
+            };
+            match next {
+                Some(n) => t = self.resolve(n),
+                None => return false,
             }
-            _ => self.ty_matchish(x, y) || self.tys.smart_elem(self.resolve(x)).is_some_and(|e| self.ty_matchish(e, y)),
         }
+        false
     }
 
     /// True when the fn item to fn pointer coercion takes `f` to `e`.
@@ -9931,6 +9959,9 @@ impl<'p> Ctx<'p> {
                     }
                     Some(v) => {
                         let t = self.expr(*v, prev);
+                        // No LUB flip here: rustc coerces a later break to
+                        // the earlier breaks' type only (`loop { break &s;
+                        // break "b"; }` is E0308).
                         match prev {
                             Some(pt) => {
                                 self.coerce_expr(*v, t, pt);
@@ -10798,7 +10829,9 @@ impl<'p> Ctx<'p> {
         if self.pure_coercible(new, prev_ty) || !self.pure_coercible(prev_ty, new) {
             return false;
         }
-        if prev.iter().any(|&s| self.out.coerce[self.ei(s)] != Coerce::None) {
+        // rustc lets only no-op adjustments stand on the earlier sites:
+        // none, or a `&mut T` to `&T` reborrow of the same pointee.
+        if prev.iter().any(|&s| !matches!(self.out.coerce[self.ei(s)], Coerce::None | Coerce::MutToShared | Coerce::Reborrow)) {
             return false;
         }
         for &s in prev {
@@ -10815,6 +10848,14 @@ impl<'p> Ctx<'p> {
     /// `str` unsizing, `&mut` to `&`, deref of extra reference layers),
     /// or `e` is a dyn reference (an unsizing site). Pure.
     fn pure_coercible(&self, f: Ty, e: Ty) -> bool {
+        // A shared reference never coerces to `&mut` (`ty_matchish`
+        // does not look at mutability).
+        if let (TyKind::Ref(_, fm, _), TyKind::Ref(_, em, _)) = (self.kind(f), self.kind(e))
+            && em.is_mut()
+            && !fm.is_mut()
+        {
+            return false;
+        }
         if self.ty_matchish(f, e) || self.ref_coercible(f, e) {
             return true;
         }
