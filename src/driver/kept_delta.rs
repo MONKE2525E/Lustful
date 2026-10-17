@@ -449,15 +449,27 @@ impl Touched {
 
     /// True when the delta may move the fingerprint of `k`.
     pub(crate) fn hit(&mut self, p: &Program, k: &ReadKey) -> bool {
+        if let Some(&h) = self.seen.get(k) {
+            return h;
+        }
+        let h = self.hit_pure(p, k);
+        self.seen.insert(*k, h);
+        h
+    }
+
+    /// `hit` without its memo: a keyed walk asks it for every key of the
+    /// read index at once, on all cores (`ReadIndex::dirty_slots`' quick
+    /// answers).
+    pub(crate) fn hit_pure(&self, p: &Program, k: &ReadKey) -> bool {
         let (defs, methods, traits) = (&self.defs, &self.methods, &self.traits);
-        *self.seen.entry(*k).or_insert_with(|| match k {
+        match k {
             ReadKey::Sig(d) => defs.contains(d),
             ReadKey::MethodSet(m) => matches!(m.head, Head::Adt(a) if methods.contains(&(a, m.name))),
             ReadKey::Binding(b) => matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d)),
             ReadKey::Checked(_) => true,
             ReadKey::ImplSet(s) => traits.contains(&s.trait_),
             ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => false,
-        })
+        }
     }
 }
 

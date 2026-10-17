@@ -742,13 +742,15 @@ fn keyed_dirty(
     p: &collect::Program,
     front: &Front,
     caches: &mut Caches,
-    moved: &mut dyn FnMut(&crate::driver::graph::ReadKey) -> bool,
+    moved: &(dyn Fn(&crate::driver::graph::ReadKey) -> bool + Sync),
     base: u64,
     answers: &mut FxMap<crate::driver::graph::ReadKey, crate::driver::graph::Read>,
 ) -> Vec<Option<bool>> {
     let mode = usize::from(p.gx.walk_instances);
     let def_slot = |d: def::DefId| p.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
-    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &|_| None, moved, &def_slot, answers);
+    // `moved` is a pure test: every key takes it on all cores.
+    let quick = |k: &crate::driver::graph::ReadKey| Some(moved(k));
+    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &quick, &mut |k| moved(k), &def_slot, answers);
     caches.slot_reads.iter().zip(dirty).map(|(r, d)| r.as_ref().filter(|r| r.verified[mode] == base).map(|_| d)).collect()
 }
 
@@ -3645,13 +3647,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let keyed: Option<Vec<Option<bool>>> = match header_moves.as_mut() {
         Some(touched) if wants => {
             super::laps::start();
-            let k = keyed_dirty(&program, front, caches, &mut |k| touched.hit(&program, k), keyed_base, &mut answers);
+            let touched: &crate::driver::kept_delta::Touched = touched;
+            let k = keyed_dirty(&program, front, caches, &|k| touched.hit_pure(&program, k), keyed_base, &mut answers);
             t.lap("reads keyed index");
             t.note_parts(super::laps::take());
             Some(k)
         }
         None if wants && body_only && (rpit_edit || put_back) => {
-            let checked = &mut |k: &crate::driver::graph::ReadKey| matches!(k, crate::driver::graph::ReadKey::Checked(_));
+            let checked = &|k: &crate::driver::graph::ReadKey| matches!(k, crate::driver::graph::ReadKey::Checked(_));
             let k = keyed_dirty(&program, front, caches, checked, keyed_base, &mut answers);
             t.lap("reads keyed index");
             Some(k)
