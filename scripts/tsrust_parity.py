@@ -8,7 +8,10 @@ Three checks, all on the fork's own inputs:
   runs   every bin on every fixture project of crates/ts_goport/tests (each dir with a
          tsconfig.json under fixtures/ and effect_fixtures/): stdout, stderr, exit code and
          every file the run writes must be byte-equal. Each run gets a fresh copy of the
-         project at the same path, so paths in the output match.
+         project at the same path, so paths in the output match, three dirs down in a work
+         root that is wiped before each run and compared whole: a project may write outside
+         itself (build_watch/coarse-mtime/lib writes ../../../out), and that must neither
+         leak into the other side's run nor go unchecked.
   tests  the fork's integration test executables (built by `cargo test --release`) run once
          with the Cargo bins and once with the lust bins in their place. They find the bins
          through CARGO_BIN_EXE_<name>, a path fixed at build time in the cargo target dir,
@@ -142,18 +145,23 @@ def tree_digest(d):
 
 # `tsc -b --verbose` starts lines with the wall clock time; two runs differ there only.
 CLOCK = re.compile(rb"^\d\d:\d\d:\d\d [AP]M - ", re.M)
+# Rust 1.99 names the OS thread id in its thread messages (`thread 'main' (4764) panicked`).
+TID = re.compile(rb"^(thread '[^']*') \(\d+\)", re.M)
 
 
-def run_one(cmd, src, work, timeout):
-    if work.exists():
-        shutil.rmtree(work)
+def run_one(cmd, src, root, timeout):
+    """One run of cmd in a fresh copy of src at root/a/b/c/case: (rc, stdout, stderr) with the
+    clock and thread ids masked, and the digest of every file under root."""
+    if root.exists():
+        shutil.rmtree(root)
+    work = root / "a/b/c/case"
     shutil.copytree(src, work, symlinks=True)
     try:
         r = subprocess.run(cmd, cwd=work, capture_output=True, timeout=timeout)
-        res = (r.returncode, CLOCK.sub(b"HH:MM:SS - ", r.stdout), r.stderr)
+        res = (r.returncode, CLOCK.sub(b"HH:MM:SS - ", r.stdout), TID.sub(rb"\1 (TID)", r.stderr))
     except subprocess.TimeoutExpired:
         res = ("hang", b"", b"")
-    return res, tree_digest(work)
+    return res, tree_digest(root)
 
 
 def first_diff(a, b):
@@ -167,7 +175,7 @@ def first_diff(a, b):
 def parity_runs(fork, cargo_bins, lust_bins, out, timeout, bins=BINS, keep=lambda case: True):
     """Every fixture run of each bin in `bins` (default all) on each project `keep` takes:
     Cargo build vs lust build."""
-    work = out / "parity-work" / "case"  # one path for both sides
+    root = out / "parity-work"  # one path for both sides
     rows = []
     for bin_name in bins:
         cb = cargo_bins / bin_name
@@ -181,7 +189,7 @@ def parity_runs(fork, cargo_bins, lust_bins, out, timeout, bins=BINS, keep=lambd
                 if not cb.exists():
                     rows.append((tag, "no cargo bin"))
                     continue
-                rows.append((tag, compare(run_one(cmd, src, work, timeout), run_one([str(lb)] + cmd[1:], src, work, timeout))))
+                rows.append((tag, compare(run_one(cmd, src, root, timeout), run_one([str(lb)] + cmd[1:], src, root, timeout))))
     shutil.rmtree(out / "parity-work", ignore_errors=True)
     return rows
 
