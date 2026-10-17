@@ -725,20 +725,21 @@ fn next_verified() -> u64 {
 /// The keyed dirty walk after a header delta (Sol review 2 item 1), by
 /// slot: Some(dirty) for a read set that held against the delta's base
 /// program (`Reads::verified` of its mode is `base`), where only the keys the delta can
-/// move (`kept_delta::Touched`) may have moved, so only those compare
-/// (graph.rs `ReadIndex::dirty_slots`). None for any other slot: a read
-/// set of another program, or none; the full walk decides it.
+/// move (`moved`: `kept_delta::Touched`, or only `Checked` keys after body
+/// edits alone) may have moved, so only those compare (graph.rs
+/// `ReadIndex::dirty_slots`). None for any other slot: a read set of
+/// another program, or none; the full walk decides it.
 fn keyed_dirty(
     p: &collect::Program,
     front: &Front,
     caches: &mut Caches,
-    touched: &mut crate::driver::kept_delta::Touched,
+    moved: &mut dyn FnMut(&crate::driver::graph::ReadKey) -> bool,
     base: u64,
     answers: &mut FxMap<crate::driver::graph::ReadKey, crate::driver::graph::Read>,
 ) -> Vec<Option<bool>> {
     let mode = usize::from(p.gx.walk_instances);
     let def_slot = |d: def::DefId| p.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
-    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &mut |k| touched.hit(p, k), &def_slot, answers);
+    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, moved, &def_slot, answers);
     caches.slot_reads.iter().zip(dirty).map(|(r, d)| r.as_ref().filter(|r| r.verified[mode] == base).map(|_| d)).collect()
 }
 
@@ -3201,6 +3202,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // What a header delta on the kept program can move, when no derive
     // delta ran with it (the keyed walks below).
     let mut header_moves = caches.header_moves.take().filter(|_| kept.is_ok() && caches.derive_dirty.is_none());
+    // A kept program that only body edits moved (no header or derive
+    // delta): only `Checked` keys can differ from what its read sets held
+    // against. An `impl Trait` body edit moves the environment hash, so
+    // every instance would take the full walk, but `reuse_kept` proved its
+    // hidden type stands (the keyed walk below).
+    let body_only = kept.is_ok() && header_moves.is_none() && caches.derive_dirty.is_none();
     // What a derive delta on the kept program can move, when every edit of
     // this request is a derive list edit (the keyed dirty walk below).
     let derive_dirty = caches.derive_dirty.take().filter(|_| std::mem::take(&mut caches.derive_only) && kept.is_ok());
@@ -3238,7 +3245,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // `Sig` fingerprint. As a full resolve's full mode does, every
     // unchanged passing body is a read-set candidate, and derived glue may
     // move.
-    if std::mem::take(&mut front.rpit_edit) && kept.is_err() {
+    let rpit_edit = std::mem::take(&mut front.rpit_edit);
+    if rpit_edit && kept.is_err() {
         let mut listed = vec![false; fn_count];
         changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
         let cands: Vec<usize> = (0..fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !listed[i]).collect();
@@ -3610,12 +3618,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // This request's node answers for the program, shared by the keyed
     // walk and the oracle's proofs below.
     let mut answers = FxMap::default();
+    let wants = keyed_base != 0 && (!mention_only.is_empty() || program.gx.has_generics);
     let keyed: Option<Vec<Option<bool>>> = match header_moves.as_mut() {
-        Some(touched) if keyed_base != 0 && (!mention_only.is_empty() || program.gx.has_generics) => {
+        Some(touched) if wants => {
             super::laps::start();
-            let k = keyed_dirty(&program, front, caches, touched, keyed_base, &mut answers);
+            let k = keyed_dirty(&program, front, caches, &mut |k| touched.hit(&program, k), keyed_base, &mut answers);
             t.lap("reads keyed index");
             t.note_parts(super::laps::take());
+            Some(k)
+        }
+        None if wants && body_only && rpit_edit => {
+            let checked = &mut |k: &crate::driver::graph::ReadKey| matches!(k, crate::driver::graph::ReadKey::Checked(_));
+            let k = keyed_dirty(&program, front, caches, checked, keyed_base, &mut answers);
+            t.lap("reads keyed index");
             Some(k)
         }
         _ => None,
