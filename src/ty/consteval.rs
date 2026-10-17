@@ -3811,17 +3811,21 @@ impl Evaluator {
         // reborrow passed on). A write-back target is
         // (arg index, target expr, target-is-a-place).
         // Only a plain `&mut T` parameter is written back; a `&mut`
-        // inside another parameter type, or in the result, would be a
-        // copy whose writes are lost (`mut_ref_outside`).
-        for &pt in body.param_tys.iter().chain([&body.ret]) {
-            let inner = match cx.tys_ref().kind(pt) {
-                TyKind::Ref(_, m, it) if m.is_mut() && pt != body.ret => it,
-                _ => pt,
+        // inside another parameter value, or in the result, would be a
+        // copy whose writes are lost (`mut_ref_outside`). A value with
+        // no reference in it holds no `&mut`, whatever its type
+        // (`Self { last: None, .. }` of a type with an `Option<&mut T>`).
+        for (i, &pt) in body.param_tys.iter().enumerate() {
+            let Some((v, _)) = arg_vals.get(i) else { continue };
+            let (inner, v) = match (cx.tys_ref().kind(pt), v) {
+                (TyKind::Ref(_, m, it), ConstValue::Ref(cell)) if m.is_mut() => (it, &**cell),
+                _ => (pt, v),
             };
-            if holds_mut_ref(cx, inner, &mut Vec::new()) {
+            if value_has_ref(v) && holds_mut_ref(cx, inner, &mut Vec::new()) {
                 return Err(mut_ref_outside(span, "a const fn whose parameter or result holds a `&mut` this way"));
             }
         }
+        let ret_holds_mut = holds_mut_ref(cx, body.ret, &mut Vec::new());
         let mut wb_targets: Vec<(usize, ExprId, bool)> = Vec::new();
         for (i, &a) in args.iter().enumerate() {
             let i = i + off;
@@ -3996,6 +4000,9 @@ impl Evaluator {
             // integer result is range-checked against it first:
             // this is where an untyped local meets its real type.
             Flow::Val(v) | Flow::Return(v) => {
+                if ret_holds_mut && value_has_ref(&v.0) {
+                    return Err(mut_ref_outside(span, "a const fn whose parameter or result holds a `&mut` this way"));
+                }
                 if let (ConstValue::Int(i), Some(it)) = (&v.0, self.int_ty_of(cx, body.ret))
                     && v.1 != body.ret
                 {
@@ -6667,6 +6674,18 @@ fn fmt_text(fmt: &[ast::FmtPiece]) -> Option<String> {
 /// wrong value (fx-constbck).
 fn mut_ref_outside(span: Span, what: &str) -> Diag {
     Diag::new(C_OUTSIDE, span, format!("{what} is outside the bounded const evaluator"), "Pass `&mut place` straight to a const fn, or compute the value without a `&mut`.")
+}
+
+/// True when a const value holds a reference anywhere in it (a
+/// promoted or `&mut` cell, or a reference to a static). String and
+/// byte literals are shared data and count as none.
+fn value_has_ref(v: &ConstValue) -> bool {
+    match v {
+        ConstValue::Ref(_) | ConstValue::StaticRef(_) | ConstValue::StaticPlace(..) => true,
+        ConstValue::Aggregate(vs) | ConstValue::Variant(_, vs) => vs.iter().any(value_has_ref),
+        ConstValue::Repeat(x, _) => value_has_ref(x),
+        _ => false,
+    }
 }
 
 /// True when a value of type `t` may hold a `&mut` reference: in
