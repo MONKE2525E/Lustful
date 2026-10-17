@@ -2041,19 +2041,19 @@ impl ReadIndex {
         let fresh = crate::driver::compile::par_map(&missing, |k| p.read_fingerprint(k));
         answers.extend(missing.into_iter().zip(fresh));
         crate::driver::laps::mark("keyed/fingerprint");
+        // Each live entry compares its slot's stored answer, a lookup in a
+        // read set apiece: a widely read moved key has many thousands, so
+        // the entries go out in chunks to all cores.
         let mut dirty = vec![false; slot_reads.len()];
-        for (k, list) in moved {
+        let chunks: Vec<(&ReadKey, &[(u32, u64)])> = moved.iter().flat_map(|&(k, list)| list.chunks(2048).map(move |c| (k, c))).collect();
+        let (stamp, reads, answers) = (&self.stamp, &*slot_reads, &*answers);
+        let hits = crate::driver::compile::par_map(&chunks, |&(k, list)| {
             let now = answers[k];
-            for &(s, seal) in list {
-                let s = s as usize;
-                if self.stamp.get(s) != Some(&seal) || dirty[s] {
-                    continue;
-                }
-                if slot_reads[s].as_ref().and_then(|r| r.get(k)).is_some_and(|stored| stored != now) {
-                    dirty[s] = true;
-                }
-            }
-        }
+            let live = |s: usize, seal: u64| stamp.get(s) == Some(&seal);
+            let changed = |s: usize| reads[s].as_ref().and_then(|r| r.get(k)).is_some_and(|stored| stored != now);
+            list.iter().map(|&(s, seal)| (s as usize, seal)).filter(|&(s, seal)| live(s, seal) && changed(s)).map(|(s, _)| s).collect::<Vec<_>>()
+        });
+        hits.into_iter().flatten().for_each(|s| dirty[s] = true);
         crate::driver::laps::mark("keyed/compare");
         let live = |s: usize, seal: u64| self.stamp.get(s) == Some(&seal);
         let mut has_checked = vec![false; slot_reads.len()];
