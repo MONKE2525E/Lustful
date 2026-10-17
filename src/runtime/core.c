@@ -72,10 +72,27 @@ void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     return p;
 })
 
+/* std's System::alloc_zeroed: calloc when malloc's alignment is enough,
+   so the pages stay untouched until used (`vec![0u8; n]` for a large n
+   returns at once, as in Rust). */
 void *lust_alloc_zeroed(uint64_t size, uint64_t align) LUST_BODY({
+    if (!size) return (void *)(uintptr_t)(align ? align : 1);
+    if (align <= 16) {
+        void *p = calloc(size, 1);
+        if (!p) lust_oom_size(size);
+        return p;
+    }
     void *p = lust_alloc(size, align);
-    if (size) memset(p, 0, size);
+    memset(p, 0, size);
     return p;
+})
+
+/* True when the `n` bytes at `p` are all zero. The `vec![x; n]` IsZero
+   test for scalars and arrays of scalars (types without padding). */
+int32_t lust_is_zeroed(const void *p, uint64_t n) LUST_BODY({
+    const unsigned char *b = (const unsigned char *)p;
+    for (uint64_t i = 0; i < n; i++) if (b[i]) return 0;
+    return 1;
 })
 
 void lust_dealloc(void *ptr, uint64_t size, uint64_t align) LUST_BODY({
@@ -363,6 +380,20 @@ lust_Vec lust_vec_with_capacity(uint64_t n, uint64_t elem, uint64_t align) LUST_
     if (n) {
         if (n > (uint64_t)9223372036854775807ull / elem) { lust_vec_capacity_overflow(); return v; }
         v.ptr = lust_alloc(n * elem, align);
+        v.cap = n;
+    }
+    return v;
+})
+
+/* RawVec::with_capacity_zeroed: `vec![x; n]` for a value whose bytes
+   are all zero (Rust's IsZero fast path). The same capacity overflow
+   rule as lust_vec_with_capacity; the memory comes from calloc. */
+lust_Vec lust_vec_with_capacity_zeroed(uint64_t n, uint64_t elem, uint64_t align) LUST_BODY({
+    lust_Vec v = {(void *)(uintptr_t)(align ? align : 1), 0, 0};
+    if (!elem) { lust_vec_set_zst(&v, align); return v; }
+    if (n) {
+        if (n > (uint64_t)9223372036854775807ull / elem) { lust_vec_capacity_overflow(); return v; }
+        v.ptr = lust_alloc_zeroed(n * elem, align);
         v.cap = n;
     }
     return v;

@@ -6104,6 +6104,20 @@ impl Ex<'_, '_> {
                 self.assign(dest, Rvalue::Bin(Add, Operand::Copy(Place::local(ca)), Operand::Copy(Place::local(cb))));
                 self.goto(join);
             }
+            // core's slice `Iter::count` and alloc's `vec::IntoIter::count`
+            // are the length (no walk, so a zero-sized element costs nothing
+            // for any length). An IntoIter whose elements need a drop keeps
+            // the loop: it drops them in the same order.
+            K::SliceIter | K::SliceIterMut => {
+                let n = self.size(itp, ty)?;
+                self.assign(dest, Rvalue::Use(n));
+                self.goto(join);
+            }
+            K::VecIntoIter if !crate::check::collect::needs_drop(self.p, &self.body.tys, a[0]) => {
+                let r = self.ref_to(false, itp, ty);
+                self.call_builtin(Builtin::VecIterLen, vec![Operand::Move(Place::local(r))], dest);
+                self.goto(join);
+            }
             _ => {
                 self.count_loop(itp, ty, dest)?;
                 self.goto(join);
@@ -6141,6 +6155,15 @@ impl Ex<'_, '_> {
         match k {
             // core's `ChunkBy::last` is `next_back` too (R13).
             K::Range | K::RangeInclusive | K::ChunkBy | K::ChunkByMut => {
+                self.next(itp, ty, dest.clone(), true)?;
+                self.goto(join);
+            }
+            // alloc's `vec::IntoIter::last` is `next_back`; the rest then
+            // drops with the iterator. With no element drop to run, the rest
+            // needs no walk (a zero-sized element costs nothing for any
+            // length). Drop elements keep the loop: it drops them in the
+            // same order.
+            K::VecIntoIter if !crate::check::collect::needs_drop(self.p, &self.body.tys, a[0]) => {
                 self.next(itp, ty, dest.clone(), true)?;
                 self.goto(join);
             }

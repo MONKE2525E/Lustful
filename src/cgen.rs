@@ -1305,6 +1305,35 @@ fn vec_cap(et: &str, v: &str) -> String {
     format!("(sizeof({et}) ? ({v})->cap : 0xffffffffffffffffULL)")
 }
 
+/// A C condition that is true when zeroed memory, read as `t`, is the
+/// same value as the C lvalue `e`: Rust's `IsZero` test, which lets
+/// `vec![e; n]` take zeroed memory and skip every clone. `z` names a
+/// zeroed static of type `t` (the caller declares it when the condition
+/// mentions it), for the discriminant zeroed memory holds. Scalars and
+/// arrays of scalars test their bytes (no padding); tuples test each
+/// field; an `Option` must hold the zeroed discriminant and, when that is
+/// `Some`, a zero payload (so `None::<Box<T>>` passes when null is
+/// `None`). None for other types: the caller fills by copy or clone.
+fn zero_test(p: &Program, t: &CTy, e: &str, z: &str) -> Option<String> {
+    let scalar = |t: &CTy| matches!(t, CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_));
+    match t {
+        CTy::Unit => Some("1".into()),
+        _ if scalar(t) => Some(format!("lust_is_zeroed(&{e}, sizeof({e}))")),
+        CTy::Array(el, _) if scalar(el) => Some(format!("lust_is_zeroed(&{e}, sizeof({e}))")),
+        CTy::Tuple(es) => {
+            let fs = es.iter().enumerate().map(|(i, el)| zero_test(p, el, &format!("{e}.f{i}"), &format!("{z}.f{i}")));
+            let fs = fs.collect::<Option<Vec<_>>>()?;
+            Some(if fs.is_empty() { "1".into() } else { format!("({})", fs.join(" && ")) })
+        }
+        CTy::Option(el) => {
+            let (de, dz) = (disc_call(p, t, &format!("(&{e})")), disc_call(p, t, &format!("(&{z})")));
+            let some = zero_test(p, el, &variant_field(p, t, e, 1, 0), &variant_field(p, t, z, 1, 0)).unwrap_or_else(|| "0".into());
+            Some(format!("({de} == {dz} && ({de} == 0 || {some}))"))
+        }
+        _ => None,
+    }
+}
+
 /// C integer type for an explicit enum tag or a niche scalar of `size`
 /// bytes. Niche scalars are read and written as unsigned bit patterns.
 fn tag_c_type(size: u64, signed: bool) -> &'static str {
@@ -3115,7 +3144,8 @@ impl FnGen<'_, '_> {
                 format!("(({mt}*)lust_alloc_zeroed(sizeof({mt}), _Alignof({mt})))")
             }
             // `Box::new_uninit_slice(n)`: RawVec's allocation for `n`
-            // slots (its capacity overflow panic), zeroed, as a boxed
+            // slots (its capacity overflow panic), zeroed by calloc (no
+            // page is touched, as for Rust's uninit memory), as a boxed
             // slice of exactly `n`. Under panic=unwind the overflow
             // returns with cap 0 (an empty box, never written).
             CallTarget::Builtin(Builtin::BoxNewUninitSlice) => {
@@ -3125,7 +3155,7 @@ impl FnGen<'_, '_> {
                 let (k, v, t) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(
                     self.out,
-                    "    uint64_t {k} = {n}; lust_Vec {v} = lust_vec_with_capacity({k}, sizeof({mt}), _Alignof({mt})); if ({v}.cap) memset({v}.ptr, 0, {k} * sizeof({mt})); {} {t}; {t}.ptr = ({mt}*){v}.ptr; {t}.len = {} >= {k} ? {k} : 0;",
+                    "    uint64_t {k} = {n}; lust_Vec {v} = lust_vec_with_capacity_zeroed({k}, sizeof({mt}), _Alignof({mt})); {} {t}; {t}.ptr = ({mt}*){v}.ptr; {t}.len = {} >= {k} ? {k} : 0;",
                     ctype(dest_cty),
                     vec_cap(&mt, &format!("&{v}"))
                 );
@@ -3505,26 +3535,63 @@ impl FnGen<'_, '_> {
                 let (nv, _) = self.operand(n, loc, post);
                 let (t, xt, i) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(self.out, "    {et} {xt} = {xv};\n    uint64_t {i}_n = {nv};");
-                let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({i}_n, sizeof({et}), _Alignof({et}));");
+                // std's from_elem fast paths. A value that zeroed memory
+                // reproduces (IsZero) takes calloc'd memory and no clones; a
+                // zero-sized Copy value (`()`) only sets the length. Both
+                // return at once for any n, as in Rust.
+                let copy = is_copy_c(self.p, &ec);
+                let zt = self.tmp();
+                let zero = zero_test(self.p, &ec, &xt, &zt);
+                if let Some(z) = &zero {
+                    if z.contains(&zt) {
+                        let _ = writeln!(self.out, "    static {et} {zt};");
+                    }
+                    let _ = writeln!(self.out, "    int32_t {zt}_z = {z};");
+                    let _ = writeln!(
+                        self.out,
+                        "    lust_Vec {t} = {zt}_z ? lust_vec_with_capacity_zeroed({i}_n, sizeof({et}), _Alignof({et})) : lust_vec_with_capacity({i}_n, sizeof({et}), _Alignof({et}));"
+                    );
+                } else {
+                    let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({i}_n, sizeof({et}), _Alignof({et}));");
+                }
                 if self.p.unwind {
                     // A capacity overflow panic returns here under panic=unwind:
                     // fill nothing, drop the value, and unwind.
                     let _ = writeln!(self.out, "    if ({} < {i}_n) {i}_n = 0;", vec_cap(&et, &format!("&{t}")));
                 }
-                let clone = if is_copy_c(self.p, &ec) {
-                    xt.to_string()
+                let drop_x = if needs_drop_c(self.p, &ec) {
+                    self.want(Glue::Drop, &ec);
+                    format!(" drop_{}(&{xt});", mangle(&ec))
+                } else {
+                    String::new()
+                };
+                let fast = match (&zero, copy) {
+                    (Some(_), true) => format!("{zt}_z || sizeof({et}) == 0"),
+                    (Some(_), false) => format!("{zt}_z"),
+                    (None, true) => format!("sizeof({et}) == 0"),
+                    (None, false) => String::new(),
+                };
+                if !fast.is_empty() {
+                    let _ = writeln!(self.out, "    if ({fast}) {{{drop_x} }} else");
+                }
+                if copy {
+                    // u8 and i8 fill with memset in std; any one-byte Copy
+                    // value gives the same bytes.
+                    let _ = writeln!(
+                        self.out,
+                        "    if (sizeof({et}) == 1) memset({t}.ptr, *(uint8_t *)&{xt}, {i}_n);\n    else for (uint64_t {i} = 0; {i} < {i}_n; {i}++) (({et}*){t}.ptr)[{i}] = {xt};"
+                    );
                 } else {
                     self.want(Glue::Clone, &ec);
-                    format!("clone_{}(&{xt})", mangle(&ec))
-                };
-                // Clone n-1 times, then move the original into the last slot (as Rust does).
-                let _ = writeln!(self.out, "    for (uint64_t {i} = 0; {i} + 1 < {i}_n; {i}++) (({et}*){t}.ptr)[{i}] = {clone};");
-                let _ = write!(self.out, "    if ({i}_n) (({et}*){t}.ptr)[{i}_n - 1] = {xt};");
-                if needs_drop_c(self.p, &ec) {
-                    self.want(Glue::Drop, &ec);
-                    let _ = write!(self.out, " else drop_{}(&{xt});", mangle(&ec));
+                    // Clone n-1 times, then move the original into the last slot (as Rust does).
+                    let _ = writeln!(
+                        self.out,
+                        "    {{ for (uint64_t {i} = 0; {i} + 1 < {i}_n; {i}++) (({et}*){t}.ptr)[{i}] = clone_{}(&{xt});",
+                        mangle(&ec)
+                    );
+                    let _ = writeln!(self.out, "    if ({i}_n) (({et}*){t}.ptr)[{i}_n - 1] = {xt}; else{} }}", if drop_x.is_empty() { " {}" } else { &drop_x });
                 }
-                let _ = writeln!(self.out, "\n    {t}.len = {i}_n;");
+                let _ = writeln!(self.out, "    {t}.len = {i}_n;");
                 t
             }
             Rvalue::Eq { a, b, ty, ne } => {
@@ -3598,7 +3665,8 @@ impl FnGen<'_, '_> {
                 let (v, _) = self.operand(o, loc, post);
                 let (t, xt, i) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(self.out, "    {et} {xt} = {v};\n    {ct} {t};");
-                let _ = writeln!(self.out, "    for (uint64_t {i} = 0; {i} < {n}; {i}++) {t}.v[{i}] = {xt};");
+                // A zero-sized element has nothing to copy (`[(); usize::MAX]`).
+                let _ = writeln!(self.out, "    if (sizeof({et})) for (uint64_t {i} = 0; {i} < {n}; {i}++) {t}.v[{i}] = {xt};");
                 t
             }
             Rvalue::Format(parts) => self.format(parts, loc, post, 0),
@@ -6349,12 +6417,12 @@ impl FnGen<'_, '_> {
                 let CTy::Vec(e) = &**v else { unreachable!() };
                 let et = ctype(e);
                 let (vv, o) = (&vals[0], &vals[1]);
-                let (n, i) = (self.tmp(), self.tmp());
+                let n = self.tmp();
                 // Elements move bitwise; the source keeps its
                 // buffer and capacity with length 0, as in Rust.
                 let _ = writeln!(
                     self.out,
-                    "    uint64_t {n} = {o}->len;\n    lust_vec_reserve({vv}, {n}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = 0; {i} < {n}; {i}++) (({et}*){vv}->ptr)[{vv}->len + {i}] = (({et}*){o}->ptr)[{i}];\n    {vv}->len += {n};\n    {o}->len = 0;"
+                    "    uint64_t {n} = {o}->len;\n    lust_vec_reserve({vv}, {n}, sizeof({et}), _Alignof({et}));\n    memcpy(({et}*){vv}->ptr + {vv}->len, {o}->ptr, {n} * sizeof({et}));\n    {vv}->len += {n};\n    {o}->len = 0;"
                 );
                 "((lust_Unit){})".into()
             }
@@ -6365,30 +6433,32 @@ impl FnGen<'_, '_> {
                 let (_, sptr, slen) = slice_like(&tys[1], &vals[1]);
                 let (sp, sn, i) = (self.tmp(), self.tmp(), self.tmp());
                 let vv = &vals[0];
-                let cloned = if is_copy_c(self.p, e) {
-                    format!("{sp}[{i}]")
-                } else {
-                    self.want(Glue::Clone, e);
-                    format!("clone_{}(&{sp}[{i}])", mangle(e))
-                };
                 // The source pointer and length are read into
                 // temporaries before the reserve can reallocate
                 // (the receiver cannot alias the source in Rust,
                 // but the operand text may name the same locals).
                 let _ = writeln!(
                     self.out,
-                    "    {et} *{sp} = {sptr};\n    uint64_t {sn} = {slen};\n    lust_vec_reserve({vv}, {sn}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = 0; {i} < {sn}; {i}++) (({et}*){vv}->ptr)[{vv}->len++] = {cloned};"
+                    "    {et} *{sp} = {sptr};\n    uint64_t {sn} = {slen};\n    lust_vec_reserve({vv}, {sn}, sizeof({et}), _Alignof({et}));"
                 );
+                if is_copy_c(self.p, e) {
+                    // A trivial Clone is a byte copy (std's TrivialClone path),
+                    // so a zero-sized element costs nothing for any length.
+                    let _ = writeln!(self.out, "    memcpy(({et}*){vv}->ptr + {vv}->len, {sp}, {sn} * sizeof({et}));\n    {vv}->len += {sn};");
+                } else {
+                    self.want(Glue::Clone, e);
+                    let _ = writeln!(self.out, "    for (uint64_t {i} = 0; {i} < {sn}; {i}++) (({et}*){vv}->ptr)[{vv}->len++] = clone_{}(&{sp}[{i}]);", mangle(e));
+                }
                 "((lust_Unit){})".into()
             }
             B::VecSplitOff => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };
-                let (et, t, i) = (ctype(e), self.tmp(), self.tmp());
+                let (et, t) = (ctype(e), self.tmp());
                 let (vv, at) = (&vals[0], &vals[1]);
                 let _ = writeln!(
                     self.out,
-                    "    if ({at} > {vv}->len) lust_panic_nn(\"`at` split index (is \", {at}, \") should be <= len (is \", {vv}->len, \")\", {loc});\n    lust_Vec {t} = lust_vec_with_capacity({vv}->len - {at}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = {at}; {i} < {vv}->len; {i}++) (({et}*){t}.ptr)[{i} - {at}] = (({et}*){vv}->ptr)[{i}];\n    {t}.len = {vv}->len - {at};\n    {vv}->len = {at};"
+                    "    if ({at} > {vv}->len) lust_panic_nn(\"`at` split index (is \", {at}, \") should be <= len (is \", {vv}->len, \")\", {loc});\n    lust_Vec {t} = lust_vec_with_capacity({vv}->len - {at}, sizeof({et}), _Alignof({et}));\n    memcpy({t}.ptr, ({et}*){vv}->ptr + {at}, ({vv}->len - {at}) * sizeof({et}));\n    {t}.len = {vv}->len - {at};\n    {vv}->len = {at};"
                 );
                 t
             }
@@ -6633,16 +6703,16 @@ impl FnGen<'_, '_> {
                 // slice forms clone them. Both allocate exactly.
                 let moves = b == B::VecFrom && matches!(tys[0], CTy::Array(..));
                 let (t, i) = (self.tmp(), self.tmp());
-                let elem = if moves || is_copy_c(self.p, &e) {
-                    format!("{ptr}[{i}]")
+                let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({len}, sizeof({et}), _Alignof({et}));");
+                if moves || is_copy_c(self.p, &e) {
+                    // A move or a trivial Clone is a byte copy (std's
+                    // TrivialClone path): free for zero-sized elements.
+                    let _ = writeln!(self.out, "    memcpy({t}.ptr, {ptr}, {len} * sizeof({et}));");
                 } else {
                     self.want(Glue::Clone, &e);
-                    format!("clone_{}(&{ptr}[{i}])", mangle(&e))
-                };
-                let _ = writeln!(
-                    self.out,
-                    "    lust_Vec {t} = lust_vec_with_capacity({len}, sizeof({et}), _Alignof({et}));\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) (({et}*){t}.ptr)[{i}] = {elem};\n    {t}.len = {len};"
-                );
+                    let _ = writeln!(self.out, "    for (uint64_t {i} = 0; {i} < {len}; {i}++) (({et}*){t}.ptr)[{i}] = clone_{}(&{ptr}[{i}]);", mangle(&e));
+                }
+                let _ = writeln!(self.out, "    {t}.len = {len};");
                 t
             }
             B::StrFind | B::StrRfind => {
@@ -9431,6 +9501,10 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             CTy::Array(e, n) => match c_layout(p, t) {
                 Some(l) => {
                     let ct = ctype(t);
+                    // tcc and gcc refuse a C array longer than 2^31 - 1 even
+                    // when its element is zero-sized (`[(); usize::MAX]`); such
+                    // an array has size 0 either way, so it is declared `v[0]`.
+                    let n = if l.size == 0 && *n > i32::MAX as u64 { 0 } else { *n };
                     let _ = writeln!(out, "typedef struct {ct} {{ {} v[{n}]; }} {ct};", ctype(e));
                     layout_assert(out, &ct, &l);
                 }
@@ -10023,9 +10097,14 @@ fn glue_def_value(
                 CTy::Vec(e) => {
                     let et = ctype(e);
                     let _ = writeln!(body, "  lust_Vec r = lust_vec_with_capacity(p->len, sizeof({et}), _Alignof({et}));");
-                    let c = clone_of(e, &format!("(({et}*)p->ptr)[i]"), &mut need);
-                    let _ =
-                        writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) (({et}*)r.ptr)[i] = {c};\n  r.len = p->len;\n  return r;");
+                    if is_copy_c(p, e) && !written(e) {
+                        // std's TrivialClone path: one byte copy, free for
+                        // zero-sized elements.
+                        let _ = writeln!(body, "  memcpy(r.ptr, p->ptr, p->len * sizeof({et}));\n  r.len = p->len;\n  return r;");
+                    } else {
+                        let c = clone_of(e, &format!("(({et}*)p->ptr)[i]"), &mut need);
+                        let _ = writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) (({et}*)r.ptr)[i] = {c};\n  r.len = p->len;\n  return r;");
+                    }
                 }
                 // `MaybeUninit::clone` is a byte copy in core
                 // (no clone of the possibly-uninit value).

@@ -232,14 +232,19 @@ impl FnGen<'_, '_> {
                     "    uint64_t {s}, {en};\n    lust_range_check({vv}->len, {}, {}, {}, {}, &{s}, &{en});\n    lust_vec_reserve({vv}, {en} - {s}, sizeof({et}), _Alignof({et}));",
                     vals[1], vals[2], vals[3], vals[4]
                 );
-                let elem = format!("(({et}*){vv}->ptr)[{i}]");
-                let val = if is_copy_c(self.p, &e) {
-                    elem
+                if is_copy_c(self.p, &e) {
+                    // std's TrivialClone path: one byte copy past the end,
+                    // free for zero-sized elements.
+                    let _ = writeln!(self.out, "    memcpy(({et}*){vv}->ptr + {vv}->len, ({et}*){vv}->ptr + {s}, ({en} - {s}) * sizeof({et}));\n    {vv}->len += {en} - {s};");
                 } else {
                     self.want(Glue::Clone, &e);
-                    format!("clone_{}(&{elem})", mangle(&e))
-                };
-                let _ = writeln!(self.out, "    for (uint64_t {i} = {s}; {i} < {en}; {i}++) {{ {et} c_ = {val}; (({et}*){vv}->ptr)[{vv}->len++] = c_; }}");
+                    let elem = format!("(({et}*){vv}->ptr)[{i}]");
+                    let _ = writeln!(
+                        self.out,
+                        "    for (uint64_t {i} = {s}; {i} < {en}; {i}++) {{ {et} c_ = clone_{}(&{elem}); (({et}*){vv}->ptr)[{vv}->len++] = c_; }}",
+                        mangle(&e)
+                    );
+                }
                 "((lust_Unit){})".into()
             }
             B::VecDedupBy | B::VecDedupByKey => {
