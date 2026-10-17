@@ -246,6 +246,104 @@ fn builtin_is_const(b: Builtin) -> bool {
             // `NonZero::new` and `NonZero::get`.
             | NonZeroNew
             | NonZeroGet
+            // More integer methods that are const in 1.99 (probed with
+            // rustc 1.99 in const fn bodies, tf-v07).
+            | DivCeil
+            | IsMultipleOf
+            | NextMultipleOf
+            | CheckedNextMultipleOf
+            | UnsignedAbs
+            | UnboundedShl
+            | UnboundedShr
+            | CastSigned
+            | CastUnsigned
+            | Isqrt
+            | CheckedIsqrt
+            | BitWidth
+            | HighestOne
+            | LowestOne
+            | IsolateHighestOne
+            | IsolateLowestOne
+            | IntMidpoint
+            | IntAbsDiff
+            | StrictAdd
+            | StrictSub
+            | StrictMul
+            | StrictDiv
+            | StrictRem
+            | StrictDivEuclid
+            | StrictRemEuclid
+            | StrictNeg
+            | StrictAbs
+            | StrictPow
+            | StrictShl
+            | StrictShr
+            | MixedCheckedAdd
+            | MixedCheckedSub
+            | MixedWrappingAdd
+            | MixedWrappingSub
+            | MixedSaturatingAdd
+            | MixedSaturatingSub
+            | MixedOverflowingAdd
+            | MixedOverflowingSub
+            | MixedStrictAdd
+            | MixedStrictSub
+            | CheckedSignedDiff
+            | FloatMulAdd
+            // `char` and `u8` ASCII methods and the UTF encoders.
+            | CharEncodeUtf8
+            | CharEncodeUtf16
+            | CharIsWhitespace
+            | CharIsUppercase
+            | CharIsLowercase
+            | CharIsAlphabetic
+            | CharIsAlphanumeric
+            | CharToUppercase
+            | CharToLowercase
+            | MakeAsciiLowercase
+            | MakeAsciiUppercase
+            // Pointers, cells, `MaybeUninit`, ranges, UTF-8, and slices.
+            // A slice method reached through a `Vec`, `String`, or smart
+            // pointer is still a non-const `Deref` (`deref_receiver`).
+            | HintBlackBox
+            | PtrNull
+            | PtrIsNull
+            | PtrFromRef
+            | PtrCast
+            | RangeInclStart
+            | RangeInclEnd
+            | RefCellNew
+            | RefCellIntoInner
+            | CellGet
+            | CellReplace
+            | CellIntoInner
+            | CellGetMut
+            | MaybeUninitUninit
+            | MaybeUninitZeroed
+            | MaybeUninitNew
+            | MaybeUninitWrite
+            | MaybeUninitAsPtr
+            | MaybeUninitAsMutPtr
+            | WeakNew
+            | StrFromUtf8
+            | Utf8ErrorValidUpTo
+            | Utf8ErrorErrorLen
+            | LocationCaller
+            | LocationFile
+            | LocationLine
+            | LocationColumn
+            | SliceFromRef
+            | SliceIsAscii
+            | StrIsAscii
+            | SliceEqIgnoreAsciiCase
+            | StrEqIgnoreAsciiCase
+            | SliceRotateLeft
+            | SliceRotateRight
+            | VecSwap
+            | SliceCopyFromSlice
+            | VecFirstMut
+            | SeqAsPtr
+            | StrAsPtr
             // The reads behind std source's `const fn discriminant`.
             | DiscriminantValue
             | DiscriminantKind
@@ -466,6 +564,33 @@ impl Walk<'_, '_> {
         }
     }
 
+    /// A builtin method reached through a `Vec`, `String`, `Rc`, or `Arc`
+    /// receiver that the type does not define itself (`v.first()` on a
+    /// `Vec`) runs through `Deref`, which is not const (rustc E0658). A
+    /// `Box` deref is built in, so it is allowed.
+    fn deref_receiver(&mut self, e: ExprId, recv: ExprId) {
+        use crate::ty::BuiltinTy;
+        let Res::BuiltinMethod { b, .. } = self.ck.res(e) else { return };
+        let t = self.peel_refs(self.ty(recv));
+        let own = match self.ck.tys.builtin_of(t) {
+            Some(BuiltinTy::Vec) => matches!(b, Builtin::VecLen | Builtin::VecIsEmpty | Builtin::VecCapacity | Builtin::VecAsSlice | Builtin::SeqAsPtr),
+            Some(BuiltinTy::Boxed) => return,
+            Some(BuiltinTy::String) => {
+                matches!(b, Builtin::StringLen | Builtin::StringIsEmpty | Builtin::StringAsStr | Builtin::StringAsBytes | Builtin::StringCapacity)
+            }
+            _ if self.ck.tys.smart_elem(t).is_some() => false,
+            _ => return,
+        };
+        if !own && builtin_is_const(b) {
+            let tn = ty_name(self.p, &self.ck.tys, t);
+            self.err(
+                self.p.ast.expr_span(e),
+                format!("cannot call this method through a deref of `{tn}` in a const function: its `Deref` impl is not const"),
+                "Call the method on a slice or `str` reference, or move the call out of the const function.",
+            );
+        }
+    }
+
     fn fn_call(&mut self, f: LocalDefId, span: Span) {
         let info = self.p.fn_info(f);
         if !info.is_const {
@@ -572,6 +697,7 @@ impl Walk<'_, '_> {
             Expr::MethodCall { recv, name, args, .. } => {
                 let written = Some(self.p.name(*name));
                 self.call_res(e, "method", written);
+                self.deref_receiver(e, *recv);
                 // A by-value receiver moves into the callee; a borrowed
                 // receiver stays a place of the caller.
                 let by_value = matches!(
