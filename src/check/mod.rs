@@ -8740,64 +8740,67 @@ impl<'p> Ctx<'p> {
     }
 
     /// The explicit generic args written on one path segment.
+    /// A turbofish argument the parser read as a type: a type, or a const
+    /// when the bare name is a const parameter of this body or a const
+    /// item and no type (rustc reads it by the parameter's kind, so
+    /// `f::<N>()` and `x.m::<N>()` take the const). `instantiate_template`
+    /// rejects a kind mismatch.
+    fn written_type_arg(&mut self, t: ast::TyId) -> Option<GenericArg> {
+        let p = self.p;
+        if let ast::TyExpr::Path(segs) = p.ast.ty(t)
+            && segs.iter().all(|s| !s.has_args())
+        {
+            let is_param =
+                |cx: &Self, n: Sym| cx.body_scope.param_tys.iter().any(|(pn, _)| *pn == n) || n == p.known.self_type;
+            match segs.as_slice() {
+                // A const param of this body (`f::<N>()`).
+                // `(N)` is a const operation on it, not
+                // the parameter itself.
+                [seg] if let Some((i, _, val)) = self.const_param(seg.name) => {
+                    if p.ast.is_parenthesized_ty(t) {
+                        self.err(
+                            "L0110",
+                            p.ast.ty_span(t),
+                            "generic parameters may not be used in const operations",
+                            "Write the const parameter without parentheses.",
+                        );
+                    }
+                    Some(GenericArg::Const(self.tys.intern_const(val.unwrap_or(ConstKind::Param(i)))))
+                }
+                [seg]
+                    if !is_param(self, seg.name)
+                        && !p.type_names.contains_key(&seg.name)
+                        && !p.aliases.contains_key(&seg.name)
+                        && p.const_names.contains_key(&seg.name) =>
+                {
+                    use crate::ty::consteval::ConstValue;
+                    let idx = p.const_names[&seg.name];
+                    match &p.consts[idx as usize].value {
+                        // Stored as `const_call_kind` stores a literal: the
+                        // two's complement bits (`const_int_fits` reads them).
+                        ConstValue::Int(v) => Some(GenericArg::Const(self.tys.intern_const(ConstKind::Int(*v as u128)))),
+                        ConstValue::Bool(b) => Some(GenericArg::Const(self.tys.intern_const(ConstKind::Bool(*b)))),
+                        ConstValue::Char(c) => Some(GenericArg::Const(self.tys.intern_const(ConstKind::Char(*c)))),
+                        _ => Some(GenericArg::Ty(self.resolve_written(t))),
+                    }
+                }
+                // Multi-segment paths stay type paths:
+                // a const path as a generic argument
+                // needs braces in Rust (`h::<{ S::N }>`).
+                _ => Some(GenericArg::Ty(self.resolve_written(t))),
+            }
+        } else {
+            Some(GenericArg::Ty(self.resolve_written(t)))
+        }
+    }
+
     fn explicit_seg_args(&mut self, seg: &ast::PathSeg) -> Vec<Option<GenericArg>> {
         let p = self.p;
         let ast::GenericArgs::Angle(written) = &seg.args else { return Vec::new() };
         let mut out = Vec::new();
         for a in written {
             out.push(match a {
-                ast::GenericArg::Type(t) => {
-                    // A bare path the parser read as a type may name
-                    // a const (`h::<N>`): rustc reads it by the
-                    // parameter's kind. When the name is no type
-                    // here but is a const item, read the const;
-                    // `instantiate_template` rejects a kind mismatch.
-                    if let ast::TyExpr::Path(segs) = p.ast.ty(*t)
-                        && segs.iter().all(|s| !s.has_args())
-                    {
-                        let is_param =
-                            |cx: &Self, n: Sym| cx.body_scope.param_tys.iter().any(|(pn, _)| *pn == n) || n == p.known.self_type;
-                        match segs.as_slice() {
-                            // A const param of this body (`f::<N>()`).
-                            // `(N)` is a const operation on it, not
-                            // the parameter itself.
-                            [seg] if let Some((i, _, val)) = self.const_param(seg.name) => {
-                                if p.ast.is_parenthesized_ty(*t) {
-                                    self.err(
-                                        "L0110",
-                                        p.ast.ty_span(*t),
-                                        "generic parameters may not be used in const operations",
-                                        "Write the const parameter without parentheses.",
-                                    );
-                                }
-                                Some(GenericArg::Const(self.tys.intern_const(val.unwrap_or(ConstKind::Param(i)))))
-                            }
-                            [seg]
-                                if !is_param(self, seg.name)
-                                    && !p.type_names.contains_key(&seg.name)
-                                    && !p.aliases.contains_key(&seg.name)
-                                    && p.const_names.contains_key(&seg.name) =>
-                            {
-                                use crate::ty::consteval::ConstValue;
-                                let idx = p.const_names[&seg.name];
-                                match &p.consts[idx as usize].value {
-                                    ConstValue::Int(v) => u128::try_from(*v)
-                                        .ok()
-                                        .map(|v| GenericArg::Const(self.tys.intern_const(ConstKind::Int(v)))),
-                                    ConstValue::Bool(b) => Some(GenericArg::Const(self.tys.intern_const(ConstKind::Bool(*b)))),
-                                    ConstValue::Char(c) => Some(GenericArg::Const(self.tys.intern_const(ConstKind::Char(*c)))),
-                                    _ => Some(GenericArg::Ty(self.resolve_written(*t))),
-                                }
-                            }
-                            // Multi-segment paths stay type paths:
-                            // a const path as a generic argument
-                            // needs braces in Rust (`h::<{ S::N }>`).
-                            _ => Some(GenericArg::Ty(self.resolve_written(*t))),
-                        }
-                    } else {
-                        Some(GenericArg::Ty(self.resolve_written(*t)))
-                    }
-                }
+                ast::GenericArg::Type(t) => self.written_type_arg(*t),
                 ast::GenericArg::Lifetime(_) => None,
                 ast::GenericArg::Const(e) => Some(self.const_call_arg(*e)),
                 ast::GenericArg::Binding { span, .. } => {
@@ -16286,10 +16289,10 @@ impl<'p> Ctx<'p> {
             .iter()
             .map(|a| match a {
                 ast::GenericArg::Type(t) if any_static => Some(GenericArg::Ty(self.resolve_annotation(*t))),
-                // `x.m::<N>()` with `N` a const parameter of the body: the
-                // parser reads it as a type path (tf-p5, `as_chunks::<N>`).
-                ast::GenericArg::Type(t) if let Some(c) = self.const_param_path(*t) => Some(GenericArg::Const(c)),
-                ast::GenericArg::Type(t) => Some(GenericArg::Ty(self.resolve_written(*t))),
+                // `x.m::<N>()` with `N` a const parameter of the body or a
+                // const item: the parser reads it as a type path (tf-p5,
+                // `as_chunks::<N>`).
+                ast::GenericArg::Type(t) => self.written_type_arg(*t),
                 ast::GenericArg::Const(e2) => Some(self.const_call_arg(*e2)),
                 _ => None,
             })
