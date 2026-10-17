@@ -1307,7 +1307,9 @@ pub(super) fn finish_deferred_lang_methods(cx: &mut Ctx) {
             }
             continue;
         }
-        if cx.has_unbound_var(base) || !winners.is_empty() {
+        if cx.tainted_lookup(base) {
+            // A follow-up of this body's first error (`tainted_lookup`).
+        } else if cx.has_unbound_var(base) || !winners.is_empty() {
             cx.err(
                 "L0610",
                 d.name_span,

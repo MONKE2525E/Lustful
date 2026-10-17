@@ -251,6 +251,11 @@ def one_pass(a, by_name, work, copy, env, removed, cause_of_name, status, pass_n
                     break
                 print(f"tsrust-deep: {name} round {rnd}: removed users of {sorted(gone)}", flush=True)
                 continue
+            # prune_round charges an item to the last of its errors: an error that names an
+            # item an earlier round removed goes last, so the item counts as that item's
+            # cascade, not as a root of a follow-up error in the same item (a missing callee
+            # leaves its result's type open: `no field parse on &mut _`).
+            located.sort(key=lambda e: any(n in cause_of_name for n in names_in(e[3])))
             before = len(removed)
             unknown = unknown_type_parents(located, copy, cause_of_name)
             try:

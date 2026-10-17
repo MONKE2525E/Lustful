@@ -3046,6 +3046,15 @@ impl<'p> Ctx<'p> {
     fn err(&mut self, code: &'static str, span: Span, msg: impl Into<String>, fix: impl Into<String>) {
         self.errs.push(Diag::new(code, span, msg, fix));
     }
+    /// True when this body already has an error and `t` still holds an
+    /// unresolved inference variable: as rustc's "tainted by errors"
+    /// inference, a field or method lookup (or a format trait check) on
+    /// such a type is a follow-up of the first error (a call of a
+    /// missing fn leaves its result open), so it reports nothing more.
+    /// The program is rejected either way.
+    fn tainted_lookup(&self, t: Ty) -> bool {
+        !self.errs.is_empty() && self.has_unbound_deep(t)
+    }
     fn span(&self, e: ExprId) -> Span {
         self.p.ast.expr_span(e)
     }
@@ -9316,7 +9325,7 @@ impl<'p> Ctx<'p> {
                     let tref = self.tys.mk_ref(false, target);
                     (derefs, inner) = self.autoderef_smart(tref);
                 }
-                if !matches!(self.kind(inner), TyKind::Error) {
+                if !matches!(self.kind(inner), TyKind::Error) && !self.tainted_lookup(bt) {
                     let tn = self.tn(bt);
                     self.err("L0103", span, format!("no field `{}` on type `{tn}`", self.name(*name)), "Check the field name.");
                 }
@@ -17246,6 +17255,9 @@ impl<'p> Ctx<'p> {
                     );
                     return ERROR;
                 }
+                if self.tainted_lookup(base) {
+                    return ERROR;
+                }
                 let tn = self.tn(base);
                 self.err(
                     "L0104",
@@ -19655,7 +19667,7 @@ impl<'p> Ctx<'p> {
             },
         };
         if let Some(what) = what {
-            if self.kind(t) != TyKind::Error {
+            if self.kind(t) != TyKind::Error && !self.tainted_lookup(t) {
                 let tn = self.tn(t);
                 let fix = match what {
                     "Debug" => "Add #[derive(Debug)] to the type.",
