@@ -3173,6 +3173,7 @@ fn parse_repr(interner: &Interner, attrs: &[ast::Attr]) -> Result<crate::ty::lay
                                 _ => 64,
                             };
                             repr.int = Some((bits, signed));
+                            repr.word = matches!(text, "isize" | "usize");
                         }
                         _ => return Err(bad(text)),
                     }

@@ -61,7 +61,8 @@ prints "reserved, not yet emitted".
 | L0543 | Known-value checks | tf-mdrop | in use | `drop` of a `ManuallyDrop` value does nothing (rustc `undropped_manually_drops`) |
 | L0544 | Known-value checks | tf-mdrop | in use | `let _ =` on a lock guard (rustc `let_underscore_lock`) |
 | L0545 | Known-value checks | tf-mdrop | in use | A codepoint that changes text direction in a comment or literal (rustc `text_direction_codepoint_in_comment`, `_in_literal`) |
-| L0546-L0549 | Known-value checks | check | reserved | |
+| L0546 | Known-value checks | tf-v07 | in use | `mem::discriminant` of a type that is not an enum (rustc `enum_intrinsics_non_enums`) |
+| L0547-L0549 | Known-value checks | check | reserved | |
 | L0601 | Types and aliases | W-RESOLVE | in use | Type alias cycle |
 | L0602 | Types and aliases | W-CORELANG | in use | Type form or type alias is not supported yet (S3b parser reject) |
 | L0603 | Types and aliases | fx-scanfa | in use | Unstable type form: a written `!` outside a fn return type (rustc E0658) |

@@ -1342,6 +1342,17 @@ fn adt_discs(p: &Program, t: &CTy) -> Vec<i128> {
     }
 }
 
+/// The integer type that holds the discriminant of an enum or Option
+/// value of type `t` in rustc (`DiscriminantKind`): the enum's `repr`
+/// type, else `isize`. None for a type that is not an enum.
+fn disc_holder(p: &Program, t: &CTy) -> Option<IntTy> {
+    match t {
+        CTy::Option(_) | CTy::Result(..) => Some(IntTy::Isize),
+        CTy::Adt(a) if p.adt(*a).is_enum => Some(p.adt(*a).repr.disc_holder()),
+        _ => None,
+    }
+}
+
 /// True when every discriminant equals its variant index, so a stored
 /// tag value reads back as the index with no mapping.
 fn discs_sequential(discs: &[i128]) -> bool {
@@ -4643,6 +4654,28 @@ impl FnGen<'_, '_> {
                 let ct = CTy::Fmt(crate::ty::fmt::FmtTy::Arguments);
                 let _ = writeln!(self.out, "    {} {tmp} = {};", ctype(&ct), vals[0]);
                 self.to_string_value(&ct, &format!("(&{tmp})"), loc)
+            }
+            // `mem::discriminant`'s reads (std source, library/core/src/mem.rs):
+            // the declared discriminant of the enum behind the pointer as an
+            // i128, and a code for the type rustc keeps it in.
+            B::DiscriminantValue => {
+                let CTy::Ref(t) = &tys[0] else { unreachable!() };
+                let discs = if disc_holder(self.p, t).is_some() { adt_discs(self.p, t) } else { Vec::new() };
+                if discs.is_empty() {
+                    return scalar_lit(0, 16, true);
+                }
+                let idx = disc_call(self.p, t, &vals[0]);
+                if discs_sequential(&discs) {
+                    format!("((lust_i128){{(uint64_t)({idx}), 0}})")
+                } else {
+                    let lits: Vec<String> = discs.iter().map(|&d| scalar_lit(d as u128, 16, true)).collect();
+                    format!("((lust_i128[]){{{}}})[{idx}]", lits.join(", "))
+                }
+            }
+            B::DiscriminantKind => {
+                let CTy::Ref(t) = &tys[0] else { unreachable!() };
+                let code = crate::ty::layout::disc_kind_code(disc_holder(self.p, t).unwrap_or(IntTy::U8));
+                format!("((uint8_t){code})")
             }
             // Interior writes of std source cells (W-STD-C): the slot is
             // an `Option<T>` behind a shared reference. `once_init` runs

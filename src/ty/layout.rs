@@ -126,6 +126,9 @@ pub struct Repr {
     pub kind: ReprKind,
     /// A fixed integer tag (`repr(u8)` and kin): width in bits and signedness.
     pub int: Option<(u32, bool)>,
+    /// The integer tag is written `isize` or `usize` (not `i64`/`u64`):
+    /// `mem::discriminant` hashes it as that type.
+    pub word: bool,
     /// `repr(align(n))`.
     pub align: Option<u64>,
     /// `repr(packed)` or `repr(packed(N))`: the alignment bound.
@@ -144,6 +147,40 @@ impl Repr {
     /// True when the repr fixes the enum tag, so the niche-filled candidate is off.
     fn fixes_tag(&self) -> bool {
         self.int.is_some() || self.kind != ReprKind::Default
+    }
+
+    /// The integer type that holds an enum's discriminant in rustc
+    /// (`DiscriminantKind`): the `repr` integer, else `isize`.
+    pub fn disc_holder(&self) -> IntTy {
+        match self.int {
+            None => IntTy::Isize,
+            Some((_, true)) if self.word => IntTy::Isize,
+            Some((_, false)) if self.word => IntTy::Usize,
+            Some((bits, signed)) => IntTy::ALL
+                .iter()
+                .copied()
+                .find(|i| i.bits() == bits && i.signed() == signed && !matches!(i, IntTy::Isize | IntTy::Usize))
+                .unwrap_or(IntTy::Isize),
+        }
+    }
+}
+
+/// The code of a discriminant's integer type in std source's
+/// `Discriminant::kind` (library/core/src/mem.rs).
+pub fn disc_kind_code(it: IntTy) -> u8 {
+    match it {
+        IntTy::I8 => 0,
+        IntTy::I16 => 1,
+        IntTy::I32 => 2,
+        IntTy::I64 => 3,
+        IntTy::I128 => 4,
+        IntTy::Isize => 5,
+        IntTy::U8 => 6,
+        IntTy::U16 => 7,
+        IntTy::U32 => 8,
+        IntTy::U64 => 9,
+        IntTy::U128 => 10,
+        IntTy::Usize => 11,
     }
 }
 
@@ -752,7 +789,7 @@ fn niche_enum_layout(variants: &[Vec<Layout>], discs: &[i128], repr: Repr) -> Op
     if variants.len() < 2 {
         return None;
     }
-    let vrepr = Repr { kind: ReprKind::Default, int: None, align: repr.align, pack: None };
+    let vrepr = Repr { kind: ReprKind::Default, int: None, word: false, align: repr.align, pack: None };
     let mut layouts: Vec<Layout> = Vec::with_capacity(variants.len());
     for v in variants {
         layouts.push(univariant_layout(v, vrepr, UnivKind::AlwaysSized).ok()?);

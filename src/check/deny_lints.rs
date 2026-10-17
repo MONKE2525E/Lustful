@@ -9,6 +9,8 @@
 //   `ManuallyDrop<T>` does nothing.
 // - `let_underscore_lock` (L0544): `let _ = m.lock();` drops the guard
 //   at once.
+// - `enum_intrinsics_non_enums` (L0546): `mem::discriminant` of a type
+//   that is not an enum (and has no type parameters).
 
 use super::Checked;
 use crate::ast::{self, Attr, Expr, Pat, PatId, Stmt};
@@ -85,6 +87,19 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &Checked) -> Option<Diag> {
             return Some(d);
         }
     }
+    let ei_names = ["enum_intrinsics_non_enums"];
+    if !leveled(p, fn_attrs, &ei_names) {
+        let ei_scopes = scoped(&ei_names);
+        for i in def.exprs.0..def.exprs.1 {
+            if let Expr::Call { callee, args } = &p.ast.exprs[i as usize]
+                && let [arg] = args.as_slice()
+                && let Some(d) = discriminant_non_enum(p, ck, *callee, *arg, ast::ExprId(i))
+                && !within(d.span, &ei_scopes)
+            {
+                return Some(d);
+            }
+        }
+    }
     let lock_names = ["let_underscore_lock", "let_underscore"];
     if leveled(p, fn_attrs, &lock_names) {
         return None;
@@ -149,6 +164,31 @@ fn undropped_manually_drops(p: &Program, ck: &Checked, range: (u32, u32), call: 
         p.ast.expr_spans[call.0 as usize],
         "calls to `std::mem::drop` with `std::mem::ManuallyDrop` instead of the inner value does nothing",
         "Drop the inner value: `drop(ManuallyDrop::into_inner(m))` (rustc `undropped_manually_drops`).",
+    ))
+}
+
+/// rustc's `enum_intrinsics_non_enums` for `mem::discriminant` (std
+/// source, library/core/src/mem.rs): the pointee type is neither an enum
+/// nor open in a type parameter.
+fn discriminant_non_enum(p: &Program, ck: &Checked, callee: ast::ExprId, arg: ast::ExprId, call: ast::ExprId) -> Option<Diag> {
+    let Res::Fn(f) = ck.res(callee) else { return None };
+    let info = p.fn_info(f);
+    // Std module fns carry their module's hidden name (src/stdmods.rs).
+    if p.name(info.name) != "__lust_core_mem$discriminant" || p.shipped_crate_at(info.def(&p.ast).name_span) != Some(crate::ty::lang::ShippedCrate::Core) {
+        return None;
+    }
+    let TyKind::Ref(_, _, t) = ck.tys.kind(ck.ty(arg)) else { return None };
+    let enum_like = ck.tys.option_elem(t).is_some()
+        || ck.tys.result_args(t).is_some()
+        || ck.tys.local_adt(t).or_else(|| ck.tys.adt_parts(t).and_then(|(d, _)| p.defs.local_adt(d))).is_some_and(|a| p.adt(a).is_enum);
+    if enum_like || ck.tys.flags(t).contains_param() || matches!(ck.tys.kind(t), TyKind::Error | TyKind::Infer(_)) {
+        return None;
+    }
+    Some(Diag::new(
+        "L0546",
+        p.ast.expr_spans[call.0 as usize],
+        "the return value of `mem::discriminant` is unspecified when called with a non-enum type",
+        "Pass a reference to an enum value (rustc `enum_intrinsics_non_enums`).",
     ))
 }
 

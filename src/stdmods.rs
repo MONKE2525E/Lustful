@@ -79,7 +79,7 @@ pub const STD_MODULES: &[StdModule] = &[
         krate: ShippedCrate::Core,
         paths: &[("core", "mem"), ("std", "mem")],
         full: false,
-        triggers: &["MaybeUninit", "ManuallyDrop", "new_uninit", "new_zeroed", "new_uninit_slice", "new_zeroed_slice"],
+        triggers: &["MaybeUninit", "ManuallyDrop", "new_uninit", "new_zeroed", "new_uninit_slice", "new_zeroed_slice", "discriminant", "Discriminant"],
     },
     StdModule {
         name: "__lust_core_cmp",

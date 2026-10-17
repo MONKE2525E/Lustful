@@ -417,6 +417,17 @@ pub enum Builtin {
     /// `Option<T>` behind a shared reference, leaving `None`. Std source
     /// only: `LazyLock` takes its init fn this way (W-STD-C).
     OnceTake,
+    /// `core::intrinsics::discriminant_value(&v)`: the declared
+    /// discriminant of the enum value `v` as an i128 (0 for a value of
+    /// a type that is not an enum, as rustc's intrinsic). Std source
+    /// only: `mem::discriminant` (library/core/src/mem.rs).
+    DiscriminantValue,
+    /// `core::intrinsics::discriminant_kind(&v)`: which integer type
+    /// holds `v`'s discriminant in rustc (a code, see `Discriminant` in
+    /// library/core/src/mem.rs: the enum's `repr` type, `isize` without
+    /// one, `u8` for a type that is not an enum). Std source only, with
+    /// `DiscriminantValue`.
+    DiscriminantKind,
     StringCapacity,
     StringReserve,
     StringReserveExact,
@@ -12082,6 +12093,18 @@ impl<'p> Ctx<'p> {
             };
             return Some(Res::Builtin(Builtin::Sync(op)));
         }
+        if matches!(text.as_str(), "discriminant_value" | "discriminant_kind") {
+            if self.p.shipped_crate_at(span) != Some(lang::ShippedCrate::Core) {
+                self.err(
+                    "L0642",
+                    span,
+                    format!("intrinsic `core::intrinsics::{text}` can only be called from lust's shipped library crates"),
+                    "Call the public std item that wraps it instead (`std::mem::discriminant`).",
+                );
+                return None;
+            }
+            return Some(Res::Builtin(if text == "discriminant_value" { Builtin::DiscriminantValue } else { Builtin::DiscriminantKind }));
+        }
         if matches!(text.as_str(), "once_init" | "once_take") {
             if !matches!(self.p.shipped_crate_at(span), Some(lang::ShippedCrate::Core | lang::ShippedCrate::Std)) {
                 self.err(
@@ -15075,6 +15098,11 @@ impl<'p> Ctx<'p> {
                         (vec![t], UNIT)
                     }
                     Builtin::FmtFormat => (vec![crate::ty::fmt::fmt_ty(&mut self.tys, crate::ty::fmt::FmtTy::Arguments)], STRING),
+                    Builtin::DiscriminantValue | Builtin::DiscriminantKind => {
+                        let t = self.new_var(false);
+                        let r = self.tys.mk_ref(false, t);
+                        (vec![r], if b == Builtin::DiscriminantValue { int(IntTy::I128) } else { int(IntTy::U8) })
+                    }
                     Builtin::OnceInit | Builtin::OnceTake => {
                         let t = self.new_var(false);
                         let o = self.tys.mk_option(t);

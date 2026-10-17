@@ -72,6 +72,7 @@ const DOCS: &[(&str, &str)] = &[
     ("L0543", include_str!("../docs/errors/L0543.md")),
     ("L0544", include_str!("../docs/errors/L0544.md")),
     ("L0545", include_str!("../docs/errors/L0545.md")),
+    ("L0546", include_str!("../docs/errors/L0546.md")),
     ("L0601", include_str!("../docs/errors/L0601.md")),
     ("L0602", include_str!("../docs/errors/L0602.md")),
     ("L0603", include_str!("../docs/errors/L0603.md")),

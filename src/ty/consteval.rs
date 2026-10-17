@@ -1079,6 +1079,7 @@ fn eval_once<'a, C: ConstCx<'a>>(
         next_flex_group: 0,
         pins,
         rerun: false,
+        binds: Vec::new(),
     };
     let r = ev.run(cx, e, expected);
     let rerun = ev.rerun.then_some(ev.pins);
@@ -1174,6 +1175,9 @@ struct Evaluator {
     /// Set when a literal local was pinned after a write: its earlier
     /// arithmetic ran wide, so `eval` runs again with the pin.
     rerun: bool,
+    /// The type args of the generic const fn whose body runs (by param
+    /// index), for the reads that need a concrete type.
+    binds: Vec<Option<Ty>>,
 }
 
 /// A local bound by `let x = <unsuffixed literal>;` with no written
@@ -3417,6 +3421,37 @@ impl Evaluator {
         {
             return Ok((ConstValue::Unit, want));
         }
+        // `mem::discriminant`'s reads in std source (library/core/src/mem.rs):
+        // the declared discriminant of the enum value, and the code of
+        // the integer type rustc keeps it in (0 and `u8` for a non-enum).
+        if let Expr::Path(segs) = cx.ast().expr(callee)
+            && let [a, b, c] = segs.as_slice()
+            && cx.sym_text(a.name) == "core"
+            && cx.sym_text(b.name) == "intrinsics"
+            && matches!(cx.sym_text(c.name), "discriminant_value" | "discriminant_kind")
+            && let [arg] = args
+        {
+            let kind = cx.sym_text(c.name) == "discriminant_kind";
+            let (v, t) = self.value(cx, env, *arg, None)?;
+            // The std fn is generic: its parameter has the type `&T`.
+            let t = if self.binds.is_empty() { t } else { subst_binds(cx.tys(), t, &self.binds.clone()) };
+            let (v, t) = self.auto_deref(cx, v, t);
+            let tys = cx.tys_ref();
+            let adt = tys.local_adt(t).filter(|&a| cx.is_enum(a));
+            let builtin_enum = tys.option_elem(t).is_some() || tys.result_args(t).is_some();
+            let concrete = !tys.flags(t).contains_param() && !matches!(tys.kind(t), TyKind::Ref(..) | TyKind::Error);
+            let (disc, holder) = match (&v, adt) {
+                (ConstValue::Variant(i, _), Some(a)) => (cx.discriminant(a, *i), cx.adt_repr(a).disc_holder()),
+                (ConstValue::Variant(i, _), None) if builtin_enum => (*i as i128, IntTy::Isize),
+                (v, None) if !builtin_enum && concrete && !matches!(v, ConstValue::Variant(..)) => (0, IntTy::U8),
+                _ => return Err(outside(span, "this discriminant read")),
+            };
+            return Ok(if kind {
+                (ConstValue::Int(super::layout::disc_kind_code(holder) as i128), super::int(IntTy::U8))
+            } else {
+                (ConstValue::Int(disc), super::int(IntTy::I128))
+            });
+        }
         // A call through a local (a fn pointer value): rustc rejects
         // fn pointer calls in const contexts. Never resolve the name
         // to an item of the same name instead.
@@ -3922,13 +3957,16 @@ impl Evaluator {
             body.ret
         };
         cx.enter_const_fn(body.owner);
-        // The callee's literal locals index its own env.
+        // The callee's literal locals index its own env; its type
+        // parameters bind to this call's type args.
         let caller_flex = std::mem::take(&mut self.flex_locals);
+        let caller_binds = std::mem::replace(&mut self.binds, if generic { binds.clone() } else { Vec::new() });
         let flow = match bind_err {
             Some(d) => Err(d),
             None => self.block(cx, &mut fenv, body.body, Some(body.ret)),
         };
         self.flex_locals = caller_flex;
+        self.binds = caller_binds;
         cx.exit_const_fn();
         self.call_depth -= 1;
         // A parameter of a drop type that the body did not

@@ -246,6 +246,9 @@ fn builtin_is_const(b: Builtin) -> bool {
             // `NonZero::new` and `NonZero::get`.
             | NonZeroNew
             | NonZeroGet
+            // The reads behind std source's `const fn discriminant`.
+            | DiscriminantValue
+            | DiscriminantKind
     )
 }
 
