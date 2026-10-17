@@ -1638,22 +1638,23 @@ pub(super) fn plain_inherent_probe(
     Probe::Miss
 }
 
-/// How many std supertraits of dyn principal `principal` (Debug,
-/// Display, Hasher, ..., whose methods are not vtable methods and so are
-/// not in `object_cands`) declare a method `name` of receiver form `form`. They
-/// are object candidates too, in scope or not: with `trait U: Debug {
-/// fn fmt(&self) }`, `dyn U`'s `x.fmt()` is ambiguous in rustc (E0034).
+/// The std supertraits of dyn principal `principal` (Debug, Display,
+/// Hasher, ..., whose methods are not vtable methods and so are not in
+/// `object_cands`; Debug or Display also as the principal itself) that
+/// declare a method `name` of receiver form `form`. They are object
+/// candidates too, in scope or not: with `trait U: Debug { fn fmt(&self)
+/// }`, `dyn U`'s `x.fmt()` is ambiguous in rustc (E0034).
 fn std_super_cands(
     cx: &Ctx,
     principal: DefId,
     name: Sym,
     form: ReceiverForm,
     cands: &[(usize, crate::check::object::ObjectCand)],
-) -> usize {
+) -> Vec<DefId> {
     let p = cx.p;
     let mut seen: Vec<DefId> = Vec::new();
     let mut work = vec![principal];
-    let mut n = 0;
+    let mut n = Vec::new();
     while let Some(cur) = work.pop() {
         if seen.contains(&cur) {
             continue;
@@ -1661,8 +1662,9 @@ fn std_super_cands(
         seen.push(cur);
         let Some(rec) = p.gx.index.trait_record(cur) else { continue };
         // `dyn Debug` / `dyn Display` have dyn infos with no vtable
-        // methods: their `fmt` is still a candidate here.
-        if cur != principal
+        // methods: their `fmt` is still a candidate here, also as the
+        // principal itself.
+        if (cur != principal || cur == p.gx.lang.debug || cur == p.gx.lang.display)
             && !p.gx.dyn_infos.get(&cur).is_some_and(|i| i.methods.iter().any(|m| m.name == name))
             && !cands.iter().any(|(_, c)| c.owner.def == cur)
             && let Some(m) = rec.method_by_name(name)
@@ -1675,7 +1677,9 @@ fn std_super_cands(
                 Some(SelfKind::Value | SelfKind::Typed) => form == ReceiverForm::Value,
                 None => false,
             };
-            n += usize::from(same);
+            if same {
+                n.push(cur);
+            }
         }
         for pred in &rec.generics.predicates {
             if let Predicate::Trait(b) = pred
@@ -1754,8 +1758,8 @@ pub(super) fn dyn_probe(
             Err(_) => p.gx.trait_methods.get(&c.def).and_then(|t| form_of(t.self_kind)) == Some(form),
         })
         .collect();
-    let std_supers = if only.is_some() { 0 } else { std_super_cands(cx, principal.def, name, form, &cands) };
-    if inherent.is_some() as usize + cands.len() + std_supers > 1 {
+    let std_supers = if only.is_some() { Vec::new() } else { std_super_cands(cx, principal.def, name, form, &cands) };
+    if inherent.is_some() as usize + cands.len() + std_supers.len() > 1 {
         cx.err(
             "L0720",
             name_span,
@@ -1793,6 +1797,16 @@ pub(super) fn dyn_probe(
         cx.set_res(e, Res::Method { f, derefs, autoref: probe.autoref });
         cx.check_args(&params[1.min(params.len())..], args, name_span);
         return Probe::Hit(ret);
+    }
+    // The one candidate is `fmt` of a Display or Debug supertrait (`dyn U`
+    // with `U: Display`): that trait's builtin call, which formats through
+    // the vtable's fmt shim. It needs no import, like any object candidate.
+    if cands.is_empty()
+        && let [d] = std_supers[..]
+        && (d == p.gx.lang.display || d == p.gx.lang.debug)
+    {
+        let kind = if d == p.gx.lang.display { crate::ast::FmtKind::Display } else { crate::ast::FmtKind::Debug };
+        return Probe::Hit(cx.set_fmt_call(e, kind, derefs, probe.autoref, name_span, args));
     }
     let Some((ci, c)) = cands.into_iter().next() else { return Probe::Miss };
     let slot = match c.call {
@@ -2096,6 +2110,67 @@ fn method_search_steps(
             match trait_method_probe(cx, e, group, derefs, name, name_span, args, explicit, expected) {
                 Probe::Miss => {}
                 hit => return hit,
+            }
+            match fmt_ptr_probe(cx, e, group, derefs, name, name_span, args, explicit) {
+                Probe::Miss => {}
+                hit => return hit,
+            }
+        }
+    }
+    Probe::Miss
+}
+
+/// `x.fmt(f)` where a group's `&self` Self type is a std pointer to a dyn
+/// object (`Box<dyn U>`, `Rc<dyn U>`, `&dyn U`): the fmt traits in scope
+/// that the pointer implements are rustc's extension candidates at this
+/// step, ahead of the object candidates of the dyn step below it. One is
+/// the call; two are ambiguous (rustc E0034).
+#[allow(clippy::too_many_arguments)]
+fn fmt_ptr_probe(
+    cx: &mut Ctx,
+    e: ExprId,
+    group: &[RcvProbe],
+    derefs: u8,
+    name: Sym,
+    name_span: Span,
+    args: &[ExprId],
+    explicit: &[Option<GenericArg>],
+) -> Probe {
+    if cx.p.interner.get(name) != "fmt" || args.len() != 1 || !explicit.is_empty() {
+        return Probe::Miss;
+    }
+    for &probe in group {
+        if probe.filter != ReceiverForm::Ref {
+            continue;
+        }
+        let s = cx.resolve(probe.self_ty);
+        let mut cur = s;
+        loop {
+            cur = match cx.tys.kind(cur) {
+                TyKind::Ref(_, _, inner) => cx.resolve(inner),
+                _ => match cx.tys.smart_elem(cur) {
+                    Some(inner) => cx.resolve(inner),
+                    None => break,
+                },
+            };
+        }
+        if cur == s || !matches!(cx.tys.kind(cur), TyKind::Dyn(..)) {
+            continue;
+        }
+        match cx.fmt_traits_of(s)[..] {
+            [] => {}
+            [k] => return Probe::Hit(cx.set_fmt_call(e, k, derefs + probe.extra_derefs, probe.autoref, name_span, args)),
+            _ => {
+                cx.err(
+                    "L0104",
+                    name_span,
+                    "multiple applicable items in scope: `fmt` of `Display` and of `Debug`",
+                    "Call it as `fmt::Display::fmt(&value, f)` or `fmt::Debug::fmt(&value, f)`.",
+                );
+                for &a in args {
+                    cx.expr(a, None);
+                }
+                return Probe::Failed;
             }
         }
     }

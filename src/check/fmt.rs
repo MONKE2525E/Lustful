@@ -213,18 +213,7 @@ impl<'p> Ctx<'p> {
     /// (`self.0.fmt(f)` in an impl of Debug): the one fmt trait in scope
     /// that the type implements.
     fn builtin_fmt_call(&mut self, e: ExprId, recv: ExprId, base: Ty, derefs: u8, name_span: Span, args: &[ExprId]) -> Option<Ty> {
-        let p = self.p;
-        let candidates: Vec<FmtKind> = FMT_TRAITS
-            .iter()
-            .copied()
-            .filter(|&k| {
-                self.fmt_trait_in_scope(k)
-                    && match k {
-                        FmtKind::Display => has_display(p, &self.tys, base),
-                        _ => has_debug(p, &self.tys, base),
-                    }
-            })
-            .collect();
+        let candidates = self.fmt_traits_of(base);
         let kind = match candidates.as_slice() {
             [] => return None,
             [k] => *k,
@@ -241,13 +230,36 @@ impl<'p> Ctx<'p> {
                 return Some(ERROR);
             }
         };
-        let b = if kind == FmtKind::Display { Builtin::FmtCallDisplay } else { Builtin::FmtCallDebug };
         self.check_packed_borrow(recv, name_span);
-        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
+        Some(self.set_fmt_call(e, kind, derefs, Autoref::Ref, name_span, args))
+    }
+
+    /// The fmt traits in scope here (`fmt_trait_in_scope`) that `t`
+    /// implements, Display first: the `fmt` candidates of a receiver `&t`.
+    pub(super) fn fmt_traits_of(&mut self, t: Ty) -> Vec<FmtKind> {
+        let p = self.p;
+        FMT_TRAITS
+            .iter()
+            .copied()
+            .filter(|&k| {
+                self.fmt_trait_in_scope(k)
+                    && match k {
+                        FmtKind::Display => has_display(p, &self.tys, t),
+                        _ => has_debug(p, &self.tys, t),
+                    }
+            })
+            .collect()
+    }
+
+    /// Resolves `x.fmt(f)` as the builtin `fmt` of trait `kind`: the
+    /// receiver `derefs` deep, then `autoref`. Returns `fmt::Result`.
+    pub(super) fn set_fmt_call(&mut self, e: ExprId, kind: FmtKind, derefs: u8, autoref: Autoref, name_span: Span, args: &[ExprId]) -> Ty {
+        let b = if kind == FmtKind::Display { Builtin::FmtCallDisplay } else { Builtin::FmtCallDebug };
+        self.set_res(e, Res::BuiltinMethod { b, derefs, autoref });
         let f = fmt_ty(&mut self.tys, FmtTy::Formatter);
         let fm = self.tys.mk_ref(true, f);
         self.check_args(&[fm], args, name_span);
-        Some(self.fmt_result_ty())
+        self.fmt_result_ty()
     }
 
     /// One method of a Formatter or Debug builder receiver.
