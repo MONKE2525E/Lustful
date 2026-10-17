@@ -60,6 +60,19 @@ struct TemplateEntry {
     calls: Vec<(u32, ClosureKind)>,
 }
 
+/// One clean check of a template with closures: its reads alone. Collect
+/// never reuses it (the check also registers the closure bodies); the
+/// derive delta compares it to know whether the kept program's check of
+/// the template still holds (driver/kept_derive.rs).
+struct ClosureTemplateEntry {
+    src: u64,
+    env: u64,
+    /// When it was stored (`next_stamp`).
+    stamp: u64,
+    reads: Reads,
+    n_exprs: u32,
+}
+
 /// One clean discovery check: the Adt types the body names, its
 /// instance requests (template def, owned args), its closures, and its
 /// vtable requests (concrete type, dyn type), in check order.
@@ -180,6 +193,9 @@ pub struct GenReuse {
     /// count), set by the driver before collect.
     pub env: u64,
     templates: FxMap<DefId, TemplateEntry>,
+    /// The last clean check of each template with closures, if its last
+    /// check was clean (`store_closure_template`).
+    closure_templates: FxMap<DefId, ClosureTemplateEntry>,
     discovery: FxMap<DefId, DiscoveryEntry>,
     /// Defs whose last discovery check stored nothing (a body error), so
     /// their entry, if any, is older than what that collect used. Each
@@ -243,6 +259,7 @@ impl GenReuse {
     /// Drops every entry: the trait system they were made under changed.
     pub fn clear(&mut self) {
         self.templates.clear();
+        self.closure_templates.clear();
         self.discovery.clear();
         self.readers_index.clear();
         self.readers_pushed = 0;
@@ -254,6 +271,7 @@ impl GenReuse {
     /// another env stay.
     pub fn drop_env(&mut self, env: u64) {
         self.templates.retain(|_, e| e.env != env);
+        self.closure_templates.retain(|_, e| e.env != env);
         self.discovery.retain(|_, e| e.env != env);
     }
 
@@ -522,6 +540,51 @@ impl GenReuse {
         self.templates.insert(p.def_id(t), entry);
     }
 
+    /// Stores the reads of one check of template `t`, which has closures
+    /// (`reads`), or drops its entry when the check had errors (None):
+    /// an entry is always that of the template's last check.
+    pub(crate) fn store_closure_template(&mut self, p: &Program, t: LocalDefId, reads: Option<&Reads>) {
+        let def = p.def_id(t);
+        let src = self.src_of(p, t).filter(|_| self.on);
+        let (Some(reads), Some(src)) = (reads, src) else {
+            self.closure_templates.remove(&def);
+            return;
+        };
+        let (lo, hi) = p.fn_def(t).exprs;
+        let entry = ClosureTemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads), n_exprs: hi - lo };
+        self.closure_templates.insert(def, entry);
+    }
+
+    /// Whether the stored check of template `t`, which has closures, still
+    /// holds. With `moves` (a derive-only request) only the read keys it
+    /// takes are compared, else every read. None when there is no entry the
+    /// caller can trust: none, one stored after `lo` (the kept program's
+    /// `reuse_stamp`: the other mode's program may have stored it), or one
+    /// with a `Checked` read (a collect checks such a body again each time).
+    pub(crate) fn closure_template_holds(
+        &mut self,
+        p: &Program,
+        t: LocalDefId,
+        lo: u64,
+        moves: Option<&mut dyn FnMut(&ReadKey) -> bool>,
+    ) -> Option<bool> {
+        let e = self.closure_templates.get(&p.def_id(t))?;
+        let src = self.src_of(p, t)?;
+        let (a, b) = p.fn_def(t).exprs;
+        if !self.on || e.stamp > lo || e.reads.keys().any(|k| matches!(k, ReadKey::Checked(_))) {
+            return None;
+        }
+        if e.src != src || e.n_exprs != b - a {
+            return Some(false);
+        }
+        let memo = &mut self.memo;
+        let mut same = |k: &ReadKey, stored: &Read| *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored;
+        Some(match moves {
+            Some(moves) => e.reads.iter().all(|(k, stored)| !moves(k) || same(k, stored)),
+            None => e.reads.iter().all(|(k, stored)| same(k, stored)),
+        })
+    }
+
     /// Drops this program's node answers: a signature delta changed the
     /// program they describe (driver/kept_delta.rs).
     pub fn forget_answers(&mut self) {
@@ -537,10 +600,12 @@ impl GenReuse {
         Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads))
     }
 
-    /// The read keys of every stored template check (the derive delta
+    /// The read keys of every stored template check, those of templates
+    /// with closures included (the derive delta
     /// fingerprints the moved ones at once before its replay).
     pub(crate) fn template_read_keys(&self) -> impl Iterator<Item = &ReadKey> {
-        self.templates.values().flat_map(|e| e.reads.iter().map(|(k, _)| k))
+        let closures = self.closure_templates.values().flat_map(|e| e.reads.iter().map(|(k, _)| k));
+        self.templates.values().flat_map(|e| e.reads.iter().map(|(k, _)| k)).chain(closures)
     }
 
     /// `template_holds` when only the read keys `moves` takes can have

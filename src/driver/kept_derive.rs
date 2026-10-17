@@ -13,9 +13,9 @@
 //   slots that read them; the compile tail rechecks the dirty slots and
 //   reuses the rest without walking their reads;
 // - mono's checks that read derive lists replay, as a collect with generic
-//   reuse runs them: a template whose stored check no longer holds checks
-//   again, and so does one with no stored check (it has closures) whose
-//   body names the reach; plain bodies go through the header delta's
+//   reuse runs them: a template whose stored check (or, with closures, the
+//   reads of its last check) no longer holds checks again, and so does one
+//   with neither whose body names the reach; plain bodies go through the header delta's
 //   discovery replay (`kept_delta::replay_discovery`): a body whose entry
 //   reads no key the delta can move stands, the others must give the same
 //   discovery output. Entries stored after the program's `reuse_stamp`
@@ -185,12 +185,50 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
     out
 }
 
+/// `kept_delta::recheck_template` for templates `ts`, which have no
+/// closures and define no opaque type: their body checks only read the
+/// program, so they run in parallel (`generics::template_body`), and the
+/// writes follow in fn order. Their checks do not read the picks or
+/// closure call kinds the others write (a template check records picks,
+/// it does not replay them).
+fn recheck_par(p: &mut Program, ts: &[LocalDefId], caches: &mut Caches) -> Result<(), &'static str> {
+    if ts.is_empty() {
+        return Ok(());
+    }
+    let mut ranges: Vec<(u32, u32)> = ts.iter().map(|&t| p.fn_def(t).exprs).collect();
+    ranges.sort_unstable();
+    let inside = |x: u32| {
+        let k = ranges.partition_point(|r| r.0 <= x);
+        k > 0 && x < ranges[k - 1].1
+    };
+    p.gx.trait_picks.retain(|x, _| !inside(x.0));
+    let set: crate::intern::FxMap<LocalDefId, ()> = ts.iter().map(|&t| (t, ())).collect();
+    p.gx.template_closures.retain(|k, _| !set.contains_key(&k.0));
+    p.gx.template_calls.retain(|k, _| !set.contains_key(&k.0));
+    // Collect's template check runs before mono.
+    let (counts, mono_done) = (p.gx.mono_counts, std::mem::replace(&mut p.gx.mono_done, false));
+    let prog: &Program = p;
+    let bodies = crate::driver::compile::par_map(ts, |&t| generics::template_body(prog, t, &[]));
+    let mut out = Ok(());
+    for (&t, body) in ts.iter().zip(bodies) {
+        if !generics::finish_template(p, t, &mut caches.gen_reuse, body, &[], &Vec::new()).is_empty() {
+            out = Err("sig diag");
+            break;
+        }
+    }
+    (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
+    out
+}
+
 /// Mono's template checks after a derive delta: a template (trait default
 /// bodies included) whose stored check no longer holds checks again as
 /// collect's template check does,
 /// and must pass with the same hidden type (`kept_delta::recheck_template`).
-/// A template with no stored check (one with closures) checks again when
-/// its body mentions a name of `reach_names`, or its own signature moves.
+/// A template with closures has no stored check; the reads of its last
+/// check answer for it (`GenReuse::closure_template_holds`). One with
+/// neither checks again when its body mentions a name of `reach_names`, or
+/// its own signature moves. Templates with no closures and no opaque type
+/// check in parallel (`recheck_par`).
 /// With `keyed` (a derive-only request) a stored check compares only the
 /// read keys the delta can move. A check stored after the program's
 /// `reuse_stamp` (by the other mode's program) checks again: this program
@@ -246,6 +284,14 @@ fn replay_templates(
             } else {
                 caches.gen_reuse.template_holds(p, t)
             };
+            // A template with closures has no stored check: the reads of
+            // its last check answer instead (`closure_template_holds`).
+            let holds = holds.or_else(|| {
+                let prog: &Program = p;
+                let moves: Option<&mut dyn FnMut(&crate::driver::graph::ReadKey) -> bool> =
+                    if keyed { Some(&mut |k| prog.derive_key_moves(&mut moves, k)) } else { None };
+                caches.gen_reuse.closure_template_holds(prog, t, prog.reuse_stamp, moves)
+            });
             match holds {
                 Some(true) => continue,
                 Some(false) => {}
@@ -262,6 +308,17 @@ fn replay_templates(
             again.push(t);
         }
         crate::driver::laps::mark("kept/derive templates walk");
+        // Templates with no closures and no opaque type of their own check
+        // in parallel (`recheck_par`); the others, and a check the other
+        // mode stored, one at a time in fn order.
+        let (par, again): (Vec<LocalDefId>, Vec<LocalDefId>) = again.into_iter().partition(|&t| {
+            !caches.gen_reuse.newer(p, t, p.reuse_stamp, start)
+                && !generics::fn_has_closures(p, t)
+                && !p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(t)))
+                && !p.gx.closures.values().any(|e| e.parent == t)
+        });
+        recheck_par(p, &par, caches)?;
+        crate::driver::laps::mark("kept/derive templates par");
         for t in again {
             let body = p.fn_def(t).exprs;
             super::kept_delta::recheck_template(p, t, &[body], caches)?;

@@ -10312,32 +10312,60 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
     // closure expressions pay this extra check.
     let mut closure_fns: Vec<LocalDefId> = Vec::new();
     let mut template_shapes: ClosureShapes = Vec::new();
-    if fn_has_closures(p, t) {
-        let (owned, shapes) = {
-            let (c, _) = crate::check::check_fn(p, t);
-            (snapshot_closures(&c), closure_shapes(&c))
-        };
-        template_shapes.clone_from(&shapes);
-        record_template_closures(p, t, shapes, Vec::new());
-        if let Some(owned) = owned {
-            closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
+    let has_closures = fn_has_closures(p, t);
+    // The closure pass reads derive lists too (capture modes): its notes
+    // join the reads the derive delta compares for this template.
+    let ((), closure_noted) = crate::check::derive_delta::scoped(p.record_reads && has_closures, || {
+        if has_closures {
+            let (owned, shapes) = {
+                let (c, _) = crate::check::check_fn(p, t);
+                (snapshot_closures(&c), closure_shapes(&c))
+            };
+            template_shapes.clone_from(&shapes);
+            record_template_closures(p, t, shapes, Vec::new());
+            if let Some(owned) = owned {
+                closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
+            }
         }
+    });
+    let mut body = template_body(p, t, &closure_fns);
+    if has_closures {
+        crate::check::derive_delta::record(p, &mut body.reads, &closure_noted);
+        reuse.store_closure_template(p, t, body.errs.is_empty().then_some(&body.reads));
     }
+    finish_template(p, t, reuse, body, &closure_fns, &template_shapes)
+}
+
+/// The part of a template check that only reads the program: the body
+/// check, its lowering and borrowck, and those of its closure bodies
+/// `closure_fns`. The derive delta runs several at once
+/// (driver/kept_derive.rs); `finish_template` writes the result.
+pub(crate) struct TemplateBody {
+    errs: Vec<Diag>,
+    picks: Vec<(ast::ExprId, crate::check::picks::TraitPick)>,
+    calls: Vec<(ast::ExprId, crate::check::closure::ClosureKind)>,
+    reads: crate::driver::graph::Reads,
+    hidden: Vec<(DefId, OwnedTy)>,
+}
+
+/// `check_template`'s body check of template `t` (see `TemplateBody`).
+pub(crate) fn template_body(p: &Program, t: LocalDefId, closure_fns: &[LocalDefId]) -> TemplateBody {
     // Lowering, borrowck and check_fn's tail passes read derive lists too
     // (Copy operands, moves): their notes join the stored reads, as in the
     // compile tail, so a derive toggle checks the template again.
-    let ((body_errs, picks, calls, mut reads, hidden), noted) = crate::check::derive_delta::scoped(p.record_reads, || {
+    let ((errs, picks, calls, mut reads, hidden), noted) = crate::check::derive_delta::scoped(p.record_reads, || {
         let (c, mut e) = crate::check::check_fn(p, t);
         let picks = c.trait_picks.clone();
         let hidden: Vec<(DefId, OwnedTy)> =
             c.opaque_hidden.iter().filter_map(|&(od, h)| snapshot_ty(&c.tys, h).map(|o| (od, o))).collect();
         let calls = c.closure_calls.clone();
-        let reads = c.reads.clone();
+        let mut reads = c.reads.clone();
         if e.is_empty() {
             let body = crate::lower::lower(p, t, c);
             e.extend(crate::borrowck::borrowck(p, &body));
-            for &cf in &closure_fns {
+            for &cf in closure_fns {
                 let (cc, _) = crate::check::check_fn(p, cf);
+                cc.reads.iter().for_each(|(k, r)| reads.record(*k, r.fingerprint, r.failed));
                 let cbody = crate::lower::lower(p, cf, cc);
                 e.extend(crate::borrowck::borrowck(p, &cbody));
             }
@@ -10345,13 +10373,28 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
         (e, picks, calls, reads, hidden)
     });
     crate::check::derive_delta::record(p, &mut reads, &noted);
+    TemplateBody { errs, picks, calls, reads, hidden }
+}
+
+/// Writes one template body check into the program and the reuse cache
+/// (hidden types, picks, closure call kinds, the stored check). Returns
+/// the check's errors.
+pub(crate) fn finish_template(
+    p: &mut Program,
+    t: LocalDefId,
+    reuse: &mut crate::driver::gen_reuse::GenReuse,
+    body: TemplateBody,
+    closure_fns: &[LocalDefId],
+    template_shapes: &ClosureShapes,
+) -> Vec<Diag> {
+    let TemplateBody { errs: body_errs, picks, calls, reads, hidden } = body;
     for (od, owned) in hidden {
         let h = build_owned_ty(p, &owned);
         p.gx.opaque_hidden.insert(od, h);
     }
     reuse.templates_checked += 1;
     reuse.template_errors += body_errs.len();
-    reuse.note_template_out(p, t, &picks, &calls, &template_shapes);
+    reuse.note_template_out(p, t, &picks, &calls, template_shapes);
     if body_errs.is_empty() && closure_fns.is_empty() && !fn_has_closures(p, t) {
         reuse.store_template(p, t, &reads, &picks, &calls);
     }
@@ -10662,7 +10705,7 @@ fn snapshot_closures(c: &crate::check::Checked) -> Option<Vec<OwnedClosure>> {
 }
 
 /// The closure analysis of one checked body without types.
-type ClosureShapes = Vec<(ast::ExprId, crate::check::closure::ClosureKind, Vec<CaptureShape>)>;
+pub(crate) type ClosureShapes = Vec<(ast::ExprId, crate::check::closure::ClosureKind, Vec<CaptureShape>)>;
 
 fn closure_shapes(c: &crate::check::Checked) -> ClosureShapes {
     c.closures
@@ -10693,7 +10736,7 @@ fn names_lang_enum_method(p: &Program, fid: LocalDefId, names: &[Sym]) -> bool {
     })
 }
 
-fn fn_has_closures(p: &Program, fid: LocalDefId) -> bool {
+pub(crate) fn fn_has_closures(p: &Program, fid: LocalDefId) -> bool {
     let (lo, hi) = p.fn_def(fid).exprs;
     (lo..hi).any(|x| matches!(p.ast.expr(ast::ExprId(x)), ast::Expr::Closure { .. }))
 }
