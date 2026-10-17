@@ -94,6 +94,7 @@ fn post_mono(p: &collect::Program, f: LocalDefId) -> bool {
 fn fill_dep_build_outputs(
     deps: &mut [crate::resolve::cargo::DepUnit],
     cache: &Path,
+    env: super::buildscript::ClientEnv,
     memo: &mut FxMap<PathBuf, Option<super::buildscript::Outputs>>,
 ) -> Result<(), String> {
     for dep in deps {
@@ -101,7 +102,7 @@ fn fill_dep_build_outputs(
             let out = match memo.get(&dep.manifest_dir) {
                 Some(o) => o.clone(),
                 None => {
-                    let o = super::buildscript::outputs(&dep.manifest_dir, cache)
+                    let o = super::buildscript::outputs(&dep.manifest_dir, cache, env)
                         .map_err(|e| format!("build script of `{}` failed: {e}", dep.package_name))?;
                     memo.insert(dep.manifest_dir.clone(), o.clone());
                     o
@@ -116,7 +117,7 @@ fn fill_dep_build_outputs(
                 dep.build_check_cfgs = out.rustc_check_cfg;
             }
         }
-        fill_dep_build_outputs(&mut dep.deps, cache, memo)?;
+        fill_dep_build_outputs(&mut dep.deps, cache, env, memo)?;
     }
     Ok(())
 }
@@ -1933,7 +1934,8 @@ fn resolved_setup(
         let cache = super::cache::cache_dir(&req.file);
         let manifest_dir = unit.package.manifest_path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         let mut cargo_env = unit.cargo_env.clone();
-        let selected_out = super::buildscript::outputs(&manifest_dir, &cache)
+        let client_env = req.client.env.as_deref();
+        let selected_out = super::buildscript::outputs(&manifest_dir, &cache, client_env)
             .map_err(|e| code2(format!("build script of `{}` failed: {e}", unit.package.name)))?;
         if let Some(out) = &selected_out {
             if let Some(dir) = &out.out_dir {
@@ -1950,7 +1952,7 @@ fn resolved_setup(
         let mut deps = unit.deps.clone();
         let mut memo: FxMap<PathBuf, Option<super::buildscript::Outputs>> = FxMap::default();
         memo.insert(manifest_dir, selected_out);
-        fill_dep_build_outputs(&mut deps, &cache, &mut memo).map_err(code2)?;
+        fill_dep_build_outputs(&mut deps, &cache, client_env, &mut memo).map_err(code2)?;
         t.lap("build script outputs");
         // Cargo runs rustc from the workspace root, so `file!` shows member paths relative to it.
         front.client.shown_root = Some((graph.workspace_root.clone(), PathBuf::new()));

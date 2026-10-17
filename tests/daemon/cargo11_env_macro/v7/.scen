@@ -1,0 +1,2 @@
+env LUST_SCEN_E=daemon
+env LUST_SCEN_O=daemon

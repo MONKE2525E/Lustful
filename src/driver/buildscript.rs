@@ -4,16 +4,31 @@
 // build script source, every `rerun-if-changed` file, and every
 // `rerun-if-env-changed` value. `refresh` re-checks the inputs per
 // session (hashes only, no Cargo run while they hold) and re-runs the
-// script through Cargo when one changed. The outputs hash covers
+// script through Cargo when one changed. Env values and the Cargo run
+// use the requesting client's env (`ClientEnv`), never the daemon's,
+// as Cargo started from the client's shell would. The outputs hash covers
 // `cargo::rustc-cfg`, `cargo::rustc-env`, and the contents of OUT_DIR
 // files; it enters the daemon's per-session refresh key and the cold
 // disk cache key, so a build script change can never serve output
 // resolved under the old one. `outputs` gives the recorded values
 // themselves to the driver, which feeds them to expansion (`env!`,
 // OUT_DIR includes) and to the crate cfg env (`rustc-cfg`).
-use crate::intern::{FxHasher, FxMap};
+use crate::intern::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+/// The env a build script check runs under: the requesting client's
+/// whole env (`protocol::Client::env`), or None for this process's own
+/// env (one-shot compiles, where this process is the client, and tests).
+pub type ClientEnv<'a> = Option<&'a [(String, String)]>;
+
+/// One var of `env` as the client sees it.
+fn client_var(env: ClientEnv, name: &str) -> Option<String> {
+    match env {
+        Some(env) => env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()),
+        None => std::env::var(name).ok(),
+    }
+}
 
 /// Build script stdout directives the driver records. Cargo accepts
 /// both `cargo:key=value` and `cargo::key=value`; other lines are the
@@ -212,11 +227,11 @@ impl Record {
 
     /// True while every recorded input still holds: the script source
     /// hash, each `rerun-if-changed` file hash, and each
-    /// `rerun-if-env-changed` value.
-    fn inputs_still_hold(&self) -> bool {
+    /// `rerun-if-env-changed` value in the client's `env`.
+    fn inputs_still_hold(&self, env: ClientEnv) -> bool {
         file_hash(&self.script) == self.script_hash
             && self.inputs.iter().all(|(p, h)| file_hash(p) == *h)
-            && self.env_inputs.iter().all(|(k, v)| std::env::var(k).ok().as_deref() == v.as_deref())
+            && self.env_inputs.iter().all(|(k, v)| client_var(env, k) == *v)
     }
 }
 
@@ -278,13 +293,15 @@ impl Refresh {
 /// `rerun-if-changed` files), so a per-request check stays cheap. When
 /// a script declares no `rerun-if-changed`, Cargo's default (any
 /// package file change) is approximated by the manifest bytes, which
-/// the graph key already covers.
-pub fn refresh(manifest_dir: &Path, cache_dir: &Path) -> Refresh {
+/// the graph key already covers. One record per manifest dir serves
+/// every client: a client whose `rerun-if-env-changed` values differ
+/// from the record's re-runs the script, as Cargo would from its shell.
+pub fn refresh(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv) -> Refresh {
     let Some(script) = build_script_for(manifest_dir) else { return Refresh::None };
-    if let Some(rec) = fresh_record(manifest_dir, cache_dir, &script) {
+    if let Some(rec) = fresh_record(manifest_dir, cache_dir, &script, env) {
         return Refresh::Fresh { hash: rec.output_hash };
     }
-    match run_through_cargo(manifest_dir, &script) {
+    match run_through_cargo(manifest_dir, &script, env) {
         Ok(rec) => {
             let hash = rec.output_hash;
             store_record(cache_dir, manifest_dir, &rec);
@@ -294,11 +311,11 @@ pub fn refresh(manifest_dir: &Path, cache_dir: &Path) -> Refresh {
     }
 }
 
-/// The stored record for `manifest_dir` while its inputs still hold.
-fn fresh_record(manifest_dir: &Path, cache_dir: &Path, script: &Path) -> Option<Record> {
+/// The stored record for `manifest_dir` while its inputs still hold in `env`.
+fn fresh_record(manifest_dir: &Path, cache_dir: &Path, script: &Path, env: ClientEnv) -> Option<Record> {
     let path = record_path(cache_dir, manifest_dir);
     let rec = std::fs::read_to_string(&path).ok().and_then(|t| Record::decode(&t))?;
-    (rec.script == script && rec.inputs_still_hold()).then_some(rec)
+    (rec.script == script && rec.inputs_still_hold(env)).then_some(rec)
 }
 
 /// Writes one record to the cache dir (tmp file plus rename).
@@ -326,12 +343,13 @@ pub struct Outputs {
 /// Cargo (which also rewrites the record). Ok(None) means the package
 /// has no build script. An Err means a script exists but its run
 /// failed; the caller must not compile the crate without its outputs.
-pub fn outputs(manifest_dir: &Path, cache_dir: &Path) -> Result<Option<Outputs>, String> {
+/// `env` is the requesting client's env, as for `refresh`.
+pub fn outputs(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv) -> Result<Option<Outputs>, String> {
     let Some(script) = build_script_for(manifest_dir) else { return Ok(None) };
-    let rec = match fresh_record(manifest_dir, cache_dir, &script) {
+    let rec = match fresh_record(manifest_dir, cache_dir, &script, env) {
         Some(rec) => rec,
         None => {
-            let rec = run_through_cargo(manifest_dir, &script)?;
+            let rec = run_through_cargo(manifest_dir, &script, env)?;
             store_record(cache_dir, manifest_dir, &rec);
             rec
         }
@@ -349,7 +367,9 @@ pub fn outputs(manifest_dir: &Path, cache_dir: &Path) -> Result<Option<Outputs>,
 /// the OUT_DIR, and the script's stdout sits in the sibling `output`
 /// file Cargo keeps next to it. The run is the cheap probe of
 /// `resolve::probe` (rustc runs only for build scripts and proc macros).
-fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, String> {
+/// Cargo runs with the client's whole `env` (Cargo passes its env on to
+/// the script), plus the vars the probe command sets for itself.
+fn run_through_cargo(manifest_dir: &Path, script: &Path, env: ClientEnv) -> Result<Record, String> {
     // Cargo decides script freshness by mtime; an input edited within
     // the same filesystem timestamp tick as the last run can look
     // fresh to it while our content hashes already moved. Rewriting
@@ -359,11 +379,13 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
     if let Ok(bytes) = std::fs::read(script) {
         let _ = std::fs::write(script, bytes);
     }
-    let out = crate::resolve::probe::check_command(&manifest_dir.join("Cargo.toml"), "", None)
-        .arg("--offline")
-        .env("CARGO_TERM_COLOR", "never")
-        .output()
-        .map_err(|e| format!("cannot run cargo: {e}"))?;
+    let mut cmd = crate::resolve::probe::check_command(&manifest_dir.join("Cargo.toml"), "", env);
+    if let Some(env) = env {
+        let own: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            cmd.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned()))).collect();
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v))).envs(own);
+    }
+    let out = cmd.arg("--offline").env("CARGO_TERM_COLOR", "never").output().map_err(|e| format!("cannot run cargo: {e}"))?;
     if !out.status.success() {
         return Err(format!("cargo check failed: {}", String::from_utf8_lossy(&out.stderr).lines().take(3).collect::<Vec<_>>().join(" ")));
     }
@@ -418,8 +440,7 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
             (ap, h)
         })
         .collect();
-    let env_inputs: Vec<(String, Option<String>)> =
-        parsed.rerun_if_env_changed.iter().map(|k| (k.clone(), std::env::var(k).ok())).collect();
+    let env_inputs: Vec<(String, Option<String>)> = parsed.rerun_if_env_changed.iter().map(|k| (k.clone(), client_var(env, k))).collect();
     Ok(Record {
         output_hash: output_hash(&parsed, Some(&out_dir_path)),
         script: script.to_path_buf(),
@@ -429,20 +450,6 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path) -> Result<Record, Strin
         out_dir: Some(out_dir_path),
         output: parsed,
     })
-}
-
-/// Per-manifest record cache for one daemon: hashes by manifest dir, so
-/// a second crate in the same workspace frame does not re-hash files
-/// the first one just checked in the same instant. Kept minimal: the
-/// daemon constructs a fresh check per request anyway; this exists so
-/// `refresh` results can be shared by the cold-cache key path.
-pub fn refresh_hash(manifest_dir: &Path, cache_dir: &Path, memo: &mut FxMap<PathBuf, u64>) -> u64 {
-    if let Some(h) = memo.get(manifest_dir) {
-        return *h;
-    }
-    let h = refresh(manifest_dir, cache_dir).hash();
-    memo.insert(manifest_dir.to_path_buf(), h);
-    h
 }
 
 #[cfg(test)]
@@ -497,9 +504,15 @@ mod tests {
         assert_eq!(back.output.rustc_cfg, rec.output.rustc_cfg);
         assert_eq!(back.output.rustc_check_cfg, rec.output.rustc_check_cfg);
         assert_eq!(back.output.rustc_env, rec.output.rustc_env);
-        assert!(back.inputs_still_hold(), "unchanged inputs hold");
+        assert!(back.inputs_still_hold(None), "unchanged inputs hold");
+        // Env values come from the client's env, not this process's.
+        let set = [("LUST_BS_TEST_ENV".to_string(), "1".to_string())];
+        assert!(!back.inputs_still_hold(Some(&set)), "a client with the var set is stale");
+        assert!(back.inputs_still_hold(Some(&[])), "a client without the var holds");
+        let empty = [("LUST_BS_TEST_ENV".to_string(), String::new())];
+        assert!(!back.inputs_still_hold(Some(&empty)), "set to empty is not unset");
         std::fs::write(&data, "v2").unwrap();
-        assert!(!back.inputs_still_hold(), "edited rerun-if-changed file is stale");
+        assert!(!back.inputs_still_hold(None), "edited rerun-if-changed file is stale");
         assert!(Record::decode("junk").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

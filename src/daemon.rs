@@ -356,13 +356,14 @@ fn shutdown(sock: &Path, base: &Path, sessions: &HashMap<SessionKey, Entry>, why
 /// output hash (driver::buildscript). Routing by SessionKey alone would
 /// reuse a session resolved under an old Cargo.toml, lock file, config,
 /// or build script; when this key moves, the entry's session is
-/// replaced before the request is served.
-fn refresh_key(key: &SessionKey) -> u64 {
+/// replaced before the request is served. `env` is the request's client
+/// env: build script records are checked and re-run in it.
+fn refresh_key(key: &SessionKey, env: Option<&[(String, String)]>) -> u64 {
     // Build script first: a stale record re-runs Cargo, which can
     // create or update Cargo.lock, and the graph key must describe
     // the graph as it stands after that run, not before it.
     let build_script = match protocol::manifest_dir(key) {
-        Some(dir) => match crate::driver::buildscript::refresh(&dir, &crate::driver::cache::cache_dir(&key.krate.root)) {
+        Some(dir) => match crate::driver::buildscript::refresh(&dir, &crate::driver::cache::cache_dir(&key.krate.root), env) {
             r @ crate::driver::buildscript::Refresh::Failed { .. } => {
                 if let crate::driver::buildscript::Refresh::Failed { error, .. } = &r {
                     eprintln!("lust daemon: build script refresh failed for {}: {error}", dir.display());
@@ -405,8 +406,8 @@ impl Entry {
         PathBuf::from(d)
     }
 
-    fn new(dir: PathBuf, key: SessionKey) -> Entry {
-        let rk = refresh_key(&key);
+    fn new(dir: PathBuf, key: SessionKey, env: Option<&[(String, String)]>) -> Entry {
+        let rk = refresh_key(&key, env);
         Entry {
             session: Session::new(dir.clone(), true, key),
             dir,
@@ -777,12 +778,19 @@ fn evict_lru(sessions: &mut HashMap<SessionKey, Entry>, keep: &SessionKey, cap: 
 /// New keys get the next directory number from `made` (never reused,
 /// also after evictions) and one log line naming the full key and its
 /// directory; past the session cap the least recently used entry goes.
-fn entry_for<'m>(sessions: &'m mut HashMap<SessionKey, Entry>, base: &Path, key: &SessionKey, made: &mut usize) -> &'m mut Entry {
+/// `env`: the client env of the request that asks (see `refresh_key`).
+fn entry_for<'m>(
+    sessions: &'m mut HashMap<SessionKey, Entry>,
+    base: &Path,
+    key: &SessionKey,
+    env: Option<&[(String, String)]>,
+    made: &mut usize,
+) -> &'m mut Entry {
     if !sessions.contains_key(key) {
         let dir = base.join(made.to_string());
         *made += 1;
         eprintln!("lust daemon: new session for crate {} in {}", key.describe(), dir.display());
-        sessions.insert(key.clone(), Entry::new(dir, key.clone()));
+        sessions.insert(key.clone(), Entry::new(dir, key.clone(), env));
         evict_lru(sessions, key, max_sessions());
     }
     let entry = sessions.get_mut(key).expect("the entry was just made");
@@ -920,7 +928,7 @@ pub fn serve(sock: &Path) -> ! {
             client: protocol::Client::default(),
             file: file.clone(),
         };
-        let entry = entry_for(&mut sessions, &base, &req.session, &mut made);
+        let entry = entry_for(&mut sessions, &base, &req.session, req.client.env.as_deref(), &mut made);
         // No client reads this answer, and the file can change while it
         // compiles (the client may write the next version), so it runs as a
         // background check does: no oracle response compare, which would
@@ -982,11 +990,11 @@ pub fn serve(sock: &Path) -> ! {
                 // Finished guard checks for this key land before its next
                 // compile, so a marked recompute takes effect here.
                 jobs.drain(&mut sessions);
-                let entry = entry_for(&mut sessions, &base, &req.session, &mut made);
+                let entry = entry_for(&mut sessions, &base, &req.session, req.client.env.as_deref(), &mut made);
                 // Graph and build-script routing (sections 1.1, 1.8): if
                 // a covered file changed since this session was made,
                 // replace it before serving, never after.
-                let rk = refresh_key(&req.session);
+                let rk = refresh_key(&req.session, req.client.env.as_deref());
                 if entry.refresh_key != rk {
                     eprintln!("lust daemon: graph or build script changed for crate {}; starting a fresh session", req.session.describe());
                     replace_session(entry, &req.session);
@@ -1036,7 +1044,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let key = SessionKey::synthetic(Path::new("/tmp/g/main.rs"), false);
         let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
-        let entry = entry_for(&mut sessions, &base, &key, &mut 0);
+        let entry = entry_for(&mut sessions, &base, &key, None, &mut 0);
         entry.served = 5;
         let warm_dir = entry.session.obj_dir().to_path_buf();
 
@@ -1136,7 +1144,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(80));
         let req = check_req(&root);
         let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
-        let entry = entry_for(&mut sessions, &base.join("s"), &req.session, &mut 0);
+        let entry = entry_for(&mut sessions, &base.join("s"), &req.session, None, &mut 0);
         let start = std::time::SystemTime::now();
         let warm = driver::compile(&req, &mut entry.session);
         assert_eq!(warm.code, 1, "store.rs has a type error: {}", warm.stderr);
@@ -1259,12 +1267,12 @@ mod tests {
         let mut made = 0;
         let keys: Vec<SessionKey> = (0..3).map(|i| SessionKey::synthetic(&tmp.join(format!("f{i}.rs")), false)).collect();
         for k in &keys {
-            let e = entry_for(&mut sessions, &tmp, k, &mut made);
+            let e = entry_for(&mut sessions, &tmp, k, None, &mut made);
             std::fs::create_dir_all(e.session.obj_dir()).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         // Touch key 0: key 1 is now the least recently used.
-        entry_for(&mut sessions, &tmp, &keys[0], &mut made);
+        entry_for(&mut sessions, &tmp, &keys[0], None, &mut made);
         let dir1 = sessions[&keys[1]].session.obj_dir().to_path_buf();
         evict_lru(&mut sessions, &keys[2], 2);
         assert!(sessions.contains_key(&keys[0]) && sessions.contains_key(&keys[2]) && !sessions.contains_key(&keys[1]));
@@ -1284,7 +1292,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let key = SessionKey::synthetic(Path::new("/tmp/g/main.rs"), false);
         let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
-        let entry = entry_for(&mut sessions, &base, &key, &mut 0);
+        let entry = entry_for(&mut sessions, &base, &key, None, &mut 0);
         let old_dir = entry.session.obj_dir().to_path_buf();
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::write(old_dir.join("u1.o"), b"x").unwrap();

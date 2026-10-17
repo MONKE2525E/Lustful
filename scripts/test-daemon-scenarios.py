@@ -191,24 +191,31 @@ def scenario(srcdir):
             else:
                 shutil.copyfile(vpath, main)
                 os.utime(main, (mtime, mtime))
+            # `vN.env` next to `vN.rs`: K=V lines of client env for this version only.
+            venv_path = vpath.removesuffix(".rs") + ".env"
+            venv = {}
+            if os.path.isfile(venv_path):
+                pairs = (l.strip().partition("=") for l in open(venv_path) if l.strip())
+                venv = {k.strip(): v.strip() for k, _, v in pairs}
+            wenv = dict(env, **venv)
             # Check first, then run, like an agent loop: a check request
             # consumes the edit, so the build request after it sees an
             # unchanged file. Built state (statics, glue) must still be
             # current (this ordering caught a real statics bug).
-            wkc, _, wkerr = run([LUST, "check", main], work, env)
-            cold_env = dict(env, LUST_NO_DAEMON="1")
+            wkc, _, wkerr = run([LUST, "check", main], work, wenv)
+            cold_env = dict(wenv, LUST_NO_DAEMON="1")
             ckc, _, ckerr = run([LUST, "check", main], work, cold_env)
             # Same rule as the edit fuzzer: both accept, or both reject with the same first code.
             if (wkc == 0) != (ckc == 0) or first_code(wkerr) != first_code(ckerr):
                 problems.append(f"{name} {v}: warm check != cold check: warm rc={wkc} {wkerr[:160]!r}, "
                                 f"cold rc={ckc} {ckerr[:160]!r}")
-            wrc, wout, werr = run([LUST, "run", main, "-o", os.path.join(work, "w.bin")], work, env)
+            wrc, wout, werr = run([LUST, "run", main, "-o", os.path.join(work, "w.bin")], work, wenv)
             crc, cout, cerr = run([LUST, "run", main, "-o", os.path.join(work, "c.bin")], work, cold_env)
             rrc, rout, _ = run(["rustc", "--edition", "2024", "-C", "panic=abort",
-                                "-C", "overflow-checks=on", main, "-o", os.path.join(work, "r.bin")], work, env)
+                                "-C", "overflow-checks=on", main, "-o", os.path.join(work, "r.bin")], work, wenv)
             rustc_ok = rrc == 0
             if rustc_ok:
-                rrc, rout, _ = run([os.path.join(work, "r.bin")], work, env)
+                rrc, rout, _ = run([os.path.join(work, "r.bin")], work, wenv)
             tag = f"{name} {v}"
             if (wrc == 0) != (crc == 0) or (wrc == 0 and wout != cout) or first_code(werr) != first_code(cerr):
                 problems.append(
