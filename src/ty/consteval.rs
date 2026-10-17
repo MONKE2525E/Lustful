@@ -464,6 +464,35 @@ fn unknown_type<'a, C: ConstCx<'a>>(cx: &C, head: &ast::PathSeg, span: Span) -> 
     Diag::new("L0102", span, format!("unknown type `{n}`"), "Check the spelling, or define the type.")
 }
 
+/// Std fns this evaluator does not run that are no `const fn` in std:
+/// a call is rustc E0015, also in a dead branch (a dead branch scan
+/// keeps only that error). Any other std call it cannot run stays
+/// outside the evaluator.
+const STD_NONCONST: &[&str] = &[
+    "std::process::exit",
+    "std::process::abort",
+    "std::process::id",
+    "std::thread::spawn",
+    "std::thread::sleep",
+    "std::thread::yield_now",
+    "std::thread::current",
+    "std::thread::park",
+    "std::env::var",
+    "std::env::vars",
+    "std::env::args",
+    "std::env::current_dir",
+    "std::fs::read",
+    "std::fs::read_to_string",
+    "std::fs::write",
+    "std::io::stdin",
+    "std::io::stdout",
+    "std::io::stderr",
+    "std::time::Instant::now",
+    "std::time::SystemTime::now",
+    "std::mem::drop",
+    "std::mem::take",
+];
+
 fn outside(span: Span, what: &str) -> Diag {
     Diag::new(
         C_OUTSIDE,
@@ -3346,6 +3375,7 @@ impl Evaluator {
             CallTarget::ConstFn(body) => self.run_const_fn(cx, env, body, None, args, span, expected),
             CallTarget::NonConst => Err(nonconst(span, "this function")),
             CallTarget::Unknown => match cx.ast().expr(callee) {
+                Expr::Path(segs) if STD_NONCONST.contains(&path_text(cx, segs).as_str()) => Err(nonconst(span, &path_text(cx, segs))),
                 Expr::Path(segs) if segs.len() == 2 && !cx.names_type(segs[0].name) => Err(unknown_type(cx, &segs[0], span)),
                 Expr::Path(segs) => Err(outside(span, &format!("the call of `{}`", path_text(cx, segs)))),
                 _ => Err(outside(span, "this call")),
