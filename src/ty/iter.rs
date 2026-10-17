@@ -566,6 +566,34 @@ impl IterKind {
         }
     }
 
+    /// True for the std adapters: they wrap a builtin iterator (their
+    /// first arg; `Chain` and `Zip` a second one too), and core's
+    /// `Iterator` impl for them has where clauses.
+    pub fn is_adapter(self) -> bool {
+        use IterKind as K;
+        matches!(
+            self,
+            K::Map
+                | K::Filter
+                | K::Enumerate
+                | K::Rev
+                | K::Take
+                | K::Skip
+                | K::Chain
+                | K::Zip
+                | K::Copied
+                | K::Cloned
+                | K::FilterMap
+                | K::MapWhile
+                | K::TakeWhile
+                | K::SkipWhile
+                | K::StepBy
+                | K::Peekable
+                | K::Inspect
+                | K::Flatten
+        )
+    }
+
     /// True for the kinds that are iterators in lust. The four
     /// open-ended range kinds are `RangeBounds` values only.
     pub fn is_iterator(self) -> bool {

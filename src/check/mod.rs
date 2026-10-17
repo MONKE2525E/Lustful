@@ -8343,7 +8343,8 @@ impl<'p> Ctx<'p> {
     /// Queues the well-formedness obligations of one body
     /// type: for every application of a local Adt inside it,
     /// the Adt's parameter bounds under the written arguments,
-    /// and for every projection its trait ref. The parts
+    /// for every projection its trait ref, and for every std
+    /// adapter `Iterator` (`generics::adapter_iter_goal`). The parts
     /// `check::sized::parts` names must be `Sized` here (L0110).
     fn wf_check_written(&mut self, t: Ty, span: Span) {
         let generic = self.generic_mode();
@@ -8366,6 +8367,14 @@ impl<'p> Ctx<'p> {
                             self.push_predicates(&preds, &argv, span);
                         }
                     }
+                    // A written std adapter must be an iterator here
+                    // (`generics::adapter_iter_goal`).
+                    if let Some((k, _)) = crate::ty::iter::iter_parts(&self.tys, t)
+                        && k.is_adapter()
+                    {
+                        let args = self.tys.intern_args(&[GenericArg::Ty(t)]);
+                        self.obl.push_trait_at(TraitRef { def: self.p.gx.lang.iterator, args, bindings: EMPTY_BINDINGS }, span, 0);
+                    }
                     for g in argv {
                         if let Some(e) = g.as_ty() {
                             stack.push(e);
@@ -8376,7 +8385,6 @@ impl<'p> Ctx<'p> {
                 TyKind::Tuple(ts) => stack.extend(self.tys.tys_of(ts).iter().copied()),
                 TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => {
                     if let TyKind::Projection(assoc, _) = self.tys.kind(t)
-                        && generic
                         && let Some(def) = self.p.gx.index.trait_of_assoc(assoc.0)
                     {
                         self.obl.push_trait_at(TraitRef { def, args: a, bindings: EMPTY_BINDINGS }, span, 0);

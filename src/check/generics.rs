@@ -2008,6 +2008,9 @@ fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_ref
         TyExpr::Paren(i) | TyExpr::Slice(i) => go(*i),
         TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => go(*inner),
         TyExpr::Path(segs) => segs.iter().any(|s| in_args(&s.args)),
+        TyExpr::QPath { self_ty, trait_path, segs } => {
+            go(*self_ty) || trait_path.iter().chain(segs.iter()).any(|s| in_args(&s.args))
+        }
         TyExpr::FnPtr { inputs, ret, .. } => inputs.iter().any(|p| go(p.ty)) || ret.is_some_and(go),
         TyExpr::Dyn { bounds, lifetime, .. } => {
             lifetime.as_ref().is_some_and(named)
@@ -7093,13 +7096,15 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 let skip = usize::from(fdef.self_param.is_some());
                 let extra = apit_bounds(&p.ast, fdef, &params[skip.min(params.len())..], &mscope);
-                let required =
+                let mut required =
                     regioned_bound_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &mscope, &fdef.generics, &fdef.where_clause, &extra);
-                let implied = if required.is_empty() {
+                let copied_proj = params.iter().chain([&ret]).any(|&t| crate::check::outlives::has_copied_projection(&p.tys, t));
+                let implied = if required.is_empty() && !copied_proj {
                     Vec::new()
                 } else {
                     implied_sig_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &mscope, fdef, &params)
                 };
+                required.extend(crate::check::outlives::copied_projection_selves(&p.tys, &implied));
                 let item = crate::check::outlives::Item {
                     implied,
                     required,
@@ -9249,7 +9254,28 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 }
                 _ => proj(p, ps[0]),
             };
-            let g = Generics { parent: None, params, predicates: Vec::new() };
+            // The where clauses of core's `Iterator` impl for an adapter,
+            // which every selection and `Item` normalization proves: the
+            // wrapped iterators are iterators, and `Copied` / `Cloned`
+            // need `T: Copy` / `T: Clone` (their `I: Iterator<Item = &T>`
+            // binds `T`; lowering checked the item shape), and `Chain`'s
+            // sides have one item type. `Rev`'s `I: DoubleEndedIterator`
+            // is checked where the type is written (`stdtypes`).
+            let mut base: Vec<Predicate> = if k.is_adapter() { vec![pred_on(p, lang.iterator, ps[0])] } else { Vec::new() };
+            match k {
+                // `B: Iterator<Item = A::Item>`.
+                K::Chain => {
+                    let a_item = proj(p, ps[0]);
+                    let args = p.tys.intern_args(&[GenericArg::Ty(ps[1])]);
+                    let bindings = p.tys.intern_bindings(&[(lang.assoc_item, GenericArg::Ty(a_item))]);
+                    base.push(Predicate::Trait(Binder::plain(TraitRef { def: lang.iterator, args, bindings })));
+                }
+                K::Zip | K::Flatten => base.push(pred_on(p, lang.iterator, ps[1])),
+                K::Copied => base.push(pred_on(p, lang.copy, ps[1])),
+                K::Cloned => base.push(pred_on(p, lang.clone, ps[1])),
+                _ => {}
+            }
+            let g = Generics { parent: None, params, predicates: base.clone() };
             insert_synthetic(p, &mut ordinal, lang.iterator, self_pat, &[], g.clone(), vec![(lang.assoc_item, item)], Synthetic::Lang, false, span);
             // `ExactSizeIterator` and `DoubleEndedIterator` for the
             // kinds core marks so (fx-option-rest; the same sets as
@@ -9288,7 +9314,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 K::Zip => Some(vec![pred_on(p, lang.exact_size_iterator, ps[0]), pred_on(p, lang.exact_size_iterator, ps[1])]),
                 _ => None,
             };
-            if let Some(predicates) = exact {
+            if let Some(mut predicates) = exact {
+                predicates.extend(base.iter().copied());
                 let ge = Generics { parent: None, params: g.params.clone(), predicates };
                 insert_synthetic(p, &mut ordinal, lang.exact_size_iterator, self_pat, &[], ge, Vec::new(), Synthetic::Lang, false, span);
             }
@@ -9314,7 +9341,8 @@ pub fn add_synthetic_impls(p: &mut Program) {
                 K::Chain => Some(vec![pred_on(p, lang.double_ended_iterator, ps[0]), pred_on(p, lang.double_ended_iterator, ps[1])]),
                 _ => None,
             };
-            if let Some(predicates) = double_ended {
+            if let Some(mut predicates) = double_ended {
+                predicates.extend(base.iter().copied());
                 let gd = Generics { parent: None, params: g.params.clone(), predicates };
                 insert_synthetic(p, &mut ordinal, lang.double_ended_iterator, self_pat, &[], gd, Vec::new(), Synthetic::Lang, false, span);
             }
@@ -13512,6 +13540,9 @@ fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Ve
                     }
                 }
             }
+            if let Some(g) = adapter_iter_goal(p, t) {
+                out.push(g);
+            }
             in_args(p, seen, out, sized, a);
         }
         TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => wf_goals(p, adt_idx, e, seen, out, sized),
@@ -13546,6 +13577,20 @@ fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Ve
         }
         _ => {}
     }
+}
+
+/// The goal `t: Iterator` when `t` is a std adapter type (lust's rule,
+/// stricter than rustc's WF, for written types in items and bodies): the
+/// builtin uses of an adapter value (`next`, `for`, `count`) do not prove
+/// the where clauses of its `Iterator` impl (`T: Clone` for
+/// `Cloned<slice::Iter<T>>`), so the written type must.
+pub(crate) fn adapter_iter_goal(p: &mut Program, t: Ty) -> Option<TraitRef> {
+    let (k, _) = crate::ty::iter::iter_parts(&p.tys, t)?;
+    if !k.is_adapter() {
+        return None;
+    }
+    let args = p.tys.intern_args(&[GenericArg::Ty(t)]);
+    Some(TraitRef { def: p.gx.lang.iterator, args, bindings: EMPTY_BINDINGS })
 }
 
 /// The goal `t: Sized`.

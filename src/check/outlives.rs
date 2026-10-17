@@ -137,7 +137,7 @@ fn implied_env(cx: &Cx, tys: &mut impl TyIntern, implied: &[Ty], facts: &[(u32, 
     for &t in implied {
         let t = expand_free(tys, t);
         let mut reqs = Vec::new();
-        wf(cx, tys, t, &mut reqs);
+        wf_in(cx, tys, t, true, &mut reqs);
         for (g, r) in reqs {
             assume(tys, &mut env, g, r);
         }
@@ -508,32 +508,41 @@ fn dyn_refs(tys: &impl TyIntern, b: BoundsId) -> Vec<TraitRef> {
 /// obligations, outlives part): `&'r X` needs `X: 'r`, an Adt needs
 /// its inferred outlives under its args, and so on into every part.
 fn wf(cx: &Cx, tys: &mut impl TyIntern, t: Ty, out: &mut Vec<Req>) {
+    wf_in(cx, tys, t, false, out);
+}
+
+/// `wf`; with `implied`, for an implied type (`implied_env`): rustc
+/// assumes what a projection normalizes to, not what its args need, and
+/// a `Copied` / `Cloned` item drops the `'a` that its impl's `T: 'a`
+/// bound needs (`<Cloned<slice::Iter<'a, T>> as Iterator>::Item` is
+/// `T`), so such a projection gives no facts.
+fn wf_in(cx: &Cx, tys: &mut impl TyIntern, t: Ty, implied: bool, out: &mut Vec<Req>) {
     match tys.kind(t) {
         TyKind::Ref(r, _, e) => {
             out.push((GenericArg::Ty(e), r));
-            wf(cx, tys, e, out);
+            wf_in(cx, tys, e, implied, out);
         }
         TyKind::Adt(d, a) => {
             let argv: Vec<GenericArg> = tys.args(a).to_vec();
             adt_reqs(cx, tys, d, &argv, out);
             for g in argv {
                 if let GenericArg::Ty(e) = g {
-                    wf(cx, tys, e, out);
+                    wf_in(cx, tys, e, implied, out);
                 }
             }
         }
         TyKind::Tuple(ts) => {
             for e in tys.tys_of(ts).to_vec() {
-                wf(cx, tys, e, out);
+                wf_in(cx, tys, e, implied, out);
             }
         }
-        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => wf(cx, tys, e, out),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => wf_in(cx, tys, e, implied, out),
         TyKind::FnPtr(sig) => {
             let b = tys.sig(sig);
             for e in tys.tys_of(b.value.inputs).to_vec() {
-                wf(cx, tys, e, out);
+                wf_in(cx, tys, e, implied, out);
             }
-            wf(cx, tys, b.value.output, out);
+            wf_in(cx, tys, b.value.output, implied, out);
         }
         TyKind::Dyn(b, _) => {
             for tr in dyn_refs(tys, b) {
@@ -541,13 +550,70 @@ fn wf(cx: &Cx, tys: &mut impl TyIntern, t: Ty, out: &mut Vec<Req>) {
             }
         }
         TyKind::Projection(_, a) => {
+            if implied && tys.args(a).first().and_then(|g| g.as_ty()).is_some_and(|s| has_copied_layer(tys, s)) {
+                return;
+            }
             for g in tys.args(a).to_vec() {
                 if let GenericArg::Ty(e) = g {
-                    wf(cx, tys, e, out);
+                    wf_in(cx, tys, e, implied, out);
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// The self types of the projections over a `Copied` / `Cloned` layer in
+/// signature types `ts`: normalizing one proves its impl's `T: 'a`, which
+/// the signature does not imply (`wf_in`), so a fn requires each self
+/// type well-formed. Empty for most fns (`has_copied_projection` gates it).
+pub fn copied_projection_selves(tys: &impl TyIntern, ts: &[Ty]) -> Vec<Ty> {
+    let mut out = Vec::new();
+    for &t in ts {
+        visit_projections(tys, t, &mut |s| {
+            if has_copied_layer(tys, s) {
+                out.push(s);
+            }
+        });
+    }
+    out
+}
+
+/// True when `t` holds a projection over a `Copied` / `Cloned` layer.
+pub fn has_copied_projection(tys: &impl TyIntern, t: Ty) -> bool {
+    let mut any = false;
+    visit_projections(tys, t, &mut |s| any |= has_copied_layer(tys, s));
+    any
+}
+
+/// Calls `f` with the self type of every projection in `t`.
+fn visit_projections(tys: &impl TyIntern, t: Ty, f: &mut dyn FnMut(Ty)) {
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => visit_projections(tys, e, f),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().for_each(|&e| visit_projections(tys, e, f)),
+        TyKind::FnPtr(sig) => {
+            let s = tys.sig(sig).value;
+            tys.tys_of(s.inputs).iter().chain([&s.output]).for_each(|&e| visit_projections(tys, e, f));
+        }
+        TyKind::Adt(_, a) | TyKind::Projection(_, a) => {
+            if let TyKind::Projection(..) = tys.kind(t)
+                && let Some(s) = tys.args(a).first().and_then(|g| g.as_ty())
+            {
+                f(s);
+            }
+            tys.args(a).iter().filter_map(|g| g.as_ty()).for_each(|e| visit_projections(tys, e, f));
+        }
+        _ => {}
+    }
+}
+
+/// True when builtin iterator `t` has a `Copied` or `Cloned` layer.
+fn has_copied_layer(tys: &impl TyIntern, t: Ty) -> bool {
+    use crate::ty::iter::{IterKind, iter_parts};
+    match iter_parts(tys, t) {
+        Some((IterKind::Copied | IterKind::Cloned, _)) => true,
+        Some((_, a)) => a.iter().any(|&x| has_copied_layer(tys, x)),
+        None => false,
     }
 }
 

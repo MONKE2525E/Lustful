@@ -5792,9 +5792,11 @@ pub(crate) fn fn_record(
         let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
         let skip = usize::from(def.self_param.is_some());
         let extra = generics::apit_bounds(ast, def, &params[skip.min(params.len())..], &scope);
-        let required = generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, &def.generics, &def.where_clause, &extra);
-        if !required.is_empty() {
+        let mut required = generics::regioned_bound_tys(ast, interner, known, &cx, &mut p.tys, &scope, &def.generics, &def.where_clause, &extra);
+        let copied_proj = params.iter().chain([&ret]).any(|&t| crate::check::outlives::has_copied_projection(&p.tys, t));
+        if !required.is_empty() || copied_proj {
             let implied = generics::implied_sig_tys(ast, interner, known, &cx, &mut p.tys, &scope, def, &params);
+            required.extend(crate::check::outlives::copied_projection_selves(&p.tys, &implied));
             let item = crate::check::outlives::Item {
                 implied,
                 required,

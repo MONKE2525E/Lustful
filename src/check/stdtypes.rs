@@ -187,6 +187,45 @@ fn pred_fn_ok(tys: &mut impl TyIntern, f: Ty, inner: Ty, out: Ty) -> bool {
     ins.len() == 1 && ins[0] == want && s.output == out
 }
 
+/// True when core implements `DoubleEndedIterator` for builtin iterator
+/// `t` (the element bounds aside: the adapters' `Iterator` impls prove
+/// those). Conservative: the kinds that need `ExactSizeIterator` too, the
+/// str and slice splits, and the forward-only kinds answer false.
+fn written_double_ended(tys: &impl TyIntern, t: Ty) -> bool {
+    use IterKind as K;
+    if tys.is_chars_ty(t) {
+        return true;
+    }
+    let Some((k, a)) = crate::ty::iter::iter_parts(tys, t) else { return false };
+    match k {
+        K::SliceIter
+        | K::SliceIterMut
+        | K::VecIntoIter
+        | K::Range
+        | K::RangeInclusive
+        | K::Windows
+        | K::Chunks
+        | K::ChunksMut
+        | K::ChunksExact
+        | K::ChunksExactMut
+        | K::CharIndices
+        | K::VecDrain
+        | K::StringDrain
+        | K::ArrayIntoIter
+        | K::RepeatN
+        | K::OptionIntoIter
+        | K::OptionIter
+        | K::OptionIterMut
+        | K::ResultIter
+        | K::ResultIterMut
+        | K::ResultIntoIter
+        | K::Args => true,
+        K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => written_double_ended(tys, a[0]),
+        K::Chain => written_double_ended(tys, a[0]) && written_double_ended(tys, a[1]),
+        _ => false,
+    }
+}
+
 /// Resolves a std iterator type path (`iter_by_path` matched it) with the
 /// written args of its last segment.
 #[allow(clippy::too_many_arguments)]
@@ -316,32 +355,17 @@ pub fn resolve_iter_path(
         StdIterPath::Kind(k) => {
             use IterKind as K;
             // Adapters wrap a builtin iterator (their item and fields need it).
-            let adapter = matches!(
-                k,
-                K::Map
-                    | K::Filter
-                    | K::Enumerate
-                    | K::Rev
-                    | K::Take
-                    | K::Skip
-                    | K::Chain
-                    | K::Zip
-                    | K::Copied
-                    | K::Cloned
-                    | K::FilterMap
-                    | K::MapWhile
-                    | K::TakeWhile
-                    | K::SkipWhile
-                    | K::StepBy
-                    | K::Peekable
-                    | K::Inspect
-                    | K::Flatten
-            );
+            let adapter = k.is_adapter();
             if adapter && !crate::ty::iter::is_iter(tys, erased_args[0]) {
                 return Err(unsupported("over a type that is not a std iterator lust knows"));
             }
             if matches!(k, K::Chain | K::Zip) && !crate::ty::iter::is_iter(tys, erased_args[1]) {
                 return Err(unsupported("over a type that is not a std iterator lust knows"));
+            }
+            // `impl<I: DoubleEndedIterator> Iterator for Rev<I>`: a `Rev` that
+            // is no iterator would let its uses skip that bound.
+            if k == K::Rev && !written_double_ended(tys, erased_args[0]) {
+                return Err(unsupported("over an iterator lust does not know to be double-ended"));
             }
             if k.is_range()
                 && k != K::RangeFull
