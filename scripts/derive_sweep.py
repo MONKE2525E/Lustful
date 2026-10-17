@@ -199,7 +199,8 @@ T5_HELPERS = "fn need_eq<X: Eq>(_x: &X) {}\n"
 # Contexts: (items with NAME and BODY, main expression). `gmk` gets its
 # value from mk() alone; `gmkc` does too, inside a template with closures
 # (no stored check: it rechecks when its body names the reach); `galias`
-# names A only through a type alias (its literal too), with closures.
+# names A only through a type alias (its literal too), with closures;
+# `gtwice` and `gfnbound` (round 6) make the closure kind follow A's derives.
 T5_CONTEXTS = {
     "gfn": ("fn NAME<T>(a: A, _t: T) -> String {\n    BODY\n}\n", "NAME(mk(), 0u8)"),
     "gclosure": ("fn NAME<T>(a: A, _t: T) -> String {\n    let f = |a: A| BODY;\n    f(a)\n}\n", "NAME(mk(), 'c')"),
@@ -208,6 +209,11 @@ T5_CONTEXTS = {
     "gmk": ("fn NAME<T>(_t: T) -> String {\n    let a = mk();\n    BODY\n}\n", "NAME(3i32)"),
     "galias": ("type NAMEA = A;\nfn NAME<T>(_t: T) -> String {\n    let g = || 1u8;\n    let a: NAMEA = MK_ALIAS;\n    format!(\"{}{}\", g(), BODY)\n}\n", "NAME(2u64)"),
     "gmkc": ("fn NAME<T>(_t: T) -> String {\n    let g = || 1u8;\n    let a = mk();\n    format!(\"{}{}\", g(), BODY)\n}\n", "NAME(true)"),
+    # Round 6: the closure's kind follows A's derives (a move closure that
+    # moves A out is FnOnce unless A is Copy): called twice, and passed to
+    # an `Fn` bound.
+    "gtwice": ("fn NAME<T>(a: A, _t: T) -> String {\n    let f = move || BODY;\n    format!(\"{}{}\", f(), f())\n}\n", "NAME(mk(), 4u8)"),
+    "gfnbound": ("fn NAMEC<F: Fn() -> String>(f: F) -> String {\n    f()\n}\nfn NAME<T>(a: A, _t: T) -> String {\n    NAMEC(move || BODY)\n}\n", "NAME(mk(), 5u8)"),
 }
 for _tr, _use in T5_USES.items():
     for _cx, (_items, _call) in T5_CONTEXTS.items():
@@ -400,6 +406,9 @@ def gen(seed, resolver=False):
         adt = rng.choice(ADTS)
         full = FULL3 + (["Default"] if adt[4] else [])
         pool = [sh for sh in T5_SHAPES if adt[4] or sh not in NEEDS_DEFAULT]
+        only = [c for c in os.environ.get("DSWEEP_CONTEXTS", "").split(",") if c]
+        if only:
+            pool = [sh for sh in pool if sh.split("_")[1] in only]
         shapes = rng.sample(pool, rng.randint(1, 3)) + rng.sample(BASE_SHAPES, rng.randint(0, 1))
         shapes = [sh for sh in sorted(set(shapes)) if (adt[4] or sh not in NEEDS_DEFAULT) and not (adt[3] and sh in NOT_GENERIC)]
         return [program(adt, d, shapes, resolver) for d in versions5(rng, full, shapes)]
@@ -519,7 +528,10 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--keep", default="")
     ap.add_argument("--resolver", action="store_true", help="route every program to the resolver path")
+    ap.add_argument("--contexts", default="", help="round 5 programs take template shapes of these contexts only (gtwice,gfnbound)")
     a = ap.parse_args()
+    if a.contexts:
+        os.environ["DSWEEP_CONTEXTS"] = a.contexts
     if not os.path.exists(LUST):
         print(f"{LUST} missing; run scripts/build.sh", file=sys.stderr)
         return 2
