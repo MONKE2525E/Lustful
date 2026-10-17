@@ -2117,6 +2117,12 @@ struct Ctx<'p> {
     /// are checked in `finish`, after literal fallback. (operand type,
     /// target, span).
     deferred_open_casts: Vec<(Ty, Ty, Span)>,
+    /// `x.into()` calls whose target was open at the call, as (call,
+    /// receiver type, target variable, method name span): resolved at
+    /// body end through std's conversions once a later use fixed the
+    /// target (`let y = s.into(); t(y)`), as rustc's pending `Into`
+    /// obligation.
+    deferred_into: Vec<(ExprId, Ty, Ty, Sym, Span)>,
     /// Types a `Result` method formats with Debug in its panic message.
     deferred_debug: Vec<(Ty, Span)>,
     /// Types a `take` builds with `Default::default()`.
@@ -2612,6 +2618,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_fn_casts: Vec::new(),
         deferred_coerce_casts: Vec::new(),
         deferred_open_casts: Vec::new(),
+        deferred_into: Vec::new(),
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_vec_clone: Vec::new(),
@@ -11474,6 +11481,25 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True for a std container type with a known head whose `Clone`
+    /// only waits on an open element variable: `Vec<_>`, `Option<_>`,
+    /// `Result<_, _>`, `HashMap<_, _>`, `HashSet<_>`, a tuple or an
+    /// array. Core's impls there are Clone exactly when the elements are
+    /// (`deferred_clone` checks that at body end). Not `Box<_>` or
+    /// `Rc<_>`: rustc's method probe derefs them to the open `_` and
+    /// stops (E0282, type must be known at this point).
+    fn open_std_clone_head(&self, t: Ty) -> bool {
+        let t = self.resolve(t);
+        if !self.has_unbound_deep(t) {
+            return false;
+        }
+        matches!(self.tys.kind(t), TyKind::Tuple(_) | TyKind::Array(..))
+            || self.tys.vec_elem(t).is_some()
+            || self.tys.option_elem(t).is_some()
+            || self.tys.result_args(t).is_some()
+            || crate::ty::hash::hash_parts(&self.tys, t).is_some_and(|(k, _)| matches!(k, crate::ty::hash::HashTy::HashMap | crate::ty::hash::HashTy::HashSet))
+    }
+
     /// rustc's probe for `Clone::clone` (`&self`) or, with `mutable`,
     /// `clone_from` (`&mut self`) over the reference and guard steps of
     /// `rt`: the first step whose by-value form (the step is `&Self`, or
@@ -16695,6 +16721,17 @@ impl<'p> Ctx<'p> {
                 self.check_args(&[], args, name_span);
                 return base;
             }
+            // A std container whose element a later use fixes (`let w =
+            // v.clone(); v.push(1u8)`): its builtin clone, with `base:
+            // Clone` checked at body end, as rustc's pending obligation.
+            if self.open_std_clone_head(base) {
+                self.record_glue_reads(p.gx.lang.clone, base);
+                self.check_packed_borrow(recv, name_span);
+                self.deferred_clone.push((base, name_span));
+                self.set_res(e, Res::BuiltinMethod { b: Builtin::Clone, derefs, autoref: Autoref::Ref });
+                self.check_args(&[], args, name_span);
+                return base;
+            }
         }
         // `clone_from` with no written fn: the `clonefrom` glue
         // (derived and core bodies) at a `Clone` receiver. A hash
@@ -16765,6 +16802,27 @@ impl<'p> Ctx<'p> {
         // types (check/convert.rs, W-STD-B).
         if let Some(ret) = self.std_into_method(e, rt, name, args, turbofish, expected) {
             return ret;
+        }
+        // `into()` with a known receiver and a target a later statement
+        // fixes: typed by a fresh target, resolved at body end
+        // (`deferred_into`).
+        if args.is_empty()
+            && turbofish.is_empty()
+            && self.name(name) == "into"
+            && !builtin_only
+            && expected.is_none_or(|t| matches!(self.kind(self.resolve(t)), TyKind::Infer(v) if !v.is_int() && !v.is_float()))
+            && self.replayed_trait_ref(e, self.p.gx.lang.into).is_none()
+        {
+            let src = self.deep(rt);
+            if !self.tys.flags(src).contains_infer() && !self.has_error_kind(src) && !matches!(self.kind(src), TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..)) {
+                let dst = match expected {
+                    Some(t) => t,
+                    None => self.new_var(false),
+                };
+                self.check_args(&[], args, name_span);
+                self.deferred_into.push((e, rt, dst, name, name_span));
+                return dst;
+            }
         }
         // Slice inherent methods on slices, arrays, and Vecs
         // (check/slice.rs).
@@ -24224,6 +24282,42 @@ impl<'p> Ctx<'p> {
                 let (src_d, dst_d) = (self.deep(src), self.deep(dst));
                 let (a, b) = (self.tn(src_d), self.tn(dst_d));
                 self.err("L0116", span, format!("cannot cast `{a}` as `{b}`"), "Give the literal a type suffix (`1u8`), or annotate the value before the cast.");
+            }
+        }
+        // `into()` calls whose target came later: std's conversions on
+        // the final types (numeric, String/Box/Rc/identity, the std
+        // `From` set). Any other target (a user `From` impl, a generic
+        // one, one still open) rejects: a lust limit, never an accept.
+        for (e, rt, dst, name, span) in std::mem::take(&mut self.deferred_into) {
+            self.literal_fallback_deep(dst);
+            let dst_d = self.deep(dst);
+            let src_d = self.deep(rt);
+            if matches!(self.kind(dst_d), TyKind::Error) {
+                continue;
+            }
+            if self.has_unbound_deep(dst_d) {
+                if !self.tainted_lookup(dst_d) {
+                    self.err("L0610", span, "type annotations needed: the target of this `into()` is not known", "Annotate the target type, as in `let y: Vec<u8> = x.into();`.");
+                }
+                continue;
+            }
+            if Self::numeric_from_ok(self.kind(src_d), self.kind(dst_d))
+                && matches!(self.kind(src_d), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char)
+            {
+                self.set_res(e, Res::PrimOp { kind: PrimOpKind::IntoCast, derefs: 0 });
+                continue;
+            }
+            if self.builtin_into_method(e, rt, name, &[], &[], Some(dst_d)).is_some() || self.std_into_method(e, rt, name, &[], &[], Some(dst_d)).is_some() {
+                continue;
+            }
+            let (a, b) = (self.tn(src_d), self.tn(dst_d));
+            let self_ty = self.into_self(rt).0;
+            let fargs = self.tys.intern_args(&[GenericArg::Ty(dst_d), GenericArg::Ty(self_ty)]);
+            let from = TraitRef { def: self.p.gx.lang.from, args: fargs, bindings: EMPTY_BINDINGS };
+            if matches!(self.select_obligation(from), Selection::NoImpl) {
+                self.err("L0612", span, format!("no impl of `From<{a}>` for `{b}`"), "Convert with a cast or a method, or change the target.");
+            } else {
+                self.err("L0640", span, format!("`into()` from `{a}` to `{b}`, a target a later statement fixes, is not supported yet"), "Annotate the target at the call: `let y: T = x.into();`.");
             }
         }
         for (src, dst, span) in std::mem::take(&mut self.deferred_open_casts) {
