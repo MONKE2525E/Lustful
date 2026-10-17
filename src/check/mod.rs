@@ -79,7 +79,7 @@ pub enum Autoref {
     SliceRefMut,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Builtin {
     StringNew,
     StringFrom,

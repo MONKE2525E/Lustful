@@ -409,15 +409,10 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
                         crate::check::caller::is_track_caller(p, *f).hash(&mut h);
                     }
                     CallTarget::Builtin(b) => {
+                        // With its payload: `SliceTrimAscii(0)` and `(1)`
+                        // have the same types and emit different C.
                         1u8.hash(&mut h);
-                        std::mem::discriminant(b).hash(&mut h);
-                        // The sync ops share one variant (check/sync.rs).
-                        if let Builtin::Sync(op) = b {
-                            op.hash(&mut h);
-                        }
-                        if let Builtin::OwnFrom(k) = b {
-                            k.hash(&mut h);
-                        }
+                        b.hash(&mut h);
                     }
                     CallTarget::Intrinsic(i) => (2u8, i).hash(&mut h),
                     CallTarget::Indirect(l) => (3u8, l).hash(&mut h),
@@ -1183,21 +1178,28 @@ struct Foo { x: i64 }
 impl Foo { fn get(&self) -> i64 { self.x } }
 fn helper(a: i64) -> i64 { a * 2 }
 fn seven() -> &'static i64 { &7 }
+fn total(v: &Vec<i64>) -> (i64, &'static (u8, char)) { (v.iter().sum(), &(3, 'z')) }
 fn main() {
     let f = Foo { x: helper(20) };
     let mut v = Vec::new();
     v.push(f.get() + *seven() - 7);
-    println!(\"{} {}\", v.len(), f.get() + 2);
+    println!(\"{} {} {:?}\", v.len(), f.get() + 2, total(&v));
 }
 ";
 
     fn lowered(src: &str, run: impl FnOnce(&Program, &SourceMap, Vec<Body>)) {
+        lowered_with(src, false, run)
+    }
+
+    /// `lowered` with `Program::unwind` set as a panic=unwind build sets it.
+    fn lowered_with(src: &str, unwind: bool, run: impl FnOnce(&Program, &SourceMap, Vec<Body>)) {
         let interner = std::sync::Arc::new(Interner::default());
         let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
         let ast = parser::parse(&lexed, &interner, &known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
-        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        let mut program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        program.unwind = unwind;
         let mut map = SourceMap::default();
         map.add_file("test.rs", src);
         let bodies = (0..program.fns.len())
@@ -1214,33 +1216,95 @@ fn main() {
     /// A cached body rebuilds in a fresh program (the next request)
     /// with the same IR fingerprint and byte-identical C under the
     /// same slot assignment, and correct C under a renumbered one
-    /// (the fingerprint stands; only slot prints move). `seven`'s
-    /// promoted `&7` keeps its static storage through the round trip.
+    /// (the fingerprint stands; only slot prints move). Under panic=abort
+    /// and panic=unwind: the promoted temps (`seven`'s `&7`, `total`'s
+    /// `&(3, 'z')`) and the statement cleanup entries survive the round
+    /// trip and the iterator expansion cgen runs first (`total`'s `sum`).
     #[test]
     fn cached_body_rebuilds_with_same_fingerprint_and_c() {
-        lowered(SRC, |p, map, bodies| {
-            let slots: Vec<u32> = (0..bodies.len() as u32).collect();
-            for (i, body) in bodies.iter().enumerate() {
-                let fp = ir_fingerprint(p, body, map, 1);
-                let used = crate::cgen::gen_fn(p, body, map, 1, &slots).used;
-                let pairs: Vec<(DiskDefId, u32)> = used.iter().map(|&u| (p.disk_id(LocalDefId(u)), u)).collect();
-                let cached = cache_body(p, body, 7, i as u32, pairs, fp);
-                // Rebuild against a fresh collect of the same source.
-                lowered(SRC, |p2, map2, _| {
-                    let rebuilt = rebuild(p2, &cached, LocalDefId(i as u32)).expect("rebuild resolves");
-                    assert_eq!(ir_fingerprint(p2, &rebuilt, map2, 1), fp, "fn {i} fingerprint survives the round trip");
-                    let a = crate::cgen::gen_fn(p, body, map, 1, &slots);
-                    let b = crate::cgen::gen_fn(p2, &rebuilt, map2, 1, &slots);
-                    assert_eq!(a.code, b.code, "fn {i} C is identical under the same slots");
-                    // Renumbered slots: same fingerprint, C differs
-                    // only where slot numbers print.
-                    let shifted: Vec<u32> = slots.iter().map(|s| s + 10).collect();
-                    let c = crate::cgen::gen_fn(p2, &rebuilt, map2, 1, &shifted);
-                    assert_eq!(ir_fingerprint(p2, &rebuilt, map2, 1), fp, "fingerprint is slot-free");
-                    if a.code.contains("lust_fns[") || a.code.contains("lust_tramps[") {
-                        assert_ne!(a.code, c.code, "fn {i} slot prints move under a renumber");
+        for unwind in [false, true] {
+            let (mut promoted, mut unwinds, mut expanded) = (0, 0, 0);
+            lowered_with(SRC, unwind, |p, map, bodies| {
+                let slots: Vec<u32> = (0..bodies.len() as u32).collect();
+                for (i, body) in bodies.iter().enumerate() {
+                    promoted += body.promoted.len();
+                    unwinds += body.stmt_unwind.len();
+                    for ex in [crate::lower::iter::expand(p, body), crate::lower::tls::expand(p, body)] {
+                        if let Ok(Some(x)) = ex {
+                            expanded += 1;
+                            // It adds cleanup entries for the statements it adds.
+                            assert_eq!(x.promoted, body.promoted, "fn {i} expansion keeps the promoted temps");
+                            assert!(body.stmt_unwind.iter().all(|e| x.stmt_unwind.contains(e)), "fn {i} expansion keeps the cleanup entries");
+                        }
                     }
-                });
+                    let fp = ir_fingerprint(p, body, map, 1);
+                    let used = crate::cgen::gen_fn(p, body, map, 1, &slots).used;
+                    let pairs: Vec<(DiskDefId, u32)> = used.iter().map(|&u| (p.disk_id(LocalDefId(u)), u)).collect();
+                    let cached = cache_body(p, body, 7, i as u32, pairs, fp);
+                    // Rebuild against a fresh collect of the same source.
+                    lowered_with(SRC, unwind, |p2, map2, _| {
+                        let rebuilt = rebuild(p2, &cached, LocalDefId(i as u32)).expect("rebuild resolves");
+                        assert_eq!((&rebuilt.promoted, &rebuilt.stmt_unwind), (&body.promoted, &body.stmt_unwind), "fn {i} round trip keeps them");
+                        assert_eq!(ir_fingerprint(p2, &rebuilt, map2, 1), fp, "fn {i} fingerprint survives the round trip");
+                        let a = crate::cgen::gen_fn(p, body, map, 1, &slots);
+                        let b = crate::cgen::gen_fn(p2, &rebuilt, map2, 1, &slots);
+                        assert_eq!(a.code, b.code, "fn {i} C is identical under the same slots");
+                        // Renumbered slots: same fingerprint, C differs
+                        // only where slot numbers print.
+                        let shifted: Vec<u32> = slots.iter().map(|s| s + 10).collect();
+                        let c = crate::cgen::gen_fn(p2, &rebuilt, map2, 1, &shifted);
+                        assert_eq!(ir_fingerprint(p2, &rebuilt, map2, 1), fp, "fingerprint is slot-free");
+                        if a.code.contains("lust_fns[") || a.code.contains("lust_tramps[") {
+                            assert_ne!(a.code, c.code, "fn {i} slot prints move under a renumber");
+                        }
+                    });
+                }
+            });
+            assert!(promoted >= 2 && expanded >= 1, "the source has promoted temps and an expansion: {promoted} {expanded}");
+            assert_eq!(unwinds > 0, unwind, "cleanup entries exist exactly under panic=unwind");
+        }
+    }
+
+    /// Every builtin payload is part of the fingerprint: these pairs have
+    /// the same operand and result types and emit different C (or select
+    /// a different std path).
+    #[test]
+    fn ir_fingerprint_hashes_builtin_payloads() {
+        use crate::check::own::Owner;
+        use crate::check::sync::SyncOp;
+        use crate::ty::sync::SyncTy;
+        use Builtin as B;
+        let pairs = [
+            (B::SliceTrimAscii(0), B::SliceTrimAscii(1)),
+            (B::SliceTrimAscii(1), B::SliceTrimAscii(2)),
+            (B::SliceSplitEnd(false), B::SliceSplitEnd(true)),
+            (B::SliceSplitAt(false), B::SliceSplitAt(true)),
+            (B::StrSplitAt(false), B::StrSplitAt(true)),
+            (B::SliceStrip(false), B::SliceStrip(true)),
+            (B::SliceAsChunks(false), B::SliceAsChunks(true)),
+            (B::ParseInt(IntTy::I32), B::ParseInt(IntTy::U32)),
+            (B::FromStrRadix(IntTy::I64), B::FromStrRadix(IntTy::U8)),
+            (B::ParseFloat(FloatTy::F32), B::ParseFloat(FloatTy::F64)),
+            (B::OwnSliceAlloc(Owner::Box), B::OwnSliceAlloc(Owner::Rc)),
+            (B::OwnFrom(Owner::Rc), B::OwnFrom(Owner::Arc)),
+            (B::Sync(SyncOp::AtomicNew(SyncTy::AtomicBool)), B::Sync(SyncOp::AtomicDefault(SyncTy::AtomicBool))),
+            (B::Sync(SyncOp::AtomicLoad), B::Sync(SyncOp::AtomicStore)),
+        ];
+        lowered(SRC, |p, map, bodies| {
+            let (mut body, at) = bodies
+                .into_iter()
+                .find_map(|b| {
+                    let at = b.blocks.iter().position(|blk| matches!(blk.term, Terminator::Call { .. }))?;
+                    Some((b, at))
+                })
+                .expect("a body with a call");
+            let mut fp_with = |x: Builtin| {
+                let Terminator::Call { target, .. } = &mut body.blocks[at].term else { unreachable!() };
+                *target = CallTarget::Builtin(x);
+                ir_fingerprint(p, &body, map, 1)
+            };
+            for (a, b) in pairs {
+                assert_ne!(fp_with(a), fp_with(b), "{a:?} and {b:?} hash apart");
             }
         });
     }
