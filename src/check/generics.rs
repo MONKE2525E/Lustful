@@ -5506,6 +5506,11 @@ pub struct GenTables {
     /// with `lt`, whose default is `partial_cmp == Some(Less)`).
     /// Keyed by (Adt, `PartialOrd` trait) (iface: W-CGEN reads this).
     pub pcmp_methods: FxMap<(AdtId, DefId), LocalDefId>,
+    /// The written `impl Default for &'static A` methods (a non-generic
+    /// impl, `A` a non-generic local Adt): the derive glue's default of
+    /// a `&'static A` field calls it (ts-rust's `&'static ExportMember`).
+    /// Keyed by `A` (iface: W-CGEN reads this).
+    pub ref_default_methods: FxMap<AdtId, LocalDefId>,
     /// The user `fmt` method instance for one concrete Adt and fmt
     /// trait (`FmtKind as u8`: Display or Debug), for cgen's Debug and
     /// Display glue (W-STD-B; iface: W-CGEN reads this).
@@ -5695,6 +5700,7 @@ impl Default for GenTables {
             glue_methods: FxMap::default(),
             clone_from_methods: FxMap::default(),
             pcmp_methods: FxMap::default(),
+            ref_default_methods: FxMap::default(),
             fmt_methods: FxMap::default(),
             deferred_debug_fields: Vec::new(),
             hasher_methods: FxMap::default(),
@@ -9012,6 +9018,12 @@ pub fn add_synthetic_impls(p: &mut Program) {
         let (box_p0, rc_p0) = (p.tys.mk_boxed(p0), p.tys.mk_rc(p0));
         for t in [box_p0, rc_p0] {
             insert_synthetic(p, &mut ordinal, lang.from, t, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        }
+        // core's `From<NonZero<T>> for T` per integer (convert.rs
+        // `FromConv::NonZeroGet`; `available_parallelism().map_or(4, Into::into)`).
+        for &i in IntTy::ALL_SUPPORTED.iter() {
+            let nz = nonzero_ty(&mut p.tys, int(i));
+            insert_synthetic(p, &mut ordinal, lang.from, int(i), &[nz], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
     }
     {
@@ -12707,7 +12719,7 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
             ConstKind::Int(k) if k <= 32 => prove_field_trait(p, env, trait_def, e),
             _ => false,
         },
-        TyKind::Ref(_, _, e) if default => matches!(p.tys.kind(e), TyKind::Str | TyKind::Slice(_)),
+        TyKind::Ref(..) if default => crate::check::collect::ref_default(p, &p.tys, ty),
         // `Cow<B>` defaults through its Owned type, which the pure
         // solver cannot normalize at the unsized heads (str, [T]);
         // the structural glue answer decides, plus the derive's own
@@ -13039,8 +13051,20 @@ fn compute_glue_methods(p: &mut Program) {
     let mut out: FxMap<(AdtId, DefId), LocalDefId> = FxMap::default();
     let mut cf_out: FxMap<AdtId, LocalDefId> = FxMap::default();
     let mut pcmp_out: FxMap<(AdtId, DefId), LocalDefId> = FxMap::default();
+    let mut ref_default_out: FxMap<AdtId, LocalDefId> = FxMap::default();
     for (_, rec) in p.gx.index.all_impls() {
         if rec.synthetic != Synthetic::None || !rec.local || !rec.generics.params.is_empty() {
+            continue;
+        }
+        // `impl Default for &'static A` (`ref_default_methods`).
+        if rec.trait_def == lang.default
+            && let TyKind::Ref(Region::Static | Region::Erased, Mut::Shared, inner) = p.tys.kind(rec.self_ty(&p.tys))
+            && let TyKind::Adt(d, EMPTY_ARGS) = p.tys.kind(inner)
+            && let Some(a) = p.tys.local_adt_of(d)
+            && let Some(f) = rec.items.iter().find_map(|&m| p.local_def(m.hash).filter(|&l| p.name(p.fn_info(l).name) == "default"))
+            && !p.gx.fn_templates.get(f.0 as usize).is_some_and(|t| t.is_some())
+        {
+            ref_default_out.insert(a, f);
             continue;
         }
         let name = if rec.trait_def == lang.clone {
@@ -13119,6 +13143,7 @@ fn compute_glue_methods(p: &mut Program) {
     p.gx.glue_methods = out;
     p.gx.clone_from_methods = cf_out;
     p.gx.pcmp_methods = pcmp_out;
+    p.gx.ref_default_methods = ref_default_out;
 }
 
 /// Fills `written_hash` and `borrow_impls` (W-STD-B): the written

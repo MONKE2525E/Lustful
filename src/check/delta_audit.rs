@@ -157,6 +157,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         glue_methods: _,          // same
         clone_from_methods: _,    // same
         pcmp_methods: _,          // same
+        ref_default_methods: _,   // same
         fmt_methods: _,           // same
         deferred_debug_fields: _, // same
         hasher_methods: _,        // same

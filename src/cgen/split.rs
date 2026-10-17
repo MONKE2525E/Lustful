@@ -259,6 +259,15 @@ impl FnGen<'_, '_> {
                 let a = self.split_adapter(f, false);
                 format!("((lust_pat){{ .kind = LUST_PAT_PRED, .pred = {a}, .env = (void*){ptr} }})")
             }
+            // A `fn(char) -> bool` pointer: the env is the stored pointer.
+            TyKind::FnPtr(_) => {
+                let ct = cty(&self.body.tys, p);
+                collect_types(&ct, &mut self.sig_types);
+                let name = format!("lust_splitp_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
+                self.adapters += 1;
+                let _ = writeln!(self.prelude, "static uint8_t {name}(void *env, uint32_t c) {{\n  return (*({}*)env)(c);\n}}", ctype(&ct));
+                format!("((lust_pat){{ .kind = LUST_PAT_PRED, .pred = {name}, .env = (void*){ptr} }})")
+            }
             TyKind::Ref(_, _, inner) => match self.body.tys.kind(inner) {
                 TyKind::Str => format!("((lust_pat){{ .kind = LUST_PAT_STR, .needle = *{ptr} }})"),
                 TyKind::Ref(..) => format!("((lust_pat){{ .kind = LUST_PAT_STR, .needle = **{ptr} }})"),

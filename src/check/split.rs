@@ -23,10 +23,16 @@ pub fn str_needle(tys: &impl TyIntern, t: Ty) -> bool {
 }
 
 /// True for the pattern types lust runs (std's `Pattern` impls but the
-/// fn-item and fn-pointer predicates).
+/// fn-item predicates, which `is_pattern_fn_item` adds).
 fn pattern_ok(tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Char | TyKind::Closure(..) => true,
+        // A safe Rust-ABI `fn(char) -> bool` (ts-rust jsdoc.rs
+        // `trim_part_end`): `FnMut(char) -> bool` like a closure.
+        TyKind::FnPtr(sig) => {
+            let s = tys.sig(sig).value;
+            !s.is_unsafe && !s.extern_c && tys.tys_of(s.inputs) == [CHAR] && s.output == BOOL
+        }
         TyKind::Array(e, _) => e == CHAR,
         TyKind::Ref(_, _, inner) => {
             str_needle(tys, t) || matches!(tys.kind(inner), TyKind::Array(e, _) | TyKind::Slice(e) if e == CHAR)

@@ -9449,6 +9449,17 @@ fn glue_hash(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> bo
 /// `Option`, tuples, arrays of at most 32 elements, `Box` and `Rc`
 /// of such types, `&str` and `&[T]`, and Adts that derive `Default`
 /// with fields of such types.
+/// A reference type's `Default`: core's `&str` and `&[T]`, or a
+/// written `impl Default for &'static A` (`gx.ref_default_methods`) at
+/// a shared reference of any lifetime (`&'static A` coerces to `&'a A`).
+pub fn ref_default(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Ref(_, _, e) if matches!(tys.kind(e), TyKind::Str | TyKind::Slice(_)) => true,
+        TyKind::Ref(_, Mut::Shared, e) => tys.local_adt(e).is_some_and(|a| p.gx.ref_default_methods.contains_key(&a)),
+        _ => false,
+    }
+}
+
 pub fn has_default(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     glue_default(p, tys, t, &mut GlueSeen::default())
 }
@@ -9475,7 +9486,7 @@ fn glue_default(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) ->
         TyKind::Param(_) | TyKind::Projection(..) => env_proves(tys, t, p.gx.lang.default, None),
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Unit | TyKind::Error => true,
         TyKind::Infer(v) => v.is_int() || v.is_float(),
-        TyKind::Ref(_, _, e) => matches!(tys.kind(e), TyKind::Str | TyKind::Slice(_)),
+        TyKind::Ref(..) => ref_default(p, tys, t),
         TyKind::Tuple(ts) => tys.tys_of(ts).len() <= 12 && tys.tys_of(ts).iter().all(|&e| glue_default(p, tys, e, seen)),
         TyKind::Array(e, n) => match tys.const_kind(n) {
             ConstKind::Int(0) => true,

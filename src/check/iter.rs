@@ -2192,8 +2192,11 @@ impl<'p> Ctx<'p> {
             // trusts its `len`, and a dishonest `size_hint` would reach
             // core's `unreachable!` (lower/iter.rs `zip_next_back`).
             K::Zip => (0..2).all(|i| self.double_ended(a[i], span) && self.exact_size(a[i], span) && !it::has_by_next(&self.tys, a[i])),
+            // `I: DoubleEndedIterator + ExactSizeIterator`; not over a user
+            // iterator, whose `len` core trusts (as for `Zip`).
+            K::Enumerate | K::Skip => self.double_ended(a[0], span) && self.exact_size(a[0], span) && !it::has_by_next(&self.tys, a[0]),
             // These need ExactSizeIterator too: lust keeps them forward-only for now.
-            K::Enumerate | K::Take | K::Skip | K::StepBy => false,
+            K::Take | K::StepBy => false,
             K::TakeWhile | K::SkipWhile | K::MapWhile => false,
             K::RecvIter | K::RecvTryIter | K::RecvIntoIter | K::Utf8Chunks | K::Utf8Chunk => false,
             // hashbrown's iterators are forward-only.

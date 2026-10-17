@@ -10381,6 +10381,16 @@ fn glue_def_value(
                 let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{call}}}\n");
                 return;
             }
+            // A written `impl Default for &'static A` (check
+            // `collect::ref_default`).
+            if let CTy::Ref(inner) = t
+                && let CTy::Adt(a) = &**inner
+                && let Some(&f) = p.gx.ref_default_methods.get(a)
+            {
+                let call = written_glue_call(p, slots, f, "", types);
+                let _ = writeln!(defs, "{ct} default_{m}(void) {{\n{call}}}\n");
+                return;
+            }
             let def_of = |t: &CTy, need: &mut dyn FnMut(Glue, &CTy)| -> String {
                 match t {
                     CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(p, t),

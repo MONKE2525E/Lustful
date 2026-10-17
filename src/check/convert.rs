@@ -60,6 +60,8 @@ pub enum FromConv {
     Own(crate::check::own::Owner),
     /// String from `Box<str>`: its buffer.
     StringFromBoxStr,
+    /// An integer from its `NonZero` (core's `From<NonZero<T>> for T`).
+    NonZeroGet,
     /// `Rc<T>` or `Arc<T>` from `Box<T>` for a sized or `dyn` `T`
     /// (alloc's `impl<T: ?Sized> From<Box<T>>`; `str` and `[T]` are
     /// `Own`): the value moves into a new counted allocation, the
@@ -141,6 +143,9 @@ pub fn std_from(p: &Program, tys: &impl TyIntern, dst: Ty, src: Ty) -> Option<Fr
     }
     if tys.option_elem(dst) == Some(src) {
         return Some(F::Some);
+    }
+    if matches!(tys.kind(dst), TyKind::Int(_)) && crate::check::generics::nonzero_elem(tys, src) == Some(dst) {
+        return Some(F::NonZeroGet);
     }
     if tys.boxed_elem(dst) == Some(src) {
         return Some(F::BoxNew);

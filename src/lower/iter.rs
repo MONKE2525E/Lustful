@@ -1617,6 +1617,7 @@ impl Ex<'_, '_> {
                 one(self, Builtin::OwnFrom(k), Operand::Move(Place::local(b)), dest);
             }
             F::StringFromBoxStr => one(self, Builtin::OwnIntoString, x, dest),
+            F::NonZeroGet => one(self, Builtin::NonZeroGet, x, dest),
             F::Some => self.some(&dest, dst, x),
             F::BoxNew => one(self, Builtin::BoxNew, x, dest),
             F::RcNew => one(self, Builtin::RcNew, x, dest),
@@ -2773,10 +2774,30 @@ impl Ex<'_, '_> {
                     self.goto(join);
                 }
             }
+            // `next_back` (`I: DoubleEndedIterator + ExactSizeIterator`):
+            // the inner's back item at index `count + inner.len()`, the
+            // length read after the pull, as core does.
+            K::Enumerate if back => {
+                let inner_item = self.item(a[0])?;
+                let iopt = self.body.tys.mk_option(inner_item);
+                let t = self.local(iopt);
+                self.next(f(0), a[0], Place::local(t), true)?;
+                let (s, n) = self.switch_opt(&Place::local(t));
+                self.cur = s;
+                let (len, _) = self.hint(f(0), a[0])?;
+                let i = self.local(USIZE);
+                self.assign(Place::local(i), Rvalue::Bin(Add, Operand::Copy(f(1)), Operand::Copy(Place::local(len))));
+                let px = self.take(Self::payload(&Place::local(t)), inner_item);
+                let tup = self.local(item);
+                self.assign(Place::local(tup), Rvalue::TupleAgg(item, vec![Operand::Copy(Place::local(i)), px]));
+                let at = self.take(Place::local(tup), item);
+                self.some(&dest, opt, at);
+                self.goto(join);
+                self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
             K::Enumerate => {
-                if back {
-                    return Err("iterator expansion: Enumerate is forward-only here".into());
-                }
                 let inner_item = self.item(a[0])?;
                 let iopt = self.body.tys.mk_option(inner_item);
                 let t = self.local(iopt);
@@ -2824,10 +2845,21 @@ impl Ex<'_, '_> {
                 self.none(&dest, opt);
                 self.goto(join);
             }
+            // `next_back` (`I: DoubleEndedIterator + ExactSizeIterator`):
+            // the inner's back item while `len() > 0`, with `len` the
+            // inner's minus the items still to skip (saturating).
+            K::Skip if back => {
+                let (len, _) = self.hint(itp.clone(), ty)?;
+                let c = self.cmp(Lt, Self::usize_c(0), Operand::Copy(Place::local(len)));
+                let (s, n) = self.branch(c);
+                self.cur = s;
+                self.next(f(0), a[0], dest.clone(), true)?;
+                self.goto(join);
+                self.cur = n;
+                self.none(&dest, opt);
+                self.goto(join);
+            }
             K::Skip => {
-                if back {
-                    return Err("iterator expansion: Skip is forward-only here".into());
-                }
                 let c = self.cmp(Lt, Self::usize_c(0), Operand::Copy(f(1)));
                 let (s, n) = self.branch(c);
                 // Each inner op has one expansion, so the code grows

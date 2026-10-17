@@ -1495,6 +1495,11 @@ pub(super) fn finish_deferred_methods(cx: &mut Ctx) {
             let conv = targs.get(1).copied().and_then(|target| {
                 let target = cx.deep(target);
                 let core = cx.deep(targs[0]);
+                // A std `From` record (`usize::from(nonzero)`): the
+                // conversion builtin, as `.into()` lowers it.
+                if d.tr.def == p.gx.lang.from && crate::check::convert::std_from(p, &cx.tys, core, target).is_some() {
+                    return Some(Builtin::ConvInto);
+                }
                 cx.conv_call_builtin(d.tr.def, core, target)
             });
             if let Some(b) = conv {
