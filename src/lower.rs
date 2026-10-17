@@ -5563,8 +5563,13 @@ impl<'p> Lower<'p> {
         self.scopes.push(Vec::new());
         let item_ty = self.for_item_ty(for_e, pat, iter);
         let (head, bodyb, exit) = (self.new_block(), self.new_block(), self.new_block());
-        // `next` computes the loop variable into this local at the top of each iteration.
-        let item = self.temp(item_ty);
+        // `next` computes the loop variable into this local at the top of
+        // each iteration. It joins the iteration's scope (below), so what
+        // the pattern leaves in it (all of it for `_`) drops at the end of
+        // each iteration, after the pattern's bindings, as rustc's
+        // `match next(&mut it) { Some(pat) => body }` drops its scrutinee:
+        // before the next `next` call, never after it.
+        let item = self.new_local(item_ty, true, None);
         if let Res::ForTrait { into_iter, next } = self.ck.res(for_e) {
             // `for x in it`: into_iter() then next() until None,
             // the Chars arm's shape with user methods. A builtin
@@ -5857,7 +5862,7 @@ impl<'p> Lower<'p> {
                 span,
             );
         }
-        self.scopes.push(Vec::new());
+        self.scopes.push(vec![item]);
         self.bind_pat(pat, Place::local(item));
         self.loops.push(LoopInfo {
             break_bb: exit,
