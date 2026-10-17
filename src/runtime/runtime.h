@@ -14,6 +14,7 @@
 void free(void *);
 void abort(void);
 void *memset(void *, int, size_t);
+void *memcpy(void *, const void *, size_t);
 #define LUST_BODY(...) ;
 #endif
 
