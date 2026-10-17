@@ -541,8 +541,27 @@ struct GuardJobs {
     rx: Receiver<GuardDone>,
     next_seq: u64,
     pending: usize,
-    /// The checks in flight, for `cancel_stale`.
+    /// The checks in flight, for `cancel_stale`. At most one runs at a time:
+    /// each is a cold compile, and on a large crate (ts_goport) a reject every
+    /// few seconds stacked four to six of them next to the warm session
+    /// until the kernel killed the daemon for memory.
     running: Vec<RunningGuard>,
+    /// Started checks that wait for the running one, oldest first. One whose
+    /// inputs change while it waits ends as `cancelled` and never runs.
+    queued: std::collections::VecDeque<QueuedGuard>,
+}
+
+/// A started check that has not begun its compile yet (`GuardJobs::spawn`).
+struct QueuedGuard {
+    seq: u64,
+    req: Request,
+    warm: Response,
+    inputs: Vec<PathBuf>,
+    /// `inputs` plus the request's root and crate files: what `cancel_stale` watches.
+    watch: Vec<PathBuf>,
+    start: std::time::SystemTime,
+    dir: PathBuf,
+    served: u64,
 }
 
 /// One check in flight: the warm inputs it compares under, the warm
@@ -564,18 +583,39 @@ const GUARD_NICE: i32 = 10;
 impl GuardJobs {
     fn new() -> GuardJobs {
         let (tx, rx) = std::sync::mpsc::channel();
-        GuardJobs { tx, rx, next_seq: 0, pending: 0, running: Vec::new() }
+        GuardJobs { tx, rx, next_seq: 0, pending: 0, running: Vec::new(), queued: std::collections::VecDeque::new() }
     }
 
     /// Cancels every check in flight whose inputs changed since its warm
     /// compile started (the test the check itself applies when it ends:
     /// its answer could only be stale). The serve loop calls it as a
-    /// request comes in. A check on unchanged inputs runs to its end.
+    /// request comes in. A check on unchanged inputs runs to its end. A
+    /// queued check whose inputs changed ends here, without a compile.
     fn cancel_stale(&mut self) {
         for g in self.running.iter_mut().filter(|g| g.why.is_none()) {
             if let Some(path) = changed_input(&g.inputs, g.start) {
                 g.cancel.store(true, Ordering::Relaxed);
                 g.why = Some(path);
+            }
+        }
+        let pending = &mut self.pending;
+        self.queued.retain(|q| match changed_input(&q.watch, q.start) {
+            Some(path) => {
+                *pending -= 1;
+                let _ = std::fs::remove_dir_all(&q.dir);
+                eprintln!("guard-check: done {} cancelled for {} ({} changed while queued)", q.seq, q.req.session.krate.root.display(), path.display());
+                false
+            }
+            None => true,
+        });
+    }
+
+    /// Starts the oldest queued check whose inputs still stand, when none runs.
+    fn start_next(&mut self) {
+        if self.running.is_empty() {
+            self.cancel_stale();
+            if let Some(q) = self.queued.pop_front() {
+                self.launch(q);
             }
         }
     }
@@ -586,17 +626,30 @@ impl GuardJobs {
     /// session's own inputs and compares only when none of them changed
     /// since `start` (`changed_input`), so an edit anywhere in the crate
     /// during either compile reads as stale, never as a guard mismatch.
+    /// While another check runs, this one waits in `queued` (its start
+    /// line is logged now, so log readers count it as pending).
     fn spawn(&mut self, req: Request, warm: Response, inputs: Vec<PathBuf>, start: std::time::SystemTime, dir: PathBuf, served: u64) {
         self.next_seq += 1;
         let seq = self.next_seq;
         self.pending += 1;
         eprintln!("guard-check: start {seq} for {}", req.file.display());
-        let tx = self.tx.clone();
-        let key = req.session.clone();
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let mut watch = inputs.clone();
         watch.push(req.file.clone());
         watch.extend(crate_inputs(&req));
+        let q = QueuedGuard { seq, req, warm, inputs, watch, start, dir, served };
+        if self.running.is_empty() && self.queued.is_empty() {
+            self.launch(q);
+        } else {
+            self.queued.push_back(q);
+        }
+    }
+
+    /// Runs one check on its own thread (see `spawn`).
+    fn launch(&mut self, q: QueuedGuard) {
+        let QueuedGuard { seq, req, warm, inputs, watch, start, dir, served } = q;
+        let tx = self.tx.clone();
+        let key = req.session.clone();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         self.running.push(RunningGuard { seq, inputs: watch, start, cancel: cancel.clone(), why: None });
         // The guard compiles like the serve loop, so it gets the
         // compiler stack size (see `pool::STACK_SIZE`).
@@ -655,6 +708,7 @@ impl GuardJobs {
             }
             apply_guard(sessions, done);
         }
+        self.start_next();
     }
 }
 
@@ -1241,6 +1295,57 @@ mod tests {
         std::fs::write(&root, &text).unwrap();
         let done = guard_once(&req, warm, vec![root.clone()], start, base.join("f4"));
         assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == root), "a reverted root reads as stale");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One check runs at a time: a second one waits until the first is
+    /// applied, then runs; a queued check whose inputs change ends as
+    /// `cancelled` without a compile.
+    #[test]
+    fn guard_runs_one_check_at_a_time() {
+        let base = std::env::temp_dir().join(format!("lust-guard-queue-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("main.rs");
+        let store = base.join("store.rs");
+        std::fs::write(&root, "mod store;\nfn main() {\n    store::put(1);\n}\n").unwrap();
+        std::fs::write(&store, "pub fn put(x: u8) -> u8 {\n    x + true\n}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let req = check_req(&root);
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let entry = entry_for(&mut sessions, &base.join("s"), &req.session, None, &mut 0);
+        let start = std::time::SystemTime::now();
+        let warm = driver::compile(&req, &mut entry.session);
+        let inputs = session_inputs(&entry.session, &req);
+        let mut jobs = GuardJobs::new();
+        let recv = |jobs: &GuardJobs| jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends");
+
+        // The second check waits for the first, then runs and matches.
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f1"), 1);
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f2"), 2);
+        assert_eq!((jobs.running.len(), jobs.queued.len(), jobs.pending), (1, 1, 2));
+        let done = recv(&jobs);
+        assert_eq!(done.seq, 1);
+        jobs.tx.send(done).unwrap();
+        jobs.drain(&mut sessions);
+        assert_eq!((jobs.running.len(), jobs.queued.len()), (1, 0), "the queued check starts once the first is applied");
+        let done = recv(&jobs);
+        assert!(done.seq == 2 && matches!(&done.outcome, GuardOutcome::Fresh(f) if f.stderr == warm.stderr));
+        jobs.tx.send(done).unwrap();
+        jobs.drain(&mut sessions);
+        assert_eq!(jobs.pending, 0);
+
+        // A queued check whose module file changed never compiles.
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f3"), 3);
+        jobs.spawn(req.clone(), warm.clone(), inputs, start, base.join("f4"), 4);
+        write_later(&store, "pub fn put(x: u8) -> u8 {\n    x + 1\n}\n");
+        jobs.cancel_stale();
+        assert!(jobs.queued.is_empty() && jobs.pending == 1, "the queued check ended as cancelled");
+        let done = recv(&jobs);
+        jobs.tx.send(done).unwrap();
+        jobs.drain(&mut sessions);
+        assert!(jobs.running.is_empty() && jobs.pending == 0);
+        assert!(!sessions.get(&req.session).unwrap().recompute_next);
         let _ = std::fs::remove_dir_all(&base);
     }
 
