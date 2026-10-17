@@ -918,27 +918,32 @@ pub fn cache_len() -> usize {
 /// it are then the imported macro), a cfg attribute, or a
 /// `recursion_limit` the expander reads. A macro-free file pays one
 /// token scan and runs the unchanged pipeline.
-/// Facts about the crate names `std`, `core` and `alloc` in one file's
-/// tokens, for qualified builtin calls (`builtin_call_path`): whether
-/// the file binds one of them to something else (`mod std`, `use x as
-/// core`, `struct alloc`, `use a::std;`), and whether the file is the
-/// crate root with a top-level `extern crate alloc;` that no attribute
-/// can cfg out, the one way `alloc::` enters the extern prelude.
-fn std_name_facts(tokens: &[Token], interner: &Interner, root: bool) -> (bool, bool) {
+/// Facts about crate names in one file's tokens, for macro call paths
+/// (`builtin_call_path`, `lookup_macro`): the names among `std`, `core`,
+/// `alloc` and the dependencies that the file binds to something else
+/// (`mod std`, `use x as core`, `struct alloc`, `use a::util;`), and
+/// whether the file is the crate root with a top-level `extern crate
+/// alloc;` that no attribute can cfg out, the one way `alloc::` enters
+/// the extern prelude.
+fn crate_name_facts(tokens: &[Token], ctx: &ExpandCtx, root: bool) -> (Vec<Sym>, bool) {
+    let interner = ctx.interner;
     let union = interner.intern("union");
-    let mut shadowed = false;
+    let mut shadowed = Vec::new();
     let mut alloc_extern = false;
     let mut depth = 0u32;
     for (i, t) in tokens.iter().enumerate() {
         match t.tok {
             Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
             Tok::RBrace | Tok::RParen | Tok::RBracket => depth = depth.saturating_sub(1),
-            Tok::Ident(s) if matches!(interner.get(s), "std" | "core" | "alloc") => {
+            Tok::Ident(s) if matches!(interner.get(s), "std" | "core" | "alloc") || ctx.extern_crates.contains(&s) => {
                 let prev = i.checked_sub(1).map(|j| tokens[j].tok);
                 let next = tokens.get(i + 1).map(|n| n.tok);
-                shadowed |= matches!(prev, Some(Tok::Mod | Tok::As | Tok::Struct | Tok::Enum | Tok::Trait | Tok::Type))
+                let binds = matches!(prev, Some(Tok::Mod | Tok::As | Tok::Struct | Tok::Enum | Tok::Trait | Tok::Type))
                     || prev == Some(Tok::Ident(union))
                     || (prev == Some(Tok::PathSep) && matches!(next, Some(Tok::Semi | Tok::Comma | Tok::RBrace)) && in_use_tree(tokens, i));
+                if binds && !shadowed.contains(&s) {
+                    shadowed.push(s);
+                }
                 alloc_extern |= root
                     && depth == 0
                     && interner.get(s) == "alloc"
@@ -1138,11 +1143,12 @@ pub struct Expander<'a> {
     /// so `assert_msg` can tell a macro body in this file from one in
     /// another file.
     root_file: Option<crate::diag::FileId>,
-    /// This file binds `std`, `core` or `alloc` to something other than
-    /// the crate (`std_name_facts`): qualified builtin calls refuse.
-    std_shadowed: bool,
+    /// The crate names (`std`, `core`, `alloc`, and `ctx.extern_crates`)
+    /// this file binds to something other than the crate
+    /// (`crate_name_facts`): paths through them refuse.
+    shadowed_crates: Vec<Sym>,
     /// This is the crate root and it has a plain `extern crate alloc;`,
-    /// so `alloc::vec!` resolves (`std_name_facts`).
+    /// so `alloc::vec!` resolves (`crate_name_facts`).
     alloc_extern: bool,
     /// Hash of files and env vars read by builtins during this run
     /// (it feeds cache keys, ARCH 6.5).
@@ -1275,7 +1281,7 @@ impl<'a> Expander<'a> {
             cur_real: ctx.real_path.clone(),
             cur_src: ctx.src.to_string(),
             root_file: None,
-            std_shadowed: false,
+            shadowed_crates: Vec::new(),
             alloc_extern: false,
             deps_hash: 0,
             deps: Vec::new(),
@@ -1597,7 +1603,7 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(
     let mut st = Expander::new(ctx, lexed.strings);
     st.root_file = lexed.tokens.first().map(|t| t.span.file);
     st.own_file = Some(eof.span.file);
-    (st.std_shadowed, st.alloc_extern) = std_name_facts(&lexed.tokens, ctx.interner, ctx.module_path.is_empty());
+    (st.shadowed_crates, st.alloc_extern) = crate_name_facts(&lexed.tokens, ctx, ctx.module_path.is_empty());
     for seed in seeds {
         st.seed_macro(seed)?;
     }
@@ -2435,7 +2441,7 @@ impl<'a> Expander<'a> {
             return !leading_colon;
         }
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
-        if self.std_shadowed || (texts[0] == "alloc" && !self.alloc_extern) {
+        if self.shadowed_crates.contains(&segs[0].sym) || (texts[0] == "alloc" && !self.alloc_extern) {
             return false;
         }
         builtin::std_macro_path(&texts)
@@ -2456,7 +2462,15 @@ impl<'a> Expander<'a> {
         }
         let last = segs[segs.len() - 1].sym;
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        // Dependency macros sit in the path tables under the crate name,
+        // as if it were a root module. In rustc `crate::util` (also
+        // through `self` and `super`) reaches a dependency only by an
+        // import lust does not track, so it finds nothing here.
         let by_module = |module: &[Sym]| -> Option<u32> {
+            let from_crate = !leading_colon && matches!(texts[0], "crate" | "self" | "super");
+            if from_crate && module.first().is_some_and(|c| self.ctx.extern_crates.contains(c)) {
+                return None;
+            }
             let key = (module.to_vec(), last);
             let visible = self.by_path_vis.get(&key).is_none_or(|v| self.module.starts_with(v));
             if visible { self.by_path.get(&key).copied() } else { None }
@@ -2505,6 +2519,11 @@ impl<'a> Expander<'a> {
                 // bind name an extern crate (rustc 2018+): a dependency,
                 // never a module of this crate. `::m!` names no macro.
                 let extern_crate = middle.first().is_some_and(|c| self.ctx.extern_crates.contains(c));
+                // A file that binds the name to something else (`mod util`)
+                // shares the table key with the dependency: refuse.
+                if extern_crate && self.shadowed_crates.contains(&middle[0]) {
+                    return None;
+                }
                 if leading_colon {
                     return if extern_crate { by_module(&middle) } else { None };
                 }
