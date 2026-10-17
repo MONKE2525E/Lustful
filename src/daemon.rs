@@ -30,8 +30,10 @@
 //   - The fresh-session guard: when the incremental answer is an error, the client gets
 //     that answer at once and the request is redone in a fresh session in the background.
 //     If the answers differ, the event is logged loudly (lines starting with "guard:"),
-//     the fresh session replaces the warm one, and the next answer for that crate is
-//     recomputed in another new session. If they match, the warm session (and its caches)
+//     the warm session is dropped, and the next answer for that crate is recomputed in a
+//     new session. The fresh compile is a one-shot one (a non-persistent session, as a
+//     cold `lust check`): a second persistent session of a large crate doubled the
+//     daemon's memory (ts_goport: 14 GB warm, the box's 32 GB OOM-killed the daemon). If they match, the warm session (and its caches)
 //     is kept. Success answers are trusted as they are. Background results are compared
 //     only when no input of either compile changed from the warm compile's start to the
 //     end of the fresh one (`session_inputs`, `crate_inputs`, `changed_input`: every source file, expansion
@@ -436,8 +438,7 @@ fn replace_session(entry: &mut Entry, key: &SessionKey) {
 
 /// What one background fresh-session check found.
 enum GuardOutcome {
-    /// A fresh compile of the same inputs; its session travels along
-    /// for adoption on a mismatch.
+    /// A fresh compile of the same inputs.
     Fresh(Response),
     /// The fresh compile panicked.
     Panicked,
@@ -525,9 +526,8 @@ struct GuardDone {
     served: u64,
     /// The answer the client already got.
     warm: Response,
-    /// The fresh session's object dir (removed unless the session is adopted).
+    /// The fresh session's object dir (always removed).
     dir: PathBuf,
-    session: Option<Session>,
     outcome: GuardOutcome,
 }
 
@@ -611,10 +611,13 @@ impl GuardJobs {
             crate::pool::set_background(Some(cancel.clone()));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 guard_hold();
-                let mut fresh = Session::new(work_dir, true, req.session.clone());
+                // Non-persistent, as a cold one-shot compile: no read sets,
+                // patch base, or kept program, so it needs a fraction of the
+                // warm session's memory, and it frees its program at the end.
+                let mut fresh = Session::new(work_dir, false, req.session.clone());
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile_background(&req, &mut fresh))) {
                     // A cancelled check never compares, whatever its compile gave.
-                    _ if cancel.load(Ordering::Relaxed) => (GuardOutcome::Cancelled(PathBuf::new()), None),
+                    _ if cancel.load(Ordering::Relaxed) => GuardOutcome::Cancelled(PathBuf::new()),
                     Ok(resp) => {
                         guard_hold();
                         // req.file even when it did not parse (then no
@@ -626,17 +629,17 @@ impl GuardJobs {
                         all.sort();
                         all.dedup();
                         match changed_input(&all, start) {
-                            None => (GuardOutcome::Fresh(resp), Some(fresh)),
-                            Some(path) => (GuardOutcome::Stale(path), None),
+                            None => GuardOutcome::Fresh(resp),
+                            Some(path) => GuardOutcome::Stale(path),
                         }
                     }
-                    Err(_) => (GuardOutcome::Panicked, None),
+                    Err(_) => GuardOutcome::Panicked,
                 }
             }));
             // A panic anywhere in the worker still produces a done record, so
             // `pending` and the log's start/done counts always settle.
-            let (outcome, session) = result.unwrap_or((GuardOutcome::Panicked, None));
-            let _ = tx.send(GuardDone { seq, key, served, warm, dir, session, outcome });
+            let outcome = result.unwrap_or(GuardOutcome::Panicked);
+            let _ = tx.send(GuardDone { seq, key, served, warm, dir, outcome });
         });
     }
 
@@ -661,10 +664,10 @@ fn first_line(s: &str) -> String {
 }
 
 /// Applies one finished background check to the session map. On a real
-/// mismatch the fresh session is adopted and the next answer for the key is
-/// marked recomputed; a result from before the last such replacement is
+/// mismatch the warm session is replaced by a new empty one and the next
+/// answer for the key is marked recomputed; a result from before the last such replacement is
 /// dropped (its bug is already reported, its session already replaced).
-fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
+fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, done: GuardDone) {
     let file = done.key.krate.root.display().to_string();
     let seq = done.seq;
     match done.outcome {
@@ -690,31 +693,28 @@ fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
         }
         GuardOutcome::Fresh(ref fresh) => {
             let same = fresh.code == done.warm.code && fresh.stdout == done.warm.stdout && fresh.stderr == done.warm.stderr;
+            // Nothing links the fresh compile's base files: remove them.
+            let _ = std::fs::remove_dir_all(&done.dir);
             if same {
-                // The warm session was right; keep its caches. The fresh
-                // build failed the same way, so nothing links its base
-                // files: remove them.
-                let _ = std::fs::remove_dir_all(&done.dir);
+                // The warm session was right; keep its caches.
                 eprintln!("guard-check: done {seq} match for {file}");
                 return;
             }
             match sessions.get_mut(&done.key) {
                 Some(entry) if done.served > entry.replaced_gen => {
                     eprintln!(
-                        "guard: background fresh session disagreed for {file} (warm {}, fresh {}); adopting fresh, next answer recomputed; warm: {}; fresh: {}",
+                        "guard: background fresh session disagreed for {file} (warm {}, fresh {}); dropping the session, next answer recomputed; warm: {}; fresh: {}",
                         done.warm.code,
                         fresh.code,
                         first_line(&done.warm.stderr),
                         first_line(&fresh.stderr)
                     );
-                    let old = std::mem::replace(&mut entry.session, done.session.take().expect("a fresh outcome carries its session"));
-                    let _ = std::fs::remove_dir_all(old.obj_dir());
+                    replace_session(entry, &done.key);
                     entry.replaced_gen = done.served;
                     entry.recompute_next = true;
                     eprintln!("guard-check: done {seq} mismatch for {file}");
                 }
                 _ => {
-                    let _ = std::fs::remove_dir_all(&done.dir);
                     eprintln!("guard-check: done {seq} mismatch for {file} (already replaced by a newer check)");
                 }
             }
@@ -1090,7 +1090,6 @@ mod tests {
             key: key.clone(),
             served,
             warm,
-            session: Some(Session::new(dir.clone(), true, key.clone())),
             dir,
             outcome: GuardOutcome::Fresh(fresh),
         }
@@ -1101,7 +1100,7 @@ mod tests {
     /// next answer recomputed; an older result after that replacement is
     /// dropped; an equal answer keeps the warm session untouched.
     #[test]
-    fn guard_apply_adopts_mismatch_and_drops_stale_results() {
+    fn guard_apply_replaces_on_mismatch_and_drops_stale_results() {
         let base = std::env::temp_dir().join(format!("lust-guard-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let key = SessionKey::synthetic(Path::new("/tmp/g/main.rs"), false);
@@ -1110,26 +1109,26 @@ mod tests {
         entry.served = 5;
         let warm_dir = entry.session.obj_dir().to_path_buf();
 
-        // Mismatch at served=3: adopt the fresh session, mark recompute.
+        // Mismatch at served=3: a new session replaces the warm one, recompute marked.
         apply_guard(&mut sessions, done(&key, 1, 3, resp(1, "warm err\n"), resp(1, "fresh err\n"), base.join("f1")));
         let entry = sessions.get(&key).unwrap();
-        assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "fresh session adopted");
+        let new_dir = entry.session.obj_dir().to_path_buf();
+        assert_ne!(new_dir, warm_dir, "warm session replaced");
         assert!(entry.recompute_next, "next answer marked recomputed");
         assert_eq!(entry.replaced_gen, 3);
 
         // An older result (served=2) after the replacement changes nothing.
         apply_guard(&mut sessions, done(&key, 2, 2, resp(1, "warm err\n"), resp(0, ""), base.join("f2")));
         let entry = sessions.get(&key).unwrap();
-        assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "stale result dropped");
+        assert_eq!(entry.session.obj_dir(), new_dir.as_path(), "stale result dropped");
         assert_eq!(entry.replaced_gen, 3);
 
         // Equal answers keep the current session and clear nothing.
         let same = resp(1, "same err\n");
         apply_guard(&mut sessions, done(&key, 3, 5, same.clone(), same, base.join("f3")));
         let entry = sessions.get(&key).unwrap();
-        assert_eq!(entry.session.obj_dir(), base.join("f1").as_path(), "match keeps the session");
+        assert_eq!(entry.session.obj_dir(), new_dir.as_path(), "match keeps the session");
         assert!(entry.recompute_next, "the earlier recompute mark stands");
-        assert_ne!(entry.session.obj_dir(), warm_dir.as_path());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1193,9 +1192,9 @@ mod tests {
     /// unchanged while a module file is edited during the guard check.
     /// The check is stale, never a mismatch. Without the edit, the same
     /// check matches the warm answer, and a warm answer that differs from
-    /// the fresh one on the same inputs is still adopted as a mismatch.
+    /// the fresh one on the same inputs is still a mismatch.
     #[test]
-    fn guard_ignores_module_edits_and_adopts_real_mismatches() {
+    fn guard_ignores_module_edits_and_catches_real_mismatches() {
         let base = std::env::temp_dir().join(format!("lust-guard-mod-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -1224,8 +1223,8 @@ mod tests {
         sessions.get_mut(&req.session).unwrap().served = 1;
         apply_guard(&mut sessions, done);
         let entry = sessions.get(&req.session).unwrap();
-        assert!(entry.recompute_next, "a mismatch on the same inputs is adopted");
-        assert_eq!(entry.session.obj_dir(), base.join("f2").as_path());
+        assert!(entry.recompute_next, "a mismatch on the same inputs replaces the session");
+        assert!(!base.join("f2").exists(), "the fresh compile's dir is removed");
 
         // The module file is fixed after the warm answer (the root stays
         // byte for byte): the fresh answer differs, but the check is stale.
@@ -1248,7 +1247,7 @@ mod tests {
     /// A check whose inputs changed since its warm compile started is
     /// cancelled when the serve loop next looks (`cancel_stale`): it ends as
     /// `cancelled`, names the changed file, never compares and never
-    /// adopts. A check on unchanged inputs is not cancelled and matches.
+    /// replaces the session. A check on unchanged inputs is not cancelled and matches.
     /// Guard phases never take the pool, and cancelled work unwinds at
     /// its next phase.
     #[test]
@@ -1289,7 +1288,7 @@ mod tests {
         jobs.drain(&mut sessions);
         assert!(jobs.running.is_empty() && jobs.pending == 0);
         let entry = sessions.get(&req.session).unwrap();
-        assert!(!entry.recompute_next, "a cancelled check never adopts");
+        assert!(!entry.recompute_next, "a cancelled check never replaces the session");
 
         // Background phases unwind once cancelled, and stay off the pool.
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
