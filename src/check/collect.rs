@@ -1716,7 +1716,15 @@ fn static_refs_in(tys: &mut impl TyIntern, t: Ty) -> Ty {
 /// integer arithmetic is in the bound today; named consts join with the
 /// const evaluator (ARCH 2.13) in `ty::consteval`.
 pub fn eval_array_len(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId) -> Option<u128> {
-    u128::try_from(eval_const_int(ast, interner, known, e)?).ok()
+    eval_array_len_in(ast, interner, known, e, None)
+}
+
+/// `eval_array_len` where `Self::X` names an associated const of the
+/// type with flat name `self_name` (a non-generic `Self`, `Scope::self_name`).
+pub fn eval_array_len_in(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, self_name: Option<Sym>) -> Option<u128> {
+    let mut ev = ScalarEval::new(ast, interner, known);
+    ev.self_name = self_name;
+    u128::try_from(ev.int(e, None)?).ok()
 }
 
 /// The value expression of a named const found by scanning the
@@ -1942,24 +1950,7 @@ pub fn eval_const_int(ast: &Ast, interner: &Interner, known: &Known, e: ast::Exp
 /// const parameter's declared type): a literal or operation out
 /// of that type's range is None, as rustc rejects it.
 pub fn eval_const_int_exp(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, exp: Option<IntTy>) -> Option<i128> {
-    let mut ev = ScalarEval { ast, interner, known, slots: Vec::new(), steps: 0, fn_depth: 0, fixed: Vec::new() };
-    let mut env: SEnv = Vec::new();
-    let v = match ev.expr(&mut env, e, exp.map(SExp::Int), 0) {
-        SFlow::V(Some(v)) => v,
-        _ => return None,
-    };
-    match v {
-        SVal::Int(x, _) => match exp {
-            Some(it) => s_coerce_int(v, it).map(|c| match c {
-                SVal::Int(x, _) => x,
-                _ => unreachable!(),
-            }),
-            None => Some(x),
-        },
-        SVal::Bool(b) => Some(b as i128),
-        SVal::Char(c) => Some(c as i128),
-        _ => None,
-    }
+    ScalarEval::new(ast, interner, known).int(e, exp)
 }
 
 /// The written integer type of a discriminant expression, in the
@@ -2488,9 +2479,40 @@ struct ScalarEval<'x> {
     fn_depth: u32,
     /// The slots of the bindings without `mut` at depth 0.
     fixed: Vec<usize>,
+    /// The flat type name `Self` names in the expression being
+    /// evaluated: the caller's non-generic `Self` at the top, the
+    /// owning type inside an associated const's value, None inside a
+    /// free const or fn. `Self::X` with None is outside the subset.
+    self_name: Option<Sym>,
 }
 
 impl<'x> ScalarEval<'x> {
+    fn new(ast: &'x Ast, interner: &'x Interner, known: &'x Known) -> Self {
+        ScalarEval { ast, interner, known, slots: Vec::new(), steps: 0, fn_depth: 0, fixed: Vec::new(), self_name: None }
+    }
+
+    /// The integer value of `e` (a bool or char counts as its code),
+    /// with `exp` pinning its unpinned literals as `eval_const_int_exp`.
+    fn int(&mut self, e: ast::ExprId, exp: Option<IntTy>) -> Option<i128> {
+        let mut env: SEnv = Vec::new();
+        let v = match self.expr(&mut env, e, exp.map(SExp::Int), 0) {
+            SFlow::V(Some(v)) => v,
+            _ => return None,
+        };
+        match v {
+            SVal::Int(x, _) => match exp {
+                Some(it) => s_coerce_int(v, it).map(|c| match c {
+                    SVal::Int(x, _) => x,
+                    _ => unreachable!(),
+                }),
+                None => Some(x),
+            },
+            SVal::Bool(b) => Some(b as i128),
+            SVal::Char(c) => Some(c as i128),
+            _ => None,
+        }
+    }
+
     fn new_slot(&mut self, v: SVal) -> usize {
         self.slots.push(v);
         self.slots.len() - 1
@@ -2762,7 +2784,9 @@ impl<'x> ScalarEval<'x> {
             }
             let rexp = def.ret.and_then(|t| sexp_of_written(ast, self.interner, self.known, t));
             self.fn_depth += 1;
+            let outer_self = self.self_name.take();
             let flow = self.block(&mut fenv, body, rexp, depth + 1);
+            self.self_name = outer_self;
             self.fn_depth -= 1;
             let out = match flow {
                 SFlow::V(v) | SFlow::Return(v) => v?,
@@ -2798,15 +2822,17 @@ impl<'x> ScalarEval<'x> {
                 },
                 None => (named_const_expr(ast, &[name]), named_const_decl(ast, &[name])),
             };
-            let v = self.const_body(target?, decl, depth)?;
+            let v = self.const_body(target?, decl, None, depth)?;
             return Some(v);
         }
         if segs.len() == 2 {
+            // `Self::X` reads the const of the type `Self` names here.
+            let ty_name = if segs[0].name == self.known.self_type { self.self_name? } else { segs[0].name };
             if !segs[0].has_args()
-                && let Some(v) = named_const_expr(ast, &[segs[0].name, segs[1].name])
+                && let Some(v) = named_const_expr(ast, &[ty_name, segs[1].name])
             {
-                let decl = named_const_decl(ast, &[segs[0].name, segs[1].name]);
-                return self.const_body(v, decl, depth);
+                let decl = named_const_decl(ast, &[ty_name, segs[1].name]);
+                return self.const_body(v, decl, Some(ty_name), depth);
             }
             let it = self.known.int_ty(segs[0].name)?;
             let bits = it.bits();
@@ -3025,13 +3051,16 @@ impl<'x> ScalarEval<'x> {
 
     /// Evaluates a const item's initializer in a fresh env and
     /// pins the result to its declared type when that is scalar.
-    fn const_body(&mut self, body: ast::ExprId, decl: Option<ast::TyId>, depth: u32) -> Option<SVal> {
+    fn const_body(&mut self, body: ast::ExprId, decl: Option<ast::TyId>, owner: Option<Sym>, depth: u32) -> Option<SVal> {
         let dexp = decl.and_then(|t| sexp_of_written(self.ast, self.interner, self.known, t));
         let mut empty: SEnv = Vec::new();
         // A const item's initializer is borrow-checked as its own body
-        // (check/const_body.rs), like a const fn's.
+        // (check/const_body.rs), like a const fn's. `Self` in it is its
+        // owning type (`owner`), or nothing for a free const.
         self.fn_depth += 1;
+        let outer_self = std::mem::replace(&mut self.self_name, owner);
         let v = self.val(&mut empty, body, dexp, depth + 1);
+        self.self_name = outer_self;
         self.fn_depth -= 1;
         let v = v?;
         match dexp {
@@ -4426,6 +4455,15 @@ pub fn collect_reuse(
             let def = p.def_of_adt(id);
             let self_ty = p.tys.mk_adt(def, &args);
             p.gx.adt_scopes[id.0 as usize].self_ty.get_or_insert(self_ty);
+            // A field's const (`[u8; Self::N]`) may name `Self` only when
+            // the Adt has no parameters (rustc rejects a generic `Self`).
+            if args.is_empty() {
+                p.gx.adt_scopes[id.0 as usize].self_name = match &item.kind {
+                    ItemKind::Struct(st) => Some(st.name),
+                    ItemKind::Enum(e) => Some(e.name),
+                    _ => None,
+                };
+            }
         }
         // The Adt's scope with regions kept, for the fields' regioned types.
         let mut keep_scope = p.gx.adt_scopes[id.0 as usize].clone();
@@ -5022,6 +5060,15 @@ pub fn collect_reuse(
                 }
                 let self_pat = generics::normalize_global(&mut p, self_pat);
                 impl_scope.self_ty = Some(self_pat);
+                // `Self::X` in a const of an impl with no parameters
+                // names the self type's consts (a generic `Self` is
+                // rustc's anonymous const error).
+                if imp.generics.params.is_empty()
+                    && let TyExpr::Path(segs) = ast.ty(imp.self_ty)
+                    && let [seg, ..] = segs.as_slice()
+                {
+                    impl_scope.self_name = Some(seg.name);
+                }
                 impl_regions(&mut p, imp, impl_def, &mut impl_scope, &mut errs);
                 {
                     let mut required = {

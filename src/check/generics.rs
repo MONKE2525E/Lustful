@@ -1326,6 +1326,10 @@ pub struct Scope {
     /// body annotations that name them (`let a: [u8; N]`); a template
     /// reads `const_params` instead.
     pub const_values: Vec<(Sym, ConstId)>,
+    /// The flat type name `Self` means in a const path (`[u8; Self::N]`),
+    /// set only where `Self` has no generic parameter: rustc rejects a
+    /// generic `Self` in an anonymous const.
+    pub self_name: Option<Sym>,
     /// When set, `_` in a written type resolves to a marker
     /// inference variable (body annotations). The counter holds
     /// the next marker id, from `INFER_MARKER_BASE`. An atomic
@@ -2598,7 +2602,7 @@ pub(crate) fn resolve_const_arg(
                 return Ok(tys.intern_const(ConstKind::Param(i)));
             }
             // A named const item evaluates like the literal forms below.
-            match crate::check::collect::eval_array_len(ast, interner, known, e) {
+            match crate::check::collect::eval_array_len_in(ast, interner, known, e, scope.self_name) {
                 Some(v) => Ok(tys.intern_const(ConstKind::Int(v))),
                 None => {
                     Err(Diag::new("L0110", span, "const argument must be a literal or a const parameter", "Use a literal such as `3`."))
@@ -2607,7 +2611,7 @@ pub(crate) fn resolve_const_arg(
         }
         ast::Expr::Bool(b) => Ok(tys.intern_const(ConstKind::Bool(*b))),
         ast::Expr::Char(c) => Ok(tys.intern_const(ConstKind::Char(*c))),
-        _ => match crate::check::collect::eval_array_len(ast, interner, known, e) {
+        _ => match crate::check::collect::eval_array_len_in(ast, interner, known, e, scope.self_name) {
             Some(v) => Ok(tys.intern_const(ConstKind::Int(v))),
             None => Err(Diag::new("L0110", span, "const argument must be a constant integer", "Write a literal such as `3`.")),
         },

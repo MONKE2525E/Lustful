@@ -356,6 +356,15 @@ fn anon_sites(p: &Program, take: &dyn Fn(FnLoc, Span) -> bool, out: &mut Vec<Sit
         }
         let parent = match &item.kind {
             ItemKind::Impl(imp) if imp.generics.params.is_empty() => p.impl_parents.get(&(k as u32)).cloned().unwrap_or_default(),
+            // A field's const in an Adt with no parameters may name `Self`.
+            ItemKind::Struct(ast::StructDef { name, generics, .. }) | ItemKind::Enum(ast::EnumDef { name, generics, .. })
+                if generics.params.is_empty() =>
+            {
+                match p.type_names.get(name) {
+                    Some(&id) => ParentGen { scope: p.gx.adt_scopes[id.0 as usize].clone(), ..ParentGen::default() },
+                    None => ParentGen::default(),
+                }
+            }
             _ => ParentGen::default(),
         };
         push(roots, &parent, None);
