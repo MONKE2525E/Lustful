@@ -1298,6 +1298,10 @@ struct OwnedMacroSource {
     tokens: Vec<crate::lexer::Token>,
     strings: Vec<String>,
     magic: Sym,
+    /// For a crate's exports: the module path, from its root, of the
+    /// public binding (`prelude` for `pub mod prelude { pub use
+    /// crate::args; }`); empty at the root. Empty for own sources.
+    path: Vec<Sym>,
 }
 
 /// One crate of a workspace session, ready to resolve.
@@ -2508,6 +2512,67 @@ fn rename_macro_token(tokens: &mut [crate::lexer::Token], alias: Sym) {
     }
 }
 
+/// Where a binding a glob (or a module re-export) copies is visible:
+/// no further than either the `use` or the source binding.
+fn glob_vis(site_vis: &Option<Vec<Sym>>, src_vis: Option<Vec<Sym>>) -> Option<Vec<Sym>> {
+    match (site_vis, src_vis) {
+        (None, v) => v,
+        (Some(g), Some(v)) if v.len() > g.len() => Some(v),
+        (g, _) => g.clone(),
+    }
+}
+
+/// One binding a glob or module re-export at use site `si` copies into
+/// `key`, under the re-export fixpoint's writer rule (`MacroEnv::build`):
+/// a name another site owns stays, and a different macro from another
+/// glob makes it ambiguous. Returns true when a table changed.
+#[allow(clippy::too_many_arguments)]
+fn copy_bind(
+    si: usize,
+    key: (Vec<Sym>, Sym),
+    src: usize,
+    vis: Option<Vec<Sym>>,
+    from_ambiguous: bool,
+    writer: &mut FxMap<(Vec<Sym>, Sym), (usize, bool)>,
+    bindings: &mut FxMap<(Vec<Sym>, Sym), usize>,
+    bvis: &mut FxMap<(Vec<Sym>, Sym), Option<Vec<Sym>>>,
+    ambiguous: &mut FxMap<(Vec<Sym>, Sym), ()>,
+) -> bool {
+    let mut changed = false;
+    match writer.get(&key).copied() {
+        Some((w, other_glob)) if w != si => {
+            if other_glob && bindings.get(&key) != Some(&src) && ambiguous.insert(key, ()).is_none() {
+                changed = true;
+            }
+        }
+        _ => {
+            if bindings.get(&key) != Some(&src) {
+                writer.insert(key.clone(), (si, true));
+                bindings.insert(key.clone(), src);
+                changed = true;
+            }
+            if bvis.get(&key) != Some(&vis) {
+                bvis.insert(key.clone(), vis);
+                changed = true;
+            }
+            if from_ambiguous && ambiguous.insert(key, ()).is_none() {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Sorts binding keys by module path text, then name text, so seeds
+/// and exports come out in one order whatever the map's order.
+fn keys_sort(keys: &mut [&(Vec<Sym>, Sym)], interner: &Interner) {
+    keys.sort_by(|a, b| {
+        let pa: Vec<&str> = a.0.iter().map(|s| interner.get(*s)).collect();
+        let pb: Vec<&str> = b.0.iter().map(|s| interner.get(*s)).collect();
+        pa.cmp(&pb).then_with(|| interner.get(a.1).cmp(interner.get(b.1)))
+    });
+}
+
 /// The macro environment of one expansion round: every macro
 /// definition visible by path in this crate, as expander seeds. Seeds
 /// come from this crate's `#[macro_export]` definitions (crate root),
@@ -2594,6 +2659,7 @@ impl MacroEnv {
                         tokens: lexed.tokens[lo..hi].to_vec(),
                         strings: lexed.strings.clone(),
                         magic: job.magic,
+                        path: Vec::new(),
                     });
                 }
             };
@@ -2619,13 +2685,42 @@ impl MacroEnv {
             }
         }
         let mut dep_owned: FxMap<String, Vec<usize>> = FxMap::default();
+        // The module paths dependencies export macros under (and their
+        // prefixes): real modules a module re-export can name.
+        let mut dep_paths: FxMap<Vec<Sym>, ()> = FxMap::default();
         for (extern_name, sources) in dep_exports {
             let sym = interner.intern(extern_name);
             let mut idxs = Vec::new();
+            dep_paths.insert(vec![sym], ());
+            let first = owned.len();
             for src in sources {
-                bindings.insert((vec![sym], src.name), owned.len());
-                idxs.push(owned.len());
-                owned.push(src.clone());
+                let mut path = vec![sym];
+                path.extend_from_slice(&src.path);
+                for k in 2..=path.len() {
+                    dep_paths.insert(path[..k].to_vec(), ());
+                }
+                // One macro the dependency exports under several paths
+                // is one source here, so two globs that bring it are no
+                // conflict (rustc: the same item).
+                let same = |o: &OwnedMacroSource| {
+                    o.name == src.name
+                        && o.magic == src.magic
+                        && o.tokens.len() == src.tokens.len()
+                        && o.tokens.iter().zip(&src.tokens).all(|(a, b)| a.tok == b.tok && a.span == b.span)
+                };
+                let idx = match (first..owned.len()).find(|&j| same(&owned[j])) {
+                    Some(j) => j,
+                    None => {
+                        owned.push(src.clone());
+                        owned.len() - 1
+                    }
+                };
+                bindings.insert((path, src.name), idx);
+                // `#[macro_use] extern crate` and textual scope take
+                // only the root exports.
+                if src.path.is_empty() && !idxs.contains(&idx) {
+                    idxs.push(idx);
+                }
             }
             dep_owned.insert(extern_name.clone(), idxs);
         }
@@ -2773,6 +2868,31 @@ impl MacroEnv {
         let seen_from = |bvis: &FxMap<(Vec<Sym>, Sym), Option<Vec<Sym>>>, key: &(Vec<Sym>, Sym), from: &[Sym]| {
             bvis.get(key).is_none_or(|v| v.as_ref().is_none_or(|v| from.starts_with(v)))
         };
+        let module_at: FxMap<&[Sym], ModuleId> = tables
+            .modules
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.krate_root == job.root_module)
+            .map(|(i, m)| (m.path.as_slice(), ModuleId(i as u32)))
+            .collect();
+        // A module a module re-export copies macros from: one a
+        // dependency exports macros under (`dep::prelude`). Only those:
+        // every file's expander compiles every seed, and this crate's
+        // own module aliases (preludes re-exporting each other) would
+        // multiply the seeds. Copies land under alias paths, which are
+        // not dependency paths, so a copy is never copied again.
+        let real_module = |m: &[Sym]| dep_paths.contains_key(m);
+        // The dependency module a `use` path names (`dep::m`, or
+        // `crate::m` when `m` names a dependency at the root), if any.
+        let module_target = |segs: &[Sym]| -> Option<Vec<Sym>> {
+            if matches!(segs.first(), Some(f) if *f == crate_sym || *f == self_sym || *f == super_sym) {
+                return None;
+            }
+            real_module(segs).then(|| segs.to_vec())
+        };
+        // Names an explicit `use` binds in each module: they shadow a
+        // glob's module of the same name.
+        let explicit: FxMap<(Vec<Sym>, Sym), ()> = sites.iter().filter(|s| !s.glob).map(|s| ((s.module.clone(), s.alias), ())).collect();
         let mut rounds = 0usize;
         loop {
             let mut changed = false;
@@ -2787,47 +2907,65 @@ impl MacroEnv {
                 }
                 if site.glob {
                     let target = resolve_glob_module(&site.segs, site.leading, &site.module, &bindings);
-                    let names: Vec<(Sym, usize, Option<Vec<Sym>>)> = bindings
+                    // The glob's own names, and the macros of the
+                    // dependency submodules it brings (`pub use
+                    // dep::effect::*;` makes `effect::typeparser::m` reach
+                    // `dep::effect::typeparser::m`), unless a module or an
+                    // explicit `use` binds that submodule's name here (it
+                    // shadows the glob).
+                    let names: Vec<((Vec<Sym>, Sym), (Vec<Sym>, Sym), usize, Option<Vec<Sym>>)> = bindings
                         .iter()
-                        .filter(|((m, _), _)| *m == target)
+                        .filter(|((m, _), _)| {
+                            if *m == target {
+                                return true;
+                            }
+                            if m.len() <= target.len() || !m.starts_with(&target) || !real_module(m) {
+                                return false;
+                            }
+                            let first = m[target.len()];
+                            let mut child = site.module.clone();
+                            child.push(first);
+                            !module_at.contains_key(child.as_slice()) && !explicit.contains_key(&(site.module.clone(), first))
+                        })
                         .filter(|(k, _)| seen_from(&bvis, k, &site.module))
-                        .map(|(k, src)| (k.1, *src, bvis.get(k).cloned().flatten()))
+                        .map(|(k, src)| {
+                            let mut path = site.module.clone();
+                            path.extend_from_slice(&k.0[target.len()..]);
+                            ((path, k.1), k.clone(), *src, bvis.get(k).cloned().flatten())
+                        })
                         .collect();
-                    for (name, src, src_vis) in names {
-                        let key = (site.module.clone(), name);
-                        // The glob's binding reaches no further than
-                        // either the glob or the source binding.
-                        let vis = match (&site.vis, src_vis) {
-                            (None, v) => v,
-                            (Some(g), Some(v)) if v.len() > g.len() => Some(v),
-                            (g, _) => g.clone(),
-                        };
-                        let from_ambiguous = ambiguous.contains_key(&(target.clone(), name));
-                        match writer.get(&key).copied() {
-                            Some((w, other_glob)) if w != si => {
-                                // Another site owns the name. A different
-                                // macro from another glob is a conflict.
-                                if other_glob && bindings.get(&key) != Some(&src) && ambiguous.insert(key, ()).is_none() {
-                                    changed = true;
-                                }
-                            }
-                            _ => {
-                                if bindings.get(&key) != Some(&src) {
-                                    writer.insert(key.clone(), (si, true));
-                                    bindings.insert(key.clone(), src);
-                                    changed = true;
-                                }
-                                if bvis.get(&key) != Some(&vis) {
-                                    bvis.insert(key.clone(), vis);
-                                    changed = true;
-                                }
-                                if from_ambiguous && ambiguous.insert(key, ()).is_none() {
-                                    changed = true;
-                                }
-                            }
-                        }
+                    for (key, from_key, src, src_vis) in names {
+                        let from_ambiguous = ambiguous.contains_key(&from_key);
+                        changed |= copy_bind(si, key, src, glob_vis(&site.vis, src_vis), from_ambiguous, &mut writer, &mut bindings, &mut bvis, &mut ambiguous);
                     }
                     continue;
+                }
+                // A `use` of a module (`pub use dep::prelude;`) binds the
+                // macros under that module at the alias path too, as a
+                // glob would (an explicit use of a name still wins). A
+                // private one is skipped like a private glob: every file's
+                // `use crate::m;` would copy all of `m`'s macros.
+                if site.vis.as_deref() != Some(site.module.as_slice())
+                    && let Some(target) = module_target(&site.segs)
+                {
+                    let mut base = site.module.clone();
+                    base.push(site.alias);
+                    if !base.starts_with(&target) {
+                        let copies: Vec<((Vec<Sym>, Sym), (Vec<Sym>, Sym), usize, Option<Vec<Sym>>)> = bindings
+                            .iter()
+                            .filter(|((m, _), _)| m.starts_with(&target) && real_module(m))
+                            .filter(|(k, _)| seen_from(&bvis, k, &site.module))
+                            .map(|(k, src)| {
+                                let mut path = base.clone();
+                                path.extend_from_slice(&k.0[target.len()..]);
+                                ((path, k.1), k.clone(), *src, bvis.get(k).cloned().flatten())
+                            })
+                            .collect();
+                        for (key, from_key, src, src_vis) in copies {
+                            let from_ambiguous = ambiguous.contains_key(&from_key);
+                            changed |= copy_bind(si, key, src, glob_vis(&site.vis, src_vis), from_ambiguous, &mut writer, &mut bindings, &mut bvis, &mut ambiguous);
+                        }
+                    }
                 }
                 if let Some(src) = resolve_use(&site.segs, site.leading, &site.module, site_textual[si], &bindings, &bvis, &ambiguous) {
                     let key = (site.module.clone(), site.alias);
@@ -2860,13 +2998,6 @@ impl MacroEnv {
         // be visible from the caller (rustc E0603): the module path a
         // walk through `path` stays visible within is the narrowest
         // scope on it (they nest, so the longest).
-        let module_at: FxMap<&[Sym], ModuleId> = tables
-            .modules
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.krate_root == job.root_module)
-            .map(|(i, m)| (m.path.as_slice(), ModuleId(i as u32)))
-            .collect();
         let narrower = |a: Option<Vec<Sym>>, b: Option<Vec<Sym>>| match (a, b) {
             (Some(a), Some(b)) => Some(if a.len() >= b.len() { a } else { b }),
             (a, b) => a.or(b),
@@ -2891,11 +3022,7 @@ impl MacroEnv {
         };
         let mut seeds = Vec::with_capacity(bindings.len());
         let mut keys: Vec<&(Vec<Sym>, Sym)> = bindings.keys().collect();
-        keys.sort_by(|a, b| {
-            let pa: Vec<&str> = a.0.iter().map(|s| interner.get(*s)).collect();
-            let pb: Vec<&str> = b.0.iter().map(|s| interner.get(*s)).collect();
-            pa.cmp(&pb).then_with(|| interner.get(a.1).cmp(interner.get(b.1)))
-        });
+        keys_sort(&mut keys, interner);
         // An ambiguous name gets no path seed: a path to it finds
         // nothing, so it is a reject, never a pick of one glob.
         for key in keys.into_iter().filter(|k| !ambiguous.contains_key(*k)) {
@@ -2911,17 +3038,24 @@ impl MacroEnv {
                 visible_in: path_scope(&key.0, bvis.get(key).cloned().flatten()),
             });
         }
-        // Macros visible at this crate's root by path (its own
-        // `#[macro_export]` definitions plus root re-exports), under
-        // their binding names: what dependent crates receive.
+        // Macros visible by path from outside this crate (its own
+        // `#[macro_export]` definitions, root re-exports, and public
+        // re-exports in public modules: `dep::prelude::args`), under
+        // their binding names and module paths: what dependent crates
+        // receive. Only a binding public along its whole path does.
         let mut root_sources: Vec<OwnedMacroSource> = Vec::new();
-        // Only a public binding reaches another crate.
-        let mut root_keys: Vec<&(Vec<Sym>, Sym)> =
-            bindings.keys().filter(|k| k.0.is_empty() && !ambiguous.contains_key(*k) && bvis.get(*k).is_none_or(Option::is_none)).collect();
-        root_keys.sort_by(|a, b| interner.get(a.1).cmp(interner.get(b.1)));
+        let mut root_keys: Vec<&(Vec<Sym>, Sym)> = bindings
+            .keys()
+            .filter(|k| {
+                !ambiguous.contains_key(*k)
+                    && bvis.get(*k).is_none_or(Option::is_none)
+                    && (k.0.is_empty() || (module_at.contains_key(k.0.as_slice()) && path_scope(&k.0, None).is_none()))
+            })
+            .collect();
+        keys_sort(&mut root_keys, interner);
         for key in root_keys {
             let src = owned[bindings[key]].clone();
-            root_sources.push(OwnedMacroSource { name: key.1, ..src });
+            root_sources.push(OwnedMacroSource { name: key.1, path: key.0.clone(), ..src });
         }
         // Glob imports in each file bring the target module's
         // path-visible macros into plain-name scope in the importing
