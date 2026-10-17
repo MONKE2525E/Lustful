@@ -856,6 +856,7 @@ impl FileExpander {
             cfg: expand_cfg(&self.env),
             module_path: module_path.clone(),
             crate_name: Some(self.crate_name.clone()),
+            extern_crates: self.menv.extern_crates(interner),
             client,
         };
         let spliced = self.menv.splice(*di, lexed, self.magic);
@@ -2976,6 +2977,13 @@ impl MacroEnv {
         MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods, glob_seeds, scopes }
     }
 
+    /// The extern crate names a `::name::m!` path can start with here
+    /// (`ExpandCtx::extern_crates`): every dependency, and the magic
+    /// segment of every crate below this one.
+    fn extern_crates(&self, interner: &Interner) -> Vec<Sym> {
+        self.dep_owned.keys().map(|n| interner.intern(n)).collect()
+    }
+
     /// The macro sources dependent crates see at this crate's root:
     /// its `#[macro_export]` definitions plus any macro re-exported
     /// at the root by a public `use` (glob or single-name).
@@ -3203,6 +3211,7 @@ fn resolve_one(
                 cfg: expand_cfg(&input.env),
                 module_path: module_paths[di].clone(),
                 crate_name: Some(input.crate_name.clone()),
+                extern_crates: menv.extern_crates(interner),
                 client,
             };
             let spliced = menv.splice(di, orig, job.magic);

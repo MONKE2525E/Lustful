@@ -116,6 +116,62 @@ pub fn is_token_builtin(name: &str) -> bool {
     )
 }
 
+/// True when the written path of a qualified builtin call (`std::println`,
+/// `core::prelude::v1::assert`, `alloc::vec`, crate first, macro name
+/// last) names that macro in rustc 1.99. Measured against rustc for every
+/// name of `is_passthrough` and `is_token_builtin`: core's root and
+/// preludes hold the core macros; std's root and preludes add the
+/// std-only ones; `pin!` and `offset_of!` live only in `pin` and `mem`.
+/// Paths through private modules (`std::macros`) or other modules
+/// (`std::vec::vec`, `core::println`) are rustc E0433.
+pub fn std_macro_path(path: &[&str]) -> bool {
+    let core_macro = |n: &str| {
+        matches!(
+            n,
+            "panic"
+                | "assert"
+                | "assert_eq"
+                | "assert_ne"
+                | "debug_assert"
+                | "debug_assert_eq"
+                | "debug_assert_ne"
+                | "todo"
+                | "unreachable"
+                | "unimplemented"
+                | "format_args"
+                | "matches"
+                | "concat"
+                | "stringify"
+                | "cfg"
+                | "env"
+                | "option_env"
+                | "line"
+                | "column"
+                | "file"
+                | "module_path"
+                | "include"
+                | "include_str"
+                | "include_bytes"
+                | "compile_error"
+                | "write"
+                | "writeln"
+        )
+    };
+    let std_only = |n: &str| matches!(n, "println" | "print" | "eprintln" | "eprint" | "format" | "vec" | "dbg" | "thread_local");
+    let prelude = |p: &str| matches!(p, "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024");
+    let Some((&name, module)) = path.split_last() else { return false };
+    match module {
+        ["std"] => core_macro(name) || std_only(name),
+        ["std", "prelude", p] if prelude(p) => core_macro(name) || std_only(name),
+        ["core"] => core_macro(name),
+        ["core", "prelude", p] if prelude(p) => core_macro(name),
+        ["alloc"] => matches!(name, "vec" | "format"),
+        ["std" | "core", "pin"] => name == "pin",
+        ["std" | "core", "mem"] => name == "offset_of",
+        _ => false,
+    }
+}
+
 /// The cfg facts a `cfg!` or `#[cfg]` in this file sees. Lust builds for
 /// the host target with debug assertions on; a single file has no Cargo
 /// features. Unknown names are false, as in rustc with no `--cfg`.

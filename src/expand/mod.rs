@@ -651,6 +651,12 @@ pub struct ExpandCtx<'a> {
     /// single-file crate name); None falls back to the current file's
     /// stem, which is right only for a crate root file.
     pub crate_name: Option<String>,
+    /// The names this crate reaches as extern crates besides std, core
+    /// and alloc: its dependencies (and the `$crate` magic segments of
+    /// crates below it). A path call with a leading `::` (`::dep::m!`)
+    /// resolves only through one of these, as rustc reads `::name` as an
+    /// extern crate. Empty off the Cargo path.
+    pub extern_crates: Vec<Sym>,
     /// The requesting client's env and shown paths (`for_file` gives `ClientView::PROCESS`).
     pub client: &'a ClientView,
 }
@@ -707,6 +713,7 @@ impl<'a> ExpandCtx<'a> {
             cfg: builtin::CfgEnv { test, debug_assertions: true, facts: Vec::new(), panic_unwind: false },
             module_path: Vec::new(),
             crate_name: None,
+            extern_crates: Vec::new(),
             client: &ClientView::PROCESS,
         }
     }
@@ -911,6 +918,42 @@ pub fn cache_len() -> usize {
 /// it are then the imported macro), a cfg attribute, or a
 /// `recursion_limit` the expander reads. A macro-free file pays one
 /// token scan and runs the unchanged pipeline.
+/// Facts about the crate names `std`, `core` and `alloc` in one file's
+/// tokens, for qualified builtin calls (`builtin_call_path`): whether
+/// the file binds one of them to something else (`mod std`, `use x as
+/// core`, `struct alloc`, `use a::std;`), and whether the file is the
+/// crate root with a top-level `extern crate alloc;` that no attribute
+/// can cfg out, the one way `alloc::` enters the extern prelude.
+fn std_name_facts(tokens: &[Token], interner: &Interner, root: bool) -> (bool, bool) {
+    let union = interner.intern("union");
+    let mut shadowed = false;
+    let mut alloc_extern = false;
+    let mut depth = 0u32;
+    for (i, t) in tokens.iter().enumerate() {
+        match t.tok {
+            Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+            Tok::RBrace | Tok::RParen | Tok::RBracket => depth = depth.saturating_sub(1),
+            Tok::Ident(s) if matches!(interner.get(s), "std" | "core" | "alloc") => {
+                let prev = i.checked_sub(1).map(|j| tokens[j].tok);
+                let next = tokens.get(i + 1).map(|n| n.tok);
+                shadowed |= matches!(prev, Some(Tok::Mod | Tok::As | Tok::Struct | Tok::Enum | Tok::Trait | Tok::Type))
+                    || prev == Some(Tok::Ident(union))
+                    || (prev == Some(Tok::PathSep) && matches!(next, Some(Tok::Semi | Tok::Comma | Tok::RBrace)) && in_use_tree(tokens, i));
+                alloc_extern |= root
+                    && depth == 0
+                    && interner.get(s) == "alloc"
+                    && prev == Some(Tok::Crate)
+                    && next == Some(Tok::Semi)
+                    && i >= 2
+                    && tokens[i - 2].tok == Tok::Extern
+                    && (i < 3 || tokens[i - 3].tok != Tok::RBracket);
+            }
+            _ => {}
+        }
+    }
+    (shadowed, alloc_extern)
+}
+
 pub fn needs_expansion(tokens: &[Token], interner: &Interner) -> bool {
     let macro_rules = interner.intern("macro_rules");
     for (i, t) in tokens.iter().enumerate() {
@@ -1095,6 +1138,12 @@ pub struct Expander<'a> {
     /// so `assert_msg` can tell a macro body in this file from one in
     /// another file.
     root_file: Option<crate::diag::FileId>,
+    /// This file binds `std`, `core` or `alloc` to something other than
+    /// the crate (`std_name_facts`): qualified builtin calls refuse.
+    std_shadowed: bool,
+    /// This is the crate root and it has a plain `extern crate alloc;`,
+    /// so `alloc::vec!` resolves (`std_name_facts`).
+    alloc_extern: bool,
     /// Hash of files and env vars read by builtins during this run
     /// (it feeds cache keys, ARCH 6.5).
     deps_hash: u64,
@@ -1226,6 +1275,8 @@ impl<'a> Expander<'a> {
             cur_real: ctx.real_path.clone(),
             cur_src: ctx.src.to_string(),
             root_file: None,
+            std_shadowed: false,
+            alloc_extern: false,
             deps_hash: 0,
             deps: Vec::new(),
             recursion_limit: DEFAULT_RECURSION_LIMIT,
@@ -1546,6 +1597,7 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(
     let mut st = Expander::new(ctx, lexed.strings);
     st.root_file = lexed.tokens.first().map(|t| t.span.file);
     st.own_file = Some(eof.span.file);
+    (st.std_shadowed, st.alloc_extern) = std_name_facts(&lexed.tokens, ctx.interner, ctx.module_path.is_empty());
     for seed in seeds {
         st.seed_macro(seed)?;
     }
@@ -2372,6 +2424,23 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
+    /// True when a call path names a builtin macro as rustc 1.99 resolves
+    /// it: a plain name, or a std path `builtin::std_macro_path` lists,
+    /// with or without a leading `::`, whose crate segment really is that
+    /// crate here (no binding of the name in this file; `alloc` only
+    /// after the root's `extern crate alloc;`). `::println!` names an
+    /// extern crate `println` (E0433).
+    fn builtin_call_path(&self, segs: &[Seg], leading_colon: bool) -> bool {
+        if segs.len() == 1 {
+            return !leading_colon;
+        }
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        if self.std_shadowed || (texts[0] == "alloc" && !self.alloc_extern) {
+            return false;
+        }
+        builtin::std_macro_path(&texts)
+    }
+
     /// Resolves a macro call path to a definition index. This is the
     /// single macro lookup entry point: today it reads this single
     /// file's textual scope, imports, and path tables. S7's frozen
@@ -2423,23 +2492,27 @@ impl<'a> Expander<'a> {
             }
             "super" => {
                 let supers = texts.iter().take_while(|&&t| t == "super").count();
-                let keep = self.module.len().saturating_sub(supers);
-                let mut module: Vec<Sym> = self.module[..keep].to_vec();
+                // `super` past the crate root is rustc E0433.
+                if supers > self.module.len() {
+                    return None;
+                }
+                let mut module: Vec<Sym> = self.module[..self.module.len() - supers].to_vec();
                 module.extend_from_slice(&middle[supers.min(middle.len())..]);
                 by_module(&module)
             }
             _ => {
+                // `::name` and a first segment the current module does not
+                // bind name an extern crate (rustc 2018+): a dependency,
+                // never a module of this crate. `::m!` names no macro.
+                let extern_crate = middle.first().is_some_and(|c| self.ctx.extern_crates.contains(c));
                 if leading_colon {
-                    return if middle.is_empty() { self.exported.get(&last).copied() } else { by_module(&middle) };
+                    return if extern_crate { by_module(&middle) } else { None };
                 }
-                // Relative to the current module, then from the root, as
-                // a plain path resolves in one crate.
                 let mut module = self.module.clone();
                 module.extend_from_slice(&middle);
                 by_module(&module)
-                    .or_else(|| by_module(&middle))
                     .or_else(|| self.glob_path_lookup(segs))
-                    .or_else(|| if middle.is_empty() { self.exported.get(&last).copied() } else { None })
+                    .or_else(|| if extern_crate { by_module(&middle) } else { None })
             }
         }
     }
@@ -3725,7 +3798,7 @@ impl<'a> Expander<'a> {
             if let Some((segs, leading_colon, group_idx)) = path_call_at(&trees, i, self.ctx.interner)
                 && self.lookup_macro(&segs, leading_colon).is_none()
                 && !(segs.len() == 1 && !leading_colon && self.plain_call_ambiguous(&segs[0]))
-                && (segs.len() == 1 || matches!(segs.first().map(|s| s.text.as_str()), Some("std" | "core" | "alloc")))
+                && self.builtin_call_path(&segs, leading_colon)
                 && builtin::is_passthrough(segs.last().map_or("", |s| &s.text))
             {
                 let (delim, inner, group_span) = match &trees[group_idx] {
@@ -4520,8 +4593,7 @@ impl<'a> Expander<'a> {
             Some(canon) => self.ctx.interner.get(canon).to_string(),
             None => call.name_text().to_string(),
         };
-        let std_prefixed = matches!(call.segs.first().map(|s| s.text.as_str()), Some("std" | "core" | "alloc"));
-        if call.segs.len() == 1 || std_prefixed {
+        if self.builtin_call_path(&call.segs, call.leading_colon) {
             // A builtin counts depth as rustc's expansion of it does (see
             // `builtin::rustc_depth`): its arguments expand `args` levels
             // down, so a token builtin's own one-level-down expansions

@@ -1515,6 +1515,8 @@ fn expand_pure(
         cfg: crate::resolve::worklist::expand_cfg(env),
         module_path: base.tables.modules[module.0 as usize].path.clone(),
         crate_name: Some(crate_name.clone()),
+        // No dependency macro expands on this path (a user macro gives up).
+        extern_crates: Vec::new(),
         client: &front.client,
     };
     // Unknown cfg names reject before expansion, as in the resolver.
