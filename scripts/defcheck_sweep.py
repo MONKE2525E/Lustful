@@ -213,6 +213,76 @@ def build_cases():
          "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<T>(T);\nimpl Tag<&'static u8> for G<u8> {}\nimpl<'a, T> NeedT<&'a u8> for G<T> where G<u8>: Tag<&'static u8> {}\n" + MAINP)
     case("implsuper", "super_generic_self_exact",
          "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<T>(T);\nimpl<'a, T> NeedT<&'a u8> for G<T> where G<T>: Tag<&'a u8> {}\n" + MAINP)
+    # Round 2, family wc (tf-v07-bck's gen_wc matrix, p52): the
+    # supertrait goal's shape (same, pair, ref, vec) x the Tk impl
+    # (any T, T: 'static, only 'static shapes) x the impl's arg
+    # region x its where clause (none, goal shape, element shape
+    # at 'a or 'static, another trait, both). A clause proves the
+    # goal only at its own shape and regions.
+    wc_supers = {"same": "Tk<A>", "pair": "Tk<(A, A)>", "ref": "Tk<&'static A>", "vec": "Tk<Vec<A>>"}
+    wc_impls = {
+        "any": "impl<T> Tk<T> for S {}",
+        "static": "impl<T: 'static> Tk<T> for S {}",
+        "refstatic": "impl Tk<&'static u32> for S {}\nimpl Tk<(&'static u32, &'static u32)> for S {}\nimpl Tk<Vec<&'static u32>> for S {}\nimpl Tk<&'static &'static u32> for S {}",
+    }
+    wc_goals = {"same": "{x}", "pair": "({x}, {x})", "ref": "&'static {x}", "vec": "Vec<{x}>"}
+    for sk, sup in wc_supers.items():
+        for ik, timpl in wc_impls.items():
+            for ak, arg in (("a", "&'a u32"), ("static", "&'static u32")):
+                goal = wc_goals[sk].format(x=arg)
+                wheres = {
+                    "none": "",
+                    "goal": f"where S: Tk<{goal}>",
+                    "elem_a": "where S: Tk<&'a u32>",
+                    "elem_static": "where S: Tk<&'static u32>",
+                    "other_trait": "where S: Tk2",
+                    "both": f"where S: Tk<&'a u32>, S: Tk<{goal}>",
+                }
+                for wk, w in wheres.items():
+                    lt = "<'a> " if "'a" in arg or "'a" in w else ""
+                    src = ("#![allow(unused)]\nstruct S;\ntrait Tk2 {}\nimpl Tk2 for S {}\ntrait Tk<A> {}\n"
+                           f"trait Sup<A>: {sup} {{}}\n{timpl}\nimpl {lt}Sup<{arg}> for S {w} {{}}\n" + MAINP).replace("impl  ", "impl ").replace("impl <", "impl<")
+                    case("wc", f"wc_{sk}_{ik}_{ak}_{wk}", src)
+    # Round 2, family dupclause: clause count and lifetime mix
+    # against one supertrait goal on a generic Self. One clause
+    # proves it only at fact-equal regions; two clauses that read
+    # regions differently are ambiguous (rustc E0283) when one
+    # proves it; a 'static clause is not assembled against a
+    # lifetime goal, so an impl can still prove that shape.
+    dup_head = "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<X>(X);\n"
+    dup_impls = {"noimpl": "", "any": "impl<X, Y> Tag<Y> for G<X> {}\n", "staticbound": "impl<X, Y: 'static> Tag<Y> for G<X> {}\n"}
+    for gname, goal_r in (("ga", "'a"), ("gs", "'static")):
+        other_r = "'static" if goal_r == "'a" else "'a"
+        exact = f"G<X>: Tag<&{goal_r} u8>"
+        other = f"G<X>: Tag<&{other_r} u8>"
+        bcl = "G<X>: Tag<&'b u8>"
+        clause_sets = {
+            "exact": exact,
+            "other": other,
+            "b": bcl,
+            "b_eq": bcl + ", 'a: 'b, 'b: 'a",
+            "b_ab": bcl + ", 'a: 'b",
+            "b_ba": bcl + ", 'b: 'a",
+            "exact_other": exact + ", " + other,
+            "other_exact": other + ", " + exact,
+            "exact_exact": exact + ", " + exact,
+            "other_other": other + ", " + other,
+            "exact_b": exact + ", " + bcl,
+            "b_other": bcl + ", " + other,
+            "exact_b_eq": exact + ", " + bcl + ", 'a: 'b, 'b: 'a",
+            "exact_other_b": exact + ", " + other + ", " + bcl,
+            "exact_exact_other": exact + ", " + exact + ", " + other,
+        }
+        for cname, clauses in clause_sets.items():
+            impls = dup_impls.items() if cname in ("exact", "other", "b", "b_eq", "exact_other") else [("noimpl", ""), ("any", dup_impls["any"])]
+            for iname, timpl in impls:
+                src = dup_head + timpl + f"impl<'a, 'b, X> NeedT<&{goal_r} u8> for G<X> where {clauses} {{}}\n" + MAINP
+                case("dupclause", f"dup_{gname}_{cname}_{iname}", src)
+    # The proving clause can also arrive through a supertrait.
+    case("dupclause", "dup_via_mid_static",
+         "trait Tag<A> {}\ntrait Mid<A>: Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<X>(X);\nimpl<'a, X> NeedT<&'a u8> for G<X> where G<X>: Mid<&'a u8>, G<X>: Tag<&'static u8> {}\n" + MAINP)
+    case("dupclause", "dup_via_mid_exact_only",
+         "trait Tag<A> {}\ntrait Mid<A>: Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<X>(X);\nimpl<'a, X> NeedT<&'a u8> for G<X> where G<X>: Mid<&'a u8> {}\n" + MAINP)
     # Wrapped argument types: validity follows the innermost type.
     wrapped = [("good_opt", "Option<u8>"), ("bad_opt", "Option<String>"), ("good_tup", "(u8, u8)"),
                ("bad_tup", "(String, u8)"), ("good_arr", "[u8; 2]"), ("bad_arr", "[String; 2]")]

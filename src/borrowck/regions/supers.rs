@@ -12,8 +12,14 @@
 // declared facts and the implied bounds of its header. A bound that two
 // impls may match, a part lust does not look into (a type param of the
 // impl, a dyn, a projection) adds nothing. A trait where-clause of the
-// impl proves a bound only at the arguments it writes: `S: Tag<&'static
-// u8>` does not prove the `S: Tag<&'a u8>` a supertrait owes.
+// impl proves a bound only at the arguments it writes, and only when
+// the region equalities that takes follow from the impl's facts
+// (rustc's rule, over a probed matrix): `S: Tag<&'static u8>` does not
+// prove the `S: Tag<&'a u8>` a supertrait owes, a clause at another
+// shape (`Tk<&'a u32>` for a `Tk<(&'a u32, &'a u32)>` goal) proves
+// nothing, a clause that does not prove leaves the bound to the one
+// matching impl, and two clauses that could prove it at different
+// lifetimes make the proof ambiguous (rustc E0283).
 use super::*;
 use std::rc::Rc;
 
@@ -52,6 +58,21 @@ enum Fit {
     Maybe,
 }
 
+/// What the checked impl's own where-clauses say about one
+/// obligation (`Cx::clause_proof`).
+enum ClauseProof {
+    /// One clause proves it; these needs follow from the facts.
+    Proven(Vec<(Re, Re)>),
+    /// A proving clause and another candidate read regions
+    /// differently: the proof is ambiguous (rustc E0283).
+    Ambiguous,
+    /// A part this walk cannot read: nothing learned.
+    Unreadable,
+    /// No clause proves it. The needs of the first
+    /// shape-matching clause, for when no impl matches either.
+    NoProof(Vec<(Re, Re)>),
+}
+
 impl Fit {
     fn and(self, o: Fit) -> Fit {
         match (self, o) {
@@ -69,6 +90,10 @@ struct Cx<'p> {
     /// The checked impl's own where-clauses and their supertraits,
     /// each read under its frame (`None`: the impl's own types).
     own: Vec<(TraitRef, Option<Rc<Frame>>)>,
+    /// The checked impl's known `x: y` facts (`known_facts`).
+    known: Vec<(Re, Re)>,
+    /// A trait whose proof by the own clauses is ambiguous, once.
+    ambig: Option<DefId>,
     /// `x: y` between the checked impl's regions.
     needs: Vec<(Re, Re)>,
     /// `T: y` for the checked impl's type param `T`.
@@ -155,7 +180,9 @@ fn check_impl(p: &Program, rec: &crate::traits::index::ImplRecord, ir: &ImplRegi
             }
         }
     }
-    let mut cx = Cx { p, own, needs: Vec::new(), ty_needs: Vec::new(), steps: 0 };
+    let known = known_facts(p, ir);
+    let mut cx = Cx { p, own, known, ambig: None, needs: Vec::new(), ty_needs: Vec::new(), steps: 0 };
+    let name = |d: DefId| p.gx.index.trait_record(d).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
     let mut bad = None;
     for pred in preds {
         let Predicate::Trait(b) = *pred else { continue };
@@ -165,19 +192,29 @@ fn check_impl(p: &Program, rec: &crate::traits::index::ImplRecord, ir: &ImplRegi
         cx.needs.clear();
         cx.ty_needs.clear();
         cx.oblige(b.value, &frame, 0);
-        let known = known_facts(p, ir);
-        if let Some(&(_, y)) = cx.needs.iter().find(|&&(x, y)| !holds(&known, x, y)) {
+        if let Some(g) = cx.ambig {
+            return Some(Diag::new(
+                "L0610",
+                rec.span,
+                format!(
+                    "this impl of `{}` has more than one where clause that can prove its `{g}` bound, at different lifetimes",
+                    name(rec.trait_def),
+                    g = name(g)
+                ),
+                "Remove the extra where clauses, or give them the same lifetimes.",
+            ));
+        }
+        if let Some(&(_, y)) = cx.needs.iter().find(|&&(x, y)| !holds(&cx.known, x, y)) {
             bad = Some((b.value.def, "a lifetime in the impl's header", y));
             break;
         }
         let ty_known = known_ty_facts(p, ir);
-        if let Some(&(_, y)) = cx.ty_needs.iter().find(|&&(j, y)| !ty_holds(&known, &ty_known, j, y)) {
+        if let Some(&(_, y)) = cx.ty_needs.iter().find(|&&(j, y)| !ty_holds(&cx.known, &ty_known, j, y)) {
             bad = Some((b.value.def, "a type parameter of the impl", y));
             break;
         }
     }
     let (goal, what, y) = bad?;
-    let name = |d: DefId| p.gx.index.trait_record(d).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
     let life = if y == Re::Static { "`'static`" } else { "a lifetime of the impl" };
     Some(Diag::new(
         "L0617",
@@ -328,9 +365,20 @@ impl Cx<'_> {
         if depth > MAX_DEPTH || self.steps > 256 {
             return;
         }
-        if self.own_proves(tr, fr) {
-            return;
-        }
+        let fallback = match self.clause_proof(tr, fr) {
+            ClauseProof::Proven(n) => {
+                self.needs.extend(n);
+                return;
+            }
+            ClauseProof::Ambiguous => {
+                if self.ambig.is_none() {
+                    self.ambig = Some(tr.def);
+                }
+                return;
+            }
+            ClauseProof::Unreadable => return,
+            ClauseProof::NoProof(f) => f,
+        };
         // A std trait none of whose impls ties regions: nothing to learn
         // (and its impl list is long).
         if !p.gx.index.trait_record(tr.def).is_some_and(|r| r.local) && !p.regions.replay_traits(p).contains(&tr.def) {
@@ -368,7 +416,12 @@ impl Cx<'_> {
                 Fit::Yes => found = Some((rec.def, m)),
             }
         }
-        let Some((def, m)) = found else { return };
+        let Some((def, m)) = found else {
+            // No impl matches either: a shape-matching clause is the
+            // only proof left, and its needs do not hold.
+            self.needs.extend(fallback);
+            return;
+        };
         self.needs.extend(m.needs.iter().copied());
         let Some(ir) = p.regions.impl_regions.get(&def) else { return };
         let lt = |k: u32| m.lts.get(&k).copied().unwrap_or(Re::Free);
@@ -405,25 +458,45 @@ impl Cx<'_> {
         re_in(r, fr)
     }
 
-    /// True when one of the impl's own where-clauses proves the
-    /// obligation `tr` (read under `fr`) at its written arguments:
-    /// every argument pair must equate, and the region equalities
-    /// that takes are needs like any other. A candidate with a part
-    /// this walk cannot read still proves, and adds nothing. A
-    /// clause for one instantiation never proves another from the
-    /// trait id alone.
-    fn own_proves(&mut self, tr: TraitRef, fr: &Rc<Frame>) -> bool {
+    /// What the impl's own where-clauses say about the obligation
+    /// `tr` (read under `fr`). A clause is a candidate only when
+    /// every argument pair equates: a different shape (an element
+    /// type for a pair goal) is no proof at all. A candidate
+    /// proves the obligation when the region equalities that
+    /// takes follow from the impl's facts; rustc accepts exactly
+    /// the fact-equal cases over a probed matrix (an impl's
+    /// `'a: 'b, 'b: 'a`, or `'a: 'static` against a `'static`
+    /// goal). When one candidate proves it and another candidate
+    /// reads its regions differently, the proof is ambiguous
+    /// (rustc E0283), whether the other candidate proves it or
+    /// not.
+    ///
+    /// A candidate that does not prove it is selected (its needs
+    /// are the answer, no impl fallback) only when it mentions
+    /// one of the impl's parameters, a type parameter in any
+    /// argument (the Self type counts) or a lifetime parameter
+    /// at any region slot. As probed, a clause at `'b` for a
+    /// goal at `'a`, a clause at `'a` for a `'static` goal, and
+    /// a clause at `'static` on a generic Self type are selected
+    /// and fail; a clause at `'static` on a concrete Self type
+    /// for a goal at `'a` mentions no parameter, is not
+    /// assembled at all, and the one matching impl proves the
+    /// bound instead. A candidate with a part this walk cannot
+    /// read keeps the old rule: it proves, and adds nothing.
+    fn clause_proof(&self, tr: TraitRef, fr: &Rc<Frame>) -> ClauseProof {
         let p = self.p;
-        let own = self.own.clone();
-        let mut first_needs: Option<Vec<(Re, Re)>> = None;
+        let oa = p.tys.args(tr.args).to_vec();
+        // Per candidate: its needs, and whether it mentions an
+        // impl parameter (eligible for selection).
+        let mut yes: Vec<(Vec<(Re, Re)>, bool)> = Vec::new();
         let mut saw_maybe = false;
-        for (cr, cf) in own {
+        for (cr, cf) in self.own.clone() {
             if cr.def != tr.def {
                 continue;
             }
-            let (ca, oa) = (p.tys.args(cr.args).to_vec(), p.tys.args(tr.args).to_vec());
+            let ca = p.tys.args(cr.args).to_vec();
             if ca.iter().chain(&oa).any(|g| !matches!(g, GenericArg::Ty(_))) {
-                return true;
+                return ClauseProof::Unreadable;
             }
             if ca.len() != oa.len() {
                 continue;
@@ -435,24 +508,45 @@ impl Cx<'_> {
                 fit = fit.and(self.equate(Val(ct, cf.clone()), Val(ot, Some(fr.clone())), &mut m));
             }
             match fit {
-                Fit::Yes if m.needs.iter().all(|&(x, y)| x == y || x == Re::Free || y == Re::Free) => {
-                    self.needs.extend(m.needs);
-                    return true;
-                }
                 Fit::Yes => {
-                    if first_needs.is_none() {
-                        first_needs = Some(m.needs);
+                    // Eligible when the clause's arguments
+                    // mention a type parameter or a lifetime
+                    // parameter of the checked impl.
+                    let mut mentions = false;
+                    for g in &ca {
+                        if let Some(ct) = g.as_ty() {
+                            let (mut rs, mut ps) = (Vec::new(), Vec::new());
+                            self.regions_in(Val(ct, cf.clone()), &mut rs, &mut ps, 0);
+                            mentions |= !ps.is_empty() || rs.iter().any(|r| matches!(r, Re::Univ(_)));
+                        }
                     }
+                    yes.push((m.needs, mentions));
                 }
                 Fit::Maybe => saw_maybe = true,
                 Fit::No => {}
             }
         }
-        if let Some(n) = first_needs {
-            self.needs.extend(n);
-            return true;
+        if saw_maybe {
+            return ClauseProof::Unreadable;
         }
-        saw_maybe
+        // A candidate's region reading: its needs without the
+        // pairs that always hold. Two clauses with the same
+        // reading are one proof, not two.
+        let key = |needs: &[(Re, Re)]| -> Vec<(Re, Re)> {
+            needs.iter().copied().filter(|&(x, y)| x != y && x != Re::Free && y != Re::Free).collect()
+        };
+        let holds_all = |n: &[(Re, Re)]| n.iter().all(|&(x, y)| holds(&self.known, x, y));
+        if let Some((n0, _)) = yes.iter().find(|(n, _)| holds_all(n)) {
+            let k0 = key(n0);
+            if yes.iter().any(|(n, _)| !same_needs(&key(n), &k0)) {
+                return ClauseProof::Ambiguous;
+            }
+        }
+        let chosen = yes.iter().find(|(n, e)| *e && holds_all(n)).or_else(|| yes.iter().find(|(_, e)| *e));
+        match chosen {
+            Some((n, _)) => ClauseProof::Proven(n.clone()),
+            None => ClauseProof::NoProof(yes.into_iter().next().map_or_else(Vec::new, |(n, _)| n)),
+        }
     }
 
     /// Follows a type param to what its frame binds it to. A param of the
@@ -595,8 +689,12 @@ impl Cx<'_> {
         }
     }
 
-    /// Two obligation-side types that one impl param binds twice: their
-    /// regions are equal, slot by slot. Maybe when the shapes do not pair.
+    /// Two obligation-side types that one impl param binds twice, or
+    /// a where-clause's argument against the goal's: their regions
+    /// are equal, slot by slot. No when two concrete shapes cannot
+    /// pair (an element type for a pair); Maybe when a part this
+    /// walk does not read (a param, a projection, a dyn) keeps the
+    /// shapes from pairing.
     fn equate(&self, a: Val, b: Val, m: &mut Match) -> Fit {
         let p = self.p;
         let (Some(Val(at, af)), Some(Val(bt, bf))) = (self.norm(a), self.norm(b)) else { return Fit::Maybe };
@@ -625,11 +723,19 @@ impl Cx<'_> {
             }
             (TyKind::Tuple(x), TyKind::Tuple(y)) => {
                 let (x, y) = (p.tys.tys_of(x).to_vec(), p.tys.tys_of(y).to_vec());
+                if x.len() != y.len() {
+                    return Fit::No;
+                }
                 x.iter().zip(&y).fold(Fit::Yes, |f, (&a, &b)| f.and(self.equate(Val(a, af.clone()), Val(b, bf.clone()), m)))
             }
             (TyKind::Slice(x), TyKind::Slice(y)) | (TyKind::Array(x, _), TyKind::Array(y, _)) => self.equate(Val(x, af), Val(y, bf), m),
+            (TyKind::RawPtr(_, x), TyKind::RawPtr(_, y)) => self.equate(Val(x, af), Val(y, bf), m),
             (x, y) if scalar(&x) && x == y => Fit::Yes,
             (TyKind::Param(x), TyKind::Param(y)) if x == y && af.is_none() && bf.is_none() => Fit::Yes,
+            // Concrete shapes that cannot pair: another Adt, the
+            // other mutability, another scalar, another constructor.
+            (TyKind::Adt(..), TyKind::Adt(..)) | (TyKind::Ref(..), TyKind::Ref(..)) => Fit::No,
+            (x, y) if concrete(&x) && concrete(&y) => Fit::No,
             _ => Fit::Maybe,
         }
     }
@@ -643,6 +749,30 @@ fn re_in(r: Region, fr: &Option<Rc<Frame>>) -> Re {
         (Region::Param(k), Some(f)) => f.lts.get(&k).copied().unwrap_or(Re::Free),
         _ => Re::Free,
     }
+}
+
+/// True when a type's outer shape is fixed here, so a different
+/// concrete shape against it cannot pair in `equate`. A param, a
+/// projection, a dyn, a fn type, or an inference hole can still
+/// become the other side.
+fn concrete(k: &TyKind) -> bool {
+    !matches!(
+        k,
+        TyKind::Param(_)
+            | TyKind::Projection(..)
+            | TyKind::Dyn(..)
+            | TyKind::FnPtr(_)
+            | TyKind::FnDef(..)
+            | TyKind::Closure(..)
+            | TyKind::Opaque(..)
+            | TyKind::Infer(_)
+            | TyKind::Error
+    )
+}
+
+/// Two need lists hold the same pairs, in any order.
+fn same_needs(a: &[(Re, Re)], b: &[(Re, Re)]) -> bool {
+    a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
 }
 
 fn scalar(k: &TyKind) -> bool {
