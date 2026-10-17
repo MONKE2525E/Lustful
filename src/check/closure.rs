@@ -1588,6 +1588,16 @@ impl<'p> Ctx<'p> {
             self.cap_walk(init, false, w);
             return;
         }
+        // Any other coercion (an owning unsizing `let s: Arc<dyn Tr> =
+        // upvar;`, a fn item to a fn pointer) makes a new value of the
+        // pattern's type: the plain consume, not a binding from the place,
+        // whose type the pattern's is not (the env field took `Arc<dyn Tr>`
+        // and the creator stored `Arc<T>`: tcc errors, ts-rust hostimpl.rs
+        // tests `FakeSpawner::spawn`).
+        if !matches!(self.out.coerce[self.ei(init)], Coerce::None) {
+            self.cap_consume(init, w);
+            return;
+        }
         self.cap_walk(init, false, w);
         match self.cap_cat(init) {
             Cat::Place(pl) => {
