@@ -121,8 +121,7 @@ pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>, moved: &mut dyn FnMut(
 
 /// Checks the initializer bodies `keep` selects and stores their reads.
 fn check_sites(p: &mut Program, errs: &mut Vec<Diag>, keep: &dyn Fn(FnLoc) -> bool) {
-    let mut sites = sites(p);
-    sites.retain(|s| keep(s.loc));
+    let sites = sites(p, keep);
     if sites.is_empty() {
         return;
     }
@@ -216,34 +215,82 @@ fn item_span(item: &ast::Item) -> Option<Span> {
     }
 }
 
-/// Every initializer body of the program, outside shipped std source.
-/// A `thread_local!` static's value is a path to its init fn, which is
-/// checked as a fn already.
-fn sites(p: &Program) -> Vec<Site> {
+/// The initializer bodies of the program that `keep` selects, outside
+/// shipped std source. A `thread_local!` static's value is a path to its
+/// init fn, which is checked as a fn already. Each site's scope is built
+/// only when `keep` takes it: after a delta it takes a few of thousands.
+fn sites(p: &Program, keep: &dyn Fn(FnLoc) -> bool) -> Vec<Site> {
     let ast = &*p.ast;
-    let plain = |loc, ty, span| Site { loc, ty: SiteTy::Written(ty), parent: ParentGen::default(), owner: None, trait_def: None, loc_sibs: None, span };
+    let take = |loc: FnLoc, span: Span| p.shipped_crate_at(span).is_none() && !p.in_lang_methods(span) && keep(loc);
+    let plain = |loc, ty, span| Site {
+        loc,
+        ty: SiteTy::Written(ty),
+        parent: ParentGen::default(),
+        owner: None,
+        trait_def: None,
+        loc_sibs: None,
+        span,
+    };
     let tls = |item: &ast::Item| super::tls::key_form(&item.attrs, &p.interner).is_some();
     let mut out = Vec::new();
     for (i, item) in ast.items.iter().enumerate() {
         let i = i as u32;
         match &item.kind {
-            ItemKind::Const(c) if c.init_fn.is_some() => out.push(plain(FnLoc::ConstItem(i), c.ty, c.span)),
-            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) => out.push(plain(FnLoc::ConstItem(i), s.ty, s.span)),
+            ItemKind::Const(c) if c.init_fn.is_some() && take(FnLoc::ConstItem(i), c.span) => {
+                out.push(plain(FnLoc::ConstItem(i), c.ty, c.span))
+            }
+            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) && take(FnLoc::ConstItem(i), s.span) => {
+                out.push(plain(FnLoc::ConstItem(i), s.ty, s.span))
+            }
             ItemKind::Impl(imp) if !imp.consts.is_empty() => {
+                let mut cs = imp
+                    .consts
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, c)| c.init_fn.is_some() && take(FnLoc::ImplConst(i, *k as u32), c.span))
+                    .peekable();
+                if cs.peek().is_none() {
+                    continue;
+                }
                 let Some(parent) = p.impl_parents.get(&i) else { continue };
                 let owner = parent.scope.self_ty.and_then(|t| p.tys.local_adt(t));
-                for (k, c) in imp.consts.iter().enumerate().filter(|(_, c)| c.init_fn.is_some()) {
+                for (k, c) in cs {
                     let loc = FnLoc::ImplConst(i, k as u32);
-                    out.push(Site { loc, ty: SiteTy::Written(c.ty), parent: parent.clone(), owner, trait_def: None, loc_sibs: None, span: c.span });
+                    out.push(Site {
+                        loc,
+                        ty: SiteTy::Written(c.ty),
+                        parent: parent.clone(),
+                        owner,
+                        trait_def: None,
+                        loc_sibs: None,
+                        span: c.span,
+                    });
                 }
             }
             ItemKind::Trait(t) if t.consts.iter().any(|c| c.init_fn.is_some()) => {
+                let mut cs = t
+                    .consts
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, c)| c.init_fn.is_some() && take(FnLoc::TraitConst(i, *k as u32), c.span))
+                    .peekable();
+                if cs.peek().is_none() {
+                    continue;
+                }
                 let Some(&td) = p.gx.trait_names.get(&t.name) else { continue };
                 let (Some(rec), Some(scope)) = (p.gx.index.trait_record(td), p.gx.trait_scopes.get(&td)) else { continue };
                 let parent = ParentGen { generics: rec.generics.clone(), scope: scope.clone(), impl_item: None };
-                for (k, c) in t.consts.iter().enumerate().filter(|(_, c)| c.init_fn.is_some()) {
+                for (k, c) in cs {
                     let loc = FnLoc::TraitConst(i, k as u32);
-                    out.push(Site { loc, ty: SiteTy::Written(c.ty), parent: parent.clone(), owner: None, trait_def: Some(td), loc_sibs: None, span: c.span });
+                    out.push(Site {
+                        loc,
+                        ty: SiteTy::Written(c.ty),
+                        parent: parent.clone(),
+                        owner: None,
+                        trait_def: Some(td),
+                        loc_sibs: None,
+                        span: c.span,
+                    });
                 }
             }
             _ => {}
@@ -252,35 +299,38 @@ fn sites(p: &Program) -> Vec<Site> {
     for (i, item) in ast.stmt_items.iter().enumerate() {
         let loc = FnLoc::NestedConst(i as u32);
         let mut site = match &item.kind {
-            ItemKind::Const(c) if c.init_fn.is_some() => plain(loc, c.ty, c.span),
-            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) => plain(loc, s.ty, s.span),
+            ItemKind::Const(c) if c.init_fn.is_some() && take(loc, c.span) => plain(loc, c.ty, c.span),
+            ItemKind::Static(s) if s.init_fn.is_some() && !tls(item) && take(loc, s.span) => plain(loc, s.ty, s.span),
             _ => continue,
         };
         apply_stmt_overlay(p, &mut site.parent.scope, item.span);
         out.push(site);
     }
-    out.extend(anon_sites(p));
-    out.retain(|s| p.shipped_crate_at(s.span).is_none() && !p.in_lang_methods(s.span));
+    anon_sites(p, &take, &mut out);
     out
 }
 
-/// The anonymous consts written in live items' signatures (`SigWalk`).
-/// One inside a non-generic impl sees its `Self` (rustc allows no
-/// generic `Self` or parameter there); one in an item inside a fn body
-/// sees the items of the blocks around it, as a nested const does. A
-/// const argument or default takes the type collect saw for it
-/// (`GenTables::anon_wants`).
-fn anon_sites(p: &Program) -> Vec<Site> {
+/// The anonymous consts of item signatures (`SigWalk`) that `take`
+/// selects, as sites with the scope of their item, added to `out`.
+fn anon_sites(p: &Program, take: &dyn Fn(FnLoc, Span) -> bool, out: &mut Vec<Site>) {
     let ast = &*p.ast;
     if ast.anon_consts.is_empty() {
-        return Vec::new();
+        return;
     }
-    let wants = p.gx.anon_wants.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let mut out = Vec::new();
-    let mut push = |roots: Vec<(ast::ExprId, Option<ConstScalar>)>, parent: &ParentGen, sibs: Option<&Vec<u32>>| {
-        for (e, want) in roots {
-            let Some(i) = ast.anon_const(e) else { continue };
-            let want = want.or_else(|| wants.get(&e.0).copied().flatten());
+    let wants = p.gx.anon_wants.lock().unwrap_or_else(|e| e.into_inner());
+    // The taken roots of one item: (anon const, its type when known, span).
+    let taken = |item: &ast::Item| -> Vec<(u32, Option<ConstScalar>, Span)> {
+        SigWalk::roots(ast, &p.interner, item)
+            .into_iter()
+            .filter_map(|(e, want)| {
+                let i = ast.anon_const(e)?;
+                let span = ast.expr_span(e);
+                take(FnLoc::AnonConst(i), span).then(|| (i, want.or_else(|| wants.get(&e.0).copied().flatten()), span))
+            })
+            .collect()
+    };
+    let mut push = |roots: Vec<(u32, Option<ConstScalar>, Span)>, parent: &ParentGen, sibs: Option<&Vec<u32>>| {
+        for (i, want, span) in roots {
             out.push(Site {
                 loc: FnLoc::AnonConst(i),
                 ty: SiteTy::Scalar(want),
@@ -288,12 +338,12 @@ fn anon_sites(p: &Program) -> Vec<Site> {
                 owner: parent.scope.self_ty.and_then(|t| p.tys.local_adt(t)),
                 trait_def: None,
                 loc_sibs: sibs.cloned(),
-                span: ast.expr_span(e),
+                span,
             });
         }
     };
     for (k, item) in ast.items.iter().enumerate() {
-        let roots = SigWalk::roots(ast, &p.interner, item);
+        let roots = taken(item);
         if roots.is_empty() {
             continue;
         }
@@ -304,7 +354,7 @@ fn anon_sites(p: &Program) -> Vec<Site> {
         push(roots, &parent, None);
     }
     for (k, item) in ast.stmt_items.iter().enumerate() {
-        let roots = SigWalk::roots(ast, &p.interner, item);
+        let roots = taken(item);
         if roots.is_empty() {
             continue;
         }
@@ -312,7 +362,6 @@ fn anon_sites(p: &Program) -> Vec<Site> {
         apply_stmt_overlay(p, &mut parent.scope, item.span);
         push(roots, &parent, p.scope_of_stmt.get(&(k as u32)));
     }
-    out
 }
 
 /// Walks one item's signature (generics, field, parameter and alias
