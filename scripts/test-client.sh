@@ -332,6 +332,25 @@ printf 'fn main() { let x: i32 = "s"; println!("{}", x); }\n' > "$d/bad.rs"
 out=$( (cd "$d" && "$lust" check --rustc bad.rs) 2>&1 ); rc=$?
 if [ $rc -ne 0 ]; then ok "check --rustc: bad file fails"; else bad "check --rustc: bad file fails" "exit 0"; fi
 case "$out" in *E0308*) ok "check --rustc: rustc error text streams through";; *) bad "check --rustc: rustc error text streams through" "output: $out";; esac
+# Default lint levels: rustc's deny-by-default MIR lints reject in both rustc paths (a
+# metadata-only check or -A unconditional_panic would accept these), and a source allow wins.
+printf 'fn main() {\n    let a = [1, 2, 3];\n    println!("{}", a[5]);\n}\n' > "$d/idx.rs"
+printf 'fn main() {\n    let x: u8 = 255 + 1;\n    println!("{}", x);\n}\n' > "$d/ovf.rs"
+printf '#![allow(unconditional_panic)]\nfn main() {\n    let a = [1, 2, 3];\n    if std::env::args().count() > 5 {\n        println!("{}", a[5]);\n    }\n    println!("ok");\n}\n' > "$d/idx_allow.rs"
+out=$( (cd "$d" && "$lust" check --rustc idx.rs) 2>&1 ); rc=$?
+if [ $rc -ne 0 ]; then ok "check --rustc: unconditional_panic rejects"; else bad "check --rustc: unconditional_panic rejects" "exit 0"; fi
+case "$out" in *unconditional_panic*) ok "check --rustc: names the lint";; *) bad "check --rustc: names the lint" "output: $out";; esac
+(cd "$d" && "$lust" check --rustc ovf.rs) >/dev/null 2>&1; rc=$?
+if [ $rc -ne 0 ]; then ok "check --rustc: arithmetic_overflow rejects"; else bad "check --rustc: arithmetic_overflow rejects" "exit 0"; fi
+(cd "$d" && "$lust" check --rustc idx_allow.rs) >/dev/null 2>&1; rc=$?
+check "check --rustc: a source #![allow] is kept" test $rc -eq 0
+(cd "$d" && "$lust" build --release idx.rs -o idxrel) >/dev/null 2>&1; rc=$?
+if [ $rc -ne 0 ]; then ok "release: unconditional_panic rejects"; else bad "release: unconditional_panic rejects" "exit 0"; fi
+(cd "$d" && "$lust" build --release ovf.rs -o ovfrel) >/dev/null 2>&1; rc=$?
+if [ $rc -ne 0 ]; then ok "release: arithmetic_overflow rejects (overflow-checks off)"; else bad "release: arithmetic_overflow rejects (overflow-checks off)" "exit 0"; fi
+(cd "$d" && "$lust" build --release idx_allow.rs -o allowrel) >/dev/null 2>&1; rc=$?
+check "release: a source #![allow] is kept" test $rc -eq 0 -a "$("$d/allowrel" 2>/dev/null)" = "ok"
+ls "$d" | grep -q '\.o$' && bad "check --rustc: leaves no object file" "$(ls "$d")" || ok "check --rustc: leaves no object file"
 (cd "$d" && "$lust" check --release hello.rs) >/dev/null 2>&1; rc=$?
 check "release: --release on check is a usage error" test $rc -eq 2
 (cd "$d" && "$lust" build --rustc hello.rs) >/dev/null 2>&1; rc=$?

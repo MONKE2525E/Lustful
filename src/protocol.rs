@@ -1229,11 +1229,13 @@ pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug
         }
         std::process::exit(0);
     }
-    // No Cargo.toml: rustc on the single file, with DESIGN.md's release oracle flags.
+    // No Cargo.toml: rustc on the single file, with DESIGN.md's release oracle flags at
+    // rustc's default lint levels, so deny-by-default lints (unconditional_panic,
+    // arithmetic_overflow) reject as they do for any rustc user; a source `#[allow]` still works.
     let fallback = PathBuf::from(file.file_stem().unwrap_or_default());
     let out: &Path = out.unwrap_or(&fallback);
     let mut cmd = std::process::Command::new("rustc");
-    cmd.args(["--edition", "2024", "-C", "panic=abort", "-A", "unconditional_panic"]);
+    cmd.args(["--edition", "2024", "-C", "panic=abort"]);
     if dev {
         cmd.args(["-C", "overflow-checks=on"]);
     } else {
@@ -1256,30 +1258,23 @@ pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug
     exit_with(status);
 }
 
-/// `lust check --rustc`: the real rustc check (metadata only, no binary) with the dev
-/// oracle flags from DESIGN.md. A second opinion for agents. Never returns.
+/// `lust check --rustc`: the real rustc verdict with the dev oracle flags from DESIGN.md at
+/// rustc's default lint levels. A second opinion for agents. It emits an object file (no link),
+/// not metadata: `--emit=metadata` stops before the MIR passes, so it misses deny-by-default
+/// lints (unconditional_panic, arithmetic_overflow) and post-monomorphization const errors that
+/// `rustc` and `cargo build` reject. On a 950-line file the object takes 190 ms against 160 ms
+/// for metadata and 250 ms for a linked binary. Never returns.
 pub fn run_rustc_check(file: &Path) -> ! {
-    let meta = std::env::temp_dir().join(format!("lust-rustc-check-{}.rmeta", std::process::id()));
-    eprintln!("lust: checking with rustc (oracle): rustc --edition 2024 --emit=metadata {}", file.display());
+    let obj = std::env::temp_dir().join(format!("lust-rustc-check-{}.o", std::process::id()));
+    eprintln!("lust: checking with rustc (oracle): rustc --edition 2024 --emit=obj {}", file.display());
     let status = run_streamed(
         "rustc",
         std::process::Command::new("rustc")
-            .args([
-                "--edition",
-                "2024",
-                "-C",
-                "panic=abort",
-                "-C",
-                "overflow-checks=on",
-                "-A",
-                "unconditional_panic",
-                "--emit=metadata",
-                "-o",
-            ])
-            .arg(&meta)
+            .args(["--edition", "2024", "-C", "panic=abort", "-C", "overflow-checks=on", "--emit=obj", "-o"])
+            .arg(&obj)
             .arg(file),
     );
-    let _ = std::fs::remove_file(&meta);
+    let _ = std::fs::remove_file(&obj);
     exit_with(status);
 }
 

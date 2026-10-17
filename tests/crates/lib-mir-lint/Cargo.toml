@@ -1,0 +1,4 @@
+[package]
+name = "lib_mir_lint"
+version = "0.1.0"
+edition = "2024"

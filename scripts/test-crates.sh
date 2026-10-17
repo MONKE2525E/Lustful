@@ -22,7 +22,8 @@
 #   stderr=exact      also compare the program's stderr, with the thread id
 #                     of a panic line masked (panic location fixtures; the
 #                     package sets panic = "abort" so the exits match)
-#   lib=1             check the lib target only: `cargo check --lib` and
+#   lib=1             check the lib target only: `cargo build --lib` (not
+#                     check: metadata skips deny lints like unconditional_panic) and
 #                     `lust check <root> --lib` must both accept (or both
 #                     reject, with expect=); nothing runs. root= names the
 #                     lib root (default src/lib.rs)
@@ -150,7 +151,7 @@ for dir in "$fixtures"/*/; do
   fi
 
   if [ -n "$lib" ]; then
-    cargo_args=(check --manifest-path "$case_dir/proj/$manifest" --lib)
+    cargo_args=(build --manifest-path "$case_dir/proj/$manifest" --lib)
     lust_args=(check "$case_dir/proj/$root_file" --manifest-path "$case_dir/proj/$manifest" --lib)
   fi
 
@@ -190,7 +191,7 @@ for dir in "$fixtures"/*/; do
   fi
   if [ -n "$lib" ]; then
     if [ $cargo_ok -eq 0 ]; then
-      report bad "$name" "cargo check --lib failed: $(tail -3 "$case_dir/cargo.err")"
+      report bad "$name" "cargo build --lib failed: $(tail -3 "$case_dir/cargo.err")"
     else
       lust_cc "$lust" "${lust_args[@]}" >"$case_dir/lust.out" 2>"$case_dir/lust.err"; st=$?
       if is_timeout "$st"; then

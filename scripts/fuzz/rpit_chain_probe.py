@@ -136,8 +136,9 @@ def main():
                 f.write(vb)
             w, werr = run([a.lust, "check", main_rs], d, env, a.timeout)
             c, cerr = run([a.lust, "check", main_rs], d, cold, a.timeout)
-            r, _ = run(["rustc", "--edition", "2024", "--crate-type", "bin", "--emit=metadata",
-                        "-o", os.path.join(d, "x.rmeta"), main_rs], d, env, a.timeout)
+            # --emit=obj, not metadata: metadata skips the MIR deny lints and post-mono errors.
+            r, _ = run(["rustc", "--edition", "2024", "--crate-type", "bin", "-C", "panic=abort",
+                        "-C", "overflow-checks=on", "--emit=obj", "-o", os.path.join(d, "x.o"), main_rs], d, env, a.timeout)
             counts["probes"] += 1
             bad = []
             if "TIMEOUT" in (w, c):

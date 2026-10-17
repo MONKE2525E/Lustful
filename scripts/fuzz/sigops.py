@@ -584,8 +584,10 @@ class External:
 
     def _rustc_ok(self, root):
         try:
-            r = subprocess.run(["rustc", "--edition", "2024", "--crate-type", "bin", "--emit=metadata",
-                                "-o", os.path.join(self.tmp, "x.rmeta"), root],
+            # --emit=obj, not metadata: metadata skips the MIR deny lints (unconditional_panic,
+            # arithmetic_overflow) and post-monomorphization errors that a real build rejects.
+            r = subprocess.run(["rustc", "--edition", "2024", "--crate-type", "bin", "-C", "panic=abort",
+                                "-C", "overflow-checks=on", "--emit=obj", "-o", os.path.join(self.tmp, "x.o"), root],
                                cwd=os.path.dirname(root), capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
             return None
