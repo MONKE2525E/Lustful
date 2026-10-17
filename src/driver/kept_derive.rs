@@ -132,6 +132,7 @@ pub(super) fn apply_derives(
                     && caches.gen_reuse.discovery_src_same(p, g)
             })
             .collect();
+        crate::driver::laps::mark("kept/derive clean");
         let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
         let stands = |g: LocalDefId| clean.get(g.0 as usize).copied().unwrap_or(false);

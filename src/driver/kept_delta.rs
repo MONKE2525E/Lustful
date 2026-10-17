@@ -691,6 +691,10 @@ pub(super) fn replay_discovery(
         // walk one body at a time.
         let mut work: Vec<(LocalDefId, crate::driver::gen_reuse::OutCopy, bool)> = Vec::new();
         let mut stop: Option<&'static str> = None;
+        // `LUST_DERIVE_LOG` counts: bodies that stand by the caller, by
+        // their reads, by their stored output.
+        let mut counts = [0usize; 3];
+        let t0 = std::time::Instant::now();
         for g in (0..fn_count as u32).map(LocalDefId) {
             if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
                 continue;
@@ -705,10 +709,14 @@ pub(super) fn replay_discovery(
                         break;
                     }
                 }
-            } else if stands(g)
-                || readers.map_or_else(|| reuse.untouched(p, g, &mut |k| touched(p, k)), |r| reuse.untouched_by(p, g, r))
-                || reuse.discovery_holds(p, g)
-            {
+            } else if stands(g) {
+                counts[0] += 1;
+                continue;
+            } else if readers.map_or_else(|| reuse.untouched(p, g, &mut |k| touched(p, k)), |r| reuse.untouched_by(p, g, r)) {
+                counts[1] += 1;
+                continue;
+            } else if reuse.discovery_holds(p, g) {
+                counts[2] += 1;
                 continue;
             } else {
                 reuse.out_copy(p.def_id(g))
@@ -722,6 +730,7 @@ pub(super) fn replay_discovery(
         }
         // The checks read the program only: they run in parallel, as the
         // compile tail's body checks do.
+        let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
         let prog: &Program = p;
         let checked = crate::driver::compile::par_map(&work, |&(g, _, _)| {
             let (mut checked, discarded) = crate::check::check_fn(prog, g);
@@ -729,6 +738,11 @@ pub(super) fn replay_discovery(
             let out = generics::discovery_out(prog, &checked, &discarded);
             let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
             (out, reads, pending)
+        });
+        crate::check::derive_delta::log(&|| {
+            let [a, b, c] = counts;
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            format!("discovery replay: {a} stand, {b} untouched, {c} hold, {} check; walk {walk_ms:.1} ms, all {ms:.1} ms\n", work.len())
         });
         for ((g, base, newer), (out, reads, pending)) in work.into_iter().zip(checked) {
             if !base.same(p, &out, walk_instances) {
