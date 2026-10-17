@@ -25,9 +25,13 @@
 // - an edit is not strictly inside one top-level fn or method body, or
 //   inside cfg-disabled code the expander dropped (`find_inactive_edit`);
 // - the old or new body holds a `$`, an item keyword other than `fn`,
-//   `static`, `const`, and `use`, a macro the expander owns, or a parser
-//   macro while a user macro may take its name; or its items
-//   (`stmt_items`) are not the old ones in the old blocks (`same_items`).
+//   `static`, `const`, `use`, `struct`, `enum`, `type`, and `impl`, a
+//   macro the expander owns, or a parser macro while a user macro may
+//   take its name; or its items (`stmt_items`, and the body impls flatten
+//   hoisted to the module items) are not the old ones in the old blocks
+//   (`same_items`). A block type item is part of its holder's item scan
+//   (`ast_hash::item_scan`), so the scan must stand too; the methods of
+//   body impls check again (`body_impl_hashes`).
 //   Attributes and the pure builtin macros (`PURE_MACROS`) patch when no
 //   user or dependency macro can take a builtin's name: the new body
 //   passes the cfg name check and expands alone, as the resolver checks
@@ -492,10 +496,16 @@ struct NewBody {
     old_exprs: (u32, u32),
     /// The old body's items (`same_items`), where the new body's go.
     items: Vec<u32>,
+    /// The old body's impls in the module items, where the new body's go,
+    /// and per new body item whether it is one (`SameItems`).
+    impls: Vec<usize>,
+    is_impl: Vec<bool>,
+    /// The methods of those impls, in `Front::fn_loc` order.
+    hoisted: Vec<usize>,
     /// The signature nodes copied ahead of the new body (`sig_nodes.rs`).
     sig: Option<super::sig_nodes::SigNodes>,
-    /// The nested fn whose own body the edit changed (`same_items`), in
-    /// `Front::fn_loc` order.
+    /// The nested fn or body impl method whose own body the edit changed
+    /// (`same_items`), in `Front::fn_loc` order.
     nested: Option<usize>,
     /// For a fn that returns `impl Trait`: the old body's raw hash, which
     /// its item scan folds in (`rescan_edited` proves the rest stands).
@@ -583,8 +593,11 @@ struct KeptEdit {
     plain: bool,
     /// The body's items (`stmt_items` indexes; see `reuse_kept`).
     items: Vec<u32>,
-    /// The nested fn whose own body changed (`NewBody::nested`).
+    /// The nested fn or body impl method whose own body changed (`NewBody::nested`).
     nested: Option<usize>,
+    /// The methods of the body's impls (`NewBody::hoisted`): new nodes, as
+    /// the body items' (see `reuse_kept`).
+    hoisted: Vec<usize>,
     /// The old body's expression range (a template's picks key on it).
     old_exprs: (u32, u32),
     /// The fn returns `impl Trait` (`reuse_kept` compares hidden types).
@@ -628,6 +641,7 @@ pub(super) fn try_patch(
             plain: e.item.is_none() && e.body.as_ref().is_none_or(|b| b.plain),
             items: e.body.as_ref().map_or_else(Vec::new, |b| b.items.clone()),
             nested: e.body.as_ref().and_then(|b| b.nested),
+            hoisted: e.body.as_ref().map_or_else(Vec::new, |b| b.hoisted.clone()),
             old_exprs: e.body.as_ref().map(|b| b.old_exprs).or(e.item.as_ref().map(|i| i.old_exprs)).unwrap_or((0, 0)),
             rpit: e.body.as_ref().is_some_and(|b| b.rpit.is_some()),
             header: e.item.is_some(),
@@ -896,10 +910,16 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let (body, mut exprs, mut pats) =
         crate::parser::parse_body_seeded(toks, &hoisted.strings, &mut body_ast, &front.interner, &front.known, seed)
             .map_err(|_| "body parse")?;
-    let (items, nested) = same_items(ast, old, text, span, &body_ast, (&old_body.tokens, &new_body.tokens), edit)?;
-    let nested = match nested {
-        Some(i) => Some(front.fn_loc.iter().position(|&l| l == (usize::MAX, Some(i as usize))).ok_or("body items")?),
+    let same = same_items(ast, old, text, (item, span), &body_ast, (&old_body.tokens, &new_body.tokens), edit)?;
+    let nested = match same.inner {
+        Some(loc) => Some(front.fn_loc.iter().position(|&l| l == loc).ok_or("body items")?),
         None => None,
+    };
+    // The methods of the body's impls (`Front::fn_loc` order): they fold the
+    // holder's content into their body hashes (`ast_hash::assemble`).
+    let impl_fns: Vec<usize> = match same.impls.is_empty() {
+        true => Vec::new(),
+        false => front.fn_loc.iter().enumerate().filter(|(_, l)| same.impls.contains(&l.0)).map(|(j, _)| j).collect(),
     };
     let mut scratch = def.clone();
     scratch.body = Some(body);
@@ -933,7 +953,8 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
         && plain_body(&old_body, &front.interner)
         && plain_body(&new_body, &front.interner)
         && plain_body(&hoisted, &front.interner);
-    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, items, sig, nested, rpit })
+    let SameItems { items, impls, is_impl, .. } = same;
+    Ok(NewBody { fn_index, item, sub, old_body: (span.lo, span.hi), body_ast, body, exprs, pats, plain, old_exprs: def.exprs, items, impls, is_impl, hoisted: impl_fns, sig, nested, rpit })
 }
 
 /// The byte range of one top-level fn or method: from its first token
@@ -1260,73 +1281,146 @@ fn moved_splice_lo(base: &PatchBase, edit: Edit) -> Option<u32> {
     base.tables.std_splice_lo.map(|lo| if edit.file == FileId(0) && lo >= edit.b { (lo as i64 + edit.d) as u32 } else { lo })
 }
 
-/// The items (`stmt_items` indexes, in parse order) of the old fn body at
-/// `span`, when the new body (`body_ast`, parsed from `text`) holds the
-/// same ones: as many, each with the same source text at its old place
-/// moved by the edit, and no brace
-/// token in the changed tokens of the body (`toks`: old and new), so each
-/// item sits in the same block as before and sees the same items and
-/// `use`s. Resolve and collect then make the same defs of them, with the
-/// same indexes once `apply` puts each new item at its old index.
-/// One exception, returned second: an edit strictly inside the body of a
-/// nested fn that holds no item changes that fn's body only (its head
-/// text stands, its end moves by the edit). Braces may change there: no
-/// item sits in that body, and every other item still matches its text.
+/// The old fn body's items matched to the new body's (`same_items`).
+struct SameItems {
+    /// The old `stmt_items` indexes of the new body's items that stay
+    /// body items, in parse order: each new one takes its old index.
+    items: Vec<u32>,
+    /// The `ast.items` indexes of the old body's impls, which flatten
+    /// hoisted to the module items (`ImplDef::in_body`), in parse order:
+    /// each new body impl takes its old item's place.
+    impls: Vec<usize>,
+    /// Per new body item (`body_ast.stmt_items` order): true for an impl.
+    is_impl: Vec<bool>,
+    /// The fn whose own body the edit changed, as a `Front::fn_loc` entry:
+    /// a nested fn (`(usize::MAX, Some(stmt index))`) or a method of a body
+    /// impl (`(item, Some(method))`).
+    inner: Option<(usize, Option<usize>)>,
+}
+
+/// The items of the old fn body at `span` (the body of `ast.items[item]`),
+/// when the new body (`body_ast`, parsed from `text`) holds the same ones:
+/// as many of each kind, each with the same source text at its old place
+/// moved by the edit, and in the changed tokens of the body (`toks`: old
+/// and new) no brace, or only braces that close among them where no item
+/// overlaps them, so each item sits in the same block as before and sees
+/// the same items and `use`s. Resolve and collect then make the same
+/// defs of them, with the same indexes once `apply` puts each new item at
+/// its old index. The body's impls sit in the module items after `item`
+/// (flatten hoists them); the new body's take their places.
+/// One exception (`SameItems::inner`): an edit strictly inside the body of
+/// a nested fn or of a body impl's method, where that body holds no item,
+/// changes that fn's body only (the item's text before the body's brace
+/// stands, its end moves by the edit). Braces may change there: no item
+/// sits in that body, and every other item still matches its text.
 fn same_items(
     ast: &Ast,
     old: &str,
     text: &str,
-    span: crate::diag::Span,
+    (item, span): (usize, crate::diag::Span),
     body_ast: &Ast,
     toks: (&[lexer::Token], &[lexer::Token]),
     edit: Edit,
-) -> Result<(Vec<u32>, Option<u32>), &'static str> {
+) -> Result<SameItems, &'static str> {
     let inside = |s: crate::diag::Span| s.file == span.file && span.lo <= s.lo && s.hi <= span.hi;
     let olds: Vec<u32> = (0..ast.stmt_items.len() as u32).filter(|&i| inside(ast.stmt_items[i as usize].span)).collect();
-    if olds.len() != body_ast.stmt_items.len() {
+    let hoisted = |it: &crate::ast::Item| matches!(&it.kind, ItemKind::Impl(imp) if imp.in_body);
+    let impls: Vec<usize> = (item + 1..ast.items.len()).take_while(|&i| hoisted(&ast.items[i]) && inside(ast.items[i].span)).collect();
+    let is_impl: Vec<bool> = body_ast.stmt_items.iter().map(|it| matches!(it.kind, ItemKind::Impl(_))).collect();
+    // A body impl that flatten keeps in the body (one a macro made) is L0820 there.
+    let root = |it: &crate::ast::Item| it.span.ctxt == CtxtId::ROOT;
+    if olds.iter().any(|&i| matches!(ast.stmt_items[i as usize].kind, ItemKind::Impl(_)))
+        || body_ast.stmt_items.iter().zip(&is_impl).any(|(it, &imp)| imp && !root(it))
+    {
         return Err("body items");
     }
-    if olds.is_empty() {
-        return Ok((olds, None));
+    let n_impls = is_impl.iter().filter(|&&x| x).count();
+    if olds.len() + impls.len() != body_ast.stmt_items.len() || impls.len() != n_impls {
+        return Err("body items");
     }
-    let fn_body = |it: &crate::ast::Item, a: &Ast| match &it.kind {
-        ItemKind::Fn(f) => f.body.map(|b| a.blocks[b.0 as usize].span),
-        _ => None,
+    if olds.is_empty() && impls.is_empty() {
+        return Ok(SameItems { items: olds, impls, is_impl, inner: None });
+    }
+    // The new body's items in old order: (old item, new item) per kind.
+    let news: Vec<&crate::ast::Item> = body_ast.stmt_items.iter().zip(&is_impl).filter(|(_, x)| !**x).map(|(it, _)| it).collect();
+    let new_impls: Vec<&crate::ast::Item> = body_ast.stmt_items.iter().zip(&is_impl).filter(|(_, x)| **x).map(|(it, _)| it).collect();
+    let pairs: Vec<(&crate::ast::Item, &crate::ast::Item)> =
+        olds.iter().map(|&i| &ast.stmt_items[i as usize]).zip(news).chain(impls.iter().map(|&i| &ast.items[i]).zip(new_impls)).collect();
+    // The bodies of an item's own fns: a fn's, an impl's methods'.
+    let fn_bodies = |it: &crate::ast::Item, a: &Ast| -> Vec<crate::diag::Span> {
+        match &it.kind {
+            ItemKind::Fn(f) => f.body.iter().map(|b| a.blocks[b.0 as usize].span).collect(),
+            ItemKind::Impl(imp) => imp.fns.iter().filter_map(|f| f.body).map(|b| a.blocks[b.0 as usize].span).collect(),
+            _ => Vec::new(),
+        }
     };
-    let nested = olds.iter().position(|&i| fn_body(&ast.stmt_items[i as usize], ast).is_some_and(|b| b.lo < edit.a && edit.b < b.hi));
-    if let Some(k) = nested {
-        let b = fn_body(&ast.stmt_items[olds[k] as usize], ast).ok_or("body items")?;
+    let strictly = |b: &crate::diag::Span| b.lo < edit.a && edit.b < b.hi;
+    let holders: Vec<(usize, usize)> =
+        pairs.iter().enumerate().flat_map(|(k, (o, _))| fn_bodies(o, ast).iter().position(strictly).map(|m| (k, m))).collect();
+    let inner = match holders[..] {
+        [] => None,
+        [(k, m)] => Some((k, m)),
+        _ => return Err("body items"),
+    };
+    if let Some((k, m)) = inner {
+        let b = fn_bodies(pairs[k].0, ast)[m];
         let holds = |s: crate::diag::Span| b.lo <= s.lo && s.hi <= b.hi;
-        if olds.iter().enumerate().any(|(j, &i)| j != k && holds(ast.stmt_items[i as usize].span)) {
+        if pairs.iter().enumerate().any(|(j, (o, _))| j != k && holds(o.span)) {
             return Err("body items");
         }
     } else {
+        // Braces in the changed tokens are fine when they close in the
+        // window in both versions and no item overlaps it: every item then
+        // sits inside the same braces as before.
         let (pre, post) = token_window(toks.0, toks.1, edit);
         let (ow, nw) = (&toks.0[pre..toks.0.len() - post], &toks.1[pre..toks.1.len() - post]);
-        if ow.iter().chain(nw).any(|t| matches!(t.tok, Tok::LBrace | Tok::RBrace)) {
+        let balanced = |w: &[lexer::Token]| {
+            let mut depth = 0i32;
+            w.iter().all(|t| {
+                depth += match t.tok {
+                    Tok::LBrace => 1,
+                    Tok::RBrace => -1,
+                    _ => 0,
+                };
+                depth >= 0
+            }) && depth == 0
+        };
+        let clear = |w: &[lexer::Token], spans: Vec<crate::diag::Span>| match (w.first(), w.last()) {
+            (Some(f), Some(l)) => spans.iter().all(|s| s.hi <= f.span.lo || l.span.hi <= s.lo),
+            _ => true,
+        };
+        let braces = ow.iter().chain(nw).any(|t| matches!(t.tok, Tok::LBrace | Tok::RBrace));
+        if braces
+            && !(balanced(ow)
+                && balanced(nw)
+                && clear(ow, pairs.iter().map(|(o, _)| o.span).collect())
+                && clear(nw, pairs.iter().map(|(_, n)| n.span).collect()))
+        {
             return Err("body items");
         }
     }
     // Same text at the same place: span keys of the resolver tables
     // (`const_init_module`) move with the edit.
     let src = |t: &str, s: crate::diag::Span| t.get(s.lo as usize..s.hi as usize).map(str::to_owned);
-    for (k, &i) in olds.iter().enumerate() {
-        let (o, n) = (ast.stmt_items[i as usize].span, body_ast.stmt_items[k].span);
-        if Some(k) == nested {
-            // The head up to the body's brace stands (the edit is after it).
-            let (b, nb) = (fn_body(&ast.stmt_items[i as usize], ast), fn_body(&body_ast.stmt_items[k], body_ast));
-            let head = b.zip(nb).is_some_and(|(b, nb)| b.lo == nb.lo && src(old, crate::diag::Span { hi: b.lo, ..o }) == src(text, crate::diag::Span { hi: b.lo, ..n }));
-            if edit.plain(o) != n || !head {
+    for (k, (o, n)) in pairs.iter().enumerate() {
+        let (os, ns) = (o.span, n.span);
+        if let Some((_, m)) = inner.filter(|i| i.0 == k) {
+            // The text up to the body's brace stands (the edit is after it).
+            let (b, nb) = (fn_bodies(o, ast).get(m).copied(), fn_bodies(n, body_ast).get(m).copied());
+            let head = b.zip(nb).is_some_and(|(b, nb)| {
+                b.lo == nb.lo && src(old, crate::diag::Span { hi: b.lo, ..os }) == src(text, crate::diag::Span { hi: b.lo, ..ns })
+            });
+            if edit.plain(os) != ns || !head {
                 return Err("body items");
             }
             continue;
         }
-        if edit.plain(o) != n || src(old, o).is_none() || src(old, o) != src(text, n) {
+        if edit.plain(os) != ns || src(old, os).is_none() || src(old, os) != src(text, ns) {
             return Err("body items");
         }
     }
-    let nested = nested.map(|k| olds[k]);
-    Ok((olds, nested))
+    let inner = inner.map(|(k, m)| if k < olds.len() { (usize::MAX, Some(olds[k] as usize)) } else { (impls[k - olds.len()], Some(m)) });
+    Ok(SameItems { items: olds, impls, is_impl, inner })
 }
 
 /// The changed tokens of one edit: how many tokens of `old` (lexed from
@@ -1711,9 +1805,9 @@ fn body_tokens_ok(lexed: &lexer::Lexed, lo: usize, hi: usize, interner: &crate::
                     return Err("body shape");
                 }
             }
-            // `fn`, `static`, `const`, and `use` items are compared after
-            // the parse (`same_items`).
-            Tok::Struct | Tok::Enum | Tok::Impl | Tok::Trait | Tok::Mod | Tok::Extern | Tok::Type => return Err("body item"),
+            // `fn`, `static`, `const`, `use`, struct, enum, type alias, and
+            // impl items are compared after the parse (`same_items`).
+            Tok::Trait | Tok::Mod | Tok::Extern => return Err("body item"),
             // A glob `use` in a body: a full resolve reads block globs
             // through what it records for them, which the body rewrite
             // against the frozen tables does not rebuild (the patch
@@ -1821,18 +1915,45 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         let before = (ast.exprs.len(), ast.pats.len(), ast.tys.len(), ast.blocks.len(), ast.stmt_items.len());
         let stmt_base = before.4 as u32;
         let (_, new_items, _) = Arc::make_mut(&mut front.ast).append_chunk(std::mem::take(&mut e.body_ast), stmt_base);
-        // Each body item takes its old index (`same_items`).
-        if !e.items.is_empty() {
+        // Each body item takes its old index (`same_items`). A body impl
+        // takes its old place in the module items, and its statement goes,
+        // as flatten hoists it (`hoist_block_impls`).
+        if !e.is_impl.is_empty() {
             let ast = Arc::make_mut(&mut front.ast);
+            let (mut stmts, mut impls) = (e.items.iter(), e.impls.iter());
+            let mut to: Vec<Option<u32>> = Vec::with_capacity(e.is_impl.len());
+            for &imp in &e.is_impl {
+                to.push(if imp { None } else { Some(*stmts.next().ok_or("body items")?) });
+            }
+            let mut bad = false;
             for blk in &mut ast.blocks[before.3..] {
-                for s in &mut blk.stmts {
-                    if let crate::ast::Stmt::Item(i) = s {
-                        *i = *e.items.get((*i - stmt_base) as usize).ok_or("body items")?;
+                blk.stmts.retain_mut(|s| match s {
+                    crate::ast::Stmt::Item(i) => match to.get((*i - stmt_base) as usize) {
+                        Some(&Some(n)) => {
+                            *i = n;
+                            true
+                        }
+                        Some(None) => false,
+                        None => {
+                            bad = true;
+                            true
+                        }
+                    },
+                    _ => true,
+                });
+            }
+            if bad || new_items.len() != to.len() {
+                return Err("body items");
+            }
+            for (mut it, k) in new_items.into_iter().zip(to) {
+                match k {
+                    Some(i) => ast.stmt_items[i as usize] = it,
+                    None => {
+                        let ItemKind::Impl(imp) = &mut it.kind else { return Err("body items") };
+                        imp.in_body = true;
+                        ast.items[*impls.next().ok_or("body items")?] = it;
                     }
                 }
-            }
-            for (&i, it) in e.items.iter().zip(new_items) {
-                ast.stmt_items[i as usize] = it;
             }
         }
         if let Some(sig) = &e.sig {
@@ -1876,6 +1997,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
             }
         }
         let (hash, idents) = rescan_edited(front, &mut base, e)?;
+        if !e.impls.is_empty() {
+            body_impl_hashes(front, &mut base, e)?;
+        }
         let def = fn_def_at(&front.ast, e.item, e.sub);
         let line = front.map.line_col(def.name_span).0;
         let h = fn_text_hash(&front.ast, &front.map, def, line, hash);
@@ -2010,6 +2134,12 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     // its line, and its text hash reads that line from its start
     // (`fn_text_hash`): it hashes again, so its C (which embeds columns)
     // is made again.
+    // The fns `apply` hashed again above at their new lines: body impl
+    // methods (`body_impl_hashes`) and the edited body's nested fns
+    // (`nested_fn_hashes`; the body holds items, so `rescan_edited` scanned
+    // its item whole).
+    let rehashed: Vec<usize> = edits.iter().filter_map(|e| e.body.as_ref()).flat_map(|b| b.hoisted.iter().copied()).collect();
+    let rehashed_items: Vec<u32> = edits.iter().filter_map(|e| e.body.as_ref()).flat_map(|b| b.items.iter().copied()).collect();
     for e in &edits {
         let after = (e.edit.b as i64 + e.edit.d) as u32;
         let fns = base.fns_by_file.get(e.file.0 as usize).cloned().unwrap_or_default();
@@ -2026,8 +2156,12 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
             if text[..span.lo as usize].rfind('\n').map_or(0, |i| i + 1) >= after as usize {
                 continue;
             }
-            // A body item's fn folds its item's content (`nested_fn_hashes`).
-            if item == usize::MAX {
+            // A body item's fn folds its item's content (`nested_fn_hashes`),
+            // and so does a body impl's method (`body_impl_hashes` did this edit's).
+            if rehashed.contains(&j) || item == usize::MAX && sub.is_some_and(|i| rehashed_items.contains(&(i as u32))) {
+                continue;
+            }
+            if item == usize::MAX || super::ast_hash::body_impl_holder(&front.ast, item).is_some() {
                 return Err("fn on the edit's line");
             }
             let h = fn_text_hash(&front.ast, &front.map, def, line, super::ast_hash::body_scan(&front.ast, def, None).0);
@@ -2153,6 +2287,39 @@ fn item_stands(front: &mut Front, e: &NewBody, scan: crate::scan::ItemScan, hash
     Ok(())
 }
 
+/// The scans of the body impls a body edit put in place (`NewBody::impls`)
+/// and their methods' body hashes and lines: each impl's scan must stand
+/// (its text did, but for one method body at most), and its methods fold
+/// the holder's new content in, as the full scan does (`ast_hash::assemble`).
+fn body_impl_hashes(front: &mut Front, base: &mut PatchBase, e: &NewBody) -> Result<(), &'static str> {
+    let (scan, bodies, _) = super::ast_hash::scan_item(&front.ast, &front.ast.items[e.item]);
+    let content = super::ast_hash::item_content(&scan, &bodies);
+    for &k in &e.impls {
+        let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, &front.ast.items[k]);
+        if front.items.get(k) != Some(&scan) || front.chunks[0].scan.items.get(k) != Some(&scan) {
+            return Err("item scan");
+        }
+        nested_fn_hashes(front, base, &scan, &bodies, &inner)?;
+        let fns: Vec<usize> = front.fn_loc.iter().enumerate().filter(|(_, l)| l.0 == k).map(|(j, _)| j).collect();
+        if fns.len() != bodies.len() {
+            return Err("state");
+        }
+        for (&j, (hash, idents)) in fns.iter().zip(bodies) {
+            let (item, sub) = front.fn_loc[j];
+            let def = fn_def_at(&front.ast, item, sub);
+            let line = front.map.line_col(def.name_span).0;
+            let h = fn_text_hash(&front.ast, &front.map, def, line, crate::scan::fold_outer(hash, content));
+            base.body_hashes[j] = h;
+            base.fn_lines[j] = line;
+            let chunk = &mut front.chunks[0];
+            chunk.scan.fns.get_mut(j).ok_or("state")?.body_hash = h;
+            *chunk.scan.body_idents.get_mut(j).ok_or("state")? = idents;
+        }
+        base.item_scans.remove(&k);
+    }
+    Ok(())
+}
+
 /// The body hashes of the fns nested anywhere in one edited item
 /// (`inner`, from `scan_item`), which fold in the item's content hash, as
 /// the full scan computes them (`ast_hash::assemble`), and their lines.
@@ -2241,13 +2408,16 @@ pub(super) fn reuse_kept(
         // so the program's statics, consts, item blocks, and nested fn
         // signatures stand. Closure and template tables key on Ast nodes,
         // which are new: a nested fn must be a plain fn with no closure.
-        for &i in &e.items {
-            if let Some(crate::check::collect::BodyItem::Fn(f)) = p.body_items.get(&i).copied() {
-                let def = p.fn_def(f);
-                let closure = p.ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|x| matches!(x, crate::ast::Expr::Closure { .. }));
-                if closure || p.gx.fn_class.get(f.0 as usize) != Some(&FnClass::Plain) {
-                    return Err("body items");
-                }
+        // The body impls' methods are new nodes too.
+        let body_fns = e.items.iter().filter_map(|i| match p.body_items.get(i).copied() {
+            Some(crate::check::collect::BodyItem::Fn(f)) => Some(f),
+            _ => None,
+        });
+        for f in body_fns.chain(e.hoisted.iter().map(|&j| LocalDefId(j as u32))) {
+            let def = p.fn_def(f);
+            let closure = p.ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|x| matches!(x, crate::ast::Expr::Closure { .. }));
+            if closure || p.gx.fn_class.get(f.0 as usize) != Some(&FnClass::Plain) {
+                return Err("body items");
             }
         }
         // A template checks again below, in a check only: a build's

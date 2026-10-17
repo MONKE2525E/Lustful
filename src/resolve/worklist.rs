@@ -7949,8 +7949,9 @@ impl Rewrite<'_> {
 /// resolve: the daemon's body patch (driver/patch.rs) re-parses one
 /// body and rewrites it here instead of resolving the crate again.
 /// `outer` holds the generics of the impl or trait around a method.
-/// The body must hold no items (the patch checks that). Returns the
-/// rewrite's diagnostics; the patch gives up on any.
+/// Its block items rewrite as in the full pass; the patch proves they
+/// are the old ones (`same_items`). Returns the rewrite's diagnostics;
+/// the patch gives up on any.
 #[allow(clippy::too_many_arguments)]
 pub fn rewrite_fn_body(
     tables: &ResolvedTables,
