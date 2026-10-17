@@ -2029,13 +2029,24 @@ impl ReadIndex {
         &mut self,
         p: &Program,
         slot_reads: &mut [Option<Reads>],
+        quick: &(dyn Fn(&ReadKey) -> Option<bool> + Sync),
         moves: &mut dyn FnMut(&ReadKey) -> bool,
         def_slot: &dyn Fn(DefId) -> Option<usize>,
         answers: &mut FxMap<ReadKey, Read>,
     ) -> (Vec<bool>, Vec<bool>) {
         self.sync(slot_reads);
         crate::driver::laps::mark("keyed/sync");
-        let moved: Vec<(&ReadKey, &Vec<(u32, u64)>)> = self.by_key.iter().filter(|(k, _)| moves(k)).collect();
+        // `quick` answers most keys from tables on all cores; `moves` the
+        // rest, one at a time.
+        let entries: Vec<(&ReadKey, &Vec<(u32, u64)>)> = self.by_key.iter().collect();
+        let quick_answers: Vec<Vec<Option<bool>>> =
+            crate::driver::compile::par_map(&entries.chunks(4096).collect::<Vec<_>>(), |c| c.iter().map(|(k, _)| quick(k)).collect());
+        let moved: Vec<(&ReadKey, &Vec<(u32, u64)>)> = entries
+            .into_iter()
+            .zip(quick_answers.into_iter().flatten())
+            .filter(|((k, _), q)| q.unwrap_or_else(|| moves(k)))
+            .map(|(e, _)| e)
+            .collect();
         crate::driver::laps::mark("keyed/classify");
         let missing: Vec<ReadKey> = moved.iter().map(|(k, _)| **k).filter(|k| !answers.contains_key(k)).collect();
         let fresh = crate::driver::compile::par_map(&missing, |k| p.read_fingerprint(k));
@@ -2098,7 +2109,20 @@ pub(crate) struct DeriveMoves<'a> {
     names: Option<FxMap<Sym, ()>>,
 }
 
+/// A `Sync` view of a `DeriveMoves` whose moved fn names are made: the
+/// tables `Program::derive_key_moves_quick` reads.
+pub(crate) struct QuickMoves<'a> {
+    defs: &'a FxMap<DefId, ()>,
+    sig: &'a FxMap<DefId, bool>,
+    names: &'a FxMap<Sym, ()>,
+}
+
 impl<'a> DeriveMoves<'a> {
+    /// The tables of `derive_key_moves_quick` (None before `moved_fn_names`).
+    pub(crate) fn quick(&self) -> Option<QuickMoves<'_>> {
+        Some(QuickMoves { defs: self.reach.defs(), sig: &self.sig, names: self.names.as_ref()? })
+    }
+
     pub(crate) fn new(reach: &'a crate::check::derive_delta::Reach) -> DeriveMoves<'a> {
         DeriveMoves { reach, sig: FxMap::default(), keys: None, names: None }
     }
@@ -2179,6 +2203,23 @@ impl Program {
             }
         }
         m.names = Some(names);
+    }
+
+    /// `derive_key_moves` from tables only, for a parallel walk: None when
+    /// the key needs the walk itself (the caller asks `derive_key_moves`).
+    /// `m` must hold the moved fn names (`moved_fn_names`).
+    pub(crate) fn derive_key_moves_quick(&self, m: &QuickMoves, key: &ReadKey) -> Option<bool> {
+        let row = |d: DefId| self.adt_by_def(d).is_some_and(|a| self.derive_def(a).is_some_and(|x| m.defs.contains_key(&x)));
+        match key {
+            ReadKey::Sig(def) => m.sig.get(def).copied(),
+            ReadKey::Binding(k) => match self.binding_res(k.module, k.ns, k.name) {
+                BindingRes::Def(def) => m.sig.get(&def).copied(),
+                _ => Some(false),
+            },
+            ReadKey::MethodSet(k) => Some(matches!(k.head, Head::Adt(d) if row(d)) || m.names.contains_key(&k.name)),
+            ReadKey::Checked(_) | ReadKey::TraitInScope(..) => Some(false),
+            ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::Layout(_) | ReadKey::ImplSet(_) => None,
+        }
     }
 
     /// `derive_key_moves` for a `Sig` key (memoized in `m`).

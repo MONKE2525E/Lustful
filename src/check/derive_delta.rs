@@ -566,6 +566,11 @@ impl Reach {
         set.contains_key(&(i as u32))
     }
 
+    /// The Adt templates of the reach (a `Sync` view for parallel walks).
+    pub(crate) fn defs(&self) -> &crate::intern::FxMap<DefId, ()> {
+        &self.defs
+    }
+
     /// True when Adt row `i` (a template or an instance) is in the reach.
     pub(crate) fn row(&self, p: &Program, i: usize) -> bool {
         p.derive_def(AdtId(i as u32)).is_some_and(|d| self.defs.contains_key(&d))

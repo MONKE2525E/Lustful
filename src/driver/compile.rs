@@ -739,7 +739,7 @@ fn keyed_dirty(
 ) -> Vec<Option<bool>> {
     let mode = usize::from(p.gx.walk_instances);
     let def_slot = |d: def::DefId| p.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
-    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, moved, &def_slot, answers);
+    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &|_| None, moved, &def_slot, answers);
     caches.slot_reads.iter().zip(dirty).map(|(r, d)| r.as_ref().filter(|r| r.verified[mode] == base).map(|_| d)).collect()
 }
 

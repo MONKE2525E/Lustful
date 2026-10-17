@@ -90,8 +90,13 @@ pub(super) fn apply_derives(
     p.fp_memo.on(p.adts.len());
     let (is_dirty, has_checked) = {
         let prog: &Program = p;
+        // `named` gives the tables of the parallel classifier; `moves` the
+        // walk for the keys it leaves.
+        let mut named = crate::driver::graph::DeriveMoves::new(&reach);
+        prog.moved_fn_names(&mut named);
+        let quick = named.quick();
+        let quick = |k: &crate::driver::graph::ReadKey| quick.as_ref().and_then(|q| prog.derive_key_moves_quick(q, k));
         let mut moves = crate::driver::graph::DeriveMoves::new(&reach);
-        prog.moved_fn_names(&mut moves);
         crate::driver::laps::mark("kept/derive names");
         let def_slot = |d: crate::def::DefId| prog.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
         let answers = &mut caches.gen_reuse.memo;
@@ -102,6 +107,7 @@ pub(super) fn apply_derives(
         let out = caches.read_index.dirty_slots(
             prog,
             &mut caches.slot_reads,
+            &quick,
             &mut |k| {
                 if !logging {
                     return prog.derive_key_moves(&mut moves, k);
