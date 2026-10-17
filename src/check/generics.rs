@@ -10399,6 +10399,13 @@ pub(crate) struct TemplateBody {
     hidden: Vec<(DefId, OwnedTy)>,
 }
 
+impl TemplateBody {
+    /// True when the body check reported an error (no write done yet).
+    pub(crate) fn failed(&self) -> bool {
+        !self.errs.is_empty()
+    }
+}
+
 /// `check_template`'s body check of template `t` (see `TemplateBody`).
 pub(crate) fn template_body(p: &Program, t: LocalDefId, closure_fns: &[LocalDefId]) -> TemplateBody {
     // Lowering, borrowck and check_fn's tail passes read derive lists too

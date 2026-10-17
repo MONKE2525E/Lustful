@@ -102,7 +102,16 @@ pub(super) fn apply_derives(
     // Without user generics collect runs no template check or discovery
     // (the lang enum methods' generics alone need neither in a check).
     if p.gx.user_generics {
-        replay_templates(p, front, caches, &reach, keyed, start).map_err(|why| (why, false))?;
+        if let Err(why) = replay_templates(p, front, caches, &reach, keyed, start) {
+            // A parallel template check failed before the replays wrote
+            // (`recheck_par`): the delta undoes as a refusal above does.
+            if why == TEMPLATE_DIAG {
+                caches.gen_reuse.forget_answers();
+                undo.restore(p);
+                return Err((why, true));
+            }
+            return Err((why, false));
+        }
         crate::driver::laps::mark("kept/derive templates");
         // A body's discovery reads are a subset of its check's, taken on
         // the same program: a body whose stored check reads are all clean
@@ -187,6 +196,10 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
     out
 }
 
+/// The refusal of a template body check that failed before any write
+/// (`recheck_par`); `p` is then as the derive delta left it.
+const TEMPLATE_DIAG: &str = "derive template diag";
+
 /// `kept_delta::recheck_template` for templates `ts`, which have no
 /// closures and define no opaque type: their body checks only read the
 /// program, so they run in parallel (`generics::template_body`), and the
@@ -196,6 +209,16 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
 fn recheck_par(p: &mut Program, ts: &[LocalDefId], caches: &mut Caches) -> Result<(), &'static str> {
     if ts.is_empty() {
         return Ok(());
+    }
+    // Collect's template check runs before mono.
+    let (counts, mono_done) = (p.gx.mono_counts, std::mem::replace(&mut p.gx.mono_done, false));
+    let prog: &Program = p;
+    let bodies = crate::driver::compile::par_map(ts, |&t| generics::template_body(prog, t, &[]));
+    // A body error before any write: the caller undoes the derive delta
+    // and keeps the program (a rejected derive edit, then its revert).
+    if bodies.iter().any(generics::TemplateBody::failed) {
+        (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
+        return Err(TEMPLATE_DIAG);
     }
     let mut ranges: Vec<(u32, u32)> = ts.iter().map(|&t| p.fn_def(t).exprs).collect();
     ranges.sort_unstable();
@@ -207,10 +230,6 @@ fn recheck_par(p: &mut Program, ts: &[LocalDefId], caches: &mut Caches) -> Resul
     let set: crate::intern::FxMap<LocalDefId, ()> = ts.iter().map(|&t| (t, ())).collect();
     p.gx.template_closures.retain(|k, _| !set.contains_key(&k.0));
     p.gx.template_calls.retain(|k, _| !set.contains_key(&k.0));
-    // Collect's template check runs before mono.
-    let (counts, mono_done) = (p.gx.mono_counts, std::mem::replace(&mut p.gx.mono_done, false));
-    let prog: &Program = p;
-    let bodies = crate::driver::compile::par_map(ts, |&t| generics::template_body(prog, t, &[]));
     let mut out = Ok(());
     for (&t, body) in ts.iter().zip(bodies) {
         if !generics::finish_template(p, t, &mut caches.gen_reuse, body, &[], &Vec::new()).is_empty() {
