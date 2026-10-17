@@ -3,6 +3,9 @@
 # token soup. Every case runs under a timeout (PARSE_FUZZ_TIMEOUT seconds, default 2). A hang (timeout), a compiler
 # panic (exit 101), or a signal death (exit > 128) is a failure; clean accepts and
 # clean errors are both fine. Failing inputs are kept in a directory printed at the end.
+# Rule-zero sample: up to PARSE_FUZZ_RUSTC (default 60; 0 turns it off) of the cases lust
+# accepts are built with default-lint rustc (scripts/rustc_sample.py); a rustc rejection is
+# bad too. The run prints a "parse-fuzz: rustc sample: ..." line before its summary.
 # Usage: scripts/parse-fuzz.sh [cases] [seed]
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -76,7 +79,9 @@ run_one() {
   f="$1"
   LUST_NO_DAEMON=1 timeout "${PARSE_FUZZ_TIMEOUT:-2}" "$LUST_BIN" check "$f" >/dev/null 2>&1
   code=$?
-  if [ "$code" -eq 124 ]; then
+  if [ "$code" -eq 0 ]; then
+    echo "$f" >> "$FAILDIR/.accepted"
+  elif [ "$code" -eq 124 ]; then
     # A timeout under parallel load is retried once later, alone, with 6x the limit; only a
     # second timeout is a hang (two land gates timed out on cases that pass in under 10 s idle).
     echo "$f" >> "$FAILDIR/.slow"
@@ -96,12 +101,22 @@ if [ -s "$faildir/.slow" ]; then
       cp "$f" "$faildir/"; echo "BAD exit=$code $f (hang: also timed out alone at 6x the limit)"
     else
       echo "slow: $f timed out under load, passed alone"
+      [ "$code" -eq 0 ] && echo "$f" >> "$faildir/.accepted"
     fi
   done < "$faildir/.slow"
   rm -f "$faildir/.slow"
 fi
 
-bad=$(find "$faildir" -name 'case-*.rs' | wc -l)
+rbad=0
+if [ "${PARSE_FUZZ_RUSTC:-60}" -gt 0 ]; then
+  touch "$faildir/.accepted"
+  # shellcheck disable=SC2046 # one path per line, no spaces (case-NNNNN.rs)
+  python3 "$root/scripts/rustc_sample.py" "${PARSE_FUZZ_RUSTC:-60}" "$seed" "$faildir" $(cat "$faildir/.accepted") \
+    | sed 's/^/parse-fuzz: /'
+  rbad=$(find "$faildir" -name 'rustc-reject-*.rs' | wc -l)
+fi
+rm -f "$faildir/.accepted"
+bad=$(( $(find "$faildir" -name 'case-*.rs' | wc -l) + rbad ))
 echo "parse-fuzz: $cases cases, $bad bad"
 if [ "$bad" -ne 0 ]; then
   echo "failing inputs kept in $faildir"

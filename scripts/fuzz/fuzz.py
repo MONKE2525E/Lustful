@@ -21,6 +21,9 @@
 # `--rustc` also judges the pulse's op states against rustc, and `--baseline LUST`
 # against a pinned baseline lust (see sigops.External). Under LUST_CHECK_ITEMPATCH=1
 # every `itempatch oracle:` line in the daemon log is a failure.
+# `--rustc-sample N` (single-file crates) keeps a sample of up to N edited texts that lust
+# accepted and builds them with default-lint rustc at the end: each rustc rejection is a
+# failure (rule zero; scripts/rustc_sample.py). It never changes the edit stream.
 #
 # Usage:
 #   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3|patchseq [--modules 40] [--strict]
@@ -32,6 +35,7 @@ from collections import Counter
 import sigops
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import oracle_log  # noqa: E402  (scripts/oracle_log.py)
+import rustc_sample  # noqa: E402  (scripts/rustc_sample.py)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LUST = os.path.join(ROOT, "target/release/lust")
@@ -1144,6 +1148,9 @@ def save_pair(out, tag, prev, cur):
 
 
 def cmd_run(a):
+    if a.rustc_sample and a.crate in ("patchseq", "multi", "multi2", "multi3"):
+        print(f"setup error: --rustc-sample needs a single-file crate, not {a.crate}")
+        return 2
     if a.crate == "patchseq":
         return cmd_run_patchseq(a)
     if a.crate in ("multi", "multi2", "multi3"):
@@ -1162,6 +1169,7 @@ def cmd_run(a):
     # Signature-edit pulses (--sig-ops) on their own RNG.
     srng = random.Random(a.seed ^ 0x516ED)
     ext = sigops.External(a.rustc, a.baseline)
+    rs = rustc_sample.Sample(a.rustc_sample, a.seed)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -1239,6 +1247,8 @@ def cmd_run(a):
                 if a.stop_first:
                     break
                 continue
+            if da[0] == 0:
+                rs.offer(text)
             if da[0] == 0 and len(snapshots) < 40 and rng.random() < 0.05:
                 snapshots.append(text)
             # A const_edit can move a baked-in value while `check` still
@@ -1294,6 +1304,7 @@ def cmd_run(a):
         h.wait_guard_idle()
         guard = h.guard_count()
         failures = sig_result(h, ext, failures)
+        failures += rs.judge(a.out)
         print(f"RESULT seed={a.seed} crate={a.crate} modules={a.modules} edits={a.edits} "
               f"failures={failures} guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
@@ -2406,6 +2417,8 @@ def main():
     r.add_argument("--sig-ops", action="store_true", help="signature-edit pulses (sigops.py)")
     r.add_argument("--rustc", action="store_true", help="judge sigops states against rustc")
     r.add_argument("--baseline", default=None, help="baseline lust binary for --rustc")
+    r.add_argument("--rustc-sample", type=int, default=0,
+                   help="build up to N accepted texts with rustc (single-file crates)")
     for name in ("replay", "shrink"):
         s = sub.add_parser(name)
         s.add_argument("--prev", required=True)
