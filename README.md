@@ -49,11 +49,11 @@ The fine print:
 
 ## Install
 
-Linux x86_64 only. Download `lust-0.1.0-x86_64-linux.tar.gz` from the [releases](../../releases) page, then:
+Linux x86_64 only. Download `lust-0.2.0-x86_64-linux.tar.gz` from the [releases](../../releases) page, then:
 
 ```sh
-tar xzf lust-0.1.0-x86_64-linux.tar.gz
-export PATH="$PWD/lust-0.1.0-x86_64-linux/bin:$PATH"
+tar xzf lust-0.2.0-x86_64-linux.tar.gz
+export PATH="$PWD/lust-0.2.0-x86_64-linux/bin:$PATH"
 lust --version
 ```
 
