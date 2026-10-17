@@ -1476,13 +1476,14 @@ pub fn splice_placeholders(trees: Vec<Tt>, name: &str, replacement: &[Tt], inter
 /// `use` in the expanding file, exactly as in Rust. `tokens` is the
 /// flat token slice of the definition (from `macro_rules` to its
 /// closing group and optional `;`), and `strings` is the string table
-/// those tokens index into; the expander remaps them into its own table
-/// and compiles the definition there, so string values stay exact.
+/// those tokens index into (shared: it is the defining file's whole
+/// table); the expander remaps them into its own table and compiles the
+/// definition there, so string values stay exact.
 #[derive(Clone)]
 pub struct MacroSeed {
     pub path: Vec<Sym>,
     pub tokens: Vec<Token>,
-    pub strings: Vec<String>,
+    pub strings: std::sync::Arc<Vec<String>>,
     /// When set, this seed also answers plain `name!` calls in this
     /// module path: it records a glob import (`use a::*;`) of this
     /// macro into that module, which the worklist resolved. Plain

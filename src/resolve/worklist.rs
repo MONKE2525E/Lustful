@@ -1287,13 +1287,15 @@ impl SharedFiles {
 
 /// One `macro_rules!` definition in token form, for cross-file and
 /// cross-crate macro visibility: the definition's flat tokens and the
-/// string table they index into, plus the defining crate's `$crate`
-/// magic segment so expansion in another crate can rewrite it.
+/// string table they index into (the defining file's whole table, shared
+/// by its macros and every seed made from them), plus the defining
+/// crate's `$crate` magic segment so expansion in another crate can
+/// rewrite it.
 #[derive(Clone)]
 struct OwnedMacroSource {
     name: Sym,
     tokens: Vec<crate::lexer::Token>,
-    strings: Vec<String>,
+    strings: std::sync::Arc<Vec<String>>,
     magic: Sym,
     /// For a crate's exports: the module path, from its root, of the
     /// public binding (`prelude` for `pub mod prelude { pub use
@@ -2633,6 +2635,7 @@ impl MacroEnv {
         for (di, disc) in discs.iter().enumerate() {
             let base_path = tables.modules[disc.module.0 as usize].path.clone();
             let mut collect = |outline: &scan::Outline, lexed: &lexer::Lexed, owned: &mut Vec<OwnedMacroSource>| {
+                let mut shared: Option<std::sync::Arc<Vec<String>>> = None;
                 for m in &outline.macros {
                     let mut mod_path = base_path.clone();
                     mod_path.extend(m.container_path.iter().copied());
@@ -2654,7 +2657,7 @@ impl MacroEnv {
                     owned.push(OwnedMacroSource {
                         name: m.name,
                         tokens: lexed.tokens[lo..hi].to_vec(),
-                        strings: lexed.strings.clone(),
+                        strings: shared.get_or_insert_with(|| std::sync::Arc::new(lexed.strings.clone())).clone(),
                         magic: job.magic,
                         path: Vec::new(),
                     });
