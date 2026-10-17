@@ -4953,7 +4953,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             // `&mut V`, and keep the conservative rule; so does an
             // element with a `Cell` inside, which `&T` can write).
             _ if matches!(target, CallTarget::Builtin(crate::check::Builtin::VecRetain | crate::check::Builtin::SetRetain))
-                && avs.first().is_some_and(|(t0, _)| plain_shared(&self.body.tys, *t0)) => {}
+                && avs.first().is_some_and(|(t0, _)| plain_shared(self.p, &self.body.tys, *t0)) => {}
             // A map or set lookup (W-STD-B) reads its `&Q` key during the
             // call only: the opaque rule over the receiver alone.
             _ if let CallTarget::Builtin(
@@ -9479,26 +9479,53 @@ fn item_builtin(b: crate::check::Builtin) -> bool {
 /// arrays, slices, the hash tables of such parts, and trait objects
 /// whose trait names no lifetime. Any other type (a `Cell` anywhere,
 /// a user Adt, a parameter) answers false.
-fn plain_shared(tys: &impl TyIntern, t: Ty) -> bool {
+fn plain_shared(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
     match tys.kind(t) {
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Unit => true,
-        TyKind::Ref(_, _, i) | TyKind::Array(i, _) | TyKind::Slice(i) => plain_shared(tys, i),
-        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| plain_shared(tys, e)),
+        TyKind::Ref(_, _, i) | TyKind::Array(i, _) | TyKind::Slice(i) => plain_shared(p, tys, i),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| plain_shared(p, tys, e)),
         // A trait object stores a borrow only through a lifetime its
         // trait names: none here (no lifetime args, plain type args),
         // so its object lifetime alone takes no capture.
         TyKind::Dyn(b, _) => tys.dyn_bounds(b).principal.is_none_or(|pr| {
             !tys.args(pr.value.args).iter().any(|g| matches!(g, GenericArg::Lifetime(_)))
-                && dyn_arg_tys(tys, t).into_iter().all(|e| plain_shared(tys, e))
+                && dyn_arg_tys(tys, t).into_iter().all(|e| plain_shared(p, tys, e))
         }),
         // `Rc<T>` and `Arc<T>` hand out `&T` only.
-        TyKind::Adt(..) if let Some(e) = tys.rc_elem(t) => plain_shared(tys, e),
+        TyKind::Adt(..) if let Some(e) = tys.rc_elem(t) => plain_shared(p, tys, e),
+        // A written Adt with no lifetime param and no borrow in its type
+        // arguments holds no borrow at any depth, so nothing written through
+        // `&T` can take one (ts-rust goport_watch.rs:308: an `Arc<dyn Fn(Ev)>`
+        // element, `Ev` a plain struct). Builtins keep the rule below:
+        // `Chars` and the guards hold a borrow no argument names.
+        TyKind::Adt(..) if holds_no_borrow(p, tys, t) => true,
         TyKind::Adt(_, a) => {
             matches!(
                 tys.builtin_of(t),
                 Some(BuiltinTy::String | BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Option | BuiltinTy::Hash(_))
-            ) && tys.args(a).iter().all(|g| g.as_ty().is_none_or(|e| plain_shared(tys, e)))
+            ) && tys.args(a).iter().all(|g| g.as_ty().is_none_or(|e| plain_shared(p, tys, e)))
         }
+        _ => false,
+    }
+}
+
+/// True when a value of type `t` holds no borrow at any depth: built from
+/// primitives, `str`, tuples, arrays, slices, and written Adts with no
+/// lifetime param whose type arguments are such types. A reference, pointer,
+/// trait object, parameter, closure or builtin Adt answers false
+/// (`plain_shared`).
+fn holds_no_borrow(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
+    match tys.kind(t) {
+        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Unit | TyKind::Never => true,
+        TyKind::Array(e, _) | TyKind::Slice(e) => holds_no_borrow(p, tys, e),
+        TyKind::Tuple(ts) => tys.tys_of(ts).iter().all(|&e| holds_no_borrow(p, tys, e)),
+        // A body type erases a user Adt's lifetime arguments: its own
+        // lifetime params count (`adt_regions`).
+        TyKind::Adt(_, a) if tys.builtin_of(t).is_none() && adt_regions(p, tys, t) == 0 => tys.args(a).iter().all(|g| match g {
+            GenericArg::Ty(e) => holds_no_borrow(p, tys, *e),
+            GenericArg::Lifetime(_) => false,
+            GenericArg::Const(_) => true,
+        }),
         _ => false,
     }
 }
