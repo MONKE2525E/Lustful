@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Differential tests against rustc (the oracle). Two modes (ARCH 9.3
 # runner table):
+#   rustc runs with its default lint levels (only -A warnings), so a deny-by-default lint
+#   rejects a case; a case that needs an allow carries it in its source.
 #   Default (abort mode, -C panic=abort):
 #     tests/pass/*.rs: rustc and lust must both build. Stdout, exit status, and stderr
 #                      must match (stderr with the thread id masked and the case path as
@@ -20,6 +22,7 @@
 #     that lust rejects fails; a tests/pass case that lust rejects in
 #     unwind mode only (a form unwinding does not cover yet, such as
 #     thread::spawn) is UNSUPPORTED, and LUST_STRICT=1 makes it fail.
+#     The filter `unwind-` runs only the tests/unwind cases (their names get that prefix).
 # Usage: scripts/difftest.sh [filter]
 #   SANITIZE=1 also builds the generated C with gcc -fsanitize=address,undefined and runs it.
 #              Its stdout and exit status must match the plain lust build's.
@@ -146,7 +149,7 @@ if [ "${PANIC:-abort}" = unwind ]; then
   lust_flags=(-C panic=unwind)
   require_dir tests/unwind
   require_dir tests/pass
-  rustc_flags=(--edition 2024 -C panic=unwind -C overflow-checks=on -A unconditional_panic -A warnings)
+  rustc_flags=(--edition 2024 -C panic=unwind -C overflow-checks=on -A warnings)
   # tests/unwind cases, then every tests/pass case: unwind mode must not
   # change a program that does not panic, and must unwind the ones that do.
   unwind_cases=$(ls "$root"/tests/unwind/*.rs)
@@ -201,7 +204,10 @@ fi
 require_dir tests/pass
 require_dir tests/fail
 require_dir tests/reject
-rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A unconditional_panic -A warnings)
+# rustc's default lint levels decide acceptance (rule zero): a deny-by-default lint such as
+# unconditional_panic rejects the case here. -A warnings lowers only warn-level lints; it
+# turns no error off. A case that needs an allow says so in its own source, with a comment.
+rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
 
 # pass_case <name> <file>: one tests/pass case (see the header).
 pass_case() {
@@ -239,15 +245,9 @@ pass_case() {
 neg_case() {
   local name=$1 f=$2 expect rustc_ok out
   expect=$(head -1 "$f" | sed -n 's|^// expect: *\(L[0-9]*\).*|\1|p')
-  # Fail cases must be rejected by rustc with its default deny lints, so
-  # the fail oracle drops the `-A unconditional_panic` the pass corpus
-  # needs for its runtime-panic cases. Reject cases keep the pass flags:
-  # they only have to be programs rustc can build at all.
-  if [[ "$f" == */fail/* ]]; then
-    rustc_oracle build "$f" --edition 2024 -C panic=abort -C overflow-checks=on -A warnings
-  else
-    rustc_oracle build "$f" "${rustc_flags[@]}"
-  fi
+  # Every mode uses the same default-lint flags: a fail case must be rejected and a reject
+  # case accepted by rustc as it is.
+  rustc_oracle build "$f" "${rustc_flags[@]}"
   rustc_ok=$(cat rustc.cc)
   if [[ "$f" == */fail/* && $rustc_ok -eq 0 ]]; then
     report bad "$name" "rustc accepted it, so it is not a valid negative test"; return
