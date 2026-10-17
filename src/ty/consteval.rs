@@ -4226,6 +4226,15 @@ impl Evaluator {
                 }
             }
         }
+        // `Cell::get` and `Cell::into_inner` are const fns: a Cell's
+        // value is its content's (see `Cell::new` in `call`).
+        if let Some(elem) = cx.tys_ref().cell_elem(base_t)
+            && matches!(name.as_str(), "get" | "into_inner")
+            && args.is_empty()
+        {
+            let (v, _) = self.auto_deref(cx, rv.clone(), rt);
+            return Ok((v, elem));
+        }
         // An inherent integer method on an unpinned receiver is
         // ambiguous (rustc E0689), even where the surroundings
         // would pin the type later: the body checker reports the
