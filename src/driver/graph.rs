@@ -2148,16 +2148,7 @@ impl Program {
                 {
                     return true;
                 }
-                if m.names.is_none() {
-                    let mut names = FxMap::default();
-                    for i in 0..self.fns.len() {
-                        let f = LocalDefId(i as u32);
-                        if self.sig_moves(m, self.def_id(f)) {
-                            names.insert(self.fn_info(f).name, ());
-                        }
-                    }
-                    m.names = Some(names);
-                }
+                self.moved_fn_names(m);
                 m.names.as_ref().is_some_and(|n| n.contains_key(&k.name))
             }
             ReadKey::ImplSet(k) => {
@@ -2172,6 +2163,22 @@ impl Program {
             }
             ReadKey::Checked(_) | ReadKey::TraitInScope(..) => false,
         }
+    }
+
+    /// The names of the fns whose signature moves (`DeriveMoves::names`),
+    /// made once per `m`.
+    pub(crate) fn moved_fn_names(&self, m: &mut DeriveMoves) {
+        if m.names.is_some() {
+            return;
+        }
+        let mut names = FxMap::default();
+        for i in 0..self.fns.len() {
+            let f = LocalDefId(i as u32);
+            if self.sig_moves(m, self.def_id(f)) {
+                names.insert(self.fn_info(f).name, ());
+            }
+        }
+        m.names = Some(names);
     }
 
     /// `derive_key_moves` for a `Sig` key (memoized in `m`).

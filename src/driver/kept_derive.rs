@@ -91,6 +91,8 @@ pub(super) fn apply_derives(
     let (is_dirty, has_checked) = {
         let prog: &Program = p;
         let mut moves = crate::driver::graph::DeriveMoves::new(&reach);
+        prog.moved_fn_names(&mut moves);
+        crate::driver::laps::mark("kept/derive names");
         let def_slot = |d: crate::def::DefId| prog.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
         let answers = &mut caches.gen_reuse.memo;
         caches.read_index.dirty_slots(prog, &mut caches.slot_reads, &mut |k| prog.derive_key_moves(&mut moves, k), &def_slot, answers)
