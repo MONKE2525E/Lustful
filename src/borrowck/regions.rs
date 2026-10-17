@@ -36,6 +36,8 @@ use crate::ty::*;
 mod fnptr;
 mod replay;
 mod store;
+mod supers;
+pub use supers::check_impl_supers;
 pub(crate) use fnptr::{lub_items_fit, lub_shapes_fit, paired_slot_regions, ptr_free};
 
 /// The variance of a type position.
@@ -248,6 +250,10 @@ pub struct RegionTables {
     /// The trait bounds of user Adts (`struct W<Q: Tk<A>, A>`), regions
     /// kept, by def: building a value replays them (`replay_adt`).
     pub adt_bounds: FxMap<DefId, Vec<Predicate>>,
+    /// The trait bounds of user traits (supertraits and where-clauses),
+    /// regions kept, by def: each impl owes them by regions too
+    /// (`check_impl_supers`).
+    pub trait_preds: FxMap<DefId, Vec<Predicate>>,
     /// Declared outlives facts between an Adt's lifetime params
     /// (`struct H<'a, 'b: 'a>`), by def: `(x, y)` is `'x: 'y` by param
     /// index, `y == STATIC_FACT` is `'static`. Every use of the type must

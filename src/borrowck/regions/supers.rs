@@ -1,0 +1,568 @@
+// Regions of an impl's trait obligations (tf-borrow round 10).
+//
+// `impl<'a> Sup<&'a u32> for S {}` with `trait Sup<A>: Tk<A>` owes
+// `S: Tk<&'a u32>` for every `'a`. Check proves it with regions erased, so
+// `impl Tk<&'static u32> for S` passed; rustc rejects the impl (E0308,
+// lifetime mismatch). `check_impl_supers` takes each user trait impl and
+// each regioned bound of its trait (`RegionTables::trait_preds`:
+// supertraits and where-clauses), puts the impl's header in, finds the one
+// impl that matches (as `replay.rs` does at calls), and collects what its
+// header, its `'x: 'y` facts and its own where-clauses (to a bounded depth)
+// need of the impl's lifetimes. Each need must follow from the impl's
+// declared facts and the implied bounds of its header. A bound that two
+// impls may match, a part lust does not look into (a type param of the
+// impl, a dyn, a projection) adds nothing, and an impl with trait
+// where-clauses (which may prove a bound) is left alone.
+use super::*;
+use std::rc::Rc;
+
+/// A region of the checked impl: `'static`, its lifetime param `k`, or one
+/// nothing here names (no need on it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Re {
+    Static,
+    Univ(u32),
+    Free,
+}
+
+/// The types and regions a regioned type is read under: the checked
+/// impl's own (`None`), or a trait's or a selected impl's params.
+#[derive(Default)]
+struct Frame {
+    tys: FxMap<u32, Val>,
+    lts: FxMap<u32, Re>,
+}
+
+#[derive(Clone)]
+struct Val(Ty, Option<Rc<Frame>>);
+
+/// One header match: the selected impl's params and the needs `x: y`.
+#[derive(Default)]
+struct Match {
+    tys: FxMap<u32, Val>,
+    lts: FxMap<u32, Re>,
+    needs: Vec<(Re, Re)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    Yes,
+    No,
+    Maybe,
+}
+
+impl Fit {
+    fn and(self, o: Fit) -> Fit {
+        match (self, o) {
+            (Fit::No, _) | (_, Fit::No) => Fit::No,
+            (Fit::Maybe, _) | (_, Fit::Maybe) => Fit::Maybe,
+            _ => Fit::Yes,
+        }
+    }
+}
+
+const MAX_DEPTH: u32 = 4;
+
+struct Cx<'p> {
+    p: &'p Program,
+    /// Traits the checked impl's where-clauses may prove (with supertraits).
+    own: Vec<DefId>,
+    /// `x: y` between the checked impl's regions.
+    needs: Vec<(Re, Re)>,
+    /// `T: y` for the checked impl's type param `T`.
+    ty_needs: Vec<(u32, Re)>,
+    steps: u32,
+}
+
+/// Checks the trait obligations of every user trait impl by regions (see
+/// the file comment). Runs once collect has every impl and trait table.
+pub fn check_impl_supers(p: &Program) -> Vec<Diag> {
+    let mut errs = Vec::new();
+    if p.regions.trait_preds.is_empty() {
+        return errs;
+    }
+    for (_, rec) in p.gx.index.all_impls() {
+        if !rec.local || rec.synthetic != crate::traits::index::Synthetic::None {
+            continue;
+        }
+        let Some(preds) = p.regions.trait_preds.get(&rec.trait_def) else { continue };
+        // An impl with no regions in its header, facts or where-clauses
+        // (collect keeps none): its erased header, for `T: 'static` needs.
+        let plain;
+        let ir = match p.regions.impl_regions.get(&rec.def) {
+            Some(ir) => ir,
+            None => {
+                let header = p.tys.args(rec.trait_ref.args).iter().filter_map(|g| g.as_ty()).collect();
+                plain = ImplRegions { header, facts: Vec::new(), preds: Vec::new(), assoc: Vec::new() };
+                &plain
+            }
+        };
+        if let Some(d) = check_impl(p, rec, ir, preds) {
+            errs.push(d);
+        }
+    }
+    errs
+}
+
+fn check_impl(p: &Program, rec: &crate::traits::index::ImplRecord, ir: &ImplRegions, preds: &[Predicate]) -> Option<Diag> {
+    let mut frame = Frame::default();
+    for (j, &t) in ir.header.iter().enumerate() {
+        frame.tys.insert(j as u32, Val(t, None));
+    }
+    if let Some(h) = p.regions.impl_heads.get(&rec.def) {
+        for (k, &r) in h.trait_lifetimes.iter().enumerate() {
+            frame.lts.insert(k as u32, outer_re(r));
+        }
+    }
+    let frame = Rc::new(frame);
+    // A trait where-clause of the impl may prove a bound on its trait or a
+    // supertrait of it, at any depth: those bounds add nothing.
+    let mut own: Vec<DefId> = ir.preds.iter().filter_map(|q| if let Predicate::Trait(b) = q { Some(b.value.def) } else { None }).collect();
+    let mut i = 0;
+    while i < own.len() {
+        if let Some(tr) = p.gx.index.trait_record(own[i]) {
+            for q in &tr.generics.predicates {
+                if let Predicate::Trait(b) = q
+                    && !own.contains(&b.value.def)
+                {
+                    own.push(b.value.def);
+                }
+            }
+        }
+        i += 1;
+    }
+    let mut cx = Cx { p, own, needs: Vec::new(), ty_needs: Vec::new(), steps: 0 };
+    let mut bad = None;
+    for pred in preds {
+        let Predicate::Trait(b) = *pred else { continue };
+        if b.count != 0 || p.gx.lang.is_fn_family(b.value.def) {
+            continue;
+        }
+        cx.needs.clear();
+        cx.ty_needs.clear();
+        cx.oblige(b.value, &frame, 0);
+        let known = known_facts(p, ir);
+        if let Some(&(_, y)) = cx.needs.iter().find(|&&(x, y)| !holds(&known, x, y)) {
+            bad = Some((b.value.def, "a lifetime in the impl's header", y));
+            break;
+        }
+        let ty_known = known_ty_facts(p, ir);
+        if let Some(&(_, y)) = cx.ty_needs.iter().find(|&&(j, y)| !ty_holds(&known, &ty_known, j, y)) {
+            bad = Some((b.value.def, "a type parameter of the impl", y));
+            break;
+        }
+    }
+    let (goal, what, y) = bad?;
+    let name = |d: DefId| p.gx.index.trait_record(d).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
+    let life = if y == Re::Static { "`'static`" } else { "a lifetime of the impl" };
+    Some(Diag::new(
+        "L0617",
+        rec.span,
+        format!(
+            "{what} may not live long enough: this impl of `{}` owes `{g}`, and the `{g}` impl it selects needs it to outlive {life}",
+            name(rec.trait_def),
+            g = name(goal)
+        ),
+        "Write the lifetimes the selected impl has (for example `'static`), or add the bound it needs (`'a: 'b`, `T: 'static`).",
+    ))
+}
+
+/// The checked impl's known `x: y` facts: declared ones and the implied
+/// bounds of its header types (`&'a &'b T`: `'b: 'a`; an Adt's declared
+/// facts).
+fn known_facts(p: &Program, ir: &ImplRegions) -> Vec<(Re, Re)> {
+    let mut out: Vec<(Re, Re)> = ir
+        .facts
+        .iter()
+        .map(|&(a, b)| (Re::Univ(a), if b == crate::check::generics::STATIC_FACT { Re::Static } else { Re::Univ(b) }))
+        .collect();
+    for &t in &ir.header {
+        let mut fs = Vec::new();
+        implied_regioned(&p.tys, t, &mut Vec::new(), &mut fs);
+        adt_facts_in(p, t, &mut fs);
+        out.extend(fs.into_iter().map(|(a, b)| (outer_re(a), outer_re(b))));
+    }
+    out
+}
+
+/// The declared `'x: 'y` facts of the user Adts in `t`, at their args.
+fn adt_facts_in(p: &Program, t: Ty, out: &mut Vec<(Region, Region)>) {
+    match p.tys.kind(t) {
+        TyKind::Adt(def, args) => {
+            let lts: Vec<Region> = p.tys.args(args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).collect();
+            for &(a, b) in p.regions.adt_facts.get(&def).map_or(&[][..], |v| v.as_slice()) {
+                let y = if b == crate::check::generics::STATIC_FACT { Some(Region::Static) } else { lts.get(b as usize).copied() };
+                if let (Some(&x), Some(y)) = (lts.get(a as usize), y) {
+                    out.push((x, y));
+                }
+            }
+            for g in p.tys.args(args) {
+                if let GenericArg::Ty(e) = *g {
+                    adt_facts_in(p, e, out);
+                }
+            }
+        }
+        TyKind::Ref(_, _, e) | TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => adt_facts_in(p, e, out),
+        TyKind::Tuple(ts) => {
+            for &e in p.tys.tys_of(ts) {
+                adt_facts_in(p, e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The checked impl's known `T: r` facts by type param: its `T: 'r`
+/// where-clauses and the implied bounds of its header (`&'a T`: `T: 'a`).
+fn known_ty_facts(p: &Program, ir: &ImplRegions) -> Vec<(u32, Re)> {
+    let mut out: Vec<(u32, Re)> = ir
+        .preds
+        .iter()
+        .filter_map(|q| match *q {
+            Predicate::TypeOutlives(t, r) => match p.tys.kind(t) {
+                TyKind::Param(j) => Some((j.0, outer_re(r))),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    for &t in &ir.header {
+        params_under_refs(p, t, &mut Vec::new(), &mut out);
+    }
+    out
+}
+
+/// `T: 'r` for each type param `T` inside a reference `&'r ..` of `t`.
+fn params_under_refs(p: &Program, t: Ty, outer: &mut Vec<Re>, out: &mut Vec<(u32, Re)>) {
+    match p.tys.kind(t) {
+        TyKind::Param(j) => out.extend(outer.iter().map(|&r| (j.0, r))),
+        TyKind::Ref(r, _, e) => {
+            outer.push(outer_re(r));
+            params_under_refs(p, e, outer, out);
+            outer.pop();
+        }
+        TyKind::Adt(_, args) => {
+            for g in p.tys.args(args) {
+                if let GenericArg::Ty(e) = *g {
+                    params_under_refs(p, e, outer, out);
+                }
+            }
+        }
+        TyKind::Tuple(ts) => {
+            for &e in p.tys.tys_of(ts) {
+                params_under_refs(p, e, outer, out);
+            }
+        }
+        TyKind::Array(e, _) | TyKind::Slice(e) => params_under_refs(p, e, outer, out),
+        _ => {}
+    }
+}
+
+/// True when the checked impl's type param `j` outlives `y` by `ty_known`
+/// and the region facts.
+fn ty_holds(known: &[(Re, Re)], ty_known: &[(u32, Re)], j: u32, y: Re) -> bool {
+    y == Re::Free || ty_known.iter().any(|&(k, r)| k == j && holds(known, r, y))
+}
+
+fn outer_re(r: Region) -> Re {
+    match r {
+        Region::Static => Re::Static,
+        Region::Param(k) => Re::Univ(k),
+        _ => Re::Free,
+    }
+}
+
+/// True when `x: y` follows from `known` (transitively; `'static`
+/// outlives every region).
+fn holds(known: &[(Re, Re)], x: Re, y: Re) -> bool {
+    if x == y || x == Re::Static || x == Re::Free || y == Re::Free {
+        return true;
+    }
+    let mut seen = vec![x];
+    let mut i = 0;
+    while i < seen.len() {
+        let a = seen[i];
+        i += 1;
+        for &(u, v) in known {
+            if u == a && !seen.contains(&v) {
+                if v == y || v == Re::Static {
+                    return true;
+                }
+                seen.push(v);
+            }
+        }
+    }
+    false
+}
+
+impl Cx<'_> {
+    /// `args[0]: tr<args[1..]>` (read under `fr`) holds: add what the one
+    /// impl that matches needs.
+    fn oblige(&mut self, tr: TraitRef, fr: &Rc<Frame>, depth: u32) {
+        let p = self.p;
+        self.steps += 1;
+        if depth > MAX_DEPTH || self.steps > 256 || self.own.contains(&tr.def) {
+            return;
+        }
+        // A std trait none of whose impls ties regions: nothing to learn
+        // (and its impl list is long).
+        if !p.gx.index.trait_record(tr.def).is_some_and(|r| r.local) && !p.regions.replay_traits(p).contains(&tr.def) {
+            return;
+        }
+        let args = p.tys.args(tr.args);
+        // A trait with lifetime params: its impls' lifetime args are not
+        // in the regioned headers.
+        if args.iter().any(|g| !matches!(g, GenericArg::Ty(_))) {
+            return;
+        }
+        let acts: Vec<Val> = args.iter().filter_map(|g| g.as_ty()).map(|t| Val(t, Some(fr.clone()))).collect();
+        let mut found: Option<(DefId, Match)> = None;
+        for &id in p.gx.index.impls_of_trait(tr.def) {
+            let rec = p.gx.index.get(id);
+            let pats: Vec<Ty> = match p.regions.impl_regions.get(&rec.def) {
+                Some(ir) => ir.header.clone(),
+                None => p.tys.args(rec.trait_ref.args).iter().filter_map(|g| g.as_ty()).collect(),
+            };
+            if pats.len() != acts.len() {
+                return;
+            }
+            let mut m = Match::default();
+            let mut fit = Fit::Yes;
+            for (&pat, a) in pats.iter().zip(&acts) {
+                fit = fit.and(self.match_ty(pat, a.clone(), &mut m));
+                if fit == Fit::No {
+                    break;
+                }
+            }
+            match fit {
+                Fit::No => {}
+                Fit::Maybe => return,
+                Fit::Yes if found.is_some() => return,
+                Fit::Yes => found = Some((rec.def, m)),
+            }
+        }
+        let Some((def, m)) = found else { return };
+        self.needs.extend(m.needs.iter().copied());
+        let Some(ir) = p.regions.impl_regions.get(&def) else { return };
+        let lt = |k: u32| m.lts.get(&k).copied().unwrap_or(Re::Free);
+        for &(a, b) in &ir.facts {
+            let y = if b == crate::check::generics::STATIC_FACT { Re::Static } else { lt(b) };
+            self.needs.push((lt(a), y));
+        }
+        let sel = Rc::new(Frame { tys: m.tys, lts: m.lts });
+        for pred in &ir.preds {
+            match *pred {
+                Predicate::Outlives(a, b) => {
+                    let (x, y) = (self.re(a, &Some(sel.clone())), self.re(b, &Some(sel.clone())));
+                    self.needs.push((x, y));
+                }
+                Predicate::TypeOutlives(t, r) => {
+                    let y = self.re(r, &Some(sel.clone()));
+                    let (mut rs, mut ps) = (Vec::new(), Vec::new());
+                    self.regions_in(Val(t, Some(sel.clone())), &mut rs, &mut ps, 0);
+                    for x in rs {
+                        self.needs.push((x, y));
+                    }
+                    for j in ps {
+                        self.ty_needs.push((j, y));
+                    }
+                }
+                Predicate::Trait(b) if b.count == 0 => self.oblige(b.value, &sel, depth + 1),
+                _ => {}
+            }
+        }
+    }
+
+    /// The region `r` read under frame `fr` (`None`: the checked impl's).
+    fn re(&self, r: Region, fr: &Option<Rc<Frame>>) -> Re {
+        match (r, fr) {
+            (Region::Static, _) => Re::Static,
+            (Region::Param(k), None) => Re::Univ(k),
+            (Region::Param(k), Some(f)) => f.lts.get(&k).copied().unwrap_or(Re::Free),
+            _ => Re::Free,
+        }
+    }
+
+    /// Follows a type param to what its frame binds it to. A param of the
+    /// checked impl (no frame) stays; an unbound one is `None`.
+    fn norm(&self, mut v: Val) -> Option<Val> {
+        loop {
+            let TyKind::Param(j) = self.p.tys.kind(v.0) else { return Some(v) };
+            let Some(f) = &v.1 else { return Some(v) };
+            v = f.tys.get(&j.0)?.clone();
+        }
+    }
+
+    /// The checked impl's regions in `v`, and its type params there.
+    fn regions_in(&self, v: Val, out: &mut Vec<Re>, params: &mut Vec<u32>, depth: u32) {
+        let p = self.p;
+        let Some(Val(t, fr)) = self.norm(v) else { return };
+        if depth > 16 {
+            return;
+        }
+        match p.tys.kind(t) {
+            TyKind::Param(j) if fr.is_none() => params.push(j.0),
+            TyKind::Ref(r, _, e) => {
+                out.push(self.re(r, &fr));
+                self.regions_in(Val(e, fr), out, params, depth + 1);
+            }
+            TyKind::Adt(_, args) => {
+                for g in p.tys.args(args) {
+                    match *g {
+                        GenericArg::Lifetime(r) => out.push(self.re(r, &fr)),
+                        GenericArg::Ty(e) => self.regions_in(Val(e, fr.clone()), out, params, depth + 1),
+                        GenericArg::Const(_) => {}
+                    }
+                }
+            }
+            TyKind::Tuple(ts) => {
+                for &e in p.tys.tys_of(ts) {
+                    self.regions_in(Val(e, fr.clone()), out, params, depth + 1);
+                }
+            }
+            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::RawPtr(_, e) => self.regions_in(Val(e, fr), out, params, depth + 1),
+            _ => {}
+        }
+    }
+
+    /// A selected impl's header region `pr` against the obligation's `o`:
+    /// `'static` needs `o: 'static`; the impl's `'x` binds once, and a
+    /// second use needs the two equal.
+    fn match_re(&self, pr: Region, o: Re, m: &mut Match) {
+        match pr {
+            Region::Static => m.needs.push((o, Re::Static)),
+            Region::Param(k) => match m.lts.get(&k) {
+                Some(&x) => {
+                    m.needs.push((x, o));
+                    m.needs.push((o, x));
+                }
+                None => {
+                    m.lts.insert(k, o);
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// Matches a selected impl's header type `pat` (its own params and
+    /// lifetimes) against the obligation's type `o`.
+    fn match_ty(&self, pat: Ty, o: Val, m: &mut Match) -> Fit {
+        let p = self.p;
+        if let TyKind::Param(j) = p.tys.kind(pat) {
+            return match m.tys.get(&j.0).cloned() {
+                Some(prev) => self.equate(prev, o, m),
+                None => {
+                    m.tys.insert(j.0, o);
+                    Fit::Yes
+                }
+            };
+        }
+        let Some(Val(ot, ofr)) = self.norm(o) else { return Fit::Maybe };
+        match (p.tys.kind(pat), p.tys.kind(ot)) {
+            (TyKind::Ref(pr, pm, pi), TyKind::Ref(or, om, oi)) => {
+                if pm != om {
+                    return Fit::No;
+                }
+                let x = self.re(or, &ofr);
+                let fit = self.match_ty(pi, Val(oi, ofr), m);
+                if fit == Fit::Yes {
+                    self.match_re(pr, x, m);
+                }
+                fit
+            }
+            (TyKind::Adt(pd, pa), TyKind::Adt(od, oa)) => {
+                if pd != od {
+                    return Fit::No;
+                }
+                let (pa, oa) = (p.tys.args(pa).to_vec(), p.tys.args(oa).to_vec());
+                if pa.len() != oa.len() {
+                    return Fit::Maybe;
+                }
+                let mut fit = Fit::Yes;
+                let mut lts = Vec::new();
+                for (g, h) in pa.iter().zip(&oa) {
+                    match (*g, *h) {
+                        (GenericArg::Ty(a), GenericArg::Ty(b)) => fit = fit.and(self.match_ty(a, Val(b, ofr.clone()), m)),
+                        (GenericArg::Lifetime(a), GenericArg::Lifetime(b)) => lts.push((a, self.re(b, &ofr))),
+                        _ => {}
+                    }
+                    if fit == Fit::No {
+                        return fit;
+                    }
+                }
+                if fit == Fit::Yes {
+                    for (a, x) in lts {
+                        self.match_re(a, x, m);
+                    }
+                }
+                fit
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) => {
+                let (a, b) = (p.tys.tys_of(a).to_vec(), p.tys.tys_of(b).to_vec());
+                if a.len() != b.len() {
+                    return Fit::No;
+                }
+                a.iter().zip(&b).fold(Fit::Yes, |f, (&x, &y)| if f == Fit::No { f } else { f.and(self.match_ty(x, Val(y, ofr.clone()), m)) })
+            }
+            (TyKind::Slice(a), TyKind::Slice(b)) | (TyKind::Array(a, _), TyKind::Array(b, _)) => self.match_ty(a, Val(b, ofr), m),
+            // A param of the checked impl, a dyn, a fn pointer, a
+            // projection, or a shape this walk does not read.
+            (_, TyKind::Param(_) | TyKind::Projection(..) | TyKind::Dyn(..) | TyKind::FnPtr(_) | TyKind::Opaque(..) | TyKind::Infer(_) | TyKind::Error) => {
+                Fit::Maybe
+            }
+            (TyKind::Dyn(..) | TyKind::FnPtr(_) | TyKind::Projection(..), _) => Fit::Maybe,
+            (pk, ok) if scalar(&pk) || scalar(&ok) => {
+                if pk == ok {
+                    Fit::Yes
+                } else {
+                    Fit::No
+                }
+            }
+            (pk, ok) if std::mem::discriminant(&pk) != std::mem::discriminant(&ok) => Fit::No,
+            _ => Fit::Maybe,
+        }
+    }
+
+    /// Two obligation-side types that one impl param binds twice: their
+    /// regions are equal, slot by slot. Maybe when the shapes do not pair.
+    fn equate(&self, a: Val, b: Val, m: &mut Match) -> Fit {
+        let p = self.p;
+        let (Some(Val(at, af)), Some(Val(bt, bf))) = (self.norm(a), self.norm(b)) else { return Fit::Maybe };
+        match (p.tys.kind(at), p.tys.kind(bt)) {
+            (TyKind::Ref(ar, am, ai), TyKind::Ref(br, bm, bi)) if am == bm => {
+                let (x, y) = (self.re(ar, &af), self.re(br, &bf));
+                m.needs.push((x, y));
+                m.needs.push((y, x));
+                self.equate(Val(ai, af), Val(bi, bf), m)
+            }
+            (TyKind::Adt(ad, aa), TyKind::Adt(bd, ba)) if ad == bd => {
+                let (aa, ba) = (p.tys.args(aa).to_vec(), p.tys.args(ba).to_vec());
+                let mut fit = Fit::Yes;
+                for (g, h) in aa.iter().zip(&ba) {
+                    match (*g, *h) {
+                        (GenericArg::Ty(x), GenericArg::Ty(y)) => fit = fit.and(self.equate(Val(x, af.clone()), Val(y, bf.clone()), m)),
+                        (GenericArg::Lifetime(x), GenericArg::Lifetime(y)) => {
+                            let (x, y) = (self.re(x, &af), self.re(y, &bf));
+                            m.needs.push((x, y));
+                            m.needs.push((y, x));
+                        }
+                        _ => {}
+                    }
+                }
+                fit
+            }
+            (TyKind::Tuple(x), TyKind::Tuple(y)) => {
+                let (x, y) = (p.tys.tys_of(x).to_vec(), p.tys.tys_of(y).to_vec());
+                x.iter().zip(&y).fold(Fit::Yes, |f, (&a, &b)| f.and(self.equate(Val(a, af.clone()), Val(b, bf.clone()), m)))
+            }
+            (TyKind::Slice(x), TyKind::Slice(y)) | (TyKind::Array(x, _), TyKind::Array(y, _)) => self.equate(Val(x, af), Val(y, bf), m),
+            (x, y) if scalar(&x) && x == y => Fit::Yes,
+            (TyKind::Param(x), TyKind::Param(y)) if x == y && af.is_none() && bf.is_none() => Fit::Yes,
+            _ => Fit::Maybe,
+        }
+    }
+}
+
+fn scalar(k: &TyKind) -> bool {
+    matches!(k, TyKind::Unit | TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Never)
+}

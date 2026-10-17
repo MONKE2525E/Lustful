@@ -6863,6 +6863,14 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
             ss.self_ty = Some(self_ty);
             let required =
                 regioned_bound_tys(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &ss, &tdef_generics, &tdef_where, &[(self_ty, &tdef_bounds)]);
+            // Its trait bounds with regions: each impl owes them by regions
+            // too (`borrowck::check_impl_supers`).
+            let (_, preds) =
+                regioned_bound_preds(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, &ss, &tdef_generics, &tdef_where, &[(self_ty, &tdef_bounds)]);
+            let preds: Vec<Predicate> = preds.into_iter().filter(|q| matches!(q, Predicate::Trait(b) if b.count == 0)).collect();
+            if !preds.is_empty() && !p.in_lang_methods(p.ast.items[item_i].span) && p.shipped_crate_at(p.ast.items[item_i].span).is_none() {
+                p.regions.trait_preds.insert(trait_def, preds);
+            }
             let item = crate::check::outlives::Item {
                 implied: Vec::new(),
                 required,
@@ -13936,6 +13944,7 @@ pub fn finish_collect(p: &mut Program, errs: &mut Vec<Diag>) {
     p.gx.derive_marks[2] = p.fns.len();
     check_written_wf(p, errs, None);
     crate::check::outlives::check_all(p, errs);
+    errs.extend(crate::borrowck::check_impl_supers(p));
     crate::driver::laps::mark("collect/finish wf+outlives");
     normalize_signatures(p);
     crate::check::coherence_std::add_std_shadow_impls(p);
