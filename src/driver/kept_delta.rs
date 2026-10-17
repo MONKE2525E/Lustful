@@ -738,8 +738,10 @@ pub(super) fn replay_discovery(
             let own = bases.iter().find(|b| b.0 == g.0 as usize).map(|b| b.1.as_ref());
             let newer = reuse.newer(p, g, p.reuse_stamp, start);
             let base = if newer {
-                match own {
-                    Some(b) => b.cloned(),
+                // Another collect replaced the entry: the output the program
+                // has is its base, or the one kept for it (`GenReuse::hold`).
+                match own.map(|b| b.cloned()).or_else(|| reuse.held_copy(p, g, p.reuse_stamp).map(Some)) {
+                    Some(b) => b,
                     None => {
                         stop = Some("sig mode");
                         break;

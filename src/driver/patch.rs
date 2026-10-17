@@ -2292,6 +2292,7 @@ pub(super) fn reuse_kept(
             // for the next request, which redoes these headers with its
             // own (sigedit R9: a rejected header edit, then its fix).
             if intact {
+                caches.gen_reuse.hold(p.reuse_stamp);
                 front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true, recheck });
             }
             return Err(why);
@@ -2318,6 +2319,7 @@ pub(super) fn reuse_kept(
                 // rejected derive edit, then its revert). Not after a header delta
                 // of this request: its writes stand.
                 if intact && headers.is_empty() {
+                    caches.gen_reuse.hold(p.reuse_stamp);
                     front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: false, recheck });
                 }
                 return Err(why);
@@ -2365,7 +2367,7 @@ pub(super) fn reuse_kept(
         (p.record_reads, p.unwind) = (record_reads, unwind);
         if !stands {
             if headers.is_empty() && derives.is_empty() {
-                put_back(front, p, edits, bases, recheck);
+                put_back(front, caches, p, edits, bases, recheck);
             }
             return Err("hidden type");
         }
@@ -2495,7 +2497,7 @@ pub(super) fn reuse_kept(
     (p.record_reads, p.unwind) = (record_reads, unwind);
     if let Some(why) = refused {
         if intact {
-            put_back(front, p, edits, bases, recheck);
+            put_back(front, caches, p, edits, bases, recheck);
         }
         return Err(why);
     }
@@ -2509,8 +2511,10 @@ pub(super) fn reuse_kept(
 /// nothing to it but its moved spans (the edits say so): the request then
 /// collects in full, and when that answers with errors the program stays
 /// for the next request (`keep_err`), as after a refused header delta (an
-/// edit with a body error, then its fix or revert).
-fn put_back(front: &mut Front, p: crate::check::collect::Program, edits: Vec<KeptEdit>, bases: Vec<KeptBase>, recheck: Vec<usize>) {
+/// edit with a body error, then its fix or revert). The discovery outputs it
+/// has stay known when that collect replaces them (`GenReuse::hold`).
+fn put_back(front: &mut Front, caches: &mut Caches, p: crate::check::collect::Program, edits: Vec<KeptEdit>, bases: Vec<KeptBase>, recheck: Vec<usize>) {
+    caches.gen_reuse.hold(p.reuse_stamp);
     let slot = usize::from(p.gx.walk_instances);
     front.kept[slot] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true, recheck });
 }

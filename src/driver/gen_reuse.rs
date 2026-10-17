@@ -224,6 +224,11 @@ pub struct GenReuse {
     /// pending (`Checked::closure_map_pending`, no error) also keeps that
     /// check's source hash and reads (`pending_untouched`).
     unstored: FxMap<DefId, (u64, OutCopy, Option<(u64, Reads)>)>,
+    /// For a kept program put back after a refused delta (`hold`): its
+    /// `Program::reuse_stamp`, and the discovery output it has for each def
+    /// whose entry or note a later collect replaced (the full collect that
+    /// answered that request, often with errors).
+    held: Option<(u64, FxMap<DefId, OutCopy>)>,
     /// Node answers of this collect's program, for read replays (and the
     /// derive delta's keyed walk, graph.rs `ReadIndex::dirty_slots`).
     pub(crate) memo: FxMap<ReadKey, Read>,
@@ -286,6 +291,7 @@ impl GenReuse {
         self.readers_index.clear();
         self.readers_pushed = 0;
         self.unstored.clear();
+        self.held = None;
     }
 
     /// Drops the entries a collect under `env` stored or replayed (a
@@ -294,7 +300,49 @@ impl GenReuse {
     pub fn drop_env(&mut self, env: u64) {
         self.templates.retain(|_, e| e.env != env);
         self.closure_templates.retain(|_, e| e.env != env);
+        let gone: Vec<DefId> = self.discovery.iter().filter(|(_, e)| e.env == env).map(|(d, _)| *d).collect();
+        for def in gone {
+            self.keep_held(def);
+        }
         self.discovery.retain(|_, e| e.env != env);
+    }
+
+    /// Starts to keep the discovery outputs the kept program with stamp `lo`
+    /// has, for the defs whose entry or note later collects replace
+    /// (driver/patch.rs: a refused delta puts its program back for the next
+    /// request, and the full collect that answers in between stores its own).
+    pub(crate) fn hold(&mut self, lo: u64) {
+        if self.held.as_ref().is_none_or(|h| h.0 != lo) {
+            self.held = Some((lo, FxMap::default()));
+        }
+    }
+
+    /// Before the entry or note of `def` changes: keeps the output the held
+    /// program has for it, when the current one is no newer than its stamp
+    /// (a note comes after any entry of the same def: `store_discovered`
+    /// drops it).
+    fn keep_held(&mut self, def: DefId) {
+        let Some((lo, map)) = &self.held else { return };
+        if map.contains_key(&def) {
+            return;
+        }
+        let stamp = self.unstored.get(&def).map(|n| n.0).or_else(|| self.discovery.get(&def).map(|e| e.stamp));
+        if stamp.is_some_and(|s| s <= *lo)
+            && let Some(copy) = self.out_copy(def)
+            && let Some((_, map)) = &mut self.held
+        {
+            map.insert(def, copy);
+        }
+    }
+
+    /// The discovery output the kept program with stamp `lo` has for fn
+    /// `f`, when a later collect replaced its entry or note (`hold`).
+    pub(crate) fn held_copy(&self, p: &Program, f: LocalDefId, lo: u64) -> Option<OutCopy> {
+        let (held_lo, map) = self.held.as_ref()?;
+        if *held_lo != lo {
+            return None;
+        }
+        map.get(&p.def_id(f)).cloned()
     }
 
     /// Notes that a fresh discovery check of `f` stored nothing.
@@ -308,6 +356,7 @@ impl GenReuse {
         vtables: &[(OwnedTy, OwnedTy)],
         pending: Option<&Reads>,
     ) {
+        self.keep_held(p.def_id(f));
         let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
         let copy = OutCopy { adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec(), vtables: vtables.to_vec() };
         let pending = pending.filter(|_| self.on).and_then(|r| Some((self.src_of(p, f)?, with_own_sig(p, f, r))));
@@ -867,6 +916,7 @@ impl GenReuse {
             return;
         }
         let Some(src) = self.src_of(p, f) else { return };
+        self.keep_held(p.def_id(f));
         let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
         let reads = with_own_sig(p, f, reads);
         let entry = DiscoveryEntry {
