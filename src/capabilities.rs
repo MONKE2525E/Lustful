@@ -1628,6 +1628,8 @@ const REJECTED: &[(&str, &str)] = &[
     ("destructuring in `let` without an initializer", "L9001"),
     ("non-scalar const patterns", "L9001"),
     ("match guards over a by-value slice-pattern middle", "L9001"),
+    ("match guards over a bound map Entry payload", "L9001"),
+    ("a map Entry variant matched through a reference or with this payload pattern", "L9001"),
     ("ranges outside `for` loops", "L9001"),
     ("std items lust does not have yet, by module path (named in the message)", "L0505"),
     ("refutable patterns here (in `let` and parameters)", "L9001"),
