@@ -63,7 +63,9 @@ pub(crate) struct HeaderEdit {
 /// was (a refusal before any write, a diagnostic of a new signature, or
 /// a hidden type that moved before any template checked again: the old
 /// records go back, and the caller may keep it for the next request,
-/// sigedit R9) or half edited (it must be dropped).
+/// sigedit R9) or half edited (it must be dropped). On Ok, the errors of
+/// the templates that failed their check again are in
+/// `Caches::delta_template_errs` (by template), for `reuse_kept` to answer.
 #[allow(dead_code)] // The item patch (sigedit P1.3) calls it from `reuse_kept`.
 pub(crate) fn apply_headers(
     p: &mut Program,
@@ -74,7 +76,12 @@ pub(crate) fn apply_headers(
     walk_instances: bool,
     bases: &mut Bases,
 ) -> Result<(), (&'static str, bool)> {
+    caches.delta_template_errs = Some(Vec::new());
     let out = apply(p, front, caches, reach, edits, walk_instances, bases);
+    let template_errs = caches.delta_template_errs.take().unwrap_or_default();
+    if out.is_ok() {
+        caches.delta_template_errs = Some(template_errs);
+    }
     // The keys this delta can move, for the compile tail's keyed walk.
     if out.is_ok() {
         let mut fns: Vec<usize> = edits.iter().map(|e| e.fn_index).collect();
@@ -313,7 +320,12 @@ pub(super) fn recheck_template(p: &mut Program, f: LocalDefId, old: &[(u32, u32)
     let errs = generics::check_template(p, f, &mut caches.gen_reuse);
     (p.gx.mono_counts, p.gx.mono_done) = (counts, mono_done);
     if !errs.is_empty() {
-        return Err("sig diag");
+        // In a header delta the errors are collect's answer (`reuse_kept`);
+        // the hidden type test below still refuses an `impl Trait` it moved.
+        match caches.delta_template_errs.as_mut() {
+            Some(all) => all.push((f.0 as usize, errs)),
+            None => return Err("sig diag"),
+        }
     }
     if p.gx.opaque_hidden.get(&od).copied() != hidden {
         return Err("hidden type");

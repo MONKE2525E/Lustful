@@ -2297,6 +2297,12 @@ pub(super) fn reuse_kept(
             return Err(why);
         }
     }
+    // Templates that a header delta found failing: their errors are this
+    // request's answer, as collect's template check gives them.
+    let mut header_template_errs: Vec<(usize, Vec<crate::diag::Diag>)> = caches.delta_template_errs.take().unwrap_or_default();
+    if walk_instances && !header_template_errs.is_empty() {
+        return Err("sig template");
+    }
     // Derive list edits: the derive delta toggles the synthetic records
     // and runs the checks derive lists feed again.
     let mut derives: Vec<usize> = edits.iter().filter_map(|e| e.derive).collect();
@@ -2371,6 +2377,11 @@ pub(super) fn reuse_kept(
     let mut template_errs = Vec::new();
     let mut seen: Vec<usize> = Vec::new();
     let mut errored: Vec<usize> = Vec::new();
+    for (t, errs) in header_template_errs.drain(..) {
+        errored.push(t);
+        seen.push(t);
+        template_errs.extend(errs);
+    }
     let edited = edits.iter().filter_map(|e| e.fn_index);
     for fn_index in edited.chain(recheck.iter().copied()) {
         let header = edits.iter().any(|x| x.header && x.fn_index == Some(fn_index));
