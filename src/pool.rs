@@ -8,7 +8,9 @@
 // One phase runs on the pool at a time. A `par_map` that finds the pool busy
 // (a nested call from inside a phase, a second compile on another daemon
 // thread, or a stopped pool) uses scoped threads, as every phase did before
-// the pool.
+// the pool. Background work (the daemon guard, `set_background`) never
+// takes the pool, so a check in flight does not hold it while a request is
+// served.
 //
 // `stop` ends every pool thread and keeps the pool stopped while its guard
 // lives. tcc's in-memory run forks (src/tcc.rs), and a fork copies only the
@@ -28,6 +30,25 @@ use std::thread::JoinHandle;
 /// its own work (`par_map` takes items from an atomic counter). Stored
 /// with its lifetime erased; see `run`.
 type Job = dyn Fn() + Sync + 'static;
+
+thread_local! {
+    /// Set on a background thread (the daemon guard, `set_background`) and
+    /// on every phase thread it starts: the cancel flag of its work.
+    static BACKGROUND: std::cell::RefCell<Option<std::sync::Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The unwind payload of background work whose cancel flag was set
+/// (`set_background`), raised at the start of its next `par_map`.
+pub struct Cancelled;
+
+/// Marks this thread's compiler work as background work with a cancel
+/// flag (None clears it). Its `par_map` phases never take the pool (they
+/// run on scoped threads, which inherit the thread's scheduling priority),
+/// so serve work keeps the pool's warm workers; and once `cancel` is set,
+/// the next phase unwinds with `Cancelled` instead of running.
+pub fn set_background(cancel: Option<std::sync::Arc<AtomicBool>>) {
+    BACKGROUND.with(|b| *b.borrow_mut() = cancel);
+}
 
 /// The name of every pool thread (also what /proc shows for it).
 const THREAD_NAME: &str = "lust-pool";
@@ -353,6 +374,10 @@ impl Drop for SmallPages {
 /// uneven items still spread over every thread. A panic in `f` resumes in
 /// the caller with its own payload.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let background = BACKGROUND.with(|b| b.borrow().clone());
+    if background.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+        resume_unwind(Box::new(Cancelled));
+    }
     let n = threads().min(items.len().max(1));
     if n <= 1 {
         return items.iter().map(f).collect();
@@ -378,13 +403,17 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
         let out = take();
         parts.lock().unwrap_or_else(|e| e.into_inner()).push(out);
     };
-    let chunks: Vec<Vec<(usize, R)>> = if run(n - 1, &job) {
+    let chunks: Vec<Vec<(usize, R)>> = if background.is_none() && run(n - 1, &job) {
         parts.into_inner().unwrap_or_else(|e| e.into_inner())
     } else {
+        // A background phase's threads carry its cancel flag, so their
+        // nested phases stay off the pool too.
+        let scoped = || {
+            set_background(background.clone());
+            take()
+        };
         std::thread::scope(|s| {
-            let handles: Vec<_> = (0..n)
-                .map(|_| thread(SCOPED_NAME).spawn_scoped(s, || take()).unwrap_or_else(|_| s.spawn(|| take())))
-                .collect();
+            let handles: Vec<_> = (0..n).map(|_| thread(SCOPED_NAME).spawn_scoped(s, scoped).unwrap_or_else(|_| s.spawn(scoped))).collect();
             handles.into_iter().map(|h| h.join().unwrap_or_else(|payload| resume_unwind(payload))).collect()
         })
     };

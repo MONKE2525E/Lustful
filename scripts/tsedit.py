@@ -668,14 +668,15 @@ class Bench:
 
 def guard_counts(log):
     """The daemon's background guard checks (src/daemon.rs): started, and
-    done as match, stale (an input changed during the check), or mismatch.
+    done as match, stale (an input changed during the check), cancelled (the
+    daemon saw an input change and stopped it), or mismatch.
     `guard_lines` counts the loud `guard:` lines; any one is a bug or a
     false alarm to look at, and a mismatch costs the next request a full
     fresh compile."""
     text = log.read_text() if log.exists() else ""
     done = lambda kind: len(re.findall(rf"^guard-check: done \d+ {kind}", text, re.M))  # noqa: E731
     return {"started": len(re.findall(r"^guard-check: start ", text, re.M)), "match": done("match"), "stale": done("stale"),
-            "mismatch": done("mismatch"), "guard_lines": len(re.findall(r"^guard:", text, re.M))}
+            "cancelled": done("cancelled"), "mismatch": done("mismatch"), "guard_lines": len(re.findall(r"^guard:", text, re.M))}
 
 
 def print_table(res):
@@ -683,7 +684,7 @@ def print_table(res):
           f"{res['rustc']}, {res['host']['nproc']} cpus; daemon first {res['daemon_first_ms']:.0f} ms, no-op {res['noop_ms']} ms")
     g = res.get("guard")
     if g:
-        print(f"guard checks: {g['started']} started, {g['match']} match, {g['stale']} stale, {g['mismatch']} mismatch, "
+        print(f"guard checks: {g['started']} started, {g['match']} match, {g['stale']} stale, {g.get('cancelled', 0)} cancelled, {g['mismatch']} mismatch, "
               f"{g['guard_lines']} guard: lines")
     print(f"{'kind':<8} {'ok':>4} {'rej':>4} {'lust med':>9} {'p95':>8} {'cargo med':>10} {'p95':>8} {'ratio':>8} {'p95':>8}"
           f"  {'FA':>3} {'FR':>3} {'w!=c':>4} {'hang':>4}")

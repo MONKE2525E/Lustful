@@ -63,6 +63,8 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
     fn getuid() -> u32;
     #[cfg(target_os = "linux")]
+    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    #[cfg(target_os = "linux")]
     fn inotify_init1(flags: i32) -> i32;
     #[cfg(target_os = "linux")]
     fn inotify_add_watch(fd: i32, path: *const u8, mask: u32) -> i32;
@@ -441,6 +443,9 @@ enum GuardOutcome {
     Panicked,
     /// This input changed after the warm compile started: no comparison is possible.
     Stale(PathBuf),
+    /// The serve loop saw this input changed while the check ran and
+    /// stopped it (`GuardJobs::cancel_stale`): a stale check, cut short.
+    Cancelled(PathBuf),
 }
 
 /// Every file a compile in `session` read for `req`: the root, each source
@@ -536,12 +541,43 @@ struct GuardJobs {
     rx: Receiver<GuardDone>,
     next_seq: u64,
     pending: usize,
+    /// The checks in flight, for `cancel_stale`.
+    running: Vec<RunningGuard>,
 }
+
+/// One check in flight: the warm inputs it compares under, the warm
+/// compile's start, and its cancel flag (`pool::set_background`).
+struct RunningGuard {
+    seq: u64,
+    inputs: Vec<PathBuf>,
+    start: std::time::SystemTime,
+    cancel: std::sync::Arc<AtomicBool>,
+    /// The changed input that cancelled it.
+    why: Option<PathBuf>,
+}
+
+/// The nice value of a guard thread and the phase threads it starts
+/// (Linux threads inherit it): serve work runs first when both want a core.
+#[cfg(target_os = "linux")]
+const GUARD_NICE: i32 = 10;
 
 impl GuardJobs {
     fn new() -> GuardJobs {
         let (tx, rx) = std::sync::mpsc::channel();
-        GuardJobs { tx, rx, next_seq: 0, pending: 0 }
+        GuardJobs { tx, rx, next_seq: 0, pending: 0, running: Vec::new() }
+    }
+
+    /// Cancels every check in flight whose inputs changed since its warm
+    /// compile started (the test the check itself applies when it ends:
+    /// its answer could only be stale). The serve loop calls it as a
+    /// request comes in. A check on unchanged inputs runs to its end.
+    fn cancel_stale(&mut self) {
+        for g in self.running.iter_mut().filter(|g| g.why.is_none()) {
+            if let Some(path) = changed_input(&g.inputs, g.start) {
+                g.cancel.store(true, Ordering::Relaxed);
+                g.why = Some(path);
+            }
+        }
     }
 
     /// Redoes `req` in a fresh session on a new thread. `inputs` are the
@@ -557,14 +593,28 @@ impl GuardJobs {
         eprintln!("guard-check: start {seq} for {}", req.file.display());
         let tx = self.tx.clone();
         let key = req.session.clone();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let mut watch = inputs.clone();
+        watch.push(req.file.clone());
+        watch.extend(crate_inputs(&req));
+        self.running.push(RunningGuard { seq, inputs: watch, start, cancel: cancel.clone(), why: None });
         // The guard compiles like the serve loop, so it gets the
         // compiler stack size (see `pool::STACK_SIZE`).
         let _ = crate::pool::thread("lust-guard").spawn(move || {
             let work_dir = dir.clone();
+            // Background work: off the pool, at a lower priority (on Linux,
+            // `setpriority` of process 0 sets this thread's nice), cancellable.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                setpriority(0, 0, GUARD_NICE)
+            };
+            crate::pool::set_background(Some(cancel.clone()));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 guard_hold();
                 let mut fresh = Session::new(work_dir, true, req.session.clone());
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile_background(&req, &mut fresh))) {
+                    // A cancelled check never compares, whatever its compile gave.
+                    _ if cancel.load(Ordering::Relaxed) => (GuardOutcome::Cancelled(PathBuf::new()), None),
                     Ok(resp) => {
                         guard_hold();
                         // req.file even when it did not parse (then no
@@ -592,8 +642,14 @@ impl GuardJobs {
 
     /// Applies every finished check. Runs only on the serve loop.
     fn drain(&mut self, sessions: &mut HashMap<SessionKey, Entry>) {
-        while let Ok(done) = self.rx.try_recv() {
+        while let Ok(mut done) = self.rx.try_recv() {
             self.pending -= 1;
+            if let Some(k) = self.running.iter().position(|g| g.seq == done.seq) {
+                let g = self.running.swap_remove(k);
+                if let (GuardOutcome::Cancelled(path), Some(why)) = (&mut done.outcome, g.why) {
+                    *path = why;
+                }
+            }
             apply_guard(sessions, done);
         }
     }
@@ -615,6 +671,10 @@ fn apply_guard(sessions: &mut HashMap<SessionKey, Entry>, mut done: GuardDone) {
         GuardOutcome::Stale(ref path) => {
             let _ = std::fs::remove_dir_all(&done.dir);
             eprintln!("guard-check: done {seq} stale for {file} ({} changed during the check)", path.display());
+        }
+        GuardOutcome::Cancelled(ref path) => {
+            let _ = std::fs::remove_dir_all(&done.dir);
+            eprintln!("guard-check: done {seq} cancelled for {file} ({} changed during the check)", path.display());
         }
         GuardOutcome::Panicked => {
             let _ = std::fs::remove_dir_all(&done.dir);
@@ -988,8 +1048,10 @@ pub fn serve(sock: &Path) -> ! {
                 // and guard compiles run on other threads here (src/tcc.rs).
                 assert!(req.run_args.is_none(), "the daemon wire carries no run arguments");
                 // Finished guard checks for this key land before its next
-                // compile, so a marked recompute takes effect here.
+                // compile, so a marked recompute takes effect here. Checks
+                // whose inputs changed since stop: they could only be stale.
                 jobs.drain(&mut sessions);
+                jobs.cancel_stale();
                 let entry = entry_for(&mut sessions, &base, &req.session, req.client.env.as_deref(), &mut made);
                 // Graph and build-script routing (sections 1.1, 1.8): if
                 // a covered file changed since this session was made,
@@ -1180,6 +1242,70 @@ mod tests {
         std::fs::write(&root, &text).unwrap();
         let done = guard_once(&req, warm, vec![root.clone()], start, base.join("f4"));
         assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == root), "a reverted root reads as stale");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A check whose inputs changed since its warm compile started is
+    /// cancelled when the serve loop next looks (`cancel_stale`): it ends as
+    /// `cancelled`, names the changed file, never compares and never
+    /// adopts. A check on unchanged inputs is not cancelled and matches.
+    /// Guard phases never take the pool, and cancelled work unwinds at
+    /// its next phase.
+    #[test]
+    fn guard_cancels_on_changed_inputs_only() {
+        let base = std::env::temp_dir().join(format!("lust-guard-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("main.rs");
+        let store = base.join("store.rs");
+        std::fs::write(&root, "mod store;\nfn main() {\n    store::put(1);\n}\n").unwrap();
+        std::fs::write(&store, "pub fn put(x: u8) -> u8 {\n    x + true\n}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let req = check_req(&root);
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let entry = entry_for(&mut sessions, &base.join("s"), &req.session, None, &mut 0);
+        let start = std::time::SystemTime::now();
+        let warm = driver::compile(&req, &mut entry.session);
+        assert_eq!(warm.code, 1, "store.rs has a type error: {}", warm.stderr);
+        let inputs = session_inputs(&entry.session, &req);
+
+        // Unchanged inputs: the check runs to its end and matches.
+        let mut jobs = GuardJobs::new();
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f1"), 1);
+        jobs.cancel_stale();
+        assert!(jobs.running.iter().all(|g| g.why.is_none()), "no input changed");
+        let done = jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends");
+        assert!(matches!(&done.outcome, GuardOutcome::Fresh(f) if f.stderr == warm.stderr && f.code == warm.code));
+
+        // A module file changed: cancelled, and the outcome names it.
+        write_later(&store, "pub fn put(x: u8) -> u8 {\n    x + 1\n}\n");
+        let mut jobs = GuardJobs::new();
+        jobs.spawn(req.clone(), warm.clone(), inputs, start, base.join("f2"), 1);
+        jobs.cancel_stale();
+        assert!(jobs.running.iter().all(|g| g.why.as_ref() == Some(&store)), "the module edit cancels");
+        let done = jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends");
+        assert!(matches!(done.outcome, GuardOutcome::Cancelled(_)), "a cancelled check never compares");
+        jobs.tx.send(done).unwrap();
+        jobs.drain(&mut sessions);
+        assert!(jobs.running.is_empty() && jobs.pending == 0);
+        let entry = sessions.get(&req.session).unwrap();
+        assert!(!entry.recompute_next, "a cancelled check never adopts");
+
+        // Background phases unwind once cancelled, and stay off the pool.
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let out = std::thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                crate::pool::set_background(Some(cancel.clone()));
+                let first = crate::pool::par_map(&[1, 2, 3, 4], |x| x * 2);
+                cancel.store(true, Ordering::Relaxed);
+                let second = std::panic::catch_unwind(|| crate::pool::par_map(&[1, 2], |x| x + 1));
+                (first, second.err().is_some_and(|p| p.downcast_ref::<crate::pool::Cancelled>().is_some()))
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(out, (vec![2, 4, 6, 8], true));
         let _ = std::fs::remove_dir_all(&base);
     }
 
