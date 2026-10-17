@@ -242,7 +242,8 @@ fn replay_templates(
     start: u64,
 ) -> Result<(), &'static str> {
     let fn_count = front.fn_loc.len();
-    let names = reach_names(p, reach, fn_count);
+    // Only a template with no stored reads needs the names (made once).
+    let mut names: Option<crate::intern::FxMap<crate::intern::Sym, ()>> = None;
     let mut moves = crate::driver::graph::DeriveMoves::memoized(reach);
     let idents = &front.chunks[0].scan.body_idents;
     // The moved keys the stored checks read, fingerprinted once and in
@@ -296,6 +297,7 @@ fn replay_templates(
                 Some(true) => continue,
                 Some(false) => {}
                 None => {
+                    let names = names.get_or_insert_with(|| reach_names(p, reach, fn_count));
                     let named = match idents.get(t.0 as usize) {
                         Some(ids) if (t.0 as usize) < fn_count => ids.iter().any(|s| names.contains_key(s)),
                         _ => super::ast_hash::body_scan(&p.ast, p.fn_def(t), None).1.iter().any(|s| names.contains_key(s)),
