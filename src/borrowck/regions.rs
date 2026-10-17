@@ -6502,7 +6502,8 @@ impl<'b, 'p> Builder<'b, 'p> {
 
     /// Fixed items (`fixed_items`) and a sink's element slots, pairwise:
     /// equal, as the trait match makes them (rustc E0597 on a later
-    /// shorter borrow into the sink).
+    /// shorter borrow into the sink). Also the two copies of an array
+    /// `IntoIter`'s element slots.
     fn tie_fixed(&mut self, items: &[u32], elems: &[u32]) {
         for (&a, &b) in items.iter().zip(elems) {
             self.edge(a, b);
@@ -6567,7 +6568,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::MapKeys | K::SetIter => cat(&[&own, &args[0]]),
             K::MapValues | K::MapValuesMut => cat(&[&own, &args[1]]),
             K::MapIntoIter | K::MapDrain => cat(&[&args[0], &args[1]]),
-            K::MapIntoKeys | K::SetIntoIter | K::SetDrain | K::RepeatN | K::ArrayIntoIter => args[0].clone(),
+            K::MapIntoKeys | K::SetIntoIter | K::SetDrain | K::RepeatN => args[0].clone(),
+            K::ArrayIntoIter => {
+                self.tie_fixed(&args[0], &args[1]);
+                args[0].clone()
+            }
             K::MapIntoValues | K::ByNext => args[1].clone(),
             // (usize, char): no regions.
             K::CharIndices | K::StringDrain | K::Args => Vec::new(),
@@ -6924,7 +6929,18 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 None => false,
             },
-            K::VecIntoIter | K::ArrayIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::RecvIntoIter => match vars.get(..n0) {
+            // `array::IntoIter<E, [E; N]>` names `E` twice; both are the one
+            // `E` of std's `IntoIter<E, N>` (the loan goes into the array's).
+            K::ArrayIntoIter => match (vars.get(..n0), vars.get(n0..2 * n0)) {
+                (Some(e), Some(arr)) => {
+                    let (e, arr) = (e.to_vec(), arr.to_vec());
+                    self.tie_fixed(&e, &arr);
+                    out.push(e);
+                    true
+                }
+                _ => false,
+            },
+            K::VecIntoIter | K::Range | K::RangeInclusive | K::RangeFrom | K::RecvIntoIter => match vars.get(..n0) {
                 Some(v) => {
                     out.push(v.to_vec());
                     true
