@@ -32,6 +32,16 @@
 // `thread_local!` `const { .. }` initializer (its block is a plain fn's
 // body), records a `Checked` read; the driver finds those readers by their
 // reads.
+//
+// The header delta asks a sharper question for an inherent method
+// (`reaches_inherent`): a path `Q::name` in an item value names the
+// associated fn of the type `Q` denotes, so `LazyLock::new` names no
+// user `Store::new`. A name counts there unless every root mention is the
+// last segment of such a path whose qualifier cannot denote the method's
+// Adt: not its name, `Self`, or any name a type alias, `use` rename, or
+// associated type has (by name, as everything here). Identifiers inside a
+// closure body in an item value do not count at all (outside `const`
+// blocks): the evaluator never runs a closure (`ast_hash::ConstRoots`).
 use super::compile::fn_def_at;
 use super::session::Front;
 use crate::intern::{FxHasher, Sym};
@@ -54,6 +64,14 @@ pub(crate) struct ConstReach {
     /// body identifiers joined `names`.
     consts: Vec<(usize, Sym)>,
     expanded: Vec<bool>,
+    /// `names` but the last segments of qualified paths in item values,
+    /// and those paths' qualifiers by name (`reaches_inherent`).
+    unqual: FxSet<Sym>,
+    quals: crate::intern::FxMap<Sym, Vec<Sym>>,
+    /// Names a qualifier may give any type: `Self`, type aliases, `use`
+    /// renames, and associated types (source names: a resolver flat name's
+    /// last part, `intern::source_name`).
+    aliases: FxSet<String>,
 }
 
 impl ConstReach {
@@ -64,7 +82,7 @@ impl ConstReach {
         let mut bodies: Vec<(u32, u32)> = front.fn_loc.iter().map(|&(item, sub)| fn_def_at(&front.ast, item, sub).exprs).collect();
         trait_bodies(&front.ast.items, &mut bodies);
         bodies.sort_unstable();
-        let roots = super::ast_hash::const_idents(&front.ast, (0, 0, 0), true, Some(&bodies));
+        let roots = super::ast_hash::const_idents(&front.ast, (0, 0, 0), true, Some(&bodies), front.known.self_type);
         let consts: Vec<(usize, Sym)> = front
             .fn_loc
             .iter()
@@ -74,6 +92,10 @@ impl ConstReach {
                 def.qual.is_const.then_some((i, def.name))
             })
             .collect();
+        let mut quals: crate::intern::FxMap<Sym, Vec<Sym>> = Default::default();
+        for &(q, n) in &roots.quals {
+            quals.entry(n).or_default().push(q);
+        }
         let mut r = ConstReach {
             names: FxSet::default(),
             scalar: roots.scalar.iter().copied().collect(),
@@ -81,6 +103,9 @@ impl ConstReach {
             seen: arena_lens(front),
             expanded: vec![false; consts.len()],
             consts,
+            unqual: roots.scalar.iter().chain(&roots.value_unqual).copied().collect(),
+            quals,
+            aliases: aliases(front),
         };
         r.names.extend(r.scalar.iter().copied());
         r.names.extend(r.values.iter().flat_map(|v| v.1.iter().copied()));
@@ -92,8 +117,9 @@ impl ConstReach {
     /// nodes, and the new bodies of the edited fns (`Front::fn_loc`
     /// indexes) that are reachable const fns.
     pub(crate) fn update(&mut self, front: &Front, edited: &[usize]) {
-        let roots = super::ast_hash::const_idents(&front.ast, self.seen, false, None);
+        let roots = super::ast_hash::const_idents(&front.ast, self.seen, false, None, front.known.self_type);
         self.scalar.extend(roots.scalar.iter().copied());
+        self.unqual.extend(roots.scalar.iter().copied());
         self.names.extend(roots.scalar);
         self.seen = arena_lens(front);
         for (k, (i, _)) in self.consts.iter().enumerate() {
@@ -110,6 +136,23 @@ impl ConstReach {
         let (item, sub) = front.fn_loc[i];
         let def = fn_def_at(&front.ast, item, sub);
         self.names.contains(&def.name)
+    }
+
+    /// `reaches` for fn `i`, an inherent method of the Adt whose source
+    /// name is `adt` (see the module docs): false when every root mention
+    /// of its name is `Q::name` with `Q` none of `adt` and `aliases`.
+    pub(crate) fn reaches_inherent(&self, front: &Front, i: usize, adt: &str) -> bool {
+        let (item, sub) = front.fn_loc[i];
+        let name = fn_def_at(&front.ast, item, sub).name;
+        if !self.names.contains(&name) {
+            return false;
+        }
+        let adt = adt.trim_start_matches("r#");
+        let may_be = |q: &Sym| {
+            let q = crate::intern::source_name(front.interner.get(*q)).trim_start_matches("r#");
+            q == adt || self.aliases.contains(q)
+        };
+        self.unqual.contains(&name) || self.quals.get(&name).is_none_or(|qs| qs.iter().any(may_be))
     }
 
     /// True when the results of fns `fns` (`Front::fn_loc` indexes) can
@@ -154,6 +197,21 @@ impl ConstReach {
                 if !self.expanded[k] && self.names.contains(&name) {
                     self.expanded[k] = true;
                     self.names.extend(idents.get(i).into_iter().flatten().copied());
+                    let (item, sub) = front.fn_loc[i];
+                    let (unqual, quals) = super::ast_hash::body_quals(&front.ast, fn_def_at(&front.ast, item, sub));
+                    self.unqual.extend(unqual);
+                    // `Self::f` in a method names its impl's self type's `f`.
+                    let own = match front.ast.items.get(item).map(|it| &it.kind) {
+                        Some(crate::ast::ItemKind::Impl(imp)) if sub.is_some() => match front.ast.ty(imp.self_ty) {
+                            crate::ast::TyExpr::Path(segs) => segs.last().map(|s| s.name),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    for (q, n) in quals {
+                        let q = if q == front.known.self_type { own.unwrap_or(q) } else { q };
+                        self.quals.entry(n).or_default().push(q);
+                    }
                     grew = true;
                 }
             }
@@ -162,6 +220,40 @@ impl ConstReach {
             }
         }
     }
+}
+
+/// `ConstReach::aliases` for the front's Ast: `Self`, and the names of
+/// every type alias, `use` rename, and associated type.
+fn aliases(front: &Front) -> FxSet<String> {
+    fn tree(t: &crate::ast::UseTree, out: &mut FxSet<Sym>) {
+        match &t.kind {
+            crate::ast::UseKind::Simple { rename: Some(r) } => {
+                out.insert(*r);
+            }
+            crate::ast::UseKind::Group(ts) => ts.iter().for_each(|t| tree(t, out)),
+            _ => {}
+        }
+    }
+    fn items(its: &[crate::ast::Item], out: &mut FxSet<Sym>) {
+        use crate::ast::ItemKind;
+        for it in its {
+            match &it.kind {
+                ItemKind::Type(a) => {
+                    out.insert(a.name);
+                }
+                ItemKind::Use(u) => tree(&u.tree, out),
+                ItemKind::Impl(imp) => out.extend(imp.types.iter().map(|t| t.name)),
+                ItemKind::Trait(t) => out.extend(t.types.iter().map(|t| t.name)),
+                ItemKind::Mod(m) => items(m.body.as_deref().unwrap_or(&[]), out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = FxSet::default();
+    out.insert(front.known.self_type);
+    items(&front.ast.items, &mut out);
+    items(&front.ast.stmt_items, &mut out);
+    out.into_iter().map(|s| crate::intern::source_name(front.interner.get(s)).trim_start_matches("r#").to_string()).collect()
 }
 
 /// The expression ranges of trait default method bodies (not in

@@ -273,8 +273,16 @@ fn untouched_refusals(
         if i >= front.fn_loc.len() {
             return Err("sig class");
         }
-        refusal(p, LocalDefId(i as u32), walk_instances)?;
-        if reach.reaches(front, i) {
+        let f = LocalDefId(i as u32);
+        refusal(p, f, walk_instances)?;
+        // An inherent method: a root `Q::name` names it only when `Q` may
+        // denote its Adt (`ConstReach::reaches_inherent`).
+        let adt = p.gx.inherent_methods.iter().find(|(_, v)| v.contains(&f)).and_then(|(k, _)| p.adt_by_def(k.0));
+        let reached = match adt {
+            Some(a) => reach.reaches_inherent(front, i, crate::intern::source_name(p.name(p.adt(a).name))),
+            None => reach.reaches(front, i),
+        };
+        if reached {
             return Err("sig const");
         }
     }

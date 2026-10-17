@@ -42,7 +42,7 @@ fn item_fns<'a>(item: &'a Item) -> Vec<&'a FnDef> {
 /// (check/opaque.rs), so it is part of the item, not a body-only edit
 /// (as in `scan::scan`).
 fn item_scan(ast: &Ast, item: &Item, body_hashes: &[u64], inner: Option<&mut Vec<u32>>) -> scan::ItemScan {
-    let mut w = Walker { ast, idents: None, inner };
+    let mut w = Walker { ast, idents: None, inner, quals: None, muted: 0 };
     let mut h = FxHasher::default();
     w.item(&mut h, item, false);
     // The type items in the item's bodies (structs, enums, traits,
@@ -165,7 +165,7 @@ pub(crate) fn scan_ast_seq(ast: &Ast) -> AstScans {
 /// The structural hash of one item without fn bodies (the item-scan
 /// hash of `scan_ast`). A trait item hashes its default bodies too.
 pub(crate) fn item_hash(ast: &Ast, item: &Item) -> u64 {
-    let mut w = Walker { ast, idents: None, inner: None };
+    let mut w = Walker { ast, idents: None, inner: None, quals: None, muted: 0 };
     let mut h = FxHasher::default();
     w.item(&mut h, item, false);
     h.finish()
@@ -178,7 +178,7 @@ pub(crate) fn item_hash(ast: &Ast, item: &Item) -> u64 {
 /// itself, even when its body hash and caller-visible `Sig`
 /// fingerprint (which excludes parameter names) both stand.
 pub(crate) fn fn_head_hash(ast: &Ast, f: &FnDef) -> u64 {
-    let mut w = Walker { ast, idents: None, inner: None };
+    let mut w = Walker { ast, idents: None, inner: None, quals: None, muted: 0 };
     let mut h = FxHasher::default();
     "ast-fn-head-v1".hash(&mut h);
     w.fn_head(&mut h, f, false);
@@ -196,9 +196,20 @@ pub(crate) fn item_content(scan: &scan::ItemScan, bodies: &[(u64, Vec<Sym>)]) ->
     h.finish()
 }
 
+/// A const fn body as an evaluator root (`ConstReach`, `Walker::quals`):
+/// its identifiers but the last segments of qualified paths, and those
+/// paths' (qualifier, name) pairs.
+pub(crate) fn body_quals(ast: &Ast, f: &FnDef) -> (Vec<Sym>, Vec<(Sym, Sym)>) {
+    let (mut idents, mut quals) = (Vec::new(), Vec::new());
+    if let Some(b) = f.body {
+        Walker { ast, idents: Some(&mut idents), inner: None, quals: Some(&mut quals), muted: 0 }.block(&mut FxHasher::default(), b);
+    }
+    (idents, quals)
+}
+
 pub(crate) fn body_scan(ast: &Ast, f: &FnDef, inner: Option<&mut Vec<u32>>) -> (u64, Vec<Sym>) {
     let mut idents = Vec::new();
-    let mut w = Walker { ast, idents: Some(&mut idents), inner };
+    let mut w = Walker { ast, idents: Some(&mut idents), inner, quals: None, muted: 0 };
     let mut h = FxHasher::default();
     "ast-body-v1".hash(&mut h);
     match f.body {
@@ -216,20 +227,32 @@ pub(crate) fn body_scan(ast: &Ast, f: &FnDef, inner: Option<&mut Vec<u32>>) -> (
 /// values (array lengths, const generic arguments, `const` blocks,
 /// pattern bounds, discriminants, const param defaults), and per const,
 /// static, or associated const item, its name and the identifiers of its
-/// value.
+/// value. Item values also give `quals`: (qualifier, name) for each path
+/// of two or more segments (`LazyLock::new`), and `value_unqual`: their
+/// identifiers in any other place. Identifiers inside a closure body count
+/// only inside a `const` block there (`Walker::quals`).
 #[derive(Default)]
 pub(crate) struct ConstRoots {
     pub scalar: Vec<Sym>,
     pub values: Vec<(Option<Sym>, Vec<Sym>)>,
+    pub quals: Vec<(Sym, Sym)>,
+    pub value_unqual: Vec<Sym>,
 }
 
 /// The const expressions an item holds outside fn bodies, for
 /// `const_idents`: const and static values, discriminants, associated
 /// const values, and const param defaults, in nested modules too. Types
 /// sit in the type arena, which `const_idents` scans on its own.
-fn item_consts(ast: &Ast, item: &Item, out: &mut ConstRoots) {
+fn item_consts(ast: &Ast, item: &Item, self_sym: Sym, out: &mut ConstRoots) {
+    // Every identifier of `e` into `idents`, the names of qualified paths
+    // last (their pairs into `quals` too).
+    fn walk_quals(ast: &Ast, e: ExprId, idents: &mut Vec<Sym>, quals: &mut Vec<(Sym, Sym)>) {
+        let from = quals.len();
+        Walker { ast, idents: Some(idents), inner: None, quals: Some(quals), muted: 0 }.expr(&mut FxHasher::default(), e);
+        idents.extend(quals[from..].iter().map(|q| q.1));
+    }
     fn walk(ast: &Ast, e: ExprId, idents: &mut Vec<Sym>) {
-        Walker { ast, idents: Some(idents), inner: None }.expr(&mut FxHasher::default(), e);
+        walk_quals(ast, e, idents, &mut Vec::new());
     }
     fn generics(ast: &Ast, g: &Generics, out: &mut ConstRoots) {
         for p in &g.params {
@@ -240,8 +263,10 @@ fn item_consts(ast: &Ast, item: &Item, out: &mut ConstRoots) {
     }
     fn value(ast: &Ast, name: Option<Sym>, e: Option<ExprId>, out: &mut ConstRoots) {
         if let Some(e) = e {
-            let mut idents = Vec::new();
-            walk(ast, e, &mut idents);
+            let (mut idents, from) = (Vec::new(), out.quals.len());
+            walk_quals(ast, e, &mut idents, &mut out.quals);
+            let unqual = idents.len() - (out.quals.len() - from);
+            out.value_unqual.extend_from_slice(&idents[..unqual]);
             out.values.push((name, idents));
         }
     }
@@ -261,14 +286,21 @@ fn item_consts(ast: &Ast, item: &Item, out: &mut ConstRoots) {
         ItemKind::Impl(imp) => {
             generics(ast, &imp.generics, out);
             imp.fns.iter().for_each(|f| generics(ast, &f.generics, out));
+            // `Self::f` in an impl's const names the self type's `f`.
+            let from = out.quals.len();
             imp.consts.iter().for_each(|c| value(ast, Some(c.name), c.default, out));
+            if let TyExpr::Path(segs) = ast.ty(imp.self_ty)
+                && let Some(last) = segs.last()
+            {
+                out.quals[from..].iter_mut().filter(|q| q.0 == self_sym).for_each(|q| q.0 = last.name);
+            }
         }
         ItemKind::Trait(t) => {
             generics(ast, &t.generics, out);
             t.fns.iter().for_each(|f| generics(ast, &f.generics, out));
             t.consts.iter().for_each(|c| value(ast, Some(c.name), c.default, out));
         }
-        ItemKind::Mod(m) => m.body.iter().flatten().for_each(|it| item_consts(ast, it, out)),
+        ItemKind::Mod(m) => m.body.iter().flatten().for_each(|it| item_consts(ast, it, self_sym, out)),
         ItemKind::ExternBlock(b) => {
             for it in &b.items {
                 if let ForeignItem::Static(st) = it {
@@ -288,14 +320,14 @@ fn item_consts(ast: &Ast, item: &Item, out: &mut ConstRoots) {
 /// (`item_consts`). `bodies` (sorted expression ranges of fn bodies),
 /// when given, keeps a `const` block outside them out of `scalar`: it
 /// sits in an item value, which `values` covers.
-pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool, bodies: Option<&[(u32, u32)]>) -> ConstRoots {
+pub(crate) fn const_idents(ast: &Ast, from: (usize, usize, usize), items: bool, bodies: Option<&[(u32, u32)]>, self_sym: Sym) -> ConstRoots {
     let mut out = ConstRoots::default();
     if items {
         for it in ast.items.iter().chain(&ast.stmt_items) {
-            item_consts(ast, it, &mut out);
+            item_consts(ast, it, self_sym, &mut out);
         }
     }
-    let mut w = Walker { ast, idents: Some(&mut out.scalar), inner: None };
+    let mut w = Walker { ast, idents: Some(&mut out.scalar), inner: None, quals: None, muted: 0 };
     let mut h = FxHasher::default();
     // The const arguments of one path segment's (or turbofish's) angle
     // arguments.
@@ -375,11 +407,25 @@ struct Walker<'a> {
     idents: Option<&'a mut Vec<Sym>>,
     /// When set (top-level item scans), every body item walked is recorded.
     inner: Option<&'a mut Vec<u32>>,
+    /// Set for const evaluation roots (`item_consts`): a path of two or
+    /// more segments gives (qualifier, name) here in place of its last
+    /// name in `idents`, and identifiers inside a closure body are not
+    /// recorded, except inside a `const` block there. The evaluator never
+    /// runs a closure (a `LazyLock` init closure is a fn pointer value,
+    /// `consteval::ConstValue::FnPtr`); the closure body checks as a body
+    /// with reads (check/const_body.rs).
+    quals: Option<&'a mut Vec<(Sym, Sym)>>,
+    /// Closure bodies entered with `quals` set, minus the `const` blocks
+    /// entered inside them: while above 0, `sym` records nothing.
+    muted: u32,
 }
 
 impl Walker<'_> {
     fn sym(&mut self, h: &mut FxHasher, s: Sym) {
         s.hash(h);
+        if self.muted > 0 {
+            return;
+        }
         if let Some(v) = &mut self.idents {
             v.push(s);
         }
@@ -459,8 +505,14 @@ impl Walker<'_> {
 
     fn path(&mut self, h: &mut FxHasher, segs: &[PathSeg]) {
         (segs.len() as u64).hash(h);
-        for s in segs {
-            self.sym(h, s.name);
+        for (i, s) in segs.iter().enumerate() {
+            match &mut self.quals {
+                Some(q) if i > 0 && i + 1 == segs.len() && self.muted == 0 => {
+                    s.name.hash(h);
+                    q.push((segs[i - 1].name, s.name));
+                }
+                _ => self.sym(h, s.name),
+            }
             self.generic_args(h, &s.args);
         }
     }
@@ -1014,7 +1066,10 @@ impl Walker<'_> {
                     Some(t) => self.ty(h, *t),
                     None => 0u8.hash(h),
                 }
+                let roots = u32::from(self.quals.is_some());
+                self.muted += roots;
                 self.expr(h, *body);
+                self.muted -= roots;
             }
             Expr::Try(e) => {
                 35u8.hash(h);
@@ -1054,7 +1109,9 @@ impl Walker<'_> {
             }
             Expr::ConstBlock(b) => {
                 43u8.hash(h);
+                let muted = std::mem::take(&mut self.muted);
                 self.block(h, *b);
+                self.muted = muted;
             }
             Expr::Underscore => 44u8.hash(h),
             Expr::MacroCall(c) => {
