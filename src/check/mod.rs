@@ -199,6 +199,8 @@ pub enum Builtin {
     IsolateHighestOne,
     IsolateLowestOne,
     IntMidpoint,
+    /// `a.abs_diff(b)`: the distance, in the unsigned twin type.
+    IntAbsDiff,
     StrictAdd,
     StrictSub,
     StrictMul,
@@ -7839,8 +7841,10 @@ impl<'p> Ctx<'p> {
     /// its own item type. Only when the return type still holds a
     /// variable, an argument is a closure or a path (a fn item), and
     /// the expectation has no dyn, where the result could still
-    /// coerce (rustc's own expectation is not binding there). A failed
-    /// unify rolls back, so a coercion-only match keeps its old path.
+    /// coerce (rustc's own expectation is not binding there). A lazy
+    /// cell never coerces, so its dyn value type does not count
+    /// (`LazyLock<Box<dyn Fn()>>`). A failed unify rolls back, so a
+    /// coercion-only match keeps its old path.
     pub(super) fn expected_output_first(&mut self, ret: Ty, expected: Option<Ty>, args: &[ExprId]) {
         let Some(want) = expected else { return };
         let ret_deep = self.deep(ret);
@@ -7850,7 +7854,9 @@ impl<'p> Ctx<'p> {
             return;
         }
         let want = self.deep(want);
-        if object::mentions_dyn(&self.tys, want) || matches!(self.kind(want), TyKind::Infer(_) | TyKind::Never | TyKind::Error) {
+        let p = self.p;
+        let lazy = self.tys.local_adt(want).is_some_and(|a| matches!(p.display_path(p.adt(a).name).as_str(), "std::sync::LazyLock" | "core::cell::LazyCell"));
+        if (!lazy && object::mentions_dyn(&self.tys, want)) || matches!(self.kind(want), TyKind::Infer(_) | TyKind::Never | TyKind::Error) {
             return;
         }
         let mut open = Vec::new();
@@ -11862,7 +11868,7 @@ impl<'p> Ctx<'p> {
         if segs.len() == 2
             && (self.replay_pick(e).is_some()
                 || !self.assoc_const_key(segs).is_some_and(|(adt, item)| self.inherent_value_blocks(adt, item)))
-            && let Some(base) = assoc_base
+            && let Some(base) = assoc_base.or_else(|| self.prim_ty_by_name(segs[0].name))
             && let Some((idx, t)) = self.trait_assoc_const(Some(e), base, None, segs[1].name, span)
         {
             if let Some((_, v)) = idx {
@@ -17183,6 +17189,14 @@ impl<'p> Ctx<'p> {
         if n == k.unsigned_abs && s {
             return Some((B::UnsignedAbs, Autoref::None, vec![], int(i.counterpart())));
         }
+        // `abs_diff` gives the unsigned twin; `midpoint` as a method is
+        // the associated fn's (the 128-bit forms stay out, as there).
+        if n == k.abs_diff && !w128 {
+            return Some((B::IntAbsDiff, Autoref::None, vec![t], int(if s { i.counterpart() } else { i })));
+        }
+        if n == k.midpoint && !w128 {
+            return bin(B::IntMidpoint);
+        }
         // The families that stay within the value (wrapping and plain).
         if n == k.wrapping_add {
             return bin(B::WrappingAdd);
@@ -20113,6 +20127,15 @@ impl<'p> Ctx<'p> {
             return ERROR;
         }
         let name = segs[0].name;
+        // `<u64>::MAX` is `u64::MAX`.
+        if trait_path.is_empty()
+            && let ast::TyExpr::Path(ty_segs) = p.ast.ty(self_ty)
+            && let [ty_seg] = ty_segs.as_slice()
+            && matches!(ty_seg.args, ast::GenericArgs::None)
+            && self.prim_ty_by_name(ty_seg.name).is_some()
+        {
+            return self.path_expr(e, &[ty_seg.clone(), segs[0].clone()], span);
+        }
         let base = self.resolve_written(self_ty);
         let hint = if trait_path.is_empty() {
             None

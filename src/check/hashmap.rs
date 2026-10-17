@@ -945,6 +945,8 @@ pub fn hash_ctor_builtin(k: HashTy, item: &str) -> Option<Builtin> {
     let table = matches!(k, HashTy::HashMap | HashTy::HashSet);
     Some(match item {
         "new" if table || k == HashTy::RandomState || k == HashTy::DefaultHasher => Builtin::HashNew,
+        // `BuildHasherDefault::new()` is its `default()` (a const fn).
+        "new" if k == HashTy::BuildHasherDefault => Builtin::HashDefault,
         "with_capacity" if table => Builtin::HashWithCapacity,
         "with_hasher" if table => Builtin::HashWithHasher,
         "with_capacity_and_hasher" if table => Builtin::HashWithCapacityAndHasher,

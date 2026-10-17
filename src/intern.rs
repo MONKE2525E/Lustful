@@ -334,6 +334,7 @@ known_syms!(
     isolate_highest_one,
     isolate_lowest_one,
     midpoint,
+    abs_diff,
     strict_add,
     strict_sub,
     strict_mul,

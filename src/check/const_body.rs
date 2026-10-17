@@ -73,8 +73,10 @@ fn check_sites(p: &mut Program, errs: &mut Vec<Diag>, keep: &dyn Fn(FnLoc) -> bo
     let ids: Vec<LocalDefId> = sites.into_iter().filter_map(|s| install(p, s)).collect();
     let prog: &Program = p;
     let results = crate::pool::par_map(&ids, |&f| {
+        // Every checker error counts: a value the evaluator takes but the
+        // checker does not type is a false reject, never a dropped error.
         let (ck, mut e) = super::check_fn(prog, f);
-        let mut reads = if e.is_empty() {
+        let reads = if e.is_empty() {
             // Lowering and borrowck read derive lists too (Copy operands).
             let ((mut reads, be), noted) = super::derive_delta::scoped(prog.record_reads, || {
                 let body = crate::lower::lower(prog, f, ck);
@@ -85,14 +87,6 @@ fn check_sites(p: &mut Program, errs: &mut Vec<Diag>, keep: &dyn Fn(FnLoc) -> bo
             e.extend(be);
             reads
         } else {
-            if !may_borrow(prog, f) {
-                // The evaluator took a value the body checker does not
-                // type (a std item the checker lacks, a hoisted `LazyLock`
-                // init): with no binding, borrow, or static read, the
-                // value holds no borrow error, so the checker's limit is
-                // no reason to reject.
-                e.clear();
-            }
             ck.reads
         };
         (prog.fns[f.0 as usize].loc, e, reads)
@@ -153,26 +147,6 @@ pub fn module_of(p: &Program, f: LocalDefId) -> Option<ModuleId> {
         }
     }
     best.map(|(_, m)| m).or(root)
-}
-
-/// True when initializer body `f` has a form that can hold a borrow
-/// error: a pattern binding (a `let`, a match arm, a closure parameter),
-/// a borrow, a deref, an assignment, a method call on a receiver other
-/// than a literal (it may be borrowed), a closure, or a path that names a
-/// static (a read may move
-/// out of it). The scan covers the body's expression and pattern ranges.
-fn may_borrow(p: &Program, f: LocalDefId) -> bool {
-    use crate::ast::{Expr, Pat};
-    let def = p.fn_def(f);
-    let statics = |segs: &[ast::PathSeg]| segs.last().is_some_and(|s| p.static_names.contains_key(&s.name) || p.statics.iter().any(|st| st.name == s.name));
-    (def.pats.0..def.pats.1).any(|i| matches!(p.ast.pat(ast::PatId(i)), Pat::Binding { .. } | Pat::At { .. }))
-        || (def.exprs.0..def.exprs.1).any(|i| match p.ast.expr(ast::ExprId(i)) {
-            Expr::Ref { .. } | Expr::Deref(_) | Expr::Assign { .. } | Expr::AssignOp { .. } | Expr::Closure { .. } => true,
-            // A literal receiver is a constant: a borrow of it is promoted.
-            Expr::MethodCall { recv, .. } => !matches!(p.ast.expr(*recv), Expr::Int(..) | Expr::Float(_) | Expr::Bool(_) | Expr::Char(_) | Expr::Str(_)),
-            Expr::Path(segs) => statics(segs),
-            _ => false,
-        })
 }
 
 /// The span of a const or static item as the resolver keys it.

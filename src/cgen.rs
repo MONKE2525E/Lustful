@@ -5421,6 +5421,7 @@ impl FnGen<'_, '_> {
             | B::IsolateHighestOne
             | B::IsolateLowestOne
             | B::IntMidpoint
+            | B::IntAbsDiff
             | B::StrictAdd
             | B::StrictSub
             | B::StrictMul
@@ -7376,6 +7377,15 @@ impl FnGen<'_, '_> {
             B::UnsignedAbs => {
                 let uct = int_c(it.counterpart());
                 format!("(({uct})(({a} < 0 ? (0ull - {ua}) : {ua}) & {mask}))")
+            }
+            // The difference of the 64-bit images wraps to the distance.
+            B::IntAbsDiff => {
+                let (uct, gt) = if sgn {
+                    (int_c(it.counterpart()), format!("{sa} > {sb}"))
+                } else {
+                    (int_c(it), format!("{masked_a} > ({ub} & {mask})"))
+                };
+                format!("(({uct})(({gt} ? ({ua} - {ub}) : ({ub} - {ua})) & {mask}))")
             }
             B::UnboundedShl => format!("(({}) >= {bits}u ? ({ct})0 : ({ct})(({masked_a} << {}) & {mask}))", vals[1], vals[1]),
             B::UnboundedShr => {
