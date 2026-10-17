@@ -550,9 +550,10 @@ mod tests {
         let want: Vec<u64> = items.iter().map(slow).collect();
         let secs = |n| std::time::Duration::from_secs(n);
         // Phases until pool threads are up (other tests may hold the pool
-        // for a while, and a new thread takes its name as it starts).
+        // for a while, and a new thread takes its name as it starts). A loaded
+        // gate box can take many seconds, as for the restart below.
         let t0 = std::time::Instant::now();
-        while pool_threads() == 0 && t0.elapsed() < secs(5) {
+        while pool_threads() == 0 && t0.elapsed() < secs(30) {
             assert_eq!(par_map(&items, slow), want);
         }
         assert!(pool_threads() > 0, "the pool has threads before the stop");
