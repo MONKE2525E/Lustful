@@ -13,8 +13,8 @@ then run the plain census (scripts/tsrust-full.sh).
 
 Usage: tsrust_deep.py --fork DIR --lust PATH --work DIR [--only a,b] [--max-rounds N]
                        [--rustc] [--save-clean FILE.tgz]
-Targets default to the three library crates in dependency order (goport_util,
-goport_lsproto, ts_goport). Output: <work>/deep.json and a ranked table on stdout.
+Targets default to the fork's library crates in dependency order (DEFAULT; goport_core only
+on forks that have it, v0.7.0 and later). A fork lib missing from DEFAULT stops the run. Output: <work>/deep.json and a ranked table on stdout.
 
 --rustc makes a clean fork that BOTH compilers accept (scripts/tsedit.py edits it): when lust
 accepts a target, `cargo check` it with lust's dev features too, remove the items that hold
@@ -40,7 +40,7 @@ sys.path.insert(0, str(HERE.parent / "bench/slices"))
 import prune  # noqa: E402  (bench/slices/prune.py: items_of, prune_round, located)
 import tsrust_full  # noqa: E402
 
-DEFAULT = ["goport_util", "goport_lsproto", "ts_goport"]
+DEFAULT = ["goport_util", "goport_lsproto", "goport_core", "ts_goport"]
 
 
 def errors(lust, t, work, env):
@@ -153,7 +153,7 @@ def main():
     ap.add_argument("--fork", required=True, type=Path)
     ap.add_argument("--lust", required=True)
     ap.add_argument("--work", required=True, type=Path)
-    ap.add_argument("--only", default=",".join(DEFAULT))
+    ap.add_argument("--only", default="")
     ap.add_argument("--max-rounds", type=int, default=200)
     ap.add_argument("--rustc", action="store_true", help="also prune until cargo check accepts each target")
     ap.add_argument("--save-clean", default="", help="write the changed files of the pruned copy to this tar.gz (relative to --work)")
@@ -166,6 +166,12 @@ def main():
     shutil.copytree(a.fork.resolve(), copy, ignore=shutil.ignore_patterns("target", ".git", ".lust-cache"))
     env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(work / "lust-cache"), CARGO_TARGET_DIR=str(work / "cargo-target"))
     by_name = {t["name"]: t for t in tsrust_full.targets(copy)}
+    if not a.only:
+        # The codegen tools are leaf crates outside the ts_goport tree; any other new lib joins DEFAULT.
+        new = [n for n, t in by_name.items() if t["kind"] == "lib" and n not in DEFAULT + ["ts_ast_codegen", "ts_diagnostics_codegen"]]
+        if new:
+            sys.exit(f"tsrust-deep: fork libs not in DEFAULT (add them in dependency order): {', '.join(new)}")
+        a.only = ",".join(n for n in DEFAULT if n in by_name)
     removed, cause_of_name, status = [], {}, {}
     # One check of every target on the unpruned copy first: a target that needs a build script
     # record lust has not stored yet (the tsgo bin) gets it through `cargo check` now. After the
