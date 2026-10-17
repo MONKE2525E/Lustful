@@ -17,7 +17,7 @@ mod item_outline;
 pub(crate) mod gen_reuse;
 pub mod graph;
 mod patch;
-mod sig_nodes;
+pub(crate) mod sig_nodes;
 mod span_shift;
 mod session;
 

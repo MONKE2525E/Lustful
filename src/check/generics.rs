@@ -8469,7 +8469,8 @@ fn validate_method_sig(
 
 /// The derived impl record of trait `k` (in `Derives` flag order: Clone,
 /// Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default) for the
-/// Adt template row `a`, with a bound per type parameter, as rustc writes
+/// Adt template row `a`, with a bound per type parameter and per `T::Item`
+/// field part (`Field::derive_bounds`), as rustc writes
 /// them. `add_synthetic_impls` makes every derive's record with it; a
 /// derive delta makes the record of a trait the Adt never derived before
 /// with it too (check/derive_delta.rs), so both get the same record.
@@ -8500,11 +8501,24 @@ pub(crate) fn insert_derived(p: &mut Program, a: usize, k: usize, ordinal: &mut 
     // Std's `PhantomData<T>` impls have no bounds (std source,
     // W-STD-C).
     let bounded = !(trait_def == lang.default && is_enum) && !p.is_phantom_adt(adt);
-    for (i, param) in p.gx.adt_generics[a].params.clone().iter().enumerate() {
-        if !bounded || param.kind != ParamKind::Type {
-            continue;
+    // Then each field part written as a path from a type param
+    // (`T::Item`: `Field::derive_bounds`), as rustc's derive bounds it.
+    let mut on: Vec<Ty> = Vec::new();
+    for (i, param) in p.gx.adt_generics[a].params.iter().enumerate() {
+        if bounded && param.kind == ParamKind::Type {
+            on.push(p.tys.intern(TyKind::Param(ParamId(i as u32))));
         }
-        let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
+    }
+    if bounded {
+        for f in p.adts[a].variants.iter().flat_map(|v| v.fields.iter()) {
+            for &b in &f.derive_bounds {
+                if !on.contains(&b) {
+                    on.push(b);
+                }
+            }
+        }
+    }
+    for t in on {
         let mut tr_args = vec![GenericArg::Ty(t)];
         if with_rhs {
             tr_args.push(GenericArg::Ty(t));
@@ -10613,7 +10627,7 @@ fn adt_instance(p: &mut Program, template: AdtId, args: &[GenericArg]) -> AdtId 
         for (name, ty, span) in fields {
             let ty = subst(&mut p.tys, ty, args);
             let ty = normalize_global(p, ty);
-            out_fields.push(crate::check::collect::Field { name, ty, span });
+            out_fields.push(crate::check::collect::Field { name, ty, span, derive_bounds: Vec::new() });
         }
         variants.push(crate::check::collect::Variant { name: vname, shape, fields: out_fields, disc, non_exhaustive: variant_ne });
     }
@@ -12501,7 +12515,15 @@ fn prove_trait_ref(
                     cx.tys.vec_elem(t).or_else(|| cx.tys.option_elem(t)).or_else(|| cx.tys.smart_elem(t))
                 };
                 if let Some(e) = elem {
-                    Some(vec![e])
+                    // std's `Clone` for `Rc<T>` and `Arc<T>` has no goal on
+                    // `T`, `Box<str>` none on `str`, and `Box<[T]>` asks `T`.
+                    let clone = tr.def == lang.clone;
+                    match cx.tys.kind(e) {
+                        _ if clone && cx.tys.rc_elem(t).is_some() => Some(Vec::new()),
+                        TyKind::Str if clone => Some(Vec::new()),
+                        TyKind::Slice(x) if clone => Some(vec![x]),
+                        _ => Some(vec![e]),
+                    }
                 } else if cx.tys.result_args(t).is_some() {
                     cx.tys.result_args(t).map(|(a, b)| vec![a, b])
                 } else if let Some(a) = cx.tys.local_adt(t) {
@@ -12597,6 +12619,11 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
         // A field whose type did not resolve: that error is reported
         // already, and a derive error on top would name the wrong cause.
         TyKind::Error => true,
+        // std's `PhantomData<T>` has every derivable trait at every `T`.
+        // Lust lacks its Debug and Hash records (marker.rs), so a generic
+        // field's proof at the definition answers here; a use of the
+        // derived impl asks the glue at the instance, which rejects those.
+        TyKind::Adt(..) if p.tys.flags(ty).contains_param() && p.tys.local_adt(ty).is_some_and(|a| p.is_phantom_adt(a)) => true,
         TyKind::Tuple(ts) => {
             let elems: Vec<Ty> = p.tys.tys_of(ts).to_vec();
             // core's tuple impls of the derive family stop at 12
@@ -13210,6 +13237,7 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&cra
                 break;
             }
         }
+        check_generic_derive_fields(p, idx, derives, &field_tys, span, errs);
         if !(derives.eq || derives.hash || derives.partial_ord || derives.ord || derives.default) {
             continue;
         }
@@ -13263,21 +13291,7 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&cra
             if !wanted {
                 continue;
             }
-            // The derive's own parameter bounds join the env.
-            let mut env = base_env.clone();
-            for (i, param) in p.gx.adt_generics[idx].params.iter().enumerate() {
-                if param.kind != ParamKind::Type {
-                    continue;
-                }
-                let t = p.tys.intern(TyKind::Param(ParamId(i as u32)));
-                let mut a = vec![GenericArg::Ty(t)];
-                if trait_def == lang.partial_ord {
-                    a.push(GenericArg::Ty(t));
-                }
-                let args = p.tys.intern_args(&a);
-                env.push(Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS })));
-            }
-            let env = elaborate_env(&mut p.tys, &p.gx.index, &env);
+            let env = derive_env(p, idx, &base_env, trait_def);
             for &ft in &field_tys {
                 if !prove_field_trait(p, &env, trait_def, ft) {
                     errs.push(Diag::new(
@@ -13288,6 +13302,96 @@ fn check_derive_bounds(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&cra
                     ));
                     break;
                 }
+            }
+        }
+    }
+}
+
+/// The env a derived impl of `trait_def` on Adt row `idx` checks its
+/// fields under, as rustc's derive writes the impl: the Adt's own
+/// bounds (`base`, elaborated), `T: Trait` per type param, and
+/// `B: Trait` per path part `Field::derive_bounds` holds (`T::Item`).
+fn derive_env(p: &mut Program, idx: usize, base: &[Predicate], trait_def: DefId) -> Vec<Predicate> {
+    let lang = p.gx.lang;
+    let mut on: Vec<Ty> = Vec::new();
+    for (i, param) in p.gx.adt_generics[idx].params.iter().enumerate() {
+        if param.kind == ParamKind::Type {
+            on.push(p.tys.intern(TyKind::Param(ParamId(i as u32))));
+        }
+    }
+    for v in &p.adts[idx].variants {
+        for f in &v.fields {
+            for &b in &f.derive_bounds {
+                if !on.contains(&b) {
+                    on.push(b);
+                }
+            }
+        }
+    }
+    let mut env = base.to_vec();
+    for t in on {
+        let mut a = vec![GenericArg::Ty(t)];
+        if trait_def == lang.partial_eq || trait_def == lang.partial_ord {
+            a.push(GenericArg::Ty(t));
+        }
+        let args = p.tys.intern_args(&a);
+        env.push(Predicate::Trait(Binder::plain(TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS })));
+    }
+    elaborate_env(&mut p.tys, &p.gx.index, &env)
+}
+
+/// The derived `Debug`, `Clone`, `PartialEq`, and `Copy` impls of a
+/// generic Adt row `idx`, checked at the definition as rustc checks them,
+/// whether or not a use instantiates them: each field type that names a
+/// type param must implement the trait under the derive's env
+/// (`derive_env`), and derived `Copy` needs `Self: Clone` there. Fields
+/// with no param are collect's (`check_derive_fields`) and the checks
+/// above.
+fn check_generic_derive_fields(p: &mut Program, idx: usize, derives: crate::check::collect::Derives, field_tys: &[Ty], span: Span, errs: &mut Vec<Diag>) {
+    let lang = p.gx.lang;
+    let generic: Vec<Ty> = field_tys.iter().copied().filter(|&ft| p.tys.flags(ft).contains_param()).collect();
+    let wanted = [
+        (derives.debug, lang.debug, "Debug"),
+        (derives.clone, lang.clone, "Clone"),
+        (derives.partial_eq, lang.partial_eq, "PartialEq"),
+        (derives.copy, lang.copy, "Copy"),
+    ];
+    let has_params = p.gx.adt_generics[idx].params.iter().any(|q| q.kind != ParamKind::Lifetime);
+    if !has_params || !wanted.iter().any(|w| w.0) {
+        return;
+    }
+    let base = elaborate_env(&mut p.tys, &p.gx.index, &p.gx.adt_generics[idx].predicates.clone());
+    for (on, trait_def, dname) in wanted {
+        if !on {
+            continue;
+        }
+        let env = derive_env(p, idx, &base, trait_def);
+        if let Some(&ft) = generic.iter().find(|&&ft| !prove_field_trait(p, &env, trait_def, ft)) {
+            let tn = crate::check::collect::ty_name(p, &p.tys, ft);
+            errs.push(Diag::new(
+                "L0112",
+                span,
+                format!("cannot derive {dname}: field type `{tn}` does not implement {dname}"),
+                format!("Derive {dname} on the field type too, or remove {dname} from the derive list."),
+            ));
+        }
+        // `impl<T: Copy> Copy for S<T>` needs `S<T>: Clone` under the same
+        // env: a written `Clone` impl must cover it (a derived one does).
+        if trait_def == lang.copy && !derives.clone {
+            let own: Vec<GenericArg> = p.gx.adt_generics[idx]
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, d)| match d.kind {
+                    ParamKind::Const(_) => GenericArg::Const(p.tys.intern_const(ConstKind::Param(i as u32))),
+                    ParamKind::Lifetime => GenericArg::Lifetime(Region::Erased),
+                    ParamKind::Type => GenericArg::Ty(p.tys.intern(TyKind::Param(ParamId(i as u32)))),
+                })
+                .collect();
+            let def = p.gx.adt_info[idx].0;
+            let self_ty = p.tys.mk_adt(def, &own);
+            if !prove_field_trait(p, &env, lang.clone, self_ty) {
+                errs.push(Diag::new("L0112", span, "deriving Copy requires Clone", "Add Clone to the derive list."));
             }
         }
     }

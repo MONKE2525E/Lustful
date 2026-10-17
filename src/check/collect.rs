@@ -44,6 +44,11 @@ pub struct Field {
     /// synthetic field). Written-type diagnostics (WF bounds) point
     /// here, at the field that owes the bound, not at the Adt name.
     pub span: Span,
+    /// The parts of the written type that rustc's derive bounds besides
+    /// the type params (`check_derive_bounds`): each path that starts at
+    /// a type param of the Adt (`T::Item` in `Vec<T::Item>`; not
+    /// `<T as Tr>::Item`). Empty for synthetic fields and instances.
+    pub derive_bounds: Vec<Ty>,
 }
 
 pub struct Variant {
@@ -3657,7 +3662,7 @@ pub fn collect_reuse(
             let variant = |n: &str, ty: Ty, disc: i128| Variant {
                 name: interner.intern(n),
                 shape: VariantShape::Tuple,
-                fields: vec![Field { name: zero, ty, span }],
+                fields: vec![Field { name: zero, ty, span, derive_bounds: Vec::new() }],
                 disc,
                 non_exhaustive: false,
             };
@@ -3695,7 +3700,7 @@ pub fn collect_reuse(
             // derives are std's, written here directly (no AST item).
             let id = AdtId(adt_base as u32 + rank);
             let unit = |n: &str, disc: i128| Variant { name: interner.intern(n), shape: VariantShape::Unit, fields: Vec::new(), disc, non_exhaustive: false };
-            let field = |n: &str, ty: Ty| Field { name: interner.intern(n), ty, span };
+            let field = |n: &str, ty: Ty| Field { name: interner.intern(n), ty, span, derive_bounds: Vec::new() };
             let named = |fields: Vec<Field>| vec![Variant { name, shape: VariantShape::Named, fields, disc: 0, non_exhaustive: false }];
             let (def, variants, derives) = match usize::MAX - item_idx {
                 0 => (
@@ -4452,11 +4457,12 @@ pub fn collect_reuse(
                             )),
                             Err(_) => {}
                         }
-                        fields.push(Field { name: fname, ty: t, span: ast.ty_span(fty) });
+                        let derive_bounds = derive_bound_tys(&mut p, ast, interner, known, id, fty);
+                        fields.push(Field { name: fname, ty: t, span: ast.ty_span(fty), derive_bounds });
                     }
                     Err(d) => {
                         errs.push(d);
-                        fields.push(Field { name: fname, ty: ERROR, span: ast.ty_span(fty) });
+                        fields.push(Field { name: fname, ty: ERROR, span: ast.ty_span(fty), derive_bounds: Vec::new() });
                     }
                 }
             }
@@ -5517,6 +5523,37 @@ pub(crate) fn check_main_termination(p: &Program, errs: &mut Vec<Diag>) {
             "Write `fn main() { ... }` or `fn main() -> Result<(), E> { ... }`.",
         ));
     }
+}
+
+/// The parts of field type `fty` of Adt `id` that rustc's derive bounds
+/// on top of `T: Trait` per type param: every path type whose first
+/// segment names a type param, with more segments (`T::Item`, also inside
+/// generic args), resolved in the Adt's scope. rustc decides this on the
+/// written syntax, so `<T as Iterator>::Item` adds no bound.
+fn derive_bound_tys(p: &mut Program, ast: &Ast, interner: &Interner, known: &Known, id: AdtId, fty: ast::TyId) -> Vec<Ty> {
+    let params: Vec<Sym> =
+        p.gx.adt_generics[id.0 as usize].params.iter().filter(|q| q.kind == ParamKind::Type).map(|q| q.name).collect();
+    let mut out = Vec::new();
+    if params.is_empty() {
+        return out;
+    }
+    let mut stack = vec![fty];
+    while let Some(t) = stack.pop() {
+        let te = ast.ty(t);
+        if let TyExpr::Path(segs) = te
+            && segs.len() > 1
+            && params.contains(&segs[0].name)
+        {
+            let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
+            if let Ok(r) = generics::resolve_scoped(ast, interner, known, &cx, &mut p.tys, t, &p.gx.adt_scopes[id.0 as usize])
+                && !out.contains(&r)
+            {
+                out.push(r);
+            }
+        }
+        stack.extend(crate::driver::sig_nodes::ty_children(te));
+    }
+    out
 }
 
 /// Collect's field checks of the derived `Copy` and `Debug` impls, for

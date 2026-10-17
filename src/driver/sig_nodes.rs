@@ -188,7 +188,7 @@ fn plain_path(segs: &[PathSeg]) -> bool {
 }
 
 /// The type nodes one type node holds, through generic arguments too.
-fn ty_children(t: &TyExpr) -> Vec<TyId> {
+pub(crate) fn ty_children(t: &TyExpr) -> Vec<TyId> {
     fn segs(segs: &[PathSeg], out: &mut Vec<TyId>) {
         for s in segs {
             match &s.args {
