@@ -1855,10 +1855,23 @@ impl Ex<'_, '_> {
     /// The builtin iterator a `ByNext` wrapper reaches through the
     /// `&mut I` it holds (core's `impl Iterator for &mut I`): it steps,
     /// hints, and fuses as `I` itself, in place.
-    fn by_mut_builtin(&self, held: Ty) -> Option<Ty> {
+    /// A std collection iterator struct behind the `&mut` counts as its
+    /// inner builtin iterator (field 0, `by_mut_place`).
+    fn by_mut_builtin(&mut self, held: Ty) -> Option<Ty> {
         match self.body.tys.kind(held) {
             TyKind::Ref(_, Mut::Mut, inner) if self.kind_args(inner).is_some() || self.body.tys.is_chars_ty(inner) => Some(inner),
+            TyKind::Ref(_, Mut::Mut, inner) => self.wrapper_inner(inner),
             _ => None,
+        }
+    }
+
+    /// The place of the builtin iterator `by_mut_builtin` found, for the
+    /// `&mut` held at `at`: `*at`, or field 0 of the collection iterator
+    /// struct it points to.
+    fn by_mut_place(&mut self, held: Ty, at: Place) -> Place {
+        match self.body.tys.kind(held) {
+            TyKind::Ref(_, _, inner) if self.wrapper_inner(inner).is_some() => at.deref().project(Proj::Field(0)),
+            _ => at.deref(),
         }
     }
 
@@ -2530,7 +2543,8 @@ impl Ex<'_, '_> {
             }
             // The wrapped iterator's own `next` (W-STD-B): forward only.
             K::ByNext if let Some(inner) = self.by_mut_builtin(a[0]) => {
-                self.next(f(0).deref(), inner, dest, back)?;
+                let at = self.by_mut_place(a[0], f(0));
+                self.next(at, inner, dest, back)?;
                 self.goto(join);
             }
             K::ByNext => {
@@ -5001,7 +5015,7 @@ impl Ex<'_, '_> {
     /// True when `len()` on `ty` runs std's exact-size assert over a
     /// user `size_hint`: a `ByNext` core under the adapters whose
     /// own `len` delegates to their inner iterator's.
-    fn len_asserts(&self, ty: Ty) -> bool {
+    fn len_asserts(&mut self, ty: Ty) -> bool {
         use IterKind as K;
         match self.kind_args(ty) {
             Some((K::ByNext, a)) => self.by_mut_builtin(a[0]).is_none_or(|inner| self.len_asserts(inner)),
@@ -5145,7 +5159,8 @@ impl Ex<'_, '_> {
             }
             // `&mut I` over a builtin iterator: its own hint.
             K::ByNext if let Some(inner) = self.by_mut_builtin(a[0]) => {
-                let (l, h) = self.hint(f(0).deref(), inner)?;
+                let at = self.by_mut_place(a[0], f(0));
+                let (l, h) = self.hint(at, inner)?;
                 self.assign(Place::local(lo), Rvalue::Use(Operand::Copy(Place::local(l))));
                 self.assign(Place::local(hi), Rvalue::Use(Operand::Move(Place::local(h))));
             }
@@ -5632,7 +5647,7 @@ impl Ex<'_, '_> {
 
     /// True when Rust 1.99 implements `TrustedLen` for this type (the
     /// kinds lust has), which picks `collect`'s exact-capacity path.
-    fn trusted_len(&self, ty: Ty) -> bool {
+    fn trusted_len(&mut self, ty: Ty) -> bool {
         use IterKind as K;
         let Some((k, a)) = self.kind_args(ty) else { return false };
         match k {
@@ -6189,7 +6204,7 @@ impl Ex<'_, '_> {
 
     /// True when `fold` over this type pulls differently from a `next`
     /// loop (see `each`).
-    fn fold_differs(&self, ty: Ty) -> bool {
+    fn fold_differs(&mut self, ty: Ty) -> bool {
         use IterKind as K;
         let Some((k, a)) = self.kind_args(ty) else { return false };
         match k {
@@ -6906,7 +6921,7 @@ impl Ex<'_, '_> {
     /// True when Rust 1.99 implements FusedIterator for the type: every
     /// std iterator lust has, and adapters over fused ones; not a user
     /// iterator (`ByNext`).
-    fn fused(&self, t: Ty) -> bool {
+    fn fused(&mut self, t: Ty) -> bool {
         match self.kind_args(t) {
             None => true,
             // core: `impl<I: FusedIterator + ?Sized> FusedIterator for &mut I`.

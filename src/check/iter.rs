@@ -1010,10 +1010,18 @@ impl<'p> Ctx<'p> {
         // for &mut I`: the reference moves into a `ByNext` wrapper whose
         // `next` steps `*r` in place (lower/iter.rs). Other forms through
         // a reference (`&I`, `&&mut I`) stay out.
-        if by_value && derefs == 1 && actual_base == base && self.iter_method_known(n) {
+        // A std collection iterator struct behind `&mut` (`&mut
+        // vec_deque::IntoIter<T>`, typed as its inner iterator `base`)
+        // steps through the struct's own `next` the same way. BTree
+        // `range` iterators stay out: lowering would hint them as their
+        // exact inner iterator, where std gives `(0, None)`.
+        let wrapper = actual_base != base
+            && self.p.collection_iter_inner(&mut self.tys, actual_base) == Some(base)
+            && !self.p.is_btree_range_iter(&mut self.tys, actual_base);
+        if by_value && derefs == 1 && (actual_base == base || wrapper) && self.iter_method_known(n) {
             let rt = self.out.expr_ty[self.ei(recv)];
             let rt = self.deep(rt);
-            if matches!(self.kind(rt), TyKind::Ref(_, Mut::Mut, inner) if inner == base) {
+            if matches!(self.kind(rt), TyKind::Ref(_, Mut::Mut, inner) if inner == actual_base) {
                 let wrapped = it::mk_iter(&mut self.tys, IterKind::ByNext, &[rt, item]);
                 let i = self.ei(recv);
                 self.out.coerce[i] = Coerce::ByNext(wrapped);
@@ -1783,6 +1791,13 @@ impl<'p> Ctx<'p> {
             let inner = self.deep(inner);
             if it::is_iter(&self.tys, inner) {
                 return it::item_ty(&mut self.tys, inner);
+            }
+            // A std collection iterator struct: its inner iterator's items
+            // (not BTree `range` iterators, as above).
+            if !self.p.is_btree_range_iter(&mut self.tys, inner)
+                && let Some(i) = self.p.collection_iter_inner(&mut self.tys, inner)
+            {
+                return it::item_ty(&mut self.tys, i);
             }
         }
         let user = match self.kind(base) {

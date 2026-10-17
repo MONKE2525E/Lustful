@@ -593,6 +593,19 @@ impl Program {
     pub fn is_std_adt(&self, a: AdtId) -> bool {
         self.adts.get(a.0 as usize).is_some_and(|adt| self.std_source_span(adt.span))
     }
+    /// True for BTree `range`/`range_mut` iterators: std gives them the
+    /// default `size_hint` of `(0, None)`, while their inner slice
+    /// iterator is exact. Paths that would hint them as the inner
+    /// iterator leave them out.
+    pub fn is_btree_range_iter(&self, tys: &mut impl TyIntern, t: Ty) -> bool {
+        tys.local_adt(t).is_some_and(|a| {
+            self.is_std_adt(a)
+                && matches!(
+                    self.display_path(self.adt(a).name).as_str(),
+                    "alloc::collections::btree_map::Range" | "alloc::collections::btree_map::RangeMut" | "alloc::collections::btree_set::Range"
+                )
+        })
+    }
     /// The inner iterator type when `t` is one of the std source
     /// collection iterator structs (`alloc::collections::{btree_map,
     /// btree_set, vec_deque}` iterators, W-STD-C): each is a nominal
