@@ -2041,6 +2041,10 @@ struct Ctx<'p> {
     /// Item types an iterator method needs to be Copy (`copied`),
     /// re-tested at finish as above (W-STD-A).
     deferred_copy: Vec<(Ty, Span)>,
+    /// `repeat_n(x, n)` element types: lust copies them bitwise, so a Copy
+    /// type with a written `Clone` (which std's `repeat_n` calls) is
+    /// rejected at body end.
+    deferred_repeat_n: Vec<(Ty, Span)>,
     /// `Range<{integer}>::len` and kin: the element must end as one of
     /// core's exact-size range integers (check/iter.rs `exact_size`).
     deferred_exact_range: Vec<(Ty, bool, Span)>,
@@ -2555,6 +2559,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_collect: Vec::new(),
         deferred_sum: Vec::new(),
         deferred_copy: Vec::new(),
+        deferred_repeat_n: Vec::new(),
         deferred_exact_range: Vec::new(),
         deferred_io_copy: Vec::new(),
         stmt_expr: None,
@@ -15264,6 +15269,7 @@ impl<'p> Ctx<'p> {
                     Builtin::IterRepeatN => {
                         let t = self.callee_turbo_ty(callee, span);
                         self.deferred_copy.push((t, span));
+                        self.deferred_repeat_n.push((t, span));
                         (vec![t, USIZE], crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::RepeatN, &[t]))
                     }
                     // `std::array::from_fn::<T, N, F>(f) -> [T; N]` with
@@ -24249,6 +24255,18 @@ impl<'p> Ctx<'p> {
             if !is_copy(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
                 let tn = self.tn(t);
                 self.err("L0612", span, format!("`{tn}` is not Copy"), "Use `.cloned()` instead of `.copied()`.");
+            }
+        }
+        for (t, span) in std::mem::take(&mut self.deferred_repeat_n) {
+            let t = self.deep(t);
+            if is_copy(self.p, &self.tys, t) && !has_clone(self.p, &self.tys, t) && !matches!(self.kind(t), TyKind::Error | TyKind::Infer(_)) {
+                let tn = self.tn(t);
+                self.err(
+                    "L0612",
+                    span,
+                    format!("`repeat_n` of `{tn}`, a Copy type with a written Clone impl, is not supported"),
+                    "Derive Clone on the type.",
+                );
             }
         }
         for (r, w, span) in std::mem::take(&mut self.deferred_io_copy) {
