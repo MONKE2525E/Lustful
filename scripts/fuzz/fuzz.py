@@ -401,6 +401,7 @@ class Harness:
         self.logpath = os.path.join(self.work, "daemon.log")
         self.log = open(self.logpath, "w")
         self.daemon = None
+        self.rss_peak, self.rss_bad = 0.0, ""
         self.start_daemon()
 
     def start_daemon(self):
@@ -415,6 +416,8 @@ class Harness:
         # Any guard check the previous daemon left pending is dead with it.
         self._poll_log()
         self._gstart_base = self._gstart
+        # A new daemon warms up again before the RSS bound applies.
+        self._rss_n, self._rss_warm = 0, 0.0
         self._gdone_base = self._gdone
         t0 = time.time()
         while not os.path.exists(self.sock):
@@ -423,8 +426,11 @@ class Harness:
             time.sleep(0.005)
 
     def kill_daemon(self):
+        # start_new_session made the daemon its group's leader, so the group id is its pid.
+        # os.getpgid fails once poll() has reaped a dead daemon, and a fork child it left
+        # (an in-memory run) would keep the socket lock and block the next daemon.
         try:
-            os.killpg(os.getpgid(self.daemon.pid), signal.SIGKILL)
+            os.killpg(self.daemon.pid, signal.SIGKILL)
         except Exception:
             try:
                 self.daemon.kill()
@@ -466,6 +472,43 @@ class Harness:
 
     def daemon_alive(self):
         return self.daemon.poll() is None
+
+    # Daemon RSS bound (fx-oraclemem): once a daemon has served RSS_WARM edits, its RSS may
+    # grow to at most twice that value plus RSS_SLACK_MB. A per-request leak fails the run
+    # instead of filling the box (the patch oracle once kept a Program per request, about
+    # 10 MB per edit). FUZZ_RSS_LOG=<file> appends `<sample> <MB>` per edit.
+    RSS_WARM = 100
+    RSS_SLACK_MB = 256
+
+    def rss_mb(self):
+        """The daemon's resident set in MB (0 when it is gone)."""
+        try:
+            with open(f"/proc/{self.daemon.pid}/status") as f:
+                kb = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
+            return kb / 1024
+        except Exception:
+            return 0.0
+
+    def rss_sample(self):
+        """Samples the daemon RSS after one edit (see RSS_WARM)."""
+        mb = self.rss_mb()
+        self._rss_n += 1
+        self.rss_peak = max(self.rss_peak, mb)
+        if self._rss_n == self.RSS_WARM:
+            self._rss_warm = mb
+        elif self._rss_warm and mb > 2 * self._rss_warm + self.RSS_SLACK_MB and not self.rss_bad:
+            self.rss_bad = f"{self._rss_warm:.0f} MB after {self.RSS_WARM} edits -> {mb:.0f} MB after {self._rss_n}"
+        if os.environ.get("FUZZ_RSS_LOG"):
+            with open(os.environ["FUZZ_RSS_LOG"], "a") as f:
+                f.write(f"{self._rss_n} {mb:.0f}\n")
+
+    def rss_result(self):
+        """Prints the RSS line; 1 when the bound broke (a failure), else 0."""
+        print(f"rss: daemon peak {self.rss_peak:.0f} MB, warm {self._rss_warm:.0f} MB", flush=True)
+        if self.rss_bad:
+            print(f"FAIL daemon RSS grew past 2x + {self.RSS_SLACK_MB} MB: {self.rss_bad}", flush=True)
+            return 1
+        return 0
 
     def _poll_log(self):
         """Reads only the daemon log bytes new since the last poll and folds
@@ -1215,6 +1258,7 @@ def cmd_run(a):
                 h.run_cmd("check", True)
                 continue
             ok, why, da, co = compare(h, "check", a.strict)
+            h.rss_sample()
             # The guard now runs behind the answer. Wait for it before
             # counting or editing again, so a mismatch is charged to this
             # edit (and the next edit never races the background check).
@@ -1304,6 +1348,7 @@ def cmd_run(a):
         h.wait_guard_idle()
         guard = h.guard_count()
         failures = sig_result(h, ext, failures)
+        failures += h.rss_result()
         failures += rs.judge(a.out)
         print(f"RESULT seed={a.seed} crate={a.crate} modules={a.modules} edits={a.edits} "
               f"failures={failures} guard_fired={guard} wall={time.time() - t0:.0f}s")
@@ -1703,6 +1748,7 @@ def cmd_run_multi(a, rename=False, feat3=False):
                 continue
             ok, why, da, co = compare(h, "check", a.strict)
             h.wait_guard_idle()
+            h.rss_sample()
             g = h.guard_count()
             if g > seen_guard:
                 save_bundle(f"guard-{it}", prev, files)
@@ -1792,6 +1838,7 @@ def cmd_run_multi(a, rename=False, feat3=False):
         h.wait_guard_idle()
         guard = h.guard_count()
         failures = sig_result(h, ext, failures)
+        failures += h.rss_result()
         print(f"RESULT seed={a.seed} crate={a.crate} edits={a.edits} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
@@ -2215,6 +2262,7 @@ def cmd_run_patchseq(a):
         # The guard's fresh session logs a line of its own after an error
         # answer: wait for it, and count the warm answer's line only.
         h.wait_guard_idle()
+        h.rss_sample()
         with open(visits) as f:
             f.seek(mark)
             warm = (f.read().splitlines() or [""])[0]
@@ -2298,6 +2346,7 @@ def cmd_run_patchseq(a):
         h.wait_guard_idle()
         guard = h.guard_count()
         failures = sig_result(h, ext, failures)
+        failures += h.rss_result()
         print(f"RESULT seed={a.seed} crate=patchseq edits={steps} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(Counter(k.split(":")[-1] for k in ops.elements())))
