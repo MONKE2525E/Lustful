@@ -82,6 +82,7 @@ pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>, moved: &mut dyn FnMut(
         check_all(p, errs);
         return 0;
     }
+    let t0 = std::time::Instant::now();
     let mut memo = crate::intern::FxMap::default();
     let reads = std::mem::take(&mut p.const_body_reads);
     let known: std::collections::HashSet<FnLoc> = reads.iter().map(|(l, _)| *l).collect();
@@ -107,6 +108,11 @@ pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>, moved: &mut dyn FnMut(
     } else {
         reads.iter().map(|(_, r)| p.reads_dirty_memo(r, &mut memo) != 0).collect()
     };
+    super::derive_delta::log(&|| {
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let n = dirty.iter().filter(|&&d| d).count();
+        format!("const bodies: {} sets, {n} dirty, {} fingerprints, compare {ms:.1} ms\n", reads.len(), memo.len())
+    });
     let mut locs = std::collections::HashSet::new();
     for ((l, r), d) in reads.into_iter().zip(dirty) {
         if d {
@@ -116,6 +122,7 @@ pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>, moved: &mut dyn FnMut(
         }
     }
     check_sites(p, errs, &|l| locs.contains(&l) || !known.contains(&l));
+    super::derive_delta::log(&|| format!("const bodies: {} rechecked, all {:.1} ms\n", locs.len(), t0.elapsed().as_secs_f64() * 1e3));
     unproven
 }
 
