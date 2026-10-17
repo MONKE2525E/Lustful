@@ -639,6 +639,12 @@ pub(super) fn replay_discovery(
     let mut outs: Vec<(LocalDefId, Option<crate::driver::graph::Reads>, crate::driver::gen_reuse::Discovered)> = Vec::new();
     let out = (|| {
         let reuse = &mut caches.gen_reuse;
+        // The bodies that check again, each with the output it must give,
+        // in fn order. A body with no output to compare ends the list: its
+        // Err comes after the answers of the bodies before it, as in a
+        // walk one body at a time.
+        let mut work: Vec<(LocalDefId, crate::driver::gen_reuse::OutCopy, bool)> = Vec::new();
+        let mut stop: Option<&'static str> = None;
         for g in (0..fn_count as u32).map(LocalDefId) {
             if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
                 continue;
@@ -646,7 +652,13 @@ pub(super) fn replay_discovery(
             let own = bases.iter().find(|b| b.0 == g.0 as usize).map(|b| b.1.as_ref());
             let newer = reuse.newer(p, g, p.reuse_stamp, start);
             let base = if newer {
-                own.ok_or("sig mode")?.cloned()
+                match own {
+                    Some(b) => b.cloned(),
+                    None => {
+                        stop = Some("sig mode");
+                        break;
+                    }
+                }
             } else if stands(g)
                 || readers.map_or_else(|| reuse.untouched(p, g, &mut |k| touched(p, k)), |r| reuse.untouched_by(p, g, r))
                 || reuse.discovery_holds(p, g)
@@ -657,25 +669,37 @@ pub(super) fn replay_discovery(
             };
             let Some(base) = base else {
                 crate::check::derive_delta::log(&|| format!("discovery {}: no output kept\n", p.display_name(p.fn_def(g).name)));
-                return Err("discovery");
+                stop = Some("discovery");
+                break;
             };
-            let (mut checked, discarded) = crate::check::check_fn(p, g);
+            work.push((g, base, newer));
+        }
+        // The checks read the program only: they run in parallel, as the
+        // compile tail's body checks do.
+        let prog: &Program = p;
+        let checked = crate::driver::compile::par_map(&work, |&(g, _, _)| {
+            let (mut checked, discarded) = crate::check::check_fn(prog, g);
             let pending = checked.closure_map_pending;
-            let out = generics::discovery_out(p, &checked, &discarded);
+            let out = generics::discovery_out(prog, &checked, &discarded);
+            let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
+            (out, reads, pending)
+        });
+        for ((g, base, newer), (out, reads, pending)) in work.into_iter().zip(checked) {
             if !base.same(p, &out, walk_instances) {
                 crate::check::derive_delta::log(&|| {
                     format!("discovery {}: output differs (pending {pending}, newer {newer}): {}\n", p.display_name(p.fn_def(g).name), base.differs(p, &out))
                 });
                 return Err("discovery");
             }
-            let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
             reuse.discovery_checked += 1;
-            drop((checked, discarded));
             // Every body type enters the global store, as discovery does.
             for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
                 generics::build_owned_ty(p, t);
             }
             outs.push((g, reads, out));
+        }
+        if let Some(why) = stop {
+            return Err(why);
         }
         for (g, reads, (adt_tys, reqs, closures, vts)) in &outs {
             match reads {
