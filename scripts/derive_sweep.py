@@ -272,6 +272,17 @@ P7_SHAPES = {
         "const P7C: Option<<A as ToOwned>::Owned> = None;\n",
         "println!(\"{}\", P7C.is_none());",
     ),
+    # A body that calls a generic `impl Fn` fn stays pending in `lust
+    # check` (its reads are kept): one that names A without a derive
+    # bound, and one that needs A: Copy.
+    "p7_pending": (
+        "fn p7_mk<V: Copy>(v: V) -> impl Fn() -> V {\n    move || v\n}\nfn p7_pend(a: &A) -> String {\n    let f = p7_mk(show(a).len());\n    format!(\"{}\", f())\n}\n",
+        "println!(\"{}\", p7_pend(&mk()));",
+    ),
+    "p7_pending_copy": (
+        "fn p7_mkc<V: Copy>(v: V) -> impl Fn() -> V {\n    move || v\n}\nfn p7_pendc(a: A) -> String {\n    let f = p7_mkc(a);\n    show(&f()) + &show(&f())\n}\n",
+        "println!(\"{}\", p7_pendc(mk()));",
+    ),
 }
 SHAPES.update(P7_SHAPES)
 
