@@ -1811,6 +1811,12 @@ impl<'p> Ctx<'p> {
             {
                 return it::item_ty(&mut self.tys, i);
             }
+            // A user iterator: its own items; the `ByNext` wrapper holds the
+            // `&mut` and steps `*r` in place, as `(&mut it).take(2)` does
+            // (`v.extend(&mut it)`, `I = &mut UserIter` in an instance).
+            if self.tys.local_adt(inner).is_some() && self.tys.builtin_of(inner).is_none() {
+                return self.by_next_item(inner, span);
+            }
         }
         let user = match self.kind(base) {
             TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) => false,
