@@ -2,7 +2,7 @@
 
 # lust
 
-lust is a compiler for a subset of Rust. It checks and builds Rust code much faster than rustc, so the edit, check, run loop stays short. It emits C and compiles it with [tcc](https://bellard.org/tcc/).
+lust is a compiler for a subset of Rust. A warm lust daemon re-checks Rust code after an edit much faster than rustc, so the edit, check, run loop stays short. It emits C and compiles it with [tcc](https://bellard.org/tcc/).
 
 Rule zero: every program lust accepts is valid Rust (rustc 1.99, edition 2024), and it gives the same output. When lust cannot match rustc, it rejects the program with an error code. It never guesses.
 
@@ -20,21 +20,32 @@ On a fork of ts-rust (upstream commit `b11b618ae`, 2026-10-09) with small change
 
 ## Speed
 
-Warm `lust check` through the daemon, compared with `cargo check` (rustc 1.99, incremental, the faster of the default and `-Z threads=8` setups). 16 vCPU Linux box. All numbers come from [docs/speed.md](docs/speed.md) and the latest runs on the full ts_goport crate.
+lust is fast when a warm daemon re-checks an edit inside function bodies. It is not fast for a first, cold check of a large crate.
 
-| Edit | Code | lust median | lust p95 | cargo check median | Ratio median | Ratio p95 |
-|---|---|---:|---:|---:|---:|---:|
-| Change one function body | ts-rust slices, 150k to 165k lines | 3 to 4 ms | 7 to 15 ms | 2.0 to 2.4 s | 519x to 644x | 187x to 346x |
-| Change a signature, a type, or a derive | full ts_goport crate, 348k lines | 43 to 94 ms | 110 ms to 7.0 s | about 5.6 to 6.6 s | 64x to 131x | not measured |
+`lust check` of ts_goport (the main ts-rust crate) from the pinned fork, measured on a fresh 16 vCPU, 32 GB Linux box with the 0.1.0 release package. `cargo check` ran on the same box (rustc 1.97.1, incremental).
+
+| Step | lust | cargo check |
+|---|---:|---:|
+| Cold check, no daemon | 70.5 s (5.4 GB peak) | 37.9 s (deps included) |
+| Daemon first check | 81.5 s | - |
+| No change | under 10 ms | 0.02 s |
+| Change one function body (3 edits, one a type error) | under 10 ms each (7.9 ms total in `--timings`) | 5.0 to 5.1 s |
+| Add a comment to `lib.rs` | 8.3 s | - |
+
+Body edits at scale, from [docs/speed.md](docs/speed.md): 120 body edits on each of three ts-rust slices (150k to 165k lines), compared with the faster of cargo check and cargo check with `-Z threads=8` (rustc 1.99):
+
+| | lust | cargo check | Ratio |
+|---|---:|---:|---:|
+| Median | 3 to 4 ms | 2.0 to 2.4 s | 519x to 644x |
+| p95 | 7 to 15 ms | | 187x to 346x |
+| Worst | 102 to 143 ms | | |
 
 The fine print:
 
-- Body edits are the fast path. The worst body edit in 120 was 102 to 143 ms.
-- Edits outside bodies are slower and less even. Some signature edits still fall back to a full check, which costs about as much as a cold check. That is where the 7.0 s p95 comes from.
-- A cold check (no daemon) is only about 2x faster than cargo check on ts-rust. The first check of a new daemon session costs the same as a cold check.
-- `lust build` after a body edit is about 17x faster than a cargo build at the median (9x at p95). A cold `lust build` of a large ts-rust bin takes about 2 minutes.
+- Edits outside function bodies (a signature, a type, a derive) are slower and less even. On a trimmed ts_goport tree (259k lines), the latest runs give medians of 43 to 94 ms (64x to 131x faster than cargo check), but a p95 of up to 7 s for signature edits. Some of these edits still fall back to a full check.
+- The daemon holds the whole program in memory. On ts_goport it used 14.5 GB after the first check and 19.9 GB after a few edits. On a 16 GB box the daemon was killed for lack of memory. Use a machine with 32 GB or more for ts-rust.
+- `lust build` after a body edit is about 17x faster than a cargo build at the median (9x at p95) on the slices. A cold `lust build` of a large ts-rust bin takes about 2 minutes.
 - Built programs run slower than rustc debug builds, because tcc does not optimize.
-- The daemon holds the whole program in memory: about 3.3 GB peak on a 165k-line slice.
 
 ## Install
 
@@ -51,6 +62,7 @@ The package holds `lust`, `lust-core`, the pinned tcc, and the std and adapter s
 You also need:
 
 - glibc 2.38 or later (Ubuntu 24.04, Debian 13, Fedora 39, or newer).
+- Enough memory for the daemon: a small project needs little, ts-rust needs 32 GB (see [Speed](#speed)).
 - The C library development files (`libc6-dev` on Debian and Ubuntu, `glibc-devel` on Fedora). tcc links your program against them.
 - Cargo, to check a Cargo crate: lust reads `cargo metadata` and the registry sources. Cargo also does release builds.
 
