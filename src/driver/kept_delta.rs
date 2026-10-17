@@ -644,7 +644,8 @@ pub(super) fn replay_discovery(
                 continue;
             }
             let own = bases.iter().find(|b| b.0 == g.0 as usize).map(|b| b.1.as_ref());
-            let base = if reuse.newer(p, g, p.reuse_stamp, start) {
+            let newer = reuse.newer(p, g, p.reuse_stamp, start);
+            let base = if newer {
                 own.ok_or("sig mode")?.cloned()
             } else if stands(g)
                 || readers.map_or_else(|| reuse.untouched(p, g, &mut |k| touched(p, k)), |r| reuse.untouched_by(p, g, r))
@@ -663,7 +664,7 @@ pub(super) fn replay_discovery(
             let out = generics::discovery_out(p, &checked, &discarded);
             if !base.same(p, &out, walk_instances) {
                 crate::check::derive_delta::log(&|| {
-                    format!("discovery {}: output differs (pending {pending}): {}\n", p.display_name(p.fn_def(g).name), base.differs(&out))
+                    format!("discovery {}: output differs (pending {pending}, newer {newer}): {}\n", p.display_name(p.fn_def(g).name), base.differs(p, &out))
                 });
                 return Err("discovery");
             }

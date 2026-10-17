@@ -105,7 +105,7 @@ impl OutCopy {
 
     /// Which part of `out` differs from this copy where `same` compares
     /// (a refusal log line).
-    pub(crate) fn differs(&self, out: &Discovered) -> String {
+    pub(crate) fn differs(&self, p: &Program, out: &Discovered) -> String {
         let (adt_tys, _, closures, vtables) = out;
         let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).count();
         let mut parts = Vec::new();
@@ -119,12 +119,45 @@ impl OutCopy {
         );
         if a != b {
             let same_set = a.iter().all(|t| b.contains(t)) && b.iter().all(|t| a.contains(t));
-            parts.push(format!("makers {} -> {} (same set {same_set})", makers(&self.adt_tys), makers(adt_tys)));
+            let gone: Vec<String> = a.iter().filter(|t| !b.contains(t)).take(3).map(|t| owned_str(p, t)).collect();
+            let new: Vec<String> = b.iter().filter(|t| !a.contains(t)).take(3).map(|t| owned_str(p, t)).collect();
+            parts.push(format!("makers {} -> {} (same set {same_set}; gone {gone:?}, new {new:?})", makers(&self.adt_tys), makers(adt_tys)));
         }
         if self.vtables != *vtables {
             parts.push(format!("vtables {} -> {}", self.vtables.len(), vtables.len()));
         }
         parts.join(", ")
+    }
+}
+
+/// A short text of an owned type for a refusal log line (Adt names,
+/// other leaves by kind).
+fn owned_str(p: &Program, t: &OwnedTy) -> String {
+    let args = |a: &[crate::check::generics::OwnedArg]| {
+        let xs: Vec<String> = a
+            .iter()
+            .map(|g| match g {
+                crate::check::generics::OwnedArg::Ty(t) => owned_str(p, t),
+                crate::check::generics::OwnedArg::Lifetime(r) => format!("{r:?}"),
+                crate::check::generics::OwnedArg::Const(_) => "const".to_string(),
+            })
+            .collect();
+        xs.join(", ")
+    };
+    match t {
+        OwnedTy::Adt(d, a) => {
+            let name = p.adt_by_def(*d).map_or_else(|| format!("#{:x}", d.hash.0), |x| p.display_name(p.adt(x).name).to_string());
+            format!("{name}<{}>", args(a))
+        }
+        OwnedTy::Ref(r, m, e) => format!("&{r:?} {m:?} {}", owned_str(p, e)),
+        OwnedTy::RawPtr(_, e) => format!("*{}", owned_str(p, e)),
+        OwnedTy::Slice(e) => format!("[{}]", owned_str(p, e)),
+        OwnedTy::Array(e, _) => format!("[{}; _]", owned_str(p, e)),
+        OwnedTy::Tuple(ts) => format!("({})", ts.iter().map(|t| owned_str(p, t)).collect::<Vec<_>>().join(", ")),
+        OwnedTy::Leaf(k) => format!("{k:?}"),
+        OwnedTy::Opaque(d, a) => format!("opaque#{:x}<{}>", d.hash.0, args(a)),
+        OwnedTy::Closure(d, _) => format!("closure#{:x}", d.hash.0),
+        _ => "other".to_string(),
     }
 }
 
@@ -644,9 +677,13 @@ impl GenReuse {
         self.on && !self.unstored.contains_key(&def) && self.discovery.get(&def).is_some_and(|e| self.src_of(p, f) == Some(e.src))
     }
 
-    /// The stored discovery output of fn `f`, if it still holds.
+    /// The stored discovery output of fn `f`, if it still holds. Not when
+    /// a later check of `f` stored nothing (`unstored`, an error or a
+    /// pending closure map): the caller checks again. A replay would leave
+    /// that note, which `out_copy` returns, so every later kept-program
+    /// delta would compare the body with the note's output and refuse.
     pub fn discovered(&mut self, p: &Program, f: LocalDefId) -> Option<Discovered> {
-        if !self.on {
+        if !self.on || self.unstored.contains_key(&p.def_id(f)) {
             return None;
         }
         let src = self.src_of(p, f)?;
