@@ -3929,10 +3929,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         diags.push(Diag::new("L0130", diag::Span::default(), "no `main` function", "Add `fn main() { ... }`."));
     }
     t.lap(if mode == "full" { "check+borrowck (par)" } else { "check changed fns (par)" });
-    // A one-shot (non-persistent) process exits right after this call. Freeing the IR and
+    // A one-shot process (`leak_at_exit`) exits right after this call. Freeing the IR and
     // program arenas, mostly built on worker threads, costs about 10 ms on a 31k-line crate,
-    // so leak them on every return below and let the OS reclaim the memory at exit.
-    let leak_at_exit = !caches.persistent;
+    // so leak them on every return below and let the OS reclaim the memory at exit. A
+    // non-persistent session inside the daemon (the patch oracle's) must free them.
+    let leak_at_exit = caches.leak_at_exit;
     if !diags.is_empty() {
         // The visits line for tests and logs only: an error answer must
         // stay the cold one, so stderr gets no stats.

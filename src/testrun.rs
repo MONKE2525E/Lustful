@@ -324,6 +324,7 @@ pub fn run(args: &[String]) -> i32 {
     // by crate, so the harness build below gets a fresh session).
     let dir = std::env::temp_dir().join(format!("lust-test-{}", std::process::id()));
     let mut session = driver::Session::new(dir.join("obj"), false, SessionKey::synthetic(&file, true));
+    session.caches.leak_at_exit = true;
     // Both requests are test crates: the harness build must keep the
     // `#[test]` fns it calls (a normal build removes them).
     let req = |cmd: Cmd, file: PathBuf, out: PathBuf| Request {
@@ -378,6 +379,7 @@ pub fn run(args: &[String]) -> i32 {
     let harness_path = abs(&dir.join("harness.rs"));
     let bin = dir.join("testbin");
     let mut session = driver::Session::new(dir.join("obj-harness"), false, SessionKey::synthetic(&harness_path, true));
+    session.caches.leak_at_exit = true;
     let build = driver::compile(&req(Cmd::Build, harness_path.clone(), bin.clone()), &mut session);
     if build.code != 0 {
         // Spans match the user file byte for byte; only the file name differs.

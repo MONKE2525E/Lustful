@@ -346,6 +346,10 @@ pub(crate) struct Caches {
     pub(crate) objects: Option<bool>,
     /// A daemon session builds against libbase.so; a one-shot session links statically.
     pub(crate) persistent: bool,
+    /// The process exits right after this session's request (`lust check` and `lust test`
+    /// one-shots set it): compile leaks the program and IR instead of freeing them. A
+    /// non-persistent session inside a daemon (the patch oracle's fresh compile) frees them.
+    pub(crate) leak_at_exit: bool,
     /// Generic reuse (driver/gen_reuse.rs): template check and instance
     /// discovery results of a generic program, valid while `gen_key`
     /// (the item-level environment and AST fn count they were made
@@ -464,6 +468,7 @@ impl Session {
                 obj_dir,
                 objects: None,
                 persistent,
+                leak_at_exit: false,
                 overlays: Default::default(),
                 gen_reuse: Default::default(),
                 inst_ids: FxMap::default(),
