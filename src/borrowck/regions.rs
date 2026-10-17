@@ -6738,7 +6738,11 @@ impl<'b, 'p> Builder<'b, 'p> {
             K::CharIndices | K::StringDrain | K::Args => Vec::new(),
             // Range kinds that are `RangeBounds` values here, not iterators.
             K::RangeTo | K::RangeFull | K::RangeToInclusive => return None,
-            K::Flatten => self.item_slots(a[1], &args[1])?,
+            // `flat_map`'s front and back iterators hold what its map holds
+            // (`call_flat_map`); a plain `flatten`'s are not tied to the
+            // outer iterator, so its items are not known here.
+            K::Flatten if matches!(crate::ty::iter::iter_parts(&self.body.tys, a[0]), Some((K::Map, _))) => self.item_slots(a[1], &args[1])?,
+            K::Flatten => return None,
             K::OptionIntoIter | K::ResultIntoIter => args[0].clone(),
             // `&'a str` of the haystack (W-STD-B); the matches forms
             // yield it too, with a plain `usize` for the indices forms.
@@ -9456,6 +9460,22 @@ impl<'b, 'p> Builder<'b, 'p> {
         vars.get(off as usize..(off + n) as usize).map(|v| v.to_vec())
     }
 
+    /// The vars of `<T as Iterator>::Item` or `<T as IntoIterator>::Item`
+    /// (assoc `a`, args `pa`) at erased type `e`, when `T` is a bound param
+    /// whose erased type is an iterator `item_slots` reads: its items'
+    /// own vars. None for anything else.
+    fn iter_item_vars(&mut self, a: crate::ty::AssocId, pa: crate::ty::ArgsId, e: Ty, binds: &FxMap<u32, Vec<u32>>) -> Option<Vec<u32>> {
+        let p = self.p;
+        if a.0 != p.gx.lang.assoc_item && a.0 != p.gx.lang.assoc_into_item {
+            return None;
+        }
+        let Some(GenericArg::Ty(t)) = p.tys.args(pa).first().copied() else { return None };
+        let TyKind::Param(j) = p.tys.kind(t) else { return None };
+        let (vars, et) = (binds.get(&j.0)?.clone(), *self.bind_tys.get(&j.0)?);
+        let items = self.item_slots(et, &vars)?;
+        (items.len() == self.sc.slots(e) as usize).then_some(items)
+    }
+
     fn inst_walk(&mut self, r: Ty, e: Ty, univ: &[u32], binds: &mut FxMap<u32, Vec<u32>>, out: &mut Vec<u32>) -> bool {
         let tys = &self.p.tys;
         let et = &self.body.tys;
@@ -9518,6 +9538,14 @@ impl<'b, 'p> Builder<'b, 'p> {
                 // `<T as Deref>::Target` over a builtin pointer `T` is its
                 // pointee, region for region: share those vars.
                 if let Some(v) = self.deref_target_vars(a, pa, e, binds) {
+                    out.extend_from_slice(&v);
+                    return true;
+                }
+                // `<I as Iterator>::Item` (or `IntoIterator::Item`) over an
+                // iterator type the call binds `I` to: those items' own vars
+                // (`I = &mut slice::Iter<'w, T>` gives `&'w T`, not the
+                // reborrow's region).
+                if let Some(v) = self.iter_item_vars(a, pa, e, binds) {
                     out.extend_from_slice(&v);
                     return true;
                 }
