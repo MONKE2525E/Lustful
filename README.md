@@ -43,7 +43,7 @@ Body edits at scale, from [docs/speed.md](docs/speed.md): 120 body edits on each
 The fine print:
 
 - Edits outside function bodies (a signature, a type, a derive) are slower and less even. On a trimmed ts_goport tree (259k lines), the latest runs give medians of 43 to 94 ms (64x to 131x faster than cargo check), but a p95 of up to 7 s for signature edits. Some of these edits still fall back to a full check.
-- The daemon holds the whole program in memory. On ts_goport it used 14.5 GB after the first check and 19.9 GB after a few edits. On a 16 GB box the daemon was killed for lack of memory. Use a machine with 32 GB or more for ts-rust.
+- The daemon holds the whole program in memory. On ts_goport (pinned fork, boat, a later build than the 0.1.0 package) it uses about 4.8 GB after the first check and stays near 5.7 GB over 300 edits of mixed kinds. A cold check peaks at about 1.5 GB. A 16 GB machine is enough for ts-rust. The 0.1.0 package used 14.5 GB after the first check and up to 20 GB, because each file copied the string table of every macro it could see.
 - `lust build` after a body edit is about 17x faster than a cargo build at the median (9x at p95) on the slices. A cold `lust build` of a large ts-rust bin takes about 2 minutes.
 - Built programs run slower than rustc debug builds, because tcc does not optimize.
 
@@ -62,7 +62,7 @@ The package holds `lust`, `lust-core`, the pinned tcc, and the std and adapter s
 You also need:
 
 - glibc 2.38 or later (Ubuntu 24.04, Debian 13, Fedora 39, or newer).
-- Enough memory for the daemon: a small project needs little, ts-rust needs 32 GB (see [Speed](#speed)).
+- Enough memory for the daemon: a small project needs little, ts-rust needs about 6 GB (see [Speed](#speed)).
 - The C library development files (`libc6-dev` on Debian and Ubuntu, `glibc-devel` on Fedora). tcc links your program against them.
 - Cargo, to check a Cargo crate: lust reads `cargo metadata` and the registry sources. Cargo also does release builds.
 
