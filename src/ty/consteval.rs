@@ -3662,6 +3662,14 @@ impl Evaluator {
             }
             CallTarget::ConstFn(body) => self.run_const_fn(cx, env, body, None, args, span, expected),
             CallTarget::NonConst => Err(nonconst(span, "this function")),
+            CallTarget::Unknown if let Some(it) = self.nonzero_new_ty(cx, callee, args, expected) => {
+                // `NonZeroU32::new(n)` and kin are const fns (std 1.47):
+                // `Some` of the wrapped integer, `None` for zero.
+                let t = super::int(it);
+                let n = self.int_arg(cx, env, args[0], t, span)?;
+                let nz = crate::check::generics::nonzero_ty(cx.tys(), t);
+                Ok(self.opt_value(cx, nz, (n != 0).then(|| ConstValue::Aggregate(vec![ConstValue::Int(n)]))))
+            }
             CallTarget::Unknown => match cx.ast().expr(callee) {
                 Expr::Path(segs) if STD_NONCONST.contains(&path_text(cx, segs).as_str()) => Err(nonconst(span, &path_text(cx, segs))),
                 Expr::Path(segs) if segs.len() == 2 && !cx.names_type(segs[0].name) => Err(unknown_type(cx, &segs[0], span)),
@@ -3669,6 +3677,38 @@ impl Evaluator {
                 _ => Err(outside(span, "this call")),
             },
         }
+    }
+
+    /// The integer type of a `NonZero` constructor call (`NonZeroU32::new`,
+    /// `std::num::NonZero::<u8>::new`, or `NonZero::new` at an expected
+    /// `Option<NonZero<T>>`), by written names. Callers ask only after
+    /// the path resolved to no user fn.
+    fn nonzero_new_ty<'a, C: ConstCx<'a>>(&self, cx: &mut C, callee: ExprId, args: &[ExprId], expected: Option<Ty>) -> Option<IntTy> {
+        let Expr::Path(segs) = cx.ast().expr(callee) else { return None };
+        let [prefix @ .., ty_seg, f] = segs.as_slice() else { return None };
+        if args.len() != 1 || cx.sym_text(f.name) != "new" || !f.type_args().is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = prefix.iter().map(|s| cx.sym_text(s.name)).collect();
+        if !matches!(names.as_slice(), [] | ["std" | "core", "num"]) || prefix.iter().any(|s| !s.type_args().is_empty()) {
+            return None;
+        }
+        let ty_name = cx.sym_text(ty_seg.name);
+        if let Some(it) = ty_name.strip_prefix("NonZero").and_then(|w| IntTy::ALL.iter().find(|i| i.name().eq_ignore_ascii_case(w)).copied()) {
+            return ty_seg.type_args().is_empty().then_some(it);
+        }
+        if ty_name != "NonZero" {
+            return None;
+        }
+        let t = match ty_seg.type_args().as_slice() {
+            [a] => cx.resolve_ty(*a),
+            [] => {
+                let inner = expected.and_then(|t| cx.tys_ref().option_elem(t))?;
+                crate::check::generics::nonzero_elem(cx.tys_ref(), inner)?
+            }
+            _ => return None,
+        };
+        self.int_ty_of(cx, t)
     }
 
     /// Runs const fn `body` on `args` (evaluated in the caller's
@@ -4163,6 +4203,19 @@ impl Evaluator {
                 format!("cannot call method `{name}` on an integer whose type is not known yet"),
                 "Add a type suffix such as `5i64`, or a type annotation on the variable.",
             ));
+        }
+        // `NonZero::get` is a const fn: the wrapped integer.
+        if name == "get"
+            && args.is_empty()
+            && let Some(elem) = crate::check::generics::nonzero_elem(cx.tys_ref(), base_t)
+        {
+            let (v, _) = self.auto_deref(cx, rv.clone(), rt);
+            if let ConstValue::Aggregate(f) = v
+                && let [n @ ConstValue::Int(_)] = f.as_slice()
+            {
+                return Ok((n.clone(), elem));
+            }
+            return Err(outside_err());
         }
         let no_args = |args: &[ExprId]| args.is_empty();
         match &rv {

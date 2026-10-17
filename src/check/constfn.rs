@@ -243,6 +243,9 @@ fn builtin_is_const(b: Builtin) -> bool {
             | MemSwap
             | MemReplace
             | MemForget
+            // `NonZero::new` and `NonZero::get`.
+            | NonZeroNew
+            | NonZeroGet
     )
 }
 
