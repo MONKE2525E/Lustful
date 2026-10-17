@@ -4150,7 +4150,15 @@ pub fn collect_reuse(
                     .filter_map(|g| if let ast::GenericParam::Type { name, default, .. } = g { Some((*name, *default)) } else { None })
                     .collect();
                 let generic = !a.generics.params.is_empty() && lts.len() + type_params.len() == a.generics.params.len();
+                let n_errs = errs.len();
                 alias_lifetimes(ast, interner, a.ty, &lts, &mut errs);
+                // `alias_lifetimes` reads references only; a dyn bound or
+                // a path argument of `'_` is rustc E0106 too.
+                if errs.len() == n_errs
+                    && let Some(d) = generics::item_ty_lifetime_err(ast, interner, a.ty, &lts, false)
+                {
+                    errs.push(d);
+                }
                 if generic {
                     // rustc E0091: every type param of an alias is used.
                     for (n, _) in &type_params {
@@ -6151,6 +6159,12 @@ fn eval_pending_items(
             _ => continue,
         };
         let Some(value) = value else { continue };
+        // Only `'static` and `'_` name a lifetime in a const or static
+        // type; the plain resolver below drops lifetimes unchecked.
+        if let Some(d) = generics::item_ty_lifetime_err(ast, &p.interner, ty_id, &[], true) {
+            errs.push(d);
+            continue;
+        }
         let tls = if is_static.is_some() { super::tls::key_form(&item.attrs, &p.interner) } else { None };
         let resolved = match stmt_idx {
             Some(_) => resolve_stmt_item_ty(p, ty_id, item.span),
@@ -6936,6 +6950,16 @@ fn register_assoc_consts(
                     format!("`{}` is defined more than once", p.interner.get(c.name)),
                     "Rename one of the definitions.",
                 ));
+                continue;
+            }
+            let impl_lts: Vec<Sym> = imp
+                .generics
+                .params
+                .iter()
+                .filter_map(|g| if let ast::GenericParam::Lifetime { lt, .. } = g { Some(lt.name) } else { None })
+                .collect();
+            if let Some(d) = generics::item_ty_lifetime_err(ast, &p.interner, c.ty, &impl_lts, true) {
+                errs.push(d);
                 continue;
             }
             let ty = match resolve_item_ty(p, c.ty, Some(self_ty)) {

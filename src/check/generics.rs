@@ -1560,6 +1560,119 @@ pub fn lifetime_diag(span: Span) -> Diag {
     )
 }
 
+/// Collects every lifetime written in type `id` that no `for<..>` binder
+/// inside it declares (fx-ltdecl). The flag is true inside a fn pointer
+/// type or `Fn(..)` sugar, where `'_` is that signature's own elided
+/// lifetime. Used where the plain resolver drops lifetimes unchecked.
+pub(crate) fn written_lifetimes(ast: &Ast, id: ast::TyId, out: &mut Vec<(ast::Lifetime, bool)>) {
+    lifetimes_in_ty(ast, id, &mut Vec::new(), false, out);
+}
+
+fn lifetimes_in_ty(ast: &Ast, id: ast::TyId, bound: &mut Vec<Sym>, sig: bool, out: &mut Vec<(ast::Lifetime, bool)>) {
+    let mut lt = |lt: ast::Lifetime, bound: &[Sym], out: &mut Vec<(ast::Lifetime, bool)>| {
+        if !bound.contains(&lt.name) {
+            out.push((lt, sig));
+        }
+    };
+    match ast.ty(id) {
+        TyExpr::Ref { lifetime, inner, .. } => {
+            lifetime.iter().for_each(|&l| lt(l, bound, out));
+            lifetimes_in_ty(ast, *inner, bound, sig, out);
+        }
+        TyExpr::Path(segs) => lifetimes_in_segs(ast, segs, bound, sig, out),
+        TyExpr::Tuple(elems) => elems.iter().for_each(|&e| lifetimes_in_ty(ast, e, bound, sig, out)),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } | TyExpr::Slice(inner) | TyExpr::Paren(inner) => {
+            lifetimes_in_ty(ast, *inner, bound, sig, out)
+        }
+        TyExpr::FnPtr { binder, inputs, ret, .. } => {
+            let n = bound.len();
+            bound.extend(binder.iter().map(|l| l.name));
+            inputs.iter().for_each(|p| lifetimes_in_ty(ast, p.ty, bound, true, out));
+            ret.iter().for_each(|&r| lifetimes_in_ty(ast, r, bound, true, out));
+            bound.truncate(n);
+        }
+        TyExpr::Dyn { binder, bounds, lifetime } => {
+            let n = bound.len();
+            bound.extend(binder.iter().map(|l| l.name));
+            lifetimes_in_bounds(ast, bounds, bound, sig, out);
+            bound.truncate(n);
+            lifetime.iter().for_each(|&l| lt(l, bound, out));
+        }
+        TyExpr::ImplTrait { bounds, captures } => {
+            lifetimes_in_bounds(ast, bounds, bound, sig, out);
+            for c in captures.iter().flat_map(|c| &c.args) {
+                if let ast::UseArg::Lifetime(l) = c {
+                    lt(*l, bound, out);
+                }
+            }
+        }
+        TyExpr::QPath { self_ty, trait_path, segs } => {
+            lifetimes_in_ty(ast, *self_ty, bound, sig, out);
+            lifetimes_in_segs(ast, trait_path, bound, sig, out);
+            lifetimes_in_segs(ast, segs, bound, sig, out);
+        }
+        TyExpr::Unit | TyExpr::Never | TyExpr::Infer | TyExpr::MacroCall(_) => {}
+    }
+}
+
+fn lifetimes_in_segs(ast: &Ast, segs: &[ast::PathSeg], bound: &mut Vec<Sym>, sig: bool, out: &mut Vec<(ast::Lifetime, bool)>) {
+    for seg in segs {
+        match &seg.args {
+            ast::GenericArgs::Angle(args) => {
+                for g in args {
+                    match g {
+                        ast::GenericArg::Type(t) | ast::GenericArg::Binding { kind: ast::BindingKind::EqTy(t), .. } => {
+                            lifetimes_in_ty(ast, *t, bound, sig, out)
+                        }
+                        ast::GenericArg::Lifetime(l) if !bound.contains(&l.name) => out.push((*l, sig)),
+                        ast::GenericArg::Binding { kind: ast::BindingKind::Constraint(bs), .. } => {
+                            lifetimes_in_bounds(ast, bs, bound, sig, out)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ast::GenericArgs::Parenthesized { inputs, output } => {
+                inputs.iter().chain(output).for_each(|&t| lifetimes_in_ty(ast, t, bound, true, out));
+            }
+            ast::GenericArgs::None => {}
+        }
+    }
+}
+
+fn lifetimes_in_bounds(ast: &Ast, bounds: &[TraitBound], bound: &mut Vec<Sym>, sig: bool, out: &mut Vec<(ast::Lifetime, bool)>) {
+    for b in bounds {
+        match b {
+            TraitBound::Lifetime(l) if !bound.contains(&l.name) => out.push((*l, sig)),
+            TraitBound::Lifetime(_) => {}
+            TraitBound::Trait { binder, trait_ref, .. } => {
+                let n = bound.len();
+                bound.extend(binder.iter().map(|l| l.name));
+                lifetimes_in_segs(ast, &trait_ref.path, bound, sig, out);
+                bound.truncate(n);
+            }
+        }
+    }
+}
+
+/// The first lifetime in the written type `id` of an item that is not
+/// `'static`, `'_` (when `elided` allows it outside fn signatures), or a
+/// name in `lts` (rustc E0261, E0401 for an outer item's lifetime; E0637
+/// or E0106 for `'_`). Consts and statics pass no names and allow `'_`;
+/// an alias body or an impl's associated type passes its params and
+/// allows `'_` only inside fn signatures.
+pub(crate) fn item_ty_lifetime_err(ast: &Ast, interner: &Interner, id: ast::TyId, lts: &[Sym], elided: bool) -> Option<Diag> {
+    let mut found = Vec::new();
+    written_lifetimes(ast, id, &mut found);
+    found.into_iter().find_map(|(lt, sig)| match interner.get(lt.name) {
+        "static" => None,
+        "_" if elided || sig => None,
+        "_" => Some(Diag::new("L0202", lt.span, "`'_` cannot be used here", "Write `'static` or a named lifetime parameter of the item.")),
+        _ if lts.contains(&lt.name) => None,
+        _ => Some(lifetime_diag_undeclared(interner, lt)),
+    })
+}
+
 /// Checks one written lifetime name: `'static`, `'_`, or a lifetime
 /// param the scope declares. Any other name is undeclared (rustc E0261,
 /// L0203). Returns the region to record in an erased type (erased).
@@ -4768,7 +4881,8 @@ pub(crate) fn bound_predicates(
                 "a bound like `T: 'a` on a named lifetime is not supported yet",
                 "Remove the bound if the code still checks, or bound the type by `'static`.",
             )),
-            Ok(_) => {}
+            // `T: '_` names no lifetime (rustc E0637).
+            Ok(_) => errs.push(Diag::new("L0202", lt.span, "`'_` cannot be used here", "Write `'static` or a named lifetime parameter.")),
         },
         TraitBound::Trait { binder, trait_ref, maybe } => {
             let span = trait_ref.path.last().map_or(Span::default(), |_| Span::default());
@@ -6110,6 +6224,11 @@ pub fn resolve_fn_sig(
                     let mut preds: Vec<Predicate> = Vec::new();
                     let mut relaxed: Vec<u32> = Vec::new();
                     for b in bounds {
+                        // `-> impl Tr + '_` captures the elided input lifetime;
+                        // only a param or where bound of `'_` is E0637.
+                        if matches!(b, TraitBound::Lifetime(lt) if interner.get(lt.name) == "_") {
+                            continue;
+                        }
                         bound_predicates(ast, interner, known, cx, tys, &scope, self_param, b, &mut preds, &mut relaxed, errs);
                     }
                     let span = ast.ty_span(t);
@@ -7363,6 +7482,12 @@ pub fn finish_trait_impl(
         };
         match at.default {
             Some(d) => {
+                // An assoc type's value elides no lifetime (rustc E0637);
+                // its names were checked by `resolve_scoped`.
+                let names: Vec<Sym> = scope.lifetimes.iter().map(|&(n, _)| n).collect();
+                if let Some(diag) = item_ty_lifetime_err(&p.ast, &p.interner, d, &names, false) {
+                    errs.push(diag);
+                }
                 let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
                 match resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut p.tys, d, scope) {
                     Ok(t) => assoc_tys.push((assoc, t)),
