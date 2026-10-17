@@ -36,6 +36,10 @@
 #                  same module file, one `#[macro_export]` from the root by
 #                  `crate::` path): the body patch expands the file again
 #                  (`expand_by_file`); errors, hygiene, refused shapes
+#   sig_implmac    an impl whose methods are partly made by an impl-level
+#                  macro call, with a nested fn in another method: header
+#                  edits of a written method (the item patch skips the made
+#                  ones and refolds the nested fn's hash)
 #   sig_tdefault   trait default bodies (templates after the AST fns) that
 #                  call a fn and use a derived type: header edits of the fn,
 #                  and a derive drop of a trait a default body uses
@@ -54,7 +58,7 @@ import os, re, subprocess, tempfile
 
 OPS = ["sig_where", "sig_param", "sig_ret", "rpit_bound", "derive_drop", "derive_add",
        "alias_rename", "reexport_glob", "rpit_chain", "const_closure", "sig_generic", "sig_impl",
-       "sig_apit", "sig_umacro", "sig_umbody", "sig_tdefault", "sig_dyn", "sig_samename"]
+       "sig_apit", "sig_umacro", "sig_umbody", "sig_implmac", "sig_tdefault", "sig_dyn", "sig_samename"]
 
 # One-line fn headers: indent, head up to the name, generics, params,
 # return type. A header that already has a `where` is left alone.
@@ -456,6 +460,25 @@ def sig_umbody(rng, fs):
     s1 = swap(a, *e1)
     s2 = swap(s1 if e2[0] in s1[tgt] else a, *e2)
     return [a, s1, s2, a, fs]
+
+
+def sig_implmac(rng, fs):
+    """An impl with two methods an impl-level macro makes, one method with
+    a nested fn, and one plain method; header edits of the plain one
+    (`_header_walk`), and a body edit of the nested fn on top."""
+    k = rng.randrange(10**6)
+    c = f"    pub fn zi{k}_sum"
+    head = f"{c}(&self, k: i64) -> i64 {{"
+    items = (f"\nmacro_rules! zi{k}_get {{\n    ($n:ident, $m:expr) => {{\n        pub fn $n(&self) -> i64 {{\n            self.0 * $m\n"
+             f"        }}\n    }};\n}}\n#[allow(dead_code)]\npub struct Zi{k}(i64);\n#[allow(dead_code)]\nimpl Zi{k} {{\n"
+             f"    zi{k}_get!(zi{k}_two, 2);\n    pub fn zi{k}_nest(&self) -> i64 {{\n        fn zi{k}_in(x: i64) -> i64 {{\n"
+             f"            x + 1\n        }}\n        zi{k}_in(self.0)\n    }}\n    zi{k}_get!(zi{k}_three, 3);\n"
+             f"{head}\n        self.zi{k}_two() + self.zi{k}_three() + k\n    }}\n}}\n"
+             f"#[allow(dead_code)]\nfn zi{k}_use() -> i64 {{\n    let w = Zi{k}(2);\n    w.zi{k}_sum(1) + w.zi{k}_nest()\n}}\n")
+    edits = [f"{c}(&self, k: i64) -> i64 where u32: Copy {{", f"{c}(&self, k: i64) -> i64 where String: Copy {{",
+             f"{c}(&self, k: u8) -> i64 {{", f"{c}(&self, k: i64, _e: u8) -> i64 {{", f"{c}(&self, k: i64) -> u64 {{"]
+    extra = [("            x + 1\n", "            x + 2\n"), (f"zi{k}_get!(zi{k}_two, 2);", f"zi{k}_get!(zi{k}_two, 4);")]
+    return _header_walk(rng, fs, items, head, edits, extra)
 
 
 def sig_tdefault(rng, fs):

@@ -1045,7 +1045,14 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     // The item that holds the edit, then the fn in it.
     let cands: Vec<(usize, (usize, Option<usize>))> = front.fn_loc.iter().copied().enumerate().filter(|(_, l)| holds(l)).collect();
     let mut found = None;
+    let root = |s: crate::diag::Span| s.ctxt == CtxtId::ROOT && s.file == file;
     for (fn_index, (item, sub)) in cands {
+        // A method an impl-level macro call made has no written range of
+        // its own; an edit in that call is in no written fn.
+        let def = fn_def_at(ast, item, sub);
+        if !root(def.name_span) || !def.body.is_some_and(|bl| root(ast.blocks[bl.0 as usize].span)) {
+            continue;
+        }
         let (lo, hi) = fn_range(ast, item, sub, old, &front.interner).ok_or(Some("item range"))?;
         if lo < a && b < hi {
             found = Some((fn_index, item, sub, lo, hi));
@@ -1056,10 +1063,6 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     let def = fn_def_at(ast, item, sub);
     // The outline holds the qualifiers, so the new fn is const too.
     let full = def.qual.is_const || matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.trait_ref.is_some());
-    let root = |s: crate::diag::Span| s.ctxt == CtxtId::ROOT && s.file == file;
-    if !root(def.name_span) || !def.body.is_some_and(|bl| root(ast.blocks[bl.0 as usize].span)) {
-        return Err(Some("item: expansion"));
-    }
     // No body items in the old fn (the new one is checked after the parse).
     if ast.stmt_items.iter().any(|it| it.span.file == file && lo <= it.span.lo && it.span.hi <= hi) {
         return Err(Some("item: body items"));
@@ -1900,11 +1903,11 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
                 x.stmt_items.extend(p.stmt_items);
             }
         }
-        // The whole item's scan, and every fn of it (a method's impl).
+        // The whole item's scan, and every fn of it (a method's impl). The
+        // fns nested in its other methods fold in its content hash, which
+        // the edit moves (the edited fn holds none, `find_item_edit`).
         let (scan, bodies, inner) = super::ast_hash::scan_item(&front.ast, &front.ast.items[it.item]);
-        if !inner.is_empty() {
-            return Err("item: body items");
-        }
+        nested_fn_hashes(front, &mut base, &scan, &bodies, &inner)?;
         let fns: Vec<usize> = front.fn_loc.iter().enumerate().filter(|(_, l)| l.0 == it.item).map(|(j, _)| j).collect();
         if fns.len() != bodies.len() {
             return Err("state");
@@ -3634,6 +3637,47 @@ pub fn run() -> i64 {
         for &(old, new, path) in steps {
             let v = warm_equals_cold(&mut warm, &root, &m1, old, new);
             assert_eq!(field(&v, "path"), path, "{new:?}: {v}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A method header edit in an impl that also holds methods an
+    /// impl-level macro call made, and a method with a nested fn, takes the
+    /// item patch: the made methods have no written range (skipped), and
+    /// the nested fn's body hash folds in the impl's new content. A header
+    /// edit of the method that holds the nested fn resolves. Each state is
+    /// the cold answer.
+    #[test]
+    fn impl_with_made_methods_and_body_items_item_edit_matches_cold() {
+        let dir = std::env::temp_dir().join(format!("lust-item-impl-{}", std::process::id()));
+        let root = write_crate(&dir, 1);
+        let m0 = dir.join("m0.rs");
+        let src = "macro_rules! getter {\n    ($n:ident, $k:expr) => {\n        pub fn $n(&self) -> i64 {\n            self.0 * $k\n        }\n    };\n}\n\n\
+                   pub struct W(i64);\n\nimpl W {\n    getter!(twice, 2);\n\n    \
+                   pub fn nested(&self) -> i64 {\n        fn inner(x: i64) -> i64 {\n            x + 1\n        }\n        inner(self.0)\n    }\n\n    \
+                   getter!(thrice, 3);\n\n    pub fn sum(&self, k: i64) -> i64 {\n        self.twice() + self.thrice() + k\n    }\n}\n\n\
+                   pub fn run() -> i64 {\n    let w = W(2);\n    w.sum(1) + w.nested()\n}\n";
+        std::fs::write(&m0, src).unwrap();
+        let mut warm = Session::new(dir.join("obj"), true, SessionKey::synthetic(&root, false));
+        assert_eq!(check(&mut warm, &root).0, 0);
+        let sum = "    pub fn sum(&self, k: i64) -> i64 {";
+        let steps: &[(&str, &str, &str, i32)] = &[
+            (sum, "    pub fn sum(&self, k: i64) -> i64 where u32: Copy {", "item", 0),
+            ("    pub fn sum(&self, k: i64) -> i64 where u32: Copy {", "    pub fn sum(&self, k: i64) -> i64 where String: Copy {", "item", 1),
+            ("    pub fn sum(&self, k: i64) -> i64 where String: Copy {", "    pub fn sum(&self, k: u8) -> i64 {", "item", 1),
+            ("    pub fn sum(&self, k: u8) -> i64 {", sum, "item", 0),
+            // The method that holds the nested fn: a full resolve.
+            ("    pub fn nested(&self) -> i64 {", "    pub fn nested(&self) -> i64 where u32: Copy {", "resolve", 0),
+            ("    pub fn nested(&self) -> i64 where u32: Copy {", "    pub fn nested(&self) -> i64 {", "resolve", 0),
+            // A body edit of the nested fn's method, then a header edit.
+            ("            x + 1\n", "            x + 2\n", "patch", 0),
+            (sum, "    pub fn sum(&self, k: i64) -> i64 where i64: Copy {", "item", 0),
+            ("    pub fn sum(&self, k: i64) -> i64 where i64: Copy {", sum, "item", 0),
+        ];
+        for (old, new, path, code) in steps {
+            let v = warm_equals_cold(&mut warm, &root, &m0, old, new);
+            assert_eq!(field(&v, "path"), *path, "{new:?}: {v}");
+            assert_eq!(check(&mut warm, &root).0, *code, "{new:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
