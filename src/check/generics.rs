@@ -13862,6 +13862,77 @@ fn wf_goals(p: &mut Program, adt_idx: &FxMap<DefId, usize>, t: Ty, seen: &mut Ve
     }
 }
 
+/// The goals a written trait reference owes for the trait's own
+/// parameter bounds (`trait Sup<T: Copy>` written `Sup<String>`
+/// owes `String: Copy`, rustc E0277 at the item that writes it).
+/// Only predicates on a bare non-Self parameter of the trait
+/// count: a supertrait names the Self parameter and is an impl
+/// obligation, and an associated type bound names a projection,
+/// not one of this reference's arguments.
+fn trait_ref_param_goals(p: &mut Program, tref: TraitRef, out: &mut Vec<TraitRef>) {
+    use crate::traits::index::subst_predicate;
+    let Some(rec) = p.gx.index.trait_record(tref.def).cloned() else { return };
+    if rec.generics.predicates.is_empty() {
+        return;
+    }
+    let argv: Vec<GenericArg> = p.tys.args(tref.args).to_vec();
+    for &pred in &rec.generics.predicates {
+        let Predicate::Trait(b) = pred else { continue };
+        if b.count != 0 {
+            continue;
+        }
+        let subject = p.tys.args(b.value.args).first().and_then(|g| g.as_ty());
+        if !subject.is_some_and(|t| matches!(p.tys.kind(t), TyKind::Param(id) if id.0 >= 1)) {
+            continue;
+        }
+        if let Predicate::Trait(sb) = subst_predicate(&mut p.tys, pred, &argv)
+            && sb.count == 0
+        {
+            out.push(sb.value);
+        }
+    }
+}
+
+/// Elaboration through supertraits only, for proving
+/// `trait_ref_param_goals`: like `elaborate_in`, but a trait
+/// reference contributes only the predicates on its Self
+/// parameter (its supertraits), never its parameter bounds.
+/// The full elaboration assumes those bounds, so it cannot
+/// prove them.
+fn elaborate_supers_only(p: &mut Program, written: &[Predicate]) -> Vec<Predicate> {
+    use crate::traits::index::subst_predicate;
+    let mut out: Vec<Predicate> = Vec::new();
+    let mut work: Vec<Predicate> = written.to_vec();
+    let mut i = 0;
+    while i < work.len() {
+        let pred = work[i];
+        i += 1;
+        if out.contains(&pred) {
+            continue;
+        }
+        out.push(pred);
+        if let Predicate::Trait(b) = pred {
+            for &(assoc, arg) in p.tys.bindings(b.value.bindings) {
+                if let GenericArg::Ty(ty) = arg {
+                    work.push(Predicate::AssocEq(Binder { count: b.count, value: AssocEqData { assoc, trait_args: b.value.args, ty } }));
+                }
+            }
+            if let Some(rec) = p.gx.index.trait_record(b.value.def).cloned() {
+                let argv: Vec<GenericArg> = p.tys.args(b.value.args).to_vec();
+                for &q in &rec.generics.predicates {
+                    let on_self = matches!(q, Predicate::Trait(qb)
+                        if p.tys.args(qb.value.args).first().and_then(|g| g.as_ty())
+                            .is_some_and(|t| matches!(p.tys.kind(t), TyKind::Param(id) if id.0 == 0)));
+                    if on_self {
+                        work.push(subst_predicate(&mut p.tys, q, &argv));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The goal `t: Iterator` when `t` is a std adapter type (lust's rule,
 /// stricter than rustc's WF, for written types in items and bodies): the
 /// builtin uses of an adapter value (`next`, `for`, `count`) do not prove
@@ -14023,7 +14094,17 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate:
             .collect();
         let args = p.tys.intern_args(&own);
         generics.predicates.push(Predicate::Trait(Binder::plain(TraitRef { def: rec.def, args, bindings: EMPTY_BINDINGS })));
-        items.push((Vec::new(), Vec::new(), generics, rec.span));
+        // An associated const's written type is a written type of
+        // the trait (`const C: Need<String>` is E0277 with no
+        // impl): the initializer pass alone cannot see a const
+        // with no initializer.
+        let const_tys: Vec<(Ty, Span)> = rec
+            .assoc_items
+            .iter()
+            .filter(|&&(_, _, is_type)| !is_type)
+            .filter_map(|&(assoc, _, _)| p.gx.trait_assoc_consts.get(&assoc).map(|&(t, _)| (t, rec.span)))
+            .collect();
+        items.push((const_tys, Vec::new(), generics, rec.span));
     }
     // A derive delta: only items whose types or bounds reach the edited Adt.
     if let Some(x) = reach {
@@ -14099,6 +14180,9 @@ fn check_wf_item(p: &mut Program, adt_idx: &FxMap<DefId, usize>, (tys, values, g
     let (tys_seen, values_seen): (Vec<Ty>, Vec<Ty>) = (tys.iter().map(|x| x.0).collect(), values.iter().map(|x| x.0).collect());
     let env = elaborate_env(&mut p.tys, &p.gx.index, &generics.predicates);
     let mut goals: Vec<(TraitRef, Span)> = Vec::new();
+    // Trait parameter goals are proved in a supertrait-only env
+    // below: full elaboration assumes exactly these bounds.
+    let mut param_goals: Vec<(TraitRef, Span)> = Vec::new();
     // Sized goals from value positions and `parts` fail as
     // L0110; a failed param-bound goal keeps the L0612 shape.
     let mut sized_goals: Vec<(TraitRef, Span)> = Vec::new();
@@ -14113,16 +14197,25 @@ fn check_wf_item(p: &mut Program, adt_idx: &FxMap<DefId, usize>, (tys, values, g
         sized_goals.extend(s2.into_iter().map(|g| (g, tspan)));
     }
     // The types a where clause names are written types too
-    // (`where Vec<T>: Clone` needs `T: Sized`).
+    // (`where Vec<T>: Clone` needs `T: Sized`), and a written
+    // trait reference owes the trait's own parameter bounds
+    // under its arguments (`Sup<String>` for `Sup<T: Copy>`).
     for pred in &generics.predicates {
         if let Predicate::Trait(b) = pred {
-            for g in p.tys.args(b.value.args).to_vec() {
+            let mut named: Vec<GenericArg> = p.tys.args(b.value.args).to_vec();
+            named.extend(p.tys.bindings(b.value.bindings).iter().map(|(_, g)| *g));
+            for g in named {
                 if let Some(t) = g.as_ty() {
                     let (mut g2, mut s2) = (Vec::new(), Vec::new());
                     wf_goals(p, &adt_idx, t, &mut seen, &mut g2, &mut s2);
                     goals.extend(g2.into_iter().map(|g| (g, span)));
                     sized_goals.extend(s2.into_iter().map(|g| (g, span)));
                 }
+            }
+            if b.count == 0 {
+                let mut g2: Vec<TraitRef> = Vec::new();
+                trait_ref_param_goals(p, b.value, &mut g2);
+                param_goals.extend(g2.into_iter().map(|g| (g, span)));
             }
         }
     }
@@ -14154,6 +14247,25 @@ fn check_wf_item(p: &mut Program, adt_idx: &FxMap<DefId, usize>, (tys, values, g
         let t = p.tys.args(goal.args).first().and_then(|g| g.as_ty()).unwrap_or(ERROR);
         errs.push(crate::check::sized::unsized_diag(p, &p.tys, t, gspan));
         return;
+    }
+    // The trait parameter goals first, in the supertrait-only
+    // env: the full env elaborates a written trait reference
+    // into all of the trait's predicates, so it would prove
+    // each of these goals from itself.
+    if !param_goals.is_empty() {
+        let wf_env = elaborate_supers_only(p, &generics.predicates);
+        for (goal, gspan) in param_goals {
+            if !prove_wf_goal(p, &wf_env, goal) {
+                let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
+                errs.push(Diag::new(
+                    "L0612",
+                    gspan,
+                    format!("a type here does not satisfy the `{gname}` bound its definition requires"),
+                    format!("Add the `{gname}` bound to this item, or change the type so the bound holds."),
+                ));
+                break;
+            }
+        }
     }
     for (goal, gspan) in goals {
         if !prove_wf_goal(p, &env, goal) {
