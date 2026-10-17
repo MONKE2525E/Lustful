@@ -2395,7 +2395,9 @@ fn scan_use_sites(trees: &[crate::lexer::TokenTree], module: &[Sym], interner: &
                     i += 1;
                 }
             }
-            Some(Tok::Use) => {
+            // `use<..>` is a precise-capturing bound in a signature
+            // (`-> impl Send + use<>`), never a `use` item.
+            Some(Tok::Use) if tok(trees, i + 1) != Some(Tok::Lt) => {
                 let start = i + 1;
                 let mut end = start;
                 while end < trees.len() && tok(trees, end) != Some(Tok::Semi) {

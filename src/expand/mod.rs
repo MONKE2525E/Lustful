@@ -4983,7 +4983,9 @@ fn use_span_at(trees: &[Tt], i: usize) -> Option<(bool, usize, usize)> {
             j += 1;
         }
     }
-    if tok_at(trees, j).map(|t| t.tok) != Some(Tok::Use) {
+    // `use<..>` is a precise-capturing bound in a signature
+    // (`-> impl Send + use<>`), never a `use` item.
+    if tok_at(trees, j).map(|t| t.tok) != Some(Tok::Use) || tok_at(trees, j + 1).map(|t| t.tok) == Some(Tok::Lt) {
         return None;
     }
     let end = (j..trees.len()).find(|&k| matches!(&trees[k], Tt::Tok(t) if t.tok == Tok::Semi))? + 1;

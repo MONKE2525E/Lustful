@@ -583,7 +583,8 @@ pub fn outline(lexed: &Lexed, interner: &crate::intern::Interner) -> Outline {
                 pending = PendingAttrs::default();
                 pending_vis = OutlineVis::Private;
             }
-            Tok::Use => {
+            // `use<..>` is a precise-capturing bound, not a `use` item.
+            Tok::Use if toks.get(i + 1).map(|t| t.tok) != Some(Tok::Lt) => {
                 out.uses.push(toks[i].span);
                 pending = PendingAttrs::default();
                 pending_vis = OutlineVis::Private;

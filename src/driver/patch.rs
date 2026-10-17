@@ -1554,6 +1554,8 @@ fn find_inactive_edit(front: &Front, text: &str, edit: Edit) -> Result<(), Optio
         while i < upto {
             match ot[i].tok {
                 Tok::Semi => open_item = false,
+                // `use<..>` is a precise-capturing bound, not a `use` item.
+                Tok::Use if ot.get(i + 1).map(|t| t.tok) == Some(Tok::Lt) => {}
                 Tok::Use | Tok::Extern => open_item = true,
                 _ => {}
             }
