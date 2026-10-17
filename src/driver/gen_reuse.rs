@@ -200,8 +200,10 @@ pub struct GenReuse {
     /// Defs whose last discovery check stored nothing (a body error), so
     /// their entry, if any, is older than what that collect used. Each
     /// keeps that check's output, stamped (`next_stamp`): never replayed,
-    /// only compared (`out_copy`).
-    unstored: FxMap<DefId, (u64, OutCopy)>,
+    /// only compared (`out_copy`). A `lust check` body whose check stays
+    /// pending (`Checked::closure_map_pending`, no error) also keeps that
+    /// check's source hash and reads (`pending_untouched`).
+    unstored: FxMap<DefId, (u64, OutCopy, Option<(u64, Reads)>)>,
     /// Node answers of this collect's program, for read replays (and the
     /// derive delta's keyed walk, graph.rs `ReadIndex::dirty_slots`).
     pub(crate) memo: FxMap<ReadKey, Read>,
@@ -284,10 +286,21 @@ impl GenReuse {
         requests: &[(LocalDefId, Vec<OwnedArg>)],
         closures: &[OwnedClosure],
         vtables: &[(OwnedTy, OwnedTy)],
+        pending: Option<&Reads>,
     ) {
         let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
         let copy = OutCopy { adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec(), vtables: vtables.to_vec() };
-        self.unstored.insert(p.def_id(f), (next_stamp(), copy));
+        let pending = pending.filter(|_| self.on).and_then(|r| Some((self.src_of(p, f)?, with_own_sig(p, f, r))));
+        self.unstored.insert(p.def_id(f), (next_stamp(), copy, pending));
+    }
+
+    /// True when fn `f`'s last discovery check was a pending one of
+    /// `lust check` (`note_unstored` kept its reads), made from its current
+    /// source, and read no node `touched` names: a check again would give
+    /// the noted output once more (the derive delta's replay skips it).
+    pub(crate) fn pending_untouched(&self, p: &Program, f: LocalDefId, touched: &mut impl FnMut(&ReadKey) -> bool) -> bool {
+        let Some((_, _, Some((src, reads)))) = self.unstored.get(&p.def_id(f)) else { return false };
+        self.on && self.src_of(p, f) == Some(*src) && !reads.iter().any(|(k, _)| touched(k))
     }
 
     /// Drops every entry when the trait-system key moved since the last
@@ -779,7 +792,7 @@ impl GenReuse {
     /// for that body. The daemon's kept programs take one per edited fn
     /// at the patch (driver/patch.rs).
     pub(crate) fn out_copy(&self, def: DefId) -> Option<OutCopy> {
-        if let Some((_, c)) = self.unstored.get(&def) {
+        if let Some((_, c, _)) = self.unstored.get(&def) {
             return Some(c.clone());
         }
         let e = self.discovery.get(&def)?;

@@ -12056,7 +12056,10 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
                     if discarded.is_empty() && !pending {
                         reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
                     } else {
-                        reuse.note_unstored(p, fid, &adt_tys, &reqs, &closures_owned, &vts);
+                        // A pending check of `lust check` (no instances) stays
+                        // pending: its reads let a derive delta skip it.
+                        let keep = !p.gx.walk_instances && discarded.is_empty() && !checked.closure_kind_pending;
+                        reuse.note_unstored(p, fid, &adt_tys, &reqs, &closures_owned, &vts, keep.then_some(&checked.reads));
                     }
                     (adt_tys, reqs, closures_owned, vts)
                 }

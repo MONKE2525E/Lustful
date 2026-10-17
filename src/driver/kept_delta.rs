@@ -682,7 +682,9 @@ pub(super) fn replay_discovery(
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
     // (body, its reads when it is stored, its output).
-    let mut outs: Vec<(LocalDefId, Option<crate::driver::graph::Reads>, crate::driver::gen_reuse::Discovered)> = Vec::new();
+    // (body, its reads when it is stored or a pending check of `lust check`
+    // (`GenReuse::note_unstored`), whether it is pending, its output).
+    let mut outs: Vec<(LocalDefId, Option<crate::driver::graph::Reads>, bool, crate::driver::gen_reuse::Discovered)> = Vec::new();
     let out = (|| {
         let reuse = &mut caches.gen_reuse;
         // The bodies that check again, each with the output it must give,
@@ -718,6 +720,9 @@ pub(super) fn replay_discovery(
             } else if reuse.discovery_holds(p, g) {
                 counts[2] += 1;
                 continue;
+            } else if readers.is_none() && !walk_instances && reuse.pending_untouched(p, g, &mut |k| touched(p, k)) {
+                counts[1] += 1;
+                continue;
             } else {
                 reuse.out_copy(p.def_id(g))
             };
@@ -737,7 +742,8 @@ pub(super) fn replay_discovery(
             let (mut checked, discarded) = crate::check::check_fn(prog, g);
             let pending = checked.closure_map_pending;
             let out = generics::discovery_out(prog, &checked, &discarded);
-            let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
+            let keep = discarded.is_empty() && (!pending || (!walk_instances && !checked.closure_kind_pending));
+            let reads = keep.then(|| std::mem::take(&mut checked.reads));
             // Why the output is not stored (`LUST_DERIVE_LOG`).
             let why = discarded.first().map(|d| format!("{} {}", d.code, d.message)).unwrap_or_default();
             (out, reads, pending, t.elapsed().as_secs_f64() * 1e3, why)
@@ -749,8 +755,9 @@ pub(super) fn replay_discovery(
                 .iter()
                 .zip(&checked)
                 .map(|(&(g, _, newer), x)| {
-                    let tags = if newer { " (newer)" } else { "" }.to_string() + if x.1.is_none() { " (unstored" } else { "" };
-                    let tags = if x.1.is_none() { format!("{tags}: {}{})", if x.2 { "pending " } else { "" }, x.4) } else { tags };
+                    let unstored = x.1.is_none() || x.2;
+                    let tags = if newer { " (newer)" } else { "" }.to_string() + if unstored { " (unstored" } else { "" };
+                    let tags = if unstored { format!("{tags}: {}{})", if x.2 { "pending " } else { "" }, x.4) } else { tags };
                     (x.3, format!("{}{tags}", p.display_name(p.fn_def(g).name)))
                 })
                 .collect();
@@ -771,15 +778,15 @@ pub(super) fn replay_discovery(
             for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
                 generics::build_owned_ty(p, t);
             }
-            outs.push((g, reads, out));
+            outs.push((g, reads, pending, out));
         }
         if let Some(why) = stop {
             return Err(why);
         }
-        for (g, reads, (adt_tys, reqs, closures, vts)) in &outs {
+        for (g, reads, pending, (adt_tys, reqs, closures, vts)) in &outs {
             match reads {
-                Some(r) => reuse.store_discovered(p, *g, r, adt_tys, reqs, closures, vts),
-                None => reuse.note_unstored(p, *g, adt_tys, reqs, closures, vts),
+                Some(r) if !pending => reuse.store_discovered(p, *g, r, adt_tys, reqs, closures, vts),
+                _ => reuse.note_unstored(p, *g, adt_tys, reqs, closures, vts, reads.as_ref()),
             }
         }
         Ok(())
