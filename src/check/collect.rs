@@ -1754,7 +1754,8 @@ fn named_const_expr(ast: &Ast, names: &[Sym]) -> Option<ast::ExprId> {
             let mut found = None;
             for item in &ast.items {
                 let ItemKind::Impl(imp) = &item.kind else { continue };
-                if imp.trait_ref.is_some() {
+                // A body impl's self name may be a block type (R18).
+                if imp.trait_ref.is_some() || imp.in_body {
                     continue;
                 }
                 let TyExpr::Path(segs) = ast.ty(imp.self_ty) else { continue };
@@ -1798,7 +1799,8 @@ fn named_const_decl(ast: &Ast, names: &[Sym]) -> Option<ast::TyId> {
             let mut found = None;
             for item in &ast.items {
                 let ItemKind::Impl(imp) = &item.kind else { continue };
-                if imp.trait_ref.is_some() {
+                // A body impl's self name may be a block type (R18).
+                if imp.trait_ref.is_some() || imp.in_body {
                     continue;
                 }
                 let TyExpr::Path(segs) = ast.ty(imp.self_ty) else { continue };
@@ -2137,7 +2139,7 @@ fn disc_ty(ast: &Ast, interner: &Interner, known: &Known, e: ast::ExprId, env: &
             let mut seen = false;
             for item in &ast.items {
                 let ItemKind::Impl(imp) = &item.kind else { continue };
-                if imp.trait_ref.is_some() {
+                if imp.trait_ref.is_some() || imp.in_body {
                     continue;
                 }
                 let TyExpr::Path(tsegs) = ast.ty(imp.self_ty) else { continue };
@@ -5055,11 +5057,22 @@ pub fn collect_reuse(
                 p.defs.insert(impl_def, DefData::skeleton(DefsKind::Impl, None, known.self_type, Vis::Priv, imp.span));
 
                 let (impl_generics, mut impl_scope) = {
+                    // A body impl's bounds see the block type items (R18).
+                    let mut seed = generics::Scope::default();
+                    if imp.in_body {
+                        apply_stmt_overlay(&p, &mut seed, imp.span);
+                    }
                     let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
-                    generics::build_generics(ast, interner, known, &cx, &mut p.tys, &imp.generics, &imp.where_clause, &mut errs)
+                    generics::build_generics_shifted(ast, interner, known, &cx, &mut p.tys, &imp.generics, &imp.where_clause, 0, &seed, &mut errs)
                 };
                 if !impl_generics.params.is_empty() {
                     p.mark_generic(imp.span);
+                }
+                // An impl the resolver hoisted out of a fn body sees the
+                // block type items around it, not the enclosing fns'
+                // params (R18).
+                if imp.in_body {
+                    apply_stmt_overlay(&p, &mut impl_scope, imp.span);
                 }
                 let self_pat = {
                     let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
@@ -5338,6 +5351,10 @@ pub fn collect_reuse(
                     let site = FnSite { loc: FnLoc::Impl(item_idx as u32, k as u32), owner, self_ty: Some(self_pat), parent: Some(impl_def), hash };
                     let id = add_fn(&mut p, site, &parent_gen, &mut errs);
                     method_ids.push(id);
+                    // A body impl's methods see the block items around it.
+                    if imp.in_body {
+                        p.fn_siblings.insert(id, visible_stmt_items(&p.item_blocks, imp.span));
+                    }
                     if static_dyn {
                         p.gx.static_dyn_fns.push(id);
                     }
@@ -6850,6 +6867,21 @@ fn nested_static_hash(p: &Program, sidx: u32, name: Sym) -> crate::def::DefPathH
     crate::def::child_hash(parent_hash, crate::def::DefKind::Static, p.interner.get(name), ordinal)
 }
 
+/// The owner Adt of an impl hoisted out of a fn body (`ImplDef::in_body`),
+/// read from the Self type the fn pass resolved in the block overlay: its
+/// written name may be a block type that shadows a module type of that
+/// name, so `type_names` cannot answer.
+fn body_impl_owner(p: &Program, impl_def: DefId) -> Option<AdtId> {
+    let self_ty = match p.gx.inherent_impl_self.get(&impl_def) {
+        Some(&(t, _)) => t,
+        None => p.gx.index.by_def(impl_def)?.1.self_ty(&p.tys),
+    };
+    match p.tys.kind(self_ty) {
+        TyKind::Adt(def, _) => p.defs.local_adt(def),
+        _ => None,
+    }
+}
+
 /// Registers the associated consts of inherent impls, trait
 /// impls, and trait defaults as pending items of
 /// `eval_const_items` (W-RESOLVE phase 2, on the merged
@@ -6888,6 +6920,7 @@ fn register_assoc_consts(
         let parent_hash = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
         let impl_def = DefId { krate: p.krate, hash: parent_hash };
         let owner = match ast.ty(imp.self_ty) {
+            _ if imp.in_body => body_impl_owner(p, impl_def),
             TyExpr::Path(segs) if segs.len() == 1 => p.type_names.get(&segs[0].name).copied(),
             _ => None,
         };

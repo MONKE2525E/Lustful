@@ -478,7 +478,9 @@ fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
 /// Finds a `fn` item inside the body of a fn of a generic item (`fn
 /// f<T>() { fn g() {} }`, or a method of `impl<T>`): the resolver rejects
 /// a path in it to an outer generic param (rustc E0401), which otherwise
-/// reads the module item that the param shadows. A brace stack over the
+/// reads the module item that the param shadows. Also finds an `impl` or
+/// `trait` item inside any fn body: only the resolver hoists a block impl
+/// to its module's items (`hoist_block_impls`). A brace stack over the
 /// whole file's tokens, fed in order (a big file's pieces one by one).
 #[derive(Default)]
 struct NestedFnScan {
@@ -501,6 +503,15 @@ impl NestedFnScan {
                     }
                     self.fn_pending = true;
                     self.generic_pending |= next(2) == Some(Tok::Lt);
+                }
+                // An item `impl` or `trait` in a body: the token before
+                // it ends a statement or an attribute (`impl Trait` types
+                // follow `:`, `->`, `<`, `(`, `,`, or `&`).
+                Tok::Impl | Tok::Trait
+                    if self.stack.iter().any(|&(body, _)| body)
+                        && (i == 0 || matches!(toks[i - 1].tok, Tok::LBrace | Tok::RBrace | Tok::Semi | Tok::RBracket | Tok::RParen | Tok::Unsafe | Tok::Pub)) =>
+                {
+                    return true;
                 }
                 Tok::Impl if next(1) == Some(Tok::Lt) => self.generic_pending = true,
                 Tok::Trait if next(2) == Some(Tok::Lt) => self.generic_pending = true,
@@ -3633,6 +3644,7 @@ fn resolve_one(
         collect_assoc_vis(&w.ast, &w.ast.items, w.module, interner, tables);
         check_vis_restrictions(&w.ast.items, w.module, interner, tables, &mut inner_diags);
         check_stmt_vis_restrictions(&w.ast, w.module, interner, tables, &mut inner_diags);
+        collect_stmt_impl_vis(&w.ast, w.module, interner, tables, &mut inner_diags);
     }
     if !inner_diags.is_empty() {
         return Err(OneError { diags: inner_diags, seen, std_asks });
@@ -3763,6 +3775,7 @@ fn resolve_one(
         let mut flat_items = Vec::new();
         let mut flat_mods: Vec<ModuleId> = Vec::new();
         flatten_items_mods(std::mem::take(&mut w.ast.items), w.module, fi, &[], &list_module, &mut flat_items, &mut flat_mods);
+        hoist_block_impls(&mut w.ast, &mut flat_items, &mut flat_mods);
         let (mut p_lines, mut p_hashes, mut p_paths) = (Vec::new(), Vec::new(), Vec::new());
         for (item, module) in flat_items.iter().zip(flat_mods.iter()) {
             let mut push = |def: &FnDef| {
@@ -4987,6 +5000,23 @@ fn check_vis_restrictions(items: &[Item], module: ModuleId, interner: &Interner,
     }
 }
 
+/// Every module item's span with its module, inline modules included:
+/// the module of a body item is the one of the smallest span holding it.
+fn module_item_spans(items: &[Item], module: ModuleId, tables: &ResolvedTables, out: &mut Vec<(Span, ModuleId)>) {
+    for item in items {
+        out.push((item.span, module));
+        if let ItemKind::Mod(m) = &item.kind
+            && let Some(body) = &m.body
+        {
+            let mut full = tables.modules[module.0 as usize].path.clone();
+            full.push(m.name);
+            if let Some(child) = tables.module_by_path_in(tables.root_of(module), &full) {
+                module_item_spans(body, child, tables, out);
+            }
+        }
+    }
+}
+
 /// Reports bad restricted visibilities on items inside function
 /// bodies (`Ast::stmt_items`), like `check_vis_restrictions` does for
 /// module items: a `pub(super)` or `pub(in ..)` there names modules
@@ -4997,22 +5027,8 @@ fn check_stmt_vis_restrictions(ast: &Ast, module: ModuleId, interner: &Interner,
     if ast.stmt_items.is_empty() {
         return;
     }
-    fn item_spans(items: &[Item], module: ModuleId, tables: &ResolvedTables, out: &mut Vec<(Span, ModuleId)>) {
-        for item in items {
-            out.push((item.span, module));
-            if let ItemKind::Mod(m) = &item.kind
-                && let Some(body) = &m.body
-            {
-                let mut full = tables.modules[module.0 as usize].path.clone();
-                full.push(m.name);
-                if let Some(child) = tables.module_by_path_in(tables.root_of(module), &full) {
-                    item_spans(body, child, tables, out);
-                }
-            }
-        }
-    }
     let mut spans: Vec<(Span, ModuleId)> = Vec::new();
-    item_spans(&ast.items, module, tables, &mut spans);
+    module_item_spans(&ast.items, module, tables, &mut spans);
     for item in &ast.stmt_items {
         let m = spans
             .iter()
@@ -5038,6 +5054,76 @@ fn check_stmt_vis_restrictions(ast: &Ast, module: ModuleId, interner: &Interner,
             for f in fs {
                 check(&f.vis, diags);
             }
+        }
+    }
+}
+
+/// `collect_assoc_vis` for the impls inside fn bodies, which flatten
+/// hoists to module items later (`hoist_block_impls`): a private member
+/// of a body impl of a module type is private to the fn's module (rustc
+/// E0624). An impl of a block type needs no entry (no other module can
+/// name the type). Each body impl's consts also record their module for
+/// the const evaluator. When a block `use` is in scope, the written self
+/// name may be an import that shadows an item, so an impl with a non-pub
+/// member there is not supported yet (L0820); so is one whose self type
+/// does not resolve here.
+fn collect_stmt_impl_vis(ast: &Ast, module: ModuleId, interner: &Interner, tables: &mut ResolvedTables, diags: &mut Vec<Diag>) {
+    if !ast.stmt_items.iter().any(|it| matches!(it.kind, ItemKind::Impl(_))) {
+        return;
+    }
+    let holds = |s: Span, t: Span| s.file == t.file && s.lo <= t.lo && t.hi <= s.hi;
+    let mut spans: Vec<(Span, ModuleId)> = Vec::new();
+    module_item_spans(&ast.items, module, tables, &mut spans);
+    for item in &ast.stmt_items {
+        let ItemKind::Impl(imp) = &item.kind else { continue };
+        let m = spans.iter().filter(|(s, _)| holds(*s, item.span)).min_by_key(|(s, _)| s.hi - s.lo).map_or(module, |(_, m)| *m);
+        for c in &imp.consts {
+            tables.const_init_module.insert(c.span, m);
+        }
+        if imp.trait_ref.is_some() {
+            continue;
+        }
+        let private = imp.fns.iter().map(|f| &f.vis).chain(imp.consts.iter().map(|c| &c.vis)).any(|v| *v != Vis::Public);
+        if !private {
+            continue;
+        }
+        // The items of every block around the impl.
+        let around: Vec<&Item> = ast
+            .blocks
+            .iter()
+            .filter(|b| holds(b.span, item.span))
+            .flat_map(|b| b.stmts.iter().filter_map(|s| if let Stmt::Item(i) = s { ast.stmt_items.get(*i as usize) } else { None }))
+            .collect();
+        if around.iter().any(|it| matches!(it.kind, ItemKind::Use(_))) {
+            diags.push(crate::diag::not_yet("L0820", item.span, "a non-pub member of an impl in a fn body with a block `use` in scope"));
+            continue;
+        }
+        let TyExpr::Path(segs) = ast.ty(imp.self_ty) else {
+            diags.push(crate::diag::not_yet("L0820", item.span, "a non-pub member of an impl in a fn body for this self type"));
+            continue;
+        };
+        let names: Vec<Sym> = segs.iter().map(|s| s.name).collect();
+        let block_type = |it: &&Item| match &it.kind {
+            ItemKind::Struct(x) => x.name == names[0],
+            ItemKind::Enum(x) => x.name == names[0],
+            ItemKind::Union(x) => x.name == names[0],
+            ItemKind::Type(x) => x.name == names[0],
+            ItemKind::Trait(x) => x.name == names[0],
+            _ => false,
+        };
+        if names.len() == 1 && around.iter().any(block_type) {
+            continue;
+        }
+        let PathRes::Done(Target::Def(def)) = tables.resolve_path(m, &names, Namespace::Type, PathMode::Lexical, false, interner) else {
+            diags.push(crate::diag::not_yet("L0820", item.span, "a non-pub member of an impl in a fn body for this self type"));
+            continue;
+        };
+        let entry = tables.assoc_vis.entry(def).or_default();
+        for f in &imp.fns {
+            entry.insert(f.name, (vis_from_ast(&f.vis, interner), m));
+        }
+        for c in &imp.consts {
+            entry.insert(c.name, (vis_from_ast(&c.vis, interner), m));
         }
     }
 }
@@ -5202,9 +5288,15 @@ impl Rewrite<'_> {
 
     /// Rewrites the trait paths in one bound list.
     fn bounds(&mut self, ast: &mut Ast, bounds: &mut Vec<crate::ast::TraitBound>, span: Span, module: ModuleId) {
+        self.bounds_in(ast, bounds, span, module, &[]);
+    }
+
+    /// `bounds` for an item in a body: its bounds also see `outer` (the
+    /// item frames of the blocks around it).
+    fn bounds_in(&mut self, ast: &mut Ast, bounds: &mut Vec<crate::ast::TraitBound>, span: Span, module: ModuleId, outer: &[Frame]) {
         for b in bounds.iter_mut() {
             if let crate::ast::TraitBound::Trait { trait_ref, .. } = b {
-                self.rewrite_path(&mut trait_ref.path, Namespace::Type, span, module, &[], ast);
+                self.rewrite_path(&mut trait_ref.path, Namespace::Type, span, module, outer, ast);
             }
         }
     }
@@ -5238,17 +5330,24 @@ impl Rewrite<'_> {
     /// Rewrites one item's generic parameter bounds, defaults,
     /// and where clause (trait paths name traits in this module).
     fn generics(&mut self, ast: &mut Ast, g: &mut crate::ast::Generics, w: &mut crate::ast::WhereClause, module: ModuleId) {
+        self.generics_in(ast, g, w, module, &[]);
+    }
+
+    /// `generics` for an item in a body (a nested fn, a block impl and its
+    /// methods): bounds and types also see `outer`, the item frames of the
+    /// blocks around it, so a block type in a where clause is that type.
+    fn generics_in(&mut self, ast: &mut Ast, g: &mut crate::ast::Generics, w: &mut crate::ast::WhereClause, module: ModuleId, outer: &[Frame]) {
         for p in g.params.iter_mut() {
             match p {
                 crate::ast::GenericParam::Type { bounds, default, span, .. } => {
-                    self.bounds(ast, bounds, *span, module);
+                    self.bounds_in(ast, bounds, *span, module, outer);
                     if let Some(d) = *default {
-                        self.ty(ast, d, module, &[]);
+                        self.ty(ast, d, module, outer);
                     }
                 }
                 crate::ast::GenericParam::Const { ty, default, .. } => {
                     let ty = *ty;
-                    self.ty(ast, ty, module, &[]);
+                    self.ty(ast, ty, module, outer);
                     // A default with a body of its own resolves like a
                     // const argument (`check/const_body.rs` checks it).
                     if let Some(d) = *default
@@ -5263,8 +5362,8 @@ impl Rewrite<'_> {
         for pred in w.preds.iter_mut() {
             if let crate::ast::WherePred::Type { ty, bounds, .. } = pred {
                 let ty = *ty;
-                self.ty(ast, ty, module, &[]);
-                self.bounds(ast, bounds, w.span, module);
+                self.ty(ast, ty, module, outer);
+                self.bounds_in(ast, bounds, w.span, module, outer);
             }
         }
     }
@@ -5420,7 +5519,7 @@ impl Rewrite<'_> {
     /// (the item frames of the blocks around a nested fn).
     fn fn_def_in(&mut self, ast: &mut Ast, def: &mut FnDef, module: ModuleId, outer: &[Frame]) {
         let mark = self.push_params(&def.generics);
-        self.generics(ast, &mut def.generics, &mut def.where_clause, module);
+        self.generics_in(ast, &mut def.generics, &mut def.where_clause, module, outer);
         // A typed receiver (`self: &Arc<Self>`) names types as a param does.
         if let Some(t) = def.self_param.as_ref().and_then(|sp| sp.ty) {
             self.ty(ast, t, module, outer);
@@ -6503,6 +6602,37 @@ impl Rewrite<'_> {
                 self.ty(ast, a.ty, module, outer);
                 self.gen_params.truncate(mark);
                 ast.stmt_items[idx as usize].kind = ItemKind::Type(a);
+            }
+            // A block impl: its header and method signatures and bodies
+            // see the block items around it as a nested fn does (R18);
+            // its own generics stay its own. Flatten then hoists it to
+            // its module's items (`hoist_block_impls`).
+            ItemKind::Impl(imp) => {
+                let mut imp = imp.clone();
+                let mark = self.push_params(&imp.generics);
+                self.generics_in(ast, &mut imp.generics, &mut imp.where_clause, module, outer);
+                if let Some(tr) = &mut imp.trait_ref {
+                    self.rewrite_path(&mut tr.path, Namespace::Type, imp.span, module, outer, ast);
+                }
+                self.ty(ast, imp.self_ty, module, outer);
+                for at in imp.types.iter_mut() {
+                    self.bounds_in(ast, &mut at.bounds, at.span, module, outer);
+                    self.generics_in(ast, &mut at.generics, &mut at.where_clause, module, outer);
+                    if let Some(d) = at.default {
+                        self.ty(ast, d, module, outer);
+                    }
+                }
+                for t in imp.consts.iter().map(|c| c.ty).collect::<Vec<_>>() {
+                    self.ty(ast, t, module, outer);
+                }
+                for v in imp.consts.iter().filter_map(|c| c.default).collect::<Vec<_>>() {
+                    self.expr(ast, v, module, &mut outer.to_vec());
+                }
+                for f in &mut imp.fns {
+                    self.fn_def_in(ast, f, module, outer);
+                }
+                self.gen_params.truncate(mark);
+                ast.stmt_items[idx as usize].kind = ItemKind::Impl(imp);
             }
             _ => {}
         }
@@ -8762,6 +8892,66 @@ mod tests {
 /// each surviving item came from in `out_mods` (parallel to `out`).
 /// Inline module bodies splice in with their child module from
 /// `list_module`; mod, use, and extern crate items drop.
+/// Moves each impl inside a fn body (`Ast::stmt_items`) to the module
+/// items, right after the module item whose span holds it and in that
+/// item's module. An impl in a block is global for method lookup and
+/// coherence (rustc), so collect and check take it as a module impl;
+/// its header and bodies see the block items around it by its span (R18,
+/// `collect::apply_stmt_overlay`). The other body items keep their order
+/// and `Stmt::Item` indexes follow them. A body impl from a macro
+/// expansion, or one no item holds, stays a body item (collect: L0820).
+fn hoist_block_impls(ast: &mut Ast, items: &mut Vec<Item>, mods: &mut Vec<ModuleId>) {
+    let holds = |s: Span, t: Span| s.file == t.file && s.lo <= t.lo && t.hi <= s.hi;
+    let owner = |it: &Item| {
+        (matches!(it.kind, ItemKind::Impl(_)) && it.span.ctxt == crate::diag::CtxtId::ROOT)
+            .then(|| items.iter().position(|o| o.span.ctxt == crate::diag::CtxtId::ROOT && holds(o.span, it.span)))
+            .flatten()
+    };
+    let owners: Vec<Option<usize>> = ast.stmt_items.iter().map(owner).collect();
+    if owners.iter().all(Option::is_none) {
+        return;
+    }
+    let mut remap: Vec<Option<u32>> = vec![None; owners.len()];
+    let mut hoisted: Vec<Vec<Item>> = vec![Vec::new(); items.len()];
+    let mut kept = Vec::with_capacity(owners.len());
+    for (i, mut item) in std::mem::take(&mut ast.stmt_items).into_iter().enumerate() {
+        match owners[i] {
+            Some(o) => {
+                if let ItemKind::Impl(imp) = &mut item.kind {
+                    imp.in_body = true;
+                }
+                hoisted[o].push(item);
+            }
+            None => {
+                remap[i] = Some(kept.len() as u32);
+                kept.push(item);
+            }
+        }
+    }
+    ast.stmt_items = kept;
+    for b in &mut ast.blocks {
+        b.stmts.retain_mut(|s| match s {
+            Stmt::Item(i) => match remap[*i as usize] {
+                Some(n) => {
+                    *i = n;
+                    true
+                }
+                None => false,
+            },
+            _ => true,
+        });
+    }
+    let (mut out, mut out_mods) = (Vec::with_capacity(items.len()), Vec::with_capacity(items.len()));
+    for ((item, m), extra) in std::mem::take(items).into_iter().zip(std::mem::take(mods)).zip(hoisted) {
+        out.push(item);
+        out_mods.push(m);
+        out_mods.extend(std::iter::repeat_n(m, extra.len()));
+        out.extend(extra);
+    }
+    *items = out;
+    *mods = out_mods;
+}
+
 fn flatten_items_mods(
     items: Vec<Item>,
     module: ModuleId,

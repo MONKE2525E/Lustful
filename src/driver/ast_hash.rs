@@ -1469,7 +1469,7 @@ impl Walker<'_> {
                 3u8.hash(h);
                 self.attrs(h, &imp.inner_attrs);
                 self.generics(h, &imp.generics);
-                (imp.is_unsafe, imp.is_negative).hash(h);
+                (imp.is_unsafe, imp.is_negative, imp.in_body).hash(h);
                 match &imp.trait_ref {
                     Some(tr) => self.path(h, &tr.path),
                     None => 0u8.hash(h),

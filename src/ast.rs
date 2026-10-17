@@ -521,6 +521,10 @@ pub struct ImplDef {
     pub consts: Vec<AssocConstDef>,
     pub types: Vec<AssocTypeDef>,
     pub span: Span,
+    /// True for an impl written inside a fn body, once the resolver hoisted
+    /// it to its module's items (`worklist::hoist_block_impls`): its
+    /// header and bodies see the block items around its span (R18).
+    pub in_body: bool,
 }
 
 /// A `use` declaration: one tree (`use a::{b, c as d, self};`, `use a::*;`).

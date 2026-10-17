@@ -400,8 +400,9 @@ fn grown() -> i64 { 1 }
         # inside a fn body makes the token scan count one more fn than
         # the Ast fn list. slot_update indexed the Ast-side arrays by
         # the scan count and the compiler panicked (cold rc 101, the
-        # daemon's fresh session reported an internal error). Both
-        # sides must now give collect's L0820, byte for byte.
+        # daemon's fresh session reported an internal error). The
+        # resolver now hoists the impl to the module items (tf-fnimpl):
+        # both sides must accept, with the same output.
         ib = os.path.join(work, "implbody.rs")
         open(ib, "w").write('fn first() {}\nfn main() {}\n')
         rc1, _, _ = run_lust(["check", ib])
@@ -411,8 +412,8 @@ fn grown() -> i64 { 1 }
         r = run_timed([LUST, "check", ib], cwd=work, env=cold_env,
                            capture_output=True, text=True, timeout=20)
         check("impl in fn body: scan/Ast count split does not panic (realish seed 1)",
-              rc1 == 0 and rcw == 1 and r.returncode == 1
-              and "L0820" in errw and errw == r.stderr and "panicked" not in r.stderr,
+              rc1 == 0 and rcw == 0 and r.returncode == 0
+              and errw == r.stderr and "panicked" not in r.stderr,
               f"rc1={rc1} warm rc={rcw} err={errw[:120]!r} cold rc={r.returncode}")
 
         # 14. Duplicate definitions through warm edits: adding a second

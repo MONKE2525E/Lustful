@@ -20802,9 +20802,13 @@ impl<'p> Ctx<'p> {
         {
             return Some(t);
         }
-        let a = match self.binding(Namespace::Type, head) {
-            BindingRes::Def(def) => p.adt_by_def(def),
-            _ => None,
+        // A block type item first (R18), as `assoc_const_key` reads it.
+        let a = match self.local_adt_of(head) {
+            Some(a) => Some(a),
+            None => match self.binding(Namespace::Type, head) {
+                BindingRes::Def(def) => p.adt_by_def(def),
+                _ => None,
+            },
         };
         // Through a type alias of a user Adt: the alias's type, with its
         // own args (`type R = M; R::NONE`).
@@ -20904,8 +20908,11 @@ impl<'p> Ctx<'p> {
         }
         let p = self.p;
         let (ty_name, item) = (segs[0].name, segs[1].name);
+        // A block type item shadows a module type of its name (R18).
         let adt = if ty_name == p.known.self_type {
             self.self_adt()
+        } else if let Some(a) = self.local_adt_of(ty_name) {
+            Some(a)
         } else {
             match self.binding(Namespace::Type, ty_name) {
                 BindingRes::Def(def) => p.adt_by_def(def),

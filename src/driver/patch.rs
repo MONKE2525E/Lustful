@@ -827,6 +827,11 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     if !matches!(ast.items[item].kind, ItemKind::Fn(_) | ItemKind::Impl(_)) {
         return Err("not in a fn body");
     }
+    // A hoisted body impl's method resolves with its block's items; the
+    // body rewrite here sees module scope only.
+    if matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.in_body) {
+        return Err("body impl");
+    }
     let span = ast.blocks[def.body.ok_or("not in a fn body")?.0 as usize].span;
     // A fn's expression and pattern ranges (`FnDef::exprs`, closure
     // numbering reads them) start at its first parameter: parameter
@@ -1082,6 +1087,9 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
         }
     }
     let (fn_index, item, sub, lo, hi) = found.ok_or(None)?;
+    if matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.in_body) {
+        return Err(Some("item: body impl"));
+    }
     let def = fn_def_at(ast, item, sub);
     // The outline holds the qualifiers, so the new fn is const too.
     let full = def.qual.is_const || matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.trait_ref.is_some());

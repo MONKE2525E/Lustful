@@ -3212,6 +3212,7 @@ impl<'a> Parser<'a> {
             generics,
             is_unsafe,
             is_negative,
+            in_body: false,
             trait_ref,
             self_ty,
             where_clause,
