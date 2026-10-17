@@ -1639,8 +1639,8 @@ pub(super) fn plain_inherent_probe(
 }
 
 /// How many std supertraits of dyn principal `principal` (Debug,
-/// Display, Hasher, ..., which have no `dyn_infos` and so are not in
-/// `object_cands`) declare a method `name` of receiver form `form`. They
+/// Display, Hasher, ..., whose methods are not vtable methods and so are
+/// not in `object_cands`) declare a method `name` of receiver form `form`. They
 /// are object candidates too, in scope or not: with `trait U: Debug {
 /// fn fmt(&self) }`, `dyn U`'s `x.fmt()` is ambiguous in rustc (E0034).
 fn std_super_cands(
@@ -1660,8 +1660,10 @@ fn std_super_cands(
         }
         seen.push(cur);
         let Some(rec) = p.gx.index.trait_record(cur) else { continue };
+        // `dyn Debug` / `dyn Display` have dyn infos with no vtable
+        // methods: their `fmt` is still a candidate here.
         if cur != principal
-            && !p.gx.dyn_infos.contains_key(&cur)
+            && !p.gx.dyn_infos.get(&cur).is_some_and(|i| i.methods.iter().any(|m| m.name == name))
             && !cands.iter().any(|(_, c)| c.owner.def == cur)
             && let Some(m) = rec.method_by_name(name)
         {

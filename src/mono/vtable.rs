@@ -129,6 +129,16 @@ pub fn ensure_vtable(p: &mut Program, self_ty: Ty, principal: TraitRef, made: &m
         p.gx.vtable_by_key.insert((self_ty, principal), id);
         return Some(id);
     }
+    // `dyn Debug` / `dyn Display`: no methods; the header's fmt shim
+    // formats the value (check proved `T: Debug` / `T: Display` at the
+    // coercion, also for types std implements without an impl record:
+    // `&str`, tuples).
+    if principal.def == p.gx.lang.debug || principal.def == p.gx.lang.display {
+        let id = p.gx.vtables.len() as u32;
+        p.gx.vtables.push(VtableData { self_ty, principal, methods: Vec::new(), supers: Vec::new() });
+        p.gx.vtable_by_key.insert((self_ty, principal), id);
+        return Some(id);
+    }
     let info = p.gx.dyn_infos.get(&principal.def)?.clone();
     let tr = object::with_self(&mut p.tys, principal, self_ty);
     let (impl_id, impl_args) = select_impl_global(p, tr)?;

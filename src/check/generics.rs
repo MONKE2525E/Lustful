@@ -3813,11 +3813,13 @@ fn resolve_dyn(
                 }
                 binder_shadow(interner, scope, binder)?;
                 // Vtables exist for user traits, the Fn family (ARCH
-                // 2.9: a closure's one call entry), and `Any` (a type id,
-                // check/any.rs); another std trait (`dyn Display`) has no
-                // method bodies the subset can point a vtable at yet.
+                // 2.9: a closure's one call entry), `Any` (a type id,
+                // check/any.rs), and `Debug` and `Display` (the header's
+                // fmt shim); another std trait has no method bodies the
+                // subset can point a vtable at yet.
                 let fn_family = cx.lang.is_fn_family(trait_def);
-                if !fn_family && trait_def != cx.lang.any && !cx.index.trait_record(trait_def).is_some_and(|r| r.local) {
+                let fmt_trait = trait_def == cx.lang.debug || trait_def == cx.lang.display;
+                if !fn_family && !fmt_trait && trait_def != cx.lang.any && !cx.index.trait_record(trait_def).is_some_and(|r| r.local) {
                     let name = interner.get(trait_ref.path.last().unwrap().name).to_string();
                     return Err(dyn_not_yet(span, &format!("`dyn {name}` (a std trait)")));
                 }

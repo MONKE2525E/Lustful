@@ -1,4 +1,4 @@
-// expect: L0110
+// expect: L0202
 // Probe e_20 (probes, w-opaque2): rustc and lust reject it.
 #![allow(unused)]
 fn f(a: &[u8], b: &[u8]) -> impl Iterator<Item = &dyn std::fmt::Debug> { std::iter::empty() }

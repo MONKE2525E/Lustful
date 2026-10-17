@@ -1656,7 +1656,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("associated consts", "L0621"),
     ("dependency crates with no lust adapter or shim yet (named in the message)", "L0508"),
     ("`impl Trait` types", "L0602"),
-    ("`dyn` with a std trait (`dyn Display`, `dyn Fn(..)`) or no principal trait", "L0702"),
+    ("`dyn` with a std trait other than the Fn family, `Any`, `Error`, `Debug` and `Display` (`dyn Iterator`), or no principal trait", "L0702"),
     ("`dyn` for traits with associated types or std supertraits other than `Debug` and `Display`", "L0702"),
     ("`dyn` coercions in const and static initializers", "L0702"),
     ("`Box<dyn Trait>`, `Rc<dyn Trait>`, `Arc<dyn Trait>`", "L0641"),

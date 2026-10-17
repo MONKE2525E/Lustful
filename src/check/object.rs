@@ -130,6 +130,10 @@ pub fn compute_dyn_infos(p: &Program) -> FxMap<DefId, DynInfo> {
     // `dyn Any` (check/any.rs): no vtable methods; its vtable holds the
     // value's type id after the header (`VT_ANY_ID`). `trait Any: 'static`.
     memo.insert(p.gx.lang.any, DynInfo { static_bound: true, ..DynInfo::default() });
+    // `dyn Debug` and `dyn Display`: no vtable methods; the dyn type
+    // formats through the header shim (`VT_FMT_DEBUG`, `VT_FMT_DISPLAY`).
+    memo.insert(p.gx.lang.debug, DynInfo { fmt_debug: true, ..DynInfo::default() });
+    memo.insert(p.gx.lang.display, DynInfo { fmt_display: true, ..DynInfo::default() });
     let mut defs: Vec<DefId> = p.gx.trait_names.values().copied().collect();
     defs.sort_by_key(|d| d.hash.0);
     for d in defs {
