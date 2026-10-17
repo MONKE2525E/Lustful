@@ -860,11 +860,8 @@ impl FileExpander {
             client,
         };
         let spliced = self.menv.splice(*di, lexed, self.magic);
-        let seeds: std::borrow::Cow<[crate::expand::MacroSeed]> = match self.menv.glob_seeds.get(*di) {
-            Some(extra) if !extra.is_empty() => self.menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
-            _ => std::borrow::Cow::Borrowed(&self.menv.seeds),
-        };
-        Some(crate::expand::expand_lexed_seeded_with_deps(spliced, &ects, &seeds))
+        let extra = self.menv.glob_seeds.get(*di).map_or(&[][..], Vec::as_slice);
+        Some(crate::expand::expand_lexed_seeded_extra(spliced, &ects, &self.menv.seeds, extra))
     }
 
     /// The cfg environment the expansions ran under.
@@ -3349,13 +3346,10 @@ fn resolve_one(
                 client,
             };
             let spliced = menv.splice(di, orig, job.magic);
-            // Borrowed unless this file has glob seeds of its own: a copy of
-            // every seed per file cost more than the expansion of most files.
-            let seeds: std::borrow::Cow<[crate::expand::MacroSeed]> = match menv.glob_seeds.get(di) {
-                Some(extra) if !extra.is_empty() => menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
-                _ => std::borrow::Cow::Borrowed(&menv.seeds),
-            };
-            crate::expand::expand_lexed_seeded_with_deps(spliced, &ects, &seeds).map(|(l, deps)| (Some(l), deps))
+            // The crate's seeds, then this file's glob seeds, borrowed: a copy
+            // of every seed per file cost more than the expansion of most files.
+            let extra = menv.glob_seeds.get(di).map_or(&[][..], Vec::as_slice);
+            crate::expand::expand_lexed_seeded_extra(spliced, &ects, &menv.seeds, extra).map(|(l, deps)| (Some(l), deps))
         });
         file_deps.resize_with(discs.len(), Vec::new);
         for (di, r) in results.into_iter().enumerate() {

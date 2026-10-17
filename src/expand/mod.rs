@@ -1032,10 +1032,11 @@ fn seed_name(seed: &MacroSeed, interner: &Interner) -> Option<Sym> {
 /// `needs_expansion` finds no work in its tokens: a glob `use` may bring
 /// a macro named like a parser macro (a seed defines one), or a
 /// worklist glob seed for this file does.
-fn seeds_bind_parser_name(tokens: &[Token], seeds: &[MacroSeed], interner: &Interner) -> bool {
+fn seeds_bind_parser_name(tokens: &[Token], seeds: &[MacroSeed], extra: &[MacroSeed], interner: &Interner) -> bool {
     let parser = |s: &MacroSeed| seed_name(s, interner).is_none_or(|n| builtin::is_passthrough(interner.get(n)));
     let glob_use = || tokens.iter().enumerate().any(|(i, t)| t.tok == Tok::Star && in_use_tree(tokens, i));
-    seeds.iter().any(|s| s.import_into.is_some() && (s.ambiguous || parser(s))) || (seeds.iter().any(parser) && glob_use())
+    let all = || seeds.iter().chain(extra);
+    all().any(|s| s.import_into.is_some() && (s.ambiguous || parser(s))) || (all().any(parser) && glob_use())
 }
 
 /// Per-file expander state. One `expand_lexed` run builds one of these.
@@ -1581,12 +1582,19 @@ pub fn delimiter_error(tokens: &[Token]) -> Option<Diag> {
 /// fns (`lazy::hoist_static_closures`, W-STD-C), so every pipeline that
 /// expands sees the same items.
 pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
-    let (lexed, deps) = expand_macros(lexed, ctx, seeds)?;
+    expand_lexed_seeded_extra(lexed, ctx, seeds, &[])
+}
+
+/// `expand_lexed_seeded_with_deps` with the seeds in two lists, `seeds`
+/// then `extra`: the worklist passes the crate's seeds and one file's
+/// glob seeds without copying them into one list.
+pub fn expand_lexed_seeded_extra(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed], extra: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
+    let (lexed, deps) = expand_macros(lexed, ctx, seeds, extra)?;
     Ok((lazy::hoist_static_closures(lexed, ctx.interner), deps))
 }
 
-/// Macro expansion proper, for `expand_lexed_seeded_with_deps`.
-fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
+/// Macro expansion proper, for `expand_lexed_seeded_extra`.
+fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed], extra: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
     // rustc's lexer rejects any unbalanced or mismatched delimiter in
     // the file (attributes, cfg-off items, unused macro bodies too),
     // before any macro or parse error. The parser reads some groups
@@ -1594,7 +1602,7 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(
     if let Some(d) = delimiter_error(&lexed.tokens) {
         return Err(d);
     }
-    if !needs_expansion(&lexed.tokens, ctx.interner) && !seeds_bind_parser_name(&lexed.tokens, seeds, ctx.interner) {
+    if !needs_expansion(&lexed.tokens, ctx.interner) && !seeds_bind_parser_name(&lexed.tokens, seeds, extra, ctx.interner) {
         return Ok((lexed, Vec::new()));
     }
     let (trees, _) = build_trees(&lexed.tokens);
@@ -1603,7 +1611,7 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(
     st.root_file = lexed.tokens.first().map(|t| t.span.file);
     st.own_file = Some(eof.span.file);
     (st.shadowed_crates, st.alloc_extern) = crate_name_facts(&lexed.tokens, ctx, ctx.module_path.is_empty());
-    for seed in seeds {
+    for seed in seeds.iter().chain(extra) {
         st.seed_macro(seed)?;
     }
     let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();

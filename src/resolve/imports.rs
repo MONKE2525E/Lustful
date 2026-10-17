@@ -2379,28 +2379,31 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
 /// those names (`run_imports` passes the names changed since the last
 /// copy; each name's copy reads and writes that name alone). Returns
 /// true on a change.
+/// The bindings of module `src` in one namespace, all or those `only`
+/// names, borrowed (`copy_glob` copies only the ones it takes).
+fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only: Option<&[Sym]>) -> Vec<(Sym, &'t BindState)> {
+    let map = &tables.maps[src.0 as usize][ns_index(ns)];
+    match only {
+        None => map.iter().map(|(n, b)| (*n, b)).collect(),
+        Some(o) => o.iter().filter_map(|n| map.get(n).map(|b| (*n, b))).collect(),
+    }
+}
+
 fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Option<&[Sym]>, interner: &Interner) -> bool {
     // `only` is sorted by symbol (`run_imports`).
     let want = |name: &Sym| only.is_none_or(|o| o.binary_search(name).is_ok());
-    let names_of = |tables: &ResolvedTables, ns: Namespace| -> Vec<(Sym, BindState)> {
-        let map = &tables.maps[src.0 as usize][ns_index(ns)];
-        match only {
-            None => map.iter().map(|(n, b)| (*n, b.clone())).collect(),
-            Some(o) => o.iter().filter_map(|n| map.get(n).map(|b| (*n, b.clone()))).collect(),
-        }
-    };
     let mut changed = false;
     // Copy in deterministic name order.
     let mut entries: Vec<(Namespace, Sym, Bind)> = Vec::new();
     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
-        let mut names = names_of(tables, ns);
+        let mut names = glob_names(tables, src, ns, only);
         names.sort_by(|a, b| interner.get(a.0).cmp(interner.get(b.0)));
         for (name, state) in names {
             // A `macro_rules!` definition is not in its
             // module's namespace, so no glob copies it.
             // A glob binding a pending single import of
             // the name hides is not copied yet.
-            if let BindState::One(b) = &state
+            if let BindState::One(b) = state
                 && (b.rank >= 2 || !tables.pending_single.contains_key(&(src, name)))
                 && tables.visible(&b.vis, b.def_module, imp.module, interner)
                 && !(ns == Namespace::Macro && tables.is_textual_bind(src, name, b))
@@ -2427,7 +2430,7 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
     // (`ambig_vis`), and none that a pending single
     // import in the source hides.
     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
-        let mut names: Vec<Sym> = names_of(tables, ns)
+        let mut names: Vec<Sym> = glob_names(tables, src, ns, only)
             .into_iter()
             .filter_map(|(name, state)| matches!(state, BindState::Ambiguous).then_some(name))
             .filter(|name| !tables.pending_single.contains_key(&(src, *name)))
