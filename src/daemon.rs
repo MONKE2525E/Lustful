@@ -456,6 +456,32 @@ enum GuardOutcome {
 /// client env and shown paths, crate selection) needs no entry: a guard
 /// compiles a clone of the warm request, in this same daemon binary.
 /// Cheap (no file system call), so the serve loop takes the warm session's.
+/// An FxHash of the text of every file in the session's source map,
+/// by path: the bytes the session's last compile read. The guard
+/// compares the warm session's snapshot against the fresh one's, so
+/// a fresh compile that read different bytes (an edit mid-read can
+/// give it a truncated file) is stale by content, whatever the
+/// filesystem clock says about the edit (`changed_input` is only as
+/// fine as that clock; on a gate box a truncated read compared as a
+/// guard mismatch, fx-defcheck round 3). Cheap: the texts are
+/// already in the map.
+fn session_text_hashes(session: &Session) -> crate::intern::FxMap<PathBuf, u64> {
+    use std::hash::{Hash, Hasher};
+    let map = &session.front.map;
+    let mut out = crate::intern::FxMap::default();
+    for k in 0..map.file_count() {
+        let f = crate::diag::FileId(k as u32);
+        let p = map.path(f);
+        if p.is_empty() {
+            continue;
+        }
+        let mut h = crate::intern::FxHasher::default();
+        map.text(f).unwrap_or("").hash(&mut h);
+        out.insert(PathBuf::from(p), h.finish());
+    }
+    out
+}
+
 fn session_inputs(session: &Session, req: &Request) -> Vec<PathBuf> {
     let front = &session.front;
     let mut paths = vec![req.file.clone()];
@@ -557,6 +583,8 @@ struct QueuedGuard {
     req: Request,
     warm: Response,
     inputs: Vec<PathBuf>,
+    /// The warm session's source texts at spawn (`session_text_hashes`).
+    texts: crate::intern::FxMap<PathBuf, u64>,
     /// `inputs` plus the request's root and crate files: what `cancel_stale` watches.
     watch: Vec<PathBuf>,
     start: std::time::SystemTime,
@@ -628,7 +656,16 @@ impl GuardJobs {
     /// during either compile reads as stale, never as a guard mismatch.
     /// While another check runs, this one waits in `queued` (its start
     /// line is logged now, so log readers count it as pending).
-    fn spawn(&mut self, req: Request, warm: Response, inputs: Vec<PathBuf>, start: std::time::SystemTime, dir: PathBuf, served: u64) {
+    fn spawn(
+        &mut self,
+        req: Request,
+        warm: Response,
+        inputs: Vec<PathBuf>,
+        texts: crate::intern::FxMap<PathBuf, u64>,
+        start: std::time::SystemTime,
+        dir: PathBuf,
+        served: u64,
+    ) {
         self.next_seq += 1;
         let seq = self.next_seq;
         self.pending += 1;
@@ -636,7 +673,7 @@ impl GuardJobs {
         let mut watch = inputs.clone();
         watch.push(req.file.clone());
         watch.extend(crate_inputs(&req));
-        let q = QueuedGuard { seq, req, warm, inputs, watch, start, dir, served };
+        let q = QueuedGuard { seq, req, warm, inputs, texts, watch, start, dir, served };
         if self.running.is_empty() && self.queued.is_empty() {
             self.launch(q);
         } else {
@@ -646,7 +683,7 @@ impl GuardJobs {
 
     /// Runs one check on its own thread (see `spawn`).
     fn launch(&mut self, q: QueuedGuard) {
-        let QueuedGuard { seq, req, warm, inputs, watch, start, dir, served } = q;
+        let QueuedGuard { seq, req, warm, inputs, texts, watch, start, dir, served } = q;
         let tx = self.tx.clone();
         let key = req.session.clone();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
@@ -681,9 +718,27 @@ impl GuardJobs {
                         all.extend(crate_inputs(&req));
                         all.sort();
                         all.dedup();
+                        // The ctime proof first (it also covers the
+                        // inputs no source map holds). Then the
+                        // content proof: every text the fresh
+                        // compile read must be a text the warm
+                        // session read, byte for byte. An edit the
+                        // filesystem clock cannot order (it can lag
+                        // the realtime clock by far more than the
+                        // ctime slack on a loaded or virtualized
+                        // box) still changes the bytes, so a fresh
+                        // compile that read a file mid-write (a
+                        // truncated root once answered L0130 no
+                        // `main` against the warm L0110) reads as
+                        // stale here, never as a mismatch.
+                        let fresh_texts = session_text_hashes(&fresh);
+                        let text_diff = fresh_texts.iter().find(|(p, h)| texts.get(*p) != Some(*h)).map(|(p, _)| p.clone());
                         match changed_input(&all, start) {
-                            None => GuardOutcome::Fresh(resp),
                             Some(path) => GuardOutcome::Stale(path),
+                            None => match text_diff {
+                                Some(path) => GuardOutcome::Stale(path),
+                                None => GuardOutcome::Fresh(resp),
+                            },
                         }
                     }
                     Err(_) => GuardOutcome::Panicked,
@@ -837,8 +892,9 @@ fn compile_guarded(entry: &mut Entry, req: &Request, jobs: &mut GuardJobs) -> Re
         Ok(r) => {
             // An error answer: hand it out now, verify it in the background.
             let inputs = session_inputs(&entry.session, req);
+            let texts = session_text_hashes(&entry.session);
             let dir = entry.fresh_dir();
-            jobs.spawn(req.clone(), r.clone(), inputs, start, dir, served);
+            jobs.spawn(req.clone(), r.clone(), inputs, texts, start, dir, served);
             r
         }
         Err(payload) => {
@@ -1212,9 +1268,16 @@ mod tests {
     }
 
     /// Runs one guard check to its end on the test thread's own channel.
-    fn guard_once(req: &Request, warm: Response, inputs: Vec<PathBuf>, start: std::time::SystemTime, dir: PathBuf) -> GuardDone {
+    fn guard_once(
+        req: &Request,
+        warm: Response,
+        inputs: Vec<PathBuf>,
+        texts: crate::intern::FxMap<PathBuf, u64>,
+        start: std::time::SystemTime,
+        dir: PathBuf,
+    ) -> GuardDone {
         let mut jobs = GuardJobs::new();
-        jobs.spawn(req.clone(), warm, inputs, start, dir, 1);
+        jobs.spawn(req.clone(), warm, inputs, texts, start, dir, 1);
         jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends")
     }
 
@@ -1264,15 +1327,16 @@ mod tests {
         let warm = driver::compile(&req, &mut entry.session);
         assert_eq!(warm.code, 1, "store.rs has a type error: {}", warm.stderr);
         let inputs = session_inputs(&entry.session, &req);
+        let texts = session_text_hashes(&entry.session);
         assert!(inputs.contains(&store), "the module file is a guard input: {inputs:?}");
 
         // Same inputs, same answer: a match keeps the warm session.
-        let done = guard_once(&req, warm.clone(), inputs.clone(), start, base.join("f1"));
+        let done = guard_once(&req, warm.clone(), inputs.clone(), texts.clone(), start, base.join("f1"));
         assert!(matches!(&done.outcome, GuardOutcome::Fresh(f) if f.stderr == warm.stderr && f.code == warm.code));
 
         // Same inputs, a warm answer that differs: a real mismatch.
         let wrong = Response { stderr: "error[L0001]: not what a fresh session says\n".into(), ..warm.clone() };
-        let done = guard_once(&req, wrong, inputs.clone(), start, base.join("f2"));
+        let done = guard_once(&req, wrong, inputs.clone(), texts.clone(), start, base.join("f2"));
         assert!(matches!(done.outcome, GuardOutcome::Fresh(_)));
         sessions.get_mut(&req.session).unwrap().served = 1;
         apply_guard(&mut sessions, done);
@@ -1283,7 +1347,7 @@ mod tests {
         // The module file is fixed after the warm answer (the root stays
         // byte for byte): the fresh answer differs, but the check is stale.
         write_later(&store, "pub fn put(x: u8) -> u8 {\n    x + 1\n}\n");
-        let done = guard_once(&req, warm.clone(), inputs.clone(), start, base.join("f3"));
+        let done = guard_once(&req, warm.clone(), inputs.clone(), texts.clone(), start, base.join("f3"));
         assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == store), "module edit reads as stale");
 
         // An edit and a revert of the root (A -> B -> A, fx-cgen-rec 11:16):
@@ -1293,8 +1357,40 @@ mod tests {
         let start = std::time::SystemTime::now();
         write_later(&root, "fn main() {}\n");
         std::fs::write(&root, &text).unwrap();
-        let done = guard_once(&req, warm, vec![root.clone()], start, base.join("f4"));
+        let done = guard_once(&req, warm, vec![root.clone()], texts.clone(), start, base.join("f4"));
         assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == root), "a reverted root reads as stale");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The content proof: a fresh compile that read other bytes than
+    /// the warm session's snapshot is stale even when no input's
+    /// ctime moved (the rej02 gate flake: the fresh compile read the
+    /// root mid-write and answered L0130 no `main`, and the coarse
+    /// filesystem clock hid the edit from the ctime proof). The
+    /// snapshot is doctored here, which stands in for the fresh
+    /// compile having read the truncated file.
+    #[test]
+    fn guard_stale_when_fresh_read_other_bytes() {
+        let base = std::env::temp_dir().join(format!("lust-guard-texts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("main.rs");
+        std::fs::write(&root, "fn main() {\n    let x: u8 = true;\n}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let req = check_req(&root);
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let entry = entry_for(&mut sessions, &base.join("s"), &req.session, None, &mut 0);
+        let start = std::time::SystemTime::now();
+        let warm = driver::compile(&req, &mut entry.session);
+        assert_eq!(warm.code, 1, "a type error: {}", warm.stderr);
+        let inputs = session_inputs(&entry.session, &req);
+        let mut texts = session_text_hashes(&entry.session);
+        assert!(texts.contains_key(&root), "the root text is in the snapshot: {texts:?}");
+        // The warm snapshot now claims other bytes for the root than
+        // the fresh compile will read, and nothing on disk moves.
+        texts.insert(root.clone(), 0);
+        let done = guard_once(&req, warm, inputs, texts, start, base.join("f1"));
+        assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == root), "other bytes read as stale");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1317,12 +1413,13 @@ mod tests {
         let start = std::time::SystemTime::now();
         let warm = driver::compile(&req, &mut entry.session);
         let inputs = session_inputs(&entry.session, &req);
+        let texts = session_text_hashes(&entry.session);
         let mut jobs = GuardJobs::new();
         let recv = |jobs: &GuardJobs| jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends");
 
         // The second check waits for the first, then runs and matches.
-        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f1"), 1);
-        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f2"), 2);
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), texts.clone(), start, base.join("f1"), 1);
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), texts.clone(), start, base.join("f2"), 2);
         assert_eq!((jobs.running.len(), jobs.queued.len(), jobs.pending), (1, 1, 2));
         let done = recv(&jobs);
         assert_eq!(done.seq, 1);
@@ -1336,8 +1433,8 @@ mod tests {
         assert_eq!(jobs.pending, 0);
 
         // A queued check whose module file changed never compiles.
-        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f3"), 3);
-        jobs.spawn(req.clone(), warm.clone(), inputs, start, base.join("f4"), 4);
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), texts.clone(), start, base.join("f3"), 3);
+        jobs.spawn(req.clone(), warm.clone(), inputs, texts.clone(), start, base.join("f4"), 4);
         write_later(&store, "pub fn put(x: u8) -> u8 {\n    x + 1\n}\n");
         jobs.cancel_stale();
         assert!(jobs.queued.is_empty() && jobs.pending == 1, "the queued check ended as cancelled");
@@ -1372,10 +1469,11 @@ mod tests {
         let warm = driver::compile(&req, &mut entry.session);
         assert_eq!(warm.code, 1, "store.rs has a type error: {}", warm.stderr);
         let inputs = session_inputs(&entry.session, &req);
+        let texts = session_text_hashes(&entry.session);
 
         // Unchanged inputs: the check runs to its end and matches.
         let mut jobs = GuardJobs::new();
-        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), start, base.join("f1"), 1);
+        jobs.spawn(req.clone(), warm.clone(), inputs.clone(), texts.clone(), start, base.join("f1"), 1);
         jobs.cancel_stale();
         assert!(jobs.running.iter().all(|g| g.why.is_none()), "no input changed");
         let done = jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends");
@@ -1384,7 +1482,7 @@ mod tests {
         // A module file changed: cancelled, and the outcome names it.
         write_later(&store, "pub fn put(x: u8) -> u8 {\n    x + 1\n}\n");
         let mut jobs = GuardJobs::new();
-        jobs.spawn(req.clone(), warm.clone(), inputs, start, base.join("f2"), 1);
+        jobs.spawn(req.clone(), warm.clone(), inputs, texts.clone(), start, base.join("f2"), 1);
         jobs.cancel_stale();
         assert!(jobs.running.iter().all(|g| g.why.as_ref() == Some(&store)), "the module edit cancels");
         let done = jobs.rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the guard check ends");

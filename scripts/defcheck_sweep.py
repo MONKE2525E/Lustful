@@ -16,8 +16,11 @@
 # hang. False rejects are listed for review (lust is a subset).
 #
 # Usage: python3 scripts/defcheck_sweep.py [--jobs J] [--family F]
-#        [--keep DIR]   (needs target/release/lust built)
-import argparse, os, subprocess, sys, tempfile
+#        [--keep DIR] [--daemon]   (needs target/release/lust built)
+# --daemon also runs every case through a warm daemon (a valid
+# prime, then the case as an edit) and requires the warm check's
+# stderr to equal the cold one's byte for byte (class warm-diff).
+import argparse, os, subprocess, sys, tempfile, time
 from concurrent.futures import ProcessPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -314,6 +317,28 @@ def build_cases():
         case("direct", f"generic_ctor_{an}", NEED + f"fn make<T: Copy>(x: T) -> Need<T> {{ Need(x) }}\nfn main() {{ let _n: Need<{aty}> = make({aexpr}); println!(\"ok\"); }}\n")
 
 
+_DENV = None
+
+
+def init_daemon():
+    """Pool worker init for --daemon: one private daemon per worker."""
+    global _DENV
+    import atexit, signal as _sig
+    if not os.environ.get("SWEEP_DAEMON"):
+        return
+    d = tempfile.mkdtemp(prefix="defcheck-daemon-")
+    env = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(d, "d.sock"), LUST_NO_CACHE="1", TMPDIR=d)
+    env.pop("LUST_NO_DAEMON", None)
+    log = open(os.path.join(d, "daemon.log"), "w")
+    proc = subprocess.Popen([LUST, "daemon"], cwd=d, env=env, stderr=log, start_new_session=True)
+    for _ in range(2000):
+        if os.path.exists(env["LUST_DAEMON_SOCKET"]):
+            break
+        time.sleep(0.005)
+    atexit.register(lambda: os.killpg(os.getpgid(proc.pid), _sig.SIGTERM))
+    _DENV = env
+
+
 def run(cmd, timeout=25, env=None):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
@@ -337,6 +362,24 @@ def one(job):
     crc, _, cerr = run([LUST, "check", path], env=env)
     if crc is None:
         return (family, name, "hang", "lust check timeout")
+    if _DENV is not None:
+        # Warm must equal cold byte for byte: prime the file's
+        # session on a valid program, edit in this case's source
+        # (mtime bumped), and check through the daemon.
+        wenv = dict(_DENV, TMPDIR=d)
+        mt = int(time.time()) + 100
+        with open(path, "w") as f:
+            f.write("fn main() {}\n")
+        os.utime(path, (mt, mt))
+        run([LUST, "check", path], env=wenv)
+        with open(path, "w") as f:
+            f.write(src)
+        os.utime(path, (mt + 2, mt + 2))
+        wrc, _, werr = run([LUST, "check", path], env=wenv)
+        if wrc is None:
+            return (family, name, "hang", "warm check timeout")
+        if (wrc, werr) != (crc, cerr):
+            return (family, name, "warm-diff", f"warm={werr[:140]!r} cold={cerr[:140]!r}")
     rustc_ok, lust_ok = rrc == 0, crc == 0
     if rustc_ok and lust_ok:
         brc, _, berr = run([LUST, "build", path, "-o", os.path.join(d, "lbin")], env=env)
@@ -366,12 +409,15 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--family", default="")
     ap.add_argument("--keep", default="")
+    ap.add_argument("--daemon", action="store_true")
     a = ap.parse_args()
+    if a.daemon:
+        os.environ["SWEEP_DAEMON"] = "1"
     build_cases()
     jobs = [(f, n, s, os.path.join(a.keep, n) if a.keep else "") for (f, n, s) in CASES if not a.family or f == a.family]
     counts = {}
     bad = []
-    with ProcessPoolExecutor(max_workers=a.jobs) as ex:
+    with ProcessPoolExecutor(max_workers=a.jobs, initializer=init_daemon) as ex:
         for fam, name, cls, info in ex.map(one, jobs):
             counts[cls] = counts.get(cls, 0) + 1
             if cls != "ok":
@@ -380,7 +426,7 @@ def main():
         print(f"  {cls:18s} {fam}/{name} {info}")
     # The summary prints last, so a gate lane can match it on the tail line.
     print(f"defcheck_sweep: {len(jobs)} cases: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    fatal = [b for b in bad if b[2] in ("FALSE-ACCEPT", "false-accept-check", "wrong-output", "hang", "build-reject")]
+    fatal = [b for b in bad if b[2] in ("FALSE-ACCEPT", "false-accept-check", "wrong-output", "hang", "build-reject", "warm-diff")]
     return 1 if fatal else 0
 
 
