@@ -16,15 +16,12 @@
 pub struct PhantomData<T>;
 
 // Lust std source, adapted from rust-lang/rust 1.99 `core/src/marker.rs`
-// (`impl Hash`) and `core/src/fmt/mod.rs` (`impl Debug`): no bounds on
-// `T`; Hash writes nothing, Debug prints the type name.
+// (`impl Hash`): no bound on `T`, and it writes nothing. `Debug`
+// (`PhantomData<{type_name::<T>()}>`) is compiler glue instead
+// (src/cgen/fmt.rs), so it exists exactly for the `T` whose type name
+// lust can print (`check::any::type_name_of`), and no instance is made
+// for the others.
 
 impl<T> core::hash::Hash for PhantomData<T> {
     fn hash<H: core::hash::Hasher>(&self, _: &mut H) {}
-}
-
-impl<T> core::fmt::Debug for PhantomData<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "PhantomData<{}>", core::any::type_name::<T>())
-    }
 }

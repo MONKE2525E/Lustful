@@ -5288,6 +5288,8 @@ impl<'p> Ctx<'p> {
             TyKind::Adt(..)
                 if ((trait_def == lang.clone || trait_def == lang.debug) && crate::check::collect::owning_iter_elem(&self.tys, self_ty).is_some())
                     || (trait_def == lang.default && crate::check::collect::vec_into_iter_elem(&self.tys, self_ty).is_some()) => {}
+            // `PhantomData<T>`'s Debug is glue for a `T` lust can name.
+            TyKind::Adt(..) if trait_def == lang.debug && self.tys.local_adt(self_ty).is_some_and(|a| p.is_phantom_adt(a)) => {}
             TyKind::Adt(..) if trait_def == lang.clone && (self.tys.is_chars_ty(self_ty) || crate::ty::iter::iter_parts(&self.tys, self_ty).is_some()) => {
                 return crate::check::collect::iter_clone_is_copy(p, &self.tys, self_ty);
             }

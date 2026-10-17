@@ -12839,6 +12839,14 @@ fn prove_trait_ref(
             // The solver has no records for these heads.
             TyKind::FnPtr(_) if !is_default => Some(Vec::new()),
             TyKind::RawPtr(..) => Some(Vec::new()),
+            // `PhantomData<T>: Debug` is glue, for a `T` lust can name
+            // (`collect::phantom_debug_text`); never through a record.
+            _ if tr.def == lang.debug && cx.tys.local_adt(t).is_some_and(|a| p.is_phantom_adt(a)) => {
+                if crate::check::collect::phantom_debug_text(p, &cx.tys, t).is_none() {
+                    return false;
+                }
+                Some(Vec::new())
+            }
             // std's owning iterators (vec, option, result `IntoIter`):
             // `Debug` and `Clone` from `T`'s; `vec::IntoIter` is `Default`
             // for every `T`; no `Copy` or `Hash` (no records).

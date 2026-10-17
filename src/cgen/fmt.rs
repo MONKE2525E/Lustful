@@ -163,6 +163,16 @@ fn builder_list(n: &str, elem: &str, et: &CTy, need: &mut dyn FnMut(Glue, &CTy))
 
 /// The body of `dbg_<m>`: Rust's Debug for `t`, through the builders.
 pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) -> String {
+    // `PhantomData<T>`: core's `write!(f, "PhantomData<{}>", type_name::<T>())`,
+    // which ignores the width and fill. Check admits only a `T` lust can
+    // name (`collect::phantom_debug_text`).
+    if let CTy::Adt(a) = t
+        && p.is_phantom_adt(*a)
+    {
+        let text = p.tys.full_adt_ty(*a).and_then(|ty| crate::check::collect::phantom_debug_text(p, &p.tys, ty));
+        let text = text.expect("internal: Debug glue for a PhantomData whose type name check did not admit");
+        return format!("  (void)p;\n  return lust_f_write_str(f, {});\n", lit(&text));
+    }
     // `NonZero<T>` prints its integer, with no wrapper name.
     if let CTy::Adt(a) = t
         && p.def_of_adt(*a) == crate::ty::nonzero_def()

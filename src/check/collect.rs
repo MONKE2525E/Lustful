@@ -9024,6 +9024,29 @@ pub(crate) fn vec_into_iter_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
     }
 }
 
+/// core's Debug text of a `PhantomData<T>` type `t`
+/// (`PhantomData<{type_name::<T>()}>`), or None when `t` is not one or
+/// lust cannot print `T`'s type name exactly. It decides Debug of
+/// `PhantomData` everywhere (glue walks, body derive queries, the
+/// solver's record-less step), so cgen's glue only meets printable ones.
+pub(crate) fn phantom_debug_text(p: &Program, tys: &impl TyIntern, t: Ty) -> Option<String> {
+    let a = tys.local_adt(t)?;
+    if !p.is_phantom_adt(a) {
+        return None;
+    }
+    // An instance's args are global; a template application read in
+    // collect is too. A body-local arg type (none in practice) gets None.
+    let arg = match p.gx.adt_instance_of.get(a.0 as usize) {
+        Some(Some((_, args))) => p.tys.args(*args).first()?.as_ty()?,
+        _ => tys.adt_first_ty_arg(t)?,
+    };
+    if p.tys.get(tys.kind(arg)) != Some(arg) {
+        return None;
+    }
+    let mut scratch = crate::ty::Tys::new(&p.tys);
+    Some(format!("PhantomData<{}>", crate::check::any::type_name_of(p, &mut scratch, arg, false)?))
+}
+
 /// The element of a std owning iterator whose Debug and Clone hold
 /// exactly when its element's do and that cgen writes as core does:
 /// `vec::IntoIter<T>` (`CTy::VecIter`), `option::IntoIter<T>` and
@@ -9934,6 +9957,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             // value, so they need no Debug on T (TRIAGE T5).
             if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::try_send_error_def() || d == generics::try_lock_error_def()) {
                 return true;
+            }
+            if tys.local_adt(t).is_some_and(|a| p.is_phantom_adt(a)) {
+                return phantom_debug_text(p, tys, t).is_some();
             }
             match tys.local_adt(t) {
                 Some(a) => {
