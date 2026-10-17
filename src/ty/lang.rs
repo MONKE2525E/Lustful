@@ -1747,6 +1747,7 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/collections/hash_map/IntoValues",
     "std/collections/hash_set/IntoIter",
     "std/collections/hash_map/HashMap",
+    "std/collections/hash_map/Entry",
     "std/collections/hash_set/HashSet",
     "std/collections/hash_map/RandomState",
     "std/collections/hash_map/DefaultHasher",
@@ -2168,6 +2169,8 @@ const STD_MACRO_PATHS: &[&str] = &[
 ];
 
 const STD_VARIANT_PATHS: &[&str] = &[
+    "std/collections/hash_map/Entry/Occupied",
+    "std/collections/hash_map/Entry/Vacant",
     "core/option/Option/Some",
     "std/option/Option/Some",
     "core/option/Option/None",

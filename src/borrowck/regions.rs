@@ -625,7 +625,7 @@ impl AdtTables {
                 return match k {
                     HashTy::HashMap | HashTy::HashSet => (Variance::Co, DropMode::Owned),
                     HashTy::BuildHasherDefault => (Variance::Co, DropMode::None),
-                    HashTy::Entry => (Variance::Inv, if j == 0 { DropMode::Owned } else { DropMode::None }),
+                    HashTy::Entry | HashTy::VacantEntry => (Variance::Inv, if j == 0 { DropMode::Owned } else { DropMode::None }),
                     // `OccupiedEntry` holds the map's `&'a mut` and owns nothing.
                     HashTy::OccupiedEntry => (Variance::Inv, DropMode::None),
                     HashTy::RandomState | HashTy::DefaultHasher => (Variance::Inv, DropMode::Owned),
@@ -762,7 +762,7 @@ pub(crate) fn adt_region_count(adt_lifetimes: &FxMap<DefId, Vec<crate::intern::S
         Some(BuiltinTy::Fmt(k)) if k.is_builder() || k == crate::ty::fmt::FmtTy::Arguments => return 1,
         // The lock guards borrow their lock (W-THREADS).
         Some(BuiltinTy::Sync(k)) if k.regions() > 0 => return k.regions(),
-        Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry)) => return 1,
+        Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry | crate::ty::hash::HashTy::VacantEntry)) => return 1,
         Some(_) => return 0,
         None => {}
     }
@@ -6243,7 +6243,8 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// probe key flows into K); the `&'a mut V` an Entry method returns
     /// is that loan's, with the map's V regions; `and_modify` gives the
     /// same Entry back, `insert_entry` an `OccupiedEntry` of the same
-    /// loan and regions. A stored value (`or_insert`'s, `insert_entry`'s,
+    /// loan and regions (so do the `Entry::Occupied` / `Entry::Vacant`
+    /// payload reads, `EntryAsOccupied` / `EntryAsVacant`). A stored value (`or_insert`'s, `insert_entry`'s,
     /// and `OccupiedEntry::insert`'s argument) and a closure form's
     /// closure (all its regions) flow into V. The owned results of
     /// `OccupiedEntry::insert`, `remove`, and `remove_entry` carry the
@@ -6302,7 +6303,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let Some((&dst, rv)) = dv.split_first() else { return false };
         self.edge(own, dst);
         match b {
-            B::MapEntry | B::EntryAndModify | B::EntryInsertEntry => {
+            B::MapEntry | B::EntryAndModify | B::EntryInsertEntry | B::EntryAsOccupied | B::EntryAsVacant => {
                 if rv.len() < nk + nv {
                     return false;
                 }
@@ -6327,7 +6328,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 self.relate(vt, &hvv, vt, &rv[..nv], Variance::Inv);
                 if let Some((t1, v1)) = avs.get(1) {
-                    if b == B::EntryOrInsert {
+                    if b == B::EntryOrInsert || b == B::EntryInsert {
                         self.relate(*t1, v1, vt, &hvv, Variance::Co);
                     } else if b == B::EntryOrInsertWith && matches!(self.body.tys.kind(*t1), TyKind::Closure(..)) {
                         // `or_insert_with(|| ..)` stores what the closure
@@ -9867,6 +9868,9 @@ fn entry_builtin(b: crate::check::Builtin) -> bool {
             | B::EntryOrInsertWithKey
             | B::EntryAndModify
             | B::EntryInsertEntry
+            | B::EntryInsert
+            | B::EntryAsOccupied
+            | B::EntryAsVacant
             | B::OccKey
             | B::OccGet
             | B::OccGetMut
@@ -10008,7 +10012,7 @@ fn has_interior(tys: &impl TyIntern, t: Ty) -> bool {
 
 fn has_mut_ref(tys: &impl TyIntern, t: Ty) -> bool {
     // A map Entry holds `&'a mut HashMap<K, V>` (W-STD-B).
-    if let Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry)) = tys.builtin_of(t) {
+    if let Some(BuiltinTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry | crate::ty::hash::HashTy::VacantEntry)) = tys.builtin_of(t) {
         return true;
     }
     match tys.kind(t) {

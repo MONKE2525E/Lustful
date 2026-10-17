@@ -1009,6 +1009,11 @@ pub enum Builtin {
     /// `Entry::insert_entry(self, v) -> OccupiedEntry` and the
     /// `OccupiedEntry` methods (std 1.99's `hash_map` API).
     EntryInsertEntry,
+    /// The payload of an `Entry::Occupied(..)` / `Entry::Vacant(..)`
+    /// pattern (lower.rs): the Entry read as an `OccupiedEntry` or a
+    /// `VacantEntry`, same C struct, same loan.
+    EntryAsOccupied,
+    EntryAsVacant,
     /// `HashMap::get_key_value(&self, &Q) -> Option<(&K, &V)>`.
     MapGetKeyValue,
     OccKey,
@@ -1652,6 +1657,9 @@ pub enum PatRes {
     Opt(bool),
     /// `Ok(..)` (true) or `Err(..)` (false).
     Res(bool),
+    /// `hash_map::Entry::Occupied(..)` (true) or `Entry::Vacant(..)`
+    /// (false) on a map Entry (W-STD-B).
+    Entry(bool),
 }
 
 #[derive(Clone)]
@@ -9187,6 +9195,9 @@ impl<'p> Ctx<'p> {
                         // the moved parts early. Copy elements are
                         // exact already; anything else is a reject
                         // for now rather than wrong drop order.
+                        if self.entry_payload_bound(arm.pat) {
+                            self.errs.push(unsupported(self.span(g), "match guards over a bound map Entry payload"));
+                        }
                         if self.slice_middle_move_blocks_guard(arm.pat) {
                             self.errs.push(unsupported(self.span(g), "match guards over a by-value slice-pattern middle"));
                         }
@@ -21120,6 +21131,12 @@ impl<'p> Ctx<'p> {
             return;
         }
         if opt.is_none()
+            && let Some(occupied) = self.entry_pattern(pat)
+        {
+            self.entry_variant_pattern(pat, occupied, t, mode, in_match, span);
+            return;
+        }
+        if opt.is_none()
             && let Some(is_ok) = self.result_pattern(pat).or(alias_ctor.and_then(|(o, v)| (!o).then_some(v)))
         {
             let (a, b) = match pat_path.and_then(|segs| self.builtin_ctor_args(segs, 2, span)) {
@@ -21853,6 +21870,65 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// `std::collections::hash_map::Entry::Occupied(..)` as `Some(true)`,
+    /// `..::Vacant(..)` as `Some(false)`: the canonical std path the
+    /// resolver writes for these variants however they were imported
+    /// (`use std::collections::hash_map::Entry;` then `Entry::Occupied`).
+    fn entry_pattern(&self, pat: PatId) -> Option<bool> {
+        let Pat::TupleStruct { path, elems } = self.p.ast.pat(pat) else { return None };
+        if elems.len() != 1 {
+            return None;
+        }
+        let names: Vec<&str> = path.iter().map(|s| self.p.interner.get(s.name)).collect();
+        match names.as_slice() {
+            ["std", "collections", "hash_map", "Entry", "Occupied"] => Some(true),
+            ["std", "collections", "hash_map", "Entry", "Vacant"] => Some(false),
+            _ => None,
+        }
+    }
+
+    /// True when `pat` binds the payload of an `Entry::Occupied(x)` /
+    /// `Entry::Vacant(x)` somewhere: a guard would need it by reference
+    /// before the arm takes it by value, which lowering does not build.
+    fn entry_payload_bound(&self, pat: PatId) -> bool {
+        let p = self.p;
+        match p.ast.pat(pat) {
+            Pat::TupleStruct { elems, .. } if matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Entry(_)) => {
+                elems.iter().any(|&e| !matches!(p.ast.pat(e), Pat::Wild))
+            }
+            Pat::TupleStruct { elems, .. } | Pat::Tuple(elems) | Pat::Or(elems) => elems.iter().any(|&e| self.entry_payload_bound(e)),
+            Pat::Paren(inner) | Pat::At { inner, .. } | Pat::Ref { inner, .. } => self.entry_payload_bound(*inner),
+            Pat::Struct { fields, .. } => fields.iter().any(|&(_, e)| self.entry_payload_bound(e)),
+            _ => false,
+        }
+    }
+
+    /// Types an `Entry::Occupied(x)` / `Entry::Vacant(x)` pattern: the
+    /// scrutinee is a map Entry, and `x` binds the Entry as an
+    /// `OccupiedEntry` / `VacantEntry` by value. Other payload patterns
+    /// (`ref x`, a match through a reference) are outside the subset.
+    fn entry_variant_pattern(&mut self, pat: PatId, occupied: bool, t: Ty, mode: BindMode, in_match: bool, span: Span) {
+        use crate::ty::hash::{HashTy, mk_hash};
+        let p = self.p;
+        let pi = (pat.0 - self.out.pat_base) as usize;
+        let (k, v) = (self.new_var(false), self.new_var(false));
+        let et = mk_hash(&mut self.tys, HashTy::Entry, &[k, v]);
+        if !self.unify(et, t) {
+            self.mismatch(span, t, et);
+            return;
+        }
+        self.out.pat_res[pi] = PatRes::Entry(occupied);
+        let Pat::TupleStruct { elems, .. } = p.ast.pat(pat) else { return };
+        let sub = elems[0];
+        let plain = matches!(p.ast.pat(sub), Pat::Wild | Pat::Binding { by_ref: false, .. }) && matches!(mode, BindMode::Move);
+        if !plain || self.out.pat_derefs[pi] > 0 {
+            self.errs.push(unsupported(p.ast.pat_span(sub), "a map Entry variant matched through a reference or with this payload pattern"));
+            return;
+        }
+        let payload = mk_hash(&mut self.tys, if occupied { HashTy::OccupiedEntry } else { HashTy::VacantEntry }, &[k, v]);
+        self.pattern_mode(sub, payload, mode, in_match);
+    }
+
     /// Exhaustiveness for `match`, by the usefulness check in
     /// `usefulness.rs`. Patterns it cannot read still make it
     /// reject a match that Rust accepts (lust is a subset).
@@ -21907,7 +21983,7 @@ impl<'p> Ctx<'p> {
         let own = self.out.pat_res[(pat.0 - self.out.pat_base) as usize];
         match self.p.ast.pat(pat) {
             Pat::At { inner, .. } | Pat::Paren(inner) | Pat::Ref { inner, .. } => match self.pres(*inner) {
-                r @ (PatRes::Variant(..) | PatRes::Opt(_) | PatRes::Res(_)) => r,
+                r @ (PatRes::Variant(..) | PatRes::Opt(_) | PatRes::Res(_) | PatRes::Entry(_)) => r,
                 _ => own,
             },
             _ => own,
@@ -22041,7 +22117,7 @@ impl<'p> Ctx<'p> {
         let p = self.p;
         // A struct, or an enum with one variant (rustc: exhaustive).
         let one_variant = |a: AdtId| !p.adt(a).is_enum || p.adt(a).variants.len() == 1;
-        if matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Opt(_) | PatRes::Res(_)) {
+        if matches!(self.out.pat_res[(pat.0 - self.out.pat_base) as usize], PatRes::Opt(_) | PatRes::Res(_) | PatRes::Entry(_)) {
             return false;
         }
         match p.ast.pat(pat) {

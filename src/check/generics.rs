@@ -4136,10 +4136,17 @@ pub(crate) fn resolve_path_ty(
                 }
                 return Ok(crate::ty::iter::mk_iter(tys, k, &args));
             }
-            // The hashed collections and hashers (W-STD-B, ty/hash.rs).
+            // The hashed collections and hashers (W-STD-B, ty/hash.rs). A map
+            // entry type keeps its loan in a region slot of its own, so a
+            // written one (whose lifetime a signature would relate) is
+            // outside the subset; its variants match (`PatRes::Entry`).
             if let Some(k) = crate::ty::hash::HashTy::by_name(path[path.len() - 1])
                 && matches!(path[1], "collections" | "hash")
             {
+                use crate::ty::hash::HashTy;
+                if matches!(k, HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry) {
+                    return Err(crate::ty::hash::not_imported(k, span));
+                }
                 return resolve_hash_path(ast, interner, known, cx, tys, scope, k, segs.last().unwrap(), span);
             }
         } else {

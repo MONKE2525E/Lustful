@@ -868,7 +868,7 @@ fn needs_drop_c(p: &Program, t: &CTy) -> bool {
             hash::is_table(*k)
                 || k.is_owning_iter()
                 || k.is_drain()
-                || (*k == crate::ty::hash::HashTy::Entry && a.first().is_some_and(|k| needs_drop_c(p, k)))
+                || (matches!(*k, crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::VacantEntry) && a.first().is_some_and(|k| needs_drop_c(p, k)))
         }
         CTy::Option(e) => needs_drop_c(p, e),
         CTy::Result(a, b) => needs_drop_c(p, a) || needs_drop_c(p, b),
@@ -1164,7 +1164,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                     HashTy::RandomState => Some(plain_layout(16, 8)),
                     HashTy::DefaultHasher => Some(plain_layout(72, 8)),
                     HashTy::BuildHasherDefault => Some(layout::zst_layout(1)),
-                    HashTy::Entry | HashTy::OccupiedEntry => {
+                    HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry => {
                         let key = go(p, args.first()?, seen)?;
                         layout::struct_layout(&[layout::ptr_layout(), layout::int_layout(IntTy::U64), layout::ptr_layout(), key], c).ok()
                     }
@@ -1518,7 +1518,7 @@ fn c_size_align_legacy(p: &Program, t: &CTy) -> (u64, u64) {
                 k if k.is_owning_iter() => (104, 8),
                 k if k.is_drain() => (112, 8),
                 k if k.is_iter_form() => (40, 8),
-                crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry => {
+                crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry | crate::ty::hash::HashTy::VacantEntry => {
                     // `{ table ptr, hash, slot ptr, K key }`
                     let (ks, ka) = args.first().map_or((0, 1), |k| go(p, k, seen));
                     let align = ka.max(8);
@@ -4789,6 +4789,8 @@ impl FnGen<'_, '_> {
             | B::EntryInsert
             | B::EntryGetMut
             | B::EntryInsertEntry
+            | B::EntryAsOccupied
+            | B::EntryAsVacant
             | B::MapGetKeyValue
             | B::OccKey
             | B::OccGet
@@ -9444,7 +9446,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                     by_value_deps(s, &mut deps);
                 }
             }
-            CTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry, args) => {
+            CTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry | crate::ty::hash::HashTy::VacantEntry, args) => {
                 if let Some(k) = args.first() {
                     by_value_deps(k, &mut deps);
                 }
@@ -9783,8 +9785,9 @@ fn glue_def_value(
                 CTy::String => body.push_str("  lust_string_drop(p);\n"),
                 CTy::Hash(k, _) if hash::is_table(*k) => body.push_str(&hash::drop_body(p, t, &mut need)),
                 CTy::Hash(k, _) if k.is_owning_iter() || k.is_drain() => body.push_str(&hash::iter_drop_body(p, t, &mut need)),
-                // An occupied Entry dropped its key at `entry()`.
-                CTy::Hash(crate::ty::hash::HashTy::Entry, a) => {
+                // An occupied Entry dropped its key at `entry()`; a
+                // VacantEntry owns its key until `insert`.
+                CTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::VacantEntry, a) => {
                     need(Glue::Drop, &a[0]);
                     let _ = writeln!(body, "  if (!p->slot) drop_{}(&p->key);", mangle(&a[0]));
                 }

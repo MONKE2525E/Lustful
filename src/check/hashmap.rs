@@ -408,7 +408,7 @@ impl<'p> Ctx<'p> {
     ) -> Option<Ty> {
         use Builtin as B;
         let (kind, targs) = hash_parts(&self.tys, base)?;
-        if !matches!(kind, HashTy::HashMap | HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry) {
+        if !matches!(kind, HashTy::HashMap | HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry) {
             return None;
         }
         let n = self.p.interner.get(name);
@@ -530,6 +530,17 @@ impl<'p> Ctx<'p> {
                 Some((B::EntryAndModify, Autoref::None, vec![f], base, None))
             }
             (HashTy::Entry, "insert_entry") => {
+                let occ = mk_hash(&mut self.tys, HashTy::OccupiedEntry, &[k, v]);
+                Some((B::EntryInsertEntry, Autoref::None, vec![v], occ, None))
+            }
+            // `VacantEntry` (the payload of `Entry::Vacant`): the same steps
+            // as the Entry's vacant branch.
+            (HashTy::VacantEntry, "insert") => {
+                let r = self.tys.mk_ref(true, v);
+                Some((B::EntryInsert, Autoref::None, vec![v], r, None))
+            }
+            (HashTy::VacantEntry, "key") => Some((B::EntryKey, Autoref::Ref, vec![], self.tys.mk_ref(false, k), None)),
+            (HashTy::VacantEntry, "insert_entry") => {
                 let occ = mk_hash(&mut self.tys, HashTy::OccupiedEntry, &[k, v]);
                 Some((B::EntryInsertEntry, Autoref::None, vec![v], occ, None))
             }
@@ -951,7 +962,7 @@ pub fn hash_ctor_builtin(k: HashTy, item: &str) -> Option<Builtin> {
         "with_hasher" if table => Builtin::HashWithHasher,
         "with_capacity_and_hasher" if table => Builtin::HashWithCapacityAndHasher,
         "from" if table => Builtin::HashFromArray,
-        "default" if !matches!(k, HashTy::Entry | HashTy::OccupiedEntry) => Builtin::HashDefault,
+        "default" if !matches!(k, HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry) => Builtin::HashDefault,
         _ => return None,
     })
 }

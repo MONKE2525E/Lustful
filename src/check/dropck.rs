@@ -485,7 +485,7 @@ impl Dropck<'_, '_> {
                 }
                 // `VacantEntry { key: K, .. }`; the occupied form holds a
                 // bucket pointer.
-                HashTy::Entry => first(),
+                HashTy::Entry | HashTy::VacantEntry => first(),
                 HashTy::IntoPairs | HashTy::IntoKeys | HashTy::IntoValues => all(),
                 _ => Vec::new(),
             },

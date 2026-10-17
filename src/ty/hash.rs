@@ -18,13 +18,18 @@ pub enum HashTy {
     DefaultHasher,
     /// `hash::BuildHasherDefault<H>`: args `[H]`.
     BuildHasherDefault,
-    /// `hash_map::Entry<'a, K, V>`: args `[K, V]`. Only its methods are
-    /// supported (not matching on its variants).
+    /// `hash_map::Entry<'a, K, V>`: args `[K, V]`. Its methods, and a
+    /// match on its two variants (`PatRes::Entry`), whose payloads are
+    /// the Entry's C struct read as an `OccupiedEntry` or `VacantEntry`.
     Entry,
     /// `hash_map::OccupiedEntry<'a, K, V>`: args `[K, V]`, made by
     /// `Entry::insert_entry`. Its C form is the Entry's (the slot is set,
     /// the key field unused).
     OccupiedEntry,
+    /// `hash_map::VacantEntry<'a, K, V>`: args `[K, V]`, the payload of
+    /// `Entry::Vacant`. Its C form is the Entry's (no slot yet, the probe
+    /// key owned until `insert`).
+    VacantEntry,
     // The C forms of the hash iterators (`IterKind::is_hash`), never
     // types: no def, not in `ALL`. Args are `[K, V]` for a map's,
     // `[T]` for a set's; the variant says which part an item is.
@@ -48,7 +53,7 @@ pub enum HashTy {
 }
 
 impl HashTy {
-    pub const ALL: [HashTy; 7] = [
+    pub const ALL: [HashTy; 8] = [
         HashTy::HashMap,
         HashTy::HashSet,
         HashTy::RandomState,
@@ -56,6 +61,7 @@ impl HashTy {
         HashTy::BuildHasherDefault,
         HashTy::Entry,
         HashTy::OccupiedEntry,
+        HashTy::VacantEntry,
     ];
 
     /// The std module path and struct name: the def hash input and the
@@ -69,6 +75,7 @@ impl HashTy {
             HashTy::BuildHasherDefault => (&["core", "hash"], "BuildHasherDefault"),
             HashTy::Entry => (&["std", "collections", "hash_map"], "Entry"),
             HashTy::OccupiedEntry => (&["std", "collections", "hash_map"], "OccupiedEntry"),
+            HashTy::VacantEntry => (&["std", "collections", "hash_map"], "VacantEntry"),
             _ => (&["std", "collections", "hash_map"], "Iter"),
         }
     }
@@ -107,7 +114,7 @@ impl HashTy {
     pub fn n_args(self) -> usize {
         match self {
             HashTy::HashMap => 3,
-            HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry => 2,
+            HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry => 2,
             HashTy::BuildHasherDefault => 1,
             HashTy::RandomState | HashTy::DefaultHasher => 0,
             _ => 2,
@@ -147,7 +154,7 @@ pub fn not_imported(k: HashTy, span: crate::diag::Span) -> crate::diag::Diag {
     let fix = match k {
         HashTy::HashMap | HashTy::HashSet => format!("Import it: `use std::collections::{name};`."),
         HashTy::Entry => "Name the entry through its methods only (`map.entry(k).or_insert(v)`).".to_string(),
-        HashTy::OccupiedEntry => format!("Import it: `use std::collections::hash_map::{name};`."),
+        HashTy::OccupiedEntry | HashTy::VacantEntry => format!("Import it: `use std::collections::hash_map::{name};`."),
         _ => format!("Import it: `use std::hash::{name};`."),
     };
     crate::diag::Diag::new("L0102", span, format!("cannot find type `{name}` in this scope"), fix)

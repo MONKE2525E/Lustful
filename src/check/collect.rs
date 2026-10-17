@@ -8976,7 +8976,7 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
         use crate::ty::hash::HashTy;
         return match k {
             HashTy::HashMap | HashTy::HashSet => a.iter().all(|&e| glue_clone(p, tys, e, seen)),
-            HashTy::Entry | HashTy::OccupiedEntry => false,
+            HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry => false,
             _ => true,
         };
     }
@@ -10071,7 +10071,7 @@ fn needs_drop_sub(p: &Program, tys: &impl TyIntern, t: Ty, args: &[GenericArg], 
         use crate::ty::hash::HashTy;
         return match k {
             HashTy::HashMap | HashTy::HashSet => true,
-            HashTy::Entry => a.first().is_some_and(|&e| needs_drop_sub(p, tys, e, args, exact)),
+            HashTy::Entry | HashTy::VacantEntry => a.first().is_some_and(|&e| needs_drop_sub(p, tys, e, args, exact)),
             _ => false,
         };
     }

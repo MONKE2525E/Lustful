@@ -2110,6 +2110,14 @@ impl<'p> Ctx<'p> {
                     self.cap_pat(sub, s, has_guard, w);
                 }
             }
+            // `Entry::Occupied(x)` / `Entry::Vacant(x)`: the payload is the
+            // Entry itself, read as the variant's entry type.
+            (Pat::TupleStruct { elems, .. }, PatRes::Entry(_)) => {
+                read(self, &place, w);
+                if let Some(&s) = elems.first() {
+                    self.cap_pat(place.clone(), s, has_guard, w);
+                }
+            }
             (Pat::TupleStruct { elems, .. }, PatRes::Res(is_ok)) => {
                 // `Ok(x)` / `Err(e)`: variant 0 / 1, field 0 (as lowering).
                 read(self, &place, w);

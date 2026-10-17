@@ -19,7 +19,7 @@ pub(super) fn is_table(k: HashTy) -> bool {
 /// True for the hash types cgen declares a struct for: the tables and
 /// `Entry`.
 pub(super) fn has_struct(k: HashTy) -> bool {
-    matches!(k, HashTy::HashMap | HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry) || k.is_iter_form()
+    matches!(k, HashTy::HashMap | HashTy::HashSet | HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry) || k.is_iter_form()
 }
 
 /// The member list of a declared hash struct: a table and its builder,
@@ -27,7 +27,7 @@ pub(super) fn has_struct(k: HashTy) -> bool {
 /// and the key moved in).
 pub(super) fn struct_fields(t: &CTy) -> String {
     match t {
-        CTy::Hash(HashTy::Entry | HashTy::OccupiedEntry, a) => format!("lust_hash_table *t; uint64_t hash; void *slot; {} key;", ctype(&a[0])),
+        CTy::Hash(HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry, a) => format!("lust_hash_table *t; uint64_t hash; void *slot; {} key;", ctype(&a[0])),
         // An owning iterator's `it.t` points at its own `t`: re-pointed
         // before each use, since the struct moves.
         CTy::Hash(k, _) if k.is_owning_iter() => "lust_hash_table t; lust_hash_iter it;".to_string(),
@@ -45,7 +45,7 @@ pub(super) fn hash_ctype(k: HashTy, mangled: &str) -> String {
         HashTy::RandomState => "lust_random_state".into(),
         HashTy::DefaultHasher => "lust_sip13".into(),
         HashTy::BuildHasherDefault => "lust_Unit".into(),
-        HashTy::Entry | HashTy::OccupiedEntry => format!("HE_{mangled}"),
+        HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry => format!("HE_{mangled}"),
         _ => format!("HI_{mangled}"),
     }
 }
@@ -54,7 +54,7 @@ pub(super) fn hash_ctype(k: HashTy, mangled: &str) -> String {
 /// for a set.
 pub(super) fn elem_cty(t: &CTy) -> CTy {
     match t {
-        CTy::Hash(HashTy::HashMap | HashTy::Entry | HashTy::OccupiedEntry, a) => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
+        CTy::Hash(HashTy::HashMap | HashTy::Entry | HashTy::OccupiedEntry | HashTy::VacantEntry, a) => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
         CTy::Hash(HashTy::HashSet, a) => a[0].clone(),
         CTy::Hash(k, a) if k.is_iter_form() && a.len() == 2 => CTy::Tuple(vec![a[0].clone(), a[1].clone()]),
         CTy::Hash(k, a) if k.is_iter_form() => a[0].clone(),
@@ -688,6 +688,8 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::EntryInsert
             | B::EntryGetMut
             | B::EntryInsertEntry
+            | B::EntryAsOccupied
+            | B::EntryAsVacant
             | B::MapGetKeyValue
             | B::OccKey
             | B::OccGet
@@ -1123,6 +1125,18 @@ impl FnGen<'_, '_> {
                     ctype(&recv),
                     vals[0],
                     vals[1]
+                );
+                Some(t)
+            }
+            // The payload of an `Entry::Occupied` / `Entry::Vacant` pattern:
+            // the Entry's fields in the variant's struct (same layout).
+            B::EntryAsOccupied | B::EntryAsVacant => {
+                let ev = self.tmp();
+                let _ = writeln!(
+                    self.out,
+                    "    {} {ev} = {}; {dc} {t}; {t}.t = {ev}.t; {t}.hash = {ev}.hash; {t}.slot = {ev}.slot; {t}.key = {ev}.key;",
+                    ctype(&recv),
+                    vals[0]
                 );
                 Some(t)
             }

@@ -306,6 +306,9 @@ impl<'p> Ctx<'p> {
                     Col::Ctors(vec![(0, false), (1, !behind && self.ty_uninhabited(elem, &[], 0))])
                 } else if let Some((ok, err)) = self.tys.result_args(t) {
                     Col::Ctors(vec![(1, !behind && self.ty_uninhabited(ok, &[], 0)), (1, !behind && self.ty_uninhabited(err, &[], 0))])
+                } else if matches!(crate::ty::hash::hash_parts(&self.tys, t), Some((crate::ty::hash::HashTy::Entry, _))) {
+                    // A map Entry: `Occupied(_)` and `Vacant(_)`.
+                    Col::Ctors(vec![(1, false), (1, false)])
                 } else if let Some(a) = self.tys.local_adt(t) {
                     // A `#[non_exhaustive]` enum needs a wildcard
                     // outside its defining crate (rustc E0004); std's
@@ -414,6 +417,7 @@ impl<'p> Ctx<'p> {
         let index = match self.out.pat_res[pi] {
             PatRes::Opt(some) => Some(some as u32),
             PatRes::Res(ok) => Some(!ok as u32),
+            PatRes::Entry(occupied) => Some(!occupied as u32),
             PatRes::Variant(_, v) => Some(v),
             _ => None,
         };

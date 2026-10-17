@@ -6665,6 +6665,21 @@ impl<'p> Lower<'p> {
             }
             return;
         }
+        // `Entry::Occupied(_)` / `Entry::Vacant(_)`: the Entry's slot test
+        // (its payload pattern is a binding or `_`, check/mod.rs).
+        if let PatRes::Entry(occupied) = self.ck.pat_res(pat) {
+            let rt = self.ref_ty(false, ty);
+            let r = self.temp(rt);
+            self.assign(Place::local(r), Rvalue::Ref(false, place), span);
+            let c = self.temp(BOOL);
+            self.call_into(CallTarget::Builtin(Builtin::EntryOccupied), vec![Operand::Move(Place::local(r))], Place::local(c), span);
+            let ok = self.new_block();
+            let (tb, eb) = if occupied { (ok, fail) } else { (fail, ok) };
+            let b = &mut self.body.blocks[self.cur.0 as usize];
+            b.term = Terminator::If(Operand::Copy(Place::local(c)), tb, eb);
+            self.cur = ok;
+            return;
+        }
         if let PatRes::Res(is_ok) = self.ck.pat_res(pat) {
             let d = self.temp(int(IntTy::U32));
             self.assign(Place::local(d), Rvalue::Discriminant(place.clone()), span);
@@ -6998,6 +7013,18 @@ impl<'p> Lower<'p> {
             }
             (Pat::TupleStruct { elems, .. }, PatRes::Res(is_ok)) => {
                 self.bind_pat(elems[0], place.project(Proj::Downcast((!is_ok) as u32)).project(Proj::Field(0)));
+            }
+            // The payload binding takes the Entry by value, read as the
+            // variant's entry type (`_` leaves it in place).
+            (Pat::TupleStruct { elems, .. }, PatRes::Entry(occupied)) => {
+                let sub = elems[0];
+                if !matches!(p.ast.pat(sub), Pat::Wild) {
+                    let pt = self.ck.pat_ty(sub);
+                    let tmp = self.temp(pt);
+                    let b = if occupied { Builtin::EntryAsOccupied } else { Builtin::EntryAsVacant };
+                    self.call_into(CallTarget::Builtin(b), vec![Operand::Move(place)], Place::local(tmp), span);
+                    self.bind_pat(sub, Place::local(tmp));
+                }
             }
             (Pat::TupleStruct { .. } | Pat::Struct { .. }, PatRes::Variant(a, v)) => {
                 let base = if p.adt(a).is_enum { place.project(Proj::Downcast(v)) } else { place };

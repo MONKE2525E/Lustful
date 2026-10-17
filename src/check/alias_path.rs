@@ -423,7 +423,7 @@ pub(super) fn builtin_std_path(tys: &impl TyIntern, t: Ty) -> Option<Vec<&'stati
             path.extend(k.module());
             path.push(k.name());
         }
-        BuiltinTy::Hash(k) if !matches!(k, crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry) && !k.is_iter_form() => {
+        BuiltinTy::Hash(k) if !matches!(k, crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry | crate::ty::hash::HashTy::VacantEntry) && !k.is_iter_form() => {
             let (module, name) = k.path();
             path = module.to_vec();
             path.push(name);
