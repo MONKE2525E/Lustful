@@ -9885,6 +9885,9 @@ fn needs_drop_sub(p: &Program, tys: &impl TyIntern, t: Ty, args: &[GenericArg], 
         TyKind::Projection(..) => return !exact,
         TyKind::Tuple(ts) => return tys.tys_of(ts).iter().any(|&e| needs_drop_sub(p, tys, e, args, exact)),
         TyKind::Closure(_, a) => return closure_fields(tys, a).iter().any(|&e| needs_drop_sub(p, tys, e, args, exact)),
+        // An empty array holds nothing to drop, whatever its element
+        // (`[String; 0]`, rustc `needs_drop` is false).
+        TyKind::Array(_, n) if tys.const_kind(n) == ConstKind::Int(0) => return false,
         TyKind::Array(e, _) => return needs_drop_sub(p, tys, e, args, exact),
         _ => {}
     }
