@@ -646,21 +646,21 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     crate::pool::par_map(items, f)
 }
 
-/// True when no macro but the builtin can take a builtin macro's name in
-/// the local crate of a crate with dependencies
-/// (`macro_scope::dep_macros_shut`), over its files. Each file belongs to
+/// The crates (by root module: the local crate, its source dependencies)
+/// where no macro but the builtin can take a builtin macro's name
+/// (`macro_scope::dep_macros_shut`), over each crate's files. Each file belongs to
 /// the crate of the module the resolver gave it (a file two crates share
 /// has one id per crate); one with no recorded module counts for every
 /// crate. A dependency is clean when it compiles from source here and its
 /// own files pass the scan, with its own dependencies judged the same way.
 /// `root_text` is the root file without the std splice.
-fn dep_macros_shut(front: &Front, tables: &crate::resolve::imports::ResolvedTables, root_text: &str) -> bool {
+fn dep_macros_shut(front: &Front, tables: &crate::resolve::imports::ResolvedTables, root_text: &str) -> Vec<crate::ty::defs::ModuleId> {
     use crate::resolve::imports::ResolvedTables;
     use crate::ty::defs::ModuleId;
     let mut texts: FxMap<Option<ModuleId>, Vec<&str>> = FxMap::default();
     for k in 0..front.map.file_count() {
         let f = FileId(k as u32);
-        let Some(text) = (if k == 0 { Some(root_text) } else { front.map.text(f) }) else { return false };
+        let Some(text) = (if k == 0 { Some(root_text) } else { front.map.text(f) }) else { return Vec::new() };
         texts.entry(tables.macro_scopes.get(&f).map(|(m, _)| tables.root_of(*m))).or_default().push(text);
     }
     /// The scan of crate `root`, its dependencies judged recursively
@@ -684,7 +684,11 @@ fn dep_macros_shut(front: &Front, tables: &crate::resolve::imports::ResolvedTabl
         memo.borrow_mut().insert(root, ok);
         ok
     }
-    shut(ModuleId(0), front, tables, &texts, &Default::default())
+    let memo = Default::default();
+    let mut roots: Vec<ModuleId> = tables.crate_cfgs.keys().copied().filter(|r| r.0 != 0).collect();
+    roots.sort_unstable_by_key(|r| r.0);
+    roots.insert(0, ModuleId(0));
+    roots.into_iter().filter(|&r| shut(r, front, tables, &texts, &memo)).collect()
 }
 
 /// The dirty count of each stored read set in `sets` against `p` (None
@@ -1989,7 +1993,7 @@ fn resolved_setup(
     // What a later patch needs to expand a body alone. With dependencies,
     // only when none of their macros can take a builtin's name (the
     // PatchBase below asks `macro_scope::dep_macros_shut`).
-    let patch_expand = Some((env.clone(), crate_name.clone()));
+    let patch_expand = (env.clone(), crate_name.clone());
     let has_deps = !externs.is_empty();
     let patched =
         if ast_bloated(front) { Err("ast compaction") } else { super::patch::try_patch(front, caches, inputs, &root_text, request_start) };
@@ -2299,15 +2303,24 @@ fn resolved_setup(
     if caches.persistent {
         // With no dependency, any user macro named like a builtin (or a
         // rename to one) in any file refuses (patch.rs `shadows_builtin`).
-        let shut = || match has_deps {
+        // With dependencies, each source crate whose own scan passes may
+        // expand its bodies alone, under its own cfg (`dep_macros_shut`).
+        let shut: Vec<crate::ty::defs::ModuleId> = match has_deps {
             true => dep_macros_shut(front, &tables, &unspliced_root),
             false => {
                 let texts = (1..front.map.file_count()).filter_map(|k| front.map.text(FileId(k as u32)));
                 let texts: Vec<&str> = std::iter::once(unspliced_root.as_str()).chain(texts).collect();
-                !texts.iter().any(|t| t.contains("macro_rules")) || !texts.iter().any(|t| super::patch::shadows_builtin(t))
+                let ok = !texts.iter().any(|t| t.contains("macro_rules")) || !texts.iter().any(|t| super::patch::shadows_builtin(t));
+                if ok { vec![crate::ty::defs::ModuleId(0)] } else { Vec::new() }
             }
         };
-        let patch_expand = patch_expand.filter(|_| shut());
+        let patch_expand: FxMap<_, _> = shut
+            .into_iter()
+            .filter_map(|r| match r.0 {
+                0 => Some((r, patch_expand.clone())),
+                _ => tables.crate_cfgs.get(&r).map(|c| (r, c.clone())),
+            })
+            .collect();
         let reach = super::const_reach::ConstReach::build(front);
         front.patch = Some(super::patch::PatchBase::new(
             front,

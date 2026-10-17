@@ -1679,6 +1679,9 @@ pub fn resolve_crate_with(
             Err(d) => return Err(build_err(d)),
         }
     }
+    for j in jobs.iter().filter(|j| !j.std_splice && j.adapter.is_none()) {
+        tables.crate_cfgs.insert(j.root_module, (j.input.env.clone(), j.input.crate_name.clone()));
+    }
     let mut platform_job = None;
     if with_platform {
         match add_platform_job(input, &mut tables, &mut jobs, interner) {

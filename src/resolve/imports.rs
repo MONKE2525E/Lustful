@@ -314,6 +314,11 @@ pub struct ResolvedTables {
     /// with no local definition (a dependency's) is None. Set by the
     /// worklist before the import fixpoint.
     pub macro_scopes: FxMap<crate::diag::FileId, (ModuleId, crate::resolve::macro_scope::FileMacroScope<Option<DefId>>)>,
+    /// Each source crate's cfg env and crate name, by its root module (the
+    /// selected crate at the root, its source dependencies). The body patch
+    /// expands a dependency's fn body alone with its own crate's
+    /// (driver/patch.rs `expand_pure`).
+    pub crate_cfgs: FxMap<ModuleId, (crate::resolve::cfg::CfgEnv, String)>,
     /// The adapter crates of the session (ARCH 3.6) and the files each
     /// one read. Check reads it for intrinsic privilege and to keep
     /// layout queries off adapter types whose layout is not exact.
@@ -436,6 +441,7 @@ impl ResolvedTables {
             order_dep: FxMap::default(),
             macro_textual_binds: FxMap::default(),
             macro_scopes: FxMap::default(),
+            crate_cfgs: FxMap::default(),
             adapters: Vec::new(),
             std_globs: Vec::new(),
             std_platform: None,

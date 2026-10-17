@@ -120,11 +120,12 @@ pub(crate) struct PatchBase {
     /// user's macro, which the expander owns.
     shadowed: bool,
     tables: Arc<ResolvedTables>,
-    /// The local crate's cfg environment and name, for expanding a body
-    /// alone, when no user or dependency macro can take a builtin's name
-    /// (the caller decides: with no dependency crate, no file
-    /// `shadows_builtin`; else driver/macro_scope.rs).
-    expand: Option<(crate::resolve::cfg::CfgEnv, String)>,
+    /// Per crate root module: the crate's cfg environment and name, for
+    /// expanding a body of that crate alone, when no user or dependency
+    /// macro can take a builtin's name there (the caller decides: with no
+    /// dependency crate, no file `shadows_builtin`; else per crate,
+    /// driver/macro_scope.rs). A crate that is not here resolves in full.
+    expand: FxMap<crate::ty::defs::ModuleId, (crate::resolve::cfg::CfgEnv, String)>,
     /// `ResolvedTables::local_named_set`, for the patch's path rewrites.
     local_names: Option<FxMap<Sym, u8>>,
     /// The thread that builds `local_names` right after the full resolve
@@ -276,7 +277,7 @@ impl PatchBase {
         fn_lines: Vec<u32>,
         body_hashes: Vec<u64>,
         request_start: SystemTime,
-        expand: Option<(crate::resolve::cfg::CfgEnv, String)>,
+        expand: FxMap<crate::ty::defs::ModuleId, (crate::resolve::cfg::CfgEnv, String)>,
     ) -> PatchBase {
         let map = &front.map;
         let n = map.file_count();
@@ -539,6 +540,12 @@ pub(crate) struct KeptProgram {
 }
 
 impl PatchBase {
+    /// The cfg environment and crate name a body of `module`'s crate
+    /// expands under alone, if it may (`PatchBase::expand`).
+    fn expand_env(&self, module: crate::ty::defs::ModuleId) -> Option<&(crate::resolve::cfg::CfgEnv, String)> {
+        self.expand.get(&self.tables.root_of(module))
+    }
+
     /// Probes the Ast once for the nodes that can hold another file's spans
     /// (`span_shift::probe_extras`) and sets `ranges` and `extras`, when the
     /// resolve could not prove ranges alone. The full resolve calls it while
@@ -885,7 +892,7 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let raw = lexer::Lexed { tokens: new_body.tokens.clone(), strings: new_body.strings.clone() };
     let hoisted = match (old_ok, new_ok) {
         (Ok((old_calls, old_pure)), Ok((new_calls, new_pure))) => {
-            if (old_calls || new_calls) && base.shadowed || (old_pure || new_pure) && base.expand.is_none() {
+            if (old_calls || new_calls) && base.shadowed || (old_pure || new_pure) && base.expand_env(module).is_none() {
                 return Err("macro in body");
             }
             match new_pure {
@@ -1172,9 +1179,10 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     // patch's does (`expand_pure`). A body the patch cannot expand alone
     // (a user macro) takes its stored expansion when its text stands.
     let same_body = old.get(ot[oo].span.lo as usize..hi as usize) == text.get(nt[no].span.lo as usize..new_hi as usize);
+    let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
     let plain = body_tokens_ok(&ob, ot[oo].span.lo as usize, hi as usize, &front.interner).and_then(|(oc, op)| {
         let (nc, np) = body_tokens_ok(&nb, nt[no].span.lo as usize, new_hi as usize, &front.interner)?;
-        if (oc || nc) && base.shadowed || (op || np) && base.expand.is_none() { Err("item: body macro") } else { Ok(np) }
+        if (oc || nc) && base.shadowed || (op || np) && base.expand_env(module).is_none() { Err("item: body macro") } else { Ok(np) }
     });
     let kept = match plain {
         Err("body macro" | "item: body macro") if same_body => Some(kept_body(front, base, fn_index, edit, (ot[oo].span.lo, hi)).map_err(Some)?),
@@ -1196,7 +1204,6 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     }
     // The expander keeps the input's string table and appends to it, so
     // the header's tokens index the expanded strings as before.
-    let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
     let (body, strings) = match (&kept, plain) {
         (Some(k), _) => {
             // The body's strings follow the header's.
@@ -1612,12 +1619,9 @@ fn expand_pure(
     module: crate::ty::defs::ModuleId,
     raw: lexer::Lexed,
 ) -> Result<lexer::Lexed, &'static str> {
-    let Some((env, crate_name)) = &base.expand else { return Err("macro in body") };
-    // The cfg and crate name are the local crate's: a dependency's fn
-    // (a path dependency shares the session) resolves in full.
-    if base.tables.root_of(module) != crate::ty::defs::ModuleId(0) {
-        return Err("body macro");
-    }
+    // The cfg and crate name of the fn's own crate: a path dependency
+    // shares the session, and its features and cfgs are its own.
+    let Some((env, crate_name)) = base.expand_env(module) else { return Err("macro in body") };
     let path = front.map.path(file);
     let shown = front.display_root.as_deref().and_then(|r| std::path::Path::new(path).strip_prefix(r).ok());
     let ctx = crate::expand::ExpandCtx {
