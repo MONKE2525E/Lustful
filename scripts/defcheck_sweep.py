@@ -185,6 +185,11 @@ def build_cases():
         case("bound", f"assoc_bound_wrap_{wn}", SUP + f"trait Tr {{ type A2: Sup<{wt}>; }}\n" + MAINP)
         case("alias", f"alias_used_wrap_{wn}", NEED + f"type X = Need<{wt}>;\nfn f(_x: X) {{}}\n" + MAINP)
         case("impl", f"impl_trait_arg_wrap_{wn}", SUP + f"struct S;\nimpl Sup<{wt}> for S {{}}\n" + MAINP)
+        case("direct", f"fn_sig_wrap_{wn}", NEED + f"fn f(_x: Need<{wt}>) {{}}\n" + MAINP)
+        case("direct", f"field_wrap_{wn}", NEED + f"struct S {{ f: Need<{wt}> }}\n" + MAINP)
+        case("alias", f"alias_unused_wrap_{wn}", NEED + f"type X = Need<{wt}>;\n" + MAINP)
+        case("default", f"trait_default_wrap_{wn}", f"trait Tr<T: Copy = {wt}> {{}}\n" + MAINP)
+        case("impl", f"binding_ty_wrap_{wn}", NEED + f"trait Tr {{ type A2; }}\nfn f<T: Tr<A2 = Need<{wt}>>>(_x: T) {{}}\n" + MAINP)
     # A user trait as the required bound, not only Copy.
     needm = "trait Mk {}\nimpl Mk for u8 {}\nstruct NeedM<T: Mk>(T);\n"
     supm = "trait Mk {}\nimpl Mk for u8 {}\ntrait SupM<T: Mk> {}\n"
