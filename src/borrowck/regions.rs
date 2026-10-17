@@ -4704,7 +4704,7 @@ impl<'b, 'p> Builder<'b, 'p> {
             return;
         }
         if let CallTarget::Fn(f) = target
-            && self.call_fn_bound(f, &avs, dt, &dv)
+            && (self.call_fn_bound(f, &avs, dt, &dv) || self.call_param_item(f, &avs, dt, &dv))
         {
             return;
         }
@@ -7634,11 +7634,13 @@ impl<'b, 'p> Builder<'b, 'p> {
             let (x, y) = (self.inst_region(a, &univ), self.inst_region(b, &univ));
             self.edge(x, y);
         }
-        self.item_bound_exact = ok && self.item_bound_flows(preds, &binds);
+        let flows = ok && self.item_bound_flows(preds, &binds);
+        let mut equated = false;
         if ok {
-            self.item_bound_equate(sig, &binds, &univ);
+            equated = self.item_bound_equate(sig, &binds, &univ);
             self.replay_bounds(sig, &univ, &binds);
         }
+        self.item_bound_exact = flows || equated;
         // `T: Tr<'a>` for a trait with lifetime params: the type bound to
         // `T` implements `Tr` with exactly those lifetimes (trait args are
         // invariant), so its own (this body's bound on a type param, or the
@@ -8127,6 +8129,39 @@ impl<'b, 'p> Builder<'b, 'p> {
             return None;
         }
         Some(map.into_iter().map(|u| u.unwrap_or_else(|| self.fresh())).collect())
+    }
+
+    /// `it.next()` (also `nth`, `last`, `min`, `max`, `next_back`,
+    /// `nth_back`) through a type param's own `Iterator<Item = X>` bound,
+    /// a trait stub call: the `Option<X>` result holds `X`'s regions
+    /// (`fixed_items`), not the receiver's `&mut` borrow, as the trait's
+    /// `-> Option<Self::Item>` says. False for another call (the caller
+    /// takes the conservative rule).
+    fn call_param_item(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
+        let p = self.p;
+        if p.gx.fn_class.get(f.0 as usize) != Some(&crate::check::generics::FnClass::Stub) {
+            return false;
+        }
+        let Some(m) = p.regions.stub_method(p, f) else { return false };
+        let lang = p.gx.lang;
+        let named = |tr: DefId, names: &[&str]| {
+            p.gx.index.trait_record(tr).is_some_and(|r| names.iter().any(|&n| r.method_by_name(p.interner.intern(n)) == Some(m)))
+        };
+        if !named(lang.iterator, &["next", "nth", "last", "min", "max"]) && !named(lang.double_ended_iterator, &["next_back", "nth_back"]) {
+            return false;
+        }
+        let Some((rt, _)) = avs.first() else { return false };
+        if self.body.tys.option_elem(dt).is_none() {
+            return false;
+        }
+        let Some(items) = self.fixed_items(*rt) else { return false };
+        if items.len() != dv.len() {
+            return false;
+        }
+        for (&a, &b) in items.iter().zip(dv) {
+            self.edge(a, b);
+        }
+        true
     }
 
     fn call_fn_bound(&mut self, f: LocalDefId, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {

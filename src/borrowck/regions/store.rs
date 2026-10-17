@@ -286,21 +286,29 @@ fn sig_binders(tys: &impl TyIntern, s: crate::ty::SigId) -> Vec<bool> {
 
 impl Builder<'_, '_> {
     /// A callee's `I: Iterator<Item = X>` and `I: IntoIterator<Item = X>`
-    /// bounds at a call (`call_sig_with`, after its params and return are
+    /// (also `DoubleEndedIterator`, `ExactSizeIterator`) bounds at a call (`call_sig_with`, after its params and return are
     /// instantiated): trait matching makes the items of the type bound to
     /// `I` equal to `X` (`fn add<'b, I: IntoIterator<Item = &'b u8>>(v:
     /// &mut Vec<&'b u8>, it: I)` with `[&local]` needs the borrow to last
     /// `'b`; `BTreeMap::extend`, `VecDeque::extend`). When lust cannot read
     /// the items, every region of the bound type may reach `X`, at the
     /// variance of each slot of `X` (`store_flat`'s rule). A bound whose `X`
-    /// names a param nothing bound adds nothing.
-    pub(super) fn item_bound_equate(&mut self, sig: &RegionSig, binds: &FxMap<u32, Vec<u32>>, univ: &[u32]) {
+    /// names a param nothing bound adds nothing. True when there was at
+    /// least one bound and each one paired exactly (fixed or read items),
+    /// so the caller's every-argument rule (`item_bound`) is not needed.
+    pub(super) fn item_bound_equate(&mut self, sig: &RegionSig, binds: &FxMap<u32, Vec<u32>>, univ: &[u32]) -> bool {
         let lang = self.p.gx.lang;
-        let pairs: Vec<(u32, Ty)> = sig.item_bounds.iter().filter(|b| b.1 == lang.iterator || b.1 == lang.into_iterator).map(|b| (b.0, b.2)).collect();
+        let iter_trait = |d: DefId| [lang.iterator, lang.into_iterator, lang.double_ended_iterator, lang.exact_size_iterator].contains(&d);
+        let pairs: Vec<(u32, Ty)> = sig.item_bounds.iter().filter(|b| iter_trait(b.1)).map(|b| (b.0, b.2)).collect();
+        let mut exact = !pairs.is_empty();
         for (ji, x) in pairs {
-            let (Some(&it), Some(iv)) = (self.bind_tys.get(&ji), binds.get(&ji).cloned()) else { continue };
+            let (Some(&it), Some(iv)) = (self.bind_tys.get(&ji), binds.get(&ji).cloned()) else {
+                exact = false;
+                continue;
+            };
             let mut xs = Vec::new();
             if !self.callee_slots(x, Variance::Co, univ, binds, &mut xs) {
+                exact = false;
                 continue;
             }
             let xv: Vec<u32> = xs.iter().map(|s| s.0).collect();
@@ -316,6 +324,7 @@ impl Builder<'_, '_> {
             // A fn pointer in the items has no slot to equate: prove it
             // against the type each param of `X` is bound to.
             if has_fn_ptr(&self.body.tys, it) {
+                exact = false;
                 let mut ps = Vec::new();
                 params_in(&self.p.tys, x, &mut ps);
                 for j in ps {
@@ -352,6 +361,7 @@ impl Builder<'_, '_> {
                 }
                 continue;
             }
+            exact &= fixed;
             // Unknown items: any region of the bound type, at `X`'s variance.
             let (h, g) = (self.fresh(), self.fresh());
             for &a in &iv {
@@ -367,6 +377,7 @@ impl Builder<'_, '_> {
                 }
             }
         }
+        exact
     }
 
     /// The items of each side of a `Chain` (its slots `iv`), by
