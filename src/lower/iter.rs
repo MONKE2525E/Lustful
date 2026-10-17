@@ -6310,10 +6310,20 @@ impl Ex<'_, '_> {
     /// (the tuple's `extend_reserve`).
     fn partition_unzip(&mut self, itp: Place, ty: Ty, f: Option<(Local, Ty)>, dest: Place, dest_ty: Ty) -> R {
         let TyKind::Tuple(ts) = self.body.tys.kind(dest_ty) else { return Err("iterator expansion: partition into a non-pair".into()) };
-        let (va, vb) = {
+        let (da, db) = {
             let v = self.body.tys.tys_of(ts);
             (v[0], v[1])
         };
+        // A `VecDeque` side fills a Vec and wraps it at the end (head 0):
+        // core's `extend_one` is its `push_back`, which grows by the Vec
+        // rule and keeps the head at 0 from empty.
+        let deque_of = |this: &mut Self, t: Ty| -> Option<(AdtId, Ty)> {
+            let a = this.body.tys.local_adt(t).filter(|&a| this.p.is_vec_deque_adt(a))?;
+            let e = this.body.tys.adt_first_ty_arg(t)?;
+            Some((a, this.body.tys.mk_vec(e)))
+        };
+        let (qa, qb) = (deque_of(self, da), deque_of(self, db));
+        let (va, vb) = (qa.map_or(da, |q| q.1), qb.map_or(db, |q| q.1));
         let (Some(ea), Some(eb)) = (self.body.tys.vec_elem(va), self.body.tys.vec_elem(vb)) else {
             return Err("iterator expansion: partition into non-Vecs".into());
         };
@@ -6368,7 +6378,14 @@ impl Ex<'_, '_> {
             }
             Ok(())
         })?;
-        let (ma, mb) = (self.take(Place::local(a), va), self.take(Place::local(b), vb));
+        let mut side = |this: &mut Self, v: Local, vt: Ty, q: Option<(AdtId, Ty)>, dt: Ty| -> Operand {
+            let m = this.take(Place::local(v), vt);
+            let Some((adt, _)) = q else { return m };
+            let d = this.local(dt);
+            this.assign(Place::local(d), Rvalue::Aggregate(adt, 0, vec![m]));
+            this.take(Place::local(d), dt)
+        };
+        let (ma, mb) = (side(self, a, va, qa, da), side(self, b, vb, qb, db));
         self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![ma, mb]));
         Ok(())
     }

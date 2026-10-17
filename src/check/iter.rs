@@ -1655,6 +1655,7 @@ impl<'p> Ctx<'p> {
                 | "min_by_key"
                 | "max_by_key"
                 | "collect"
+                | "partition"
                 | "size_hint"
                 | "sum"
                 | "product"
@@ -1923,7 +1924,11 @@ impl<'p> Ctx<'p> {
         };
         for (h, it) in halves.into_iter().zip(items) {
             let h = self.deep(h);
-            match self.tys.vec_elem(h) {
+            // `partition` into a `VecDeque` (lowered as a Vec, then
+            // wrapped; lower/iter.rs `partition_unzip`). `unzip` stays
+            // out: its `extend_reserve` path is not lowered for a deque.
+            let deque = self.tys.local_adt(h).filter(|&a| what == "partition" && self.p.is_vec_deque_adt(a));
+            match deque.and_then(|_| self.tys.adt_first_ty_arg(h)).or_else(|| self.tys.vec_elem(h)) {
                 Some(el) => {
                     if !self.unify(el, it) {
                         self.mismatch(span, el, it);
@@ -1940,6 +1945,11 @@ impl<'p> Ctx<'p> {
                     return None;
                 }
             }
+        }
+        // `partition` answers `(B, B)`: one collection type for both sides.
+        if what == "partition" && named.is_none() && !self.unify(halves[0], halves[1]) {
+            self.mismatch(span, halves[0], halves[1]);
+            return None;
         }
         let pair = [self.deep(halves[0]), self.deep(halves[1])];
         let ts = self.tys.intern_tys(&pair);
@@ -3126,6 +3136,7 @@ const ITER_METHODS: &[&str] = &[
     "min_by_key",
     "max_by_key",
     "collect",
+    "partition",
     "sum",
     "product",
     "size_hint",

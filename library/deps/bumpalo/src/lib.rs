@@ -230,21 +230,69 @@ impl Bump {
     }
 
     /// `len` items from `f(0)`, `f(1)`, ... in order.
-    pub fn alloc_slice_fill_with<T, F: FnMut(usize) -> T>(&self, len: usize, mut f: F) -> &mut [T] {
+    pub fn alloc_slice_fill_with<T, F: FnMut(usize) -> T>(&self, len: usize, f: F) -> &mut [T] {
+        match self.try_fill_with(len, f) {
+            Ok(s) => s,
+            Err(_) => oom(),
+        }
+    }
+
+    /// `alloc_slice_fill_with` that answers `AllocErr` instead of
+    /// panicking when the room (or the layout) is not there; `f` is
+    /// not called then.
+    pub fn try_alloc_slice_fill_with<T, F: FnMut(usize) -> T>(&self, len: usize, f: F) -> Result<&mut [T], AllocErr> {
+        self.try_fill_with(len, f)
+    }
+
+    /// Both fills: `Layout::array::<T>(len)`, the room, then `f(0)`,
+    /// `f(1)`, ... in order. A panic in `f` leaks the items made so
+    /// far (upstream writes them into the chunk) and gives the room
+    /// back through `Rewind`.
+    fn try_fill_with<T, F: FnMut(usize) -> T>(&self, len: usize, mut f: F) -> Result<&mut [T], AllocErr> {
         let bytes = match core::mem::size_of::<T>().checked_mul(len) {
             Some(b) if b <= isize::MAX as usize => b,
-            _ => oom(),
+            _ => return Err(AllocErr),
         };
-        if self.try_alloc_layout(bytes, core::mem::align_of::<T>()).is_err() {
-            oom();
-        }
-        let mut items: Vec<T> = Vec::with_capacity(len);
+        let (chunk, ptr) = (self.allocated.get(), self.ptr.get());
+        self.try_alloc_layout(bytes, core::mem::align_of::<T>())?;
+        let mut guard = Rewind { bump: self, chunk, ptr, after_chunk: self.allocated.get(), after: self.ptr.get(), active: true };
+        let mut items = core::mem::ManuallyDrop::new(Vec::with_capacity(len));
         let mut i = 0;
         while i < len {
             items.push(f(i));
             i += 1;
         }
-        Box::leak(items.into_boxed_slice())
+        guard.active = false;
+        Ok(Box::leak(core::mem::ManuallyDrop::into_inner(items).into_boxed_slice()))
+    }
+}
+
+/// Upstream's `RewindGuard` for a slice fill: when `f` panics and the
+/// slice is still the last allocation, the bump position goes back to
+/// where it was (same chunk), or to the start of the chunk made for it.
+struct Rewind<'a> {
+    bump: &'a Bump,
+    /// The chunk (its `allocated` total) and position before the slice.
+    chunk: usize,
+    ptr: usize,
+    /// The same after the slice's room was taken.
+    after_chunk: usize,
+    after: usize,
+    active: bool,
+}
+
+impl Drop for Rewind<'_> {
+    fn drop(&mut self) {
+        let b = self.bump;
+        // `is_last_allocation`: the bump position is still the slice's.
+        if !self.active || b.allocated.get() != self.after_chunk || b.ptr.get() != self.after {
+            return;
+        }
+        if self.after_chunk == self.chunk {
+            b.ptr.set(self.ptr);
+        } else {
+            b.ptr.set(b.chunk_size.get());
+        }
     }
 }
 

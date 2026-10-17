@@ -503,7 +503,9 @@ impl<'p> Ctx<'p> {
         is_join: bool,
     ) -> Option<Ty> {
         use Builtin as B;
-        let str_family = elem == STRING || matches!(self.kind(elem), TyKind::Ref(_, Mut::Shared, i) if self.kind(i) == TyKind::Str);
+        let str_family = elem == STRING
+            || matches!(self.kind(elem), TyKind::Ref(_, Mut::Shared, i) if self.kind(i) == TyKind::Str)
+            || self.param_borrows_only_str(elem);
         if str_family {
             let b = if is_join { B::SliceJoinStr } else { B::SliceConcatStr };
             self.check_packed_borrow(recv, name_span);
@@ -514,6 +516,15 @@ impl<'p> Ctx<'p> {
                 self.check_args(&[], args, name_span);
             }
             return Some(STRING);
+        }
+        // Another `Borrow<str>` element (`Box<str>`, `Cow<str>`, a user
+        // type; also an instance of a `S: Borrow<str>` template, which
+        // `check` accepted): core's join, which lust does not build.
+        let borrow_str = TraitRef { def: self.p.gx.lang.borrow, args: self.tys.intern_args(&[GenericArg::Ty(elem), GenericArg::Ty(STR)]), bindings: EMPTY_BINDINGS };
+        if !matches!(self.kind(elem), TyKind::Param(_) | TyKind::Infer(_)) && matches!(self.select_obligation(borrow_str), Selection::Impl { .. }) {
+            let (tn, m) = (self.tn(elem), if is_join { "join" } else { "concat" });
+            self.err("L0640", name_span, format!("`{m}` over `{tn}` elements is not implemented yet"), "Map the parts to `&str` first, as in `parts.iter().map(|p| p.borrow()).collect::<Vec<&str>>()`.");
+            return Some(self.slice_bail(args));
         }
         let inner = match self.kind(elem) {
             TyKind::Array(el, _) => Some(el),
@@ -562,6 +573,31 @@ impl<'p> Ctx<'p> {
         self.coerce_expr(arg, t, param);
         self.set_res(e, Res::BuiltinMethod { b, derefs, autoref: Autoref::Ref });
         Some(ret)
+    }
+
+    /// A type parameter whose `Borrow` bounds all name `str` (`S:
+    /// Borrow<str>`, ts-rust's `joined_parts`): the template takes the
+    /// str family, and each instance checks again at its concrete
+    /// element (String and `&str` take the builtin; any other shape
+    /// rejects there). A second `Borrow<X>` bound makes rustc's
+    /// `Concat` item ambiguous, so it stays out.
+    fn param_borrows_only_str(&self, elem: Ty) -> bool {
+        if !matches!(self.kind(elem), TyKind::Param(_)) {
+            return false;
+        }
+        let borrow = self.p.gx.lang.borrow;
+        let mut targets = self.env().iter().filter_map(|pred| match pred {
+            Predicate::Trait(b) if b.value.def == borrow => match self.tys.args(b.value.args) {
+                [GenericArg::Ty(s), GenericArg::Ty(t)] if *s == elem => Some(*t),
+                _ => None,
+            },
+            _ => None,
+        });
+        let mut any = false;
+        targets.all(|t| {
+            any = true;
+            t == STR
+        }) && any
     }
 
     /// A comparison across sequence forms (slice, array, Vec) as

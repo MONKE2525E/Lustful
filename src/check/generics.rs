@@ -8993,6 +8993,12 @@ pub fn add_synthetic_impls(p: &mut Program) {
         for tr in [lang.debug, lang.clone] {
             insert_synthetic(p, &mut ordinal, tr, weak_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         }
+        // alloc's `impl<T> Default for Weak<T>` is `Weak::new()`, with
+        // `T: Sized` (`rc::Weak<dyn Fn()>` has no default), as for
+        // `sync::Weak` (check/sync.rs).
+        let mut g1 = one.clone();
+        g1.predicates = pred_on_p0(p, lang.sized);
+        insert_synthetic(p, &mut ordinal, lang.default, weak_p0, &[], g1, Vec::new(), Synthetic::Lang, false, span);
     }
     // From<T> for T, and Into through From.
     insert_synthetic(p, &mut ordinal, lang.from, p0, &[p0], one.clone(), Vec::new(), Synthetic::Lang, false, span);

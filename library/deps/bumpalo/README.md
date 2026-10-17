@@ -9,7 +9,9 @@ ts-rust's `leak_arena.rs` uses. Gate: `scripts/test-adapters.sh bumpalo`.
   `allocation_limit`, `allocated_bytes`, `chunk_capacity`, `alloc`,
   `try_alloc`, `alloc_with`, `try_alloc_with` (the closure runs only
   after the room is found), `alloc_slice_copy`, `try_alloc_slice_copy`,
-  `alloc_slice_fill_with`, `Default`; `AllocErr` (Debug, Display, Clone,
+  `alloc_slice_fill_with`, `try_alloc_slice_fill_with` (a panic in the
+  fill closure gives the room back and leaks the items made, as
+  upstream's rewind guard does), `Default`; `AllocErr` (Debug, Display, Clone,
   Eq). Features `default`, `std`.
 - Values live in leaked boxes and never drop, as in a Bump. Chunk
   sizes, the bump position, limits, and failures are upstream's
