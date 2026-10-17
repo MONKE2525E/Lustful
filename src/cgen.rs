@@ -1297,6 +1297,14 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
     go(p, t, &mut Seen::default())
 }
 
+/// `Vec::capacity` of the `lust_Vec` or `lust_VecIter` that the C pointer
+/// `v` points to, with C element type `et`. A zero-sized element stores
+/// capacity 0, as RawVec does (so the capacity word stays a valid niche
+/// source), and reports usize::MAX.
+fn vec_cap(et: &str, v: &str) -> String {
+    format!("(sizeof({et}) ? ({v})->cap : 0xffffffffffffffffULL)")
+}
+
 /// C integer type for an explicit enum tag or a niche scalar of `size`
 /// bytes. Niche scalars are read and written as unsigned bit patterns.
 fn tag_c_type(size: u64, signed: bool) -> &'static str {
@@ -3106,8 +3114,9 @@ impl FnGen<'_, '_> {
                 let (k, v, t) = (self.tmp(), self.tmp(), self.tmp());
                 let _ = writeln!(
                     self.out,
-                    "    uint64_t {k} = {n}; lust_Vec {v} = lust_vec_with_capacity({k}, sizeof({mt}), _Alignof({mt})); if ({v}.cap) memset({v}.ptr, 0, {k} * sizeof({mt})); {} {t}; {t}.ptr = ({mt}*){v}.ptr; {t}.len = {v}.cap ? {k} : 0;",
-                    ctype(dest_cty)
+                    "    uint64_t {k} = {n}; lust_Vec {v} = lust_vec_with_capacity({k}, sizeof({mt}), _Alignof({mt})); if ({v}.cap) memset({v}.ptr, 0, {k} * sizeof({mt})); {} {t}; {t}.ptr = ({mt}*){v}.ptr; {t}.len = {} >= {k} ? {k} : 0;",
+                    ctype(dest_cty),
+                    vec_cap(&mt, &format!("&{v}"))
                 );
                 t
             }
@@ -3136,7 +3145,7 @@ impl FnGen<'_, '_> {
                 let zst = c_layout(self.p, e).is_some_and(|l| l.size == 0);
                 let ptr = if zst { format!("({v})->ptr") } else { format!("(void*)((({et}*)({v})->ptr) + ({v})->len)") };
                 let t = self.tmp();
-                let _ = writeln!(self.out, "    {} {t}; {t}.ptr = {ptr}; {t}.len = ({v})->cap - ({v})->len;", ctype(dest_cty));
+                let _ = writeln!(self.out, "    {} {t}; {t}.ptr = {ptr}; {t}.len = {} - ({v})->len;", ctype(dest_cty), vec_cap(&et, &v));
                 t
             }
             CallTarget::Builtin(b) => match self.hash_builtin(b, args, dest_cty, loc, post) {
@@ -3489,7 +3498,7 @@ impl FnGen<'_, '_> {
                 if self.p.unwind {
                     // A capacity overflow panic returns here under panic=unwind:
                     // fill nothing, drop the value, and unwind.
-                    let _ = writeln!(self.out, "    if ({t}.cap < {i}_n) {i}_n = 0;");
+                    let _ = writeln!(self.out, "    if ({} < {i}_n) {i}_n = 0;", vec_cap(&et, &format!("&{t}")));
                 }
                 let clone = if is_copy_c(self.p, &ec) {
                     xt.to_string()
@@ -4792,11 +4801,9 @@ impl FnGen<'_, '_> {
                 format!("(({st}){{ ({et}*){v}.ptr, {v}.len }})")
             }
             B::BoxSliceIntoVec => {
-                // A zero-sized element's Vec reports capacity usize::MAX.
+                // A zero-sized element's Vec stores capacity 0 (see vec_cap).
                 let CTy::BoxSlice(e) = &tys[0] else { unreachable!("into_vec on a Box<[T]>") };
-                let zst = c_layout(self.p, e).is_some_and(|l| l.size == 0);
-                let cap = if zst { "0xffffffffffffffffULL".to_string() } else { format!("({}).len", vals[0]) };
-                format!("((lust_Vec){{ (void*)({0}).ptr, ({0}).len, {cap} }})", vals[0])
+                format!("((lust_Vec){{ (void*)({0}).ptr, ({0}).len, sizeof({1}) ? ({0}).len : 0 }})", vals[0], ctype(e))
             }
             B::BoxSliceIntoIter => format!("((lust_VecIter){{ (void*)({0}).ptr, ({0}).len, ({0}).len, 0 }})", vals[0]),
             B::ParseIntErrorKind => format!("(&({})->f0)", vals[0]),
@@ -5542,7 +5549,11 @@ impl FnGen<'_, '_> {
             // `next` and `next_back` take from `front..len`.
             B::IterVecIntoIter => format!("((lust_VecIter){{ {0}.ptr, {0}.len, {0}.cap, 0 }})", vals[0]),
             B::VecIterLen => format!("({0}->len - {0}->front)", vals[0]),
-            B::VecIterCap => format!("({0}->cap)", vals[0]),
+            B::VecIterCap => {
+                let CTy::Ref(it) = &tys[0] else { unreachable!("vec::IntoIter cap takes &lust_VecIter") };
+                let CTy::VecIter(e) = &**it else { unreachable!("vec::IntoIter cap takes &lust_VecIter") };
+                vec_cap(&ctype(e), &vals[0])
+            }
             B::VecIterFront => format!("({0}->front)", vals[0]),
             B::CharsBytesLeft => format!("({0}->s.len - {0}->pos)", vals[0]),
             B::VecIterNext | B::VecIterNextBack => {
@@ -6269,7 +6280,11 @@ impl FnGen<'_, '_> {
                 );
                 t
             }
-            B::VecCapacity => format!("({})->cap", vals[0]),
+            B::VecCapacity => {
+                let CTy::Ref(v) = &tys[0] else { unreachable!("capacity takes &Vec") };
+                let CTy::Vec(e) = &**v else { unreachable!("capacity takes &Vec") };
+                vec_cap(&ctype(e), &vals[0])
+            }
             B::VecReserve | B::VecReserveExact | B::VecShrinkToFit | B::VecShrinkTo => {
                 let CTy::Ref(v) = &tys[0] else { unreachable!() };
                 let CTy::Vec(e) = &**v else { unreachable!() };
@@ -6370,7 +6385,7 @@ impl FnGen<'_, '_> {
                     // `wrap_calls` from unwinding before that drop (the
                     // statement's own check unwinds after it).
                     let _ = writeln!(self.out, "      (void)lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));");
-                    let _ = writeln!(self.out, "      if ({vv}->cap >= {n}) {{");
+                    let _ = writeln!(self.out, "      if ({} >= {n}) {{", vec_cap(&et, vv));
                 } else {
                     let _ = writeln!(self.out, "      lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));");
                 }
@@ -9668,9 +9683,9 @@ fn glue_def_value(
                         let _ = writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) drop_{}(&(({}*)p->ptr)[i]);", mangle(e), ctype(e));
                     }
                     // An empty Vec never allocates; its pointer is the
-                    // dangling aligned address, not a heap block. The
-                    // zero-sized element form reports cap as usize::MAX,
-                    // so that case is decided here, not at run time.
+                    // dangling aligned address, not a heap block. A
+                    // zero-sized element never allocates either, so that
+                    // case is decided here, not at run time.
                     if c_layout(p, e).is_none_or(|l| l.size > 0) {
                         body.push_str("  if (p->cap) free(p->ptr);\n");
                     }

@@ -318,8 +318,11 @@ void lust_exit(int32_t code) LUST_BODY({ lust_tls_exit(); lust_print_flush(); ex
      4 when it is 2 to 1024, 1 above 1024.
    - Amortized reserve grows to max(cap * 2, len + extra, minimum).
    - Exact reserve and with_capacity take exactly the requested count.
-   - A zero-sized element never allocates and reports capacity
-     UINT64_MAX (usize::MAX), with a dangling aligned pointer.
+   - A zero-sized element never allocates and stores capacity 0, as
+     RawVec does: the stored word stays inside Cap's valid range
+     0..=isize::MAX, so enum niches above it are free. The typed layer
+     reports capacity UINT64_MAX (usize::MAX) for it (cgen vec_cap), and
+     a reserve past usize::MAX elements is a capacity overflow.
    - A byte size above isize::MAX is a capacity overflow, as in Rust.
    The typed layer owns the shrink_to length assert; this core clamps
    the target at len, which is the same end state. */
@@ -331,11 +334,11 @@ void lust_vec_grow_to(lust_Vec *v, uint64_t new_cap, uint64_t elem, uint64_t ali
 
 void lust_vec_set_zst(lust_Vec *v, uint64_t align) LUST_BODY({
     v->ptr = (void *)(uintptr_t)(align ? align : 1);
-    v->cap = 18446744073709551615ull;
+    v->cap = 0;
 })
 
 void lust_vec_reserve(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t align) LUST_BODY({
-    if (!elem) { lust_vec_set_zst(v, align); return; }
+    if (!elem) { lust_vec_set_zst(v, align); if (extra > 18446744073709551615ull - v->len) lust_vec_capacity_overflow(); return; }
     if (v->cap - v->len >= extra) return;
     uint64_t needed = v->len + extra;
     if (needed < v->len) { lust_vec_capacity_overflow(); return; }
@@ -347,7 +350,7 @@ void lust_vec_reserve(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t align
 })
 
 void lust_vec_reserve_exact(lust_Vec *v, uint64_t extra, uint64_t elem, uint64_t align) LUST_BODY({
-    if (!elem) { lust_vec_set_zst(v, align); return; }
+    if (!elem) { lust_vec_set_zst(v, align); if (extra > 18446744073709551615ull - v->len) lust_vec_capacity_overflow(); return; }
     if (v->cap - v->len >= extra) return;
     uint64_t needed = v->len + extra;
     if (needed < v->len) { lust_vec_capacity_overflow(); return; }
