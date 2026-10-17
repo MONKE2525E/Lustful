@@ -3805,7 +3805,10 @@ impl FnGen<'_, '_> {
         let mut variant = 0usize;
         for pr in &pl.proj {
             t = match (tys.kind(t), pr) {
-                (TyKind::Ref(_, _, inner), Proj::Deref) => inner,
+                (TyKind::Ref(_, _, inner) | TyKind::RawPtr(_, inner), Proj::Deref) => inner,
+                (TyKind::Adt(..), Proj::Deref) => tys.boxed_elem(t)?,
+                // A closure env is the tuple of its captures (`cty`).
+                (TyKind::Closure(_, a), Proj::Field(i)) => tys.args(a).iter().filter_map(|g| g.as_ty()).nth(*i as usize)?,
                 (_, Proj::Downcast(v)) => {
                     variant = *v as usize;
                     continue;
