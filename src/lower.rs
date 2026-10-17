@@ -4617,7 +4617,10 @@ impl<'p> Lower<'p> {
     fn ordered_operand(&mut self, es: &[ExprId], i: usize) -> Operand {
         let e = es[i];
         let o = self.operand(e);
-        let later_effects = es[i + 1..].iter().any(|&x| !self.inert_expr(x));
+        // A later `&mut` path argument is a reborrow (or a move) of its
+        // place at that argument (`f(c.p, c)` with `c: &mut S`): this one's
+        // value is read before it, as in rustc.
+        let later_effects = es[i + 1..].iter().any(|&x| !self.inert_expr(x) || self.mut_ref_path(x));
         match o {
             Operand::Copy(ref pl) | Operand::Move(ref pl)
                 if later_effects && !(pl.proj.is_empty() && self.body.locals[pl.local as usize].name.is_none()) =>
@@ -4630,6 +4633,12 @@ impl<'p> Lower<'p> {
             }
             o => o,
         }
+    }
+
+    /// True when `e` is a path or `self` of `&mut` type: as an argument it
+    /// is reborrowed or moved (`ordered_operand`).
+    fn mut_ref_path(&self, e: ExprId) -> bool {
+        matches!(self.p.ast.expr(e), Expr::Path(_) | Expr::SelfValue) && matches!(self.kind(self.ty(e)), TyKind::Ref(_, Mut::Mut, _))
     }
 
     /// True when evaluating `e` cannot write or move a place: a literal or
