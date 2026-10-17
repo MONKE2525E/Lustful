@@ -341,6 +341,13 @@ impl RegionTables {
         of(f).or_else(|| of(p.gx.instances.get(&f)?.template_local?))
     }
 
+    /// The signature body `f`'s own universals come from (`own_sig`):
+    /// `body_sig`, else `opaque_sig` (a fn whose `impl Trait` return has a
+    /// `use<..>` list or a lifetime bound).
+    pub fn own_body_sig(&self, p: &Program, f: LocalDefId) -> Option<&RegionSig> {
+        self.body_sig(p, f).or_else(|| self.opaque_sig(p, f))
+    }
+
     /// `opaque_sigs` for `f`, or for the template of instance `f`.
     pub fn opaque_sig(&self, p: &Program, f: LocalDefId) -> Option<&RegionSig> {
         self.opaque_sigs.get(&f).or_else(|| self.opaque_sigs.get(&p.gx.instances.get(&f)?.template_local?))
@@ -1361,18 +1368,27 @@ pub(super) struct OwnSig {
     /// Per type param that a dyn coercion in the body unsizes: its index
     /// and the universal that stands for it (`param_univs`).
     pub param_univ: Vec<(u32, Univ)>,
+    /// In a closure body, per lifetime `k` of the enclosing fn that one of
+    /// the fn's `Fn*` bounds names: the universal that stands for `'k`
+    /// (`End::Fn(k)`). A call through such a bound (or passing the bounded
+    /// param on) binds `'k` to it; the creator proves what the body needs
+    /// of it with its own `'k`.
+    pub fn_lts: Vec<Option<Univ>>,
 }
 
 /// One end of a closure requirement (`closure_requirements`): `'static`,
 /// a captured slot (in the closure type's slot order), a free argument
-/// slot (in `closure_arg_slots` order), or an output slot (only as the
-/// longer-lived side's target: what the output may hold).
+/// slot (in `closure_arg_slots` order), an output slot (only as the
+/// longer-lived side's target: what the output may hold), or lifetime `k`
+/// of the enclosing fn (`OwnSig::fn_lts`; the creator reads it as its own
+/// universal for `'k`, `Builder::fn_ends`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum End {
     Static,
     Cap(u32),
     Arg(u32),
     Out(u32),
+    Fn(u32),
 }
 
 /// What a callee's `Fn*` bound makes of one closure argument slot
@@ -1400,13 +1416,30 @@ fn root_fn(p: &Program, f: LocalDefId) -> LocalDefId {
     root
 }
 
+/// The lifetimes (`Region::Param` indices) that the `Fn*` bounds of the
+/// fn enclosing body `f` name: a closure body in it gets a universal for
+/// each (`OwnSig::fn_lts`).
+fn root_bound_lifetimes(p: &Program, f: LocalDefId) -> Vec<(u32, String)> {
+    let Some(sig) = p.regions.own_body_sig(p, root_fn(p, f)) else { return Vec::new() };
+    let mut rs = Vec::new();
+    for b in &sig.fn_bounds {
+        for &t in b.inputs.iter().chain(&b.output) {
+            regions_of(&p.tys, t, &mut rs);
+        }
+    }
+    let mut ks: Vec<u32> = rs.iter().filter_map(|r| if let Region::Param(k) = r { Some(*k) } else { None }).filter(|&k| k < sig.n_univ).collect();
+    ks.sort_unstable();
+    ks.dedup();
+    ks.into_iter().map(|k| (k, sig.names.get(k as usize).cloned().unwrap_or_else(|| "a lifetime of the enclosing fn".into()))).collect()
+}
+
 /// True when a call in `body` may pass a type param with a regioned `Fn`
 /// bound (the fn holding it has one), a fn item, or a closure with its
 /// own signature (`free_sig_bound`) to a generic fn, which proves the
 /// callee's bound from its signature (`entail_bound`) even in a body
 /// with no loans.
 pub(super) fn may_entail_bounds(p: &Program, body: &Body) -> bool {
-    p.regions.body_sig(p, root_fn(p, body.fn_id)).is_some_and(|s| !s.fn_bounds.is_empty())
+    p.regions.own_body_sig(p, root_fn(p, body.fn_id)).is_some_and(|s| !s.fn_bounds.is_empty())
         || body.blocks.iter().any(|b| b.stmts.iter().any(|s| matches!(s.kind, StmtKind::Assign(_, Rvalue::FnValue(..)))))
         || body.locals.iter().any(|l| mentions_fn_ptr(&body.tys, l.ty) || free_sig_closure(p, &body.tys, l.ty))
 }
@@ -1466,17 +1499,23 @@ struct FnSides {
     item: Option<Vec<bool>>,
     early: FxMap<u32, u32>,
     n: u32,
+    /// In a closure body, the universal of each lifetime of the enclosing
+    /// fn (`OwnSig::fn_lts`); else `'k` is universal `k + 1`.
+    fn_lts: Option<Vec<Option<u32>>>,
 }
 
 impl FnSides {
     fn new(item: Option<Vec<bool>>) -> Self {
-        FnSides { item, early: FxMap::default(), n: 0 }
+        FnSides { item, early: FxMap::default(), n: 0, fn_lts: None }
     }
 
     fn side(&mut self, b: &mut Builder<'_, '_>, r: Region, out: bool) -> Side {
         match (r, &self.item) {
             (Region::Static, _) => Side::Tie(0),
-            (Region::Param(k), None) => Side::Tie(k + 1),
+            (Region::Param(k), None) => match &self.fn_lts {
+                Some(lts) => lts.get(k as usize).copied().flatten().map_or(Side::Free, Side::Tie),
+                None => Side::Tie(k + 1),
+            },
             (Region::Param(k), Some(e)) if e.get(k as usize) == Some(&true) => Side::Tie(*self.early.entry(k).or_insert_with(|| b.fresh())),
             (Region::Param(k), Some(_)) => Side::Binder(k),
             (Region::Bound(_), None) if out => Side::Binder(0),
@@ -1755,6 +1794,7 @@ impl OwnSig {
             check,
             closure,
             ends: Vec::new(),
+            fn_lts: Vec::new(),
             call_out: false,
             ret_cap: None,
             ret_vars: None,
@@ -2193,8 +2233,19 @@ impl OwnSig {
                 self.facts.push((u, sc));
             }
         }
+        for (k, name) in root_bound_lifetimes(p, body.fn_id) {
+            if self.fn_lts.len() <= k as usize {
+                self.fn_lts.resize(k as usize + 1, None);
+            }
+            self.fn_lts[k as usize] = Some(fresh(self, &name));
+        }
         self.ends = vec![None; self.n_univ as usize + 1];
         self.ends[0] = Some(End::Static);
+        for (k, u) in self.fn_lts.iter().enumerate() {
+            if let Some(u) = *u {
+                self.ends[u as usize] = Some(End::Fn(k as u32));
+            }
+        }
         for (k, &u) in self.slots.first().cloned().unwrap_or_default().iter().enumerate() {
             if u != 0 {
                 self.ends[u as usize] = Some(End::Out(k as u32));
@@ -4231,6 +4282,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 };
                 let mut roles = Vec::new();
                 closure_roles(&mut self.sc, def, cargs, &mut roles);
+                let fe = self.fn_ends(def);
                 match self.closure_reqs(def, &roles) {
                     Some(reqs) => {
                         for &(x, y) in reqs.iter() {
@@ -4252,6 +4304,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                             let from = match x {
                                 End::Cap(i) => data.get(i as usize),
                                 End::Arg(j) => vars.get(j as usize),
+                                End::Fn(k) => fe.get(k as usize).and_then(|u| u.as_ref()),
                                 End::Static | End::Out(_) => None,
                             };
                             if let Some(&v) = from {
@@ -4771,6 +4824,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                         let caps: Vec<u32> = ev.iter().skip(skip).copied().collect();
                         let vars = self.closure_arg_vars(def, &roles, &caps);
                         let n_out = self.p.gx.closures.get(&def).map(|c| c.output).map(|t| self.sc.slots(t) as usize);
+                        let fe = self.fn_ends(def);
                         match self.closure_reqs(def, &roles) {
                             Some(reqs) if n_out == Some(dv.len()) => {
                                 for &(x, y) in reqs.iter() {
@@ -4778,6 +4832,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                                     let from = match x {
                                         End::Cap(i) => caps.get(i as usize).copied(),
                                         End::Arg(j) => vars.as_ref().and_then(|v| v.get(j as usize)).copied(),
+                                        End::Fn(k) => fe.get(k as usize).copied().flatten(),
                                         End::Static | End::Out(_) => None,
                                     };
                                     if let (Some(from), Some(&d)) = (from, dv.get(k as usize)) {
@@ -5780,6 +5835,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         if !first && !force {
             return self.closure_args.get(&def).cloned();
         }
+        let fe = self.fn_ends(def);
         let reqs = self.closure_reqs(def, roles);
         if reqs.is_none() {
             self.contract_edges(roles, caps);
@@ -5791,6 +5847,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 End::Static => Some(0),
                 End::Cap(i) => caps.get(i as usize).copied(),
                 End::Arg(j) => vars.as_ref().and_then(|v| v.get(j as usize)).copied(),
+                End::Fn(k) => fe.get(k as usize).copied().flatten(),
                 // What a call's result holds: the call's rule, except an
                 // output slot the closure's bound makes its input's
                 // (`ClosureEntry::bound_output`): that is any region a
@@ -5879,7 +5936,8 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         let c = self.p.gx.closures.get(&def)?;
         let free = matches!(closure_arg_slots(&mut self.sc, c), Ok(v) if v.iter().any(|(r, _)| r.is_some()));
-        let r = if free || !roles.is_empty() || c.call_out {
+        let fn_lts = !root_bound_lifetimes(self.p, c.body_fn).is_empty();
+        let r = if free || !roles.is_empty() || c.call_out || fn_lts {
             // `check_fn` of a closure is its enclosing fn's check.
             let cf = c.body_fn;
             let mut root = c.parent;
@@ -5900,8 +5958,30 @@ impl<'b, 'p> Builder<'b, 'p> {
         } else {
             None
         };
+        // A requirement on a lifetime of the enclosing fn needs this body's
+        // universal for it (none outside that fn): else the caller's
+        // conservative rule.
+        let fe = self.fn_ends(def);
+        let r = r.filter(|reqs| reqs.iter().all(|&(a, b)| [a, b].iter().all(|e| !matches!(e, End::Fn(k) if fe.get(*k as usize).copied().flatten().is_none()))));
         self.closure_reqs.insert(def, r.clone());
         r
+    }
+
+    /// Per lifetime `k` of the fn that encloses closure `def`: this body's
+    /// universal for `'k` (`End::Fn(k)`). The fn's own body has `k + 1`; a
+    /// closure body of the same fn its `OwnSig::fn_lts`; a body outside
+    /// that fn none.
+    fn fn_ends(&self, def: DefId) -> Vec<Option<u32>> {
+        let p = self.p;
+        let Some(c) = p.gx.closures.get(&def) else { return Vec::new() };
+        if root_fn(p, c.parent) != root_fn(p, self.body.fn_id) {
+            return Vec::new();
+        }
+        if self.own.closure {
+            return self.own.fn_lts.clone();
+        }
+        let n = p.regions.own_body_sig(p, self.body.fn_id).map_or(0, |s| s.n_univ);
+        (0..n).map(|k| Some(k + 1)).collect()
     }
 
     /// `map.iter()` and kin (W-STD-B): the iterator's own region is
@@ -6815,6 +6895,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 // `try_fold` body returns it as the leading slots of its
                 // `Option` or `Result`.
                 let folds = matches!(b, Some(crate::check::Builtin::IterFold | crate::check::Builtin::IterTryFold));
+                let fe = self.fn_ends(def);
                 if k == 2
                     && pi == 0
                     && folds
@@ -6830,6 +6911,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                             let from = match x {
                                 End::Cap(i) => v.get(i as usize).copied(),
                                 End::Arg(j) => vars.get(j as usize).copied(),
+                                End::Fn(k) => fe.get(k as usize).copied().flatten(),
                                 End::Static | End::Out(_) => None,
                             };
                             if let (Some(from), Some(&a)) = (from, pv.get(q as usize)) {
@@ -7058,6 +7140,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 let mut roles = Vec::new();
                 closure_roles(&mut self.sc, def, cargs, &mut roles);
+                let fe = self.fn_ends(def);
                 let Some(reqs) = self.closure_reqs(def, &roles) else { return false };
                 let args = self.closure_args.get(&def).cloned().unwrap_or_default();
                 let item: Vec<u32> = (0..nb).map(|_| self.fresh()).collect();
@@ -7067,6 +7150,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                         End::Static => Some(0),
                         End::Cap(i) => caps.get(i as usize).copied(),
                         End::Arg(j) => args.get(j as usize).copied(),
+                        End::Fn(k) => fe.get(k as usize).copied().flatten(),
                         End::Out(_) => None,
                     };
                     if let (Some(from), Some(&o)) = (from, item.get(k as usize)) {
@@ -7318,6 +7402,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     let mut roles = Vec::new();
                     closure_roles(&mut self.sc, def, args, &mut roles);
                     let av = self.closure_args.get(&def).cloned().unwrap_or_default();
+                    let fe = self.fn_ends(def);
                     match self.closure_reqs(def, &roles) {
                         // What its body returns (`closure_reqs`).
                         Some(reqs) => {
@@ -7328,6 +7413,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                                 let v = match x {
                                     End::Cap(i) => vars.get(*at + i as usize).copied(),
                                     End::Arg(j) => av.get(j as usize).copied(),
+                                    End::Fn(k) => fe.get(k as usize).copied().flatten(),
                                     End::Static | End::Out(_) => None,
                                 };
                                 out.extend(v);
@@ -8133,6 +8219,21 @@ impl<'b, 'p> Builder<'b, 'p> {
         Some(map.into_iter().map(|u| u.unwrap_or_else(|| self.fresh())).collect())
     }
 
+    /// In a closure body: per lifetime `'k` of the enclosing fn, its
+    /// universal (`OwnSig::fn_lts`), when every lifetime the regioned types
+    /// `tys` name has one. Other entries are fresh vars.
+    fn closure_fn_univs(&mut self, tys: &[Ty]) -> Option<Vec<u32>> {
+        let mut rs = Vec::new();
+        for &t in tys {
+            regions_of(&self.p.tys, t, &mut rs);
+        }
+        let lts = self.own.fn_lts.clone();
+        if rs.iter().any(|r| matches!(r, Region::Param(k) if lts.get(*k as usize).copied().flatten().is_none())) {
+            return None;
+        }
+        Some(lts.into_iter().map(|u| u.unwrap_or_else(|| self.fresh())).collect())
+    }
+
     /// `it.next()` (also `nth`, `last`, `min`, `max`, `next_back`,
     /// `nth_back`) through a type param's own `Iterator<Item = X>` bound,
     /// a trait stub call: the `Option<X>` result holds `X`'s regions
@@ -8185,7 +8286,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         // A closure body calls through its enclosing fn's bound; the
         // fn's lifetimes are not universals there, so only a bound that
         // names none (`'static` and elided ones) takes this rule.
-        let Some(sig) = p.regions.body_sig(p, root_fn(p, self.body.fn_id)) else { return false };
+        let Some(sig) = p.regions.own_body_sig(p, root_fn(p, self.body.fn_id)) else { return false };
         let Some(b) = sig.fn_bounds.iter().find(|b| b.param == j.0 && b.inputs.len() + 1 == avs.len()).cloned() else { return false };
         if !is_call {
             return false;
@@ -8207,7 +8308,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 return false;
             }
             if named(&b.inputs) {
-                match self.closure_named_univs(&b.inputs) {
+                match self.closure_named_univs(&b.inputs).or_else(|| self.closure_fn_univs(&b.inputs)) {
                     Some(u) => closure_univ = u,
                     None => {
                         self.errs.push(Diag::new(
@@ -8435,6 +8536,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let caps = binds.get(&jf.0).cloned().unwrap_or_default();
         let mut roles = Vec::new();
         closure_roles(&mut self.sc, def, args, &mut roles);
+        let fe = self.fn_ends(def);
         match self.closure_reqs(def, &roles) {
             Some(reqs) => {
                 let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
@@ -8444,6 +8546,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     let from = match x {
                         End::Cap(i) => caps.get(i as usize),
                         End::Arg(j) => vars.get(j as usize),
+                        End::Fn(k) => fe.get(k as usize).and_then(|u| u.as_ref()),
                         End::Static | End::Out(_) => None,
                     };
                     if let Some(&v) = from {
@@ -8496,6 +8599,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         let paired = ps.iter().all(|j| binds.contains_key(j))
             && self.inst(out_t, c_out, univ, &mut ob, &mut rv)
             && rv.len() == self.sc.slots(c_out) as usize;
+        let fe = self.fn_ends(def);
         match self.closure_reqs(def, &roles) {
             Some(reqs) if paired => {
                 let vars = self.closure_args.get(&def).cloned().unwrap_or_default();
@@ -8503,6 +8607,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                     End::Static => Some(0),
                     End::Cap(i) => caps.get(i as usize).copied(),
                     End::Arg(j) => vars.get(j as usize).copied(),
+                    End::Fn(k) => fe.get(k as usize).copied().flatten(),
                     End::Out(k) => rv.get(k as usize).copied(),
                 };
                 // `(x, Out(k))`: what slot `k` may hold; `(Out(k), x)`
@@ -8539,9 +8644,9 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// writes there, or stays higher-ranked where `G`'s is (not both); a
     /// higher-ranked `G` input needs a binder (L0735); outputs must agree
     /// the same way (L0733). A fn's early-bound lifetimes are fresh here.
-    /// Type params are the call's instantiation. In a closure body the
-    /// enclosing fn's lifetimes are not universals: L0203 where `F`'s
-    /// bound names one.
+    /// Type params are the call's instantiation. In a closure body a
+    /// lifetime of the enclosing fn that `F`'s bound names is its
+    /// `OwnSig::fn_lts` universal (L0203 where it has none).
     fn entail_bound(&mut self, trait_args: ArgsId, sig: &RegionSig, univ: &[u32]) {
         let p = self.p;
         let targs: Vec<GenericArg> = p.tys.args(trait_args).to_vec();
@@ -8571,8 +8676,13 @@ impl<'b, 'p> Builder<'b, 'p> {
         if !paired {
             return self.unproved_bound(&g);
         }
+        let mut sides = FnSides::new(item.clone());
         if item.is_none() && self.own.closure && ins.iter().chain(&outs).any(|&(_, b)| matches!(b, Region::Param(_))) {
-            return self.closure_param_bound_cut();
+            let lts = self.own.fn_lts.clone();
+            if ins.iter().chain(&outs).any(|&(_, b)| matches!(b, Region::Param(k) if lts.get(k as usize).copied().flatten().is_none())) {
+                return self.closure_param_bound_cut();
+            }
+            sides.fn_lts = Some(lts);
         }
         let gside = |r: Region, n: &mut u32, out: bool| match r {
             Region::Static => Side::Tie(0),
@@ -8584,7 +8694,6 @@ impl<'b, 'p> Builder<'b, 'p> {
             }
             _ => Side::Free,
         };
-        let mut sides = FnSides::new(item);
         let mut gn = 0u32;
         let ins: Vec<(Side, Side)> = ins.iter().map(|&(a, b)| (gside(a, &mut gn, false), sides.side(self, b, false))).collect();
         let outs: Vec<(Side, Side)> = outs.iter().map(|&(a, b)| (gside(a, &mut gn, true), sides.side(self, b, true))).collect();
@@ -8695,7 +8804,7 @@ impl<'b, 'p> Builder<'b, 'p> {
                 (fs.params.clone(), fs.ret, univ)
             }
             TyKind::Param(jf) if !self.own.closure => {
-                let Some(rs) = p.regions.body_sig(p, root) else { return false };
+                let Some(rs) = p.regions.own_body_sig(p, root) else { return false };
                 let Some(f) = rs.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == ins.len()) else { return false };
                 let Some(o) = f.output else { return false };
                 (f.inputs.clone(), o, (1..=rs.n_univ).collect())
@@ -8780,7 +8889,7 @@ impl<'b, 'p> Builder<'b, 'p> {
         Some(match self.body.tys.kind(t) {
             TyKind::Param(jf) => p
                 .regions
-                .body_sig(p, root_fn(p, self.body.fn_id))
+                .own_body_sig(p, root_fn(p, self.body.fn_id))
                 .and_then(|s| s.fn_bounds.iter().find(|b| b.param == jf.0 && b.inputs.len() == n_in).cloned())
                 .map(|f| (f.inputs, f.output, None)),
             // A trait method by path (`Clone::clone`), or an impl method
@@ -8853,10 +8962,14 @@ impl<'b, 'p> Builder<'b, 'p> {
         if f_out_regions.len() != n_out || pin.len() != f_in_regions.len() {
             return unproved(self);
         }
+        let mut sides = FnSides::new(item.clone());
         if item.is_none() && self.own.closure && f_in_regions.iter().chain(&f_out_regions).any(|r| matches!(r, Region::Param(_))) {
-            return self.closure_param_bound_cut();
+            let lts = self.own.fn_lts.clone();
+            if f_in_regions.iter().chain(&f_out_regions).any(|r| matches!(r, Region::Param(k) if lts.get(*k as usize).copied().flatten().is_none())) {
+                return self.closure_param_bound_cut();
+            }
+            sides.fn_lts = Some(lts);
         }
-        let mut sides = FnSides::new(item);
         let ins: Vec<(Side, Side)> = pin.iter().zip(&f_in_regions).enumerate().map(|(i, (&t, &r))| (tside(i, t), sides.side(self, r, false))).collect();
         let outs: Vec<(Side, Side)> = t_outs.into_iter().zip(&f_out_regions).map(|(t, &r)| (t, sides.side(self, r, true))).collect();
         self.match_fn_sides(&ins, &outs, &[]);
@@ -9898,7 +10011,7 @@ impl Builder<'_, '_> {
                 // A captured or free argument region the body needs to be
                 // `'static` is the creator's requirement (`'static` outlives
                 // every region, so the others it reaches follow from it).
-                let creator_static = matches!(self.own.ends.get(u), Some(Some(End::Cap(_) | End::Arg(_))))
+                let creator_static = matches!(self.own.ends.get(u), Some(Some(End::Cap(_) | End::Arg(_) | End::Fn(_))))
                     && matches!(self.own.ends.first(), Some(Some(End::Static)))
                     && bit_iter(&univ[c * wu..(c + 1) * wu]).any(|v| v == 0);
                 for v in bit_iter(&univ[c * wu..(c + 1) * wu]) {
@@ -9906,9 +10019,10 @@ impl Builder<'_, '_> {
                         continue;
                     }
                     // A closure's creator proves relations between its
-                    // captured and free argument regions (`closure_reqs`).
-                    if matches!(self.own.ends.get(u), Some(Some(End::Cap(_) | End::Arg(_))))
-                        && matches!(self.own.ends.get(v), Some(Some(End::Static | End::Cap(_) | End::Arg(_))))
+                    // captured and free argument regions and the enclosing
+                    // fn's lifetimes (`closure_reqs`).
+                    if matches!(self.own.ends.get(u), Some(Some(End::Cap(_) | End::Arg(_) | End::Fn(_))))
+                        && matches!(self.own.ends.get(v), Some(Some(End::Static | End::Cap(_) | End::Arg(_) | End::Fn(_))))
                     {
                         continue;
                     }
@@ -9916,7 +10030,7 @@ impl Builder<'_, '_> {
                     // slots: the call picks their regions.
                     if self.own.call_out
                         && matches!(self.own.ends.get(u), Some(Some(End::Out(_))))
-                        && matches!(self.own.ends.get(v), Some(Some(End::Static | End::Cap(_) | End::Arg(_))))
+                        && matches!(self.own.ends.get(v), Some(Some(End::Static | End::Cap(_) | End::Arg(_) | End::Fn(_))))
                     {
                         continue;
                     }
@@ -9926,8 +10040,8 @@ impl Builder<'_, '_> {
                     // creator's to prove (not skipped by this rule in turn).
                     let to_creator = |w: usize| {
                         let end = |x: usize| self.own.ends.get(x).copied().flatten();
-                        matches!(end(w), Some(End::Static | End::Cap(_) | End::Arg(_)))
-                            && (matches!(end(u), Some(End::Cap(_) | End::Arg(_))) || self.own.call_out && matches!(end(u), Some(End::Out(_))))
+                        matches!(end(w), Some(End::Static | End::Cap(_) | End::Arg(_) | End::Fn(_)))
+                            && (matches!(end(u), Some(End::Cap(_) | End::Arg(_) | End::Fn(_))) || self.own.call_out && matches!(end(u), Some(End::Out(_))))
                     };
                     if bit_iter(&univ[c * wu..(c + 1) * wu])
                         .any(|w| w != u && w != v && w < nu && known[w * nu + v] && (known[u * nu + w] || to_creator(w)))
@@ -10353,3 +10467,4 @@ mod tests {
         assert_eq!(Co.join(Co), Co);
     }
 }
+

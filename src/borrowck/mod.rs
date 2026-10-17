@@ -397,7 +397,7 @@ fn own_sig(p: &Program, body: &Body) -> regions::OwnSig {
     let of_instance = |g: LocalDefId| p.gx.fn_class.get(g.0 as usize) == Some(&FnClass::Instance);
     let check = class != FnClass::Instance
         && !(closure && p.gx.closure_fns.get(&f).and_then(|d| p.gx.closures.get(d)).is_some_and(|c| of_instance(c.parent)));
-    let sig = p.regions.body_sig(p, f).or_else(|| p.regions.opaque_sig(p, f));
+    let sig = p.regions.own_body_sig(p, f);
     regions::OwnSig::build(p, body, sig, closure, check)
 }
 
