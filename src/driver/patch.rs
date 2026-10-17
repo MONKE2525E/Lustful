@@ -199,6 +199,13 @@ pub(super) fn inputs_fingerprint(parts: &dyn std::fmt::Debug) -> u64 {
     std::hash::Hasher::finish(&h)
 }
 
+/// True when every delimiter in a patch's lexed range is balanced. A
+/// patch that sees an unbalanced range falls back to the full path,
+/// which reports the delimiter error as a cold compile does.
+fn balanced(l: &lexer::Lexed) -> bool {
+    crate::expand::delimiter_error(&l.tokens).is_none()
+}
+
 /// True when `text` may define a macro named like a parser macro
 /// (`macro_rules! println`) or import one under such a name (`as vec`).
 /// A text scan: a match in a comment or string only costs the patch for
@@ -831,7 +838,7 @@ fn find_body_edit(front: &Front, text: &str, edit: Edit) -> Result<NewBody, &'st
     let sig = super::sig_nodes::copy(ast, def, span, &mut body_ast)?;
     let (lo, hi) = (span.lo as usize, span.hi as usize);
     let new_hi = (hi as i64 + d) as usize;
-    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo as u32, &front.interner).ok()).ok_or("body lex");
+    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo as u32, &front.interner).ok().filter(balanced)).ok_or("body lex");
     let (old_body, new_body) = (lex(old.get(lo..hi))?, lex(text.get(lo..new_hi))?);
     let (old_ok, new_ok) = (body_tokens_ok(&old_body, lo, hi, &front.interner), body_tokens_ok(&new_body, lo, new_hi, &front.interner));
     // A user macro (or a builtin that is not pure) is the last reason:
@@ -968,7 +975,7 @@ fn find_derive_edit(front: &Front, text: &str, edit: Edit) -> Result<NewDerive, 
         .ok_or(None)?;
     let (lo, hi) = (ast.items[item].span.lo, ast.items[item].span.hi);
     let new_hi = (hi as i64 + d) as u32;
-    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo, &front.interner).ok()).ok_or(Some("derive lex"));
+    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo, &front.interner).ok().filter(balanced)).ok_or(Some("derive lex"));
     let (old_lx, new_lx) = (lex(old.get(lo as usize..hi as usize))?, lex(text.get(lo as usize..new_hi as usize))?);
     let (ot, nt) = (&old_lx.tokens[..old_lx.tokens.len() - 1], &new_lx.tokens[..new_lx.tokens.len() - 1]);
     if nt.first().is_none_or(|t| t.span.lo != lo) || nt.last().is_none_or(|t| t.span.hi != new_hi) {
@@ -1083,7 +1090,7 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
         return Err(Some("item: body items"));
     }
     let new_hi = (hi as i64 + d) as u32;
-    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo, &front.interner).ok()).ok_or(Some("item lex"));
+    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo, &front.interner).ok().filter(balanced)).ok_or(Some("item lex"));
     let (old_lx, new_lx) = (lex(old.get(lo as usize..hi as usize))?, lex(text.get(lo as usize..new_hi as usize))?);
     let (ot, nt) = (&old_lx.tokens[..old_lx.tokens.len() - 1], &new_lx.tokens[..new_lx.tokens.len() - 1]);
     // The new range starts and ends on a token edge, so no text outside
@@ -1359,7 +1366,7 @@ fn find_inactive_edit(front: &Front, text: &str, edit: Edit) -> Result<(), Optio
         }
     }
     let new_hi = (node.hi as i64 + d) as usize;
-    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, node.lo, &front.interner).ok()).ok_or(Some("inactive lex"));
+    let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, node.lo, &front.interner).ok().filter(balanced)).ok_or(Some("inactive lex"));
     let (old_toks, new_lexed) = (lex(old.get(node.lo as usize..node.hi as usize))?, lex(text.get(node.lo as usize..new_hi))?);
     let (ot, nt) = (&old_toks.tokens[..old_toks.tokens.len() - 1], &new_lexed.tokens[..new_lexed.tokens.len() - 1]);
     // Both end where the node ends, on a token that cannot run into the

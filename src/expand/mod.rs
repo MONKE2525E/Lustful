@@ -1587,18 +1587,17 @@ pub fn expand_lexed_seeded_with_deps(lexed: Lexed, ctx: &ExpandCtx, seeds: &[Mac
 
 /// Macro expansion proper, for `expand_lexed_seeded_with_deps`.
 fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
+    // rustc's lexer rejects any unbalanced or mismatched delimiter in
+    // the file (attributes, cfg-off items, unused macro bodies too),
+    // before any macro or parse error. The parser reads some groups
+    // (attribute brackets) by depth alone, so check every file here.
+    if let Some(d) = delimiter_error(&lexed.tokens) {
+        return Err(d);
+    }
     if !needs_expansion(&lexed.tokens, ctx.interner) && !seeds_bind_parser_name(&lexed.tokens, seeds, ctx.interner) {
         return Ok((lexed, Vec::new()));
     }
-    let (trees, balanced) = build_trees(&lexed.tokens);
-    if !balanced {
-        // rustc reports this while lexing, before any macro or parse
-        // error; the parser would stop at the first unexpanded call.
-        if let Some(d) = delimiter_error(&lexed.tokens) {
-            return Err(d);
-        }
-        return Ok((lexed, Vec::new()));
-    }
+    let (trees, _) = build_trees(&lexed.tokens);
     let eof = lexed.tokens.last().cloned().unwrap_or(Token { tok: Tok::Eof, span: Span::default() });
     let mut st = Expander::new(ctx, lexed.strings);
     st.root_file = lexed.tokens.first().map(|t| t.span.file);
