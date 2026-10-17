@@ -7793,6 +7793,19 @@ impl<'p> Lower<'p> {
                 let op = self.const_operand(&vals[0], USIZE, span);
                 sync(self, SyncOp::SyncNew(k), vec![op]);
             }
+            // A const range (ty/consteval.rs): its bounds, then an
+            // inclusive range's `exhausted` flag, as `Expr::Range` lowers.
+            Some(BuiltinTy::Iter(k)) if k.is_range() && k != crate::ty::iter::IterKind::RangeFull => {
+                let elem = crate::ty::iter::iter_parts(&self.body.tys, ty).and_then(|(_, a)| a.first().copied()).unwrap_or(ERROR);
+                let ops: Vec<Operand> = vals
+                    .iter()
+                    .map(|x| match x {
+                        crate::ty::consteval::ConstValue::Bool(b) => Operand::Const(Const::Bool(*b)),
+                        _ => self.const_operand(x, elem, span),
+                    })
+                    .collect();
+                self.assign(dest.clone(), Rvalue::TupleAgg(ty, ops), span);
+            }
             Some(BuiltinTy::Vec) if vals.is_empty() => {
                 self.assign(dest.clone(), Rvalue::VecLit(self.peel_vec(ty), Vec::new()), span);
             }

@@ -1556,6 +1556,40 @@ impl Evaluator {
                 }
                 return self.block(cx, env, *b, expected);
             }
+            // A range with bounds (`35..=64`, `2..5`, `3..`, `..=9`): the
+            // value lowering builds for it, its bounds then (inclusive) the
+            // `exhausted` flag; materialized by lower.rs
+            // `const_builtin_aggregate`.
+            Expr::Range { lo, hi, inclusive } if lo.is_some() || hi.is_some() => {
+                use crate::ty::iter::{IterKind, iter_parts, mk_iter};
+                let exp_elem = expected.and_then(|t| iter_parts(cx.tys_ref(), t)).and_then(|(_, a)| a.first().copied());
+                let mut vals = Vec::new();
+                let mut elem = exp_elem;
+                for b in [lo, hi].into_iter().flatten() {
+                    let (v, t) = self.value(cx, env, *b, elem)?;
+                    if !matches!(cx.tys_ref().kind(t), TyKind::Int(_) | TyKind::Char) {
+                        return Err(outside(cx.ast().expr_span(*b), "this range bound"));
+                    }
+                    if elem.is_some_and(|w| w != t) {
+                        return Err(const_ty_mismatch(cx.ast().expr_span(*b), "this range bound"));
+                    }
+                    elem = Some(t);
+                    vals.push(v);
+                }
+                let k = match (lo.is_some(), hi.is_some(), *inclusive) {
+                    (true, true, true) => IterKind::RangeInclusive,
+                    (true, true, false) => IterKind::Range,
+                    (true, false, _) => IterKind::RangeFrom,
+                    (false, true, true) => IterKind::RangeToInclusive,
+                    (false, true, false) => IterKind::RangeTo,
+                    (false, false, _) => unreachable!(),
+                };
+                if k == IterKind::RangeInclusive {
+                    vals.push(ConstValue::Bool(false));
+                }
+                let et = elem.unwrap_or(ERROR);
+                (ConstValue::Aggregate(vals), mk_iter(cx.tys(), k, &[et]))
+            }
             Expr::Tuple(elems) => {
                 let exp: Vec<Option<Ty>> = match expected.map(|t| cx.tys_ref().kind(t)) {
                     Some(TyKind::Tuple(ts)) => cx.tys_ref().tys_of(ts).iter().map(|&t| Some(t)).collect(),
