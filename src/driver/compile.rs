@@ -3252,7 +3252,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // unchanged passing body is a read-set candidate, and derived glue may
     // move.
     let rpit_edit = std::mem::take(&mut front.rpit_edit);
-    if rpit_edit && kept.is_err() {
+    // A program put back after a refused patch: the collect that answered
+    // in between stored read sets against its own program (`Front::kept_put_back`).
+    let put_back = std::mem::take(&mut front.kept_put_back) && kept.is_ok();
+    if (rpit_edit && kept.is_err()) || put_back {
         let mut listed = vec![false; fn_count];
         changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
         let cands: Vec<usize> = (0..fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !listed[i]).collect();
@@ -3634,7 +3637,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             t.note_parts(super::laps::take());
             Some(k)
         }
-        None if wants && body_only && rpit_edit => {
+        None if wants && body_only && (rpit_edit || put_back) => {
             let checked = &mut |k: &crate::driver::graph::ReadKey| matches!(k, crate::driver::graph::ReadKey::Checked(_));
             let k = keyed_dirty(&program, front, caches, checked, keyed_base, &mut answers);
             t.lap("reads keyed index");

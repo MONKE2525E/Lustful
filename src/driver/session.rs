@@ -78,6 +78,12 @@ pub(crate) struct Front {
     /// every passing body is a read-set candidate, so the users of the
     /// opaque type check again. Cleared by the request that collects.
     pub(crate) rpit_edit: bool,
+    /// Set when `patch::reuse_kept` takes a program a refused patch put back
+    /// (`KeptProgram::prefer`): the full collect that answered in between
+    /// stored the read sets it checked against its own program, so every
+    /// passing body is a read-set candidate, as for `rpit_edit`. Cleared by
+    /// the next request.
+    pub(crate) kept_put_back: bool,
     /// Set by a full resolve whose collect failed: its slot update left the
     /// per-slot caches consistent (changed bodies lost their passing mark),
     /// so the next slot update keeps them in full mode and the read-set
@@ -405,6 +411,7 @@ impl Session {
                 prev_static_defs: None,
                 revalue_consts: false,
                 rpit_edit: false,
+                kept_put_back: false,
                 walk_after_reject: false,
                 walk_pending: Vec::new(),
                 pending_derive_only: false,

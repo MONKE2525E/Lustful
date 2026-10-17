@@ -2190,6 +2190,7 @@ pub(super) fn reuse_kept(
     use crate::def::LocalDefId;
     // A build's program holds the generic instances a check's lacks.
     let k = front.kept[usize::from(walk_instances)].take().ok_or(if front.kept.iter().any(Option::is_some) { "mode" } else { "none" })?;
+    front.kept_put_back = k.prefer;
     let mut bases = k.bases;
     let mut edits = match k.edits {
         Some(e) => e,
@@ -2331,6 +2332,9 @@ pub(super) fn reuse_kept(
         let stands = crate::check::opaque::hidden_stands(&mut p, LocalDefId(fn_index as u32));
         (p.record_reads, p.unwind) = (record_reads, unwind);
         if !stands {
+            if headers.is_empty() && derives.is_empty() {
+                put_back(front, p, edits, bases);
+            }
             return Err("hidden type");
         }
     }
@@ -2369,68 +2373,90 @@ pub(super) fn reuse_kept(
     // Discovery checks every plain body when user generics exist; with
     // only the lang enum methods' generics, a build checks the bodies
     // that name one (not tracked here) and a check none.
-    if p.gx.has_generics && edits.iter().any(|e| e.fn_index.is_some()) {
-        if !p.gx.user_generics && walk_instances {
-            return Err("lang generics");
-        }
-        // A header delta's replay (`kept_delta::replay_discovery`) has
-        // checked every plain body against its base already, a pending
-        // closure map included, as collect does.
-        if p.gx.user_generics && headers.is_empty() {
-            // As collect runs discovery: before the driver sets these.
-            let (record_reads, unwind) = (p.record_reads, p.unwind);
-            (p.record_reads, p.unwind) = (true, false);
-            for (fn_index, base) in &bases {
-                if p.gx.fn_class.get(*fn_index) != Some(&FnClass::Plain) {
-                    continue;
-                }
-                let f = LocalDefId(*fn_index as u32);
-                let (mut checked, discarded) = crate::check::check_fn(&p, f);
-                if checked.closure_map_pending {
-                    crate::check::derive_delta::log(&|| format!("kept bases {}: closure map pending\n", p.display_name(p.fn_def(f).name)));
-                    return Err("discovery");
-                }
-                let out = crate::check::generics::discovery_out(&p, &checked, &discarded);
-                // An output that differs only in types that make Adt
-                // instances stands when those were made before (`made_before`).
-                let makers = match base.as_ref() {
-                    Some(b) if b.same(&p, &out, walk_instances) => Some((Vec::new(), Vec::new())),
-                    Some(b) if discarded.is_empty() && !walks_requests(&p) => b.makers(&out),
-                    _ => None,
-                };
-                let Some(makers) = makers else {
-                    crate::check::derive_delta::log(&|| {
-                        let why = base.as_ref().map_or("no base".to_string(), |b| b.differs(&p, &out));
-                        format!("kept bases {}: output differs: {why}\n", p.display_name(p.fn_def(f).name))
-                    });
-                    return Err("discovery");
-                };
-                let reads = std::mem::take(&mut checked.reads);
-                let clean = discarded.is_empty();
-                drop((checked, discarded));
-                if makers.0 != makers.1 {
-                    if !made_before(&mut p, f, &makers.0, &makers.1) {
-                        crate::check::derive_delta::log(&|| format!("kept bases {}: new types not made before its turn\n", p.display_name(p.fn_def(f).name)));
-                        return Err("discovery");
+    // Until here only a template's check again or a delta wrote to the
+    // program (its spans aside), so a refusal below can keep it.
+    let intact = headers.is_empty() && derives.is_empty() && seen.is_empty();
+    let (record_reads, unwind) = (p.record_reads, p.unwind);
+    let refused = 'discovery: {
+        if p.gx.has_generics && edits.iter().any(|e| e.fn_index.is_some()) {
+            if !p.gx.user_generics && walk_instances {
+                return Err("lang generics");
+            }
+            // A header delta's replay (`kept_delta::replay_discovery`) has
+            // checked every plain body against its base already, a pending
+            // closure map included, as collect does.
+            if p.gx.user_generics && headers.is_empty() {
+                // As collect runs discovery: before the driver sets these.
+                (p.record_reads, p.unwind) = (true, false);
+                for (fn_index, base) in &bases {
+                    if p.gx.fn_class.get(*fn_index) != Some(&FnClass::Plain) {
+                        continue;
                     }
-                    crate::check::derive_delta::log(&|| format!("kept bases {}: types made before its turn\n", p.display_name(p.fn_def(f).name)));
-                }
-                if clean {
-                    let (adt_tys, reqs, closures, vts) = &out;
-                    caches.gen_reuse.store_discovered(&p, f, &reads, adt_tys, reqs, closures, vts);
-                }
-                caches.gen_reuse.discovery_checked += 1;
-                // Every body type enters the global store, as discovery's
-                // replay does (lowering and codegen read it there).
-                for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
-                    crate::check::generics::build_owned_ty(&mut p, t);
+                    let f = LocalDefId(*fn_index as u32);
+                    let (mut checked, discarded) = crate::check::check_fn(&p, f);
+                    if checked.closure_map_pending {
+                        crate::check::derive_delta::log(&|| format!("kept bases {}: closure map pending\n", p.display_name(p.fn_def(f).name)));
+                        break 'discovery Some("discovery");
+                    }
+                    let out = crate::check::generics::discovery_out(&p, &checked, &discarded);
+                    // An output that differs only in types that make Adt
+                    // instances stands when those were made before (`made_before`).
+                    let makers = match base.as_ref() {
+                        Some(b) if b.same(&p, &out, walk_instances) => Some((Vec::new(), Vec::new())),
+                        Some(b) if discarded.is_empty() && !walks_requests(&p) => b.makers(&out),
+                        _ => None,
+                    };
+                    let Some(makers) = makers else {
+                        crate::check::derive_delta::log(&|| {
+                            let why = base.as_ref().map_or("no base".to_string(), |b| b.differs(&p, &out));
+                            format!("kept bases {}: output differs: {why}\n", p.display_name(p.fn_def(f).name))
+                        });
+                        break 'discovery Some("discovery");
+                    };
+                    let reads = std::mem::take(&mut checked.reads);
+                    let clean = discarded.is_empty();
+                    drop((checked, discarded));
+                    if makers.0 != makers.1 {
+                        if !made_before(&mut p, f, &makers.0, &makers.1) {
+                            crate::check::derive_delta::log(&|| format!("kept bases {}: new types not made before its turn\n", p.display_name(p.fn_def(f).name)));
+                            break 'discovery Some("discovery");
+                        }
+                        crate::check::derive_delta::log(&|| format!("kept bases {}: types made before its turn\n", p.display_name(p.fn_def(f).name)));
+                    }
+                    if clean {
+                        let (adt_tys, reqs, closures, vts) = &out;
+                        caches.gen_reuse.store_discovered(&p, f, &reads, adt_tys, reqs, closures, vts);
+                    }
+                    caches.gen_reuse.discovery_checked += 1;
+                    // Every body type enters the global store, as discovery's
+                    // replay does (lowering and codegen read it there).
+                    for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
+                        crate::check::generics::build_owned_ty(&mut p, t);
+                    }
                 }
             }
-            (p.record_reads, p.unwind) = (record_reads, unwind);
         }
+        None
+    };
+    (p.record_reads, p.unwind) = (record_reads, unwind);
+    if let Some(why) = refused {
+        if intact {
+            put_back(front, p, edits, bases);
+        }
+        return Err(why);
     }
     super::laps::mark("collect/kept bodies");
     Ok((p, spans, template_errs))
+}
+
+/// Puts the kept program back after a refused body patch that wrote
+/// nothing to it but its moved spans (the edits say so): the request then
+/// collects in full, and when that answers with errors the program stays
+/// for the next request (`keep_err`), as after a refused header delta (an
+/// edit with a body error, then its fix or revert).
+fn put_back(front: &mut Front, p: crate::check::collect::Program, edits: Vec<KeptEdit>, bases: Vec<KeptBase>) {
+    let slot = usize::from(p.gx.walk_instances);
+    front.kept[slot] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true });
 }
 
 /// True when discovery makes instances from a body's requests: in a
@@ -3573,9 +3599,11 @@ pub fn run() -> i64 {
             ("    std::rc::Rc::new(7u8)\n", "    7u16\n", "hidden_type"),
             ("    7u16\n", "    7u8\n", "hidden_type"),
             ("    move |x| x + n\n", "    move |x| x + n + \"a\"\n", "hidden_type"),
-            ("    move |x| x + n + \"a\"\n", "    move |x| x + n\n", "hidden_type"),
+            // The fix of an error (here and after the `Rc` capture): the
+            // program from before the error stays (`put_back`).
+            ("    move |x| x + n + \"a\"\n", "    move |x| x + n\n", "reuse"),
             ("    move |x| x + n\n", "    let r = std::rc::Rc::new(n);\n    move |x| x + *r\n", "hidden_type"),
-            ("    let r = std::rc::Rc::new(n);\n    move |x| x + *r\n", "    move |x| x + n\n", "hidden_type"),
+            ("    let r = std::rc::Rc::new(n);\n    move |x| x + *r\n", "    move |x| x + n\n", "reuse"),
             ("    move |x| x + n\n", "    let _z = 0;\n    move |x| x + n\n", "reuse"),
             ("    move || s.len()\n", "    move || {\n        let t = s;\n        t.len()\n    }\n", ""),
             ("    move || {\n        let t = s;\n        t.len()\n    }\n", "    move || s.len()\n", ""),
