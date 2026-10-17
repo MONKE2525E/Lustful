@@ -1036,12 +1036,16 @@ impl<'p> Ctx<'p> {
         self.cap_consume(body, &mut w);
         let span = self.span(e);
         if let Some(bad) = w.bad {
-            self.err(
-                "L0820",
-                bad,
-                "this use of a captured variable is not supported in closures yet",
-                "Rewrite the use, or move the value into a local before the closure.",
-            );
+            // An earlier error in the body (an unresolved callee or type)
+            // often leaves a capture's type unknown: that error is the cause.
+            if !self.errs.iter().any(|d| d.code != "L0820") {
+                self.err(
+                    "L0820",
+                    bad,
+                    "this use of a captured variable is not supported in closures yet",
+                    "Rewrite the use, or move the value into a local before the closure.",
+                );
+            }
             return (ClosureKind::FnOnce, Vec::new());
         }
         // process_collected_capture_information: restrict precision,
