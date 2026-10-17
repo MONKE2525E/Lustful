@@ -613,6 +613,9 @@ fn replay_bodies(
     let readers = readers(p, &caches.gen_reuse, fns);
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
+    // The new signatures stand from here: the deep Adt fingerprints the
+    // checks below record follow the program (`FpMemo::follow_scoped`).
+    let followed = p.fp_memo.follow_scoped();
     let out = (|| {
         let reuse = &mut caches.gen_reuse;
         let mut again = Vec::new();
@@ -680,6 +683,9 @@ fn replay_bodies(
         super::laps::mark("collect/delta replay templates");
         replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers))
     })();
+    if followed {
+        p.fp_memo.follow_end();
+    }
     (p.record_reads, p.unwind) = (record_reads, unwind);
     out
 }
@@ -719,6 +725,10 @@ pub(super) fn replay_discovery(
     // (body, its reads when it is stored or a pending check of `lust check`
     // (`GenReuse::note_unstored`), whether it is pending, its output).
     let mut outs: Vec<(LocalDefId, Option<crate::driver::graph::Reads>, bool, crate::driver::gen_reuse::Discovered)> = Vec::new();
+    // As in `replay_bodies`: the delta's edits are in (a derive delta's
+    // toggles too), so the deep fingerprints follow the program.
+    let followed = p.fp_memo.follow_scoped();
+    crate::driver::graph::FpMemo::sync(p);
     let out = (|| {
         let reuse = &mut caches.gen_reuse;
         // The bodies that check again, each with the output it must give,
@@ -779,6 +789,7 @@ pub(super) fn replay_discovery(
             }
             crate::check::derive_delta::log(&|| format!("discovery replay pending: {}\n", why.join("; ")));
         }
+        crate::driver::graph::FpMemo::sync(p);
         let prog: &Program = p;
         let checked = crate::driver::compile::par_map(&work, |&(g, _, _)| {
             let t = std::time::Instant::now();
@@ -841,6 +852,9 @@ pub(super) fn replay_discovery(
         }
         Ok(())
     })();
+    if followed {
+        p.fp_memo.follow_end();
+    }
     (p.record_reads, p.unwind) = (record_reads, unwind);
     out
 }

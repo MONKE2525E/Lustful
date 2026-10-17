@@ -670,6 +670,16 @@ impl FpMemo {
         }
     }
 
+    /// `follow_begin` for a kept program delta (driver/kept_delta.rs,
+    /// patch.rs): its body checks run after its edits, on a program that
+    /// changes between them only as mono's does (`sync`). True when this
+    /// call started following, so the caller ends it (`follow_end`).
+    pub(crate) fn follow_scoped(&mut self) -> bool {
+        let idle = self.follow.is_none() && self.layout.is_empty() && self.regions.is_empty();
+        self.follow_begin();
+        idle
+    }
+
     pub(crate) fn follow_end(&mut self) {
         if self.follow.is_some() {
             self.off();

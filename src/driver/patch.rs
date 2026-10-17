@@ -2607,11 +2607,14 @@ pub(super) fn reuse_kept(
             if p.gx.user_generics && headers.is_empty() {
                 // As collect runs discovery: before the driver sets these.
                 (p.record_reads, p.unwind) = (true, false);
+                // The edits are in: deep fingerprints follow the program.
+                p.fp_memo.follow_scoped();
                 for (fn_index, base) in &bases {
                     if p.gx.fn_class.get(*fn_index) != Some(&FnClass::Plain) {
                         continue;
                     }
                     let f = LocalDefId(*fn_index as u32);
+                    crate::driver::graph::FpMemo::sync(&mut p);
                     let (mut checked, discarded) = crate::check::check_fn(&p, f);
                     if checked.closure_map_pending {
                         crate::check::derive_delta::log(&|| format!("kept bases {}: closure map pending\n", p.display_name(p.fn_def(f).name)));
@@ -2664,6 +2667,7 @@ pub(super) fn reuse_kept(
         }
         None
     };
+    p.fp_memo.follow_end();
     (p.record_reads, p.unwind) = (record_reads, unwind);
     if let Some(why) = refused {
         if intact {
