@@ -10,7 +10,9 @@
 # and state dependence in collect, mono, and codegen (fx-scanfa round 2: a warm build said
 # "`take` (Template) has no generated body" because a pending discovery was stored for replay).
 # Run after scripts/build.sh. Env: STRIDE=n checks every n-th case (default 1), CASES=<glob>.
-# Exit 0 = all same, 1 = a difference or a case whose cold build fails, 2 = setup error.
+# Every selected case must give exactly one result line; a missing line fails the run.
+# Exit 0 = all same, 1 = a difference, a case whose cold build fails, or a missing result,
+# 2 = setup error.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 lust=$root/target/release/lust
@@ -23,8 +25,8 @@ unset LUST_DAEMON_SOCKET LUST_CACHE_DIR
 extras=$(cd "$root/tests/pass" && ls | grep -v '\.rs$' | tr '\n' ' ')
 export LUST_NO_CACHE=1 lust work root extras
 
-# one <case>: prints "ok <name>", "skip <name>" (cold build failed), or
-# "bad <name>: <why>".
+# one <case>: prints "ok <name>" or "bad <name>: <why>" (a cold build that fails is bad: a
+# tests/pass case must build).
 one() {
   local f=$1 name d out
   name=$(basename "$f" .rs)
@@ -35,7 +37,7 @@ one() {
   cd "$d" || return
   run() { ( timeout 20 "./$1" > "$1.out" 2>/dev/null ) 2>/dev/null; echo "exit=$?" >> "$1.out"; }
   if ! LUST_NO_DAEMON=1 timeout 120 "$lust" build main.rs -o cold > cold.err 2>&1; then
-    echo "skip $name"; return
+    echo "bad $name: cold build failed: $(head -c 200 cold.err)"; return
   fi
   run cold
   LUST_NO_DAEMON=1 LUST_THREADS=1 timeout 120 "$lust" build main.rs -o t1 > t1.err 2>&1 || { echo "bad $name: LUST_THREADS=1 build failed: $(head -c 200 t1.err)"; return; }
@@ -58,11 +60,13 @@ export -f one
 
 cases=$(ls "$root"/tests/pass/${CASES:-*}.rs | awk -v s="$stride" 'NR % s == 0')
 [ -n "$cases" ] || { echo "error: no cases"; exit 2; }
+n=$(printf '%s\n' $cases | wc -l)
 printf '%s\n' $cases | xargs -P "$jobs" -I{} bash -c 'one {}' > "$work/results.txt"
 ok=$(grep -c '^ok ' "$work/results.txt")
-skip=$(grep -c '^skip ' "$work/results.txt")
 bad=$(grep -c '^bad ' "$work/results.txt")
-grep -E '^(bad|skip) ' "$work/results.txt" | sort
-echo "warm-check: $ok same, $bad different, $skip skipped (cold build failed)"
-# A tests/pass case must build: a skip fails too.
-[ "$bad" -eq 0 ] && [ "$skip" -eq 0 ]
+grep -E '^bad ' "$work/results.txt" | sort
+# A case whose job died before it printed (or printed twice) shows up here.
+missing=$(( n - ok - bad ))
+[ "$missing" -eq 0 ] || echo "error: $n cases, but $((ok + bad)) result lines"
+echo "warm-check: $ok same, $bad different, $missing missing, of $n cases"
+[ "$bad" -eq 0 ] && [ "$missing" -eq 0 ]
