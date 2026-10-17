@@ -39,6 +39,7 @@
 // it was: `reuse_kept` keeps it for the next request (sigedit R9).
 //
 // check/delta_audit.rs lists what the delta does with each Program field.
+use super::compile::fn_def_at;
 use super::const_reach::ConstReach;
 use super::session::{Caches, Front};
 use crate::check::collect::{FnLoc, Program};
@@ -278,9 +279,13 @@ fn untouched_refusals(
         refusal(p, f, walk_instances)?;
         // An inherent method: a root `Q::name` names it only when `Q` may
         // denote its Adt (`ConstReach::reaches_inherent`).
+        // `refusal` took every fn that was const; the new header may be.
         let adt = p.gx.inherent_methods.iter().find(|(_, v)| v.contains(&f)).and_then(|(k, _)| p.adt_by_def(k.0));
         let reached = match adt {
-            Some(a) => reach.reaches_inherent(front, i, p.name(p.adt(a).name)),
+            Some(a) => {
+                let (item, sub) = front.fn_loc[i];
+                reach.reaches_inherent(front, i, p.name(p.adt(a).name), fn_def_at(&front.ast, item, sub).qual.is_const)
+            }
             None => reach.reaches(front, i),
         };
         if reached {

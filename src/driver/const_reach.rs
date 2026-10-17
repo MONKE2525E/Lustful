@@ -41,7 +41,9 @@
 // Adt: not its name, `Self`, or any name a type alias, `use` rename, or
 // associated type has (by name, as everything here), or a name the
 // resolver gave a def of another crate (a dependency cannot name a type
-// of a crate that depends on it). A qualifier with generic arguments
+// of a crate that depends on it). A method call `.name(..)` there counts
+// only when the method is const before or after the edit (the check rejects
+// a const context's call of a non-const fn, L0631). A qualifier with generic arguments
 // (`Id::<T>::f`, through `type Id<T> = T`) counts as unqualified. Identifiers inside a
 // closure body in an item value do not count at all (outside `const`
 // blocks): the evaluator never runs a closure (`ast_hash::ConstRoots`).
@@ -99,9 +101,12 @@ impl ConstReach {
         for &(q, n) in &roots.quals {
             quals.entry(n).or_default().push(q);
         }
+        for &n in &roots.scalar_calls {
+            quals.entry(n).or_default().push(n);
+        }
         let mut r = ConstReach {
             names: FxSet::default(),
-            scalar: roots.scalar.iter().copied().collect(),
+            scalar: roots.scalar.iter().chain(&roots.scalar_calls).copied().collect(),
             values: roots.values,
             seen: arena_lens(front),
             expanded: vec![false; consts.len()],
@@ -121,9 +126,12 @@ impl ConstReach {
     /// indexes) that are reachable const fns.
     pub(crate) fn update(&mut self, front: &Front, edited: &[usize]) {
         let roots = super::ast_hash::const_idents(&front.ast, self.seen, false, None, front.known.self_type);
-        self.scalar.extend(roots.scalar.iter().copied());
+        self.scalar.extend(roots.scalar.iter().chain(&roots.scalar_calls).copied());
         self.unqual.extend(roots.scalar.iter().copied());
-        self.names.extend(roots.scalar);
+        self.names.extend(roots.scalar.iter().chain(&roots.scalar_calls).copied());
+        for &n in &roots.scalar_calls {
+            self.quals.entry(n).or_default().push(n);
+        }
         self.seen = arena_lens(front);
         for (k, (i, _)) in self.consts.iter().enumerate() {
             if edited.contains(i) {
@@ -146,8 +154,12 @@ impl ConstReach {
     /// of its name is `Q::name` with `Q` none of the Adt's name and
     /// `aliases`, or a name the resolver gave another crate's def
     /// (`crate_prefix`: a dependency or shipped crate cannot name a type of
-    /// a crate that depends on it, so neither can its aliases).
-    pub(crate) fn reaches_inherent(&self, front: &Front, i: usize, adt: &str) -> bool {
+    /// a crate that depends on it, so neither can its aliases). A method
+    /// call `.name(..)` (the pair (name, name)) counts only for a method
+    /// that may be const: the check rejects a const context's call of a
+    /// non-const fn (L0631), so no evaluator runs one, and a method call
+    /// is no fn pointer value whose header a value reads.
+    pub(crate) fn reaches_inherent(&self, front: &Front, i: usize, adt: &str, may_be_const: bool) -> bool {
         let (item, sub) = front.fn_loc[i];
         let name = fn_def_at(&front.ast, item, sub).name;
         if !self.names.contains(&name) {
@@ -163,7 +175,7 @@ impl ConstReach {
             let q = crate::intern::source_name(full).trim_start_matches("r#");
             q == adt || self.aliases.contains(q)
         };
-        self.unqual.contains(&name) || self.quals.get(&name).is_none_or(|qs| qs.iter().any(may_be))
+        self.unqual.contains(&name) || self.quals.get(&name).is_none_or(|qs| qs.iter().any(|q| may_be(q) || (*q == name && may_be_const)))
     }
 
     /// True when the results of fns `fns` (`Front::fn_loc` indexes) can
