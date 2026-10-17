@@ -10,10 +10,13 @@ use crate::traits::solve::{PureCx, Solver, eval::Evaluator};
 use crate::ty::*;
 
 /// The crate's `#![recursion_limit = "N"]`, else rustc's default 128.
-/// expand rejects a malformed value and one below 128.
+/// expand rejects a malformed value and one below 128. Every body check
+/// asks, so a program whose source never names the attribute (its name
+/// was never interned) answers without the scan of every inner attribute.
 pub fn recursion_limit(p: &Program) -> usize {
+    let Some(name) = p.interner.find("recursion_limit") else { return 128 };
     for a in &p.ast.inner_attrs {
-        if a.path.len() != 1 || p.interner.get(a.path[0].name) != "recursion_limit" {
+        if a.path.len() != 1 || a.path[0].name != name {
             continue;
         }
         // `= "N"` arrives as an expression or, after expansion, as the

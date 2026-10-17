@@ -160,10 +160,13 @@ fn json_value(b: &[u8], p: &mut usize) -> Result<Json, String> {
                         *p += 1;
                     }
                     Some(_) => {
-                        let rest = std::str::from_utf8(&b[*p..]).map_err(|_| "invalid utf-8 in string".to_string())?;
-                        let ch = rest.chars().next().ok_or("unterminated string")?;
-                        s.push(ch);
-                        *p += ch.len_utf8();
+                        // The run up to the next quote or backslash at once: both
+                        // are ASCII, so the run ends on a char boundary.
+                        let start = *p;
+                        while *p < b.len() && b[*p] != b'"' && b[*p] != b'\\' {
+                            *p += 1;
+                        }
+                        s.push_str(std::str::from_utf8(&b[start..*p]).map_err(|_| "invalid utf-8 in string".to_string())?);
                     }
                 }
             }

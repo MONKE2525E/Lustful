@@ -860,9 +860,9 @@ impl FileExpander {
             client,
         };
         let spliced = self.menv.splice(*di, lexed, self.magic);
-        let seeds: Vec<crate::expand::MacroSeed> = match self.menv.glob_seeds.get(*di) {
+        let seeds: std::borrow::Cow<[crate::expand::MacroSeed]> = match self.menv.glob_seeds.get(*di) {
             Some(extra) if !extra.is_empty() => self.menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
-            _ => self.menv.seeds.clone(),
+            _ => std::borrow::Cow::Borrowed(&self.menv.seeds),
         };
         Some(crate::expand::expand_lexed_seeded_with_deps(spliced, &ects, &seeds))
     }
@@ -3215,9 +3215,11 @@ fn resolve_one(
                 client,
             };
             let spliced = menv.splice(di, orig, job.magic);
-            let seeds: Vec<crate::expand::MacroSeed> = match menv.glob_seeds.get(di) {
+            // Borrowed unless this file has glob seeds of its own: a copy of
+            // every seed per file cost more than the expansion of most files.
+            let seeds: std::borrow::Cow<[crate::expand::MacroSeed]> = match menv.glob_seeds.get(di) {
                 Some(extra) if !extra.is_empty() => menv.seeds.iter().cloned().chain(extra.iter().cloned()).collect(),
-                _ => menv.seeds.clone(),
+                _ => std::borrow::Cow::Borrowed(&menv.seeds),
             };
             crate::expand::expand_lexed_seeded_with_deps(spliced, &ects, &seeds).map(|(l, deps)| (Some(l), deps))
         });
@@ -4305,9 +4307,9 @@ fn strip_file(
     tables: &mut ResolvedTables,
     diags: &mut Vec<Diag>,
 ) {
-    let strings = w.ast.strings.clone();
+    let strings = &w.ast.strings;
     let mut inner: Vec<Attr> = w.ast.inner_attrs.clone();
-    if let Err(d) = cfg::expand_cfg_attr(&input.env, &mut inner, &strings, interner) {
+    if let Err(d) = cfg::expand_cfg_attr(&input.env, &mut inner, strings, interner) {
         diags.push(d);
     }
     let module = w.module;
@@ -4315,7 +4317,7 @@ fn strip_file(
         tables.modules[module.0 as usize].no_prelude = true;
         no_prelude_unsupported(&inner, interner, diags);
     }
-    match cfg::attrs_enabled(&input.env, &inner, &strings, interner) {
+    match cfg::attrs_enabled(&input.env, &inner, strings, interner) {
         Ok(false) => {
             // A crate- or module-level cfg turned the whole file off.
             w.ast.items.clear();
