@@ -306,9 +306,10 @@ def main():
             counts[cls] = counts.get(cls, 0) + 1
             if cls != "ok":
                 bad.append((fam, name, cls, info))
-    print(f"defcheck_sweep: {len(jobs)} cases: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for fam, name, cls, info in sorted(bad):
         print(f"  {cls:18s} {fam}/{name} {info}")
+    # The summary prints last, so a gate lane can match it on the tail line.
+    print(f"defcheck_sweep: {len(jobs)} cases: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     fatal = [b for b in bad if b[2] in ("FALSE-ACCEPT", "false-accept-check", "wrong-output", "hang", "build-reject")]
     return 1 if fatal else 0
 
