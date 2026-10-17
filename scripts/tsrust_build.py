@@ -443,11 +443,17 @@ def run_test(exe, i, cwd, env, tmp, timeout):
         shutil.rmtree(tmp)
     tmp.mkdir(parents=True)
     e = dict(env, TMPDIR=str(tmp))
+    p = subprocess.Popen([str(exe)] + ["x"] * (i + 1), cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
     try:
-        r = subprocess.run([str(exe)] + ["x"] * (i + 1), cwd=cwd, env=e, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        res = (r.returncode, r.stdout, TID.sub(rb"\1 (TID)", r.stderr))
+        out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        res = ("hang", b"", b"")
+        p.kill()
+        p.communicate()
+        return ("hang", b"", b""), tree_digest(tmp)
+    # Tests that name std::process::id() (temp dir names) print the run's own pid: mask that
+    # exact number, as TID masks thread ids.
+    pid = re.compile(rb"(?<![0-9])" + str(p.pid).encode() + rb"(?![0-9])")
+    res = (p.returncode, pid.sub(b"(PID)", out), pid.sub(b"(PID)", TID.sub(rb"\1 (TID)", err)))
     return res, tree_digest(tmp)
 
 
