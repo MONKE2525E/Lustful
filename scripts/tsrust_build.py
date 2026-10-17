@@ -428,8 +428,10 @@ def bisect_build(lust, lib, work, env, timeout):
 
 # ---- run: each test once per build ----------------------------------------------------------
 
-def tree_digest(d):
-    return sorted((str(p.relative_to(d)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in d.rglob("*") if p.is_file())
+def tree_digest(d, pid=None):
+    """Every file under d (relative path, sha256), sorted; `pid` (a pattern) is masked in the paths."""
+    rel = (lambda p: pid.sub(b"(PID)", str(p).encode()).decode()) if pid else str
+    return sorted((rel(p.relative_to(d)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in d.rglob("*") if p.is_file())
 
 
 # Rust 1.99 names the OS thread id in its thread messages (`thread 'main' (4764) panicked`,
@@ -449,11 +451,11 @@ def run_test(exe, i, cwd, env, tmp, timeout):
         p.kill()
         p.communicate()
         return ("hang", b"", b""), tree_digest(tmp)
-    # Tests that name std::process::id() (temp dir names) print the run's own pid: mask that
-    # exact number, as TID masks thread ids.
+    # Tests that name std::process::id() (temp dir names) print the run's own pid and write
+    # files under dirs named with it: mask that exact number, as TID masks thread ids.
     pid = re.compile(rb"(?<![0-9])" + str(p.pid).encode() + rb"(?![0-9])")
     res = (p.returncode, pid.sub(b"(PID)", out), pid.sub(b"(PID)", TID.sub(rb"\1 (TID)", err)))
-    return res, tree_digest(tmp)
+    return res, tree_digest(tmp, pid)
 
 
 def compare(a, b):
