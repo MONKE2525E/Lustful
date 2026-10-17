@@ -2111,6 +2111,12 @@ struct Ctx<'p> {
     /// &Vec<u8>` before `v.push(5)`). (operand type, target, span,
     /// operand); rechecked at finish.
     deferred_coerce_casts: Vec<(Ty, Ty, Span, ExprId)>,
+    /// Casts whose operand type is still an open variable (a closure
+    /// parameter a later trait selection fixes, `|child| child as
+    /// usize`): rustc checks casts at body end (`check_casts`), so these
+    /// are checked in `finish`, after literal fallback. (operand type,
+    /// target, span).
+    deferred_open_casts: Vec<(Ty, Ty, Span)>,
     /// Types a `Result` method formats with Debug in its panic message.
     deferred_debug: Vec<(Ty, Span)>,
     /// Types a `take` builds with `Default::default()`.
@@ -2605,6 +2611,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         deferred_sort_ord: Vec::new(),
         deferred_fn_casts: Vec::new(),
         deferred_coerce_casts: Vec::new(),
+        deferred_open_casts: Vec::new(),
         deferred_debug: Vec::new(),
         deferred_default: Vec::new(),
         deferred_vec_clone: Vec::new(),
@@ -9617,6 +9624,14 @@ impl<'p> Ctx<'p> {
                 ) || self.owning_unsize_parts(t, target).is_some();
                 if coerce_cast && self.cast_operand_open(t) {
                     self.deferred_coerce_casts.push((t, target, span, *expr));
+                    return target;
+                }
+                // An operand of a still unknown type to a scalar target:
+                // decided at body end (`deferred_open_casts`).
+                if matches!(self.kind(t), TyKind::Infer(v) if v.1 == InferKind::General)
+                    && matches!(self.kind(target), TyKind::Int(_) | TyKind::Float(_) | TyKind::Char | TyKind::Bool)
+                {
+                    self.deferred_open_casts.push((t, target, span));
                     return target;
                 }
                 // A cast to a dyn reference is a coercion cast: rustc
@@ -24144,6 +24159,27 @@ impl<'p> Ctx<'p> {
         self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|t| vars.iter().any(|&v| self.occurs(v, t))))
     }
 
+    /// The scalar rows of the `as` table (the cast check in `expr`) for a
+    /// cast decided at body end: integer, float, bool and char operands,
+    /// and a fieldless enum to an integer. Any other operand (a reference,
+    /// a fn item, a raw pointer) is outside this deferred path.
+    fn scalar_cast_ok(&self, t: Ty, target: Ty) -> bool {
+        let enum_cast = self.tys.local_adt(t).is_some_and(|a| {
+            let adt = self.p.adt(a);
+            adt.is_enum && adt.variants.iter().all(|v| v.shape == VariantShape::Unit)
+        });
+        match (self.kind(t), self.kind(target)) {
+            (_, TyKind::Int(_)) if enum_cast => true,
+            (TyKind::Int(_) | TyKind::Bool | TyKind::Char, TyKind::Int(_)) => true,
+            (TyKind::Int(_) | TyKind::Float(_), TyKind::Float(_)) => true,
+            (TyKind::Float(_), TyKind::Int(_)) => true,
+            (TyKind::Int(IntTy::U8) | TyKind::Char, TyKind::Char) => true,
+            (TyKind::Bool, TyKind::Bool) => true,
+            (TyKind::Error, _) | (_, TyKind::Error) => true,
+            _ => false,
+        }
+    }
+
     /// Resolves every recorded type, defaults integer variables, and checks literal ranges.
     fn finish(&mut self) {
         // rustc's literal fallback runs between the last soft run and
@@ -24173,6 +24209,14 @@ impl<'p> Ctx<'p> {
                 let (src_d, dst_d) = (self.deep(src), self.deep(dst));
                 let (a, b) = (self.tn(src_d), self.tn(dst_d));
                 self.err("L0116", span, format!("cannot cast `{a}` as `{b}`"), "Give the literal a type suffix (`1u8`), or annotate the value before the cast.");
+            }
+        }
+        for (src, dst, span) in std::mem::take(&mut self.deferred_open_casts) {
+            self.literal_fallback_deep(src);
+            let (src_d, dst_d) = (self.deep(src), self.deep(dst));
+            if !self.scalar_cast_ok(src_d, dst_d) {
+                let (a, b) = (self.tn(src_d), self.tn(dst_d));
+                self.err("L0116", span, format!("cannot cast `{a}` as `{b}`"), "Annotate the value's type before the cast.");
             }
         }
         // A deferred `as_deref` pick can bind type variables other
