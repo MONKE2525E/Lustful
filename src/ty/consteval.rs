@@ -4723,12 +4723,12 @@ impl Evaluator {
         // The mixed-sign families and `checked_signed_diff`: the
         // argument has the other signedness, and the exact result
         // runs in i128 (exact below 128-bit widths, where the
-        // checker keeps these). The overflowing forms stay out,
-        // with the plain overflowing family above.
+        // checker keeps these). The overflowing forms give the
+        // wrapped value and whether it overflowed.
         // std has the `_unsigned` forms on signed types only and the
         // `_signed` forms on unsigned types only (rustc E0599 otherwise).
         let suffix_ok = if signed { name.ends_with("_unsigned") } else { name.ends_with("_signed") && name != "checked_signed_diff" };
-        let mixed_kind = ["checked_", "wrapping_", "saturating_", "strict_"]
+        let mixed_kind = ["checked_", "wrapping_", "saturating_", "strict_", "overflowing_"]
             .iter()
             .find(|p| suffix_ok && (name.starts_with(&format!("{p}add_")) || name.starts_with(&format!("{p}sub_"))));
         if let Some(kind) = mixed_kind {
@@ -4749,6 +4749,12 @@ impl Evaluator {
             return match *kind {
                 "checked_" => Ok(self.opt_value(cx, rt, fits.then_some(ConstValue::Int(int_from_bits(exact as u128 & mask, it))))),
                 "wrapping_" => bits_v(exact as u128),
+                "overflowing_" => {
+                    let ts = cx.tys().intern_tys(&[rt, BOOL]);
+                    let t = cx.tys().intern(TyKind::Tuple(ts));
+                    let v = ConstValue::Int(int_from_bits(exact as u128 & mask, it));
+                    Ok((ConstValue::Aggregate(vec![v, ConstValue::Bool(!fits)]), t))
+                }
                 "saturating_" => {
                     if signed {
                         int_v(exact.clamp(lo, hi_s))
