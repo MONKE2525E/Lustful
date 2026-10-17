@@ -518,8 +518,11 @@ pub enum CfgSyntaxHint {
 /// when any one position parses it or stops only at an unsupported
 /// form this parser cannot build (a non-L0001 reject, whose tail this
 /// check cannot see past). No name resolution or type check runs, and
-/// the built AST is dropped.
-pub fn check_cfg_syntax(toks: &[Token], strings: &[String], interner: &Interner, known: &Known, hint: CfgSyntaxHint) -> PResult<()> {
+/// the built AST is dropped. A node in a brace group (`in_brace`: a file,
+/// module, block, or braced body) is never a tuple field, a
+/// comma-separated expression, or a type, so those positions are not
+/// tried there (`#[cfg(any())] pub default` is no tuple field).
+pub fn check_cfg_syntax(toks: &[Token], strings: &[String], interner: &Interner, known: &Known, hint: CfgSyntaxHint, in_brace: bool) -> PResult<()> {
     if toks.iter().all(|t| t.tok == Tok::Eof) {
         return Ok(());
     }
@@ -600,6 +603,9 @@ pub fn check_cfg_syntax(toks: &[Token], strings: &[String], interner: &Interner,
             WHERE_PRED,
         ],
     };
+    if in_brace {
+        order.retain(|c| ![TUPLE_FIELD, EXPR_COMMA, TYPE].contains(c));
+    }
     // A top-level `=>` is a match arm wherever the hint came from.
     let mut depth = 0usize;
     let mut has_arm = false;
@@ -1998,6 +2004,19 @@ impl<'a> Parser<'a> {
         attrs.iter().chain(&self.scope_allows).any(|a| crate::check::allow_attr(a, self.interner, name))
     }
 
+    /// True when the tokens from here are only item qualifiers (`const`,
+    /// `async`, `unsafe`, `extern "abi"`) and then `}` or the end.
+    fn quals_then_end(&self) -> bool {
+        let mut k = 0;
+        loop {
+            match self.peek_at(k) {
+                Tok::Const | Tok::Async | Tok::Unsafe | Tok::Extern | Tok::Str(..) => k += 1,
+                Tok::RBrace | Tok::Eof => return k > 0,
+                _ => return false,
+            }
+        }
+    }
+
     fn item(&mut self) -> PResult<Option<Item>> {
         let outer = std::mem::replace(&mut self.in_body, false);
         let item = self.item_here();
@@ -2108,6 +2127,8 @@ impl<'a> Parser<'a> {
             Tok::LBrace if qual.abi.is_some() && self.cfg_syntax => ItemKind::Mod(self.extern_block_cfg(start)?),
             Tok::LBrace if qual.abi.is_some() => return Err(not_yet(C_EXTERN, start, "extern blocks")),
             Tok::Crate if qual.abi.is_some() => ItemKind::ExternCrate(self.extern_crate_def()?),
+            // Qualifiers with nothing after them are a grammar error.
+            Tok::Eof | Tok::RBrace if has_qual => return Err(syntax(start, "expected an item after qualifiers")),
             // In cfg-removed code `const` with no item after it (`const C =
             // 1;`, a bare `const`) is a grammar error, as in rustc.
             _ if qual.is_const && self.cfg_syntax => return Err(syntax(start, "expected an item after `const`")),
@@ -3074,6 +3095,10 @@ impl<'a> Parser<'a> {
                 }
                 // Const fns in traits are unstable in Rust
                 // (E0379) and unsupported here.
+                // Qualifiers with no item after them are a grammar error.
+                Tok::Const | Tok::Unsafe | Tok::Async | Tok::Extern if self.quals_then_end() => {
+                    return Err(syntax(self.span(), "expected an item after qualifiers"));
+                }
                 Tok::Const if self.peek_at(1) == Tok::Fn => return Err(self.reject(C_CONST, "const functions in traits")),
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),
@@ -3196,6 +3221,10 @@ impl<'a> Parser<'a> {
                     attrs.extend(def.attrs);
                     def.attrs = attrs;
                     fns.push(def);
+                }
+                // Qualifiers with no item after them are a grammar error.
+                Tok::Const | Tok::Unsafe | Tok::Async | Tok::Extern if self.quals_then_end() => {
+                    return Err(syntax(self.span(), "expected an item after qualifiers"));
                 }
                 Tok::Const => return Err(self.reject(C_CONST, "const functions")),
                 Tok::Unsafe => return Err(unsafe_error(self.span())),

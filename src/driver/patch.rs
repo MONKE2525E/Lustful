@@ -193,6 +193,7 @@ struct Dropped {
     lo: u32,
     hi: u32,
     item: bool,
+    brace: bool,
 }
 
 /// The crate selection inputs a patch must see unchanged: anything that
@@ -320,7 +321,7 @@ impl PatchBase {
             .iter()
             .flat_map(|c| &c.expand_deps)
             .filter_map(|d| match *d {
-                crate::expand::Dep::Dropped { file, lo, hi, item } => Some(Dropped { file, lo, hi, item }),
+                crate::expand::Dep::Dropped { file, lo, hi, item, brace } => Some(Dropped { file, lo, hi, item, brace }),
                 _ => None,
             })
             .collect();
@@ -1566,7 +1567,7 @@ fn find_inactive_edit(front: &Front, text: &str, edit: Edit) -> Result<(), Optio
         }
     }
     let hint = if node.item { crate::parser::CfgSyntaxHint::Item } else { crate::parser::CfgSyntaxHint::Node };
-    crate::parser::check_cfg_syntax(nt, &new_lexed.strings, &front.interner, &front.known, hint).map_err(|_| Some("inactive syntax"))?;
+    crate::parser::check_cfg_syntax(nt, &new_lexed.strings, &front.interner, &front.known, hint, node.brace).map_err(|_| Some("inactive syntax"))?;
     if old.contains("macro_rules") != text.contains("macro_rules")
         || shadows_parser_macro(old) != shadows_parser_macro(text)
         || shadows_builtin(old) != shadows_builtin(text)

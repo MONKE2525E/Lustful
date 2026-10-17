@@ -759,13 +759,15 @@ pub enum Dep {
     /// Not an outside input: a cfg-disabled node of the file's own tokens
     /// (macro depth 0) that the expander grammar-checked and dropped
     /// (`check_disabled_syntax`), as file id, byte range (attribute run
-    /// included), and whether it was checked as an item. The body patch
+    /// included), whether it was checked as an item, and whether it sat in
+    /// a brace group (`check_cfg_syntax`'s `in_brace`). The body patch
     /// proves an edit inside it the same way (driver/patch.rs).
     Dropped {
         file: u32,
         lo: u32,
         hi: u32,
         item: bool,
+        brace: bool,
     },
 }
 
@@ -4168,12 +4170,13 @@ impl<'a> Expander<'a> {
     fn check_disabled_syntax(&mut self, trees: &[Tt], start: usize, end: usize, hint: crate::parser::CfgSyntaxHint, depth: u32) -> Result<(), Diag> {
         let mut toks = Vec::new();
         flatten_final(&trees[start..end], &mut toks);
-        crate::parser::check_cfg_syntax(&toks, &self.strings, self.ctx.interner, self.ctx.known, hint)?;
+        let brace = self.group == Group::Brace;
+        crate::parser::check_cfg_syntax(&toks, &self.strings, self.ctx.interner, self.ctx.known, hint, brace)?;
         if let (0, Some(first), Some(last)) = (depth, toks.first(), toks.last()) {
             let (a, b) = (first.span, last.span);
             if a.ctxt == CtxtId::ROOT && b.ctxt == CtxtId::ROOT && a.file == b.file && a.lo < b.hi {
                 let item = hint == crate::parser::CfgSyntaxHint::Item;
-                self.deps.push(Dep::Dropped { file: a.file.0, lo: a.lo, hi: b.hi, item });
+                self.deps.push(Dep::Dropped { file: a.file.0, lo: a.lo, hi: b.hi, item, brace });
             }
         }
         Ok(())
