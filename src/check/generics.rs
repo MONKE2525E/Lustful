@@ -13479,12 +13479,28 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate:
             let preds = |g: &Generics| g.predicates.iter().any(|q| x.pred(&p.tys, q));
             f.params.iter().any(|&t| x.ty(&p.tys, t))
                 || x.ty(&p.tys, f.ret)
+                || p.gx.written_projections.get(&p.fn_defs[i]).is_some_and(|w| w.iter().any(|&t| x.ty(&p.tys, t)))
                 || p.gx.fn_templates.get(i).and_then(Option::as_ref).is_some_and(|t| preds(&t.generics))
                 || p.defs.get(p.fn_defs[i]).is_some_and(|d| preds(&d.generics))
         })
     };
     let wanted: Vec<usize> = (0..n_fns).filter(|&i| fn_reaches(p, i)).collect();
-    let mut items: Vec<WfItem> = wanted.into_iter().filter_map(|i| wf_fn_item(p, i)).collect();
+    // A derive delta checks the types as written (`written_projections`):
+    // collect checked them before it normalized them, and a projection
+    // owes its trait ref.
+    let written = |p: &Program, def: DefId, n: usize| p.gx.written_projections.get(&def).filter(|w| reach.is_some() && w.len() == n).cloned();
+    let mut items: Vec<WfItem> = wanted
+        .into_iter()
+        .filter_map(|i| {
+            let mut item = wf_fn_item(p, i)?;
+            if let Some(w) = written(p, p.fn_defs[i], item.0.len()) {
+                let span = item.3;
+                item.1 = if item.1.is_empty() { Vec::new() } else { w.iter().map(|&t| (t, span)).collect() };
+                item.0 = w.into_iter().map(|t| (t, span)).collect();
+            }
+            Some(item)
+        })
+        .collect();
     let at = |tys: Vec<Ty>, span: Span| -> Vec<(Ty, Span)> { tys.into_iter().map(|t| (t, span)).collect() };
     let methods: Vec<(DefId, Vec<Ty>, bool, Generics, Span)> =
         p.gx.trait_methods
@@ -13511,11 +13527,20 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate:
             continue;
         }
         let a = p.adt(AdtId(idx as u32));
-        let tys: Vec<(Ty, Span)> = a.variants.iter().flat_map(|v| v.fields.iter().map(|f| (f.ty, f.span))).collect();
+        let n = a.variants.iter().map(|v| v.fields.len()).sum();
+        let w = p.defs.def_of_adt(AdtId(idx as u32)).and_then(|d| written(p, d, n));
+        // The field types, in field order (as written, see above).
+        let field_ty = |k: usize, t: Ty| w.as_ref().map_or(t, |w| w[k]);
+        let tys: Vec<(Ty, Span)> = a.variants.iter().flat_map(|v| &v.fields).enumerate().map(|(k, f)| (field_ty(k, f.ty), f.span)).collect();
         // Only a struct's last field may be unsized.
         let unsized_ok = usize::from(!a.is_enum);
-        let values: Vec<(Ty, Span)> =
-            a.variants.iter().flat_map(|v| v.fields.iter().take(v.fields.len().saturating_sub(unsized_ok)).map(|f| (f.ty, f.span))).collect();
+        let mut k = 0;
+        let mut values: Vec<(Ty, Span)> = Vec::new();
+        for v in &a.variants {
+            let take = v.fields.len().saturating_sub(unsized_ok);
+            values.extend(v.fields.iter().enumerate().take(take).map(|(j, f)| (field_ty(k + j, f.ty), f.span)));
+            k += v.fields.len();
+        }
         items.push((tys, values, p.gx.adt_generics[idx].clone(), a.span));
     }
     for (_, rec) in p.gx.index.all_impls() {

@@ -270,10 +270,6 @@ pub(crate) fn apply(p: &mut Program, a: AdtId, new: Derives, undo: &mut Undo) ->
     if toggles.iter().any(|&(tr, ..)| assoc_impl_involved(p, tr, &reach)) {
         return Err("derive assoc impl");
     }
-    // Collect checked these written types before it normalized them.
-    if p.gx.written_projections.values().any(|tys| tys.iter().any(|&t| reach.ty(&p.tys, t))) {
-        return Err("derive projection");
-    }
     for i in 0..p.adts.len() {
         if i == a.0 as usize || p.gx.adt_instance_of.get(i).copied().flatten().is_some_and(|(t, _)| t == def) {
             undo.rows.push((i, p.adts[i].derives_unlogged()));
@@ -296,6 +292,10 @@ pub(crate) fn apply(p: &mut Program, a: AdtId, new: Derives, undo: &mut Undo) ->
         undo.records.push((id, on));
         p.gx.index.set_dead(id, !on);
     }
+    // Collect normalized these written types under the old derive lists.
+    if !written_projections_hold(p, &reach) {
+        return Err("derive projection");
+    }
     let mut errs = Vec::new();
     crate::check::generics::recheck_derive_items(p, &reach, &mut errs);
     if errs.is_empty() {
@@ -304,6 +304,46 @@ pub(crate) fn apply(p: &mut Program, a: AdtId, new: Derives, undo: &mut Undo) ->
     let name = p.display_name(p.adt(a).name).to_string();
     log(&|| errs.iter().take(3).map(|e| format!("derive diag {name}: {} {}\n", e.code, e.message)).collect());
     Err("derive diag")
+}
+
+/// True when every written type collect normalized (`written_projections`)
+/// that names the reach normalizes, under the new derive lists, to the
+/// type the program holds: a fn signature (under the fn's env) or an Adt's
+/// fields (under the Adt's env). Their well-formedness checks again on the
+/// written types (`check_written_wf`). Any other written type that names
+/// the reach (an impl's Self type, a const item's type) answers false.
+fn written_projections_hold(p: &mut Program, reach: &Reach) -> bool {
+    let named: Vec<(DefId, Vec<Ty>)> =
+        p.gx.written_projections.iter().filter(|(_, tys)| tys.iter().any(|&t| reach.ty(&p.tys, t))).map(|(&d, tys)| (d, tys.clone())).collect();
+    if named.is_empty() {
+        return true;
+    }
+    for (d, written) in named {
+        let (env, now): (Vec<Predicate>, Vec<Ty>) = if let Some(i) = p.fn_defs.iter().position(|&f| f == d) {
+            let env = p.gx.fn_scopes.get(i).map(|s| s.env.clone()).unwrap_or_default();
+            (env, p.fns[i].params.iter().copied().chain([p.fns[i].ret]).collect())
+        } else if let Some(a) = p.defs.local_adt(d) {
+            let a = a.0 as usize;
+            (p.gx.adt_envs.get(a).cloned().unwrap_or_default(), p.adts[a].variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect())
+        } else {
+            log(&|| format!("derive projection: {d:?} is no fn or Adt\n"));
+            return false;
+        };
+        if now.len() != written.len() {
+            return false;
+        }
+        for (w, n) in written.into_iter().zip(now) {
+            let t = crate::check::generics::normalize_global_in(p, &env, w);
+            if t != n {
+                log(&|| {
+                    let name = |t| crate::check::collect::ty_name(p, &p.tys, t);
+                    format!("derive projection: {d:?} {} now {} was {}\n", name(w), name(t), name(n))
+                });
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// `LUST_DERIVE_LOG=<file>`: appends why a kept-program delta fell back
