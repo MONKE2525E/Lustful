@@ -4130,6 +4130,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     let glue_changed = shared_changed || regenerated || statics_changed;
     t.lap("codegen (par)");
+    // Nothing reads the IR after codegen. A one-shot build leaks it at exit
+    // (`leak_at_exit`), but on a large program it is the largest block
+    // alive at the peak (ts-rust's bins: about 2.4 GB of 9.4 GB, through
+    // tcc and the link), so a large build frees it now.
+    let n_bodies = bodies.len();
+    let bodies = if leak_at_exit && n_bodies >= 10_000 {
+        drop(bodies);
+        t.lap("free IR");
+        Vec::new()
+    } else {
+        bodies
+    };
 
     // Units: 0 = main (always rebuilt), 1 = glue, 2 = runtime, 3 = function table, 4 = location
     // tables, 5.. = function groups. A cold build links them all statically. The daemon links
@@ -4478,7 +4490,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             resp.stderr,
             "lust build {path}: ok ({} functions, {mode}: {} fn(s) generated, {} units compiled, {} overlays, {kb} KB of C)",
             program.fns.len(),
-            bodies.len(),
+            n_bodies,
             n_units,
             caches.overlays.len(),
         );
