@@ -738,7 +738,9 @@ pub(super) fn replay_discovery(
             let pending = checked.closure_map_pending;
             let out = generics::discovery_out(prog, &checked, &discarded);
             let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
-            (out, reads, pending, t.elapsed().as_secs_f64() * 1e3)
+            // Why the output is not stored (`LUST_DERIVE_LOG`).
+            let why = discarded.first().map(|d| format!("{} {}", d.code, d.message)).unwrap_or_default();
+            (out, reads, pending, t.elapsed().as_secs_f64() * 1e3, why)
         });
         crate::check::derive_delta::log(&|| {
             let [a, b, c] = counts;
@@ -747,7 +749,8 @@ pub(super) fn replay_discovery(
                 .iter()
                 .zip(&checked)
                 .map(|(&(g, _, newer), x)| {
-                    let tags = if newer { " (newer)" } else { "" }.to_string() + if x.1.is_none() { " (unstored)" } else { "" };
+                    let tags = if newer { " (newer)" } else { "" }.to_string() + if x.1.is_none() { " (unstored" } else { "" };
+                    let tags = if x.1.is_none() { format!("{tags}: {}{})", if x.2 { "pending " } else { "" }, x.4) } else { tags };
                     (x.3, format!("{}{tags}", p.display_name(p.fn_def(g).name)))
                 })
                 .collect();
@@ -756,7 +759,7 @@ pub(super) fn replay_discovery(
             let n = work.len();
             format!("discovery replay: {a} stand, {b} untouched, {c} hold, {n} check; walk {walk_ms:.1} ms, all {ms:.1} ms; {slow}\n")
         });
-        for ((g, base, newer), (out, reads, pending, _)) in work.into_iter().zip(checked) {
+        for ((g, base, newer), (out, reads, pending, ..)) in work.into_iter().zip(checked) {
             if !base.same(p, &out, walk_instances) {
                 crate::check::derive_delta::log(&|| {
                     format!("discovery {}: output differs (pending {pending}, newer {newer}): {}\n", p.display_name(p.fn_def(g).name), base.differs(p, &out))
