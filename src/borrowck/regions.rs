@@ -4780,10 +4780,18 @@ impl<'b, 'p> Builder<'b, 'p> {
                 // `mk(v.iter())` returning `Vec<T>` borrows `v` (rustc
                 // E0505 on a later move; this was a false accept, also
                 // behind `collect` into a BTreeSet). Over-approximate:
-                // every argument region may reach the result.
+                // every argument region may reach the result, except a
+                // slot the signature writes `'static` (it holds no borrow:
+                // `-> Result<Vec<T>, &'static str>`).
                 if ok && self.item_bound(f) && !std::mem::take(&mut self.item_bound_exact) {
                     let all: Vec<u32> = avs.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-                    self.flow_all(&all, &dv);
+                    let mut named: Vec<Region> = Vec::new();
+                    let targets: Vec<u32> = if regioned_slots(&mut self.sc, sig.ret, dt, &mut named) && named.len() == dv.len() {
+                        dv.iter().zip(&named).filter(|(_, r)| **r != Region::Static).map(|(&v, _)| v).collect()
+                    } else {
+                        dv.clone()
+                    };
+                    self.flow_all(&all, &targets);
                 }
                 if ok {
                     // Closures no bound paired: like the opaque rule.
