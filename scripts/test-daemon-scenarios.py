@@ -19,7 +19,8 @@ SCEN = os.path.join(ROOT, "tests/daemon")
 
 
 def run(cmd, cwd, env, timeout=60):
-    r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+    # errors="replace": a wrong program may print bytes that are not UTF-8.
+    r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -122,6 +123,25 @@ def daemon_env(srcdir):
         return {}
     pairs = (l.strip().partition("=") for l in open(path) if l.strip())
     return {k.strip(): v.strip() for k, _, v in pairs}
+
+
+def expect_problems(tag, path, stderr):
+    """The `vN.expect` lines the warm run's last `lust-stats:` line breaks."""
+    lines = [l for l in stderr.splitlines() if l.startswith("lust-stats:")]
+    if not lines:
+        return [f"{tag}: no lust-stats line in the warm run (set LUST_STATS=1 in daemon_env)"]
+    stats = {k: int(v) for k, _, v in (kv.partition("=") for kv in lines[-1].split()[1:]) if v.isdigit()}
+    out = []
+    for line in open(path):
+        m = re.fullmatch(r"\s*(\w+)\s*(>=|<=|==)\s*(\d+)\s*", line)
+        if not m:
+            continue
+        k, op, n = m.group(1), m.group(2), int(m.group(3))
+        got = stats.get(k)
+        ok = got is not None and {">=": got >= n, "<=": got <= n, "==": got == n}[op]
+        if not ok:
+            out.append(f"{tag}: expected {k}{op}{n}, warm run has {k}={got}")
+    return out
 
 
 def guard_problems(log_path, name, wait=120):
@@ -244,6 +264,12 @@ def scenario(srcdir):
                     problems.append(f"{tag}: cold wrong: cold=({crc},{cout!r}) rustc=({rrc},{rout!r})")
             else:
                 notes.append(f"{tag}: lust rejects valid Rust in both modes (unsupported today)")
+            # `vN.expect` next to `vN`: `<stat><op><n>` lines (op >=, <=, ==) on the
+            # warm run's `lust-stats:` counters (set LUST_STATS=1 in daemon_env),
+            # e.g. `reemitted>=1` proves the cached-IR re-emit ran.
+            expect_path = vpath.removesuffix(".rs") + ".expect"
+            if os.path.isfile(expect_path):
+                problems.extend(expect_problems(tag, expect_path, werr if "run" in ops else ""))
             # Under LUST_CHECK_ITEMPATCH=1 the daemon logs each oracle failure
             # (and answers that request again from a fresh session).
             log.flush()
