@@ -3950,6 +3950,16 @@ pub fn collect_reuse(
                         Derives { clone: true, copy: true, partial_eq: true, eq: true, ..Derives::default() },
                     )
                 }
+                // std: `enum TryLockError<T> { Poisoned(PoisonError<T>),
+                // WouldBlock }`, no derives: its Debug and Display are
+                // std's texts (synthetic impls in generics.rs, glue in
+                // cgen/fmt.rs).
+                30 => {
+                    let t = p.tys.intern(TyKind::Param(ParamId(0)));
+                    let pe = crate::ty::sync::sync_ty(&mut p.tys, crate::ty::sync::SyncTy::PoisonError, &[t]);
+                    let poisoned = Variant { name: interner.intern("Poisoned"), shape: VariantShape::Tuple, fields: vec![field("0", pe)], disc: 0, non_exhaustive: false };
+                    (generics::try_lock_error_def(), vec![poisoned, unit("WouldBlock", 1)], Derives::default())
+                }
                 // std: `struct WaitTimeoutResult(bool)` with
                 // derived Debug (TRIAGE T5).
                 27 => (
@@ -4003,8 +4013,8 @@ pub fn collect_reuse(
             let repr = crate::ty::layout::Repr { int: (item_idx == usize::MAX).then_some((8, true)), ..Default::default() };
             p.adts[id.0 as usize] = AdtDef { name, is_enum, variants, derives, span, repr, non_exhaustive: synthetic_ne };
             p.gx.adt_info[id.0 as usize] = (def, 0);
-            if usize::MAX - item_idx == 12 || usize::MAX - item_idx == 25 || usize::MAX - item_idx == 26 || usize::MAX - item_idx == 28 {
-                // `Bound<T>`, `NonZero<T>`, `TrySendError<T>`, and `MaybeUninit<T>`:
+            if matches!(usize::MAX - item_idx, 12 | 25 | 26 | 28 | 30) {
+                // `Bound<T>`, `NonZero<T>`, `TrySendError<T>`, `MaybeUninit<T>`, and `TryLockError<T>`:
                 // the generic synthetic std Adts. Give each its param and field table, as
                 // the field pass does for a user generic type.
                 p.gx.adt_info[id.0 as usize] = (def, 1);
@@ -4032,6 +4042,9 @@ pub fn collect_reuse(
                     p.regions.adt_fields.insert(def, vec![vec![t], vec![t], Vec::new()]);
                 } else if usize::MAX - item_idx == 26 {
                     p.regions.adt_fields.insert(def, vec![vec![t], vec![t]]);
+                } else if usize::MAX - item_idx == 30 {
+                    let pe = crate::ty::sync::sync_ty(&mut p.tys, crate::ty::sync::SyncTy::PoisonError, &[t]);
+                    p.regions.adt_fields.insert(def, vec![vec![pe], Vec::new()]);
                 } else {
                     p.regions.adt_fields.insert(def, vec![vec![t]]);
                 }
@@ -9831,9 +9844,9 @@ fn glue_debug(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
             if let Some((a, b)) = tys.result_args(t) {
                 return glue_debug(p, tys, a, seen) && glue_debug(p, tys, b, seen);
             }
-            // `TrySendError`'s Debug hides the value, so it
-            // needs no Debug on T (TRIAGE T5).
-            if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::try_send_error_def()) {
+            // `TrySendError`'s and `TryLockError`'s Debug hide the
+            // value, so they need no Debug on T (TRIAGE T5).
+            if tys.adt_parts(t).is_some_and(|(d, _)| d == generics::try_send_error_def() || d == generics::try_lock_error_def()) {
                 return true;
             }
             match tys.local_adt(t) {
@@ -9875,7 +9888,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
             tys.is_string_ty(t)
                 || tys.smart_elem(t).is_some_and(|e| has_display(p, tys, e))
                 || tys.poison_elem(t).is_some()
-                || matches!(crate::ty::sync::sync_kind(tys, t), Some(crate::ty::sync::SyncTy::SendError | crate::ty::sync::SyncTy::TryLockError))
+                || matches!(crate::ty::sync::sync_kind(tys, t), Some(crate::ty::sync::SyncTy::SendError))
                 || tys.adt_parts(t).is_some_and(|(d, _)| {
                     d == crate::check::generics::fmt_error_def()
                         || d == generics::utf8_error_def()
@@ -9883,6 +9896,7 @@ pub fn has_display(p: &Program, tys: &impl TyIntern, t: Ty) -> bool {
                         || d == generics::recv_error_def()
                         || d == generics::try_recv_error_def()
                         || d == generics::recv_timeout_error_def()
+                        || d == generics::try_lock_error_def()
                         || d == generics::location_def()
                         || d == generics::borrow_error_def()
                         || d == generics::borrow_mut_error_def()

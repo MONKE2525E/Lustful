@@ -167,7 +167,7 @@ fn may_drop(p: &Program, tys: &mut Tys, t: Ty, depth: u32) -> bool {
                     BuiltinTy::Option | BuiltinTy::Result | BuiltinTy::Cell | BuiltinTy::RefCell
                 ) || matches!(
                     b,
-                    BuiltinTy::Sync(SyncTy::Mutex | SyncTy::RwLock | SyncTy::PoisonError | SyncTy::OnceLock | SyncTy::SendError | SyncTy::TryLockError)
+                    BuiltinTy::Sync(SyncTy::Mutex | SyncTy::RwLock | SyncTy::PoisonError | SyncTy::OnceLock | SyncTy::SendError)
                 );
                 return if wraps {
                     arg_tys().into_iter().any(|e| may_drop(p, tys, e, depth + 1))
@@ -464,7 +464,7 @@ impl Dropck<'_, '_> {
                 // `OnceLock { once: Once (AtomicU32), value, _marker:
                 // PhantomData<T> }`.
                 SyncTy::OnceLock => [Some(Item::Ty(crate::ty::int(IntTy::U32))), at(0)].into_iter().flatten().collect(),
-                SyncTy::PoisonError | SyncTy::SendError | SyncTy::TryLockError | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle => first(),
+                SyncTy::PoisonError | SyncTy::SendError | SyncTy::JoinHandle | SyncTy::ScopedJoinHandle => first(),
                 // Channel ends hold a raw counter pointer; guards and the
                 // rest hold references or plain data.
                 _ => Vec::new(),

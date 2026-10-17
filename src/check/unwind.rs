@@ -275,7 +275,7 @@ fn adt_unwind_safe(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], refs
                 }
                 each(tys, parts, seen)
             }
-            B::Sync(S::PoisonError | S::SendError | S::TryLockError) => each(tys, args.iter().map(|&e| (refs, e)).collect(), seen),
+            B::Sync(S::PoisonError | S::SendError) => each(tys, args.iter().map(|&e| (refs, e)).collect(), seen),
             _ => None,
         };
     }

@@ -71,15 +71,12 @@ pub enum SyncTy {
     OnceLock,
     /// `core::time::Duration` (for `thread::sleep`).
     Duration,
-    /// `std::sync::TryLockError<T>`: only `WouldBlock` is reachable (no
-    /// lock is ever poisoned), so its C form holds nothing.
-    TryLockError,
     /// `std::thread::Builder` (TRIAGE T5): name and stack size.
     ThreadBuilder,
 }
 
 impl SyncTy {
-    pub const ALL: [SyncTy; 36] = [
+    pub const ALL: [SyncTy; 35] = [
         SyncTy::Arc,
         SyncTy::ArcWeak,
         SyncTy::AtomicBool,
@@ -114,7 +111,6 @@ impl SyncTy {
         SyncTy::BarrierWaitResult,
         SyncTy::OnceLock,
         SyncTy::Duration,
-        SyncTy::TryLockError,
         SyncTy::ThreadBuilder,
     ];
 
@@ -155,7 +151,6 @@ impl SyncTy {
             SyncTy::BarrierWaitResult => "BarrierWaitResult",
             SyncTy::OnceLock => "OnceLock",
             SyncTy::Duration => "Duration",
-            SyncTy::TryLockError => "TryLockError",
             SyncTy::ThreadBuilder => "Builder",
         }
     }
@@ -236,7 +231,6 @@ impl SyncTy {
             | SyncTy::BarrierWaitResult
             | SyncTy::OnceLock
             | SyncTy::Duration
-            | SyncTy::TryLockError
             | SyncTy::ThreadBuilder => return None,
             SyncTy::AtomicBool => AtomicVal::Bool,
             SyncTy::AtomicI8 => AtomicVal::Int(IntTy::I8),

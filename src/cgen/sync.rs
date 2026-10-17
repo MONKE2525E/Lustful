@@ -24,7 +24,6 @@ pub(super) fn sync_ctype(k: SyncTy, e: &CTy) -> String {
         }
         (SyncTy::Condvar, _) => "uint32_t".into(),
         (SyncTy::Duration, _) => "lust_Duration".into(),
-        (SyncTy::TryLockError, _) => "lust_Unit".into(),
         (SyncTy::Barrier, _) => "lust_Barrier".into(),
         (SyncTy::BarrierWaitResult, _) => "uint8_t".into(),
         (SyncTy::ThreadBuilder, _) => "lust_ThreadBuilder".into(),
@@ -68,7 +67,6 @@ pub(super) fn sync_layout(k: SyncTy) -> Option<Layout> {
         SyncTy::Scope | SyncTy::Condvar => return Some(plain_layout(4, 4)),
         SyncTy::Barrier => return Some(plain_layout(32, 8)),
         SyncTy::Duration => return Some(plain_layout(16, 8)),
-        SyncTy::TryLockError => return Some(layout::zst_layout(1)),
         SyncTy::BarrierWaitResult => return Some(plain_layout(1, 1)),
         SyncTy::ThreadBuilder => return Some(plain_layout(40, 8)),
         _ => {}
@@ -209,20 +207,6 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         }
         (_, SyncTy::Sender | SyncTy::SyncSender | SyncTy::Receiver | SyncTy::SendError) => chan_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
         (_, SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::OnceLock) => once_glue_def(p, g, k, e, &m, &ct, protos, defs, need),
-        // `TryLockError::WouldBlock` (the only one built).
-        (Glue::Drop, SyncTy::TryLockError) => {
-            let _ = writeln!(protos, "void drop_{m}({ct} *p);");
-            let _ = writeln!(defs, "void drop_{m}({ct} *p) {{\n  (void)p;\n}}\n");
-        }
-        (Glue::Debug, SyncTy::TryLockError) => {
-            let _ = writeln!(protos, "int dbg_{m}(lust_Formatter *f, {ct} *p);");
-            let _ = writeln!(defs, "int dbg_{m}(lust_Formatter *f, {ct} *p) {{\n  (void)p; return lust_f_dbg_str(f, (lust_str){{(uint8_t*)\"WouldBlock\", 10}});\n}}\n");
-        }
-        (Glue::Display, SyncTy::TryLockError) => {
-            let msg = "try_lock failed because the operation would block";
-            let _ = writeln!(protos, "int disp_{m}(lust_Formatter *f, {ct} *p);");
-            let _ = writeln!(defs, "int disp_{m}(lust_Formatter *f, {ct} *p) {{\n  (void)p; return lust_f_pad(f, (lust_str){{(uint8_t*)\"{msg}\", {}}});\n}}\n", msg.len());
-        }
         // `Duration`: a plain `{ secs, nanos }` value.
         (Glue::Clone, SyncTy::Duration) => {
             let _ = writeln!(protos, "{ct} clone_{m}({ct} *p);");
@@ -880,6 +864,42 @@ impl FnGen<'_, '_> {
             disc_set(self.p, dest, &t, 1),
             disc_set(self.p, &et, &err, 1),
             disc_set(self.p, &et, &err, 0)
+        );
+        t
+    }
+
+    /// `Mutex::try_lock`, `RwLock::try_read` and `try_write` (`write`):
+    /// `Ok(guard)`, `Err(WouldBlock)` when the lock is held, and
+    /// `Err(Poisoned(PoisonError(guard)))` when it was taken but is
+    /// poisoned (panic=unwind only). As in std, the poisoned case keeps
+    /// the lock: dropping the guard inside the error unlocks it. A
+    /// write guard records the panic state as `lock` does.
+    pub(super) fn try_lock(&mut self, write: bool, args: &[Operand], dest: &CTy, loc: &str, post: &mut Vec<String>) -> String {
+        let (o, ot) = self.operand(&args[0], loc, post);
+        let (call, enter) = match deref_cty(&ot) {
+            CTy::Sync(SyncTy::Mutex, _) => ("lust_mutex_trylock", true),
+            _ if write => ("lust_rw_trywrite", true),
+            _ => ("lust_rw_tryread", false),
+        };
+        let et = match dest {
+            CTy::Result(_, e) => (**e).clone(),
+            other => unreachable!("try_lock returns a Result, found {other:?}"),
+        };
+        let t = self.tmp();
+        let (ok, err) = (variant_field(self.p, dest, &t, 0, 0), variant_field(self.p, dest, &t, 1, 0));
+        let poisoned = variant_field(self.p, &et, &err, 0, 0);
+        let enter = if enter { format!(" lust_poison_enter(&({o})->poison);") } else { String::new() };
+        let _ = writeln!(
+            self.out,
+            "    {} {t}; if ({call}(&({o})->st)) {{{enter} if (({o})->poison & 1) {{ {} {} {poisoned} = {o}; {} }} else {{ {} {ok} = {o}; }} }} else {{ {} {} {} }}",
+            ctype(dest),
+            disc_set(self.p, dest, &t, 1),
+            zero_c(&err),
+            disc_set(self.p, &et, &err, 0),
+            disc_set(self.p, dest, &t, 0),
+            disc_set(self.p, dest, &t, 1),
+            zero_c(&err),
+            disc_set(self.p, &et, &err, 1),
         );
         t
     }
@@ -1543,31 +1563,6 @@ impl FnGen<'_, '_> {
             S::PoisonNew => vals[0].clone(),
             S::SyncNew(SyncTy::Barrier) => format!("((lust_Barrier){{0, 0, 0, 0, {}}})", vals[0]),
             S::SyncNew(_) => "((uint32_t)0)".into(),
-            S::TryLock(write) => {
-                let (gk, call, unlock) = match (k, write) {
-                    (SyncTy::Mutex, _) => (SyncTy::MutexGuard, "lust_mutex_trylock", "lust_mutex_unlock"),
-                    (_, false) => (SyncTy::RwLockReadGuard, "lust_rw_tryread", "lust_rw_read_unlock"),
-                    _ => (SyncTy::RwLockWriteGuard, "lust_rw_trywrite", "lust_rw_write_unlock"),
-                };
-                let guard = CTy::Sync(gk, Box::new(elem.clone()));
-                let res = CTy::Result(Box::new(guard.clone()), Box::new(CTy::Sync(SyncTy::TryLockError, Box::new(guard.clone()))));
-                collect_types(&res, &mut self.sig_types);
-                let t = self.tmp();
-                let f = variant_field(self.p, &res, &t, 0, 0);
-                let o = &vals[0];
-                let enter = if gk == SyncTy::RwLockReadGuard { String::new() } else { format!(" lust_poison_enter(&({o})->poison);", o = vals[0]) };
-                // A poisoned lock is an Err (std's `TryLockError::Poisoned`,
-                // which lust's TryLockError does not carry: the lock is
-                // released and the Err is the one lust has).
-                let _ = writeln!(
-                    self.out,
-                    "    {} {t}; if ({call}(&({o})->st) && !(({o})->poison & 1 && ({unlock}(&({o})->st), 1))) {{ {} {f} = {o};{enter} }} else {{ {} }}",
-                    ctype(&res),
-                    disc_set(self.p, &res, &t, 0),
-                    disc_set(self.p, &res, &t, 1),
-                );
-                t
-            }
             S::CondvarWait => {
                 let guard = tys[1].clone();
                 let _ = writeln!(self.out, "    lust_cv_wait({}, &({})->st);", vals[0], vals[1]);

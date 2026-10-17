@@ -177,6 +177,14 @@ pub(super) fn debug_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut dy
         let disc = disc_call(p, t, "p");
         return format!("  return lust_f_write_str(f, ({disc}) ? {} : {});\n", lit("TrySendError::Disconnected(..)"), lit("TrySendError::Full(..)"));
     }
+    // `TryLockError`'s Debug is a str's Debug: `"Poisoned(..)"` or
+    // `"WouldBlock"`, quoted.
+    if let CTy::Adt(a) = t
+        && p.def_of_adt(*a) == crate::check::generics::try_lock_error_def()
+    {
+        let disc = disc_call(p, t, "p");
+        return format!("  return lust_f_dbg_str(f, ({disc}) ? {} : {});\n", lit("WouldBlock"), lit("Poisoned(..)"));
+    }
     // `Cow<B>` prints the `B` it derefs to, with no variant name.
     if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {
         return format!("  {decl}\n  return {};\n", fmt_expr(&rb, FmtKind::Debug, "f", "(&v_)", need));
@@ -344,6 +352,17 @@ pub(super) fn display_glue_body(p: &Program, t: &CTy, slots: &Slots, need: &mut 
     {
         let disc = disc_call(p, t, "p");
         return format!("  return lust_f_pad(f, ({disc}) ? {} : {});\n", lit("sending on a closed channel"), lit("sending on a full channel"));
+    }
+    // `TryLockError`'s Display is std's per-variant text.
+    if let CTy::Adt(a) = t
+        && p.def_of_adt(*a) == crate::check::generics::try_lock_error_def()
+    {
+        let disc = disc_call(p, t, "p");
+        return format!(
+            "  return lust_f_pad(f, ({disc}) ? {} : {});\n",
+            lit("try_lock failed because the operation would block"),
+            lit("poisoned lock: another task failed inside")
+        );
     }
     // `Cow<B>` displays the `B` it derefs to (W-STD-B).
     if let Some((rb, decl)) = cow_view(p, t, "p", "v_") {

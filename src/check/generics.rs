@@ -882,6 +882,18 @@ pub fn try_send_error_ty(tys: &mut impl TyIntern, t: Ty) -> Ty {
     tys.mk_adt(try_send_error_def(), &[GenericArg::Ty(t)])
 }
 
+/// The def of `std::sync::TryLockError<T>`, a synthetic generic enum
+/// (`Poisoned(PoisonError<T>)`, `WouldBlock`): the `Err` of `try_lock`,
+/// `try_read`, and `try_write`.
+pub fn try_lock_error_def() -> DefId {
+    std_adt_table()[30].2
+}
+
+/// The `std::sync::TryLockError<T>` type.
+pub fn try_lock_error_ty(tys: &mut impl TyIntern, t: Ty) -> Ty {
+    tys.mk_adt(try_lock_error_def(), &[GenericArg::Ty(t)])
+}
+
 /// The def of `std::sync::mpsc::RecvTimeoutError`, a synthetic enum
 /// (`Timeout`, `Disconnected`; tf-p6 R09).
 pub fn recv_timeout_error_def() -> DefId {
@@ -940,14 +952,14 @@ pub fn bound_elem(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 /// `atomic::Ordering` never have one (see `std_adt_has_flat_name`). The
 /// generic `Cow` (W-STD-B) is built apart in collect. The driver
 /// predicts the same list.
-pub fn std_adts() -> [(usize, &'static str, DefId, bool); 30] {
+pub fn std_adts() -> [(usize, &'static str, DefId, bool); 31] {
     *std_adt_table()
 }
 
 /// The `std_adts` rows, hashed once per process: the `*_def` fns above
 /// read them on hot paths (field privacy, every collect run).
-fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 30] {
-    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 30]> = std::sync::OnceLock::new();
+fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 31] {
+    static TABLE: std::sync::OnceLock<[(usize, &'static str, DefId, bool); 31]> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let adt = |module: &[&str], name: &str| lang_def(module, crate::def::DefKind::Adt, name);
         [
@@ -981,6 +993,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 30] {
             (27, "WaitTimeoutResult", adt(&["std", "sync"], "WaitTimeoutResult"), false),
             (28, "MaybeUninit", adt(&["core", "mem"], "MaybeUninit"), false),
             (29, "RecvTimeoutError", adt(&["std", "sync", "mpsc"], "RecvTimeoutError"), true),
+            (30, "TryLockError", adt(&["std", "sync"], "TryLockError"), true),
         ]
     })
 }
@@ -989,7 +1002,7 @@ fn std_adt_table() -> &'static [(usize, &'static str, DefId, bool); 30] {
 /// the flat type name table. `fmt::Error` and `atomic::Ordering` do
 /// not: only their std paths (after a `use`, rewritten) reach them.
 pub fn std_adt_has_flat_name(index: usize) -> bool {
-    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29)
+    !matches!(index, 1 | 4 | 5 | 6 | 7 | 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30)
 }
 
 /// The (Adt, variant) of a std enum variant path such as
@@ -1027,6 +1040,7 @@ pub fn std_adt_of_path(path: &[&str]) -> Option<DefId> {
         ("num", "NonZero", nonzero_def()),
         ("mpsc", "TrySendError", try_send_error_def()),
         ("sync", "WaitTimeoutResult", wait_timeout_result_def()),
+        ("sync", "TryLockError", try_lock_error_def()),
         ("mem", "MaybeUninit", maybe_uninit_def()),
         ("panic", "Location", location_def()),
         ("cell", "BorrowError", borrow_error_def()),
@@ -4037,6 +4051,19 @@ pub(crate) fn resolve_path_ty(
                     return Err(Diag::new("L0110", span, "`TrySendError` takes one type argument", "Write `TrySendError<T>`."));
                 }
                 return Ok(tys.mk_adt(try_send_error_def(), &args));
+            }
+            // `std::sync::TryLockError<T>`.
+            if path.len() == 3 && path[1] == "sync" && path[2] == "TryLockError" {
+                let seg = segs.last().unwrap();
+                let GenericArgs::Angle(a) = &seg.args else {
+                    return Err(Diag::new("L0110", span, "`TryLockError` takes one type argument", "Write `TryLockError<T>`."));
+                };
+                let args: Vec<GenericArg> =
+                    resolve_generic_args(ast, interner, known, cx, tys, scope, a, &[false], 1, span, "TryLockError")?.into_iter().filter(|g| g.as_ty().is_some()).collect();
+                if args.len() != 1 {
+                    return Err(Diag::new("L0110", span, "`TryLockError` takes one type argument", "Write `TryLockError<T>`."));
+                }
+                return Ok(tys.mk_adt(try_lock_error_def(), &args));
             }
             // `core::num::NonZero<T>` and its aliases
             // (`NonZeroU32` and kin, TRIAGE T5): one integer
@@ -9105,6 +9132,13 @@ pub fn add_synthetic_impls(p: &mut Program) {
         insert_synthetic(p, &mut ordinal, lang.display, tse_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
         insert_synthetic(p, &mut ordinal, lang.debug, tse_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
+    // `TryLockError<T>`: Debug (`"Poisoned(..)"`, `"WouldBlock"`) and
+    // Display are std's texts with no bound on T (glue in cgen/fmt.rs).
+    {
+        let tle_p0 = try_lock_error_ty(&mut p.tys, p0);
+        insert_synthetic(p, &mut ordinal, lang.display, tle_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+        insert_synthetic(p, &mut ordinal, lang.debug, tle_p0, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
+    }
     // Rc<T>: Clone needs no bound on T (it bumps the count);
     // the rest follow the pointee like Box, with Deref only.
     {
@@ -12058,14 +12092,14 @@ fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
 
 /// Path segment names that mark a use of a generic synthetic std Adt:
 /// `Bound` (its variants and `RangeBounds`), `NonZero` (and its
-/// aliases), `TrySendError` (and `try_send`), and `MaybeUninit` (and alloc's
+/// aliases), `TrySendError` (and `try_send`), `TryLockError`, and `MaybeUninit` (and alloc's
 /// uninit constructors). A synthetic std Adt
 /// that needs the generic flags adds its names here, not a new scan.
 const GENERIC_STD_NAMES: &[&str] = &[
     "Bound", "Included", "Excluded", "Unbounded", "RangeBounds",
     "NonZero", "NonZeroU8", "NonZeroU16", "NonZeroU32", "NonZeroU64", "NonZeroU128", "NonZeroUsize",
     "NonZeroI8", "NonZeroI16", "NonZeroI32", "NonZeroI64", "NonZeroI128", "NonZeroIsize",
-    "TrySendError", "try_send", "MaybeUninit",
+    "TrySendError", "try_send", "MaybeUninit", "TryLockError",
     // alloc's uninit constructors make a `MaybeUninit<T>` with no
     // `MaybeUninit` in the text (`Box::write(Box::new_uninit(), v)`).
     "new_uninit", "new_zeroed", "new_uninit_slice", "new_zeroed_slice",
@@ -12073,8 +12107,10 @@ const GENERIC_STD_NAMES: &[&str] = &[
 
 /// Method names that mark the same uses: the `RangeBounds` bound
 /// methods, `NonZero::get` and `available_parallelism`, `try_send`,
-/// and `MaybeUninit`'s `uninit` and `write`.
-const GENERIC_STD_METHODS: &[&str] = &["start_bound", "end_bound", "get", "available_parallelism", "try_send", "uninit", "write"];
+/// `MaybeUninit`'s `uninit` and `write`, and the lock `try_*` calls
+/// (their `Err` is a `TryLockError<G>`).
+const GENERIC_STD_METHODS: &[&str] =
+    &["start_bound", "end_bound", "get", "available_parallelism", "try_send", "uninit", "write", "try_lock", "try_read", "try_write"];
 
 /// The name collect's `uses_cow` looks for.
 pub const COW: &str = "Cow";

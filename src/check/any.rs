@@ -798,7 +798,6 @@ fn tn_sync(p: &Program, tys: &mut impl TyIntern, t: Ty, k: crate::ty::sync::Sync
         S::RwLockReadGuard => return lt_one("std::sync::poison::rwlock::RwLockReadGuard"),
         S::RwLockWriteGuard => return lt_one("std::sync::poison::rwlock::RwLockWriteGuard"),
         S::PoisonError => return one("std::sync::poison::PoisonError"),
-        S::TryLockError => return one("std::sync::poison::TryLockError"),
         S::JoinHandle => return one("std::thread::join_handle::JoinHandle"),
         S::Thread => "std::thread::thread::Thread".into(),
         S::ThreadId => "std::thread::id::ThreadId".into(),
@@ -984,6 +983,7 @@ fn tn_std_adt(p: &Program, tys: &mut impl TyIntern, t: Ty, def: DefId, open: boo
         26 => tn_apply("std::sync::mpsc::TrySendError", vec![tn_first(p, tys, t, open, in_sig)?]),
         27 => return plain("std::sync::WaitTimeoutResult"),
         29 => return plain("std::sync::mpsc::RecvTimeoutError"),
+        30 => tn_apply("std::sync::poison::TryLockError", vec![tn_first(p, tys, t, open, in_sig)?]),
         _ => return plain("core::char::convert::CharErrorKind"),
     }))
 }

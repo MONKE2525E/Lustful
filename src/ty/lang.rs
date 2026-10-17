@@ -1443,6 +1443,7 @@ pub fn std_glob_imports(path: &[&str], name: &str) -> bool {
         || crate::ty::sync::SyncTy::by_path(&full).is_some()
         || (name == "Ordering" && matches!(full.as_slice(), ["std" | "core", "sync", "atomic", "Ordering"]))
         || (STD_MPSC_ADTS.contains(&name) && path == ["std", "sync", "mpsc"])
+        || (name == "TryLockError" && path == ["std", "sync"])
 }
 
 /// True when a glob of the std module `path` imports `name` and the
@@ -1467,7 +1468,7 @@ pub fn std_glob_fns(path: &[&str]) -> Vec<&'static str> {
 
 /// Every std type name a glob `use` can bring (`std_glob_imports`).
 pub fn std_glob_names() -> impl Iterator<Item = &'static str> {
-    STD_IMPORTED_TYPES.iter().map(|t| t.2).chain(crate::ty::sync::SyncTy::ALL.iter().map(|k| k.name())).chain(STD_MPSC_ADTS.iter().copied())
+    STD_IMPORTED_TYPES.iter().map(|t| t.2).chain(crate::ty::sync::SyncTy::ALL.iter().map(|k| k.name())).chain(STD_MPSC_ADTS.iter().copied()).chain(["TryLockError"])
 }
 
 /// The `use` path to suggest for a non-prelude std type lust knows by
@@ -1704,6 +1705,7 @@ const STD_TYPE_PATHS: &[&str] = &[
     "std/sync/mpsc/RecvError",
     "std/sync/mpsc/TrySendError",
     "std/sync/WaitTimeoutResult",
+    "std/sync/TryLockError",
     "std/sync/mpsc/TryRecvError",
     "std/sync/mpsc/RecvTimeoutError",
     "alloc/string/FromUtf8Error",
@@ -2200,6 +2202,8 @@ const STD_VARIANT_PATHS: &[&str] = &[
     "std/sync/mpsc/TryRecvError/Disconnected",
     "std/sync/mpsc/RecvTimeoutError/Timeout",
     "std/sync/mpsc/RecvTimeoutError/Disconnected",
+    "std/sync/TryLockError/Poisoned",
+    "std/sync/TryLockError/WouldBlock",
 ];
 
 /// True for a trait of the Rust 2024 prelude (and the prelude's

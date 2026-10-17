@@ -3121,6 +3121,7 @@ impl FnGen<'_, '_> {
                 t
             }
             CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::ChanTrySend)) => self.chan_try_send(args, dest_cty, loc, post),
+            CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::TryLock(write))) => self.try_lock(write, args, dest_cty, loc, post),
             CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::AvailPar)) => self.avail_par(dest_cty, loc, post),
             // `MaybeUninit::uninit` and `zeroed` (TRIAGE T5): a
             // zero compound literal of the destination type (an

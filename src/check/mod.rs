@@ -12362,7 +12362,7 @@ impl<'p> Ctx<'p> {
                 self.err(
                     "L0104",
                     span,
-                    format!("no variant `{}` on `Ordering`", path[path.len() - 1]),
+                    format!("no variant `{}` on `{}`", path[path.len() - 1], path[path.len() - 2]),
                     format!("Check the name: {}.", all.join(", ")),
                 );
                 return None;

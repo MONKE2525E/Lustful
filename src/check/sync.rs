@@ -487,8 +487,6 @@ pub fn sync_glue(tys: &impl TyIntern, t: Ty, g: SyncGlue) -> Option<Result<bool,
         // for `T: Debug`.
         (SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult, G::Debug) => Ok(true),
         (SyncTy::Condvar | SyncTy::OnceLock, G::Default) => Ok(true),
-        // `TryLockError<T>` is Debug for every `T`.
-        (SyncTy::TryLockError, G::Debug) => Ok(true),
         // `Duration` is Copy, Eq, and Default (its Debug, Ord, and
         // arithmetic are not in lust yet: they reject).
         (SyncTy::Duration, G::Default | G::Clone | G::Copy | G::PartialEq) => Ok(true),
@@ -1061,7 +1059,7 @@ impl<'p> Ctx<'p> {
                         _ => SyncTy::RwLockWriteGuard,
                     };
                     let g = sync_ty(&mut self.tys, gk, &[el]);
-                    let te = sync_ty(&mut self.tys, SyncTy::TryLockError, &[g]);
+                    let te = generics::try_lock_error_ty(&mut self.tys, g);
                     (SyncOp::TryLock(n == "try_write"), Autoref::Ref, self.tys.mk_result(g, te))
                 }
                 _ => return None,
@@ -1477,10 +1475,6 @@ pub fn add_sync_impls(p: &mut crate::check::collect::Program, ordinal: &mut u32,
         insert_synthetic(p, ordinal, tr, tid, &[], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
     }
     insert_synthetic(p, ordinal, lang.partial_eq, tid, &[tid], g0.clone(), Vec::new(), Synthetic::Lang, false, span);
-    let tle = sync_ty(&mut p.tys, SyncTy::TryLockError, &[p0]);
-    for tr in [lang.debug, lang.display] {
-        insert_synthetic(p, ordinal, tr, tle, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
-    }
     let pe = sync_ty(&mut p.tys, SyncTy::PoisonError, &[p0]);
     for tr in [lang.debug, lang.display] {
         insert_synthetic(p, ordinal, tr, pe, &[], one.clone(), Vec::new(), Synthetic::Lang, false, span);
@@ -1619,12 +1613,6 @@ pub fn builtin_auto(
         // and Sync for every `T`; `Box<dyn Any + Send>` is Send only.
         B::Sync(SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId) => Some(true),
         B::Sync(SyncTy::JoinError) => Some(send),
-        // `TryLockError<T>` follows `T` (its `Poisoned` holds one).
-        B::Sync(SyncTy::TryLockError) => {
-            let Some(e) = elem else { return Some(None) };
-            seen.push((trait_def, t));
-            auto_structural(p, tys, env, trait_def, e, seen)
-        }
         B::Sync(SyncTy::Condvar | SyncTy::Barrier | SyncTy::BarrierWaitResult | SyncTy::Duration) => Some(true),
         // `OnceLock<T>` is Send for `T: Send`, Sync for `T: Send + Sync`.
         B::Sync(SyncTy::OnceLock) => {
