@@ -13902,12 +13902,26 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// True when `name` names a `const` or `static` item (a body item or a
+    /// module binding): a call of it calls the value it holds, a fn pointer
+    /// (`static S: fn(u32) -> u32 = f; S(1)`), as a call of a local does.
+    fn value_item_callee(&mut self, name: Sym) -> bool {
+        match self.body_item_of(name) {
+            Some(crate::check::collect::BodyItem::Const(_) | crate::check::collect::BodyItem::Static(_)) => return true,
+            Some(_) => return false,
+            None => {}
+        }
+        matches!(self.binding(Namespace::Value, name), BindingRes::Def(def) if matches!(self.p.binding_kind(def), Some(DefsKind::Const | DefsKind::Static)))
+    }
+
     fn call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], span: Span, expected: Option<Ty>) -> Ty {
         let p = self.p;
         // A callee that names a local (or is not a path at all)
         // is a value call: closures and Fn-bound parameters.
         let is_value = match p.ast.expr(callee) {
-            Expr::Path(segs) if segs.len() == 1 => self.lookup(segs[0].name, self.span(callee).ctxt).is_some(),
+            Expr::Path(segs) if segs.len() == 1 => {
+                self.lookup(segs[0].name, self.span(callee).ctxt).is_some() || (!segs[0].has_args() && self.value_item_callee(segs[0].name))
+            }
             Expr::Path(_) | Expr::QPath { .. } => false,
             _ => true,
         };
