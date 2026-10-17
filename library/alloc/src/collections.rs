@@ -387,6 +387,19 @@ pub mod btree_map {
             }
         }
 
+        /// The entry of the smallest key, if any.
+        pub fn first_entry(&mut self) -> Option<OccupiedEntry<'_, K, V>> {
+            if self.entries.is_empty() { None } else { Some(OccupiedEntry { map: self, index: 0 }) }
+        }
+
+        /// The entry of the largest key, if any.
+        pub fn last_entry(&mut self) -> Option<OccupiedEntry<'_, K, V>> {
+            match self.entries.len() {
+                0 => None,
+                n => Some(OccupiedEntry { map: self, index: n - 1 }),
+            }
+        }
+
         /// Moves every entry of `other` in. On an equal key `other`'s whole
         /// entry stays and this map's drops, as std's merge does.
         pub fn append(&mut self, other: &mut BTreeMap<K, V>) {

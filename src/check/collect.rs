@@ -8830,9 +8830,10 @@ fn glue_clone(p: &Program, tys: &impl TyIntern, t: Ty, seen: &mut GlueSeen) -> b
     match tys.kind(t) {
         TyKind::Param(_) | TyKind::Projection(..) => return env_proves(tys, t, p.gx.lang.clone, None),
         TyKind::Tuple(ts) => return tys.tys_of(ts).iter().all(|&e| glue_clone(p, tys, e, seen)),
-        // A closure is Clone when its captures are; only the Copy
-        // case is supported (a clone of a closure is a copy then).
-        TyKind::Closure(..) => return is_copy(p, tys, t),
+        // A closure is Clone when its captures are (rustc's clone shim
+        // clones each capture in order; cgen's tuple glue). A `&mut`
+        // capture is not Clone.
+        TyKind::Closure(_, a) => return closure_fields(tys, a).iter().all(|&e| glue_clone(p, tys, e, seen)),
         TyKind::Array(e, _) => return glue_clone(p, tys, e, seen),
         _ => {}
     }

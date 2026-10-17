@@ -305,11 +305,32 @@ impl Ex<'_, '_> {
                 self.call(CallTarget::Indirect(f), args, dest);
                 Ok(())
             }
-            TyKind::FnDef(def, _) => {
-                let local = self.p.local_def(def.hash).ok_or("thread_local expansion: fn item outside this crate")?;
-                self.call(CallTarget::Fn(local), args, dest);
-                Ok(())
-            }
+            TyKind::FnDef(def, fargs) => match self.p.local_def(def.hash) {
+                Some(local) => {
+                    self.call(CallTarget::Fn(local), args, dest);
+                    Ok(())
+                }
+                // A std method item as the callable (`try_with(Cell::take)`):
+                // its builtin, whose code is the FnDef's third arg
+                // (check `prim_item_value`).
+                None if def == crate::ty::prim_fn_def() => {
+                    let code = match self.body.tys.args(fargs).get(2) {
+                        Some(GenericArg::Const(c)) => match self.body.tys.const_kind(*c) {
+                            ConstKind::Int(v) => v as u32,
+                            _ => u32::MAX,
+                        },
+                        _ => u32::MAX,
+                    };
+                    match crate::check::prim_builtin_of_code(code) {
+                        Some(bf) if bf != Builtin::PrimFromCast => {
+                            self.call(CallTarget::Builtin(bf), args, dest);
+                            Ok(())
+                        }
+                        _ => Err("thread_local expansion: this std fn item as the callable".into()),
+                    }
+                }
+                None => Err("thread_local expansion: fn item outside this crate".into()),
+            },
             _ => Err("thread_local expansion: the callable is not a closure or fn".into()),
         }
     }

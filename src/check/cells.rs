@@ -42,9 +42,13 @@ impl<'p> Ctx<'p> {
             // as values (`.filter_map(Weak::upgrade)`, tf-p6 R05): a
             // PrimAssoc over the method (`cell_path_method_sig`).
             ("Weak", "upgrade" | "strong_count" | "weak_count")
-            | ("RefCell", "into_inner" | "get_mut" | "replace")
-            | ("Cell", "set" | "replace" | "into_inner" | "get_mut") => {
+            | ("RefCell", "into_inner" | "get_mut" | "replace" | "take")
+            | ("Cell", "set" | "replace" | "into_inner" | "get_mut" | "take") => {
                 let elem = self.new_var(false);
+                // `take` needs `T: Default` (`.try_with(Cell::take)`).
+                if i == "take" {
+                    self.deferred_default.push((elem, span));
+                }
                 let self_ty = match t.as_str() {
                     "Weak" => self.tys.mk_builtin1(|d| d.weak, elem),
                     "RefCell" => self.tys.mk_builtin1(|d| d.refcell, elem),
@@ -161,6 +165,7 @@ impl<'p> Ctx<'p> {
                 "into_inner" => (B::RefCellIntoInner, Autoref::None, vec![], el),
                 "get_mut" => (B::RefCellGetMut, Autoref::RefMut, vec![], self.tys.mk_ref(true, el)),
                 "replace" => (B::RefCellReplace, Autoref::Ref, vec![el], el),
+                "take" => (B::RefCellTake, Autoref::Ref, vec![], el),
                 _ => return None,
             }
         } else if let Some(el) = self.tys.cell_elem(self_ty) {
@@ -169,6 +174,7 @@ impl<'p> Ctx<'p> {
                 "replace" => (B::CellReplace, Autoref::Ref, vec![el], el),
                 "into_inner" => (B::CellIntoInner, Autoref::None, vec![], el),
                 "get_mut" => (B::CellGetMut, Autoref::RefMut, vec![], self.tys.mk_ref(true, el)),
+                "take" => (B::CellTake, Autoref::Ref, vec![], el),
                 _ => return None,
             }
         } else {

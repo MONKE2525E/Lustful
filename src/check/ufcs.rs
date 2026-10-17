@@ -383,6 +383,7 @@ pub(crate) const STD_VALUE_BUILTINS: &[Builtin] = &[
     Builtin::CellReplace,
     Builtin::CellIntoInner,
     Builtin::CellGetMut,
+    Builtin::CellTake,
 ];
 
 /// True for a `STD_VALUE_BUILTINS` item that cannot panic itself, so a
