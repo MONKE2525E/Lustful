@@ -8168,6 +8168,10 @@ impl<'p> Ctx<'p> {
                     }
                     if let Some(t) = annotated {
                         self.record_annotation(*pat, t);
+                    } else if let Some(&t) = ty_ann.as_ref()
+                        && generics::qpath_names_lifetime(&self.p.ast, &self.p.interner, t)
+                    {
+                        self.annotation_outlives(t);
                     }
                 }
                 // Body items and statement macros are rejected by the parser today.
@@ -8237,6 +8241,21 @@ impl<'p> Ctx<'p> {
                 "an explicit lifetime in the annotation of this pattern is not supported yet",
                 "Bind a plain name (`let x: T = ..`), or a tuple of names.",
             );
+        }
+    }
+
+    /// The outlives check of a `let` annotation whose lifetimes sit only in
+    /// a qualified path (`generics::qpath_names_lifetime`): the type must be
+    /// well-formed under the fn's implied bounds (rustc E0309). The borrow
+    /// checker does not see these regions (the local has the erased type).
+    fn annotation_outlives(&mut self, t: ast::TyId) {
+        let p = self.p;
+        let Some(r) = self.regioned_annotation(t, Region::Erased, false) else { return };
+        let env = self.env();
+        if let Some(sig) = p.regions.body_sig(p, self.fid)
+            && let Some(d) = crate::check::outlives::check_body_ty(p, &mut self.tys, sig, env, r, p.ast.ty_span(t))
+        {
+            self.errs.push(d);
         }
     }
 

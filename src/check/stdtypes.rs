@@ -190,7 +190,8 @@ fn pred_fn_ok(tys: &mut impl TyIntern, f: Ty, inner: Ty, out: Ty) -> bool {
 /// True when core implements `DoubleEndedIterator` for builtin iterator
 /// `t` (the element bounds aside: the adapters' `Iterator` impls prove
 /// those). Conservative: the kinds that need `ExactSizeIterator` too, the
-/// str and slice splits, and the forward-only kinds answer false.
+/// str and slice splits, and the forward-only kinds answer false (lowering
+/// has no `next_back` for them: `lust build` would reject the use later).
 fn written_double_ended(tys: &impl TyIntern, t: Ty) -> bool {
     use IterKind as K;
     if tys.is_chars_ty(t) {

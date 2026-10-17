@@ -1986,6 +1986,36 @@ pub fn names_static_alias(
     }
 }
 
+/// True when a written type holds a qualified path that names a lifetime
+/// other than `'_` (`<Cloned<slice::Iter<'a, T>> as Iterator>::Item`).
+/// `names_lifetime` does not look into one; a body annotation with one
+/// still gets the outlives check (`Checker::annotation_outlives`).
+pub fn qpath_names_lifetime(ast: &Ast, interner: &Interner, id: ast::TyId) -> bool {
+    let go = |t: ast::TyId| qpath_names_lifetime(ast, interner, t);
+    let in_args = |args: &GenericArgs| match args {
+        GenericArgs::Angle(a) => a.iter().any(|g| matches!(g, AstArg::Type(t) if go(*t))),
+        GenericArgs::Parenthesized { inputs, output } => inputs.iter().any(|&t| go(t)) || output.is_some_and(go),
+        _ => false,
+    };
+    match ast.ty(id) {
+        TyExpr::QPath { self_ty, trait_path, segs } => {
+            let lt_args = |s: &ast::PathSeg| match &s.args {
+                GenericArgs::Angle(a) => a.iter().any(|g| matches!(g, AstArg::Lifetime(lt) if interner.get(lt.name) != "_")),
+                _ => false,
+            };
+            names_lifetime(ast, interner, *self_ty)
+                || trait_path.iter().chain(segs.iter()).any(|s| lt_args(s) || in_args(&s.args))
+                || go(*self_ty)
+        }
+        TyExpr::Ref { inner, .. } | TyExpr::Paren(inner) | TyExpr::Slice(inner) => go(*inner),
+        TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => go(*inner),
+        TyExpr::Tuple(elems) => elems.iter().any(|&e| go(e)),
+        TyExpr::Path(segs) => segs.iter().any(|s| in_args(&s.args)),
+        TyExpr::FnPtr { inputs, ret, .. } => inputs.iter().any(|p| go(p.ty)) || ret.is_some_and(go),
+        _ => false,
+    }
+}
+
 /// `names_lifetime`; with `static_refs`, a `'static` written on a
 /// reference does not count (`names_lifetime_beyond_static_refs`).
 fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_refs: bool) -> bool {
@@ -2008,9 +2038,6 @@ fn names_lifetime_with(ast: &Ast, interner: &Interner, id: ast::TyId, static_ref
         TyExpr::Paren(i) | TyExpr::Slice(i) => go(*i),
         TyExpr::Array { inner, .. } | TyExpr::Ptr { inner, .. } => go(*inner),
         TyExpr::Path(segs) => segs.iter().any(|s| in_args(&s.args)),
-        TyExpr::QPath { self_ty, trait_path, segs } => {
-            go(*self_ty) || trait_path.iter().chain(segs.iter()).any(|s| in_args(&s.args))
-        }
         TyExpr::FnPtr { inputs, ret, .. } => inputs.iter().any(|p| go(p.ty)) || ret.is_some_and(go),
         TyExpr::Dyn { bounds, lifetime, .. } => {
             lifetime.as_ref().is_some_and(named)
