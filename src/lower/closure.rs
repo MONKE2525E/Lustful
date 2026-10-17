@@ -302,14 +302,16 @@ impl<'p> Lower<'p> {
             }
             let span = b.term_span;
             // An indirect call names its callee local: a captured fn
-            // pointer is copied out of the env into a fresh local first.
+            // pointer is copied out of the env into a fresh temporary
+            // first (mutable, as every temporary: a call in a loop
+            // assigns it again).
             if let Terminator::Call { target: CallTarget::Indirect(l), .. } = &mut b.term
                 && up.root_of(*l).is_some()
             {
                 let mut pl = Place::local(*l);
                 if rewrite_place(&up, &mut pl, true) {
                     let ty = self.body.locals[*l as usize].ty;
-                    self.body.locals.push(LocalDecl { ty, mutable: false, name: None });
+                    self.body.locals.push(LocalDecl { ty, mutable: true, name: None });
                     let t = self.body.locals.len() as Local - 1;
                     b.stmts.push(crate::ir::Stmt { kind: StmtKind::Assign(Place::local(t), Rvalue::Use(Operand::Copy(pl))), span });
                     *l = t;
