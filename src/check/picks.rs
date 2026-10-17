@@ -359,6 +359,28 @@ pub(super) fn replay_method(
                 Probe::Miss => {}
             }
         }
+        // core's `impl<I: Iterator + ?Sized> Iterator for &mut I` (and the
+        // DoubleEndedIterator and ExactSizeIterator ones) have no body in
+        // lust either: their `next`, `size_hint`, `nth`, `next_back`,
+        // `nth_back`, `len` forward to `I`, so a pick at `&mut U` with a
+        // user impl for `U` calls that impl one deref further (`i.next()`
+        // in an instance with I = &mut UserIter, also &mut &mut UserIter).
+        let forwards = !pick.slice
+            && match cx.p.interner.get(name) {
+                "next" | "size_hint" | "nth" => pick.trait_def == lang.iterator,
+                "next_back" | "nth_back" => pick.trait_def == lang.double_ended_iterator,
+                "len" => pick.trait_def == lang.exact_size_iterator,
+                _ => false,
+            };
+        while forwards && let TyKind::Ref(_, Mut::Mut, inner) = cx.tys.kind(step) {
+            (step, derefs) = (cx.resolve(inner), derefs + 1);
+            let probe = RcvProbe::at(cx, step, pick.form);
+            match method::trait_probe_for(cx, e, Some(pick.trait_def), &[probe], derefs, name, name_span, args, explicit, expected) {
+                Probe::Hit(ret) => return Some(ret),
+                Probe::Failed => return Some(ERROR),
+                Probe::Miss => {}
+            }
+        }
     }
     let p = cx.p;
     let templated =
