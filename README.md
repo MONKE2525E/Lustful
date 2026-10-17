@@ -1,4 +1,4 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/icon.svg" width="64" height="64" alt="Lust logo: a pink crab with a smiling face">
 
 # lust-lang
 
