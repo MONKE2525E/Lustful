@@ -12,3 +12,5 @@ __pycache__/
 /bench/slices/items/Cargo.lock
 # boat-run.sh --fetch results (local only; never packed into the next job)
 /boat-out/
+# scripts/release.sh output
+/dist/

@@ -1,8 +1,8 @@
 [package]
 name = "lust"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
-description = "Speed-of-light prototype of the lust compiler (Phase 0.5)"
+description = "A Rust subset compiler for fast dev checks and builds"
 
 [[bin]]
 name = "lust"

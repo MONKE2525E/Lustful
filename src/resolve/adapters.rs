@@ -72,11 +72,15 @@ pub struct Adapter {
 }
 
 /// The library tree: `$LUST_LIBRARY` when set (the section 3.8 override
-/// for std and adapter authors), else the build-time `library/`.
+/// for std and adapter authors), else the release package's copy, else the
+/// build-time `library/`.
 pub fn library_root() -> PathBuf {
     match std::env::var_os("LUST_LIBRARY") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library"),
+        _ => match crate::tcc::install_dir() {
+            Some(d) => d.join("library"),
+            None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library"),
+        },
     }
 }
 

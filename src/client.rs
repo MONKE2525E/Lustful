@@ -108,6 +108,11 @@ fn maybe_autostart(sock: &Path, file: &Path, core: &Path) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The package version and the build hash (which also keys the daemon socket and the cache).
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("lust {} (build {})", env!("CARGO_PKG_VERSION"), &env!("LUST_BUILD_HASH")[..8]);
+        return;
+    }
     // `lust port scan ...` runs the standalone `lust-port` binary
     // (tools/lust-port), found next to this executable like `lust-core`.
     if args.first().map(String::as_str) == Some("port") {

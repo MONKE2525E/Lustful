@@ -101,9 +101,9 @@ fn env_on(name: &str) -> bool {
 /// Hashes the tcc binary and every file under its runtime dir (names and bytes, sorted).
 /// About 1 MB on this setup, so well under a millisecond at hash128 speed.
 fn tcc_hash() -> (u64, u64) {
-    let lib = Path::new(env!("LUST_TCC_LIB_PATH"));
-    let mut files = vec![PathBuf::from(env!("LUST_TCC_BIN"))];
-    let mut stack = vec![lib.to_path_buf()];
+    let (lib, bin) = crate::tcc::tcc_paths();
+    let mut files = vec![bin];
+    let mut stack = vec![lib];
     while let Some(d) = stack.pop() {
         if let Ok(rd) = std::fs::read_dir(&d) {
             for e in rd.flatten() {

@@ -6,6 +6,28 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The release package's support dir, `<prefix>/lib/lust` next to `<prefix>/bin/lust-core`
+/// (scripts/release.sh lays it out). `None` for a dev build in `target/`: then tcc and
+/// `library/` are the build-time trees.
+pub fn install_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?.parent()?.join("lib/lust");
+        dir.is_dir().then_some(dir)
+    })
+    .as_deref()
+}
+
+/// The tcc runtime dir (libtcc1.a and tcc's headers) and the `tcc` binary: the release
+/// package's copies, else the tree build.rs linked against (`LUST_TCC_HOME` at build time).
+pub fn tcc_paths() -> (PathBuf, PathBuf) {
+    match install_dir() {
+        Some(d) => (d.join("tcc/lib/tcc"), d.join("tcc/bin/tcc")),
+        None => (PathBuf::from(env!("LUST_TCC_LIB_PATH")), PathBuf::from(env!("LUST_TCC_BIN"))),
+    }
+}
+
 #[repr(C)]
 struct TccState {
     _private: [u8; 0],
@@ -107,7 +129,7 @@ struct Tcc {
 
 impl Tcc {
     fn new(output: c_int, debug: bool) -> Result<Tcc, String> {
-        let lib = CString::new(env!("LUST_TCC_LIB_PATH")).unwrap();
+        let lib = cstr(&tcc_paths().0);
         // No asynchronous unwind tables: tcc writes overlapping .eh_frame
         // FDEs (spike K6), which makes the system linker reject its
         // objects. Lust frames never unwind, so the tables are pure cost.
@@ -185,8 +207,12 @@ pub fn compile_units(units: &[(PathBuf, String)], debug: bool) -> Result<(), Str
                     fail(&errors, format!("cannot write {}: {e}\n", c.display()));
                     continue;
                 }
-                let mut cmd = Command::new(env!("LUST_TCC_BIN"));
-                cmd.arg("-c").arg("-w").arg("-fno-asynchronous-unwind-tables");
+                let (lib, bin) = tcc_paths();
+                let mut cmd = Command::new(bin);
+                // -B: the runtime dir, so tcc finds its headers wherever the package lives.
+                let mut b = std::ffi::OsString::from("-B");
+                b.push(lib);
+                cmd.arg(b).arg("-c").arg("-w").arg("-fno-asynchronous-unwind-tables");
                 if debug {
                     cmd.arg("-g");
                 }
@@ -277,7 +303,7 @@ pub fn cached_runtime_object(runtime_src: &str, debug: bool) -> Result<PathBuf, 
     let mut h = std::collections::hash_map::DefaultHasher::new();
     runtime_src.hash(&mut h);
     debug.hash(&mut h);
-    env!("LUST_TCC_LIB_PATH").hash(&mut h);
+    tcc_paths().0.hash(&mut h);
     // The compile options change the object's bytes too; name the set so
     // a flag change does not reuse an object built without it.
     "opts:no-asynchronous-unwind-tables".hash(&mut h);
