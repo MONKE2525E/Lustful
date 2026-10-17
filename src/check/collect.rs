@@ -5998,41 +5998,77 @@ enum PendingState {
 /// value.
 fn expr_names_param(ast: &Ast, e: ast::ExprId, names: &[Sym]) -> bool {
     use ast::Expr;
-    let seg_names = |segs: &[ast::PathSeg]| segs.first().is_some_and(|s| names.contains(&s.name));
-    let ty_names = |ast: &Ast, t: ast::TyId| -> bool {
-        match ast.ty(t) {
-            ast::TyExpr::Path(segs) => seg_names(segs),
-            _ => false,
-        }
-    };
+    let go = |x: ast::ExprId| expr_names_param(ast, x, names);
     match ast.expr(e) {
-        Expr::Path(segs) => seg_names(segs),
-        Expr::QPath { self_ty, .. } => ty_names(ast, *self_ty),
+        Expr::Path(segs) => path_names_param(ast, segs, names),
+        Expr::QPath { self_ty, .. } => ty_names_param(ast, *self_ty, names),
         Expr::Binary { lhs, rhs, .. } | Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } => {
-            expr_names_param(ast, *lhs, names) || expr_names_param(ast, *rhs, names)
+            go(*lhs) || go(*rhs)
         }
         Expr::Unary { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Field { base: expr, .. } | Expr::TupleField { base: expr, .. } => {
-            expr_names_param(ast, *expr, names)
+            go(*expr)
         }
-        Expr::Cast { expr, ty } => expr_names_param(ast, *expr, names) || ty_names(ast, *ty),
-        Expr::Call { callee, args } => expr_names_param(ast, *callee, names) || args.iter().any(|&a| expr_names_param(ast, a, names)),
-        Expr::MethodCall { recv, args, .. } => expr_names_param(ast, *recv, names) || args.iter().any(|&a| expr_names_param(ast, a, names)),
-        Expr::Tuple(es) | Expr::Array(es) => es.iter().any(|&x| expr_names_param(ast, x, names)),
-        Expr::ArrayRepeat { value, len } => expr_names_param(ast, *value, names) || expr_names_param(ast, *len, names),
-        Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) => {
-            let b = ast.block(*b);
-            b.stmts.iter().any(|s| match s {
-                ast::Stmt::Let { init: Some(i), .. } => expr_names_param(ast, *i, names),
-                ast::Stmt::Expr { expr: x, .. } => expr_names_param(ast, *x, names),
-                _ => false,
-            }) || b.tail.is_some_and(|t| expr_names_param(ast, t, names))
+        Expr::Cast { expr, ty } => go(*expr) || ty_names_param(ast, *ty, names),
+        Expr::Call { callee, args } => go(*callee) || args.iter().any(|&a| go(a)),
+        Expr::MethodCall { recv, args, generic_args, .. } => {
+            go(*recv) || args.iter().any(|&a| go(a)) || generic_args.iter().any(|g| arg_names_param(ast, g, names))
         }
-        Expr::If { cond, els, .. } => expr_names_param(ast, *cond, names) || els.is_some_and(|x| expr_names_param(ast, x, names)),
+        Expr::Tuple(es) | Expr::Array(es) => es.iter().any(|&x| go(x)),
+        Expr::ArrayRepeat { value, len } => go(*value) || go(*len),
+        Expr::Block(b) | Expr::UnsafeBlock(b) | Expr::ConstBlock(b) | Expr::Loop { body: b, .. } => block_names_param(ast, *b, names),
+        Expr::While { cond, body, .. } => go(*cond) || block_names_param(ast, *body, names),
+        Expr::If { cond, then, els } => go(*cond) || block_names_param(ast, *then, names) || els.is_some_and(go),
+        Expr::Match { scrut, arms } => go(*scrut) || arms.iter().any(|a| a.guard.is_some_and(go) || go(a.body)),
         Expr::StructLit { path, fields, update } => {
-            seg_names(path) || fields.iter().any(|&(_, _, x)| expr_names_param(ast, x, names)) || update.is_some_and(|x| expr_names_param(ast, x, names))
+            path_names_param(ast, path, names) || fields.iter().any(|&(_, _, x)| go(x)) || update.is_some_and(go)
         }
-        Expr::Range { lo, hi, .. } => lo.is_some_and(|x| expr_names_param(ast, x, names)) || hi.is_some_and(|x| expr_names_param(ast, x, names)),
-        Expr::Return(x) | Expr::Break { value: x, .. } => x.is_some_and(|x| expr_names_param(ast, x, names)),
+        Expr::Range { lo, hi, .. } => lo.is_some_and(go) || hi.is_some_and(go),
+        Expr::Return(x) | Expr::Break { value: x, .. } => x.is_some_and(go),
+        _ => false,
+    }
+}
+
+/// `expr_names_param` for a block: its `let` types and values, its
+/// statement expressions, and its tail.
+fn block_names_param(ast: &Ast, b: ast::BlockId, names: &[Sym]) -> bool {
+    let b = ast.block(b);
+    b.stmts.iter().any(|s| match s {
+        ast::Stmt::Let { ty, init, .. } => ty.is_some_and(|t| ty_names_param(ast, t, names)) || init.is_some_and(|i| expr_names_param(ast, i, names)),
+        ast::Stmt::Expr { expr: x, .. } => expr_names_param(ast, *x, names),
+        _ => false,
+    }) || b.tail.is_some_and(|t| expr_names_param(ast, t, names))
+}
+
+/// True when a path's first segment is one of `names`, or a generic
+/// argument of any segment names one (`size_of::<V>()`).
+fn path_names_param(ast: &Ast, segs: &[ast::PathSeg], names: &[Sym]) -> bool {
+    segs.first().is_some_and(|s| names.contains(&s.name))
+        || segs.iter().any(|s| match &s.args {
+            ast::GenericArgs::Angle(args) => args.iter().any(|g| arg_names_param(ast, g, names)),
+            ast::GenericArgs::Parenthesized { inputs, output } => {
+                inputs.iter().any(|&t| ty_names_param(ast, t, names)) || output.is_some_and(|t| ty_names_param(ast, t, names))
+            }
+            ast::GenericArgs::None => false,
+        })
+}
+
+fn arg_names_param(ast: &Ast, g: &ast::GenericArg, names: &[Sym]) -> bool {
+    match g {
+        ast::GenericArg::Type(t) => ty_names_param(ast, *t, names),
+        ast::GenericArg::Const(x) => expr_names_param(ast, *x, names),
+        _ => false,
+    }
+}
+
+/// `expr_names_param` for a written type.
+fn ty_names_param(ast: &Ast, t: ast::TyId, names: &[Sym]) -> bool {
+    use ast::TyExpr;
+    match ast.ty(t) {
+        TyExpr::Path(segs) => path_names_param(ast, segs, names),
+        TyExpr::Ref { inner, .. } | TyExpr::Slice(inner) | TyExpr::Ptr { inner, .. } | TyExpr::Paren(inner) => ty_names_param(ast, *inner, names),
+        TyExpr::Array { inner, len } => ty_names_param(ast, *inner, names) || expr_names_param(ast, *len, names),
+        TyExpr::Tuple(ts) => ts.iter().any(|&x| ty_names_param(ast, x, names)),
+        TyExpr::FnPtr { inputs, ret, .. } => inputs.iter().any(|p| ty_names_param(ast, p.ty, names)) || ret.is_some_and(|r| ty_names_param(ast, r, names)),
         _ => false,
     }
 }

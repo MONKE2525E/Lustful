@@ -12949,10 +12949,12 @@ impl<'p> Ctx<'p> {
         // A template check has no layout for a type over its params;
         // each instance answers with its own (the template body is
         // never generated). A const context still needs the number,
-        // and its evaluator rejects the param (`ConstCx::layout`).
+        // and its evaluator rejects the param (`ConstCx::layout`). A
+        // generic associated const's initializer body is check-only too:
+        // its value comes per instance from `assoc_eval`.
         // The placeholder still needs rustc's `T: Sized` requirement:
         // `size_of::<T>()` with only `T: ?Sized` in the env rejects.
-        if self.is_template_check() && self.tys.flags(t).contains_param() {
+        if self.layout_placeholders() && self.tys.flags(t).contains_param() {
             if !self.sized_ok(t) {
                 let tn = self.tn(t);
                 self.err(
@@ -22702,8 +22704,16 @@ impl<'p> Ctx<'p> {
     /// True when a `size_of`/`align_of`/`needs_drop` callee's baked
     /// answer is the template placeholder (its type argument names
     /// a parameter of this template): the value is not known here.
+    /// True when a layout query over this body's params answers a
+    /// placeholder: a template check, or a const initializer body (a
+    /// generic associated const's value comes per instance from
+    /// `assoc_eval`). Neither body is ever generated.
+    fn layout_placeholders(&self) -> bool {
+        self.is_template_check() || self.f.loc.is_const_init()
+    }
+
     fn k_query_placeholder(&mut self, callee: ExprId) -> bool {
-        if !self.is_template_check() {
+        if !self.layout_placeholders() {
             return false;
         }
         let arg = match self.p.ast.expr(callee) {
