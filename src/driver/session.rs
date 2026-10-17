@@ -88,6 +88,10 @@ pub(crate) struct Front {
     /// answered with their errors: `patch::keep` gives them to the kept
     /// program (`KeptProgram::recheck`).
     pub(crate) template_recheck: Vec<usize>,
+    /// Collect's answer for this request, given by a refused header delta
+    /// (`Caches::delta_sig_errs`, moved here by `patch::reuse_kept` when it
+    /// puts the program back): compile answers it without collecting.
+    pub(crate) delta_errs: Option<Vec<crate::diag::Diag>>,
     /// Set by a full resolve whose collect failed: its slot update left the
     /// per-slot caches consistent (changed bodies lost their passing mark),
     /// so the next slot update keeps them in full mode and the read-set
@@ -280,6 +284,9 @@ pub(crate) struct Caches {
     /// that fail give their errors here, by template, instead of refusing;
     /// `reuse_kept` answers them as collect does. None outside a header delta.
     pub(crate) delta_template_errs: Option<Vec<(usize, Vec<crate::diag::Diag>)>>,
+    /// Set by a header delta refused because the one edited signature's
+    /// own checks fail (`kept_delta::apply`): the errors collect would answer.
+    pub(crate) delta_sig_errs: Option<Vec<crate::diag::Diag>>,
     /// The cached IR body per slot, in the translatable form of
     /// `ir_cache::CachedBody`. Set when the slot's body is lowered;
     /// read when a slot renumber makes its C stale and the C must be
@@ -421,6 +428,7 @@ impl Session {
                 rpit_edit: false,
                 kept_put_back: false,
                 template_recheck: Vec::new(),
+                delta_errs: None,
                 walk_after_reject: false,
                 walk_pending: Vec::new(),
                 pending_derive_only: false,
@@ -465,6 +473,7 @@ impl Session {
                 derive_only: false,
                 header_moves: None,
                 delta_template_errs: None,
+                delta_sig_errs: None,
                 slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,

@@ -2482,8 +2482,11 @@ pub(super) fn reuse_kept(
         if let Err((why, intact)) = super::kept_delta::apply_headers(&mut p, front, caches, reach, &headers, walk_instances, &mut bases) {
             // The program is as it was, with its spans moved: it stays
             // for the next request, which redoes these headers with its
-            // own (sigedit R9: a rejected header edit, then its fix).
+            // own (sigedit R9: a rejected header edit, then its fix). A
+            // signature's own errors are this request's answer.
+            let sig_errs = caches.delta_sig_errs.take();
             if intact {
+                front.delta_errs = sig_errs;
                 caches.gen_reuse.hold(p.reuse_stamp);
                 front.kept[usize::from(walk_instances)] = Some(KeptProgram { program: p, edits: Some(edits), bases, prefer: true, recheck });
             }

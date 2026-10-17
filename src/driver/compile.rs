@@ -3327,8 +3327,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             &std_routes,
         )
     };
+    // A refused header delta that found the edited signature's own errors
+    // gives collect's answer (`Front::delta_errs`; the oracle compares it).
+    let delta_errs = front.delta_errs.take();
+    let delta_answered = delta_errs.is_some();
     let collected = match kept {
         Some(r) => r,
+        None if delta_errs.is_some() => Err(delta_errs.unwrap_or_default()),
         None => match collect(front, caches) {
             // Nested statics moved after all (another static count or
             // order): their indexes did too, so generic reuse goes and
@@ -3374,7 +3379,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // derive delta on it moves every key they moved.
             let mode = usize::from(req.cmd == Cmd::Build);
             front.pending_derive_only = !const_fn_changed && front.kept[mode].as_ref().is_some_and(|k| k.derive_edits_only());
-            front.walk_pending.extend(mention_only.iter().filter_map(|&i| front.fn_slot.get(i).copied()));
+            // Not after a header delta's own answer (`delta_answered`): its
+            // program went back with the edit pending, and the next delta
+            // moves the same keys again (its keyed walk covers them).
+            if !delta_answered {
+                front.walk_pending.extend(mention_only.iter().filter_map(|&i| front.fn_slot.get(i).copied()));
+            }
             front.walk_pending.sort_unstable();
             front.walk_pending.dedup();
             front.const_fn_pending |= const_fn_changed;

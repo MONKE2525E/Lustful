@@ -77,6 +77,7 @@ pub(crate) fn apply_headers(
     bases: &mut Bases,
 ) -> Result<(), (&'static str, bool)> {
     caches.delta_template_errs = Some(Vec::new());
+    caches.delta_sig_errs = None;
     let out = apply(p, front, caches, reach, edits, walk_instances, bases);
     let template_errs = caches.delta_template_errs.take().unwrap_or_default();
     if out.is_ok() {
@@ -139,6 +140,16 @@ fn apply(
         let out = out.and_then(|()| if errs.is_empty() { Ok(()) } else { Err("sig diag") });
         if let Err(why) = out.and_then(|()| if order_bound(p, f) { Err("sig trait impl") } else { Ok(()) }) {
             undos.into_iter().rev().for_each(|u| crate::check::delta_audit::undo(p, u));
+            // One edited header whose own signature checks fail: those
+            // errors are collect's answer (it checks no body after a
+            // signature error), `Caches::delta_sig_errs`.
+            // Not a method of a trait or a trait impl: collect checks those
+            // against each other too, with more errors than the fn's own.
+            let parent = p.defs.get(p.def_id(f)).and_then(|d| d.parent);
+            let trait_side = parent.is_some_and(|d| p.gx.index.by_def(d).is_some() || p.gx.index.trait_record(d).is_some());
+            if why == "sig diag" && fns.len() == 1 && !trait_side {
+                caches.delta_sig_errs = Some(std::mem::take(&mut errs));
+            }
             return Err((why, true));
         }
     }
