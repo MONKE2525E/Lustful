@@ -7538,6 +7538,14 @@ impl<'b, 'p> Builder<'b, 'p> {
         for vs in binds.values() {
             out.extend(vs);
         }
+        // The callee's bounds hold at the call as for any fn (`F: Fn(&mut
+        // L<'s>)` ties the argument passed for `'s`); the signature's
+        // return is a placeholder, so only the arguments pair here.
+        let src = p.gx.instances.get(&f).and_then(|i| i.template_local).unwrap_or(f);
+        let preds = p.gx.fn_templates.get(src.0 as usize).and_then(|t| t.as_ref()).map_or(&[][..], |t| &t.generics.predicates[..]);
+        if !preds.is_empty() {
+            let _ = self.call_sig_with(sig, &info.params, UNIT, avs, UNIT, &[], preds);
+        }
         out
     }
 
