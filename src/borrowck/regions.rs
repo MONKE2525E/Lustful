@@ -5041,6 +5041,15 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// for example a `-> Option<Self::Item>` written with the projection.
     fn by_next_item(&mut self, it: Ty, src: &[u32], item_ty: Ty, item: &[u32]) -> bool {
         let p = self.p;
+        // A type param of this body: its own `Item = X` bound gives the
+        // item exactly (`own_param_items`).
+        if let Some(x) = self.own_param_items(it) {
+            if x.len() != item.len() {
+                return false;
+            }
+            self.tie_fixed(&x, item);
+            return true;
+        }
         // `&mut I` over a builtin iterator (core's `impl Iterator for
         // &mut I`): the item is `I`'s, so its slots follow `I`'s own
         // (`item_slots`), not the reborrow's region.
@@ -5096,6 +5105,18 @@ impl<'b, 'p> Builder<'b, 'p> {
         let (ip, tp) = (ip.to_vec(), tp.to_vec());
         if !self.relate(it, v, inner, &ip, Variance::Co) {
             return false;
+        }
+        // A type param of this body (or `&mut` of one): its own bound.
+        let base = match self.body.tys.kind(it) {
+            TyKind::Ref(_, Mut::Mut, x) => x,
+            _ => it,
+        };
+        if let Some(x) = self.own_param_items(base) {
+            if x.len() != n1 {
+                return false;
+            }
+            self.tie_fixed(&x, &tp);
+            return true;
         }
         match self.next_sig_item(it, v) {
             Some(item) if item.len() == n1 => self.relate(item_ty, &item, item_ty, &tp, Variance::Co),
@@ -6207,21 +6228,47 @@ impl<'b, 'p> Builder<'b, 'p> {
         let n = self.sc.slots(elem) as usize;
         let Some(ev) = v0.get(1..1 + n) else { return false };
         let ev = ev.to_vec();
-        if crate::ty::iter::iter_parts(&self.body.tys, *it).is_none() {
+        // Items a type param's bound fixes (`fixed_items`): the elements
+        // equal them, whatever else this call reads off the iterator.
+        let fixed = self.fixed_items(*it);
+        if let Some(x) = &fixed {
+            match x.len() {
+                k if k == n => self.tie_fixed(x, &ev),
+                k if k == n + 1 => self.tie_fixed(&x[1..], &ev),
+                _ => {}
+            }
+        }
+        if crate::ty::iter::iter_parts(&self.body.tys, *it).is_none() && fixed.is_none() {
             return false;
         }
-        let Some(item_vars) = self.item_slots(*it, iv) else { return false };
-        let item_vars = match item_vars.len() {
-            k if k == n => item_vars,
-            k if k == n + 1 => item_vars[1..].to_vec(),
-            _ => return false,
-        };
+        let Some(cands) = self.extend_items(*it, iv, fixed.is_some()) else { return false };
+        let mut items = Vec::new();
+        for c in cands {
+            items.push(match c.len() {
+                k if k == n => c,
+                k if k == n + 1 => c[1..].to_vec(),
+                _ => return false,
+            });
+        }
         if store::has_fn_ptr(&self.body.tys, vt) {
             self.store_into(*it, iv, vt, &v0[1..]);
         }
-        self.flow_all(&item_vars, &ev);
-        self.store_slots(&item_vars, vt, &ev);
+        for item_vars in items {
+            self.flow_all(&item_vars, &ev);
+            self.store_slots(&item_vars, vt, &ev);
+        }
         true
+    }
+
+    /// The items an `extend` reads off iterator `it` (slots `iv`): its
+    /// `item_slots`, or after fixed items (`fixed_items`) each side of a
+    /// `chain` (`chain_sides`). None when neither names them.
+    fn extend_items(&mut self, it: Ty, iv: &[u32], fixed: bool) -> Option<Vec<Vec<u32>>> {
+        if let Some(x) = self.item_slots(it, iv) {
+            return Some(vec![x]);
+        }
+        let mut out = Vec::new();
+        (fixed && self.chain_sides(it, iv, &mut out)).then_some(out)
     }
 
     /// `table.extend(iter)` (W-STD-B): the items' regions outlive the
@@ -6239,6 +6286,15 @@ impl<'b, 'p> Builder<'b, 'p> {
         // Fn pointer items have no slots to flow: prove them (`store_into`).
         if store::has_fn_ptr(&self.body.tys, table) {
             self.store_into(*it, iv, table, &v0[1..]);
+        }
+        // Items a type param's bound fixes: the elements equal them.
+        let fixed_items = self.fixed_items(*it);
+        let fixed = fixed_items.is_some();
+        if let Some(x) = fixed_items
+            && (x.len() == n || x.len() == n + parts)
+        {
+            let x = self.strip_copied_borrows(x, &targs[..parts], n);
+            self.tie_fixed(&x, &ev);
         }
         // A Vec, array, slice, map, or set argument: its elements' slots
         // lead its own (after the borrow for `&C`, whose items are copied).
@@ -6260,25 +6316,30 @@ impl<'b, 'p> Builder<'b, 'p> {
             self.store_slots(&part, table, &ev);
             return true;
         }
-        let Some(item_vars) = self.item_slots(*it, iv) else { return false };
-        // `Extend<&T>` and `Extend<(&K, &V)>` copy the parts in: each part
-        // has one more (leading) region, the borrow, which does not flow.
-        let item_vars = if item_vars.len() == n + parts {
-            let mut out = Vec::new();
-            let mut at = 0;
-            for &t in targs.iter().take(parts) {
-                let k = self.sc.slots(t) as usize;
-                let Some(part) = item_vars.get(at + 1..at + 1 + k) else { return false };
-                out.extend_from_slice(part);
-                at += 1 + k;
-            }
-            out
-        } else {
-            item_vars
-        };
-        self.flow_all(&item_vars, &ev);
-        self.store_slots(&item_vars, table, &ev);
+        let Some(cands) = self.extend_items(*it, iv, fixed) else { return false };
+        for item_vars in cands {
+            let item_vars = self.strip_copied_borrows(item_vars, &targs[..parts], n);
+            self.flow_all(&item_vars, &ev);
+            self.store_slots(&item_vars, table, &ev);
+        }
         true
+    }
+
+    /// `Extend<&T>` and `Extend<(&K, &V)>` copy the parts in: an item with
+    /// one more (leading) region per part (`n` element slots, part types
+    /// `parts`) drops each borrow, which does not flow. Else the item as is.
+    fn strip_copied_borrows(&mut self, item_vars: Vec<u32>, parts: &[Ty], n: usize) -> Vec<u32> {
+        if item_vars.len() != n + parts.len() {
+            return item_vars;
+        }
+        let mut out = Vec::new();
+        let mut at = 0;
+        for &t in parts {
+            let k = self.sc.slots(t) as usize;
+            out.extend_from_slice(&item_vars[at + 1..at + 1 + k]);
+            at += 1 + k;
+        }
+        out
     }
 
     /// `Peekable::peek(&'r mut self) -> Option<&'r Item>`: the outer
@@ -6354,10 +6415,106 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
     }
 
+    /// The items of this body's type param `t` (or of `<t as
+    /// IntoIterator>::IntoIter`): `X` of its own `t: Iterator<Item = X>`
+    /// bound (or `IntoIterator`, `DoubleEndedIterator`, `ExactSizeIterator`),
+    /// as this body's vars (universal `'a` is var `a + 1`, `'static` var 0).
+    /// None in a closure body, for another type, for two different bounds,
+    /// or when `X` holds an elided region or a part with no slot reading.
+    fn own_param_items(&mut self, t: Ty) -> Option<Vec<u32>> {
+        let p = self.p;
+        let lang = p.gx.lang;
+        let j = match self.body.tys.kind(t) {
+            TyKind::Param(j) => j,
+            // `<I as IntoIterator>::IntoIter` yields `I`'s items.
+            TyKind::Projection(d, a) if d.0 == lang.assoc_into_iter => match self.body.tys.args(a).first().and_then(|g| g.as_ty()).map(|x| self.body.tys.kind(x)) {
+                Some(TyKind::Param(j)) => j,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if self.own.closure {
+            return None;
+        }
+        let sig = p.regions.body_sig(p, self.body.fn_id)?;
+        let iter_trait = |d: DefId| [lang.iterator, lang.into_iterator, lang.double_ended_iterator, lang.exact_size_iterator].contains(&d);
+        let mut xs = sig.item_bounds.iter().filter(|b| b.0 == j.0 && iter_trait(b.1)).map(|b| b.2);
+        let x = xs.next()?;
+        if xs.any(|y| y != x) {
+            return None;
+        }
+        let mut rs = Vec::new();
+        regions_of(&p.tys, x, &mut rs);
+        if rs.iter().any(|r| !matches!(r, Region::Static | Region::Param(_))) {
+            return None;
+        }
+        let univ: Vec<u32> = (1..=sig.n_univ).collect();
+        let mut ps = Vec::new();
+        params_in(&p.tys, x, &mut ps);
+        let binds: FxMap<u32, Vec<u32>> = ps.into_iter().map(|q| (q, Vec::new())).collect();
+        let mut out = Vec::new();
+        self.vars_from_binds(x, &univ, &binds, &mut out).then_some(out)
+    }
+
+    /// The item slots of iterator type `t` when trait matching fixes them:
+    /// a type param of this body (`own_param_items`), `&mut` of one, or an
+    /// adapter (also the `ByNext` wrapper) that passes such items on. They
+    /// are this body's universals, so a sink that matches the items
+    /// (`Extend<T>` for `Vec<T>`) makes its elements equal to them, though
+    /// the adapters' own item slots only flow. None for a builtin source,
+    /// whose items the call may shorten (its slots are covariant).
+    fn fixed_items(&mut self, t: Ty) -> Option<Vec<u32>> {
+        use crate::ty::iter::IterKind as K;
+        match self.body.tys.kind(t) {
+            TyKind::Param(_) | TyKind::Projection(..) => return self.own_param_items(t),
+            TyKind::Ref(_, Mut::Mut, inner) => return self.fixed_items(inner),
+            _ => {}
+        }
+        let (k, a) = crate::ty::iter::iter_parts(&self.body.tys, t)?;
+        let &a0 = a.first()?;
+        match k {
+            K::ByNext | K::Filter | K::Rev | K::Take | K::Skip | K::TakeWhile | K::SkipWhile | K::StepBy | K::Peekable | K::Inspect | K::Enumerate => {
+                self.fixed_items(a0)
+            }
+            K::Copied | K::Cloned => self.fixed_items(a0)?.get(1..).map(<[u32]>::to_vec),
+            // `Chain<A, B>` needs `B::Item == A::Item`: either side's.
+            K::Chain => self.fixed_items(a0).or_else(|| self.fixed_items(*a.get(1)?)),
+            K::Zip => {
+                let mut x = self.fixed_items(a0)?;
+                x.extend(self.fixed_items(*a.get(1)?)?);
+                Some(x)
+            }
+            _ => None,
+        }
+    }
+
+    /// True for a builtin iterator type, `Chars`, or a type param of this
+    /// body with its own `Item = X` bound (`own_param_items`).
+    fn is_iter_ty(&mut self, t: Ty) -> bool {
+        crate::ty::iter::iter_parts(&self.body.tys, t).is_some() || self.body.tys.is_chars_ty(t) || self.own_param_items(t).is_some()
+    }
+
+    /// Fixed items (`fixed_items`) and a sink's element slots, pairwise:
+    /// equal, as the trait match makes them (rustc E0597 on a later
+    /// shorter borrow into the sink).
+    fn tie_fixed(&mut self, items: &[u32], elems: &[u32]) {
+        for (&a, &b) in items.iter().zip(elems) {
+            self.edge(a, b);
+            self.edge(b, a);
+        }
+    }
+
     fn item_slots(&mut self, t: Ty, vars: &[u32]) -> Option<Vec<u32>> {
         use crate::ty::iter::IterKind as K;
         if self.body.tys.is_chars_ty(t) {
             return Some(Vec::new());
+        }
+        match self.body.tys.kind(t) {
+            TyKind::Param(_) => return self.own_param_items(t),
+            // `impl Iterator for &mut I`: `I`'s items (the reborrow's region
+            // is not part of them).
+            TyKind::Ref(_, Mut::Mut, inner) if self.is_iter_ty(inner) => return self.item_slots(inner, vars.get(1..)?),
+            _ => {}
         }
         let (k, a) = crate::ty::iter::iter_parts(&self.body.tys, t)?;
         let mut at = adt_regions(self.p, &self.body.tys, t) as usize;
@@ -6716,6 +6873,17 @@ impl<'b, 'p> Builder<'b, 'p> {
             return true;
         }
         let Some((k, a)) = crate::ty::iter::iter_parts(&self.body.tys, t) else {
+            // A type param of this body: its own `Item = X` bound.
+            if let Some(item) = self.own_param_items(t) {
+                out.push(item);
+                return true;
+            }
+            // `&mut I` over a type param or a builtin iterator: `I`'s items.
+            if let TyKind::Ref(_, Mut::Mut, inner) = self.body.tys.kind(t)
+                && self.is_iter_ty(inner)
+            {
+                return vars.get(1..).is_some_and(|v| self.iter_items(inner, v, out));
+            }
             // A library or user iterator type: its `next` signature.
             return match self.next_sig_item(t, vars) {
                 Some(item) => {

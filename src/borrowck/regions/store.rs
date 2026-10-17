@@ -304,6 +304,15 @@ impl Builder<'_, '_> {
                 continue;
             }
             let xv: Vec<u32> = xs.iter().map(|s| s.0).collect();
+            // Items a type param's bound fixes are `X` exactly, through any
+            // adapter (`fixed_items`).
+            let fixed = match self.fixed_items(it) {
+                Some(fx) if fx.len() == xv.len() => {
+                    self.tie_fixed(&fx, &xv);
+                    true
+                }
+                _ => false,
+            };
             // A fn pointer in the items has no slot to equate: prove it
             // against the type each param of `X` is bound to.
             if has_fn_ptr(&self.body.tys, it) {
@@ -318,7 +327,7 @@ impl Builder<'_, '_> {
                 }
             }
             let mut cands = Vec::new();
-            let known = if crate::ty::iter::iter_parts(&self.body.tys, it).is_some() || self.body.tys.builtin_of(it).is_some_and(|b| matches!(b, BuiltinTy::Chars)) {
+            let mut known = if crate::ty::iter::iter_parts(&self.body.tys, it).is_some() || self.body.tys.builtin_of(it).is_some_and(|b| matches!(b, BuiltinTy::Chars)) {
                 self.iter_items(it, &iv, &mut cands)
             } else if let Some(c) = self.into_iter_items(it, &iv) {
                 cands.push(c);
@@ -326,6 +335,14 @@ impl Builder<'_, '_> {
             } else {
                 self.iter_items(it, &iv, &mut cands)
             };
+            // A chain after fixed items whose other side `iter_items` does
+            // not name (`chain(None)`): each side's `item_slots`, so the
+            // conservative rule below does not reach `X` from the wrapped
+            // iterator's own borrow.
+            if fixed && !known {
+                cands.clear();
+                known = self.chain_sides(it, &iv, &mut cands);
+            }
             if known && !cands.is_empty() && cands.iter().all(|c| c.len() == xv.len()) {
                 for c in cands {
                     for (&a, &b) in c.iter().zip(&xv) {
@@ -350,6 +367,25 @@ impl Builder<'_, '_> {
                 }
             }
         }
+    }
+
+    /// The items of each side of a `Chain` (its slots `iv`), by
+    /// `item_slots`, else `iter_items`. False for another type or a side
+    /// neither names.
+    pub(super) fn chain_sides(&mut self, it: Ty, iv: &[u32], out: &mut Vec<Vec<u32>>) -> bool {
+        let Some((crate::ty::iter::IterKind::Chain, a)) = crate::ty::iter::iter_parts(&self.body.tys, it) else { return false };
+        let (Some(&a0), Some(&a1)) = (a.first(), a.get(1)) else { return false };
+        let n0 = self.sc.slots(a0) as usize;
+        let n1 = self.sc.slots(a1) as usize;
+        let (Some(v0), Some(v1)) = (iv.get(..n0).map(<[u32]>::to_vec), iv.get(n0..n0 + n1).map(<[u32]>::to_vec)) else { return false };
+        for (t, v) in [(a0, v0), (a1, v1)] {
+            match self.item_slots(t, &v) {
+                Some(x) => out.push(x),
+                None if self.iter_items(t, &v, out) => {}
+                None => return false,
+            }
+        }
+        true
     }
 
     /// The slot vars of a callee's regioned type `r` at a call, with each
