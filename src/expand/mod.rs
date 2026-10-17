@@ -864,9 +864,77 @@ struct CacheKey {
 /// their own (see `own_strings`), and the expansion context it carried.
 type CachedExpansion = (Vec<Tt>, Vec<String>, CtxtId);
 
-fn expansion_cache() -> &'static std::sync::Mutex<FxMap<CacheKey, CachedExpansion>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<FxMap<CacheKey, CachedExpansion>>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(FxMap::default()))
+/// The process-wide expansion cache, under a byte cap. Keys hold the call
+/// position, so in a daemon every edit that moves calls adds entries and
+/// strands the old ones (ts_goport: 938 MB after 300 requests). Past `cap`
+/// bytes the least recently used entries go until half the cap is left
+/// (a background thread frees them). Entries are a pure memo of
+/// `transcribe_call`, so a dropped one only costs a transcription again.
+struct ExpansionCache {
+    /// Each entry with its estimated bytes and its last use (`tick`).
+    map: FxMap<CacheKey, (CachedExpansion, usize, u64)>,
+    bytes: usize,
+    tick: u64,
+    cap: usize,
+}
+
+/// The byte cap of the process-wide expansion cache (about 15 times what
+/// one full resolve of ts_goport stores).
+const EXPANSION_CACHE_CAP: usize = 256 << 20;
+
+impl ExpansionCache {
+    fn new(cap: usize) -> ExpansionCache {
+        ExpansionCache { map: FxMap::default(), bytes: 0, tick: 0, cap }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<CachedExpansion> {
+        self.tick += 1;
+        let e = self.map.get_mut(key)?;
+        e.2 = self.tick;
+        Some(e.0.clone())
+    }
+
+    /// Stores one expansion of `tokens` tokens (`count_tokens`), then
+    /// evicts when the cache is over its cap.
+    fn insert(&mut self, key: CacheKey, exp: CachedExpansion, tokens: usize) {
+        self.tick += 1;
+        let bytes = tokens * std::mem::size_of::<Tt>() + exp.1.iter().map(|s| s.capacity() + std::mem::size_of::<String>()).sum::<usize>() + 128;
+        self.bytes += bytes;
+        if let Some(old) = self.map.insert(key, (exp, bytes, self.tick)) {
+            self.bytes -= old.1;
+        }
+        if self.bytes > self.cap {
+            let mut by_use: Vec<(u64, usize)> = self.map.values().map(|e| (e.2, e.1)).collect();
+            by_use.sort_unstable();
+            let (mut left, mut stamp) = (self.bytes, 0);
+            for &(used, b) in &by_use {
+                if left <= self.cap / 2 {
+                    break;
+                }
+                left -= b;
+                stamp = used;
+            }
+            // Freeing the dropped trees is millions of small frees (50 to
+            // 300 ms for 128 MB on ts_goport), so it runs on its own thread,
+            // not in the request and not under the cache lock.
+            let mut gone = Vec::new();
+            for (k, e) in std::mem::take(&mut self.map) {
+                if e.2 > stamp {
+                    self.map.insert(k, e);
+                } else {
+                    gone.push(e);
+                }
+            }
+            self.bytes = left;
+            // When no thread starts, the closure (and `gone`) drops here.
+            let _ = std::thread::Builder::new().name("lust-expcache-free".into()).spawn(move || drop(gone));
+        }
+    }
+}
+
+fn expansion_cache() -> &'static std::sync::Mutex<ExpansionCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ExpansionCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(ExpansionCache::new(EXPANSION_CACHE_CAP)))
 }
 
 /// Moves the strings that tokens in `trees` name from `strings` into
@@ -909,7 +977,7 @@ pub fn cache_stats() -> (u64, u64) {
 
 /// How many entries the expansion cache holds (daemon stats lines).
 pub fn cache_len() -> usize {
-    expansion_cache().lock().unwrap().len()
+    expansion_cache().lock().unwrap().map.len()
 }
 
 /// True when a flat token list can contain work for the expander: a
@@ -2563,7 +2631,8 @@ impl<'a> Expander<'a> {
             deps_hash: 0,
             layout: if def.pos_sensitive { span_layout_hash(&call.inner) } else { 0 },
         };
-        if let Some((cached, strings, old_ctxt)) = expansion_cache().lock().unwrap().get(&key).cloned() {
+        let hit = expansion_cache().lock().unwrap().get(&key);
+        if let Some((cached, strings, old_ctxt)) = hit {
             CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             let ctxt =
                 register_expansion(crate::diag::Expansion { macro_def: DefId::PLACEHOLDER, call_span: call.span, parent: call.span.ctxt });
@@ -2639,7 +2708,7 @@ impl<'a> Expander<'a> {
         let mut cached = out.clone();
         let mut strings = Vec::new();
         own_strings(&mut cached, &self.strings, &mut strings);
-        expansion_cache().lock().unwrap().insert(key, (cached, strings, ctxt));
+        expansion_cache().lock().unwrap().insert(key, (cached, strings, ctxt), count);
         Ok(out)
     }
 }
@@ -5031,6 +5100,36 @@ mod tests {
 
     /// A simple call expands, and expanding the same call again in the
     /// same process (what a daemon re-check does) hits the cache.
+    #[test]
+    fn expansion_cache_evicts_least_recently_used_past_its_cap() {
+        let key = |i: u32| CacheKey {
+            def_fingerprint: 1,
+            input_hash: 2,
+            input_span_hash: 3,
+            call_file: 0,
+            call_lo: i,
+            call_hi: i + 1,
+            call_ctxt: 0,
+            cfg_hash: 4,
+            edition: 2024,
+            deps_hash: 0,
+            layout: 0,
+        };
+        let exp = || (Vec::new(), vec!["x".repeat(1000)], CtxtId::ROOT);
+        let mut c = ExpansionCache::new(20_000);
+        for i in 0..15 {
+            c.insert(key(i), exp(), 0);
+        }
+        assert!(c.get(&key(0)).is_some(), "under the cap nothing goes");
+        for i in 15..40 {
+            c.insert(key(i), exp(), 0);
+            assert!(c.bytes <= 20_000, "{} bytes", c.bytes);
+            assert_eq!(c.bytes, c.map.values().map(|e| e.1).sum::<usize>());
+        }
+        assert!(c.get(&key(39)).is_some(), "the newest entry stays");
+        assert!(c.get(&key(1)).is_none(), "an old unused entry went");
+    }
+
     #[test]
     fn expansion_cache_hits_on_repeat() {
         let interner = Interner::default();
