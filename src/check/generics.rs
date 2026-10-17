@@ -10646,6 +10646,7 @@ fn normalize_signatures(p: &mut Program) {
 /// `FnInfo` and the def table (`normalize_signatures`, or a signature
 /// delta for the fn it edited).
 pub(crate) fn normalize_fn_sig(p: &mut Program, i: usize) {
+    crate::borrowck::normalize_self_projections(p, LocalDefId(i as u32));
     let (params, ret) = (p.fns[i].params.clone(), p.fns[i].ret);
     if !params.iter().chain([&ret]).any(|&t| p.tys.flags(t).contains_projection()) {
         return;

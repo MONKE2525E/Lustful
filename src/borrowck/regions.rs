@@ -35,8 +35,10 @@ use crate::ty::*;
 
 mod fnptr;
 mod replay;
+mod selfproj;
 mod store;
 mod supers;
+pub use selfproj::normalize_self_projections;
 pub use supers::check_impl_supers;
 pub(crate) use fnptr::{lub_items_fit, lub_shapes_fit, paired_slot_regions, ptr_free};
 
