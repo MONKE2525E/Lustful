@@ -86,6 +86,19 @@ fn is_body_type_item(kind: &ItemKind) -> bool {
     matches!(kind, ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_) | ItemKind::Trait(_) | ItemKind::Type(_) | ItemKind::Impl(_))
 }
 
+/// The index of the item that holds item `k` of `ast.items`, when `k` is
+/// an impl that flatten hoisted out of a fn body (`ImplDef::in_body`): the
+/// last item before it that is not one, if its span holds it (flatten puts
+/// each body impl right after its holder).
+pub(crate) fn body_impl_holder(ast: &Ast, k: usize) -> Option<usize> {
+    let hoisted = |it: &Item| matches!(&it.kind, ItemKind::Impl(imp) if imp.in_body);
+    if !hoisted(ast.items.get(k)?) {
+        return None;
+    }
+    let h = (0..k).rev().find(|&h| !hoisted(&ast.items[h]))?;
+    span_holds(ast.items[h].span, ast.items[k].span).then_some(h)
+}
+
 /// True when span `inner` lies inside span `outer` (same file).
 fn span_holds(outer: crate::diag::Span, inner: crate::diag::Span) -> bool {
     outer.file == inner.file && outer.lo <= inner.lo && inner.hi <= outer.hi
@@ -126,13 +139,23 @@ fn assemble(ast: &Ast, per_item: Vec<ItemScans>) -> AstScans {
     // holds each body item: `scan::fold_outer` takes it into a nested
     // fn's body hash, as the token scan does, so any edit around a
     // nested fn rechecks it (it reads the names of the blocks around it).
+    // The methods of a body impl that flatten hoisted to the module items
+    // (`ImplDef::in_body`) fold it in too: they read the block items, and a
+    // block struct edit is an edit of the holding item only.
     let mut outer = vec![0u64; ast.stmt_items.len()];
-    for (scan, bs, inner) in per_item {
+    // The content of the last item that is not a hoisted body impl: it
+    // holds the body impls that follow it (`body_impl_holder`).
+    let mut holder: Option<(usize, u64)> = None;
+    for (k, (scan, mut bs, inner)) in per_item.into_iter().enumerate() {
         let content = item_content(&scan, &bs);
         for i in inner {
             if let Some(o) = outer.get_mut(i as usize) {
                 *o = content;
             }
+        }
+        match holder {
+            Some((h, c)) if body_impl_holder(ast, k) == Some(h) => bs.iter_mut().for_each(|b| b.0 = scan::fold_outer(b.0, c)),
+            _ => holder = Some((k, content)),
         }
         items.push(scan);
         bodies.extend(bs);
