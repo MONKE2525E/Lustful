@@ -3371,6 +3371,28 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue_stale = true;
     }
     let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed && !derives_moved;
+    // A program with no generics rechecks every body on a new trait
+    // system too. Its plain bodies ask the impls of lang and std traits
+    // with no recorded read (format glue's `has_display`/`require_fmt`,
+    // `?` conversions, `for` loops, drop glue): only user trait impls
+    // have `ImplSet` reads. A removed `impl Display for S` kept the
+    // pass of a `main` that formats S (hunt11 21:29).
+    if !program.gx.has_generics && caches.gen_reuse.trait_changed {
+        let mut listed = vec![false; fn_count];
+        changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
+        mention_only.clear();
+        for i in 0..fn_count {
+            let s = front.fn_slot[i] as usize;
+            caches.ok[s] = false;
+            caches.has_out[s] = false;
+            caches.slot_reads[s] = None;
+            if !listed[i] {
+                changed.push(i);
+            }
+        }
+        changed.sort_unstable();
+        caches.glue_stale = true;
+    }
     // Persist the def order when collect grew it, like the slot
     // manifest above: the next daemon must number defs as this
     // one did or the disk objects' indices move under it.
