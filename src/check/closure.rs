@@ -1750,6 +1750,9 @@ impl<'p> Ctx<'p> {
                     }
                     // `cmp`, `partial_cmp`, `lt`, and kin take `&self`.
                     Res::PrimCmp { derefs, .. } => self.cap_receiver(*recv, derefs, Autoref::Ref, w),
+                    // `Ordering`'s `then_with`, `then`, `reverse`, and `is_*`
+                    // take `self` by value (`Ordering` is `Copy`).
+                    Res::OrderingOp { derefs, .. } => self.cap_receiver(*recv, derefs, Autoref::None, w),
                     // `x.eq(y)` as the operator `Self == R` (check's
                     // `cmp_cross_eq`): borrows the receiver at depth `ld`.
                     Res::Bin { ld, .. } => self.cap_receiver(*recv, ld, Autoref::Ref, w),
