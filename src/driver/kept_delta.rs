@@ -720,7 +720,7 @@ pub(super) fn replay_discovery(
             } else if reuse.discovery_holds(p, g) {
                 counts[2] += 1;
                 continue;
-            } else if readers.is_none() && !walk_instances && reuse.pending_untouched(p, g, &mut |k| touched(p, k)) {
+            } else if readers.is_none() && !walk_instances && reuse.pending_holds_moved(p, g, &mut |k| touched(p, k)) {
                 counts[1] += 1;
                 continue;
             } else {
@@ -736,6 +736,13 @@ pub(super) fn replay_discovery(
         // The checks read the program only: they run in parallel, as the
         // compile tail's body checks do.
         let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("LUST_DERIVE_LOG").is_some() {
+            let mut why = Vec::new();
+            for &(g, ..) in work.iter().take(8) {
+                why.push(format!("{}: {}", p.display_name(p.fn_def(g).name), reuse.pending_why(p, g, &mut |k| touched(p, k))));
+            }
+            crate::check::derive_delta::log(&|| format!("discovery replay pending: {}\n", why.join("; ")));
+        }
         let prog: &Program = p;
         let checked = crate::driver::compile::par_map(&work, |&(g, _, _)| {
             let t = std::time::Instant::now();

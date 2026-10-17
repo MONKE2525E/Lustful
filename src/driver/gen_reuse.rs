@@ -294,13 +294,32 @@ impl GenReuse {
         self.unstored.insert(p.def_id(f), (next_stamp(), copy, pending));
     }
 
+    /// Why `pending_untouched` is false for fn `f` (`LUST_DERIVE_LOG`).
+    pub(crate) fn pending_why(&self, p: &Program, f: LocalDefId, touched: &mut impl FnMut(&ReadKey) -> bool) -> String {
+        match self.unstored.get(&p.def_id(f)) {
+            None => "no note".into(),
+            Some((_, _, None)) => "no reads".into(),
+            Some((_, _, Some((src, _)))) if self.src_of(p, f) != Some(*src) => "source".into(),
+            Some((_, _, Some((_, reads)))) => {
+                let moved = reads.iter().filter(|(k, _)| touched(k)).count();
+                let differ = reads.iter().find(|(k, stored)| touched(k) && p.read_fingerprint(k) != **stored);
+                format!("{moved} moved reads, differs: {}", differ.map_or("none".into(), |(k, _)| format!("{k:?}")))
+            }
+        }
+    }
+
     /// True when fn `f`'s last discovery check was a pending one of
     /// `lust check` (`note_unstored` kept its reads), made from its current
-    /// source, and read no node `touched` names: a check again would give
+    /// source, and each of its reads that `moves` names keeps its
+    /// fingerprint (as `template_holds_moved`): a check again would give
     /// the noted output once more (the derive delta's replay skips it).
-    pub(crate) fn pending_untouched(&self, p: &Program, f: LocalDefId, touched: &mut impl FnMut(&ReadKey) -> bool) -> bool {
+    pub(crate) fn pending_holds_moved(&mut self, p: &Program, f: LocalDefId, moves: &mut impl FnMut(&ReadKey) -> bool) -> bool {
         let Some((_, _, Some((src, reads)))) = self.unstored.get(&p.def_id(f)) else { return false };
-        self.on && self.src_of(p, f) == Some(*src) && !reads.iter().any(|(k, _)| touched(k))
+        if !self.on || self.src_of(p, f) != Some(*src) {
+            return false;
+        }
+        let memo = &mut self.memo;
+        reads.iter().all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored)
     }
 
     /// Drops every entry when the trait-system key moved since the last
