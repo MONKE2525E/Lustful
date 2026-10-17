@@ -690,6 +690,7 @@ fn is_hash_builtin(b: Builtin) -> bool {
             | B::EntryInsertEntry
             | B::EntryAsOccupied
             | B::EntryAsVacant
+            | B::VacIntoKey
             | B::MapGetKeyValue
             | B::OccKey
             | B::OccGet
@@ -1130,6 +1131,13 @@ impl FnGen<'_, '_> {
             }
             // The payload of an `Entry::Occupied` / `Entry::Vacant` pattern:
             // the Entry's fields in the variant's struct (same layout).
+            // The probe key the vacant entry owns, moved out (the entry
+            // is consumed, so its drop never runs).
+            B::VacIntoKey => {
+                let ev = self.tmp();
+                let _ = writeln!(self.out, "    {} {ev} = {};", ctype(&recv), vals[0]);
+                Some(format!("{ev}.key"))
+            }
             B::EntryAsOccupied | B::EntryAsVacant => {
                 let ev = self.tmp();
                 let _ = writeln!(

@@ -6286,6 +6286,10 @@ impl<'b, 'p> Builder<'b, 'p> {
                 }
                 return dv.len() == nv && self.relate(vt, &hvv, vt, dv, Variance::Co);
             }
+            // `VacantEntry::into_key`: the owned key, with the entry's K.
+            B::VacIntoKey => {
+                return dv.len() == nk && self.relate(kt, &hk, kt, dv, Variance::Co);
+            }
             B::OccRemoveEntry => {
                 return dv.len() == nk + nv && self.relate(kt, &hk, kt, &dv[..nk], Variance::Co) && self.relate(vt, &hvv, vt, &dv[nk..], Variance::Co);
             }
@@ -9871,6 +9875,7 @@ fn entry_builtin(b: crate::check::Builtin) -> bool {
             | B::EntryInsert
             | B::EntryAsOccupied
             | B::EntryAsVacant
+            | B::VacIntoKey
             | B::OccKey
             | B::OccGet
             | B::OccGetMut

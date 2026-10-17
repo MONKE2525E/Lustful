@@ -4791,6 +4791,7 @@ impl FnGen<'_, '_> {
             | B::EntryInsertEntry
             | B::EntryAsOccupied
             | B::EntryAsVacant
+            | B::VacIntoKey
             | B::MapGetKeyValue
             | B::OccKey
             | B::OccGet

@@ -539,6 +539,7 @@ impl<'p> Ctx<'p> {
                 let r = self.tys.mk_ref(true, v);
                 Some((B::EntryInsert, Autoref::None, vec![v], r, None))
             }
+            (HashTy::VacantEntry, "into_key") => Some((B::VacIntoKey, Autoref::None, vec![], k, None)),
             (HashTy::VacantEntry, "key") => Some((B::EntryKey, Autoref::Ref, vec![], self.tys.mk_ref(false, k), None)),
             (HashTy::VacantEntry, "insert_entry") => {
                 let occ = mk_hash(&mut self.tys, HashTy::OccupiedEntry, &[k, v]);

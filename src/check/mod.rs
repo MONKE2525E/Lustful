@@ -1014,6 +1014,8 @@ pub enum Builtin {
     /// `VacantEntry`, same C struct, same loan.
     EntryAsOccupied,
     EntryAsVacant,
+    /// `VacantEntry::into_key(self) -> K`.
+    VacIntoKey,
     /// `HashMap::get_key_value(&self, &Q) -> Option<(&K, &V)>`.
     MapGetKeyValue,
     OccKey,

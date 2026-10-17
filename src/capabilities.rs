@@ -627,6 +627,7 @@ const ALL_BUILTINS: &[Builtin] = &[
     Builtin::EntryInsertEntry,
     Builtin::EntryAsOccupied,
     Builtin::EntryAsVacant,
+    Builtin::VacIntoKey,
     Builtin::MapGetKeyValue,
     Builtin::OccKey,
     Builtin::OccGet,
@@ -1284,6 +1285,7 @@ fn builtin_info(b: Builtin, k: &Known, i: &Interner) -> (&'static [&'static str]
         ),
         // Internal steps of the closure forms, never called by name.
         B::EntryOccupied | B::EntryIntoMut | B::EntryGetMut | B::EntryAsOccupied | B::EntryAsVacant => (&[], vec![], Call::Method),
+        B::VacIntoKey => (&["hash_map::VacantEntry<K, V>"], vec![i.intern("into_key")], Call::Method),
         // Also `VacantEntry::insert` by name.
         B::EntryInsert => (&["hash_map::VacantEntry<K, V>"], vec![i.intern("insert")], Call::Method),
         B::EntryInsertEntry => (&["hash_map::Entry<K, V>"], vec![i.intern("insert_entry")], Call::Method),
