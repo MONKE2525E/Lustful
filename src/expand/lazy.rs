@@ -174,7 +174,8 @@ fn hoistable_path(
     }
     let init = &toks[open + 1..end];
     // A path, also with generic args (`key::<Rc<T>>`, whose `>>` is one
-    // token; a comma only inside the angle brackets).
+    // token; a comma only inside the angle brackets), and with a `crate`,
+    // `super` or `self` segment (the hidden fn sits in the same module).
     let mut depth = 0i32;
     let path_like = !init.is_empty()
         && init.iter().all(|t| {
@@ -185,7 +186,11 @@ fn hoistable_path(
                 Tok::Comma => return depth > 0,
                 _ => {}
             }
-            depth >= 0 && matches!(t.tok, Tok::Ident(_) | Tok::PathSep | Tok::Lt | Tok::Gt | Tok::Shr | Tok::As | Tok::Comma)
+            depth >= 0
+                && matches!(
+                    t.tok,
+                    Tok::Ident(_) | Tok::Crate | Tok::Super | Tok::SelfLower | Tok::PathSep | Tok::Lt | Tok::Gt | Tok::Shr | Tok::As | Tok::Comma
+                )
         })
         && depth == 0
         && matches!(init.last()?.tok, Tok::Ident(_) | Tok::Gt | Tok::Shr);
