@@ -5865,6 +5865,7 @@ pub(crate) fn fn_record(
             let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
             rs.fn_bounds.extend(generics::fn_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
             rs.trait_bounds.extend(generics::trait_lts_of(ast, interner, known, &cx, &scope, g, w));
+            rs.item_bounds.extend(generics::item_bounds_of(ast, interner, known, &mut p.tys, &cx, &scope, g, w));
             rs.bounds.extend(generics::regioned_bound_preds(ast, interner, known, &cx, &mut p.tys, &scope, g, w, &[]).1);
         }
         rs

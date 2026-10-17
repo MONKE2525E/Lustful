@@ -1416,9 +1416,10 @@ fn root_fn(p: &Program, f: LocalDefId) -> LocalDefId {
     root
 }
 
-/// The lifetimes (`Region::Param` indices) that the `Fn*` and `Item = X`
-/// bounds of the fn enclosing body `f` name: a closure body in it gets a
-/// universal for each (`OwnSig::fn_lts`).
+/// The lifetimes (`Region::Param` indices) that the bounds of the fn
+/// enclosing body `f` name (`Fn*`, `Item = X`, `T: Tr<'a>`, `T: 'a`,
+/// implied ones): a closure body in it gets a universal for each
+/// (`OwnSig::fn_lts`).
 fn root_bound_lifetimes(p: &Program, f: LocalDefId) -> Vec<(u32, String)> {
     let Some(sig) = p.regions.own_body_sig(p, root_fn(p, f)) else { return Vec::new() };
     let mut rs = Vec::new();
@@ -1430,6 +1431,11 @@ fn root_bound_lifetimes(p: &Program, f: LocalDefId) -> Vec<(u32, String)> {
     for &(_, _, t) in &sig.item_bounds {
         regions_of(&p.tys, t, &mut rs);
     }
+    for b in &sig.trait_bounds {
+        rs.extend(b.lifetimes.iter().copied());
+    }
+    let root = root_fn(p, f);
+    rs.extend(crate::check::outlives::param_bounds(p, Some(sig), fn_env(p, root)).into_iter().map(|(_, r)| r));
     let mut ks: Vec<u32> = rs.iter().filter_map(|r| if let Region::Param(k) = r { Some(*k) } else { None }).filter(|&k| k < sig.n_univ).collect();
     ks.sort_unstable();
     ks.dedup();
@@ -2249,6 +2255,15 @@ impl OwnSig {
                 self.ends[u as usize] = Some(End::Fn(k as u32));
             }
         }
+        // A lifetime of the enclosing fn may reach the output, as a captured
+        // source may: what a call's result then holds is the call's rule
+        // (`End::Fn` sources of `End::Out` slots).
+        let outs: Vec<Univ> = self.slots.first().map(|v| v.iter().copied().filter(|&u| u != 0).collect()).unwrap_or_default();
+        for &u in self.fn_lts.iter().flatten() {
+            for &o in &outs {
+                self.facts.push((u, o));
+            }
+        }
         for (k, &u) in self.slots.first().cloned().unwrap_or_default().iter().enumerate() {
             if u != 0 {
                 self.ends[u as usize] = Some(End::Out(k as u32));
@@ -2577,9 +2592,23 @@ fn implied_walk<T: TyIntern>(
                 }
                 *at += 1;
             }
-            // The Adt's own outlives facts are implied by its use.
+            // The Adt's own outlives facts are implied by its use, and so
+            // are the lifetime requirements its fields put (rustc's
+            // inferred outlives: `S<'a, 'b> { x: &'a mut W<'b> }` gives
+            // `'b: 'a`).
             for &(x, y) in sc.p.regions.adt_facts.get(&def).map_or(&[][..], |v| v.as_slice()) {
                 let to = if y == crate::check::generics::STATIC_FACT { Some(0) } else { us.get(start + y as usize).copied() };
+                if let (Some(&a), Some(b)) = (us.get(start + x as usize), to) {
+                    facts.push((a, b));
+                }
+            }
+            for &(g, r) in sc.p.regions.adt_outlives.get(&def).map_or(&[][..], |v| v.as_slice()) {
+                let GenericArg::Lifetime(Region::Param(x)) = g else { continue };
+                let to = match r {
+                    Region::Static => Some(0),
+                    Region::Param(y) => us.get(start + y as usize).copied(),
+                    _ => None,
+                };
                 if let (Some(&a), Some(b)) = (us.get(start + x as usize), to) {
                     facts.push((a, b));
                 }
@@ -5997,6 +6026,13 @@ impl<'b, 'p> Builder<'b, 'p> {
         r
     }
 
+    /// This body's universal for lifetime `k` of its root fn: `k + 1` in the
+    /// fn itself, the `OwnSig::fn_lts` universal in a closure body (None
+    /// when the closure has none for it).
+    fn root_univ(&self, k: u32) -> Option<u32> {
+        if self.own.closure { self.own.fn_lts.get(k as usize).copied().flatten() } else { Some(k + 1) }
+    }
+
     /// Per lifetime `k` of the fn that encloses closure `def`: this body's
     /// universal for `'k` (`End::Fn(k)`). The fn's own body has `k + 1`; a
     /// closure body of the same fn its `OwnSig::fn_lts`; a body outside
@@ -7872,19 +7908,21 @@ impl<'b, 'p> Builder<'b, 'p> {
         if !tys.flags(t).contains_param() {
             return;
         }
-        if tys.flags(t).contains_projection() || self.own.closure {
+        if tys.flags(t).contains_projection() {
             return self.type_outlives_unproved();
         }
         let mut ps = Vec::new();
         params_in(tys, t, &mut ps);
         let p = self.p;
-        let f = self.body.fn_id;
-        let bounds = crate::check::outlives::param_bounds(p, p.regions.body_sig(p, f), fn_env(p, f));
+        // A closure body's type params are its enclosing fn's: that fn's
+        // bounds, read through the closure's universals for its lifetimes.
+        let f = root_fn(p, self.body.fn_id);
+        let bounds = crate::check::outlives::param_bounds(p, p.regions.own_body_sig(p, f), fn_env(p, f));
         for j in ps {
             if bounds.contains(&(j, Region::Static)) {
                 continue;
             }
-            let rs: Vec<u32> = bounds.iter().filter(|(k, _)| *k == j).filter_map(|&(_, r)| if let Region::Param(i) = r { Some(i + 1) } else { None }).collect();
+            let rs: Vec<u32> = bounds.iter().filter(|(k, _)| *k == j).filter_map(|&(_, r)| if let Region::Param(i) = r { self.root_univ(i) } else { None }).collect();
             if rs.is_empty() {
                 self.type_outlives_unproved();
             }
@@ -8032,19 +8070,18 @@ impl<'b, 'p> Builder<'b, 'p> {
         if depth > 8 {
             return None;
         }
-        // A closure body's type params are its creator's (no own bound
-        // tells); an impl's header tells the same in any body.
+        // A closure body's type params are its creator's: the enclosing
+        // fn's bound tells, read through the closure's universals for its
+        // lifetimes. An impl's header tells the same in any body.
         if let TyKind::Param(j) = self.body.tys.kind(t) {
-            if self.own.closure {
-                return None;
-            }
-            let sig = p.regions.body_sig(p, self.body.fn_id)?;
+            let root = root_fn(p, self.body.fn_id);
+            let sig = p.regions.own_body_sig(p, root)?;
             if let Some(b) = sig.trait_bounds.iter().find(|b| b.param == j.0 && b.trait_def == trait_def) {
-                return Some(b.lifetimes.iter().map(|&r| if let Region::Param(k) = r { k + 1 } else { 0 }).collect());
+                return b.lifetimes.iter().map(|&r| if let Region::Param(k) = r { self.root_univ(k) } else { Some(0) }).collect();
             }
-            let own_trait = p.fn_defs.get(self.body.fn_id.0 as usize).and_then(|&d| p.gx.index.trait_of_method(d));
+            let own_trait = p.fn_defs.get(root.0 as usize).and_then(|&d| p.gx.index.trait_of_method(d));
             if j.0 == 0 && own_trait == Some(trait_def) && sig.n_univ as usize >= n {
-                return Some((1..=n as u32).collect());
+                return (0..n as u32).map(|k| self.root_univ(k)).collect();
             }
             return None;
         }

@@ -6878,6 +6878,23 @@ pub fn fn_bounds_of(
     fn_bounds_in(ast, interner, known, tys, cx, scope, &param_bounds(ast, scope, generics, where_clause))
 }
 
+/// The `I: Tr<Item = X>` bounds a generics list and its where clause put
+/// on type params of `scope` (`RegionSig::item_bounds`): a method also
+/// takes its impl's or trait's.
+#[allow(clippy::too_many_arguments)]
+pub fn item_bounds_of(
+    ast: &Ast,
+    interner: &Interner,
+    known: &Known,
+    tys: &mut impl TyIntern,
+    cx: &ResolveCx,
+    scope: &Scope,
+    generics: &ast::Generics,
+    where_clause: &ast::WhereClause,
+) -> Vec<(u32, DefId, Ty)> {
+    item_bounds_in(ast, interner, known, tys, cx, scope, &param_bounds(ast, scope, generics, where_clause))
+}
+
 /// rustc E0106 in the bounds of a returned `impl Trait` (`impl
 /// Iterator<Item = &T>`, `impl Sized + '_`) when the output has no
 /// elided lifetime to take (`region_sig`, scope `rs`): the return type
@@ -7323,6 +7340,7 @@ pub fn build_trait_tables(p: &mut Program, errs: &mut Vec<Diag>) {
                         &tdef.where_clause,
                     ));
                     rs.trait_bounds.extend(trait_lts_of(&ast, &p.interner, &p.known, &cx, &mscope, &tdef.generics, &tdef.where_clause));
+                    rs.item_bounds.extend(item_bounds_of(&ast, &p.interner, &p.known, &mut p.tys, &cx, &mscope, &tdef.generics, &tdef.where_clause));
                     // The trait's bounds and supertraits, and the implicit
                     // `Self: Tr<P..>` of its methods, with regions.
                     let self_param = p.tys.intern(TyKind::Param(ParamId(0)));
