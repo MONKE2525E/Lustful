@@ -221,11 +221,18 @@ class Daemon:
 
 
 def slots_of(work):
+    """marker name -> slot of the fn whose C body prints it. A body runs from its
+    `f<slot>(void) {` header to the next fn header (under panic=unwind it holds
+    cleanup blocks, so it is not brace-free)."""
     out = {}
     for p in sorted(glob.glob(os.path.join(work, "emit.u*.c"))):
         text = open(p).read()
-        for m in re.finditer(r"f(\d+)\(void\) \{[^}]*?marker-(\w+)", text, re.S):
-            out[m.group(2)] = int(m.group(1))
+        heads = list(re.finditer(r"\bf(\d+)\(void\) \{", text))
+        for i, h in enumerate(heads):
+            end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+            m = re.search(r"marker-(\w+)", text[h.end():end])
+            if m:
+                out[m.group(1)] = int(h.group(1))
     return out
 
 
