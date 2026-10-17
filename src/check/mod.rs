@@ -7831,11 +7831,14 @@ impl<'p> Ctx<'p> {
         // literal var that only the impl's `Borrow` bound fixes.
         // The picked input then unifies with the written type;
         // any failure rolls the whole pick back.
-        let pick = |cx: &mut Self, trait_def: DefId, fname: &str| -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
+        // A type with two `Index` impls (indexmap's `Index<&Q>` and
+        // `Index<usize>`) is ambiguous at a fresh input, so the written
+        // index type is tried first, then the fresh input.
+        let pick_with = |cx: &mut Self, trait_def: DefId, fname: &str, written: bool| -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
             let snap = cx.snapshot_vars();
             let obl_len = cx.obl_len();
             let found = (|cx: &mut Self| -> Option<(LocalDefId, Ty, Vec<GenericArg>)> {
-                let input = cx.new_var(false);
+                let input = if written { cx.deep(idx_ty) } else { cx.new_var(false) };
                 let args = cx.tys.intern_args(&[GenericArg::Ty(base), GenericArg::Ty(input)]);
                 let tr = TraitRef { def: trait_def, args, bindings: EMPTY_BINDINGS };
                 let Selection::Impl { id, args: impl_args, .. } = cx.select_obligation_at(tr, span, 0) else { return None };
@@ -7864,6 +7867,7 @@ impl<'p> Ctx<'p> {
             }
             found
         };
+        let pick = |cx: &mut Self, trait_def: DefId, fname: &str| pick_with(cx, trait_def, fname, true).or_else(|| pick_with(cx, trait_def, fname, false));
         let (f, output, args) = pick(self, lang.index, "index")?;
         let (f_mut, args_mut) = match pick(self, lang.index_mut, "index_mut") {
             Some((g, _, a)) => (Some(g), a),

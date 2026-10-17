@@ -992,9 +992,36 @@ impl<K: Hash + Eq + core::borrow::Borrow<Q>, Q: ?Sized + Hash + Eq, V, S: BuildH
     type Output = V;
 
     fn index(&self, key: &Q) -> &V {
-        match self.get(key) {
-            Some(v) => v,
-            None => panic!("IndexMap: key not found"),
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<K: Hash + Eq + core::borrow::Borrow<Q>, Q: ?Sized + Hash + Eq, V, S: BuildHasher> core::ops::IndexMut<&Q> for IndexMap<K, V, S> {
+    fn index_mut(&mut self, key: &Q) -> &mut V {
+        self.get_mut(key).expect("no entry found for key")
+    }
+}
+
+/// The value at a position, as upstream's `Index<usize>` (same panic text).
+impl<K, V, S> core::ops::Index<usize> for IndexMap<K, V, S> {
+    type Output = V;
+
+    fn index(&self, index: usize) -> &V {
+        if let Some((_, value)) = self.get_index(index) {
+            value
+        } else {
+            panic!("index out of bounds: the len is {len} but the index is {index}", len = self.len());
+        }
+    }
+}
+
+impl<K, V, S> core::ops::IndexMut<usize> for IndexMap<K, V, S> {
+    fn index_mut(&mut self, index: usize) -> &mut V {
+        let len: usize = self.len();
+        if let Some((_, value)) = self.get_index_mut(index) {
+            value
+        } else {
+            panic!("index out of bounds: the len is {len} but the index is {index}");
         }
     }
 }

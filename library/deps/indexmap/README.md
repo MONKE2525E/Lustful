@@ -22,7 +22,7 @@ Lust adapter crate (docs/ARCH.md section 3.6). Gate:
   `sort_unstable_by`, `sort_unstable_by_key`, `reverse`, `get_index`,
   `get_index_mut`, `first`, `last`, `first_mut`, `last_mut`,
   `swap_remove_index`, `shift_remove_index`, `move_index`,
-  `swap_indices`, `as_slice`; `IntoIterator` (by value, `&`, `&mut`), `Extend`, `FromIterator`, `Index`,
+  `swap_indices`, `as_slice`; `IntoIterator` (by value, `&`, `&mut`), `Extend`, `FromIterator`, `Index` (by key, and by position with `IndexMut`),
   `Clone`, `Default`, `Debug`, `PartialEq`, `Eq`.
 - `IndexSet<T, S = RandomState>` over `IndexMap<T, (), S>`, as upstream.
 - `map::Slice<K, V>`, an unsized newtype over the entries as upstream:
