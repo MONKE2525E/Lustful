@@ -2300,6 +2300,7 @@ fn resolved_setup(
             }
         };
         let patch_expand = patch_expand.filter(|_| shut());
+        let reach = super::const_reach::ConstReach::build(front);
         front.patch = Some(super::patch::PatchBase::new(
             front,
             inputs,
@@ -2314,6 +2315,14 @@ fn resolved_setup(
         ));
         if let Some(b) = front.patch.as_mut() {
             b.oracle_input = oracle_input;
+            // The span probe of a crate with macros or includes, here where
+            // the new Ast is not shared yet, and the const reach, not on the
+            // first patch (ts_goport: about 60 and 24 ms of the first header
+            // edit after a full resolve). Later patches update the reach.
+            if let Some(ast) = Arc::get_mut(&mut front.ast) {
+                b.probe(ast, front.map.file_count());
+            }
+            b.reach = Some(reach);
         }
     }
     Ok((map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines, body_hashes, Some(tables)))

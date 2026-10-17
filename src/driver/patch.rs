@@ -159,9 +159,10 @@ pub(crate) struct PatchBase {
     /// The cfg-disabled nodes the expander dropped (`Dep::Dropped`), by
     /// file and start, with the spans of this text.
     dropped: Vec<Dropped>,
-    /// What const evaluation may reach (`const_reach.rs`), built on the
-    /// first const fn body edit and kept up to date by later patches.
-    reach: Option<super::const_reach::ConstReach>,
+    /// What const evaluation may reach (`const_reach.rs`), built at the full
+    /// resolve (compile.rs; else on the first const fn body or header edit)
+    /// and kept up to date by later patches.
+    pub(super) reach: Option<super::const_reach::ConstReach>,
     /// Under the patch oracle (`item_oracle.rs`): the cold resolve input.
     pub(super) oracle_input: Option<super::item_oracle::ColdInput>,
     /// `ResolveCache::expansions` at the full resolve: while it stands,
@@ -513,6 +514,20 @@ pub(crate) struct KeptProgram {
     /// `keep_err` leaves this one in place. A clean answer's program
     /// replaces it (`keep`).
     prefer: bool,
+}
+
+impl PatchBase {
+    /// Probes the Ast once for the nodes that can hold another file's spans
+    /// (`span_shift::probe_extras`) and sets `ranges` and `extras`, when the
+    /// resolve could not prove ranges alone. The full resolve calls it while
+    /// its Ast is not shared (compile.rs), so the first patch need not;
+    /// `apply` calls it when that did not happen.
+    pub(super) fn probe(&mut self, ast: &mut Ast, n_files: usize) {
+        if self.ranges.is_none() {
+            self.extras = Some(span_shift::probe_extras(ast, n_files));
+            self.ranges = Some(span_shift::ranges_by_file(ast, n_files));
+        }
+    }
 }
 
 impl KeptProgram {
@@ -1725,10 +1740,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     // Probe once, on the first patch: the nodes that can hold another
     // file's spans (or a context) are few, and the rest walk by file.
     if base.ranges.is_none() && !edits.is_empty() {
-        let n = front.map.file_count();
-        let ast = Arc::make_mut(&mut front.ast);
-        base.extras = Some(span_shift::probe_extras(ast, n));
-        base.ranges = Some(span_shift::ranges_by_file(ast, n));
+        base.probe(Arc::make_mut(&mut front.ast), front.map.file_count());
     }
     let no_extras = span_shift::ExtraNodes::default();
     for e in &edits {
@@ -2018,7 +2030,7 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
     match &mut base.reach {
         Some(r) => r.update(front, &edited),
         // A header edit reads it too (`kept_delta::untouched_refusals`):
-        // built once here, later patches update it.
+        // built once (at the full resolve, or here), later patches update it.
         None if !const_edits.is_empty() || !item_fns.is_empty() => base.reach = Some(super::const_reach::ConstReach::build(front)),
         None => {}
     }
