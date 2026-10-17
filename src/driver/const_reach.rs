@@ -36,17 +36,21 @@
 // The header delta asks a sharper question for an inherent method
 // (`reaches_inherent`): a path `Q::name` in an item value names the
 // associated fn of the type `Q` denotes, so `LazyLock::new` names no
-// user `Store::new`. A name counts there unless every root mention is the
-// last segment of such a path whose qualifier cannot denote the method's
-// Adt: not its name, `Self`, or any name a type alias, `use` rename, or
-// associated type has (by name, as everything here), or a name the
-// resolver gave a def of another crate (a dependency cannot name a type
-// of a crate that depends on it). A method call `.name(..)` there counts
-// only when the method is const before or after the edit (the check rejects
-// a const context's call of a non-const fn, L0631). A qualifier with generic arguments
-// (`Id::<T>::f`, through `type Id<T> = T`) counts as unqualified. Identifiers inside a
-// closure body in an item value do not count at all (outside `const`
-// blocks): the evaluator never runs a closure (`ast_hash::ConstRoots`).
+// user `Store::new`. Only three root forms can name an associated fn: a
+// path `Q::name`, a `<T>::name` path, and a method call `.name(..)`. A bare
+// name (a one-segment path, a field, a binding: `self.end`, `fn new(end:
+// i32)`) never does, so it does not count. A `Q::name` counts when its
+// qualifier may denote the method's Adt: its name, `Self`, or any name a
+// type alias, `use` rename, or associated type has (by name, as
+// everything here), but not a name the resolver gave a def of another
+// crate (a dependency cannot name a type of a crate that depends on it).
+// A method call counts only when the method is const after the edit (the
+// delta refuses one that was; the check rejects a const context's call of
+// a non-const fn, L0631). A qualifier with generic arguments (`Id::<T>::f`,
+// through `type Id<T> = T`) and a `<T>::name` path count as unqualified.
+// Identifiers inside a closure body in an item value do not count at all
+// (outside `const` blocks): the evaluator never runs a closure
+// (`ast_hash::ConstRoots`).
 use super::compile::fn_def_at;
 use super::session::Front;
 use crate::intern::{FxHasher, Sym};
@@ -106,7 +110,7 @@ impl ConstReach {
         }
         let mut r = ConstReach {
             names: FxSet::default(),
-            scalar: roots.scalar.iter().chain(&roots.scalar_calls).copied().collect(),
+            scalar: roots.scalar.iter().chain(&roots.scalar_calls).chain(&roots.scalar_bare).copied().collect(),
             values: roots.values,
             seen: arena_lens(front),
             expanded: vec![false; consts.len()],
@@ -126,9 +130,9 @@ impl ConstReach {
     /// indexes) that are reachable const fns.
     pub(crate) fn update(&mut self, front: &Front, edited: &[usize]) {
         let roots = super::ast_hash::const_idents(&front.ast, self.seen, false, None, front.known.self_type);
-        self.scalar.extend(roots.scalar.iter().chain(&roots.scalar_calls).copied());
+        self.scalar.extend(roots.scalar.iter().chain(&roots.scalar_calls).chain(&roots.scalar_bare).copied());
         self.unqual.extend(roots.scalar.iter().copied());
-        self.names.extend(roots.scalar.iter().chain(&roots.scalar_calls).copied());
+        self.names.extend(roots.scalar.iter().chain(&roots.scalar_calls).chain(&roots.scalar_bare).copied());
         for &n in &roots.scalar_calls {
             self.quals.entry(n).or_default().push(n);
         }
@@ -175,7 +179,7 @@ impl ConstReach {
             let q = crate::intern::source_name(full).trim_start_matches("r#");
             q == adt || self.aliases.contains(q)
         };
-        self.unqual.contains(&name) || self.quals.get(&name).is_none_or(|qs| qs.iter().any(|q| may_be(q) || (*q == name && may_be_const)))
+        self.unqual.contains(&name) || self.quals.get(&name).is_some_and(|qs| qs.iter().any(|q| may_be(q) || (*q == name && may_be_const)))
     }
 
     /// True when the results of fns `fns` (`Front::fn_loc` indexes) can
