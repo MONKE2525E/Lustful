@@ -1464,10 +1464,15 @@ impl<'b, 'p> Ck<'b, 'p> {
     /// True when a place goes through a dereference of a reference or raw
     /// pointer: the value it names is not owned by its root local, so it
     /// outlives the local's storage. A deref of a `Box` (or another owning
-    /// pointer) stays inside the local: dropping the local frees it.
+    /// pointer) stays inside the local: dropping the local frees it. A bare
+    /// slice or `str` local is the fat pointer of a subslice (`v[1..]`):
+    /// every place in it is behind that pointer.
     fn through_ref(&self, p: &Place) -> bool {
         let tys = &self.body.tys;
         let mut t = self.body.locals[p.local as usize].ty;
+        if matches!(tys.kind(t), TyKind::Slice(_) | TyKind::Str) {
+            return true;
+        }
         let mut variant = 0;
         for pr in &p.proj {
             t = match *pr {

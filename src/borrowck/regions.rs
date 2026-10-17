@@ -2932,8 +2932,9 @@ impl<'b, 'p> Builder<'b, 'p> {
         let mut ty = self.body.locals[place.local as usize].ty;
         if fat_local(&self.body.tys, ty) {
             // A fat-pointer local reads as the reference it stands for; an
-            // index into it drops the pointer slot.
+            // index into it goes through that pointer (a reborrow of it).
             if let Some(Proj::Index(_)) = place.proj.first() {
+                derefs.push((out[0], false));
                 out.remove(0);
             } else {
                 match self.body.tys.get(TyKind::Ref(Region::Erased, Mut::Shared, ty)) {
