@@ -3295,6 +3295,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             } else {
                 // Template errors are body errors: the program stands
                 // for the next edit, which checks that template again.
+                // After a header delta, the read sets it cannot have moved
+                // stay verified against the program (the keyed walk of its
+                // moved keys); the others lose the mark, so the next request
+                // walks only those in full.
+                if let Some(touched) = header_moves.as_ref().filter(|_| keyed_base != 0) {
+                    let mode = usize::from(p.gx.walk_instances);
+                    let k = keyed_dirty(&p, front, caches, &|k| touched.hit_pure(&p, k), keyed_base, &mut FxMap::default());
+                    for (s, d) in k.iter().enumerate() {
+                        if *d == Some(true)
+                            && let Some(Some(r)) = caches.slot_reads.get_mut(s)
+                        {
+                            r.verified[mode] = 0;
+                        }
+                    }
+                    p.verified = keyed_base;
+                }
                 super::patch::keep(front, p);
                 Some(Err(errs))
             }
