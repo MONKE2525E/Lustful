@@ -199,6 +199,11 @@ pub struct ResolvedTables {
     /// source or the importing module since the glob's last copy. Not
     /// part of any answer.
     pub glob_log: Vec<Vec<Sym>>,
+    /// While `run_imports` runs: every name in `maps` and in its imports,
+    /// by rank in string order, so glob copies sort names without
+    /// comparing strings (`sort_by_name`). Empty otherwise. Not part of
+    /// any answer.
+    pub name_rank: FxMap<Sym, u32>,
     pub externs: Vec<ExternInfo>,
     /// Adt def -> associated fn name -> (vis, defining module).
     pub assoc_vis: FxMap<DefId, FxMap<Sym, (VisKind, ModuleId)>>,
@@ -407,6 +412,7 @@ impl ResolvedTables {
             }],
             maps: vec![Default::default()],
             glob_log: Vec::new(),
+            name_rank: FxMap::default(),
             externs: Vec::new(),
             assoc_vis: FxMap::default(),
             field_vis: FxMap::default(),
@@ -2214,6 +2220,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
             tables.pending_single.entry((imp.module, *name)).or_default().push(p);
         }
     }
+    tables.name_rank = name_ranks(tables, imports, interner);
     let cap = tables.modules.len() + 2;
     let mut rounds = 0;
     let mut stall_sweep = false;
@@ -2299,6 +2306,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
         }
     }
     tables.pending_single.clear();
+    tables.name_rank = FxMap::default();
     crate::resolve::order::compute_order_dep(tables, imports, interner);
     // The plain checks first: where they report (L0507, L0510), rustc
     // does too; the order rule (L0509) takes the imports they pass.
@@ -2379,6 +2387,31 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
 /// those names (`run_imports` passes the names changed since the last
 /// copy; each name's copy reads and writes that name alone). Returns
 /// true on a change.
+/// The names of every binding table and import, ranked in string order
+/// (`ResolvedTables::name_rank`).
+fn name_ranks(tables: &ResolvedTables, imports: &[Import], interner: &Interner) -> FxMap<Sym, u32> {
+    let mut names: Vec<Sym> = tables.maps.iter().flat_map(|m| m.iter().flat_map(|ns| ns.keys().copied())).collect();
+    names.extend(imports.iter().filter_map(|imp| match &imp.kind {
+        ImportKind::Single { name, .. } => Some(*name),
+        _ => None,
+    }));
+    names.sort_unstable();
+    names.dedup();
+    names.sort_by(|a, b| interner.get(*a).cmp(interner.get(*b)));
+    names.into_iter().enumerate().map(|(k, n)| (n, k as u32)).collect()
+}
+
+/// Sorts `v` by the string order of `name(x)`: by `name_rank` when
+/// every name has one (the rank agrees with comparing the strings), else
+/// by the strings. Names are distinct, so the order is the same either way.
+fn sort_by_name<T>(v: &mut [T], name: impl Fn(&T) -> Sym, tables: &ResolvedTables, interner: &Interner) {
+    if v.iter().all(|x| tables.name_rank.contains_key(&name(x))) {
+        v.sort_by_cached_key(|x| tables.name_rank[&name(x)]);
+    } else {
+        v.sort_by(|a, b| interner.get(name(a)).cmp(interner.get(name(b))));
+    }
+}
+
 /// The bindings of module `src` in one namespace, all or those `only`
 /// names, borrowed (`copy_glob` copies only the ones it takes).
 fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only: Option<&[Sym]>) -> Vec<(Sym, &'t BindState)> {
@@ -2397,7 +2430,7 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
     let mut entries: Vec<(Namespace, Sym, Bind)> = Vec::new();
     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
         let mut names = glob_names(tables, src, ns, only);
-        names.sort_by(|a, b| interner.get(a.0).cmp(interner.get(b.0)));
+        sort_by_name(&mut names, |x| x.0, tables, interner);
         for (name, state) in names {
             // A `macro_rules!` definition is not in its
             // module's namespace, so no glob copies it.
@@ -2436,7 +2469,7 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
             .filter(|name| !tables.pending_single.contains_key(&(src, *name)))
             .filter(|name| tables.ambiguous_visible(src, ns, *name, imp.module, interner))
             .collect();
-        names.sort_by(|a, b| interner.get(*a).cmp(interner.get(*b)));
+        sort_by_name(&mut names, |x| *x, tables, interner);
         for name in names {
             let certain = tables.ambiguous_certain(src, ns, name, Some(imp.module), interner);
             let item = AmbItem::Amb { certain };
