@@ -10441,6 +10441,7 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
     // reuse) contributes its picks and closure call kinds without
     // a recheck. A body with closure expressions always rechecks:
     // its check also registers closure body fns.
+    crate::driver::graph::FpMemo::sync(p);
     let defines_opaque = p.gx.opaques.contains_key(&opaque_def(p.def_id(t)));
     if !defines_opaque && let Some((picks, calls)) = reuse.template(p, t) {
         reuse.note_template_out(p, t, &picks, &calls, &[]);
@@ -11991,6 +11992,16 @@ pub fn ast_uses_generic_std(ast: &Ast, interner: &Interner) -> bool {
 /// them against the finished tables. Returns mono's own errors
 /// (instantiation depth and count caps, section 4.2).
 pub fn materialize(p: &mut Program) -> Vec<Diag> {
+    // Body checks here record reads whose deep Adt fingerprints walk the
+    // whole type graph each time; the memo follows the changing program
+    // so each walk runs once per program state (driver/graph.rs).
+    p.fp_memo.follow_begin();
+    let errs = materialize_all(p);
+    p.fp_memo.follow_end();
+    errs
+}
+
+fn materialize_all(p: &mut Program) -> Vec<Diag> {
     // Closures need the instance machinery too: each closure body is
     // its own fn with a slot, made here (ARCH 2.9, 4.1); and so do
     // `dyn Fn` values made from fn items, whose vtables only body
@@ -12093,6 +12104,7 @@ pub fn materialize(p: &mut Program) -> Vec<Diag> {
         let mut next_queue: Vec<LocalDefId> = Vec::new();
         let mut recheck: Vec<LocalDefId> = Vec::new();
         for fid in std::mem::take(&mut queue) {
+            crate::driver::graph::FpMemo::sync(p);
             let depth = depths.get(&fid).copied().unwrap_or(0);
             // Snapshot everything the instance requests name,
             // then drop the checked body: it borrows the program

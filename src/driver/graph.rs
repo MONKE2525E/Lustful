@@ -623,8 +623,10 @@ enum Deep {
 /// sub-type that many fields share is folded once (`adt_deep`). Callers
 /// of `hash_ty_deep` make one per fingerprint and pass it along. The
 /// program-wide `FpMemo` keeps the same values across computations.
+/// The flag marks a fresh walk (`memo_check`): it neither reads nor
+/// fills the program memo.
 #[derive(Default)]
-pub(crate) struct DeepMemo(FxMap<(Deep, DefId), u64>);
+pub(crate) struct DeepMemo(FxMap<(Deep, DefId), u64>, bool);
 
 /// The program-wide memo of deep Adt fingerprints, by `AdtId`. It is on
 /// only while the program does not change: the driver turns it on after
@@ -633,11 +635,18 @@ pub(crate) struct DeepMemo(FxMap<(Deep, DefId), u64>);
 /// still walks each Adt once (`DeepMemo`). Walks that fill it hold
 /// `walk`: an Adt cycle publishes all its members before another walk
 /// can see one of them, so no walk takes a member for a finished leaf.
+///
+/// Mono (`generics::materialize`) changes the program between body
+/// checks, so there the memo follows it (`follow_begin`, `sync`): it is
+/// on, and it starts empty again whenever `deep_stamp` moves.
 #[derive(Default)]
 pub struct FpMemo {
     layout: Vec<std::sync::OnceLock<u64>>,
     regions: Vec<std::sync::OnceLock<u64>>,
     walk: std::sync::Mutex<()>,
+    /// While mono runs on a program whose memo was off: the
+    /// `deep_stamp` the current values were made under.
+    follow: Option<u64>,
 }
 
 impl FpMemo {
@@ -652,6 +661,34 @@ impl FpMemo {
         *self = FpMemo::default();
     }
 
+    /// Starts following the program through mono when the memo is off
+    /// (a collect); an on memo stays as its owner set it. `follow_end`
+    /// turns a followed memo off again.
+    pub(crate) fn follow_begin(&mut self) {
+        if self.layout.is_empty() && self.regions.is_empty() {
+            self.follow = Some(u64::MAX);
+        }
+    }
+
+    pub(crate) fn follow_end(&mut self) {
+        if self.follow.is_some() {
+            self.off();
+        }
+    }
+
+    /// Before each body check in mono: a followed memo drops its values
+    /// when an input of the deep walk moved since they were made.
+    pub(crate) fn sync(p: &mut Program) {
+        if p.fp_memo.follow.is_none() {
+            return;
+        }
+        let stamp = deep_stamp(p);
+        if p.fp_memo.follow != Some(stamp) {
+            p.fp_memo.on(p.adts.len());
+            p.fp_memo.follow = Some(stamp);
+        }
+    }
+
     fn slot(&self, p: &Program, kind: Deep, def: DefId) -> Option<&std::sync::OnceLock<u64>> {
         let a = p.adt_by_def(def)?;
         match kind {
@@ -663,15 +700,49 @@ impl FpMemo {
 
 impl DeepMemo {
     fn get(&self, p: &Program, kind: Deep, def: DefId) -> Option<u64> {
-        self.0.get(&(kind, def)).copied().or_else(|| p.fp_memo.slot(p, kind, def).and_then(|s| s.get().copied()))
+        if let Some(&v) = self.0.get(&(kind, def)) {
+            return Some(v);
+        }
+        if self.1 {
+            return None;
+        }
+        let v = p.fp_memo.slot(p, kind, def).and_then(|s| s.get().copied())?;
+        if memo_check() {
+            let fresh = adt_deep(p, kind, def, &mut DeepMemo(FxMap::default(), true));
+            assert_eq!(fresh, v, "internal: stale deep fingerprint memo for {def:?} (LUST_CHECK_FPMEMO)");
+        }
+        Some(v)
     }
 
     fn put(&mut self, p: &Program, kind: Deep, def: DefId, v: u64) {
         self.0.insert((kind, def), v);
-        if let Some(s) = p.fp_memo.slot(p, kind, def) {
+        if !self.1
+            && let Some(s) = p.fp_memo.slot(p, kind, def)
+        {
             let _ = s.set(v);
         }
     }
+}
+
+/// LUST_CHECK_FPMEMO=1: every value the program memo gives is computed
+/// again by a fresh walk, and a difference panics (test sweeps).
+fn memo_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUST_CHECK_FPMEMO").is_some_and(|v| v == "1"))
+}
+
+/// A stamp of the tables the deep walk reads that mono can grow
+/// (`hash_adt_layout`, `hash_adt_regions`): their sizes. Mono writes only
+/// new instance rows of `Program::adts` (a def maps to its template row,
+/// so a walk never reaches one) and adds entries to these tables; it
+/// edits no entry in place, so equal sizes mean equal walk inputs.
+fn deep_stamp(p: &Program) -> u64 {
+    let gx = &p.gx;
+    let mut h = FxHasher::default();
+    (gx.glue_methods.len(), gx.written_hash.len(), gx.borrow_impls.len(), gx.dyn_keys.len(), gx.adt_lifetimes.len()).hash(&mut h);
+    (gx.index.impls_of_trait(gx.lang.hasher).len(), gx.index.impls_of_trait(gx.lang.build_hasher).len()).hash(&mut h);
+    (p.regions.adt_facts.len(), p.regions.adt_fields.len(), p.regions.adt_bounds.len()).hash(&mut h);
+    h.finish()
 }
 
 /// Hashes one type shallowly (`hash_ty`), then calls `r` for every Adt
@@ -709,7 +780,7 @@ fn adt_deep(p: &Program, kind: Deep, def: DefId, memo: &mut DeepMemo) -> u64 {
     if let Some(v) = memo.get(p, kind, def) {
         return v;
     }
-    let _walk = (!p.fp_memo.layout.is_empty()).then(|| p.fp_memo.walk.lock().unwrap_or_else(|e| e.into_inner()));
+    let _walk = (!memo.1 && !p.fp_memo.layout.is_empty()).then(|| p.fp_memo.walk.lock().unwrap_or_else(|e| e.into_inner()));
     if let Some(v) = memo.get(p, kind, def) {
         return v;
     }
@@ -2977,6 +3048,29 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         assert!(b.iter().zip(&c).all(|(x, y)| x != y), "C's edit moves A, B (through A), C, and D");
         let c = layouts(&fps(&SRC.replace("x: u8", "x: u16"), true, false));
         assert_eq!((b[0] != c[0], b[1] != c[1], b[2] != c[2], b[3] != c[3]), (true, true, false, true), "B's edit moves its cycle and D");
+    }
+
+    /// The memo that follows mono (`FpMemo::sync`): a table the deep
+    /// walk reads grows (a glue method for C), and the next sync drops the
+    /// values made before, so A's fingerprint is the fresh one again.
+    #[test]
+    fn followed_memo_drops_values_when_walk_inputs_grow() {
+        const SRC: &str = "struct A { c: C }\nstruct C { x: u32 }\nfn main() {}\n";
+        with_program(SRC, |interner, p| {
+            let def = p.def_of_adt(p.type_names[&interner.intern("A")]);
+            let c = p.type_names[&interner.intern("C")];
+            p.fp_memo.follow_begin();
+            FpMemo::sync(p);
+            let before = layout_fingerprint(p, def);
+            p.gx.glue_methods.insert((c, p.gx.lang.clone), LocalDefId(0));
+            assert_eq!(layout_fingerprint(p, def), before, "the memo holds the old value until the next sync");
+            FpMemo::sync(p);
+            let after = layout_fingerprint(p, def);
+            p.fp_memo.follow_end();
+            assert!(p.fp_memo.layout.is_empty(), "a followed memo is off again after mono");
+            assert_ne!(after, before, "C's glue moves A");
+            assert_eq!(layout_fingerprint(p, def), after, "the synced value is the fresh walk's");
+        });
     }
 
     #[test]
