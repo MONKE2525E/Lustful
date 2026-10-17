@@ -619,11 +619,13 @@ fn replay_bodies(
             if reuse.untouched_by(p, t, &readers) {
                 continue;
             }
-            // A template with closures has no stored plain check: its last
-            // clean check's reads stand in (`closure_template_holds`, only
-            // the keys this delta can move), and with none it stands while
-            // its body does not name an edited fn.
-            let holds = reuse.template_holds(p, t).or_else(|| reuse.closure_template_holds(p, t, p.reuse_stamp, Some(&mut |k| moves.hit(p, k))));
+            // Only the keys this delta can move compare, as for the
+            // discovery bodies. A template with closures has no stored plain
+            // check: its last clean check's reads stand in
+            // (`closure_template_holds`), and with none it stands while its
+            // body does not name an edited fn.
+            let holds = reuse.template_holds_moved(p, t, &mut |k| moves.hit(p, k));
+            let holds = holds.or_else(|| reuse.closure_template_holds(p, t, p.reuse_stamp, Some(&mut |k| moves.hit(p, k))));
             let holds = holds.unwrap_or_else(|| {
                 !match idents.get(t.0 as usize) {
                     Some(ids) if (t.0 as usize) < fn_count => ids.iter().any(|s| names.contains(s)),
@@ -656,9 +658,10 @@ fn replay_bodies(
 /// collect with generic reuse runs them. A body stands when the program
 /// holds its entry (none stored after `Program::reuse_stamp`) and the entry
 /// reads no node `touched` names (or, with `readers`, is not in that set:
-/// the header delta's reverse index of the same nodes), or when its stored
-/// output still holds, or when the caller proved it (`stands`: the derive
-/// delta's keyed walk).
+/// the header delta's reverse index of the same nodes), or when each read
+/// of its entry that `touched` names keeps its fingerprint (in `lust check`
+/// also the reads of a pending check's note), or when the caller proved it
+/// (`stands`: the derive delta's keyed walk).
 /// An entry stored after the program's stamp (and before `start`, when the
 /// delta began) checks against the output the program keeps for it
 /// (`bases`). Every other body checks again and must give the output
@@ -717,10 +720,10 @@ pub(super) fn replay_discovery(
             } else if readers.map_or_else(|| reuse.untouched(p, g, &mut |k| touched(p, k)), |r| reuse.untouched_by(p, g, r)) {
                 counts[1] += 1;
                 continue;
-            } else if reuse.discovery_holds(p, g) {
+            } else if reuse.discovery_holds_moved(p, g, &mut |k| touched(p, k)) {
                 counts[2] += 1;
                 continue;
-            } else if readers.is_none() && !walk_instances && reuse.pending_holds_moved(p, g, &mut |k| touched(p, k)) {
+            } else if !walk_instances && reuse.pending_holds_moved(p, g, &mut |k| touched(p, k)) {
                 counts[1] += 1;
                 continue;
             } else {

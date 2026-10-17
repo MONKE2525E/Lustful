@@ -661,8 +661,9 @@ impl GenReuse {
     }
 
     /// `template_holds` when only the read keys `moves` takes can have
-    /// moved since the stored check (a derive-only request, sigedit P3.2):
-    /// the other reads are not compared.
+    /// moved since the stored check (a derive-only request, sigedit P3.2,
+    /// and a header delta, driver/kept_delta.rs): the other reads are not
+    /// compared.
     pub fn template_holds_moved(&mut self, p: &Program, t: LocalDefId, moves: &mut dyn FnMut(&ReadKey) -> bool) -> Option<bool> {
         let src = self.src_of(p, t)?;
         let (lo, hi) = p.fn_def(t).exprs;
@@ -777,21 +778,28 @@ impl GenReuse {
         self.readers_pushed += push(&mut self.readers_index, def, reads);
     }
 
-    /// True when fn `f`'s stored discovery output still holds and is the
-    /// one its last check made (`discovered` without the copy; after a
-    /// check with a body error, the program holds that check's output).
-    pub fn discovery_holds(&mut self, p: &Program, f: LocalDefId) -> bool {
-        let Some(src) = self.src_of(p, f).filter(|_| self.on && !self.unstored.contains_key(&p.def_id(f))) else { return false };
-        let Some(e) = self.discovery.get(&p.def_id(f)) else { return false };
-        e.src == src && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads)
-    }
-
     /// True when fn `f` has a stored discovery output made from its current
     /// source and its last check stored it (its reads are not compared:
     /// the derive delta's keyed walk proved them).
     pub(crate) fn discovery_src_same(&self, p: &Program, f: LocalDefId) -> bool {
         let def = p.def_id(f);
         self.on && !self.unstored.contains_key(&def) && self.discovery.get(&def).is_some_and(|e| self.src_of(p, f) == Some(e.src))
+    }
+
+    /// True when fn `f`'s stored discovery output is the one its last check
+    /// made, from its current source, and each of its reads that `moves`
+    /// names keeps its fingerprint. For an entry that held for the program
+    /// before an edit that moves only those nodes (the kept program deltas,
+    /// driver/kept_delta.rs), it then still holds, as `pending_holds_moved`
+    /// and `untouched` reason.
+    pub(crate) fn discovery_holds_moved(&mut self, p: &Program, f: LocalDefId, moves: &mut impl FnMut(&ReadKey) -> bool) -> bool {
+        let def = p.def_id(f);
+        if !self.on || self.unstored.contains_key(&def) {
+            return false;
+        }
+        let (Some(src), Some(e)) = (self.src_of(p, f), self.discovery.get(&def)) else { return false };
+        let memo = &mut self.memo;
+        e.src == src && e.reads.iter().all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored)
     }
 
     /// The stored discovery output of fn `f`, if it still holds. Not when
