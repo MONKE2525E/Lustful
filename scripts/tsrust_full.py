@@ -56,6 +56,22 @@ def targets(fork):
     return out
 
 
+# The fork's library crates in dependency order, for the deep and build censuses (goport_core
+# only on forks that have it, v0.7.0 and later). The codegen tools are leaf crates of their own.
+CENSUS_LIBS = ["goport_util", "goport_lsproto", "goport_core", "ts_goport"]
+TOOL_LIBS = ["ts_ast_codegen", "ts_diagnostics_codegen"]
+
+
+def census_libs(fork):
+    """CENSUS_LIBS the fork has, comma-joined. Exits when the fork has a lib outside CENSUS_LIBS
+    and TOOL_LIBS, so a new crate is never left out of a census without a word."""
+    names = {t["name"] for t in targets(fork) if t["kind"] == "lib"}
+    new = sorted(names - set(CENSUS_LIBS) - set(TOOL_LIBS))
+    if new:
+        sys.exit(f"tsrust-full: fork libs not in CENSUS_LIBS (add them in dependency order): {', '.join(new)}")
+    return ",".join(n for n in CENSUS_LIBS if n in names)
+
+
 def run_cargo(fork, out, log):
     """cargo test --release --workspace, then cargo build --release --bins (same profile, so the
     second step reuses the first). Returns (ok, summary line)."""

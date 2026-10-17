@@ -31,7 +31,7 @@ Usage: tsrust_build.py --fork DIR --lust PATH --work DIR [--only a,b] [--max-rou
 --reuse keeps <work>/fork from an earlier run (fast reruns after a lust fix); --clean removes the
 big dirs at the end and keeps the pruned sources as fork-src.tgz (tsrust-full.sh --boat --build
 adds it).
-Targets default to the three library crates in dependency order. Output: <work>/build.json,
+Targets default to the fork's library crates in dependency order (tsrust_full.census_libs). Output: <work>/build.json,
 a table of bugs and diffs, and the last line
   tsrust-build: <b>/<libs> build, <same>/<ran> tests same, <k> build bugs, <d> diffs, <f> false accepts
 scripts/tsrust-full.sh --build [--boat] runs it.
@@ -55,7 +55,6 @@ import prune  # noqa: E402
 import tsrust_deep  # noqa: E402
 import tsrust_full  # noqa: E402
 
-DEFAULT = ["goport_util", "goport_lsproto", "ts_goport"]
 MARK = '#[doc = "lust-test"]'
 DISPATCH = "__lust_test"
 
@@ -543,8 +542,9 @@ def main():
     ap.add_argument("--fork", required=True, type=Path)
     ap.add_argument("--lust", required=True)
     ap.add_argument("--work", required=True, type=Path)
-    ap.add_argument("--only", default=",".join(DEFAULT))
-    ap.add_argument("--max-rounds", type=int, default=250)
+    ap.add_argument("--only", default="")
+    # The v0.7.0 fork's ts_goport needs about 280 prune rounds.
+    ap.add_argument("--max-rounds", type=int, default=600)
     ap.add_argument("--timeout", type=int, default=60, help="seconds per test run")
     ap.add_argument("--build-timeout", type=int, default=1800)
     ap.add_argument("--max-bugs", type=int, default=12, help="build bugs to bisect per lib before giving up")
@@ -556,6 +556,7 @@ def main():
     work = a.work.resolve()
     copy = work / "fork"
     env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=str(work / "lust-cache"), CARGO_TARGET_DIR=str(work / "cargo-target"))
+    a.only = a.only or tsrust_full.census_libs(a.fork.resolve())
     if a.reuse and (work / "tests.json").exists():
         libs = libs_of(copy, a.only.split(","))
         tests = json.loads((work / "tests.json").read_text())
