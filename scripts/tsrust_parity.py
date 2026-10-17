@@ -62,10 +62,27 @@ TOOL_RUNS = {
 }
 
 
+def rustfmt_ok():
+    """True when rustfmt runs. ts_ast_codegen pipes its output through rustfmt; without it most
+    of its runs fail on both sides and would count as same (tsrust-pr-2, 13:52). Boat boxes have
+    only the rustup proxy, so the component is added once when it is missing."""
+    def works():
+        try:
+            return subprocess.run(["rustfmt", "--version"], capture_output=True, timeout=60).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    if not works():
+        subprocess.run(["rustup", "component", "add", "rustfmt"], capture_output=True, timeout=600)
+    return works()
+
+
 def parity_tools(fork, cargo_bins, lust_bins, out, timeout):
-    """TOOL_RUNS with the Cargo and the lust build of each tool, in the fork root."""
+    """TOOL_RUNS with the Cargo and the lust build of each tool, in the fork root. No working
+    rustfmt makes every row a failure, never a pass."""
     scratch = out / "parity-tools"
     rows = []
+    if not rustfmt_ok():
+        return [(f"{tool} {' '.join(args)}", "no rustfmt (rustup component add rustfmt failed)") for tool, runs in TOOL_RUNS.items() for args in runs]
     for tool, runs in TOOL_RUNS.items():
         cb, lb = cargo_bins / tool, lust_bins / f"{tool}-{tool}"
         for args in runs:
