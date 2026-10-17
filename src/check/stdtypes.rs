@@ -189,9 +189,9 @@ fn pred_fn_ok(tys: &mut impl TyIntern, f: Ty, inner: Ty, out: Ty) -> bool {
 
 /// True when core implements `DoubleEndedIterator` for builtin iterator
 /// `t` (the element bounds aside: the adapters' `Iterator` impls prove
-/// those). Conservative: the kinds that need `ExactSizeIterator` too, the
-/// str and slice splits, and the forward-only kinds answer false (lowering
-/// has no `next_back` for them: `lust build` would reject the use later).
+/// those). Conservative: the str and slice splits and `Flatten` answer
+/// false. Lowering has no `next_back` for some kinds this accepts (`Skip`):
+/// `lust build` rejects a `Rev` over one when the code iterates it.
 fn written_double_ended(tys: &impl TyIntern, t: Ty) -> bool {
     use IterKind as K;
     if tys.is_chars_ty(t) {
@@ -223,6 +223,45 @@ fn written_double_ended(tys: &impl TyIntern, t: Ty) -> bool {
         | K::Args => true,
         K::Map | K::Filter | K::FilterMap | K::Rev | K::Copied | K::Cloned | K::Inspect | K::Peekable => written_double_ended(tys, a[0]),
         K::Chain => written_double_ended(tys, a[0]) && written_double_ended(tys, a[1]),
+        // `I: DoubleEndedIterator + ExactSizeIterator`.
+        K::Enumerate | K::Take | K::Skip | K::StepBy => written_double_ended(tys, a[0]) && written_exact_size(tys, a[0]),
+        K::Zip => (0..2).all(|i| written_double_ended(tys, a[i]) && written_exact_size(tys, a[i])),
+        _ => false,
+    }
+}
+
+/// True when core implements `ExactSizeIterator` for builtin iterator `t`
+/// (the element bounds aside). Conservative like `written_double_ended`.
+fn written_exact_size(tys: &impl TyIntern, t: Ty) -> bool {
+    use IterKind as K;
+    let Some((k, a)) = crate::ty::iter::iter_parts(tys, t) else { return false };
+    match k {
+        K::Range | K::RangeInclusive => match tys.kind(a[0]) {
+            TyKind::Int(i) => crate::check::iter::exact_range_int(i, k == K::RangeInclusive),
+            _ => false,
+        },
+        K::SliceIter
+        | K::SliceIterMut
+        | K::VecIntoIter
+        | K::VecDrain
+        | K::ArrayIntoIter
+        | K::RepeatN
+        | K::Windows
+        | K::Chunks
+        | K::ChunksMut
+        | K::ChunksExact
+        | K::ChunksExactMut
+        | K::OptionIter
+        | K::OptionIterMut
+        | K::OptionIntoIter
+        | K::ResultIter
+        | K::ResultIterMut
+        | K::ResultIntoIter
+        | K::Args => true,
+        K::Map | K::Enumerate | K::Rev | K::Take | K::Skip | K::StepBy | K::Copied | K::Cloned | K::Peekable | K::Inspect => {
+            written_exact_size(tys, a[0])
+        }
+        K::Zip => written_exact_size(tys, a[0]) && written_exact_size(tys, a[1]),
         _ => false,
     }
 }
