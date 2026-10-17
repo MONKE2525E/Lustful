@@ -6759,6 +6759,11 @@ pub fn implied_sig_tys(
     if let (Some(sp), Some(st)) = (&def.self_param, scope.self_ty_regioned.or(scope.self_ty)) {
         match (sp.kind, sp.ty) {
             (ast::SelfKind::Typed, Some(t)) => out.extend(resolve_scoped(ast, interner, known, cx, tys, t, &ks).ok()),
+            // `&'a self` gives `Self: 'a` (its params outlive `'a`).
+            (ast::SelfKind::Ref | ast::SelfKind::RefMut, _) => match scope_region(interner, &ks, sp.lifetime, sp.span) {
+                Ok(r) => out.push(tys.intern(TyKind::Ref(r, Mut::from_bool(sp.kind == ast::SelfKind::RefMut), st))),
+                Err(_) => out.push(st),
+            },
             _ => out.push(st),
         }
     }
