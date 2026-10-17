@@ -474,10 +474,16 @@ class Harness:
         return self.daemon.poll() is None
 
     # Daemon RSS bound (fx-oraclemem): once a daemon has served RSS_WARM edits, its RSS may
-    # grow to at most twice that value plus RSS_SLACK_MB. A per-request leak fails the run
-    # instead of filling the box (the patch oracle once kept a Program per request, about
-    # 10 MB per edit). FUZZ_RSS_LOG=<file> appends `<sample> <MB>` per edit.
-    RSS_WARM = 100
+    # grow to at most RSS_GROW times that value plus RSS_SLACK_MB. A per-request leak fails
+    # the run instead of filling the box (the patch oracle once kept a Program per request,
+    # about 15 MB per edit). The daemon never gives freed pages back (MIMALLOC_PURGE_DELAY=-1,
+    # client.rs), so its RSS is a high-water mark: on crate small it climbs from about 100 to
+    # 500-700 MB in the first 300-500 edits, then flattens (+50-100 MB from edit 1500 to 6000),
+    # while live memory (MIMALLOC_PURGE_DELAY=0) stays at 150-300 MB. Warm at 500 measures
+    # growth after that climb. FUZZ_RSS_LOG=<file> appends
+    # `<sample> <MB>` per edit.
+    RSS_WARM = 500
+    RSS_GROW = 1.25
     RSS_SLACK_MB = 256
 
     def rss_mb(self):
@@ -496,7 +502,7 @@ class Harness:
         self.rss_peak = max(self.rss_peak, mb)
         if self._rss_n == self.RSS_WARM:
             self._rss_warm = mb
-        elif self._rss_warm and mb > 2 * self._rss_warm + self.RSS_SLACK_MB and not self.rss_bad:
+        elif self._rss_warm and mb > self.RSS_GROW * self._rss_warm + self.RSS_SLACK_MB and not self.rss_bad:
             self.rss_bad = f"{self._rss_warm:.0f} MB after {self.RSS_WARM} edits -> {mb:.0f} MB after {self._rss_n}"
         if os.environ.get("FUZZ_RSS_LOG"):
             with open(os.environ["FUZZ_RSS_LOG"], "a") as f:
@@ -506,7 +512,7 @@ class Harness:
         """Prints the RSS line; 1 when the bound broke (a failure), else 0."""
         print(f"rss: daemon peak {self.rss_peak:.0f} MB, warm {self._rss_warm:.0f} MB", flush=True)
         if self.rss_bad:
-            print(f"FAIL daemon RSS grew past 2x + {self.RSS_SLACK_MB} MB: {self.rss_bad}", flush=True)
+            print(f"FAIL daemon RSS grew past {self.RSS_GROW}x + {self.RSS_SLACK_MB} MB: {self.rss_bad}", flush=True)
             return 1
         return 0
 
