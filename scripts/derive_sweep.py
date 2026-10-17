@@ -226,6 +226,55 @@ SHAPES["t5_constfn_copy"] = ("const fn t5_constfn_copy<T: Copy>(a: A, t: T) -> (
                              "let (x, y, _) = t5_constfn_copy(mk(), 1u8);\n    println!(\"{} {}\", show(&x), show(&y));")
 T5_SHAPES = sorted(sh for sh in SHAPES if sh.startswith("t5_"))
 
+# Round 7 (--proj): written projections that name A in signatures, fields
+# and consts (`Self::Item` of an impl for a wrapper of A, std impls whose
+# answer follows A's Clone: ToOwned, Cloned, Cow). The derive delta checks
+# them again in place of a full collect.
+P7_SHAPES = {
+    "p7_self_item": (
+        "struct P7It(Option<A>);\nimpl Iterator for P7It {\n    type Item = A;\n    fn next(&mut self) -> Option<Self::Item> {\n        self.0.take()\n    }\n}\n",
+        "let mut it = P7It(Some(mk()));\n    println!(\"{}\", it.next().map(|a| show(&a)).unwrap_or_default());",
+    ),
+    "p7_index_out": (
+        "struct P7V(Vec<A>);\nimpl std::ops::Index<usize> for P7V {\n    type Output = A;\n    fn index(&self, i: usize) -> &Self::Output {\n        &self.0[i]\n    }\n}\n",
+        "let v = P7V(vec![mk()]);\n    println!(\"{}\", show(&v[0]));",
+    ),
+    "p7_vec_into": (
+        "fn p7_ii(v: Vec<A>) -> <Vec<A> as IntoIterator>::IntoIter {\n    v.into_iter()\n}\n",
+        "println!(\"{}\", p7_ii(vec![mk()]).count());",
+    ),
+    "p7_out_names_a": (
+        "trait P7Tr {\n    type Out;\n}\nimpl P7Tr for u8 {\n    type Out = A;\n}\nfn p7_out(x: <u8 as P7Tr>::Out) -> String {\n    show(&x)\n}\n",
+        "println!(\"{}\", p7_out(mk()));",
+    ),
+    "p7_toowned_param": (
+        "fn p7_own(a: <A as ToOwned>::Owned) -> String {\n    show(&a)\n}\n",
+        "println!(\"{}\", p7_own(mk()));",
+    ),
+    "p7_toowned_field": (
+        "struct P7F {\n    o: <A as ToOwned>::Owned,\n}\n",
+        "let f = P7F { o: mk() };\n    println!(\"{}\", show(&f.o));",
+    ),
+    "p7_cloned_item": (
+        "fn p7_cl(a: <std::iter::Cloned<std::slice::Iter<'static, A>> as Iterator>::Item) -> String {\n    show(&a)\n}\n",
+        "println!(\"{}\", p7_cl(mk()));",
+    ),
+    "p7_generic_impl_item": (
+        "struct P7G<T>(Option<T>);\nimpl<T: Clone> Iterator for P7G<T> {\n    type Item = T;\n    fn next(&mut self) -> Option<Self::Item> {\n        self.0.clone()\n    }\n}\n"
+        "fn p7_g(mut g: P7G<A>) -> Option<<P7G<A> as Iterator>::Item> {\n    g.next()\n}\n",
+        "println!(\"{}\", p7_g(P7G(Some(mk()))).map(|a| show(&a)).unwrap_or_default());",
+    ),
+    "p7_cow": (
+        "fn p7_cow(c: std::borrow::Cow<'_, A>) -> String {\n    show(&c)\n}\n",
+        "println!(\"{}\", p7_cow(std::borrow::Cow::Owned(mk())));",
+    ),
+    "p7_const_ty": (
+        "const P7C: Option<<A as ToOwned>::Owned> = None;\n",
+        "println!(\"{}\", P7C.is_none());",
+    ),
+}
+SHAPES.update(P7_SHAPES)
+
 # Shapes that need a trait an Adt form cannot derive: Default (enum forms).
 NEEDS_DEFAULT = {"generic_default"} | {f"t5_{c}_default" for c in T5_CONTEXTS}
 # Shapes a generic Adt form leaves out: lust rejects `#[derive(Copy)]` over a
@@ -401,6 +450,24 @@ def versions5(rng, full, shapes):
 
 
 def gen(seed, resolver=False):
+    vs = gen_base(seed, resolver)
+    if not os.environ.get("DSWEEP_PROJ"):
+        return vs
+    # --proj: one to three round 7 shapes in every version (their own
+    # random stream, so the base program stays the seed's).
+    prng = random.Random(seed * 7919 + 7)
+    extra = sorted(prng.sample(sorted(P7_SHAPES), prng.randint(1, 3)))
+    items = "".join(P7_SHAPES[sh][0] for sh in extra)
+    stmts = "".join("    {\n    " + P7_SHAPES[sh][1] + "\n    }\n" for sh in extra)
+    out = []
+    for v in vs:
+        head, body = v.split("fn main()", 1)
+        brace = body.index("{\n") + 2
+        out.append(head + items + "fn main()" + body[:brace] + stmts + body[brace:])
+    return out
+
+
+def gen_base(seed, resolver=False):
     rng = random.Random(seed)
     if seed % 6 == 1:
         adt = rng.choice(ADTS)
@@ -528,10 +595,13 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--keep", default="")
     ap.add_argument("--resolver", action="store_true", help="route every program to the resolver path")
+    ap.add_argument("--proj", action="store_true", help="add round 7 projection shapes (P7_SHAPES) to every program")
     ap.add_argument("--contexts", default="", help="round 5 programs take template shapes of these contexts only (gtwice,gfnbound)")
     a = ap.parse_args()
     if a.contexts:
         os.environ["DSWEEP_CONTEXTS"] = a.contexts
+    if a.proj:
+        os.environ["DSWEEP_PROJ"] = "1"
     if not os.path.exists(LUST):
         print(f"{LUST} missing; run scripts/build.sh", file=sys.stderr)
         return 2
