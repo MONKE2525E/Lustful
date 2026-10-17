@@ -5244,8 +5244,10 @@ impl<'p> Ctx<'p> {
         match self.tys.kind(self_ty) {
             TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) => {}
             TyKind::Closure(..) if trait_def == lang.copy || trait_def == lang.clone => {}
-            // core's `impl<F: FnPtr> Hash for F` (the address).
-            TyKind::FnPtr(_) => return trait_def == lang.hash,
+            // core's `impl<F: FnPtr> Hash for F` (the address), and the
+            // builtin Copy and Clone of every fn pointer and fn item.
+            TyKind::FnPtr(_) => return trait_def == lang.hash || trait_def == lang.copy || trait_def == lang.clone,
+            TyKind::FnDef(..) => return trait_def == lang.copy || trait_def == lang.clone,
             // A builtin iterator std makes Clone (`iter_clone_is_copy`).
             TyKind::Adt(..) if trait_def == lang.clone && (self.tys.is_chars_ty(self_ty) || crate::ty::iter::iter_parts(&self.tys, self_ty).is_some()) => {
                 return crate::check::collect::iter_clone_is_copy(p, &self.tys, self_ty);
@@ -25350,6 +25352,12 @@ impl<'p> SolveCx for Ctx<'p> {
             && matches!(self.kind(self_ty), TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::Closure(..))
         {
             return Some(self.derive_query_holds(tr.def, self_ty));
+        }
+        // core's builtin impls: every fn pointer and fn item is Copy and
+        // Clone, for any signature. (Their Debug, PartialEq, and kin
+        // compare or print addresses, which lust does not match.)
+        if (tr.def == lang.copy || tr.def == lang.clone) && matches!(self.kind(self_ty), TyKind::FnPtr(_) | TyKind::FnDef(..)) {
+            return Some(true);
         }
         // A builtin iterator's Clone has no impl record either: the
         // method probe's where-clause filter (`impl<T: Clone> Tag for T`
