@@ -321,7 +321,7 @@ impl<'p> Ctx<'p> {
         };
         let at = self.expr(*a, None);
         let at = self.deep(at);
-        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at).or_else(|| self.into_iterator_arg(*a, at)) else {
+        let Some(it) = crate::ty::iter::as_iter_ty(&mut self.tys, at).or_else(|| self.wrapper_iter_arg(at)).or_else(|| self.into_iterator_arg(*a, at)) else {
             let tn = self.tn(at);
             self.err("L0640", self.span(*a), format!("`extend` from `{tn}` is not implemented yet"), "Pass an iterator, a Vec, or a slice.");
             return Some(ERROR);

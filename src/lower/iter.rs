@@ -1574,7 +1574,10 @@ impl Ex<'_, '_> {
                 // `v.extend(src)` (W-STD-B): `src` through `IntoIterator`.
                 let (r, src) = (arg()?, arg()?);
                 let st = self.op_ty(&src)?;
-                let want = it::as_iter_ty(&mut self.body.tys, st).ok_or("iterator expansion: bad extend argument")?;
+                let want = self
+                    .wrapper_inner(st)
+                    .or_else(|| it::as_iter_ty(&mut self.body.tys, st))
+                    .ok_or("iterator expansion: bad extend argument")?;
                 let iv = self.into_iter(src, want)?;
                 let (owned, ty) = self.own(iv)?;
                 let rt = self.op_ty(&r)?;
@@ -1592,7 +1595,10 @@ impl Ex<'_, '_> {
                 // `map.extend(src)` (W-STD-B): `src` through `IntoIterator`.
                 let (r, src) = (arg()?, arg()?);
                 let st = self.op_ty(&src)?;
-                let want = it::as_iter_ty(&mut self.body.tys, st).ok_or("iterator expansion: bad extend argument")?;
+                let want = self
+                    .wrapper_inner(st)
+                    .or_else(|| it::as_iter_ty(&mut self.body.tys, st))
+                    .ok_or("iterator expansion: bad extend argument")?;
                 let iv = self.into_iter(src, want)?;
                 let (owned, ty) = self.own(iv)?;
                 let rt = self.op_ty(&r)?;

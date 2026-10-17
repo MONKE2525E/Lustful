@@ -1713,6 +1713,18 @@ impl<'p> Ctx<'p> {
         Some(wrapped)
     }
 
+    /// A std collection iterator struct as an `extend` argument (a local
+    /// of type `btree_map::Values`, as an instance with I = Values has):
+    /// its inner builtin iterator, which lowering unwraps (lower/iter.rs
+    /// `into_iter`). BTree `range` iterators stay out: std hints them
+    /// `(0, None)`, which the reserve would read.
+    pub(super) fn wrapper_iter_arg(&mut self, t: Ty) -> Option<Ty> {
+        if self.p.is_btree_range_iter(&mut self.tys, t) {
+            return None;
+        }
+        self.p.collection_iter_inner(&mut self.tys, t)
+    }
+
     /// An `IntoIterator` argument (`extend`, `from_iter`) of type `t`:
     /// an iterator through its own `next` (`by_next_arg`), else a value
     /// through a written or bound `IntoIterator` impl, moved by its
