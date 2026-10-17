@@ -164,13 +164,15 @@ def first_diff(a, b):
     return f"cargo {len(la)} lines, lust {len(lb)} lines"
 
 
-def parity_runs(fork, cargo_bins, lust_bins, out, timeout):
+def parity_runs(fork, cargo_bins, lust_bins, out, timeout, bins=BINS, keep=lambda case: True):
+    """Every fixture run of each bin in `bins` (default all) on each project `keep` takes:
+    Cargo build vs lust build."""
     work = out / "parity-work" / "case"  # one path for both sides
     rows = []
-    for bin_name in BINS:
+    for bin_name in bins:
         cb = cargo_bins / bin_name
         lb = lust_bins / f"ts_goport-{bin_name}"
-        for case, src in projects(fork):
+        for case, src in filter(lambda p: keep(p[0]), projects(fork)):
             for cmd in commands(cb, case):
                 tag = f"{bin_name} {' '.join(cmd[1:])} @ {case}"
                 if not lb.exists():
@@ -207,9 +209,9 @@ def put_bin(src, dst):
     os.replace(tmp, dst)
 
 
-def parity_tests(fork, cargo_bins, lust_bins, deps, timeout):
-    """Each test bin with Cargo bins, then with lust bins at the same paths. The Cargo bins are
-    restored at the end, also on an error."""
+def parity_tests(fork, cargo_bins, lust_bins, deps, timeout, swap=BINS, tests=TESTS):
+    """Each test bin with Cargo bins, then with the lust builds of the bins in `swap` (default
+    all) at the same paths. The Cargo bins are restored at the end, also on an error."""
     saved = cargo_bins / "parity-saved"
     saved.mkdir(exist_ok=True)
     rows = []
@@ -218,7 +220,7 @@ def parity_tests(fork, cargo_bins, lust_bins, deps, timeout):
             if (cargo_bins / b).exists():
                 shutil.copy2(cargo_bins / b, saved / b)
         cwd = fork / "crates/ts_goport"  # cargo test runs a test bin in its package dir
-        for t in TESTS:
+        for t in tests:
             exe = test_exe(deps, t)
             if exe is None:
                 rows.append((t, "no test bin"))
@@ -226,11 +228,11 @@ def parity_tests(fork, cargo_bins, lust_bins, deps, timeout):
             for b in BINS:
                 put_bin(saved / b, cargo_bins / b)
             a = run_tests(exe, cwd, timeout)
-            missing = [b for b in BINS if not (lust_bins / f"ts_goport-{b}").exists()]
+            missing = [b for b in swap if not (lust_bins / f"ts_goport-{b}").exists()]
             if missing:
                 rows.append((t, f"no lust bin for {', '.join(missing)} (cargo bins: {a[1]})"))
                 continue
-            for b in BINS:
+            for b in swap:
                 put_bin(lust_bins / f"ts_goport-{b}", cargo_bins / b)
             l = run_tests(exe, cwd, timeout)
             rows.append((t, "same" if a[0] == l[0] == 0 else f"cargo: {a[0]} {a[1]} | lust: {l[0]} {l[1]}"))
