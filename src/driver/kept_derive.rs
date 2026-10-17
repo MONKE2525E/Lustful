@@ -95,7 +95,49 @@ pub(super) fn apply_derives(
         crate::driver::laps::mark("kept/derive names");
         let def_slot = |d: crate::def::DefId| prog.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
         let answers = &mut caches.gen_reuse.memo;
-        caches.read_index.dirty_slots(prog, &mut caches.slot_reads, &mut |k| prog.derive_key_moves(&mut moves, k), &def_slot, answers)
+        // `LUST_DERIVE_KEYLOG` (with `LUST_DERIVE_LOG`): keys asked and
+        // moved, and the time, per kind.
+        let logging = std::env::var_os("LUST_DERIVE_KEYLOG").is_some();
+        let mut kinds: Vec<(&str, usize, usize, f64)> = Vec::new();
+        let out = caches.read_index.dirty_slots(
+            prog,
+            &mut caches.slot_reads,
+            &mut |k| {
+                if !logging {
+                    return prog.derive_key_moves(&mut moves, k);
+                }
+                let t = std::time::Instant::now();
+                let b = prog.derive_key_moves(&mut moves, k);
+                use crate::driver::graph::ReadKey as K;
+                let name = match k {
+                    K::Binding(_) => "Binding",
+                    K::MethodSet(_) => "MethodSet",
+                    K::ImplSet(_) => "ImplSet",
+                    K::Sig(_) => "Sig",
+                    K::Layout(_) => "Layout",
+                    K::Checked(_) => "Checked",
+                    K::TraitInScope(..) => "TraitInScope",
+                    K::Derives(_) => "Derives",
+                    K::DeriveBits(..) => "DeriveBits",
+                };
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                match kinds.iter_mut().find(|x| x.0 == name) {
+                    Some(x) => (x.1, x.2, x.3) = (x.1 + 1, x.2 + usize::from(b), x.3 + ms),
+                    None => kinds.push((name, 1, usize::from(b), ms)),
+                }
+                b
+            },
+            &def_slot,
+            answers,
+        );
+        crate::check::derive_delta::log(&|| {
+            if !logging {
+                return String::new();
+            }
+            let parts: Vec<String> = kinds.iter().map(|(n, a, m, ms)| format!("{n} {a}/{m} {ms:.1} ms")).collect();
+            format!("keyed classify: {}\n", parts.join(", "))
+        });
+        out
     };
     p.fp_memo.off();
     // The shortcuts below hold only when the derive delta is the request's
