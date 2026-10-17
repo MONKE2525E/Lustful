@@ -3220,8 +3220,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             const_fn_changed = true;
             gen_ok_here = false;
             caches.gen_reuse.clear();
-            mention_only = (0..fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !changed.contains(&i)).collect();
-            changed.extend_from_slice(&mention_only);
+            // Added to the candidates already listed: a failed collect's
+            // leftovers (`Front::const_fn_pending`) joined them above, and
+            // dropping those rechecked a body under the new values but
+            // kept its old C for the next build (hunt11 21:29 const chain).
+            let mut listed = vec![false; fn_count];
+            changed.iter().filter(|&&i| i < fn_count).for_each(|&i| listed[i] = true);
+            let cands: Vec<usize> = (0..fn_count).filter(|&i| caches.ok[front.fn_slot[i] as usize] && !listed[i]).collect();
+            mention_only.extend_from_slice(&cands);
+            changed.extend_from_slice(&cands);
             changed.sort_unstable();
         }
     }
@@ -3663,6 +3670,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             changed.retain(|&i| reused.get(i) != Some(&true));
         }
         t.lap("reads dirty walk");
+    }
+    // Every body still in the work set checks again, so its C (made under
+    // the old reads) is stale until codegen replaces it; a check request
+    // never gets there. The rules above clear it case by case; this keeps
+    // a body listed by any other rule from reaching the next build with
+    // C that holds old const values (hunt11 21:29 const chain).
+    for &i in &changed {
+        if let Some(&s) = front.fn_slot.get(i) {
+            caches.has_out[s as usize] = false;
+        }
     }
 
     // Slot-moved C re-emit (section 4.2): a reused fn whose own slot
