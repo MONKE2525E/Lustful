@@ -2,8 +2,8 @@
 
 Lust adapter crate (docs/ARCH.md section 3.6) for the parts
 ts-rust uses: the read side (diagnostics_loc.rs decodes locale
-data with MultiGzDecoder) and `write::GzEncoder` (pprof.rs writes
-the CPU profile). Gate: `scripts/test-adapters.sh flate2`.
+data with MultiGzDecoder), `write::GzEncoder` (pprof.rs writes
+the CPU profile), and `write::ZlibEncoder` (layergraph.rs). Gate: `scripts/test-adapters.sh flate2`.
 
 ## Implemented, same results as upstream
 
@@ -28,6 +28,12 @@ the CPU profile). Gate: `scripts/test-adapters.sh flate2`.
   Display and Debug, through a std hook only adapters can call).
   Checked against cargo builds of flate2 1.1.10 with generated
   probes (tf-flate2 REPORT).
+- `write::ZlibEncoder`: `new`, `get_ref`, `get_mut`, `try_finish`,
+  `finish`, `flush_finish`, `total_in`, `total_out`, `Write`, `Read`,
+  and the Writer's `Drop`, a port of upstream's zlib/write.rs over the
+  same Writer and a zlib-wrapped miniz compressor (header and Adler-32
+  trailer from the miniz copy). Not here: `reset`, `new_with_compress`,
+  `Debug`. ts-rust's layergraph.rs encodes mermaid URLs with it.
 - `Compression`.
 - A unit without a backend feature (`rust_backend` or
   `miniz_oxide`) fails to build, as upstream does.

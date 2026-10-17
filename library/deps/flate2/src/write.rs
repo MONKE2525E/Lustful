@@ -7,9 +7,12 @@
 // upstream's, so the bytes and the write pattern the inner writer sees
 // are the same, also when it fails or returns short writes.
 //
-// Only the GzEncoder surface is here: no `Debug` (upstream derives it
-// over its internal state), no `GzBuilder`, and no other encoder or
-// write-side decoder. Code that names them rejects.
+// `write::ZlibEncoder` is upstream's zlib/write.rs over the same Writer
+// with a zlib-wrapped `Compress`. Only the GzEncoder and ZlibEncoder
+// surfaces are here: no `Debug` (upstream derives it over its internal
+// state), no `GzBuilder`, no `ZlibEncoder::reset` or `new_with_compress`
+// (no public `Compress`), and no other encoder or write-side decoder.
+// Code that names them rejects.
 
 use std::io::{self, Read, Write};
 
@@ -107,11 +110,13 @@ struct Compress {
 }
 
 impl Compress {
-    /// A raw deflate stream at `level` (gzip wraps it itself).
-    fn new(level: Compression) -> Compress {
+    /// A deflate stream at `level`: raw (gzip wraps it itself), or with
+    /// the zlib header and Adler-32 trailer.
+    fn new(level: Compression, zlib_header: bool) -> Compress {
         debug_assert!(level.level() <= 10);
         let mut inner: Box<CompressorOxide> = Box::default();
-        inner.set_format_and_level(DataFormat::Raw, level.level().try_into().unwrap_or(1));
+        let format = if zlib_header { DataFormat::Zlib } else { DataFormat::Raw };
+        inner.set_format_and_level(format, level.level().try_into().unwrap_or(1));
         Compress { inner, total_in: 0, total_out: 0 }
     }
 
@@ -328,7 +333,7 @@ impl<W: Write> GzEncoder<W> {
     /// header configuration, see the `GzBuilder` type.
     pub fn new(w: W, level: Compression) -> GzEncoder<W> {
         GzEncoder {
-            inner: Writer::new(w, Compress::new(level)),
+            inner: Writer::new(w, Compress::new(level, false)),
             crc: Crc { amt: 0, sum: 0 },
             header: default_header(level),
             crc_bytes_written: 0,
@@ -415,5 +420,81 @@ impl<W: Write> Drop for GzEncoder<W> {
         if self.inner.is_present() {
             let _ = self.try_finish();
         }
+    }
+}
+
+/// A ZLIB encoder, or compressor.
+///
+/// This structure implements a [`Write`] interface and takes a stream of
+/// uncompressed data, writing the compressed data to the wrapped writer.
+pub struct ZlibEncoder<W: Write> {
+    inner: Writer<W>,
+}
+
+impl<W: Write> ZlibEncoder<W> {
+    /// Creates a new encoder which will write compressed data to the stream
+    /// given at the given compression level.
+    ///
+    /// When this encoder is dropped or unwrapped the final pieces of data will
+    /// be flushed.
+    pub fn new(w: W, level: Compression) -> ZlibEncoder<W> {
+        ZlibEncoder { inner: Writer::new(w, Compress::new(level, true)) }
+    }
+
+    /// Acquires a reference to the underlying writer.
+    pub fn get_ref(&self) -> &W {
+        self.inner.get_ref()
+    }
+
+    /// Acquires a mutable reference to the underlying writer.
+    ///
+    /// Note that mutating the output/input state of the stream may corrupt this
+    /// object, so care must be taken when using this method.
+    pub fn get_mut(&mut self) -> &mut W {
+        self.inner.get_mut()
+    }
+
+    /// Attempt to finish this output stream, writing out final chunks of data.
+    pub fn try_finish(&mut self) -> io::Result<()> {
+        self.inner.finish()
+    }
+
+    /// Consumes this encoder, flushing the output stream.
+    pub fn finish(mut self) -> io::Result<W> {
+        self.inner.finish()?;
+        Ok(self.inner.take_inner())
+    }
+
+    /// Consumes this encoder, flushing the output stream (a sync flush, not
+    /// the end of the stream).
+    pub fn flush_finish(mut self) -> io::Result<W> {
+        self.inner.flush()?;
+        Ok(self.inner.take_inner())
+    }
+
+    /// Returns the number of bytes that have been written to this compressor.
+    pub fn total_in(&self) -> u64 {
+        self.inner.data.total_in
+    }
+
+    /// Returns the number of bytes that the compressor has produced.
+    pub fn total_out(&self) -> u64 {
+        self.inner.data.total_out
+    }
+}
+
+impl<W: Write> Write for ZlibEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Read + Write> Read for ZlibEncoder<W> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.get_mut().read(buf)
     }
 }
