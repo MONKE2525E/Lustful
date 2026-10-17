@@ -2190,7 +2190,8 @@ impl Program {
     }
 
     /// The names of the fns whose signature moves (`DeriveMoves::names`),
-    /// made once per `m`.
+    /// made once per `m`. The `sig_moves` answers of every fn, Adt, const
+    /// and static fill `m` on the way (`derive_key_moves_quick` reads them).
     pub(crate) fn moved_fn_names(&self, m: &mut DeriveMoves) {
         if m.names.is_some() {
             return;
@@ -2203,6 +2204,14 @@ impl Program {
             }
         }
         m.names = Some(names);
+        for i in 0..self.adts.len() {
+            if let Some(d) = self.defs.def_of_adt(AdtId(i as u32)) {
+                self.sig_moves(m, d);
+            }
+        }
+        for &d in self.const_defs.iter().chain(&self.static_defs) {
+            self.sig_moves(m, d);
+        }
     }
 
     /// `derive_key_moves` from tables only, for a parallel walk: None when
@@ -2218,7 +2227,12 @@ impl Program {
             },
             ReadKey::MethodSet(k) => Some(matches!(k.head, Head::Adt(d) if row(d)) || m.names.contains_key(&k.name)),
             ReadKey::Checked(_) | ReadKey::TraitInScope(..) => Some(false),
-            ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::Layout(_) | ReadKey::ImplSet(_) => None,
+            // As `sig_moves` answers for an Adt def (no fn has that def).
+            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) => match self.adt_by_def(*d) {
+                None => Some(true),
+                Some(_) => m.sig.get(d).copied(),
+            },
+            ReadKey::ImplSet(_) => None,
         }
     }
 
