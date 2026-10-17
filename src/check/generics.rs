@@ -13488,7 +13488,8 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate:
     // A derive delta checks the types as written (`written_projections`):
     // collect checked them before it normalized them, and a projection
     // owes its trait ref.
-    let written = |p: &Program, def: DefId, n: usize| p.gx.written_projections.get(&def).filter(|w| reach.is_some() && w.len() == n).cloned();
+    let written =
+        |p: &Program, def: DefId, n: usize| p.gx.written_projections.get(&def).filter(|w| reach.is_some() && w.len() == n).cloned();
     let mut items: Vec<WfItem> = wanted
         .into_iter()
         .filter_map(|i| {
@@ -13531,7 +13532,8 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate:
         let w = p.defs.def_of_adt(AdtId(idx as u32)).and_then(|d| written(p, d, n));
         // The field types, in field order (as written, see above).
         let field_ty = |k: usize, t: Ty| w.as_ref().map_or(t, |w| w[k]);
-        let tys: Vec<(Ty, Span)> = a.variants.iter().flat_map(|v| &v.fields).enumerate().map(|(k, f)| (field_ty(k, f.ty), f.span)).collect();
+        let tys: Vec<(Ty, Span)> =
+            a.variants.iter().flat_map(|v| &v.fields).enumerate().map(|(k, f)| (field_ty(k, f.ty), f.span)).collect();
         // Only a struct's last field may be unsized.
         let unsized_ok = usize::from(!a.is_enum);
         let mut k = 0;

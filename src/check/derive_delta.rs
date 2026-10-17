@@ -314,7 +314,11 @@ pub(crate) fn apply(p: &mut Program, a: AdtId, new: Derives, undo: &mut Undo) ->
 /// the reach (an impl's Self type, a const item's type) answers false.
 fn written_projections_hold(p: &mut Program, reach: &Reach) -> bool {
     let named: Vec<(DefId, Vec<Ty>)> =
-        p.gx.written_projections.iter().filter(|(_, tys)| tys.iter().any(|&t| reach.ty(&p.tys, t))).map(|(&d, tys)| (d, tys.clone())).collect();
+        p.gx.written_projections
+            .iter()
+            .filter(|(_, tys)| tys.iter().any(|&t| reach.ty(&p.tys, t)))
+            .map(|(&d, tys)| (d, tys.clone()))
+            .collect();
     if named.is_empty() {
         return true;
     }
@@ -324,7 +328,10 @@ fn written_projections_hold(p: &mut Program, reach: &Reach) -> bool {
             (env, p.fns[i].params.iter().copied().chain([p.fns[i].ret]).collect())
         } else if let Some(a) = p.defs.local_adt(d) {
             let a = a.0 as usize;
-            (p.gx.adt_envs.get(a).cloned().unwrap_or_default(), p.adts[a].variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect())
+            (
+                p.gx.adt_envs.get(a).cloned().unwrap_or_default(),
+                p.adts[a].variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect(),
+            )
         } else {
             log(&|| format!("derive projection: {d:?} is no fn or Adt\n"));
             return false;
