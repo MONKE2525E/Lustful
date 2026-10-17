@@ -746,11 +746,15 @@ pub(super) fn replay_discovery(
             let mut slow: Vec<(f64, String)> = work
                 .iter()
                 .zip(&checked)
-                .map(|(&(g, _, newer), x)| (x.3, format!("{}{}{}", p.display_name(p.fn_def(g).name), if newer { " (newer)" } else { "" }, if x.1.is_none() { " (unstored)" } else { "" })))
+                .map(|(&(g, _, newer), x)| {
+                    let tags = if newer { " (newer)" } else { "" }.to_string() + if x.1.is_none() { " (unstored)" } else { "" };
+                    (x.3, format!("{}{tags}", p.display_name(p.fn_def(g).name)))
+                })
                 .collect();
             slow.sort_by(|x, y| y.0.total_cmp(&x.0));
-            let slow: Vec<String> = slow.iter().take(6).map(|(t, n)| format!("{n} {t:.1}")).collect();
-            format!("discovery replay: {a} stand, {b} untouched, {c} hold, {} check; walk {walk_ms:.1} ms, all {ms:.1} ms; {}\n", work.len(), slow.join(", "))
+            let slow = slow.iter().take(6).map(|(t, n)| format!("{n} {t:.1}")).collect::<Vec<_>>().join(", ");
+            let n = work.len();
+            format!("discovery replay: {a} stand, {b} untouched, {c} hold, {n} check; walk {walk_ms:.1} ms, all {ms:.1} ms; {slow}\n")
         });
         for ((g, base, newer), (out, reads, pending, _)) in work.into_iter().zip(checked) {
             if !base.same(p, &out, walk_instances) {
