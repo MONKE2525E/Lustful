@@ -1776,6 +1776,15 @@ impl<'p> Ctx<'p> {
         }
         let p = self.p;
         let lang = p.gx.lang;
+        // `&mut I` over a builtin iterator (`v.extend(&mut it)`, `I = &mut
+        // array::IntoIter<T, N>` in an instance) yields `I`'s items through
+        // its `next` (core's `Iterator for &mut I`).
+        if let TyKind::Ref(_, Mut::Mut, inner) = self.kind(base) {
+            let inner = self.deep(inner);
+            if it::is_iter(&self.tys, inner) {
+                return it::item_ty(&mut self.tys, inner);
+            }
+        }
         let user = match self.kind(base) {
             TyKind::Param(_) | TyKind::Projection(..) | TyKind::Opaque(..) => false,
             TyKind::Adt(..) if self.tys.local_adt(base).is_some() && self.tys.builtin_of(base).is_none() => true,

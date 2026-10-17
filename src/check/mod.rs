@@ -16170,25 +16170,40 @@ impl<'p> Ctx<'p> {
     /// `x.into_iter()` where `x` is an iterator (a builtin iterator, a
     /// range, a user `impl Iterator`, or `T: Iterator` in a template):
     /// core's blanket `impl<I: Iterator> IntoIterator for I` returns the
-    /// receiver itself. By value only: through a deref rustc would move
-    /// out of a borrow.
-    fn into_iter_self(&mut self, e: ExprId, base: Ty, derefs: u8, name: Sym, args: &[ExprId], turbofish: &[ast::GenericArg]) -> Option<Ty> {
-        if derefs > 0 || !args.is_empty() || !turbofish.is_empty() || self.name(name) != "into_iter" {
+    /// receiver itself. By value only (through a deref rustc would move
+    /// out of a borrow), except a `&mut I` receiver (`rt`): `&mut I` is an
+    /// iterator itself, so its first probe step takes it by value.
+    #[allow(clippy::too_many_arguments)]
+    fn into_iter_self(&mut self, e: ExprId, rt: Ty, base: Ty, derefs: u8, name: Sym, args: &[ExprId], turbofish: &[ast::GenericArg]) -> Option<Ty> {
+        if !args.is_empty() || !turbofish.is_empty() || self.name(name) != "into_iter" {
             return None;
         }
+        let rt = self.deep(rt);
+        let (base, derefs) = match (derefs, self.kind(rt)) {
+            (0, _) => (base, 0),
+            (1, TyKind::Ref(_, Mut::Mut, inner)) if self.deep(inner) == self.deep(base) => (rt, 0),
+            _ => return None,
+        };
         let base = self.deep(base);
         if matches!(self.kind(base), TyKind::Infer(_) | TyKind::Error) {
             return None;
         }
-        let args_id = self.tys.intern_args(&[GenericArg::Ty(base)]);
+        // `&mut I` is an iterator when `I` is (core's `impl<I: Iterator +
+        // ?Sized> Iterator for &mut I`): `r.into_iter()` with `r: &mut
+        // array::IntoIter<T, N>`, or `I = &mut ..` in an instance.
+        let probe = match self.kind(base) {
+            TyKind::Ref(_, Mut::Mut, inner) => self.deep(inner),
+            _ => base,
+        };
+        let args_id = self.tys.intern_args(&[GenericArg::Ty(probe)]);
         let tr = TraitRef { def: self.p.gx.lang.iterator, args: args_id, bindings: EMPTY_BINDINGS };
         // A trial: the selection's nested obligations (`impl<T> Iterator
         // for Gen<T>` queues `?T: Sized`) go with its variables, or the
         // queue keeps an unbound `?T: Sized` to body end (L0610).
         let snap = self.snapshot_vars();
         let obl_len = self.obl_len();
-        let is_iter = crate::ty::iter::is_iter(&self.tys, base)
-            || self.tys.is_chars_ty(base)
+        let is_iter = crate::ty::iter::is_iter(&self.tys, probe)
+            || self.tys.is_chars_ty(probe)
             || matches!(self.select_obligation(tr), Selection::Impl { .. } | Selection::ParamEvidence(_));
         self.rollback_vars(snap);
         self.obl_truncate(obl_len);
@@ -16743,7 +16758,7 @@ impl<'p> Ctx<'p> {
             return ret;
         }
         // `into_iter()` on a value that is its own iterator.
-        if let Some(ret) = self.into_iter_self(e, base, derefs, name, args, turbofish) {
+        if let Some(ret) = self.into_iter_self(e, rt, base, derefs, name, args, turbofish) {
             return ret;
         }
         // `into()` through std's other `From` impls between builtin
