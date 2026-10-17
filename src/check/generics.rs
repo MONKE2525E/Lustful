@@ -12654,6 +12654,9 @@ fn prove_field_trait(p: &mut Program, env: &[Predicate], trait_def: DefId, ty: T
         // core: `&T` is `Clone` and `Copy` for every `T`; `&mut T` is neither.
         TyKind::Ref(_, m, _) if trait_def == lang.copy || trait_def == lang.clone => !m.is_mut(),
         TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, _, e) => prove_field_trait(p, env, trait_def, e),
+        // `Box`, `Rc`, and `Arc` are never `Copy` (`Box<[T]>`: the arm
+        // below must not reach `T: Copy`).
+        TyKind::Adt(..) if trait_def == lang.copy && crate::check::own::own_parts(&p.tys, ty).is_some() => false,
         // `Box`, `Rc`, and `Arc` of `str` or `[T]` follow the pointee for
         // the comparison and hash traits, as std's `T: ?Sized` impls do
         // (the pure solver has no `[T]` records; check/own.rs).

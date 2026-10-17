@@ -72,7 +72,7 @@ SHAPES = [
     ("PhantomData<T>", "PhantomData", ""),
     ("(T, U)", "(tv(), uv())", "u"),
     ("Vec<(U, T)>", "vec![(uv(), tv())]", "u"),
-    ("(Box<str>, Rc<N0>, T)", '("s".into(), Rc::new(N0), tv())', ""),
+    ("(Box<str>, Rc<N0>, T)", '("s".into(), Rc::new(N0(1)), tv())', ""),
     ("Box<[I]>", "vec![iv()].into_boxed_slice()", ""),
     ("Box<[T]>", "vec![tv()].into_boxed_slice()", ""),
     ("Option<Rc<T>>", "Some(Rc::new(tv()))", ""),
@@ -165,8 +165,8 @@ def gen_program(rng, x, shape, state, used, is_enum, drop_super, extra_bound, tc
     if is_enum:
         out.append(f"impl<{gp}> Out<{', '.join(p.split(':')[0].replace('const ', '') for p in params)}> {{\n    fn n(&self) -> u8 {{\n        match self {{\n            Out::A(_, n) => *n,\n            Out::B => 7,\n        }}\n    }}\n}}\n")
     t = "std::ops::Range<u8>" if "it" in needs else tconc
-    tvals = {"u8": "3u8", "String": 'String::from("s")', "N0": "N0", "std::ops::Range<u8>": "0u8..3"}
-    out.append("struct N0;\n")
+    tvals = {"u8": "3u8", "String": 'String::from("s")', "N0": "N0(0)", "std::ops::Range<u8>": "0u8..3"}
+    out.append("struct N0(u8);\n")
     out.append(f"fn iv() -> In<{t}> {{\n    In {{ v: 5, _p: None }}\n}}\n")
     out.append(f"fn tv() -> {t} {{\n    {tvals[t]}\n}}\n")
     out.append("fn uv() -> u16 {\n    9\n}\n")
