@@ -17,7 +17,7 @@ fail=0
 report() {
   if [ "$1" = ok ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $2: $3"; fi
 }
-rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A unconditional_panic -A warnings)
+rustc_flags=(--edition 2024 -C panic=abort -C overflow-checks=on -A warnings)
 
 # 0. Registry: ranges, collisions, reserved codes, explain rows (no build needed).
 if ! "$root/scripts/check-codes.sh" "$root"; then
@@ -81,11 +81,12 @@ for page in "$root"/docs/errors/L*.md; do
     report bad "$code" "wrong example gives $(grep -o '"code":"L[0-9]*"' <<<"$out" | tr '\n' ' '), want $code"; continue
   fi
   # 3. Wrong under rustc (unless marked as valid Rust).
-  rustc "${rustc_flags[@]}" "$work/$code-wrong.rs" -o "$work/$code.rbin" >/dev/null 2>&1
+  # (rc holds rustc's status: the grep below sets $? itself.)
+  rustc "${rustc_flags[@]}" "$work/$code-wrong.rs" -o "$work/$code.rbin" >/dev/null 2>&1; rc=$?
   if grep -q 'rustc-wrong: pass' "$page"; then
-    [ $? -eq 0 ] || { report bad "$code" "page says rustc accepts the wrong example, but rustc rejects it"; continue; }
+    [ $rc -eq 0 ] || { report bad "$code" "page says rustc accepts the wrong example, but rustc rejects it"; continue; }
   else
-    [ $? -ne 0 ] || { report bad "$code" "rustc accepts the wrong example; add the rustc-wrong marker if lust rejects valid Rust on purpose"; continue; }
+    [ $rc -ne 0 ] || { report bad "$code" "rustc accepts the wrong example; add the rustc-wrong marker if lust rejects valid Rust on purpose"; continue; }
   fi
   # 4. Fixed under both.
   if ! "$lust" build "$work/$code-fixed.rs" -o "$work/$code.bin" >"$work/$code-fixed.lerr" 2>&1; then
