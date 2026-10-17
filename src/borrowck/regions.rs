@@ -1416,9 +1416,9 @@ fn root_fn(p: &Program, f: LocalDefId) -> LocalDefId {
     root
 }
 
-/// The lifetimes (`Region::Param` indices) that the `Fn*` bounds of the
-/// fn enclosing body `f` name: a closure body in it gets a universal for
-/// each (`OwnSig::fn_lts`).
+/// The lifetimes (`Region::Param` indices) that the `Fn*` and `Item = X`
+/// bounds of the fn enclosing body `f` name: a closure body in it gets a
+/// universal for each (`OwnSig::fn_lts`).
 fn root_bound_lifetimes(p: &Program, f: LocalDefId) -> Vec<(u32, String)> {
     let Some(sig) = p.regions.own_body_sig(p, root_fn(p, f)) else { return Vec::new() };
     let mut rs = Vec::new();
@@ -1426,6 +1426,9 @@ fn root_bound_lifetimes(p: &Program, f: LocalDefId) -> Vec<(u32, String)> {
         for &t in b.inputs.iter().chain(&b.output) {
             regions_of(&p.tys, t, &mut rs);
         }
+    }
+    for &(_, _, t) in &sig.item_bounds {
+        regions_of(&p.tys, t, &mut rs);
     }
     let mut ks: Vec<u32> = rs.iter().filter_map(|r| if let Region::Param(k) = r { Some(*k) } else { None }).filter(|&k| k < sig.n_univ).collect();
     ks.sort_unstable();
@@ -3513,6 +3516,17 @@ impl<'b, 'p> Builder<'b, 'p> {
         }
         if let Some((_, Some(item))) = ret_vars {
             self.rpit_item_edges(item);
+        }
+        // The hidden type's type params outlive each lifetime an `impl
+        // Trait + 'a` return names (rustc E0309): `-> impl Sized + 's { t }`
+        // with `t: T` needs `T: 's`.
+        if let Some((outlives, _)) = &ret_vars
+            && self.own.check
+        {
+            let t = self.body.locals[0].ty;
+            for &b in outlives {
+                self.hidden_params_outlive(t, b);
+            }
         }
         let body = self.body;
         for (bi, b) in body.blocks.iter().enumerate() {
@@ -6537,10 +6551,9 @@ impl<'b, 'p> Builder<'b, 'p> {
             },
             _ => return None,
         };
-        if self.own.closure {
-            return None;
-        }
-        let sig = p.regions.body_sig(p, self.body.fn_id)?;
+        // A closure body reads its enclosing fn's bounds: that fn's
+        // lifetimes are its `OwnSig::fn_lts` universals there.
+        let sig = p.regions.own_body_sig(p, root_fn(p, self.body.fn_id))?;
         let iter_trait = |d: DefId| [lang.iterator, lang.into_iterator, lang.double_ended_iterator, lang.exact_size_iterator].contains(&d);
         let mut xs = sig.item_bounds.iter().filter(|b| b.0 == j.0 && iter_trait(b.1)).map(|b| b.2);
         let x = xs.next()?;
@@ -6552,7 +6565,15 @@ impl<'b, 'p> Builder<'b, 'p> {
         if rs.iter().any(|r| !matches!(r, Region::Static | Region::Param(_))) {
             return None;
         }
-        let univ: Vec<u32> = (1..=sig.n_univ).collect();
+        let univ: Vec<u32> = if self.own.closure {
+            let lts = &self.own.fn_lts;
+            if rs.iter().any(|r| matches!(r, Region::Param(k) if lts.get(*k as usize).copied().flatten().is_none())) {
+                return None;
+            }
+            (0..sig.n_univ as usize).map(|k| lts.get(k).copied().flatten().unwrap_or(0)).collect()
+        } else {
+            (1..=sig.n_univ).collect()
+        };
         let mut ps = Vec::new();
         params_in(&p.tys, x, &mut ps);
         let binds: FxMap<u32, Vec<u32>> = ps.into_iter().map(|q| (q, Vec::new())).collect();
@@ -7866,6 +7887,40 @@ impl<'b, 'p> Builder<'b, 'p> {
             let rs: Vec<u32> = bounds.iter().filter(|(k, _)| *k == j).filter_map(|&(_, r)| if let Region::Param(i) = r { Some(i + 1) } else { None }).collect();
             if rs.is_empty() {
                 self.type_outlives_unproved();
+            }
+            for u in rs {
+                self.edge(u, a);
+            }
+        }
+    }
+
+    /// `params_outlive` for the hidden type `t` of this body's `impl Trait
+    /// + 'a` return (`a` the universal of `'a`): each type param in it needs
+    /// a `P: 'static` bound or `P: 'r` facts whose `'r` outlive `a`, else
+    /// L0617 (rustc E0309).
+    fn hidden_params_outlive(&mut self, t: Ty, a: u32) {
+        let tys = &self.body.tys;
+        if !tys.flags(t).contains_param() {
+            return;
+        }
+        let mut ps = Vec::new();
+        params_in(tys, t, &mut ps);
+        let p = self.p;
+        let f = self.body.fn_id;
+        let bounds = crate::check::outlives::param_bounds(p, p.regions.own_body_sig(p, f), fn_env(p, f));
+        for j in ps {
+            if bounds.contains(&(j, Region::Static)) {
+                continue;
+            }
+            let rs: Vec<u32> = bounds.iter().filter(|(k, _)| *k == j).filter_map(|&(_, r)| if let Region::Param(i) = r { Some(i + 1) } else { None }).collect();
+            if rs.is_empty() {
+                self.errs.push(Diag::new(
+                    "L0617",
+                    p.fn_def(f).name_span,
+                    "a type parameter may not live long enough: the returned `impl Trait` must outlive a lifetime it does not",
+                    "Add the bound (`T: 'a`) to the type parameter the returned value holds.",
+                ));
+                return;
             }
             for u in rs {
                 self.edge(u, a);
