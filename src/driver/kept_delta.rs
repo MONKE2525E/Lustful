@@ -128,7 +128,8 @@ fn apply(
         old_rets.push((rpit, p.fns[i].ret));
         undos.push(crate::check::delta_audit::sig_undo(p, f));
         let out = crate::check::delta_audit::redo_sig(p, f, rpit, &mut errs);
-        if let Err(why) = out.and_then(|()| if errs.is_empty() { Ok(()) } else { Err("sig diag") }) {
+        let out = out.and_then(|()| if errs.is_empty() { Ok(()) } else { Err("sig diag") });
+        if let Err(why) = out.and_then(|()| if order_bound(p, f) { Err("sig trait impl") } else { Ok(()) }) {
             undos.into_iter().rev().for_each(|u| crate::check::delta_audit::undo(p, u));
             return Err((why, true));
         }
@@ -450,6 +451,32 @@ fn method_sets(p: &Program, fns: &[usize]) -> Vec<(crate::def::DefId, crate::int
     let mut out: Vec<_> = p.gx.inherent_methods.iter().filter(|(_, v)| v.iter().any(|f| fs.contains(f))).map(|(k, _)| *k).collect();
     out.sort_unstable_by_key(|(d, n)| (d.krate, d.hash.0, *n));
     out
+}
+
+/// True when fn `f`, a method of a trait impl that is a template (a
+/// generic impl or method), has a bound over concrete types only that
+/// collect's compare with the trait method (`generics::validate_method_sig`)
+/// decides with the solver: it proves the goal with the impl records it has
+/// at that point of collect (no scalar impls of the derive family yet), so
+/// a finished program can answer otherwise (`where i64: Default`: cold
+/// rejects, the delta would accept). `Copy`, `Clone` and `Debug` it
+/// decides by structure, the same at any point.
+fn order_bound(p: &Program, f: LocalDefId) -> bool {
+    use crate::ty::{GenericArg, Predicate, TyIntern};
+    if generics::delta_impl_trait(p, f).is_none() {
+        return false;
+    }
+    let Some(Some(t)) = p.gx.fn_templates.get(f.0 as usize) else { return false };
+    let lang = &p.gx.lang;
+    t.generics.predicates.iter().any(|pr| {
+        let Predicate::Trait(b) = pr else { return false };
+        let by_structure = [lang.sized, lang.copy, lang.clone, lang.debug].contains(&b.value.def);
+        let concrete = p.tys.args(b.value.args).iter().all(|g| match *g {
+            GenericArg::Ty(t) => !p.tys.flags(t).contains_param() && !p.tys.flags(t).contains_infer(),
+            _ => true,
+        });
+        b.count == 0 && concrete && !by_structure
+    })
 }
 
 /// The traits of the trait impls that hold the edited fns `fns`.
