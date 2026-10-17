@@ -442,6 +442,8 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
     for &(b, i, u) in &body.stmt_unwind {
         (b.0, i, u.0).hash(&mut h);
     }
+    // cgen gives a promoted temp static storage, not a frame slot.
+    body.promoted.hash(&mut h);
     h.finish()
 }
 
@@ -506,6 +508,7 @@ pub(crate) struct CachedBody {
     locals: Vec<(u32, bool, Option<String>)>,
     blocks: Vec<CachedBlock>,
     stmt_unwind: Vec<(Bb, u32, Bb)>,
+    promoted: Vec<Local>,
 }
 
 #[derive(Clone, Debug)]
@@ -974,7 +977,8 @@ pub(crate) fn cache_body(p: &Program, body: &Body, file_hash: u64, slot: u32, us
         })
         .collect();
     let stmt_unwind = body.stmt_unwind.clone();
-    CachedBody { file_hash, slot_at_gen: slot, used_at_gen, ir_fp, arg_count: body.arg_count, tys: b.out, locals, blocks, stmt_unwind }
+    let promoted = body.promoted.clone();
+    CachedBody { file_hash, slot_at_gen: slot, used_at_gen, ir_fp, arg_count: body.arg_count, tys: b.out, locals, blocks, stmt_unwind, promoted }
 }
 
 /// Rebuilds one cached body against today's program. None when any
@@ -1162,7 +1166,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
         };
         blocks.push(BlockData { stmts, term, term_span: blk.term_span });
     }
-    Some(Body { fn_id, tys, locals, blocks, arg_count: cached.arg_count, reads: graph::Reads::new(), lower_errs: Vec::new(), annotations: Vec::new(), promoted: Vec::new(), index_exprs: Vec::new(), pat_back_index: Vec::new(), pat_front_index: Vec::new(), pat_subslice: Vec::new(), dyn_coerce: Vec::new(), false_edges: Vec::new(), opaque_locals: Vec::new(), opaque_nodrop: Vec::new(), stmt_unwind: cached.stmt_unwind.clone() })
+    Some(Body { fn_id, tys, locals, blocks, arg_count: cached.arg_count, reads: graph::Reads::new(), lower_errs: Vec::new(), annotations: Vec::new(), promoted: cached.promoted.clone(), index_exprs: Vec::new(), pat_back_index: Vec::new(), pat_front_index: Vec::new(), pat_subslice: Vec::new(), dyn_coerce: Vec::new(), false_edges: Vec::new(), opaque_locals: Vec::new(), opaque_nodrop: Vec::new(), stmt_unwind: cached.stmt_unwind.clone() })
 }
 
 #[cfg(test)]
@@ -1178,10 +1182,11 @@ mod tests {
 struct Foo { x: i64 }
 impl Foo { fn get(&self) -> i64 { self.x } }
 fn helper(a: i64) -> i64 { a * 2 }
+fn seven() -> &'static i64 { &7 }
 fn main() {
     let f = Foo { x: helper(20) };
     let mut v = Vec::new();
-    v.push(f.get());
+    v.push(f.get() + *seven() - 7);
     println!(\"{} {}\", v.len(), f.get() + 2);
 }
 ";
@@ -1209,7 +1214,8 @@ fn main() {
     /// A cached body rebuilds in a fresh program (the next request)
     /// with the same IR fingerprint and byte-identical C under the
     /// same slot assignment, and correct C under a renumbered one
-    /// (the fingerprint stands; only slot prints move).
+    /// (the fingerprint stands; only slot prints move). `seven`'s
+    /// promoted `&7` keeps its static storage through the round trip.
     #[test]
     fn cached_body_rebuilds_with_same_fingerprint_and_c() {
         lowered(SRC, |p, map, bodies| {

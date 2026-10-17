@@ -160,7 +160,8 @@ pub fn expand<'g>(p: &Program, body: &Body<'g>) -> Result<Option<Body<'g>>, Stri
         reads: Default::default(),
         lower_errs: Vec::new(),
         annotations: Vec::new(),
-        promoted: Vec::new(),
+        // cgen gives these static storage: a reference to one may escape.
+        promoted: body.promoted.clone(),
         index_exprs: Vec::new(),
         pat_back_index: Vec::new(),
         pat_front_index: Vec::new(),
