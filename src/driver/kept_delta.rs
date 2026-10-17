@@ -733,18 +733,26 @@ pub(super) fn replay_discovery(
         let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
         let prog: &Program = p;
         let checked = crate::driver::compile::par_map(&work, |&(g, _, _)| {
+            let t = std::time::Instant::now();
             let (mut checked, discarded) = crate::check::check_fn(prog, g);
             let pending = checked.closure_map_pending;
             let out = generics::discovery_out(prog, &checked, &discarded);
             let reads = (discarded.is_empty() && !pending).then(|| std::mem::take(&mut checked.reads));
-            (out, reads, pending)
+            (out, reads, pending, t.elapsed().as_secs_f64() * 1e3)
         });
         crate::check::derive_delta::log(&|| {
             let [a, b, c] = counts;
             let ms = t0.elapsed().as_secs_f64() * 1e3;
-            format!("discovery replay: {a} stand, {b} untouched, {c} hold, {} check; walk {walk_ms:.1} ms, all {ms:.1} ms\n", work.len())
+            let mut slow: Vec<(f64, String)> = work
+                .iter()
+                .zip(&checked)
+                .map(|(&(g, _, newer), x)| (x.3, format!("{}{}{}", p.display_name(p.fn_def(g).name), if newer { " (newer)" } else { "" }, if x.1.is_none() { " (unstored)" } else { "" })))
+                .collect();
+            slow.sort_by(|x, y| y.0.total_cmp(&x.0));
+            let slow: Vec<String> = slow.iter().take(6).map(|(t, n)| format!("{n} {t:.1}")).collect();
+            format!("discovery replay: {a} stand, {b} untouched, {c} hold, {} check; walk {walk_ms:.1} ms, all {ms:.1} ms; {}\n", work.len(), slow.join(", "))
         });
-        for ((g, base, newer), (out, reads, pending)) in work.into_iter().zip(checked) {
+        for ((g, base, newer), (out, reads, pending, _)) in work.into_iter().zip(checked) {
             if !base.same(p, &out, walk_instances) {
                 crate::check::derive_delta::log(&|| {
                     format!("discovery {}: output differs (pending {pending}, newer {newer}): {}\n", p.display_name(p.fn_def(g).name), base.differs(p, &out))

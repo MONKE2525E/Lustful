@@ -134,6 +134,38 @@ pub(super) fn apply_derives(
                     && caches.gen_reuse.discovery_src_same(p, g)
             })
             .collect();
+        crate::check::derive_delta::log(&|| {
+            // Why each plain body that is not clean is not (counts, a few names).
+            let mut why: Vec<(&str, usize, Vec<String>)> = Vec::new();
+            for g in (0..front.fn_loc.len() as u32).map(LocalDefId) {
+                if clean[g.0 as usize] || p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
+                    continue;
+                }
+                let s = front.fn_slot.get(g.0 as usize).map_or(usize::MAX, |&s| s as usize);
+                let w = if !keyed {
+                    "not keyed"
+                } else if !caches.slot_reads.get(s).is_some_and(Option::is_some) {
+                    "no slot reads"
+                } else if is_dirty[s] {
+                    "dirty"
+                } else if has_checked[s] {
+                    "checked read"
+                } else {
+                    "discovery src"
+                };
+                match why.iter_mut().find(|x| x.0 == w) {
+                    Some(x) => {
+                        x.1 += 1;
+                        if x.2.len() < 6 {
+                            x.2.push(p.display_name(p.fn_def(g).name).to_string());
+                        }
+                    }
+                    None => why.push((w, 1, vec![p.display_name(p.fn_def(g).name).to_string()])),
+                }
+            }
+            let parts: Vec<String> = why.iter().map(|(w, n, names)| format!("{w} {n} ({})", names.join(" "))).collect();
+            format!("derive clean: not clean: {}\n", parts.join("; "))
+        });
         crate::driver::laps::mark("kept/derive clean");
         let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
