@@ -52,13 +52,25 @@ TAR_DIRS = [Path.home() / "fork-tar", Path("/home/user/fork-tar"), FORK_TARS]
 # The reference is 9 bins that share most of their code: a long zstd window packs 464 MB into
 # 38 MB (gzip: 127 MB), so it uploads to each gate box in a few seconds.
 ZSTD_C, ZSTD_D = "zstd -19 -T0 --long=29", "zstd -d --long=29"
-# The gate's tsgo parity subset (lust tsgo seconds, boat, fork 61a13796b): every fixtures/
-# project but two (the watch-stale-dts sub-projects, 13 s each, the shape of their parent), two
-# of the 15 effect fixtures (10 s each; ignore-errors-keeps-ts once gave wrong output), and every
-# test bin but early_emit (66 s; its tsgo emit of fixtures/emit_pool is in the runs). About 80
-# of 140 runs and 6 of 7 test bins, 110 s.
-TSGO_SKIP = {"fixtures/multiprog/watch-stale-dts/lib", "fixtures/multiprog/watch-stale-dts/side"}
-TSGO_EFFECT = {"effect_fixtures/effect-error", "effect_fixtures/ignore-errors-keeps-ts"}
+# The gate's tsgo parity subset, fixed by name so one list fits both fork pins (names a pin
+# lacks match nothing). Lust tsgo seconds per project (4 runs, boat): v0.7.0 (ae1c76940) heavy
+# projects take about 15 s, light ones 1-5 s; the first cut (140 runs + 6 test bins) took 546 s. Kept:
+# every fixtures/ project but TSGO_SKIP (the lib and side sub-projects of the build_watch and
+# watch-stale-dts fixtures, built anyway by their parent's -b run, and 5 of the 7 emit_context
+# targets: es, one of the three that panic in both builds, and legacy stay), the effect
+# fixtures in TSGO_EFFECT, and every test bin but early_emit (256 s on v0.7.0; its tsgo emit of
+# fixtures/emit_pool is in the runs). v0.7.0: 120 of 216 runs, 6 of 7 test bins, about 180 s;
+# 61a13796b: 80 of 140 runs.
+TSGO_SKIP = {f"fixtures/{p}" for p in [
+    "multiprog/watch-stale-dts/lib", "multiprog/watch-stale-dts/side",
+    "build_watch/coarse-mtime/lib", "build_watch/coarse-mtime/side",
+    "build_watch/stale-json/lib", "build_watch/stale-json/side",
+    "emit_context/es-vms", "emit_context/js-split", "emit_context/legacy-param", "emit_context/deco-legacy", "emit_context/legacy-vms",
+]}
+TSGO_EFFECT = {f"effect_fixtures/{p}" for p in [
+    "effect-error", "ignore-errors-keeps-ts",
+    "unstable-api-usage", "api-stability-leak", "experimental-api-usage", "allowed-unstable-apis",
+]}
 TSGO_TESTS = [t for t in tsrust_parity.TESTS if t != "early_emit"]
 TOOLS = ["ts_ast_codegen", "ts_diagnostics_codegen"]
 # Fork files the tool runs read (tsrust_parity.TOOL_RUNS), at the same relative paths.
