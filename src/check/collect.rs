@@ -6294,7 +6294,7 @@ fn eval_pending_items(
         if is_static.is_some() {
             let sync = p.gx.lang.sync;
             let mut tys = crate::ty::Tys::new(&p.tys);
-            if crate::check::collect::auto_structural(p, &mut tys, &[], sync, ty, &mut Vec::new()) != Some(true) {
+            if crate::check::collect::auto_structural(p, &mut tys, &[], sync, ty, &mut AutoSeen::default()) != Some(true) {
                 let tn = ty_name(p, &p.tys, ty);
                 errs.push(Diag::new(
                     "L0612",
@@ -6503,7 +6503,7 @@ fn install_const_items(
                 // whose answer needs inference stays accepted here.
                 if !mutable {
                     let mut tys = crate::ty::Tys::new(&p.tys);
-                    if auto_structural(p, &mut tys, &[], p.gx.lang.sync, item.ty, &mut Vec::new()) == Some(false) {
+                    if auto_structural(p, &mut tys, &[], p.gx.lang.sync, item.ty, &mut AutoSeen::default()) == Some(false) {
                         errs.push(Diag::new(
                             "L0612",
                             item.span,
@@ -9393,6 +9393,33 @@ impl GlueSeen {
     }
 }
 
+/// The (trait, type) pairs an auto trait walk has entered (`auto_structural`;
+/// a pair is entered once): a list for `pop`, and a set for `contains`, since
+/// a walk over a large type enters thousands.
+#[derive(Default)]
+pub struct AutoSeen {
+    list: Vec<(DefId, Ty)>,
+    set: crate::intern::FxMap<(DefId, Ty), ()>,
+}
+
+impl AutoSeen {
+    pub fn contains(&self, k: &(DefId, Ty)) -> bool {
+        self.set.contains_key(k)
+    }
+    pub fn push(&mut self, k: (DefId, Ty)) {
+        self.list.push(k);
+        self.set.insert(k, ());
+    }
+    pub fn pop(&mut self) {
+        if let Some(k) = self.list.pop() {
+            self.set.remove(&k);
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+}
+
 /// An auto trait (`Send`, `Sync`, `Unpin`) of `t` by structure (ARCH
 /// 2.7), shared by body checks (`Ctx::auto_holds`, on resolved
 /// types) and collect-time proofs: a parameter answers from `env`,
@@ -9405,12 +9432,12 @@ impl GlueSeen {
 /// inference variable, a projection, or another form leaves it open.
 /// `seen` holds the (trait, type) pairs on the walk: a cycle counts as
 /// holding. The trait is part of the key: `&T: Send` asks `T: Sync`.
-pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], trait_def: DefId, t: Ty, seen: &mut Vec<(DefId, Ty)>) -> Option<bool> {
+pub fn auto_structural(p: &Program, tys: &mut impl TyIntern, env: &[Predicate], trait_def: DefId, t: Ty, seen: &mut AutoSeen) -> Option<bool> {
     let lang = &p.gx.lang;
     if seen.contains(&(trait_def, t)) {
         return Some(true);
     }
-    let all = |tys: &mut _, parts: Vec<Ty>, seen: &mut Vec<(DefId, Ty)>| -> Option<bool> {
+    let all = |tys: &mut _, parts: Vec<Ty>, seen: &mut AutoSeen| -> Option<bool> {
         let mut unknown = false;
         for e in parts {
             match auto_structural(p, tys, env, trait_def, e, seen) {

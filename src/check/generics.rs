@@ -12726,7 +12726,7 @@ fn prove_trait_ref(
     // Auto traits by structure (ARCH 2.7); an open answer is not a proof.
     if lang.is_auto(tr.def) {
         let Some(t) = self_resolved else { return false };
-        return crate::check::collect::auto_structural(p, &mut cx.tys, env, tr.def, t, &mut Vec::new()) == Some(true);
+        return crate::check::collect::auto_structural(p, &mut cx.tys, env, tr.def, t, &mut crate::check::collect::AutoSeen::default()) == Some(true);
     }
     // rustc's object candidate: `dyn Tr` implements its principal and
     // the principal's supertraits (`Box<dyn Write>: Write` through

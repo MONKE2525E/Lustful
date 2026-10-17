@@ -1517,7 +1517,7 @@ pub fn builtin_auto(
     env: &[Predicate],
     trait_def: DefId,
     t: Ty,
-    seen: &mut Vec<(DefId, Ty)>,
+    seen: &mut crate::check::collect::AutoSeen,
 ) -> Option<Option<bool>> {
     use crate::check::collect::auto_structural;
     use crate::ty::BuiltinTy as B;
@@ -1529,7 +1529,7 @@ pub fn builtin_auto(
     }
     let send = trait_def == lang.send;
     let elem = tys.adt_first_ty_arg(t);
-    let each = |tys: &mut _, parts: Vec<Ty>, seen: &mut Vec<(DefId, Ty)>| -> Option<bool> {
+    let each = |tys: &mut _, parts: Vec<Ty>, seen: &mut crate::check::collect::AutoSeen| -> Option<bool> {
         seen.push((trait_def, t));
         let mut unknown = false;
         for (part, tr) in parts.into_iter().map(|x| (x, trait_def)) {

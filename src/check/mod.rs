@@ -5383,11 +5383,11 @@ impl<'p> Ctx<'p> {
     /// An auto trait by structure (section 2.7). None when the
     /// answer needs the param env or inference to move first.
     fn auto_holds(&mut self, trait_def: DefId, t: Ty) -> Option<bool> {
-        let mut seen: Vec<(DefId, Ty)> = Vec::new();
+        let mut seen = crate::check::collect::AutoSeen::default();
         self.auto_inner(trait_def, t, &mut seen)
     }
 
-    fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut Vec<(DefId, Ty)>) -> Option<bool> {
+    fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut crate::check::collect::AutoSeen) -> Option<bool> {
         let t = self.deep(t);
         // The answer reads the fields of every Adt in `t` (their
         // layouts' fingerprints cover nested field types).
