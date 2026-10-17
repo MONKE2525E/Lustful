@@ -2088,6 +2088,9 @@ impl<'a> Parser<'a> {
             Tok::Impl if qual.is_unsafe && !qual.is_const && !qual.is_async && qual.abi.is_none() => ItemKind::Impl(self.impl_def(true)?),
             Tok::Impl if !has_qual => ItemKind::Impl(self.impl_def(false)?),
             Tok::Use if !has_qual => ItemKind::Use(self.use_def()?),
+            // A visibility at the end of the file is no item (rustc:
+            // "visibility `pub` is not followed by an item").
+            Tok::Eof if vis != Vis::Private && !has_qual => return Err(syntax(vis_span, "visibility is not followed by an item")),
             Tok::Eof if derives.is_empty() && parsed.attrs.is_empty() && !has_qual => {
                 self.scope_allows.truncate(scope_mark);
                 return Ok(None);
