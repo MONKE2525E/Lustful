@@ -409,6 +409,15 @@ impl ImplIndex {
         rec
     }
 
+    /// One impl record by id with no derive note: for a scan that only
+    /// reads `head` and `synthetic` to skip records. A derived record it
+    /// skips does not decide its answer, so its Adt's derive list is not
+    /// a read (a toggle of it would check the body again for nothing).
+    /// A record the scan goes on to use comes from `get`.
+    pub fn peek(&self, id: ImplId) -> &ImplRecord {
+        &self.impls[id.0 as usize]
+    }
+
     /// One impl record by its def.
     pub fn by_def(&self, def: DefId) -> Option<(ImplId, &ImplRecord)> {
         self.by_def.get(&def).map(|&id| (id, self.get(id)))

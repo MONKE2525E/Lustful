@@ -845,7 +845,7 @@ impl<'p> Ctx<'p> {
 fn user_impl_for_adt(p: &crate::check::Program, trait_def: DefId, def: DefId) -> bool {
     use crate::traits::index::{SelfHead, Synthetic};
     p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
-        let rec = p.gx.index.get(id);
+        let rec = p.gx.index.peek(id);
         rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
     })
 }

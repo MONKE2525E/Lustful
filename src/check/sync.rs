@@ -1505,7 +1505,7 @@ pub fn explicit_auto_impl(p: &crate::check::collect::Program, tys: &impl TyInter
     use crate::traits::index::{SelfHead, Synthetic};
     let (def, _) = tys.adt_parts(t)?;
     let any = p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
-        let rec = p.gx.index.get(id);
+        let rec = p.gx.index.peek(id);
         rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
     });
     any.then(|| crate::check::fmt::user_impl_holds(p, tys, t, trait_def))

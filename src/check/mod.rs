@@ -13015,7 +13015,7 @@ impl<'p> Ctx<'p> {
         let Some((def, _)) = self.tys.adt_parts(t) else { return false };
         [p.gx.lang.index, p.gx.lang.index_mut].iter().any(|&tr| {
             p.gx.index.impls_of_trait(tr).iter().any(|&id| {
-                let rec = p.gx.index.get(id);
+                let rec = p.gx.index.peek(id);
                 rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
             })
         })
@@ -15854,7 +15854,10 @@ impl<'p> Ctx<'p> {
                 // A user type: its own impls of the trait, any `Rhs`.
                 let Some((def, _)) = self.tys.adt_parts(t) else { return false };
                 use crate::traits::index::SelfHead;
-                self.p.gx.index.impls_of_trait(trait_def).iter().filter(|&&id| self.p.gx.index.get(id).head == SelfHead::Adt(def)).count() > 1
+                {
+                    let index = &self.p.gx.index;
+                    index.impls_of_trait(trait_def).iter().filter(|&&id| index.peek(id).head == SelfHead::Adt(def) && index.get(id).head == SelfHead::Adt(def)).count() > 1
+                }
             }
         }
     }

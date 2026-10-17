@@ -8652,8 +8652,7 @@ fn written_glue_impl(
     let lang = &p.gx.lang;
     if trait_def == lang.clone
         && p.gx.index.impls_of_trait(lang.copy).iter().any(|&id| {
-            let rec = p.gx.index.get(id);
-            rec.head == SelfHead::Adt(def) && match_impl_pat(p, tys, rec.self_ty(&p.tys), t, &mut Vec::new())
+            p.gx.index.peek(id).head == SelfHead::Adt(def) && match_impl_pat(p, tys, p.gx.index.get(id).self_ty(&p.tys), t, &mut Vec::new())
         })
     {
         return false;
@@ -8661,8 +8660,9 @@ fn written_glue_impl(
     let has_item = |rec: &crate::traits::index::ImplRecord, n: &str| {
         rec.items.iter().any(|&m| p.local_def(m.hash).is_some_and(|l| p.name(p.fn_info(l).name) == n))
     };
+    // Written impls only (`peek`: the derived records it skips are no read).
     p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
-        let rec = p.gx.index.get(id);
+        let rec = p.gx.index.peek(id);
         if rec.synthetic != Synthetic::None || rec.head != SelfHead::Adt(def) {
             return false;
         }
@@ -8950,9 +8950,8 @@ fn glue_cmp_mode(p: &Program, tys: &impl TyIntern, t: Ty, total: bool, seen: &mu
                 && !pcmp
                 && tys.adt_parts(t).is_some_and(|(def, _)| {
                     !p.gx.index.impls_of_trait(p.gx.lang.ord).iter().any(|&id| {
-                        let rec = p.gx.index.get(id);
-                        rec.head == crate::traits::index::SelfHead::Adt(def)
-                            && match_impl_pat(p, tys, rec.self_ty(&p.tys), t, &mut Vec::new())
+                        p.gx.index.peek(id).head == crate::traits::index::SelfHead::Adt(def)
+                            && match_impl_pat(p, tys, p.gx.index.get(id).self_ty(&p.tys), t, &mut Vec::new())
                     })
                 });
             // std's `Reverse<T>`: `T`'s order, swapped (`is_reverse_adt`).

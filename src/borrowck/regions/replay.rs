@@ -303,13 +303,16 @@ impl Builder<'_, '_> {
             return None;
         }
         let mut found: Option<(DefId, Match)> = None;
+        // A derived record that cannot match decides nothing: only one
+        // that does (`get`) reads its Adt's derive list (`peek`).
         for &id in p.gx.index.impls_of_trait(trait_def) {
-            let rec = p.gx.index.get(id);
+            let rec = p.gx.index.peek(id);
             let pats: Vec<Ty> = match p.regions.impl_regions.get(&rec.def) {
                 Some(ir) => ir.header.clone(),
                 None => p.tys.args(rec.trait_ref.args).iter().filter_map(|g| g.as_ty()).collect(),
             };
             if pats.len() != acts.len() {
+                p.gx.index.get(id);
                 return None;
             }
             let mut m = Match::default();
@@ -319,6 +322,9 @@ impl Builder<'_, '_> {
                 if fit == Fit::No {
                     break;
                 }
+            }
+            if fit != Fit::No {
+                p.gx.index.get(id);
             }
             match fit {
                 Fit::No => {}

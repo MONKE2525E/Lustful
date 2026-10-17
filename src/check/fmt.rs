@@ -24,8 +24,9 @@ const DECLARED_ONLY: &[&str] = &["align", "flags", "options", "with_options", "s
 pub fn user_impl_holds(p: &Program, tys: &impl TyIntern, t: Ty, trait_def: DefId) -> bool {
     use crate::traits::index::{SelfHead, Synthetic};
     let Some((def, _)) = tys.adt_parts(t) else { return false };
+    // Written impls only (`peek`: the derived records it skips are no read).
     p.gx.index.impls_of_trait(trait_def).iter().any(|&id| {
-        let rec = p.gx.index.get(id);
+        let rec = p.gx.index.peek(id);
         rec.synthetic == Synthetic::None
             && rec.head == SelfHead::Adt(def)
             && rec.generics.predicates.iter().all(|pr| matches!(pr, Predicate::Trait(b) if b.value.def == p.gx.lang.sized))
@@ -458,7 +459,7 @@ impl<'p> Ctx<'p> {
             TyKind::Adt(def, a) => {
                 let index = &self.p.gx.index;
                 index.impls_of_trait(trait_def).iter().any(|&id| {
-                    let rec = index.get(id);
+                    let rec = index.peek(id);
                     rec.synthetic == Synthetic::None && rec.head == SelfHead::Adt(def)
                 }) || self.tys.args(a).iter().any(|g| g.as_ty().is_some_and(|e| self.mentions_user_impl_adt(e, trait_def)))
             }
