@@ -11,8 +11,9 @@
 // need of the impl's lifetimes. Each need must follow from the impl's
 // declared facts and the implied bounds of its header. A bound that two
 // impls may match, a part lust does not look into (a type param of the
-// impl, a dyn, a projection) adds nothing, and an impl with trait
-// where-clauses (which may prove a bound) is left alone.
+// impl, a dyn, a projection) adds nothing. A trait where-clause of the
+// impl proves a bound only at the arguments it writes: `S: Tag<&'static
+// u8>` does not prove the `S: Tag<&'a u8>` a supertrait owes.
 use super::*;
 use std::rc::Rc;
 
@@ -65,8 +66,9 @@ const MAX_DEPTH: u32 = 4;
 
 struct Cx<'p> {
     p: &'p Program,
-    /// Traits the checked impl's where-clauses may prove (with supertraits).
-    own: Vec<DefId>,
+    /// The checked impl's own where-clauses and their supertraits,
+    /// each read under its frame (`None`: the impl's own types).
+    own: Vec<(TraitRef, Option<Rc<Frame>>)>,
     /// `x: y` between the checked impl's regions.
     needs: Vec<(Re, Re)>,
     /// `T: y` for the checked impl's type param `T`.
@@ -115,21 +117,43 @@ fn check_impl(p: &Program, rec: &crate::traits::index::ImplRecord, ir: &ImplRegi
         }
     }
     let frame = Rc::new(frame);
-    // A trait where-clause of the impl may prove a bound on its trait or a
-    // supertrait of it, at any depth: those bounds add nothing.
-    let mut own: Vec<DefId> = ir.preds.iter().filter_map(|q| if let Predicate::Trait(b) = q { Some(b.value.def) } else { None }).collect();
+    // A trait where-clause of the impl may prove a bound on its trait
+    // or a supertrait of it, but only at its written arguments. Keep
+    // the clauses themselves; a supertrait is read in a frame that
+    // puts the clause's arguments in the trait's slots (regioned
+    // preds where collect kept them, the erased record otherwise).
+    let mut own: Vec<(TraitRef, Option<Rc<Frame>>)> = ir
+        .preds
+        .iter()
+        .filter_map(|q| if let Predicate::Trait(b) = q { (b.count == 0).then_some((b.value, None)) } else { None })
+        .collect();
     let mut i = 0;
-    while i < own.len() {
-        if let Some(tr) = p.gx.index.trait_record(own[i]) {
-            for q in &tr.generics.predicates {
-                if let Predicate::Trait(b) = q
-                    && !own.contains(&b.value.def)
-                {
-                    own.push(b.value.def);
-                }
+    while i < own.len() && own.len() < 128 {
+        let (cr, cf) = own[i].clone();
+        i += 1;
+        let preds: Vec<Predicate> = match p.regions.trait_preds.get(&cr.def) {
+            Some(ps) => ps.clone(),
+            None => p.gx.index.trait_record(cr.def).map_or_else(Vec::new, |tr| tr.generics.predicates.clone()),
+        };
+        if preds.is_empty() {
+            continue;
+        }
+        let mut f2 = Frame::default();
+        for (j, t) in p.tys.args(cr.args).iter().filter_map(|g| g.as_ty()).enumerate() {
+            f2.tys.insert(j as u32, Val(t, cf.clone()));
+        }
+        for (k, r) in p.tys.args(cr.args).iter().filter_map(|g| if let GenericArg::Lifetime(r) = g { Some(*r) } else { None }).enumerate() {
+            f2.lts.insert(k as u32, re_in(r, &cf));
+        }
+        let f2 = Rc::new(f2);
+        for q in preds {
+            if let Predicate::Trait(b) = q
+                && b.count == 0
+                && !own.iter().any(|(o, of)| *o == b.value && of.as_ref().is_some_and(|x| Rc::ptr_eq(x, &f2)))
+            {
+                own.push((b.value, Some(f2.clone())));
             }
         }
-        i += 1;
     }
     let mut cx = Cx { p, own, needs: Vec::new(), ty_needs: Vec::new(), steps: 0 };
     let mut bad = None;
@@ -301,7 +325,10 @@ impl Cx<'_> {
     fn oblige(&mut self, tr: TraitRef, fr: &Rc<Frame>, depth: u32) {
         let p = self.p;
         self.steps += 1;
-        if depth > MAX_DEPTH || self.steps > 256 || self.own.contains(&tr.def) {
+        if depth > MAX_DEPTH || self.steps > 256 {
+            return;
+        }
+        if self.own_proves(tr, fr) {
             return;
         }
         // A std trait none of whose impls ties regions: nothing to learn
@@ -375,12 +402,57 @@ impl Cx<'_> {
 
     /// The region `r` read under frame `fr` (`None`: the checked impl's).
     fn re(&self, r: Region, fr: &Option<Rc<Frame>>) -> Re {
-        match (r, fr) {
-            (Region::Static, _) => Re::Static,
-            (Region::Param(k), None) => Re::Univ(k),
-            (Region::Param(k), Some(f)) => f.lts.get(&k).copied().unwrap_or(Re::Free),
-            _ => Re::Free,
+        re_in(r, fr)
+    }
+
+    /// True when one of the impl's own where-clauses proves the
+    /// obligation `tr` (read under `fr`) at its written arguments:
+    /// every argument pair must equate, and the region equalities
+    /// that takes are needs like any other. A candidate with a part
+    /// this walk cannot read still proves, and adds nothing. A
+    /// clause for one instantiation never proves another from the
+    /// trait id alone.
+    fn own_proves(&mut self, tr: TraitRef, fr: &Rc<Frame>) -> bool {
+        let p = self.p;
+        let own = self.own.clone();
+        let mut first_needs: Option<Vec<(Re, Re)>> = None;
+        let mut saw_maybe = false;
+        for (cr, cf) in own {
+            if cr.def != tr.def {
+                continue;
+            }
+            let (ca, oa) = (p.tys.args(cr.args).to_vec(), p.tys.args(tr.args).to_vec());
+            if ca.iter().chain(&oa).any(|g| !matches!(g, GenericArg::Ty(_))) {
+                return true;
+            }
+            if ca.len() != oa.len() {
+                continue;
+            }
+            let mut m = Match::default();
+            let mut fit = Fit::Yes;
+            for (g, h) in ca.iter().zip(&oa) {
+                let (Some(ct), Some(ot)) = (g.as_ty(), h.as_ty()) else { continue };
+                fit = fit.and(self.equate(Val(ct, cf.clone()), Val(ot, Some(fr.clone())), &mut m));
+            }
+            match fit {
+                Fit::Yes if m.needs.iter().all(|&(x, y)| x == y || x == Re::Free || y == Re::Free) => {
+                    self.needs.extend(m.needs);
+                    return true;
+                }
+                Fit::Yes => {
+                    if first_needs.is_none() {
+                        first_needs = Some(m.needs);
+                    }
+                }
+                Fit::Maybe => saw_maybe = true,
+                Fit::No => {}
+            }
         }
+        if let Some(n) = first_needs {
+            self.needs.extend(n);
+            return true;
+        }
+        saw_maybe
     }
 
     /// Follows a type param to what its frame binds it to. A param of the
@@ -560,6 +632,16 @@ impl Cx<'_> {
             (TyKind::Param(x), TyKind::Param(y)) if x == y && af.is_none() && bf.is_none() => Fit::Yes,
             _ => Fit::Maybe,
         }
+    }
+}
+
+/// The region `r` read under frame `fr` (`None`: the checked impl's).
+fn re_in(r: Region, fr: &Option<Rc<Frame>>) -> Re {
+    match (r, fr) {
+        (Region::Static, _) => Re::Static,
+        (Region::Param(k), None) => Re::Univ(k),
+        (Region::Param(k), Some(f)) => f.lts.get(&k).copied().unwrap_or(Re::Free),
+        _ => Re::Free,
     }
 }
 

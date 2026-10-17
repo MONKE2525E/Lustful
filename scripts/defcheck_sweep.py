@@ -174,6 +174,45 @@ def build_cases():
          "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct S;\nimpl<'a, X> NeedT<&'a X> for S where S: Tag<&'a X> {}\n" + MAINP)
     case("implsuper", "super_generic_ref_where_static",
          "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct S;\nimpl<'a, X> NeedT<&'a X> for S where S: Tag<&'static X> {}\n" + MAINP)
+    # Matrix: argument shape x where-clause region relation. The
+    # obligation always wants region 'a; the clause gives 'static,
+    # 'a itself, 'b with a fact one way, or an Adt around it.
+    shapes = [
+        ("ref", "&{r} u8"), ("mutref", "&{r} mut u8"), ("tuple", "(&{r} u8, u16)"),
+        ("slice", "&{r} [u8]"), ("box", "Box<&{r} u8>"), ("nest", "&{r} &{r} u8"),
+        ("adtlt", "W<{r}>"),
+    ]
+    for sn, shp in shapes:
+        decl = "struct W<'x>(&'x u8);\n" if sn == "adtlt" else ""
+        head = "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct S;\n" + decl
+        a_static = shp.format(r="'static")
+        a_a = shp.format(r="'a")
+        a_b = shp.format(r="'b")
+        case("implsuper", f"mx_{sn}_static_impl",
+             head + f"impl Tag<{a_static}> for S {{}}\nimpl<'a> NeedT<{a_a}> for S where S: Tag<{a_static}> {{}}\n" + MAINP)
+        case("implsuper", f"mx_{sn}_exact_where",
+             head + f"impl<'a> NeedT<{a_a}> for S where S: Tag<{a_a}> {{}}\n" + MAINP)
+        case("implsuper", f"mx_{sn}_generic_impl",
+             head + f"impl<'a> Tag<{a_a}> for S {{}}\nimpl<'a> NeedT<{a_a}> for S {{}}\n" + MAINP)
+        case("implsuper", f"mx_{sn}_b_fact_forward",
+             head + f"impl Tag<{a_static}> for S {{}}\nimpl<'a, 'b> NeedT<{a_a}> for S where S: Tag<{a_b}>, 'a: 'b, 'b: 'a {{}}\n" + MAINP)
+        case("implsuper", f"mx_{sn}_b_no_fact",
+             head + f"impl<'b> Tag<{a_b}> for S {{}}\nimpl<'a, 'b> NeedT<{a_a}> for S where S: Tag<{a_b}> {{}}\n" + MAINP)
+    # The proving clause arrives through a supertrait of the clause's trait.
+    case("implsuper", "super_via_mid_static",
+         "trait Tag<A> {}\ntrait Mid<A>: Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct S;\nimpl Tag<&'static u8> for S {}\nimpl Mid<&'static u8> for S {}\nimpl<'a> NeedT<&'a u8> for S where S: Mid<&'static u8> {}\n" + MAINP)
+    case("implsuper", "super_via_mid_exact",
+         "trait Tag<A> {}\ntrait Mid<A>: Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct S;\nimpl<'a> NeedT<&'a u8> for S where S: Mid<&'a u8> {}\n" + MAINP)
+    # A duplicated exact clause proves. (Two clauses at different
+    # lifetimes are rustc E0283 ambiguity, a separate solver gap
+    # recorded in the package report, so no case here.)
+    case("implsuper", "super_two_clauses_exact",
+         "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<T>(T);\nimpl<'a, T> NeedT<&'a u8> for G<T> where G<T>: Tag<&'a u8>, G<T>: Tag<&'a u8> {}\n" + MAINP)
+    # The impl's Self is generic; the clause names a concrete Self.
+    case("implsuper", "super_generic_self",
+         "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<T>(T);\nimpl Tag<&'static u8> for G<u8> {}\nimpl<'a, T> NeedT<&'a u8> for G<T> where G<u8>: Tag<&'static u8> {}\n" + MAINP)
+    case("implsuper", "super_generic_self_exact",
+         "trait Tag<A> {}\ntrait NeedT<A>: Tag<A> {}\nstruct G<T>(T);\nimpl<'a, T> NeedT<&'a u8> for G<T> where G<T>: Tag<&'a u8> {}\n" + MAINP)
     # Wrapped argument types: validity follows the innermost type.
     wrapped = [("good_opt", "Option<u8>"), ("bad_opt", "Option<String>"), ("good_tup", "(u8, u8)"),
                ("bad_tup", "(String, u8)"), ("good_arr", "[u8; 2]"), ("bad_arr", "[String; 2]")]
