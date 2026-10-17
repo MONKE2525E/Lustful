@@ -163,6 +163,7 @@ fn shift_gen_tables(gx: &mut GenTables, sp: &mut dyn FnMut(&mut Span)) {
         inst_order: _,
         template_rows: _,
         adt_created: _,
+        turn_marks: _,
         derive_marks: _,
         written_projections: _,
         item_index: _,

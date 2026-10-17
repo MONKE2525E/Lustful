@@ -116,6 +116,21 @@ impl OutCopy {
                     && self.requests.iter().zip(requests).all(|((d, a), (t, b))| *d == p.def_id(*t) && a == b))
     }
 
+    /// The types that can name an Adt instance (`may_make_instances`) of
+    /// this copy and of `out`, in order, when the rest that `same` compares
+    /// in a check is equal (the closures and the vtables); None otherwise.
+    /// The kept program admits an edit when the two lists are the same once
+    /// the types whose instances were made before the body's turn are left
+    /// out (driver/patch.rs `made_before`).
+    pub(crate) fn makers(&self, out: &Discovered) -> Option<(Vec<OwnedTy>, Vec<OwnedTy>)> {
+        let (adt_tys, _, closures, vtables) = out;
+        if self.closures != *closures || self.vtables != *vtables {
+            return None;
+        }
+        let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).cloned().collect::<Vec<_>>();
+        Some((makers(&self.adt_tys), makers(adt_tys)))
+    }
+
     /// Which part of `out` differs from this copy where `same` compares
     /// (a refusal log line).
     pub(crate) fn differs(&self, p: &Program, out: &Discovered) -> String {

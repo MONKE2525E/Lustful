@@ -97,6 +97,9 @@ pub(crate) struct Digest {
     defs: FxMap<DefId, DefFacts>,
     impl_sets: FxMap<(DefId, Head), Fingerprint>,
     hidden: FxMap<DefId, u64>,
+    /// Each Adt instance's type (deep hash), in creation order: a kept
+    /// program must hold the instances a cold collect makes.
+    instances: Vec<u64>,
     /// Def names, for messages only (not compared).
     names: FxMap<DefId, String>,
 }
@@ -145,6 +148,12 @@ impl Digest {
             d.names.entry(def).or_insert_with(|| format!("{kind} {}", p.interner.get(name)));
             d.defs.insert(def, DefFacts { sig: sig(def), layout: None, class: None });
         }
+        for &a in &p.gx.adt_created {
+            let Some(t) = p.tys.full_adt_ty(a) else { continue };
+            let mut h = crate::intern::FxHasher::default();
+            crate::driver::graph::hash_ty_deep(&mut h, p, &p.tys, t, &mut Default::default());
+            d.instances.push(std::hash::Hasher::finish(&h));
+        }
         for (&od, &t) in &p.gx.opaque_hidden {
             let mut h = crate::intern::FxHasher::default();
             crate::driver::graph::hash_ty_deep(&mut h, p, &p.tys, t, &mut Default::default());
@@ -176,6 +185,11 @@ impl Digest {
                 .filter(|k| !cold.impl_sets.contains_key(k))
                 .map(|k| format!("impl set of {} for {:?} only in warm", name(&k.0), k.1)),
         );
+        if self.instances != cold.instances {
+            let at = self.instances.iter().zip(&cold.instances).position(|(a, b)| a != b);
+            let same_set = self.instances.iter().all(|h| cold.instances.contains(h)) && cold.instances.iter().all(|h| self.instances.contains(h));
+            out.push(format!("Adt instances: warm {}, cold {} (first difference at {at:?}, same set {same_set})", self.instances.len(), cold.instances.len()));
+        }
         if self.hidden != cold.hidden {
             out.push(format!("hidden types: warm {} entries, cold {}", self.hidden.len(), cold.hidden.len()));
         }

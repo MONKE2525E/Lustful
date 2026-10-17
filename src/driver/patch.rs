@@ -2385,22 +2385,41 @@ pub(super) fn reuse_kept(
                     continue;
                 }
                 let f = LocalDefId(*fn_index as u32);
-                let (checked, discarded) = crate::check::check_fn(&p, f);
+                let (mut checked, discarded) = crate::check::check_fn(&p, f);
                 if checked.closure_map_pending {
                     crate::check::derive_delta::log(&|| format!("kept bases {}: closure map pending\n", p.display_name(p.fn_def(f).name)));
                     return Err("discovery");
                 }
                 let out = crate::check::generics::discovery_out(&p, &checked, &discarded);
-                if !base.as_ref().is_some_and(|b| b.same(&p, &out, walk_instances)) {
-                    crate::check::derive_delta::log(&|| format!("kept bases {}: output differs\n", p.display_name(p.fn_def(f).name)));
+                // An output that differs only in types that make Adt
+                // instances stands when those were made before (`made_before`).
+                let makers = match base.as_ref() {
+                    Some(b) if b.same(&p, &out, walk_instances) => Some((Vec::new(), Vec::new())),
+                    Some(b) if discarded.is_empty() && !walks_requests(&p) => b.makers(&out),
+                    _ => None,
+                };
+                let Some(makers) = makers else {
+                    crate::check::derive_delta::log(&|| {
+                        let why = base.as_ref().map_or("no base".to_string(), |b| b.differs(&p, &out));
+                        format!("kept bases {}: output differs: {why}\n", p.display_name(p.fn_def(f).name))
+                    });
                     return Err("discovery");
+                };
+                let reads = std::mem::take(&mut checked.reads);
+                let clean = discarded.is_empty();
+                drop((checked, discarded));
+                if makers.0 != makers.1 {
+                    if !made_before(&mut p, f, &makers.0, &makers.1) {
+                        crate::check::derive_delta::log(&|| format!("kept bases {}: new types not made before its turn\n", p.display_name(p.fn_def(f).name)));
+                        return Err("discovery");
+                    }
+                    crate::check::derive_delta::log(&|| format!("kept bases {}: types made before its turn\n", p.display_name(p.fn_def(f).name)));
                 }
-                if discarded.is_empty() {
+                if clean {
                     let (adt_tys, reqs, closures, vts) = &out;
-                    caches.gen_reuse.store_discovered(&p, f, &checked.reads, adt_tys, reqs, closures, vts);
+                    caches.gen_reuse.store_discovered(&p, f, &reads, adt_tys, reqs, closures, vts);
                 }
                 caches.gen_reuse.discovery_checked += 1;
-                drop((checked, discarded));
                 // Every body type enters the global store, as discovery's
                 // replay does (lowering and codegen read it there).
                 for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
@@ -2412,6 +2431,35 @@ pub(super) fn reuse_kept(
     }
     super::laps::mark("collect/kept bodies");
     Ok((p, spans, template_errs))
+}
+
+/// True when discovery makes instances from a body's requests: in a
+/// build, and in a check of a program with generic associated consts
+/// (`materialize`). An edited body's requests must then stay the same.
+fn walks_requests(p: &crate::check::collect::Program) -> bool {
+    p.gx.walk_instances || !p.gx.assoc_const_tmpls.is_empty()
+}
+
+/// True when `old` and `new`, the instance-making types of fn `x`'s base
+/// and new discovery outputs (`OutCopy::makers`; the rest of the two is the
+/// same), are the same list once the types whose instances were all made
+/// before `x`'s turn in collect's discovery (`generics::made_before_turn`)
+/// are left out. Discovery takes the plain bodies in fn order, and the
+/// bodies before `x` are the same in a cold collect, so the same instances
+/// exist when `x`'s turn begins. Its turn makes nothing from a type left
+/// out, and the same instances, in the same order, from the rest: the
+/// program holds the instances a cold collect makes, in its order.
+fn made_before(p: &mut crate::check::collect::Program, x: crate::def::LocalDefId, old: &[crate::check::generics::OwnedTy], new: &[crate::check::generics::OwnedTy]) -> bool {
+    let mut open = |ts: &[crate::check::generics::OwnedTy]| -> Vec<usize> {
+        (0..ts.len())
+            .filter(|&i| {
+                let t = crate::check::generics::build_owned_ty(p, &ts[i]);
+                !crate::check::generics::made_before_turn(p, t, x)
+            })
+            .collect()
+    };
+    let (a, b) = (open(old), open(new));
+    a.len() == b.len() && a.iter().zip(&b).all(|(&i, &j)| old[i] == new[j])
 }
 
 /// True when the edited fn's new body calls one of `cow_fns` by method
@@ -3159,7 +3207,8 @@ pub fn run() -> i64 {
 
     /// An edit inside a nested fn's own body takes the body patch (braces
     /// may change there), and the kept program stands while the nested
-    /// fn's discovery output does. Edit, error, fix, undo, and another
+    /// fn's discovery output makes the same instances (`made_before`: a
+    /// `Vec<String>` makes none in a check). Edit, error, fix, undo, and another
     /// edit each give the cold answer; a build prints what a cold build
     /// prints.
     #[test]
@@ -3177,7 +3226,7 @@ pub fn run() -> i64 {
             ("        w * true\n", "        if w > 0 { w * 2 } else { 0 }\n", "reuse"),
             ("        let w = v + B;\n        if w > 0 { w * 2 } else { 0 }\n", "        v * 2\n", "reuse"),
             ("        vec![v]\n", "        vec![v, v]\n", "reuse"),
-            ("        vec![v, v]\n", "        let s: Vec<String> = id(Vec::new());\n        vec![v + s.len() as i64]\n", "discovery"),
+            ("        vec![v, v]\n", "        let s: Vec<String> = id(Vec::new());\n        vec![v + s.len() as i64]\n", "reuse"),
             ("        v * 2\n", "        v * 4\n", "reuse"),
         ];
         for &(old, new, kept) in steps {

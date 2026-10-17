@@ -189,6 +189,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         inst_order: _,            // the driver's order
         template_rows: _,         // rerun
         adt_created: _,           // rerun (materialize)
+        turn_marks: _,            // rerun (materialize)
         derive_marks: _,          // same
         written_projections: _,   // replace (normalize_fn_sig)
         item_index: _,            // same

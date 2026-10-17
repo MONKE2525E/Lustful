@@ -5738,6 +5738,11 @@ pub struct GenTables {
     pub template_rows: Option<u32>,
     /// Adt instances in creation order (ids are not: see `InstOrder`).
     pub adt_created: Vec<AdtId>,
+    /// Each plain body's turn in materialize's first discovery round, in
+    /// fn order: (fn, the `adt_created` length as its turn began). The
+    /// daemon's kept program asks what existed before a body's turn
+    /// (`made_before_turn`).
+    pub turn_marks: Vec<(LocalDefId, u32)>,
     /// What collect's derive checks saw (a derive delta checks the same,
     /// check/derive_delta.rs): the `adt_created` length at the derive
     /// field checks and at `check_derive_bounds`, and the `fns` length at
@@ -5846,6 +5851,7 @@ impl Default for GenTables {
             inst_order: Default::default(),
             template_rows: None,
             adt_created: Vec::new(),
+            turn_marks: Vec::new(),
             derive_marks: [0; 3],
             written_projections: FxMap::default(),
             item_index: FxMap::default(),
@@ -12210,6 +12216,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     queue.retain(|&f| !p.check_skips(f));
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
+    p.gx.turn_marks.clear();
     let mut drop_done = 0u32;
     let mut drop_created = 0usize;
     let mut reuse = std::mem::take(&mut p.gx.reuse);
@@ -12235,6 +12242,9 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         let mut recheck: Vec<LocalDefId> = Vec::new();
         for fid in std::mem::take(&mut queue) {
             crate::driver::graph::FpMemo::sync(p);
+            if rounds == 1 && p.gx.fn_class.get(fid.0 as usize) == Some(&FnClass::Plain) {
+                p.gx.turn_marks.push((fid, p.gx.adt_created.len() as u32));
+            }
             let depth = depths.get(&fid).copied().unwrap_or(0);
             // Snapshot everything the instance requests name,
             // then drop the checked body: it borrows the program
@@ -12486,6 +12496,36 @@ pub(crate) fn may_make_instances(t: &OwnedTy) -> bool {
         OwnedTy::Ref(_, _, e) | OwnedTy::RawPtr(_, e) | OwnedTy::Slice(e) | OwnedTy::Array(e, _) => may_make_instances(e),
         OwnedTy::Tuple(ts) => ts.iter().any(may_make_instances),
         _ => false,
+    }
+}
+
+/// True when every Adt instance `ensure_global_adt_instances` makes from
+/// `t` exists and was made before plain fn `x`'s turn in materialize's
+/// first round (`GenTables::turn_marks`): that turn then makes nothing
+/// from `t`. False when `x` had no turn there.
+pub(crate) fn made_before_turn(p: &Program, t: Ty, x: LocalDefId) -> bool {
+    let marks = &p.gx.turn_marks;
+    let Ok(i) = marks.binary_search_by_key(&x.0, |m| m.0.0) else { return false };
+    let before = &p.gx.adt_created[..(marks[i].1 as usize).min(p.gx.adt_created.len())];
+    made_among(p, t, before, 0)
+}
+
+/// `made_before_turn` over the instances `before`, as deep as
+/// `ensure_global_adt_instances` walks.
+fn made_among(p: &Program, t: Ty, before: &[AdtId], depth: u32) -> bool {
+    if depth > 32 {
+        return true;
+    }
+    match p.tys.kind(t) {
+        TyKind::Adt(def, a) => {
+            let raw = p.tys.args(a);
+            let generic = p.defs.local_adt(def).is_some_and(|template| !p.gx.adt_generics[template.0 as usize].params.is_empty());
+            raw.iter().all(|g| g.as_ty().is_none_or(|e| made_among(p, e, before, depth + 1)))
+                && (raw.is_empty() || !generic || p.tys.local_adt_instance(def, a).is_some_and(|inst| before.contains(&inst)))
+        }
+        TyKind::Ref(_, _, e) | TyKind::RawPtr(_, e) | TyKind::Slice(e) | TyKind::Array(e, _) => made_among(p, e, before, depth + 1),
+        TyKind::Tuple(ts) => p.tys.tys_of(ts).iter().all(|&e| made_among(p, e, before, depth + 1)),
+        _ => true,
     }
 }
 
