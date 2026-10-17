@@ -506,8 +506,10 @@ impl Walker<'_> {
     fn path(&mut self, h: &mut FxHasher, segs: &[PathSeg]) {
         (segs.len() as u64).hash(h);
         for (i, s) in segs.iter().enumerate() {
+            // A qualifier with generic arguments (`Id::<T>::f`) may be an
+            // alias that denotes any type: the name counts unqualified.
             match &mut self.quals {
-                Some(q) if i > 0 && i + 1 == segs.len() && self.muted == 0 => {
+                Some(q) if i > 0 && i + 1 == segs.len() && self.muted == 0 && matches!(segs[i - 1].args, GenericArgs::None) => {
                     s.name.hash(h);
                     q.push((segs[i - 1].name, s.name));
                 }

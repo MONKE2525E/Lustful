@@ -39,7 +39,10 @@
 // user `Store::new`. A name counts there unless every root mention is the
 // last segment of such a path whose qualifier cannot denote the method's
 // Adt: not its name, `Self`, or any name a type alias, `use` rename, or
-// associated type has (by name, as everything here). Identifiers inside a
+// associated type has (by name, as everything here), or a name the
+// resolver gave a def of another crate (a dependency cannot name a type
+// of a crate that depends on it). A qualifier with generic arguments
+// (`Id::<T>::f`, through `type Id<T> = T`) counts as unqualified. Identifiers inside a
 // closure body in an item value do not count at all (outside `const`
 // blocks): the evaluator never runs a closure (`ast_hash::ConstRoots`).
 use super::compile::fn_def_at;
@@ -138,18 +141,26 @@ impl ConstReach {
         self.names.contains(&def.name)
     }
 
-    /// `reaches` for fn `i`, an inherent method of the Adt whose source
+    /// `reaches` for fn `i`, an inherent method of the Adt whose (flat)
     /// name is `adt` (see the module docs): false when every root mention
-    /// of its name is `Q::name` with `Q` none of `adt` and `aliases`.
+    /// of its name is `Q::name` with `Q` none of the Adt's name and
+    /// `aliases`, or a name the resolver gave another crate's def
+    /// (`crate_prefix`: a dependency or shipped crate cannot name a type of
+    /// a crate that depends on it, so neither can its aliases).
     pub(crate) fn reaches_inherent(&self, front: &Front, i: usize, adt: &str) -> bool {
         let (item, sub) = front.fn_loc[i];
         let name = fn_def_at(&front.ast, item, sub).name;
         if !self.names.contains(&name) {
             return false;
         }
-        let adt = adt.trim_start_matches("r#");
+        let own_crate = crate_prefix(adt);
+        let adt = crate::intern::source_name(adt).trim_start_matches("r#");
         let may_be = |q: &Sym| {
-            let q = crate::intern::source_name(front.interner.get(*q)).trim_start_matches("r#");
+            let full = front.interner.get(*q);
+            if crate_prefix(full).is_some_and(|c| Some(c) != own_crate) {
+                return false;
+            }
+            let q = crate::intern::source_name(full).trim_start_matches("r#");
             q == adt || self.aliases.contains(q)
         };
         self.unqual.contains(&name) || self.quals.get(&name).is_none_or(|qs| qs.iter().any(may_be))
@@ -220,6 +231,15 @@ impl ConstReach {
             }
         }
     }
+}
+
+/// The crate part of a resolver flat name, when it has one: a dependency
+/// crate's hash segment (`k` and 16 hex digits) or a shipped crate's
+/// `__lust_` segment. None for a local name, or a name as written.
+fn crate_prefix(flat: &str) -> Option<&str> {
+    let (first, _) = flat.split_once('$')?;
+    let dep = first.len() == 17 && first.starts_with('k') && first[1..].bytes().all(|b| b.is_ascii_hexdigit());
+    (dep || first.starts_with("__lust_")).then_some(first)
 }
 
 /// `ConstReach::aliases` for the front's Ast: `Self`, and the names of

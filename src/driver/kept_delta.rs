@@ -280,7 +280,7 @@ fn untouched_refusals(
         // denote its Adt (`ConstReach::reaches_inherent`).
         let adt = p.gx.inherent_methods.iter().find(|(_, v)| v.contains(&f)).and_then(|(k, _)| p.adt_by_def(k.0));
         let reached = match adt {
-            Some(a) => reach.reaches_inherent(front, i, crate::intern::source_name(p.name(p.adt(a).name))),
+            Some(a) => reach.reaches_inherent(front, i, p.name(p.adt(a).name)),
             None => reach.reaches(front, i),
         };
         if reached {
