@@ -1298,10 +1298,10 @@ impl SharedFiles {
 
 /// One `macro_rules!` definition in token form, for cross-file and
 /// cross-crate macro visibility: the definition's flat tokens and the
-/// string table they index into (the defining file's whole table, shared
-/// by its macros and every seed made from them), plus the defining
-/// crate's `$crate` magic segment so expansion in another crate can
-/// rewrite it.
+/// string table they index into (only the strings those tokens name,
+/// `own_def_strings`; shared by every seed made from it), plus the
+/// defining crate's `$crate` magic segment so expansion in another crate
+/// can rewrite it.
 #[derive(Clone)]
 struct OwnedMacroSource {
     name: Sym,
@@ -1312,6 +1312,23 @@ struct OwnedMacroSource {
     /// public binding (`prelude` for `pub mod prelude { pub use
     /// crate::args; }`); empty at the root. Empty for own sources.
     path: Vec<Sym>,
+}
+
+/// One macro definition's tokens with a string table of only the strings
+/// they name, the tokens re-indexed into it. Each file that sees the
+/// definition appends its table (seeds, `splice`), so a copy of the whole
+/// defining file's table made the string tables of ts_goport's files hold
+/// 29M strings for 3.7M tokens (fx-daemonmem: 2 GB in each Ast copy).
+fn own_def_strings(toks: &[crate::lexer::Token], strings: &[String]) -> (Vec<crate::lexer::Token>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut toks = toks.to_vec();
+    for t in &mut toks {
+        for i in t.tok.string_indices_mut().into_iter().flatten() {
+            out.push(strings.get(*i as usize).cloned().unwrap_or_default());
+            *i = out.len() as u32 - 1;
+        }
+    }
+    (toks, out)
 }
 
 /// One crate of a workspace session, ready to resolve.
@@ -2646,7 +2663,6 @@ impl MacroEnv {
         for (di, disc) in discs.iter().enumerate() {
             let base_path = tables.modules[disc.module.0 as usize].path.clone();
             let mut collect = |outline: &scan::Outline, lexed: &lexer::Lexed, owned: &mut Vec<OwnedMacroSource>| {
-                let mut shared: Option<std::sync::Arc<Vec<String>>> = None;
                 for m in &outline.macros {
                     let mut mod_path = base_path.clone();
                     mod_path.extend(m.container_path.iter().copied());
@@ -2665,13 +2681,8 @@ impl MacroEnv {
                         lo: m.span.lo,
                     });
                     own_exported.push(m.exported);
-                    owned.push(OwnedMacroSource {
-                        name: m.name,
-                        tokens: lexed.tokens[lo..hi].to_vec(),
-                        strings: shared.get_or_insert_with(|| std::sync::Arc::new(lexed.strings.clone())).clone(),
-                        magic: job.magic,
-                        path: Vec::new(),
-                    });
+                    let (tokens, strings) = own_def_strings(&lexed.tokens[lo..hi], &lexed.strings);
+                    owned.push(OwnedMacroSource { name: m.name, tokens, strings: std::sync::Arc::new(strings), magic: job.magic, path: Vec::new() });
                 }
             };
             if let Some(orig) = &disc.lexed {
@@ -8340,6 +8351,24 @@ mod tests {
     use crate::driver::graph::Reads;
     use crate::intern::{Interner, Known};
     use crate::protocol::ProfileFlags;
+
+    /// A macro definition's own string table holds only the strings of its
+    /// tokens, with the same texts as the file's table (`own_def_strings`).
+    #[test]
+    fn macro_def_owns_only_its_strings() {
+        let interner = Interner::default();
+        let src = "fn a() { \"x\"; 1.5; }\nmacro_rules! m { () => { (\"y\", 2.5, 'c') } }\nfn b() { \"z\"; }";
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let at = lexed.tokens.iter().position(|t| matches!(t.tok, crate::lexer::Tok::Ident(s) if interner.get(s) == "macro_rules")).unwrap();
+        let (lo, hi) = macro_tok_range(&lexed.tokens, at);
+        let (toks, strings) = own_def_strings(&lexed.tokens[lo..hi], &lexed.strings);
+        assert!(strings.len() < lexed.strings.len(), "{strings:?} vs {:?}", lexed.strings);
+        let texts = |toks: &[crate::lexer::Token], table: &[String]| -> Vec<String> {
+            toks.iter().filter_map(|t| crate::lexer::lit_text(&t.tok, table).map(|c| c.into_owned())).collect()
+        };
+        assert_eq!(texts(&toks, &strings), texts(&lexed.tokens[lo..hi], &lexed.strings));
+        assert!(!strings.iter().any(|s| s.contains('x') || s.contains('z')));
+    }
 
     /// The platform crate loads for a platform module mention, a `std::{..}`
     /// group that names one (or `self`), and not for compiler-handled items.
