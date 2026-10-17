@@ -1911,6 +1911,10 @@ struct Ctx<'p> {
     recursion_limit: usize,
     /// `depth::struct_depth` answers for this body's types.
     depth_memo: crate::intern::FxMap<(depth::Family, Ty), usize>,
+    /// `auto_holds` answers for types with no param, inference variable or
+    /// projection, while `opaque_env` is empty: they read only the program
+    /// and the fn's own env, which a check does not change.
+    auto_memo: crate::intern::FxMap<(DefId, Ty), Option<bool>>,
     /// The module this fn is defined in (root without the resolver),
     /// for field visibility checks (ARCH 1.5).
     module: crate::ty::defs::ModuleId,
@@ -2506,6 +2510,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         p,
         f,
         recursion_limit: where_overflow::recursion_limit(p),
+        auto_memo: Default::default(),
         depth_memo: crate::intern::FxMap::default(),
         module: defining_module(p, fid),
         tys: Tys::new(&p.tys),
@@ -5388,8 +5393,19 @@ impl<'p> Ctx<'p> {
         // layouts' fingerprints cover nested field types).
         self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
         self.note_opaques(t);
+        // A walk from the top answers the same each time for a type the env
+        // cannot reach (`auto_memo`); one inside a cycle may lean on `seen`.
+        let flags = self.tys.flags(t);
+        let memo = seen.is_empty() && self.opaque_env.is_empty() && !flags.contains_param() && !flags.contains_infer() && !flags.contains_projection();
+        if memo && let Some(&r) = self.auto_memo.get(&(trait_def, t)) {
+            return r;
+        }
         let env = self.solve_env();
-        crate::check::collect::auto_structural(self.p, &mut self.tys, &env, trait_def, t, seen)
+        let r = crate::check::collect::auto_structural(self.p, &mut self.tys, &env, trait_def, t, seen);
+        if memo {
+            self.auto_memo.insert((trait_def, t), r);
+        }
+        r
     }
 
     /// W-BORROW: for each `Fn`-family bound whose self type is a param the
