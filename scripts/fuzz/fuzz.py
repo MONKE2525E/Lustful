@@ -24,6 +24,11 @@
 # `--rustc-sample N` (single-file crates) keeps a sample of up to N edited texts that lust
 # accepted and builds them with default-lint rustc at the end: each rustc rejection is a
 # failure (rule zero; scripts/rustc_sample.py). It never changes the edit stream.
+# `--rustc-run-sample N` (single-file crates) also keeps run states: accepted states that ran
+# warm and cold (the run compares below, plus extra runs drawn from the sample's own RNG
+# while a semantic family has open slots), N spread over the families. At the end rustc
+# builds and runs each: stdout, exit status and normalized stderr must equal both lust runs,
+# and fewer than `--rustc-run-min` judged states (rustc run timeouts are unjudged) fails.
 #
 # Usage:
 #   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3|patchseq [--modules 40] [--strict]
@@ -1238,8 +1243,8 @@ def save_pair(out, tag, prev, cur):
 
 
 def cmd_run(a):
-    if a.rustc_sample and a.crate in ("patchseq", "multi", "multi2", "multi3"):
-        print(f"setup error: --rustc-sample needs a single-file crate, not {a.crate}")
+    if (a.rustc_sample or a.rustc_run_sample) and a.crate in ("patchseq", "multi", "multi2", "multi3"):
+        print(f"setup error: --rustc-sample and --rustc-run-sample need a single-file crate, not {a.crate}")
         return 2
     if a.crate == "patchseq":
         return cmd_run_patchseq(a)
@@ -1262,6 +1267,7 @@ def cmd_run(a):
     srng = random.Random(a.seed ^ 0x516ED)
     ext = sigops.External(a.rustc, a.baseline)
     rs = rustc_sample.Sample(a.rustc_sample, a.seed)
+    rr = rustc_sample.RunSample(a.rustc_run_sample, a.rustc_run_min, a.seed)
     original = crate_text(a.crate, a.modules)
     Harness.keep_work = a.keep_work
     h = Harness(a.timeout)
@@ -1348,8 +1354,13 @@ def cmd_run(a):
             # passes; run-compare right after it, not only every 25 edits.
             # Feature edits get the same treatment: a derive or impl edit
             # can change which glue a body runs while `check` still passes.
-            if (it % 25 == 24 or op == "const_edit" or op.startswith(("feat_", "feat3_"))) and da[0] == 0:
+            # The run sample's extra runs come last in the test, so its RNG
+            # moves only on accepted states the cadence above skipped.
+            if da[0] == 0 and (it % 25 == 24 or op == "const_edit" or op.startswith(("feat_", "feat3_"))
+                               or rr.want_extra(op)):
                 ok, why, ra, rb = compare(h, "run", a.strict)
+                if ok and why != "program hang":
+                    rr.offer(text, op, ra, rb)
                 if ok and why == "program hang":
                     # The edited program does not terminate on either side:
                     # same behavior, not a failure. The daemon may still be
@@ -1407,6 +1418,7 @@ def cmd_run(a):
         failures = sig_result(h, ext, failures)
         failures += h.rss_result()
         failures += rs.judge(a.out)
+        failures += rr.judge(a.out)
         print(f"RESULT seed={a.seed} crate={a.crate} modules={a.modules} edits={a.edits} "
               f"failures={failures} guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
@@ -2525,6 +2537,10 @@ def main():
     r.add_argument("--baseline", default=None, help="baseline lust binary for --rustc")
     r.add_argument("--rustc-sample", type=int, default=0,
                    help="build up to N accepted texts with rustc (single-file crates)")
+    r.add_argument("--rustc-run-sample", type=int, default=0,
+                   help="run about N accepted states with rustc and compare with warm and cold lust")
+    r.add_argument("--rustc-run-min", type=int, default=20,
+                   help="fewest judged run-sample states that pass (with --rustc-run-sample)")
     for name in ("replay", "shrink"):
         s = sub.add_parser(name)
         s.add_argument("--prev", required=True)
