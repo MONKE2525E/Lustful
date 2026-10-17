@@ -2394,6 +2394,8 @@ pub(super) fn reuse_kept(
         return Err("derive build");
     }
     let mut p = k.program;
+    // Nested templates of edited bodies, with the edit's old node range.
+    let mut nested_templates: Vec<(usize, (u32, u32))> = Vec::new();
     // The edits below change what fingerprints read.
     p.fp_memo.off();
     p.ast = front.ast.clone();
@@ -2413,17 +2415,30 @@ pub(super) fn reuse_kept(
         }
         // Body items keep their indexes, text, and blocks (`same_items`),
         // so the program's statics, consts, item blocks, and nested fn
-        // signatures stand. Closure and template tables key on Ast nodes,
-        // which are new: a nested fn must be a plain fn with no closure.
-        // The body impls' methods are new nodes too.
+        // signatures stand. Their nodes are new, and so are the body
+        // impls' methods'. A plain one keeps its closures (their defs key
+        // on the parent def and their order, `closure::closure_def`) and
+        // its discovery output (its text and the items it sees stand). A
+        // template's picks and closure tables key on its nodes: it checks
+        // again below, as an edited template does, in a check only.
         let body_fns = e.items.iter().filter_map(|i| match p.body_items.get(i).copied() {
             Some(crate::check::collect::BodyItem::Fn(f)) => Some(f),
             _ => None,
         });
         for f in body_fns.chain(e.hoisted.iter().map(|&j| LocalDefId(j as u32))) {
-            let def = p.fn_def(f);
-            let closure = p.ast.exprs[def.exprs.0 as usize..def.exprs.1 as usize].iter().any(|x| matches!(x, crate::ast::Expr::Closure { .. }));
-            if closure || p.gx.fn_class.get(f.0 as usize) != Some(&FnClass::Plain) {
+            match p.gx.fn_class.get(f.0 as usize) {
+                Some(FnClass::Plain) => {}
+                Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) => nested_templates.push((f.0 as usize, e.old_exprs)),
+                _ => return Err("body items"),
+            }
+        }
+        // A generic assoc const's template keys on its value's node.
+        if !e.hoisted.is_empty() && !p.gx.assoc_const_tmpls.is_empty() {
+            let has_consts = |j: &usize| match p.fn_info(LocalDefId(*j as u32)).loc {
+                crate::check::collect::FnLoc::Impl(i, _) => matches!(&p.ast.items[i as usize].kind, ItemKind::Impl(imp) if !imp.consts.is_empty()),
+                _ => true,
+            };
+            if e.hoisted.iter().any(has_consts) {
                 return Err("body items");
             }
         }
@@ -2562,7 +2577,8 @@ pub(super) fn reuse_kept(
         template_errs.extend(errs);
     }
     let edited = edits.iter().filter_map(|e| e.fn_index);
-    for fn_index in edited.chain(recheck.iter().copied()) {
+    let nested: Vec<usize> = nested_templates.iter().map(|n| n.0).collect();
+    for fn_index in edited.chain(recheck.iter().copied()).chain(nested) {
         let header = edits.iter().any(|x| x.header && x.fn_index == Some(fn_index));
         if header || p.gx.fn_class.get(fn_index) != Some(&FnClass::Template) || seen.contains(&fn_index) {
             continue;
@@ -2573,6 +2589,8 @@ pub(super) fn reuse_kept(
             return Err("closures");
         }
         let mut ranges: Vec<(u32, u32)> = edits.iter().filter(|x| x.fn_index == Some(fn_index)).map(|x| x.old_exprs).collect();
+        // A nested template's old nodes sit in its holder's old range.
+        ranges.extend(nested_templates.iter().filter(|n| n.0 == fn_index).map(|n| n.1));
         if ranges.is_empty() {
             ranges.push(p.fn_def(f).exprs);
         }
