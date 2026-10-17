@@ -2394,6 +2394,14 @@ fn use_item_trait_layers(p: &Program, idxs: &[u32]) -> (Vec<DefId>, Vec<Vec<Sym>
 /// own entry reports any errors, so the closure fn reports none and
 /// marks the result poisoned instead.
 pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
+    check_fn_with(p, fid, true)
+}
+
+/// `check_fn`; the body lints that run after a clean check (deny lints,
+/// depth, drop check, local type depth) only when `lints`. Mono discovery
+/// in a one-shot `lust check` reads no error of its checks
+/// (`generics::materialize`), so it skips them.
+pub(crate) fn check_fn_with<'p>(p: &'p Program, fid: LocalDefId, lints: bool) -> (Checked<'p>, Vec<Diag>) {
     // Derive lists the check reads become `Derives` reads (R12).
     // So do const fns the scalar evaluator ran for a length (`Checked`).
     let (((mut ck, mut errs), noted), called) =
@@ -2403,7 +2411,8 @@ pub fn check_fn<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>)
     // Drop-check overflow (rustc E0320) is judged on the generic body,
     // never an instance; a closure's body is its parent's check.
     let class = p.gx.fn_class.get(fid.0 as usize).copied().unwrap_or_default();
-    if errs.is_empty()
+    if lints
+        && errs.is_empty()
         && matches!(class, generics::FnClass::Plain | generics::FnClass::Template)
         && !p.in_lang_methods(p.fn_def(fid).name_span)
         && p.fn_shipped_crate(fid).is_none()

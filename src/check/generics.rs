@@ -12263,6 +12263,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     // checked; `lust check` makes no instances, so it checks again once.
     let mut rechecked: FxMap<LocalDefId, u32> = FxMap::default();
     let recheck_limit = if p.gx.walk_instances { 8 } else { 1 };
+    // The body lints after a clean check add only errors. A discovery
+    // check's errors matter only for its instance requests (a failed
+    // body's stub picks), which `lust check` walks only with generic
+    // associated consts, and for the reuse store a one-shot compile has
+    // not (`GenReuse::on`). So a one-shot `lust check` skips them.
+    let lints = p.gx.walk_instances || !p.gx.assoc_const_tmpls.is_empty() || reuse.on || !reuse.one_shot;
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -12291,7 +12297,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 stored
             } else {
                 reuse.discovery_checked += 1;
-                let (checked, discarded) = crate::check::check_fn(p, fid);
+                let (checked, discarded) = crate::check::check_fn_with(p, fid, lints);
                 let (adt_tys, reqs, closures_owned, vts) = discovery_out(p, &checked, &discarded);
                 // A body whose types still name a generic definer's
                 // template closures (its instance is made from this very
