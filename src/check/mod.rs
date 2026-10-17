@@ -15309,10 +15309,10 @@ impl<'p> Ctx<'p> {
                             }
                         }
                     }
-                    // `repeat_n(x, n)`: Copy `T` only (W-STD-B, ty/iter.rs).
+                    // `repeat_n(x, n)` with `T: Clone` (W-STD-B, ty/iter.rs).
                     Builtin::IterRepeatN => {
                         let t = self.callee_turbo_ty(callee, span);
-                        self.deferred_copy.push((t, span));
+                        self.deferred_clone.push((t, span));
                         self.deferred_repeat_n.push((t, span));
                         (vec![t, USIZE], crate::ty::iter::mk_iter(&mut self.tys, crate::ty::iter::IterKind::RepeatN, &[t]))
                     }

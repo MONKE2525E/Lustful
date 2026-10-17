@@ -1426,9 +1426,30 @@ impl Ex<'_, '_> {
                 };
                 self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![a, Self::usize_c(0), Self::usize_c(n)]));
             }
+            // core's `repeat_n`: `(Some(x), n)`, or `(None, 0)` with `x`
+            // dropped at once for a zero count.
             B::IterRepeatN => {
                 let (x, n) = (arg()?, arg()?);
-                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![x, n]));
+                let xt = self.op_ty(&x)?;
+                let ot = self.body.tys.mk_option(xt);
+                let xl = self.local(xt);
+                self.assign(Place::local(xl), Rvalue::Use(x));
+                let nl = self.copy_local(n, USIZE);
+                let o = self.local(ot);
+                let join = self.block();
+                let z = self.cmp(crate::ast::BinOp::Eq, Operand::Copy(Place::local(nl)), Self::usize_c(0));
+                let (zero, some) = self.branch(z);
+                self.cur = zero;
+                self.drop_local(xl);
+                self.none(&Place::local(o), ot);
+                self.goto(join);
+                self.cur = some;
+                let ax = self.take(Place::local(xl), xt);
+                self.some(&Place::local(o), ot, ax);
+                self.goto(join);
+                self.cur = join;
+                let ao = self.take(Place::local(o), ot);
+                self.assign(dest, Rvalue::TupleAgg(dest_ty, vec![ao, Operand::Copy(Place::local(nl))]));
             }
             // `std::array::from_fn(f)`: push each `f(i)` into a
             // `Vec` in order, then pop them back out into the array
@@ -2110,17 +2131,24 @@ impl Ex<'_, '_> {
                 self.none(&dest, opt);
                 self.goto(join);
             }
-            // `iter::RepeatN` (Copy `T`, W-STD-B): the element while the
-            // count lasts, from either end.
+            // `iter::RepeatN` (W-STD-B), as core's `next` (and `next_back`,
+            // the same): a clone of the element while more than one is
+            // left (the clone first, then the count), then the element
+            // itself, then `None`.
             K::RepeatN => {
-                let c = self.cmp(Lt, Self::usize_c(0), Operand::Copy(f(1)));
-                let (s, n) = self.branch(c);
-                self.cur = s;
+                let c = self.cmp(Lt, Self::usize_c(1), Operand::Copy(f(1)));
+                let (many, last) = self.branch(c);
+                self.cur = many;
+                let r = self.ref_to(false, Self::payload(&f(0)), a[0]);
+                let y = self.local(a[0]);
+                self.call_builtin(Builtin::Clone, vec![Operand::Move(Place::local(r))], Place::local(y));
                 self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Self::usize_c(1)));
-                self.some(&dest, opt, Operand::Copy(f(0)));
+                let ay = self.take(Place::local(y), a[0]);
+                self.some(&dest, opt, ay);
                 self.goto(join);
-                self.cur = n;
-                self.none(&dest, opt);
+                self.cur = last;
+                self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
+                self.take_none(f(0), opt, dest.clone());
                 self.goto(join);
             }
             // `Windows` (W-STD-B): the first (or last) `size` elements
@@ -3640,8 +3668,8 @@ impl Ex<'_, '_> {
         }
         match self.kind_args(ty) {
             None => true,
-            Some((k, _)) if back => !matches!(k, K::Range | K::Rev | K::Copied | K::Chain),
-            Some((k, _)) => !matches!(k, K::Range | K::Skip | K::Take | K::Enumerate | K::Rev | K::Copied | K::Chain),
+            Some((k, _)) if back => !matches!(k, K::Range | K::Rev | K::Copied | K::Chain | K::RepeatN),
+            Some((k, _)) => !matches!(k, K::Range | K::Skip | K::Take | K::Enumerate | K::Rev | K::Copied | K::Chain | K::RepeatN),
         }
     }
 
@@ -4460,6 +4488,7 @@ impl Ex<'_, '_> {
             }
             K::Rev => self.advance_back(f(0), a[0], n),
             K::Copied => self.advance(f(0), a[0], n),
+            K::RepeatN => self.repeat_n_advance(itp, a[0], n),
             K::Chain => {
                 let aty = self.place_ty(&f(0))?;
                 let out = self.local(USIZE);
@@ -4495,6 +4524,32 @@ impl Ex<'_, '_> {
             }
             _ => self.advance_loop(itp, ty, n, false),
         }
+    }
+
+    /// core's `RepeatN::advance_by(n)` (no clones): the count drops by
+    /// `n`; when that reaches 0 the element drops (`self.inner = None`)
+    /// and the remainder is what was left of `n`.
+    fn repeat_n_advance(&mut self, itp: Place, elem: Ty, n: Local) -> Result<Local, String> {
+        use crate::ast::BinOp::*;
+        let f = |i: u32| itp.project(Proj::Field(i));
+        let rem = self.local(USIZE);
+        let join = self.block();
+        let c = self.cmp(Lt, Operand::Copy(Place::local(n)), Operand::Copy(f(1)));
+        let (part, all) = self.branch(c);
+        self.cur = part;
+        self.assign(f(1), Rvalue::Bin(Sub, Operand::Copy(f(1)), Operand::Copy(Place::local(n))));
+        self.assign(Place::local(rem), Rvalue::Use(Self::usize_c(0)));
+        self.goto(join);
+        self.cur = all;
+        self.assign(Place::local(rem), Rvalue::Bin(Sub, Operand::Copy(Place::local(n)), Operand::Copy(f(1))));
+        self.assign(f(1), Rvalue::Use(Self::usize_c(0)));
+        let ot = self.body.tys.mk_option(elem);
+        let t = self.local(ot);
+        self.take_none(f(0), ot, Place::local(t));
+        self.drop_local(t);
+        self.goto(join);
+        self.cur = join;
+        Ok(rem)
     }
 
     /// `itp.advance_back_by(n)` as the remainder local: the back
@@ -4546,6 +4601,8 @@ impl Ex<'_, '_> {
             }
             K::Rev => self.advance(f(0), a[0], n),
             K::Copied => self.advance_back(f(0), a[0], n),
+            // core: `advance_back_by` is `advance_by`.
+            K::RepeatN => self.repeat_n_advance(itp, a[0], n),
             K::Chain => {
                 let bty = self.place_ty(&f(1))?;
                 let out = self.local(USIZE);
@@ -6118,6 +6175,12 @@ impl Ex<'_, '_> {
                 self.call_builtin(Builtin::VecIterLen, vec![Operand::Move(Place::local(r))], dest);
                 self.goto(join);
             }
+            // core's `RepeatN::count` is its length (no clones); the
+            // element drops with the iterator.
+            K::RepeatN => {
+                self.assign(dest, Rvalue::Use(Operand::Copy(itp.project(Proj::Field(1)))));
+                self.goto(join);
+            }
             _ => {
                 self.count_loop(itp, ty, dest)?;
                 self.goto(join);
@@ -6156,6 +6219,11 @@ impl Ex<'_, '_> {
             // core's `ChunkBy::last` is `next_back` too (R13).
             K::Range | K::RangeInclusive | K::ChunkBy | K::ChunkByMut => {
                 self.next(itp, ty, dest.clone(), true)?;
+                self.goto(join);
+            }
+            // core's `RepeatN::last` takes the element (no clones).
+            K::RepeatN => {
+                self.take_none(f(0), dest_ty, dest.clone());
                 self.goto(join);
             }
             // alloc's `vec::IntoIter::last` is `next_back`; the rest then

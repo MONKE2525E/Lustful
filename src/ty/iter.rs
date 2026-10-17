@@ -98,7 +98,9 @@ pub enum IterKind {
     /// (`CTy::ArrayIter`) drops only the stored range the indexes
     /// still span.
     ArrayIntoIter,
-    /// `iter::RepeatN<T>` (W-STD-B): args `[T]`, item `T`; Copy `T` only.
+    /// `iter::RepeatN<T>` (W-STD-B): args `[T]`, item `T`. As core's
+    /// `Option<RepeatNInner>`: the element while the count is above 0,
+    /// cloned for each item but the last, which moves it out.
     RepeatN,
     /// Any other iterator, reached through its own `Iterator::next`
     /// (W-STD-B, check/iter.rs `by_next_item`): args `[I, Item]`, the
@@ -772,8 +774,9 @@ impl IterKind {
             | K::SetDrain => &[],
             // (array, front, back): elements in `front..back` remain.
             K::ArrayIntoIter => &[F::Arg(1), F::Usize, F::Usize],
-            // (element, count left).
-            K::RepeatN => &[F::Arg(0), F::Usize],
+            // (element, count left): the element is `None` exactly when
+            // the count is 0.
+            K::RepeatN => &[F::OptArg(0), F::Usize],
             K::ByNext => &[F::Arg(0)],
             K::Windows => &[F::SliceRef(0, false), F::Usize],
             K::CharIndices => &[F::Chars, F::Usize],
