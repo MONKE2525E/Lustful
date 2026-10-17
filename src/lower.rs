@@ -2600,6 +2600,18 @@ impl<'p> Lower<'p> {
             }
             Expr::Cast { expr, .. } => {
                 let o = self.operand(*expr);
+                // A target that names a lifetime: the value goes through a
+                // temporary whose regions are the written ones (W-BORROW).
+                if let Some(&(_, r)) = self.ck.cast_annotations.iter().find(|(c, _)| *c == e) {
+                    let rv = if matches!(self.kind(ty), TyKind::FnPtr(_) | TyKind::Ref(..)) { Rvalue::Use(o) } else { Rvalue::Cast(o, ty) };
+                    let t = self.temp(ty);
+                    self.assign(Place::local(t), rv, span);
+                    self.body.annotations.push((t, r));
+                    if let Some(d) = dest {
+                        self.assign(d.clone(), Rvalue::Use(Operand::Move(Place::local(t))), span);
+                    }
+                    return;
+                }
                 if let Some(d) = dest {
                     // A cast to a fn pointer already holds the pointer
                     // value (the coercion on the inner expression made

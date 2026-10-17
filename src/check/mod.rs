@@ -1748,6 +1748,10 @@ pub struct Checked<'g> {
     /// gives each binding it covers, by checker local (W-BORROW): the
     /// borrow checker relates the binding's regions to it.
     pub annotations: Vec<(u32, Ty)>,
+    /// The regioned target type of each cast whose target names a lifetime
+    /// (`record_cast_annotation`), by cast expr: lowering puts the cast's
+    /// value in a temporary annotated with it.
+    pub cast_annotations: Vec<(ExprId, Ty)>,
     /// Obligations taken from this body's queue, once per take (each
     /// run round takes them all; `Obligations::work`). A work count for
     /// tests that guard against selection blow-ups.
@@ -2497,6 +2501,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
             fn_shim_calls: Vec::new(),
             poisoned: false,
             annotations: Vec::new(),
+            cast_annotations: Vec::new(),
             queue_work: 0,
             opaque_hidden: Vec::new(),
             opaque_holds: Vec::new(),
@@ -8253,6 +8258,21 @@ impl<'p> Ctx<'p> {
         }
     }
 
+    /// Records the regioned form of cast target `t` for cast `e`
+    /// (`Checked::cast_annotations`), after the same outlives check as a
+    /// `let` annotation.
+    fn record_cast_annotation(&mut self, e: ExprId, t: ast::TyId) {
+        let p = self.p;
+        let Some(r) = self.regioned_annotation(t, Region::Erased, true) else { return };
+        let env = self.env();
+        if let Some(sig) = p.regions.body_sig(p, self.fid)
+            && let Some(d) = crate::check::outlives::check_body_ty(p, &mut self.tys, sig, env, r, p.ast.ty_span(t))
+        {
+            self.errs.push(d);
+        }
+        self.out.cast_annotations.push((e, r));
+    }
+
     /// The outlives check of a `let` annotation whose lifetimes sit only in
     /// a qualified path (`generics::qpath_names_lifetime`): the type must be
     /// well-formed under the fn's implied bounds (rustc E0309). The borrow
@@ -9509,7 +9529,16 @@ impl<'p> Ctx<'p> {
                 }
             }
             Expr::Cast { expr, ty } => {
-                let target = self.resolve_written(*ty);
+                // A target that names a lifetime (`f as fn(TableKey<'a>)`)
+                // is an annotation of the cast's value (W-BORROW): lowering
+                // puts that value in a temporary with these regions.
+                let target = if self.annotation_has_regions(*ty) {
+                    let target = self.resolve_annotation(*ty);
+                    self.record_cast_annotation(e, *ty);
+                    target
+                } else {
+                    self.resolve_written(*ty)
+                };
                 // A bare `_` cast target takes the expected type:
                 // `let x: u16 = 3u8 as _` casts to `u16`.
                 let target = if matches!(self.kind(target), TyKind::Infer(_)) {
