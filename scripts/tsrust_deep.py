@@ -144,6 +144,40 @@ def names_in(msg):
     return out
 
 
+def impl_names(msg):
+    """The impl key (prune.impl_keys) an error about a missing method or impl points at: a
+    removed impl block's `Type::method` or `impl Trait for Type`."""
+    m = re.search(r"no method `(\w+)` on type `([^`]+)`", msg)
+    if m:
+        return [f"{prune.short_type(m.group(2))}::{m.group(1)}"]
+    m = re.search(r"no impl of `([^`]+)` for `([^`]+)`", msg)
+    return [f"impl {prune.short_type(m.group(1))} for {prune.short_type(m.group(2))}"] if m else []
+
+
+# A call, macro, turbofish or path through a name: `f(`, `.m(`, `m!`, `f::<`, `T::`.
+USED = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\(|!|::)")
+
+
+def unknown_type_parents(located, copy, cause_of_name):
+    """For each error whose type lust could not know ({projection}, {error}) because the census
+    removed what produced the value: the cause of the nearest removed name the code calls or
+    paths through, on the error line first, then on the lines above it in its item.
+    Keyed (file relative to the copy, message as prune.py stores it)."""
+    out, cache = {}, {}
+    for f, ln, _code, msg in located:
+        if "{projection}" not in msg and "{error}" not in msg:
+            continue
+        item = [it for it in prune.items_of(str(Path(f).resolve()), cache) if it[0] <= ln <= it[1]]
+        top = max(item, key=lambda it: it[0])[0] if item else ln
+        lines = Path(f).read_text().split("\n")
+        for i in range(ln, top - 1, -1):
+            hit = next((n for n in USED.findall(lines[i - 1].split("//")[0]) if n in cause_of_name and n not in ("main", "Self")), None)
+            if hit:
+                out[(os.path.relpath(Path(f).resolve(), copy), msg[:160])] = cause_of_name[hit]
+                break
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fork", required=True, type=Path)
@@ -218,6 +252,7 @@ def one_pass(a, by_name, work, copy, env, removed, cause_of_name, status, pass_n
                 print(f"tsrust-deep: {name} round {rnd}: removed users of {sorted(gone)}", flush=True)
                 continue
             before = len(removed)
+            unknown = unknown_type_parents(located, copy, cause_of_name)
             try:
                 prune.prune_round(located, tool, removed, copy, [], lambda c, m: None)
             except SystemExit as e:
@@ -230,7 +265,10 @@ def one_pass(a, by_name, work, copy, env, removed, cause_of_name, status, pass_n
                 if tool == "rustc":
                     r["code"] = f"rustc:{r['code']}"
                 key = (r["code"], tsrust_full.norm_message(r["message"], copy).removeprefix("unlocated: "))
-                parent = next((cause_of_name[n] for n in names_in(r["message"]) if n in cause_of_name), None)
+                # A cascade of an earlier removal: a name the message quotes, a removed impl's
+                # method or trait impl, or the removed producer of a value of unknown type.
+                parent = next((cause_of_name[n] for n in [*names_in(r["message"]), *impl_names(r["message"])] if n in cause_of_name), None)
+                parent = parent or unknown.get((r["file"], r["message"]))
                 r["cause"] = list(parent or key)
                 r["target"] = name
                 for n in [r["name"], *r.get("binds", [])]:

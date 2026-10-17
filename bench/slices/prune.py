@@ -333,6 +333,32 @@ def apply_drops(spec, src_root, removed):
                         "code": "DROP", "message": why[:160]})
 
 
+def short_type(t):
+    """`a::B<C, D<E>>` -> `B`: a type or trait as an impl key names it (generics, paths, `&`,
+    `dyn` and lifetimes dropped)."""
+    t = re.sub(r"\s+", " ", t)
+    while re.search(r"<[^<>]*>", t):
+        t = re.sub(r"<[^<>]*>", "", t)
+    t = re.sub(r"^(&\s*('\w+\s+)?(mut\s+)?|dyn\s+)+", "", t.strip())
+    return t.split("::")[-1].strip()
+
+
+def impl_keys(text, fns):
+    """Keys a removed impl block leaves dangling, for the deep census's cascade lookup
+    (tsrust_deep.impl_names): `Type::method` per fn in it, `impl Trait for Type` for a trait impl."""
+    head = re.sub(r"\s+", " ", text.split("{", 1)[0])
+    m = re.search(r"\bimpl\b(.*)$", head)
+    if not m:
+        return []
+    body = m.group(1)
+    while re.search(r"<[^<>]*>", body):
+        body = re.sub(r"<[^<>]*>", "", body)
+    body = re.split(r"\bwhere\b", body)[0].strip().lstrip("!")
+    trait, _, ty = body.rpartition(" for ")
+    ty = short_type(ty or body)
+    return [f"{ty}::{f}" for f in fns] + ([f"impl {short_type(trait)} for {ty}"] if trait else [])
+
+
 def prune_round(errs, tool, removed, src_root, unlocated, relocate):
     """Remove the innermost item holding each error. Returns the number of items removed."""
     by_file = {}
@@ -394,6 +420,9 @@ def prune_round(errs, tool, removed, src_root, unlocated, relocate):
             it, code, msg = spans[s]
             # A whole `use` names no item, but its renames (`a as b`) are names users refer to.
             binds = re.findall(r"\bas\s+([A-Za-z]\w*)", "\n".join(lines[s[0] - 1:s[1]])) if it[3] == "use" else []
+            if it[3] in ("impl", "traitimpl"):
+                fns = [x[4] for x in items_of(f, cache) if x[3] == "fn" and s[0] <= x[0] and x[1] <= s[1]]
+                binds = impl_keys("\n".join(lines[s[0] - 1:s[1]]), fns)
             del lines[s[0] - 1:s[1]]
             removed.append({"file": os.path.relpath(f, src_root), "kind": it[3], "name": it[4],
                             "lines": s[1] - s[0] + 1, "by": tool, "code": code, "message": msg[:160]}
