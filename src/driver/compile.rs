@@ -3159,6 +3159,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     front.slots_renumbered = false;
     caches.gen_reuse.on = caches.persistent && gen_env.is_some();
+    caches.gen_reuse.one_shot = !caches.persistent;
     caches.gen_reuse.env = gen_env.unwrap_or(0);
     // On a body patch, slot heads stand and only the changed fns' body
     // hashes moved (the slot update lists exactly those), so the last
@@ -3419,7 +3420,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.def_order_stored = def_order_size(&front.def_order);
     }
     // Read sets serve the next request's dirty walk; a one-shot process
-    // has none, so its body checks skip recording and fingerprinting.
+    // has none, so its body checks skip recording and fingerprinting
+    // (collect's own checks did too: `GenReuse::one_shot`).
     program.record_reads = caches.persistent;
     program.unwind = !session_key.profile.panic_abort;
     // Route the spliced source std fns: resolve each registry row's

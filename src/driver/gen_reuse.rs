@@ -186,6 +186,11 @@ pub struct GenReuse {
     /// False: every lookup misses and nothing is stored (one-shot
     /// sessions, and `collect` callers outside the driver).
     pub on: bool,
+    /// True when the process exits after this compile (no daemon): no
+    /// later request replays a read set, so collect's body checks
+    /// (template checks, mono discovery) record no reads and compute no
+    /// fingerprints (`Program::record_reads`). The driver sets it.
+    pub one_shot: bool,
     /// Source fingerprint of each AST fn, in `LocalDefId` order (body
     /// and head hash), set by the driver before collect.
     pub ast_src: Vec<u64>,

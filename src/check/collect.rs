@@ -3429,6 +3429,7 @@ pub fn collect_reuse(
     let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;
     p.gx.reuse = std::mem::take(reuse);
+    p.record_reads = !p.gx.reuse.one_shot;
     p.gx.inst_order = std::mem::take(&mut def_order.instances);
     p.gx.reuse.begin();
     // The builtin Adt defs join the table with their one type param where they take
