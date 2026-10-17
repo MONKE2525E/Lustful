@@ -1,0 +1,13 @@
+# A crate under a path with a space, `#` and `é` (fixture.txt projdir=):
+# Cargo's package ids name it as `path+file:///..sp%20ace%23%C3%A9..`.
+# Both packages have a build script, so lust must pick the right message.
+[package]
+name = "odd-path"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+oddlib = { path = "oddlib" }
+
+[workspace]
+members = ["oddlib"]

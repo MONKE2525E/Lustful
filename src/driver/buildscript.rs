@@ -393,7 +393,8 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path, env: ClientEnv) -> Resu
     // One message per build script Cargo ran (this package and its
     // dependencies). The one for `manifest_dir` is the message whose
     // package_id names that directory (a path package id is
-    // `path+file://<dir>#...`); a single message needs no match.
+    // `path+file://<dir>#...`, `<dir>` percent-encoded); a single
+    // message needs no match.
     let mut seen: Vec<(String, PathBuf)> = Vec::new();
     for line in stdout.lines() {
         if line.contains("\"build-script-executed\"") {
@@ -419,10 +420,13 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path, env: ClientEnv) -> Resu
             }
         }
     }
-    let want = format!("{}#", manifest_dir.to_string_lossy());
+    // The id's path is a percent-encoded URL (`sp%20ace`): decode it
+    // before comparing with the manifest dir.
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let want = canon(manifest_dir);
     let out_dir = seen
         .iter()
-        .find(|(id, _)| id.contains(&want))
+        .find(|(id, _)| crate::resolve::cargo::path_package_dir(id).is_some_and(|d| d == manifest_dir || canon(&d) == want))
         .map(|(_, d)| d.clone())
         .or_else(|| if seen.len() == 1 { seen.into_iter().next().map(|(_, d)| d) } else { None });
     let Some(out_dir_path) = out_dir.filter(|d| !d.as_os_str().is_empty()) else {

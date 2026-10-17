@@ -1,0 +1,5 @@
+# The project sits in a directory whose name Cargo percent-encodes in its
+# package ids (a space, `#`, a non-ASCII char): lust must still match the
+# build script messages to the package, cold and through the daemon.
+projdir=sp ace#é
+daemon=1

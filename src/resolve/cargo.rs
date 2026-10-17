@@ -660,6 +660,35 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     Ok(CrateGraph { key, watch: Vec::new(), stamp: 0, workspace_root, packages, workspace_members: members })
 }
 
+/// The directory a path package id names, decoded: Cargo writes a path
+/// source as a `file://` URL, so `path+file:///w/sp%20ace%23%C3%A9#a@0.1.0`
+/// (and the older `a 0.1.0 (path+file:///w/sp%20ace)`) is `/w/sp ace#é`.
+/// None for any other source. Compare package ids with filesystem paths
+/// only through this: a space, `#`, `%` or a non-ASCII char in the path
+/// is percent-encoded in the id.
+pub fn path_package_dir(id: &str) -> Option<PathBuf> {
+    const PREFIX: &str = "path+file://";
+    let rest = &id[id.find(PREFIX)? + PREFIX.len()..];
+    let enc = &rest[..rest.find(['#', ')']).unwrap_or(rest.len())];
+    let bytes = enc.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (bytes.get(i + 1).and_then(|&b| hex(b)), bytes.get(i + 2).and_then(|&b| hex(b)))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
 /// The stable package identity of section 1.7 step 1.
 pub fn package_id_string(graph: &CrateGraph, pkg: &PackageInfo) -> String {
     match &pkg.source {
@@ -1072,6 +1101,17 @@ fn first_deny_lint(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn path_package_dir_decodes() {
+        let d = |id: &str| super::path_package_dir(id).map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(d("path+file:///w/sp%20ace%23%C3%A9#a@0.1.0").as_deref(), Some("/w/sp ace#é"));
+        assert_eq!(d("path+file:///w/plain#0.4.0").as_deref(), Some("/w/plain"));
+        // `%` itself is `%25`: decoded once, `%41` stays literal.
+        assert_eq!(d("path+file:///w/pc%2541#x@1.0.0").as_deref(), Some("/w/pc%41"));
+        assert_eq!(d("a 0.1.0 (path+file:///w/sp%20ace)").as_deref(), Some("/w/sp ace"));
+        assert_eq!(d("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0"), None);
+    }
+
     use super::*;
 
     #[test]

@@ -27,6 +27,11 @@
 #                     `lust check <root> --lib` must both accept (or both
 #                     reject, with expect=); nothing runs. root= names the
 #                     lib root (default src/lib.rs)
+#   projdir=<name>    the project directory's name in the work dir (default
+#                     proj), for paths Cargo percent-encodes in package ids
+#                     (a space, `#`, a non-ASCII char)
+#   daemon=1          after the cold build, also build twice through a private
+#                     daemon (cold, then warm) and compare both programs
 #   expect=<L####>    negative fixture: lust must reject with this code.
 #                     Cargo must also reject unless the line cargo=pass is
 #                     present (valid Rust lust rejects on purpose).
@@ -93,11 +98,14 @@ for dir in "$fixtures"/*/; do
   [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
   seen=$((seen + 1))
   case_dir=$work/$name
-  mkdir -p "$case_dir/proj"
-  cp -r "$dir/." "$case_dir/proj/"
+  # `projdir=` is read first: the copy goes there.
+  projdir=$(sed -n 's/^projdir=//p' "$dir/fixture.txt" 2>/dev/null | head -1)
+  proj=$case_dir/${projdir:-proj}
+  mkdir -p "$proj"
+  cp -r "$dir/." "$proj/"
 
   # Fixture selections, with the defaults named in the header.
-  bin=$(sed -n 's/^name = "\(.*\)"/\1/p' "$case_dir/proj/Cargo.toml" | head -1)
+  bin=$(sed -n 's/^name = "\(.*\)"/\1/p' "$proj/Cargo.toml" | head -1)
   manifest=Cargo.toml
   root_file=src/main.rs
   features=""
@@ -107,8 +115,9 @@ for dir in "$fixtures"/*/; do
   cargo_pass=""
   stderr_mode=""
   lib=""
+  daemon=""
   prog_args=()
-  if [ -f "$case_dir/proj/fixture.txt" ]; then
+  if [ -f "$proj/fixture.txt" ]; then
     while IFS='=' read -r k v; do
       case "$k" in
         bin) bin=$v ;;
@@ -121,19 +130,21 @@ for dir in "$fixtures"/*/; do
         cargo) cargo_pass=$v ;;
         stderr) stderr_mode=$v ;;
         lib) lib=$v ;;
+        daemon) daemon=$v ;;
+        projdir) ;;
         args) # split on spaces by design (see header)
           read -r -a prog_args <<<"$v" ;;
         "" | \#*) ;;
         *) report bad "$name" "unknown fixture.txt key: $k"; continue 2 ;;
       esac
-    done <"$case_dir/proj/fixture.txt"
+    done <"$proj/fixture.txt"
   fi
   if [ "$target" = host ]; then target=$host_triple; fi
-  if [ -n "$lib" ] && ! grep -q '^root=' "$case_dir/proj/fixture.txt"; then root_file=src/lib.rs; fi
+  if [ -n "$lib" ] && ! grep -q '^root=' "$proj/fixture.txt"; then root_file=src/lib.rs; fi
 
-  cargo_args=(build --manifest-path "$case_dir/proj/$manifest" --bin "$bin")
-  lust_args=(build "$case_dir/proj/$root_file" -o "$case_dir/lust.bin"
-    --manifest-path "$case_dir/proj/$manifest" --bin "$bin")
+  cargo_args=(build --manifest-path "$proj/$manifest" --bin "$bin")
+  lust_args=(build "$proj/$root_file" -o "$case_dir/lust.bin"
+    --manifest-path "$proj/$manifest" --bin "$bin")
   if [ -n "$dev_config" ]; then
     cargo_args+=(--no-default-features)
     if [ -n "$features" ]; then
@@ -151,12 +162,12 @@ for dir in "$fixtures"/*/; do
   fi
 
   if [ -n "$lib" ]; then
-    cargo_args=(build --manifest-path "$case_dir/proj/$manifest" --lib)
-    lust_args=(check "$case_dir/proj/$root_file" --manifest-path "$case_dir/proj/$manifest" --lib)
+    cargo_args=(build --manifest-path "$proj/$manifest" --lib)
+    lust_args=(check "$proj/$root_file" --manifest-path "$proj/$manifest" --lib)
   fi
 
   cargo_ok=1
-  if ! (cd "$case_dir/proj" && timeout 60 cargo "${cargo_args[@]}" --target-dir "$case_dir/cargo-target") >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"; then
+  if ! (cd "$proj" && timeout 60 cargo "${cargo_args[@]}" --target-dir "$case_dir/cargo-target") >"$case_dir/cargo.out" 2>"$case_dir/cargo.err"; then
     cargo_ok=0
   fi
   if [ -n "$expect" ]; then
@@ -240,6 +251,30 @@ for dir in "$fixtures"/*/; do
     report bad "$name" "stderr differs:"
     diff <(mask_tid "$case_dir/cargo.run.err") <(mask_tid "$case_dir/lust.run.err") | head -10
     continue
+  fi
+
+  if [ "$daemon" = 1 ]; then
+    # The same build twice through a private daemon (the client starts it
+    # on this socket, inside the project dir; it exits once idle): its
+    # cold build, then its warm one, must give the same program.
+    dbad=""
+    for dpass in cold warm; do
+      env -u LUST_NO_DAEMON LUST_DAEMON_SOCKET="$proj/.lust-daemon.sock" LUST_DAEMON_IDLE=20 \
+        timeout "$case_timeout" "$lust" "${lust_args[@]}" >"$case_dir/daemon.$dpass.out" 2>"$case_dir/daemon.$dpass.err"; st=$?
+      if [ "$st" -ne 0 ]; then
+        dbad="daemon $dpass build failed (exit $st): $(head -3 "$case_dir/daemon.$dpass.err")"
+        break
+      fi
+      timeout 30 "$case_dir/lust.bin" "${prog_args[@]}" >"$case_dir/daemon.$dpass.run.out" 2>/dev/null
+      if ! cmp -s "$case_dir/cargo.run.out" "$case_dir/daemon.$dpass.run.out"; then
+        dbad="daemon $dpass build: stdout differs: $(diff "$case_dir/cargo.run.out" "$case_dir/daemon.$dpass.run.out" | head -4)"
+        break
+      fi
+    done
+    if [ -n "$dbad" ]; then
+      report bad "$name" "$dbad"
+      continue
+    fi
   fi
 
   if [ "${SANITIZE:-0}" = 1 ]; then

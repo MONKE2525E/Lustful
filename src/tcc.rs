@@ -276,7 +276,11 @@ pub fn link_shared(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), Stri
 /// executable built earlier loads.
 pub fn link_with_base(objs: &[PathBuf], dir: &Path, base: &str, out: &Path, debug: bool) -> Result<(), String> {
     let tcc = Tcc::new(TCC_OUTPUT_EXE, debug)?;
-    let rpath = CString::new(format!("-Wl,-rpath={}", dir.display())).unwrap();
+    // tcc splits an options string on spaces: the dir goes in double
+    // quotes (its `"` and `\` escaped), so a path with a space keeps
+    // its whole rpath.
+    let quoted = dir.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let rpath = CString::new(format!("-Wl,-rpath=\"{quoted}\"")).unwrap();
     let base = CString::new(base).unwrap();
     // SAFETY: valid state and NUL-terminated strings that outlive the calls.
     unsafe {
