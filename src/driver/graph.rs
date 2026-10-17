@@ -2107,6 +2107,9 @@ pub(crate) struct DeriveMoves<'a> {
     /// The names of the fns whose signature moves (`MethodSet` keys key
     /// on the method name).
     names: Option<FxMap<Sym, ()>>,
+    /// The Adt defs with a written `Hasher` or `BuildHasher` impl whose
+    /// associated type names the reach (`hasher_reaches`), made on use.
+    hashers: Option<FxMap<DefId, ()>>,
 }
 
 /// A `Sync` view of a `DeriveMoves` whose moved fn names are made: the
@@ -2124,7 +2127,7 @@ impl<'a> DeriveMoves<'a> {
     }
 
     pub(crate) fn new(reach: &'a crate::check::derive_delta::Reach) -> DeriveMoves<'a> {
-        DeriveMoves { reach, sig: FxMap::default(), keys: None, names: None }
+        DeriveMoves { reach, sig: FxMap::default(), keys: None, names: None, hashers: None }
     }
 
     /// As `new`, with every key's answer memoized.
@@ -2209,8 +2212,19 @@ impl Program {
                 self.sig_moves(m, d);
             }
         }
-        for &d in self.const_defs.iter().chain(&self.static_defs) {
-            self.sig_moves(m, d);
+        // A const's or static's answer is its type's (`sig_moves`, by index:
+        // its lookups scan the def lists). The first index of a def counts.
+        let not_fn_or_adt = |d: DefId| self.local_def(d.hash).filter(|l| self.def_id(*l) == d).is_none() && self.adt_by_def(d).is_none();
+        let consts: FxMap<DefId, ()> = self.const_defs.iter().map(|&d| (d, ())).collect();
+        for (i, &d) in self.const_defs.iter().enumerate() {
+            if !m.sig.contains_key(&d) && not_fn_or_adt(d) {
+                m.sig.insert(d, m.reach.ty(&self.tys, self.consts[i].ty));
+            }
+        }
+        for (i, &d) in self.static_defs.iter().enumerate() {
+            if !m.sig.contains_key(&d) && not_fn_or_adt(d) && !consts.contains_key(&d) {
+                m.sig.insert(d, m.reach.ty(&self.tys, self.statics[i].ty));
+            }
         }
     }
 
@@ -2276,13 +2290,22 @@ impl Program {
     /// True when Adt `def`'s layout fingerprint folds a written `Hasher`
     /// or `BuildHasher` impl's associated type that names a reach Adt
     /// (`hash_adt_layout`).
-    fn hasher_reaches(&self, m: &DeriveMoves, def: DefId) -> bool {
-        [self.gx.lang.hasher, self.gx.lang.build_hasher].iter().any(|&tr| {
-            self.gx.index.impls_of_trait(tr).iter().any(|&id| {
-                let rec = self.gx.index.get(id);
-                rec.head == crate::traits::index::SelfHead::Adt(def) && rec.assoc_tys.iter().any(|&(_, t)| m.reach.ty(&self.tys, t))
-            })
-        })
+    fn hasher_reaches(&self, m: &mut DeriveMoves, def: DefId) -> bool {
+        if m.hashers.is_none() {
+            let mut heads = FxMap::default();
+            for tr in [self.gx.lang.hasher, self.gx.lang.build_hasher] {
+                for &id in self.gx.index.impls_of_trait(tr) {
+                    let rec = self.gx.index.get(id);
+                    if let crate::traits::index::SelfHead::Adt(d) = rec.head
+                        && rec.assoc_tys.iter().any(|&(_, t)| m.reach.ty(&self.tys, t))
+                    {
+                        heads.insert(d, ());
+                    }
+                }
+            }
+            m.hashers = Some(heads);
+        }
+        m.hashers.as_ref().is_some_and(|h| h.contains_key(&def))
     }
 }
 
