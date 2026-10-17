@@ -1,167 +1,124 @@
 <img src="assets/icon.svg" width="64" height="64" alt="">
 
-# lust-lang
+# lust
 
-A Rust subset that compiles much faster than Rust. Every valid lust program is a valid Rust program with the same output. The plan is in [DESIGN.md](DESIGN.md).
+lust is a compiler for a subset of Rust. It checks and builds Rust code much faster than rustc, so the edit, check, run loop stays short. It emits C and compiles it with [tcc](https://bellard.org/tcc/).
 
-Status: **prototype.** It compiles a real subset of Rust end to end, with a real type checker and borrow checker. No generics, traits, or closures yet.
+Rule zero: every program lust accepts is valid Rust (rustc 1.99, edition 2024), and it gives the same output. When lust cannot match rustc, it rejects the program with an error code. It never guesses.
 
-## Demo: an agent's edit loop, 130x faster than rustc
+Use lust for dev checks and dev builds. Use Cargo for release builds.
 
-`bench/realish/agent_loop.py` plays the loop a coding agent runs all day: edit a function, check, build, run. It does this on a 31k-line crate (40 modules of a 784-line warehouse service: inventory, orders, a pricing-rule language with a tokenizer, parser, and evaluator, shortest-path routing, and reports). The 12 edits include behavior changes, a new function, and two mistakes (a type error and a borrow error) that both compilers must reject.
+## Status
 
-- **rustc 1.99** runs in its fastest incremental setup on this machine: `-Z threads=8`, `-C incremental`, `-C debuginfo=0`.
-- **lust** runs through a warm `lust daemon`. The `lust` command is a thin client.
-- After every edit, both compilers must agree on pass or fail, and the two programs must print exactly the same output.
+lust is new. The main target today is fast `lust check` on [ts-rust](https://github.com/pingdotgg/ts-rust), a Rust port of the TypeScript compiler (about 786k lines).
 
-24-core x86_64 Linux:
+On a fork of ts-rust (upstream commit `b11b618ae`, 2026-10-09) with small changes for lust, 2026-10-16 census:
 
-| # | Edit | rustc check | lust check | rustc build | lust build |
-|---|---|---|---|---|---|
-| 1 | tweak the bulk discount | 1351 ms | 13.5 ms | 2463 ms | 13.9 ms |
-| 2 | restock more often | 1212 ms | 7.5 ms | 2143 ms | 13.7 ms |
-| 3 | add a currency suffix | 1082 ms | 6.7 ms | 2134 ms | 14.3 ms |
-| 4 | lower the max quantity | 837 ms | 6.3 ms | 1884 ms | 19.0 ms |
-| 5 | allow cancelling paid orders | 1344 ms | 6.4 ms | 2435 ms | 13.7 ms |
-| 6 | mistake: wrong integer type (both reject) | 847 ms | 8.3 ms | - | - |
-| 7 | fix the type error | 782 ms | 8.0 ms | 1171 ms | 16.9 ms |
-| 8 | restock a bit more | 1281 ms | 7.6 ms | 2432 ms | 13.7 ms |
-| 9 | rewrite a heap check | 1232 ms | 6.5 ms | 2425 ms | 15.8 ms |
-| 10 | add a new helper function | 1169 ms | 13.8 ms | 2254 ms | 15.7 ms |
-| 11 | mistake: borrow conflict (both reject) | 819 ms | 9.1 ms | - | - |
-| 12 | fix the borrow conflict | 845 ms | 7.0 ms | 1106 ms | 18.0 ms |
-| | **total** | **12.80 s** | **0.101 s** | **20.45 s** | **0.155 s** |
+- `lust check`: 17 of 17 targets pass (every lib, bin, and cdylib).
+- `lust build`: 11 of 11 bins build.
+- Parity with the Cargo builds: 350 of 350 fixture runs give the same stdout, stderr, exit code, and written files. 7 of 7 integration test bins and 12 of 12 tool runs are the same. 479 of 479 unit tests give the same result.
 
-**Check: 127x. Build: 132x. Whole edit loop: 130x.**
+## Speed
+
+Warm `lust check` through the daemon, compared with `cargo check` (rustc 1.99, incremental, the faster of the default and `-Z threads=8` setups). 16 vCPU Linux box. All numbers come from [docs/speed.md](docs/speed.md) and the latest runs on the full ts_goport crate.
+
+| Edit | Code | lust median | lust p95 | cargo check median | Ratio median | Ratio p95 |
+|---|---|---:|---:|---:|---:|---:|
+| Change one function body | ts-rust slices, 150k to 165k lines | 3 to 4 ms | 7 to 15 ms | 2.0 to 2.4 s | 519x to 644x | 187x to 346x |
+| Change a signature, a type, or a derive | full ts_goport crate, 348k lines | 43 to 94 ms | 110 ms to 7.0 s | about 5.6 to 6.6 s | 64x to 131x | not measured |
 
 The fine print:
 
-- Running the built program is not faster. tcc does not optimize, so lust's binary runs about 1.7x slower than rustc's debug build (22 ms versus 13 ms per run here). If you count that run as part of every iteration, the loop is about 70x faster. This benchmark measures the compiler.
-- The crate is one module cloned 40 times, with renamed items. That gives realistic code at a realistic size, but not the variety of a real project.
-- One big crate is a worst case for rustc. Real projects split code into crates, which makes rustc's incremental builds faster.
-- Cold compiles are about 20x to 55x faster, not 100x. The 100x comes from incremental work (see below).
+- Body edits are the fast path. The worst body edit in 120 was 102 to 143 ms.
+- Edits outside bodies are slower and less even. Some signature edits still fall back to a full check, which costs about as much as a cold check. That is where the 7.0 s p95 comes from.
+- A cold check (no daemon) is only about 2x faster than cargo check on ts-rust. The first check of a new daemon session costs the same as a cold check.
+- `lust build` after a body edit is about 17x faster than a cargo build at the median (9x at p95). A cold `lust build` of a large ts-rust bin takes about 2 minutes.
+- Built programs run slower than rustc debug builds, because tcc does not optimize.
+- The daemon holds the whole program in memory: about 3.3 GB peak on a 165k-line slice.
 
-Reproduce with `python3 bench/realish/agent_loop.py`.
+## Install
 
-## Cold compiles
-
-Same generated file, same output. rustc gets its best configuration for each number (the fastest of incremental, non-incremental, and `-Z threads=8`). Reproduce with `bench/compare.sh plain 640 3200`.
-
-| Lines | Operation | rustc | lust | Speedup |
-|---|---|---|---|---|
-| 9.6k | check | 1.33 s | 42 ms | 32x |
-| 9.6k | debug build | 2.49 s | 115 ms | 22x |
-| 48k | check | 5.86 s | 109 ms | 54x |
-| 48k | debug build | 11.1 s | 279 ms | 40x |
-
-## How incremental compiles work
-
-The daemon keeps one session per crate selection: the crate (package and target) plus the resolver inputs that select its build (features, target triple, profile flags). A single file is a synthetic one-crate package, so `lust check file.rs` needs no setup. Two feature selections of one file get two sessions. An edit costs time that grows with the size of the edit, not of the program:
-
-1. **Find what changed.** It compares the new source with the last one (two `memcmp`s), and lexes again only the chunks of whole items that the edit touched. Chunk boundaries are content-defined, so an inserted function does not move the others.
-2. **Classify the edit.** A token-level scan hashes each function body, and everything outside bodies, without positions. If only bodies changed, only those bodies are parsed, checked, and borrow-checked again. If only top-level functions were added, removed, or changed signature, it parses only the changed chunks, and re-checks only those functions and the bodies that mention their names. Anything else (a type, an impl) is a full rebuild.
-3. **Swap in new code without relinking.** Every call goes through a function table (`lust_fns[slot]`). A slot is a function's stable identity, so adding a function does not renumber the others. The first build links everything into `libbase.so`. After an edit, only the changed functions' unit is compiled, as an "overlay" object. The small executable links main plus the overlays against `libbase.so`, and at startup the overlays replace their entries in the table. After 32 overlays, the base is rebuilt.
-4. **Stay valid when code moves.** Panic locations in generated C are relative to the function's first line, so moving a function does not change its code.
-
-## Build
+Linux x86_64 only. Download `lust-0.1.0-x86_64-linux.tar.gz` from the [releases](../../releases) page, then:
 
 ```sh
-scripts/build-tcc.sh      # builds the pinned tinycc into third_party/tcc
-cargo build --release     # builds `lust` (client) and `lust-core` (compiler)
-scripts/build.sh          # same binaries, fast-to-build profile [profile.gate], for test runs (28 s vs 126 s)
+tar xzf lust-0.1.0-x86_64-linux.tar.gz
+export PATH="$PWD/lust-0.1.0-x86_64-linux/bin:$PATH"
+lust --version
 ```
+
+The package holds `lust`, `lust-core`, the pinned tcc, and the std and adapter sources. lust finds them relative to its own executable, so you can move the folder or link `bin/lust` into your `PATH`.
+
+You also need:
+
+- glibc 2.38 or later (Ubuntu 24.04, Debian 13, Fedora 39, or newer).
+- The C library development files (`libc6-dev` on Debian and Ubuntu, `glibc-devel` on Fedora). tcc links your program against them.
+- Cargo, to check a Cargo crate: lust reads `cargo metadata` and the registry sources. Cargo also does release builds.
+
+To build from source, see [Build from source](#build-from-source).
 
 ## Use
 
 ```sh
-lust check main.rs [--json] [--max-errors N] [--timings]
-lust build main.rs [-o out] [-g] [--emit-c prefix] [--timings]
-lust build src/main.rs --manifest-path Cargo.toml [--bin name] [--features a,b] [--target triple]  # name a Cargo crate target; the file stays the crate root
-lust run main.rs [-- args]
-lust build main.rs --release            # release build: Cargo if a Cargo.toml is above the file, else rustc -O
-lust build main.rs --profile fast       # same, with a named Cargo profile
-lust check main.rs --rustc              # second opinion: the real rustc checks the file
-lust test main.rs [filter] [--json] [--timeout SECONDS]
-lust explain L0301
-lust capabilities [--json]
-lust daemon                             # serve this directory yourself (not needed: see below)
+lust check main.rs                  # type check and borrow check
+lust run main.rs [-- args]          # build with tcc and run
+lust build main.rs [-o out]         # build a dev binary
+lust test main.rs [filter]          # run #[test] functions
+lust check main.rs --rustc          # ask the real rustc for a second opinion
+lust build main.rs --release        # release build with Cargo (or rustc -O for a single file)
+lust explain L0301                  # long help for one error code
+lust capabilities --json            # what the subset supports and rejects
 ```
 
-Panic strategy: a single file builds with panic=abort (`-C panic=unwind`
-switches it). A Cargo crate target (`--manifest-path` and the other crate
-flags) builds with the dev profile Cargo would use: `panic` (default
-unwind, so `catch_unwind` works), `debug-assertions`, and
-`overflow-checks`, read from `CARGO_PROFILE_DEV_*`, the `.cargo/config.toml`
-chain, and the workspace root `Cargo.toml`, in Cargo's order.
-`overflow-checks = false` is an error (lust dev builds always check
-overflow). `lust test` runs each test in its own process with panic=abort.
-
-A project can pin the feature set for lust dev builds (for example, dev
-builds without a `jemalloc` feature, while Cargo release builds keep it):
-set `dev-exclude-features` or `dev-features` under
-`[package.metadata.lust]`, `[workspace.metadata.lust]`, or in a
-`.lust.toml` file. A plain `lust check` or `lust build` then uses that
-selection with no flags; command line feature flags override it. See
-`docs/dev-features.md`.
-
-No setup is needed for warm speed. When `check`, `build`, or `run` finds no daemon for the directory, it answers that one command cold and starts a daemon in the background (its own session, log at `.lust-cache/daemon.log`). The next command is warm. The daemon exits after 30 idle minutes (`LUST_DAEMON_IDLE`, in seconds or with an `s`/`m`/`h` suffix; `0` means never). `LUST_NO_DAEMON=1` turns autostart off. The daemon keeps at most 32 warm sessions (`LUST_DAEMON_SESSIONS`) and evicts the least recently used one. If a compile runs over 30 seconds after its client is gone (`LUST_DAEMON_HANG`; `0` turns this off), the daemon exits, and the next command starts a new one. `scripts/daemon-soak.sh` checks that memory, file descriptors, temp space, and latency stay flat over many requests. Without a daemon, `lust` compiles cold in a fresh process and links a standalone executable. With a daemon, the executable loads `libbase.so` from the daemon's cache directory.
-
-Cold runs also use a whole-request disk cache in `.lust-cache/` next to the source file (`LUST_CACHE_DIR` overrides it, `LUST_NO_CACHE=1` turns it off, `LUST_CACHE_MAX_BYTES` sets the size cap; default 512 MiB, oldest entries deleted first). An unchanged file with the same flags replays in about 4 ms (check) or 8 ms (build). The key covers the compiler build, the tcc binary and runtime files, the source bytes and path, the flags, and the target.
-
-Trust rule for the cache: it is trusted like ccache's local cache. A cached build result is copied out and can run, so a poisoned cache is code execution. Never commit `.lust-cache/` (it is in `.gitignore`), never share it, and delete it if a checkout brings one along.
-
-Release builds go through the real Rust toolchain on the same source, and lust prints which tool ran. With a `Cargo.toml` above the file, lust runs `cargo build --release` (or `--profile <name>`) with the file's package and bin selection; `-o` copies the artifact out of `target/`. Without one, it runs `rustc -O --edition 2024` with the release oracle flags from [DESIGN.md](DESIGN.md).
-
-`--json` prints one diagnostic per line (schema 1), each with `code`, `severity`, `message`, `file`, `source_hash`, `span` (bytes plus line and column), labeled secondary `labels`, `fix`, and `edits`. Output is capped at 20 diagnostics by default; a final `truncated` record says how many were omitted. `lust test` runs each `#[test]` function in its own child process. `lust explain` prints the long-form page for one code (see `docs/errors/`). `lust capabilities --json` lists what the subset supports and rejects. The three agent-kit commands never use the daemon.
-
-## Supported subset
-
-- Items: `fn`, `struct` (named fields or unit), `enum` (unit, tuple, and struct variants), inherent `impl` blocks, `use`.
-- Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default` (with `#[default]` enum variants). The derived bodies are structural glue; a field type with a written non-generic `Clone`, `Default`, `PartialEq` (with no `ne` of its own), or `PartialOrd` (with no `Ord` and no `lt`/`le`/`gt`/`ge` of its own) impl is called through that impl, and other written field impls are rejected where the derived method is used. `Hash` answers bounds only; nothing hashes yet.
-- Comparison operators and core's default methods (`ne`, `lt`/`le`/`gt`/`ge`, `Ord::max`/`min`/`clamp`) work through written `PartialEq`/`PartialOrd`/`Ord` impls; `Ordering` has `is_*`, `reverse`, `then`, and `then_with` (with a closure).
-- Types: integers (no 128-bit), `bool`, `char`, `String`, `&str`, `Vec<T>`, `Option<T>`, `&T`, `&mut T`.
-- Control flow: `if`, `if let`, `match` (guards, `|`, ranges, nested patterns, default binding modes), `loop`, `while`, `while let`, `for` over ranges, `&vec`, `&mut vec`, and `s.chars()`, `break` with a value, early `return`.
-- Macros: `macro_rules!` definitions and calls (matching, hygiene, textual and `#[macro_export]` scope, in one file), plus built-ins: `println!`, `print!`, `eprintln!`, `eprint!`, `format!` (`{}`, `{:?}`, positional, and captured names), `vec!`, `panic!`, `assert!`/`assert_eq!`/`assert_ne!`, `debug_assert!` family, `matches!`, `concat!`, `stringify!`, `cfg!`, `env!`, `option_env!`, `line!`, `column!`, `file!`, `module_path!`, `include!`, `include_str!`, `compile_error!`, `dbg!`, `write!`/`writeln!`, `todo!`, `unreachable!`, `unimplemented!`.
-- Std: common methods on `String`, `str`, `Vec`, `Option`, `char`, and integers, plus `std::env::args().count()`.
-- Borrow checking: moves, initialization, mutability, NLL-style conflicting borrows with two-phase borrows, dangling references, temporaries dropped while borrowed, and returned references (elision only).
-
-Not yet: generics, traits, closures, iterators beyond `chars()`, `Result` and `?`, `HashMap`, floats, tuples, arrays, slices, modules, `const`, `let`-else, and moving one field out of a struct while keeping the rest. Each one gives error `L9001`.
-
-Lust rejects on purpose: lifetime syntax (`L0203`), references in struct fields (`L0201`), and a glob-imported name whose binding depends on rustc's import order (`L0509`; import the item explicitly).
-
-## Tests
+A crate target in a Cargo workspace:
 
 ```sh
-scripts/difftest.sh             # compare with rustc
-SANITIZE=1 scripts/difftest.sh  # also run the generated C under ASan and UBSan
-scripts/test-client.sh          # daemon autostart, disk cache, release handoff
-scripts/test-crates.sh          # Cargo package fixtures built by Cargo and by lust
-scripts/testtest.sh             # compare `lust test` with `rustc --test`
-scripts/check-explain.sh        # check every `lust explain` example against lust and rustc
-scripts/agentkit-test.sh        # JSON diagnostics, explain, capabilities, test edges
-scripts/tsrust-full.sh          # the whole ts-rust fork (third_party/ts-rust): cargo, lust check/build, root causes (--boat, --parity)
+lust check crates/ts_goport/src/lib.rs --manifest-path crates/ts_goport/Cargo.toml --lib
+lust build crates/tsgo/src/main.rs --manifest-path crates/tsgo/Cargo.toml --bin tsgo -o tsgo
 ```
 
-- `tests/pass`: lust and rustc must give the same stdout and exit status.
-- `tests/fail`: rustc and lust must both reject. lust must give the expected error code.
-- `tests/reject`: valid Rust that lust rejects on purpose.
-- `tests/testrun`: files with `#[test]` functions; `lust test` and `rustc --test` must agree per test.
+Crate flags work as in Cargo: `--features`, `--no-default-features`, `--all-features`, `--package`, `--target`, `--offline`, `--locked`. A project can drop features from lust dev builds (for example a native allocator such as jemalloc) with `dev-exclude-features`. See [docs/dev-features.md](docs/dev-features.md).
 
-The agent-loop benchmark also tests incremental mode: every edit's result is compared with rustc.
+### The daemon
 
-## Code map
+You do not need to start it. When `check`, `build`, or `run` finds no daemon for the directory, lust answers that command cold and starts a daemon in the background. The next command is warm.
 
-| File | Role |
-|---|---|
-| `src/client.rs`, `src/protocol.rs` | The thin `lust` client (daemon autostart, release handoff) and the daemon wire format. |
-| `src/driver/cache.rs` | The whole-request disk cache for cold runs. |
-| `src/main.rs`, `src/daemon.rs`, `src/driver/` | `lust-core`: cold compiles, the daemon, and the incremental pipeline. |
-| `src/diag.rs`, `docs/errors/` | Diagnostics with stable codes. `--json` uses schema 1 records with spans, labels, and a source hash. One explain page per code. |
-| `src/testrun.rs`, `src/explain.rs`, `src/capabilities.rs` | The agent kit: `lust test`, `lust explain`, and `lust capabilities`. |
-| `src/lexer.rs`, `src/scan.rs`, `src/parser.rs`, `src/ast.rs` | Syntax in flat arenas; the token scan that finds what changed. |
-| `src/check/collect.rs` | Item tables and signatures. |
-| `src/check/mod.rs`, `src/ty/mod.rs` | Local type inference, method resolution, exhaustiveness; interned semantic types. |
-| `src/lower.rs`, `src/ir.rs` | Lowering to a MIR-like CFG with explicit temporaries and drops. |
-| `src/borrowck/mod.rs` | Init, move, and loan dataflow, plus liveness. |
-| `src/cgen.rs`, `src/runtime/` | C backend and runtime. Checked math is done in 64-bit unsigned, so C never sees signed overflow. |
-| `src/tcc.rs` | libtcc in process, parallel `tcc -c` for large programs, and shared-library linking. |
+- The daemon exits after 30 idle minutes (`LUST_DAEMON_IDLE`, for example `10m`; `0` means never).
+- `LUST_NO_DAEMON=1` turns it off.
+- Its log is `.lust-cache/daemon.log` next to the source file.
+- Cold runs also use a disk cache in `.lust-cache/`. Do not commit or share it: a cached build can run, so treat it like a ccache directory.
+
+### What happens with code lust does not support
+
+lust does not fall back to rustc for checks. If your code uses a feature outside the subset, lust stops with an error that has a stable code, such as `L9001` (not supported yet) or `L0508` (a dependency with no lust adapter). `lust explain <code>` says what to change.
+
+Release builds always go to Cargo (`cargo build --release` for a crate, `rustc -O` for a single file). lust prints which tool ran.
+
+## Platform and limits
+
+- Linux x86_64 only. The release package is built and tested there. Other platforms are not supported yet.
+- The backend is tcc. Dev binaries are not optimized.
+- Dependencies: lust compiles a crates.io package only through an adapter in `library/deps` (18 today, for example `indexmap`, `memchr`, `smallvec`, `num-bigint`), or through a small set of shims. Other dependencies give `L0508`.
+- Not supported (each gives an error code): `async`, `unsafe` code, unions, `extern` blocks and functions, and proc macros other than the built-in derives.
+- Release builds should use Cargo. lust makes dev binaries only.
+
+## Build from source
+
+```sh
+scripts/build-tcc.sh                 # builds the pinned tinycc into third_party/tcc
+cargo build --release                # builds lust (client) and lust-core (compiler)
+scripts/release.sh                   # builds dist/lust-<version>-x86_64-linux.tar.gz
+```
+
+`scripts/build.sh` builds a faster-to-compile profile for test runs. Tests: `scripts/difftest.sh` compares lust with rustc on `tests/pass`, `tests/fail`, and `tests/reject`.
+
+`third_party/ts-rust` is a git submodule. It points to a private fork of ts-rust that only the ts-rust census scripts (`scripts/tsrust-full.sh`) use. You do not need it to build or use lust. This stays so until the lust changes land in upstream ts-rust.
+
+## More
+
+- [DESIGN.md](DESIGN.md): the original design and plan. Some parts are older than the code.
+- [docs/speed.md](docs/speed.md): the speed method and full tables.
+- [docs/errors](docs/errors): one page per error code.
+
+## License
+
+MIT, see [LICENSE](LICENSE). tcc (`third_party/tcc`, and the copy in the release package) keeps its own LGPL 2.1 license. The adapter crates in `library/deps` stand in for crates.io packages; those packages keep their own licenses.
