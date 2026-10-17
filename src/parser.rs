@@ -4125,6 +4125,11 @@ impl<'a> Parser<'a> {
                                 }
                                 let fstart = self.span();
                                 if matches!(self.peek(), Tok::Int(..)) {
+                                    // `S { 0: p }` is valid Rust lust does not build;
+                                    // `S { 0 }` is a syntax error (no shorthand for a number).
+                                    if self.peek_at(1) != Tok::Colon {
+                                        return Err(syntax(self.span(), "expected identifier, found integer literal"));
+                                    }
                                     return Err(self.reject(C_CORE, "tuple struct patterns with field numbers"));
                                 }
                                 let _fattrs = self.part_attributes("pattern fields", 0)?;
