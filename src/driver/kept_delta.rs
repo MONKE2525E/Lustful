@@ -559,6 +559,7 @@ fn replay_bodies(
     let idents = &front.chunks[0].scan.body_idents;
     let fn_count = front.fn_loc.len();
     let mut touched = Touched::new(p, fns);
+    let mut moves = Touched::new(p, fns);
     let mut touched = |p: &Program, k: &ReadKey| touched.hit(p, k);
     let readers = readers(p, &caches.gen_reuse, fns);
     let (record_reads, unwind) = (p.record_reads, p.unwind);
@@ -586,13 +587,18 @@ fn replay_bodies(
             if reuse.untouched_by(p, t, &readers) {
                 continue;
             }
-            // A template with no stored check (one with closures) stands
-            // while its body does not name an edited fn.
-            let named = match idents.get(t.0 as usize) {
-                Some(ids) if (t.0 as usize) < fn_count => ids.iter().any(|s| names.contains(s)),
-                _ => super::ast_hash::body_scan(&p.ast, p.fn_def(t), None).1.iter().any(|s| names.contains(s)),
-            };
-            if !reuse.template_holds(p, t).unwrap_or(!named) {
+            // A template with closures has no stored plain check: its last
+            // clean check's reads stand in (`closure_template_holds`, only
+            // the keys this delta can move), and with none it stands while
+            // its body does not name an edited fn.
+            let holds = reuse.template_holds(p, t).or_else(|| reuse.closure_template_holds(p, t, p.reuse_stamp, Some(&mut |k| moves.hit(p, k))));
+            let holds = holds.unwrap_or_else(|| {
+                !match idents.get(t.0 as usize) {
+                    Some(ids) if (t.0 as usize) < fn_count => ids.iter().any(|s| names.contains(s)),
+                    _ => super::ast_hash::body_scan(&p.ast, p.fn_def(t), None).1.iter().any(|s| names.contains(s)),
+                }
+            });
+            if !holds {
                 again.push(t);
             }
         }
