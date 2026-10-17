@@ -11,7 +11,8 @@
 //!   (body braces, the `)` that closes the inputs, the end of the return type, the `where`
 //!   keyword; 0 0 when absent; flags: g generic type params, m inherent impl method, t trait
 //!   impl method, d trait default body, s self receiver, r returns `impl Trait`, c const,
-//!   a async, u unsafe, n nested in a fn body, x under a cfg or test attribute, `-` for none;
+//!   a async, u unsafe, n nested in a fn body, x under a cfg or test attribute, b the body
+//!   holds a type item (struct, enum, union, trait, type alias, impl), `-` for none;
 //!   tparams: the fn's own type params, comma separated, `-` for none; depth: inline mod depth)
 //!   `derive line depth kind name generic traits` (a one-line `#[derive(..)]` on a struct
 //!   or enum; depth = inline mod depth, generic 0/1, traits comma separated)
@@ -279,6 +280,21 @@ impl<'a> syn::visit::Visit<'a> for Bodies {
     }
 }
 
+/// True when a fn body holds a type item (struct, enum, union, trait, type alias, impl) at any
+/// depth: the `b` site flag (tsedit's `blockbody` kind).
+fn holds_type_item(block: &syn::Block) -> bool {
+    struct Find(bool);
+    impl<'a> syn::visit::Visit<'a> for Find {
+        fn visit_item(&mut self, i: &'a Item) {
+            self.0 |= matches!(i, Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_) | Item::Type(_) | Item::Impl(_));
+            syn::visit::visit_item(self, i);
+        }
+    }
+    let mut f = Find(false);
+    syn::visit::visit_block(&mut f, block);
+    f.0
+}
+
 /// Collects edit sites for `--sites` (scripts/tsedit.py picks its one-fn edits from them).
 #[derive(Default)]
 struct Sites {
@@ -327,6 +343,7 @@ impl Sites {
         flag(sig.unsafety.is_some(), 'u');
         flag(self.fns > 0, 'n');
         flag(self.cfg > 0 || cfg_like(attrs), 'x');
+        flag(holds_type_item(block), 'b');
         let flags = if flags.is_empty() { "-".into() } else { flags };
         let tp = if tparams.is_empty() { "-".into() } else { tparams.join(",") };
         self.out.push_str(&format!(

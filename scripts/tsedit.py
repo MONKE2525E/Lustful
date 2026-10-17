@@ -27,6 +27,8 @@ Edit kinds (each probe edits one fn or item, then goes back to the base text):
   rpit     a fn that returns `impl Trait`: body edit, `+ Sized` bound; reject: `+ Copy`
   macbody  `body` in fns whose bodies call a pure builtin macro (`matches!`, `write!`,
            `writeln!`, `debug_assert*!`): the expander runs on the patch path (not default)
+  blockbody  `body` in fns whose bodies hold a type item (struct, enum, union, trait, type
+           alias, impl; site flag `b`): the edit does not touch the item (not default)
 
 Manifest kinds (stale Cargo view probes; not in the default list, `--kinds manifest` runs them all).
 Each state edits what Cargo reads besides the sources, and often a cfg-gated bad `let` in one body:
@@ -93,7 +95,7 @@ import oracle_log  # noqa: E402  (scripts/oracle_log.py)
 KINDS = ["body", "infer", "sig", "sigx", "oblig", "derive", "generic", "rpit"]
 MANIFEST_KINDS = ["mfeat", "medition", "mlints", "mprofile", "mdeps", "mtarget"]
 # Kinds outside the default list.
-EXTRA_KINDS = ["macbody"]
+EXTRA_KINDS = ["macbody", "blockbody"]
 ALL_KINDS = KINDS + EXTRA_KINDS + MANIFEST_KINDS
 # Traits the oblig kind can ask for, with the path its helper names.
 NEED = {"Clone": "::std::clone::Clone", "Copy": "::std::marker::Copy", "Debug": "::std::fmt::Debug",
@@ -405,6 +407,12 @@ class Bench:
         for kind in self.a.kinds:
             if kind == "body":
                 for f in self.spread([f for f in fns if self.body_ok(f)], n):
+                    t = self.base[f["file"]]
+                    i = next(k)
+                    out.append((kind, lbl(f), [("accept", f["file"], in_body(t, f, f"let _lust_e: u32 = {i};")),
+                                               ("reject", f["file"], in_body(t, f, f'let _lust_e: u32 = "{i}";'))]))
+            elif kind == "blockbody":
+                for f in self.spread([f for f in fns if self.body_ok(f) and "b" in f["flags"]], n):
                     t = self.base[f["file"]]
                     i = next(k)
                     out.append((kind, lbl(f), [("accept", f["file"], in_body(t, f, f"let _lust_e: u32 = {i};")),
