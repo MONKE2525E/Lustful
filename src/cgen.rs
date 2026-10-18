@@ -10320,12 +10320,13 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, 
 /// `main_slot` is the slot of `p.main` (not its `LocalDefId`: slots are
 /// stable across edits, local ids are not).
 pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, register: &str, main_slot: Option<u32>) -> String {
-    fn_unit_parts(p, fns, slots, &[], g, register, main_slot).0
+    fn_unit_parts(p, fns, slots, &[], g, register, main_slot, None).0
 }
 
 /// `fn_unit`, and for the LLVM backend (cgen/ll.rs) the C of the unit's helpers: the same
 /// declarations, then each fn's `ll_c` (empty when no fn of the unit has LLVM IR). The fns
 /// in `inl` (cross-unit inlining, `ll::ll_inline_set`) add their declarations and helpers.
+#[allow(clippy::too_many_arguments)]
 pub fn fn_unit_parts(
     p: &Program,
     fns: &[FnOut],
@@ -10334,6 +10335,7 @@ pub fn fn_unit_parts(
     g: &GlueSet,
     register: &str,
     main_slot: Option<u32>,
+    c_refs: Option<&ll::CRefs>,
 ) -> (String, String) {
     let mut c = unit_header();
     let llvm = slots.iter().any(|&s| !fns[s].ll.is_empty());
@@ -10548,8 +10550,13 @@ pub fn fn_unit_parts(
     } else {
         String::new()
     };
-    for f in slots.iter().map(|&s| &fns[s]) {
-        c.push_str(&f.code);
+    for &s in slots {
+        let f = &fns[s];
+        // An LLVM fn's C is its C ABI wrapper and trampoline: kept only when a text names them.
+        match (c_refs, f.ll.is_empty(), names::fn_tag_opt(s as u32)) {
+            (Some(r), false, Some(id)) => c.push_str(&r.c_body(&f.code, &id)),
+            _ => c.push_str(&f.code),
+        }
     }
     // Termination entry for a `main` returning `ExitCode` or
     // `Result<T, E>` (T `()` or `ExitCode`): call main through the

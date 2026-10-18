@@ -4708,7 +4708,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // One layout phase (cgen `in_layout_phase`): the program is frozen, so each
             // worker keeps its `c_layout` answers across the units it assembles.
             let asm_tag = cgen::layout_phase();
-            let made = par_map(&jobs, |&u| {
+            let assemble = |u: usize, c_refs: Option<&cgen::ll::CRefs>| {
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
                     1 => (cgen::names::statics_unit(&program, &caches.glue), String::new()),
@@ -4720,11 +4720,47 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                     g => {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];
-                        cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot))
+                        cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs)
                     }
                 }));
                 (base_obj(u), c, helpers)
+            };
+            // The LLVM backend: an LLVM fn's C is its C ABI wrapper and trampoline, which only
+            // C calls (`fl_<id>` is what IR and helpers call), so a unit keeps them only when a
+            // text names them (`cgen::ll::CRefs`): the C units and glue shards, and every fn's
+            // helpers' C. `main`'s is always kept (the termination entry calls it).
+            let (c_jobs, fn_jobs) = jobs.split_at(5);
+            let mut made = par_map(c_jobs, |&u| assemble(u, None));
+            let c_refs = cgen::names::with(rn, || cgen::ll::on(&program)).then(|| {
+                let mut r = cgen::ll::CRefs::default();
+                for (_, c, _) in &made {
+                    r.scan(c);
+                }
+                for c in &rshards {
+                    r.scan(c);
+                }
+                let per: Vec<cgen::ll::CRefs> = par_map(&caches.out.chunks(256).collect::<Vec<_>>(), |fs| {
+                    let mut r = cgen::ll::CRefs::default();
+                    for f in fs.iter() {
+                        r.scan(&f.ll_c);
+                        if f.ll.is_empty() {
+                            r.scan(&f.code);
+                        } else if f.ll.contains("@f_") || f.ll.contains("@tramp_") {
+                            r.scan(&f.ll);
+                        }
+                    }
+                    r
+                });
+                for p in per {
+                    r.wrappers.extend(p.wrappers);
+                    r.tramps.extend(p.tramps);
+                }
+                if let Some(id) = cgen::names::with(rn, || cgen::names::fn_tag_opt(main_slot)).and_then(|id| u64::from_str_radix(&id, 16).ok()) {
+                    r.wrappers.insert(id);
+                }
+                r
             });
+            made.extend(par_map(fn_jobs, |&u| assemble(u, c_refs.as_ref())));
             let mut units: Vec<(PathBuf, String)> = Vec::with_capacity(made.len());
             // The LLVM backend (cgen/ll.rs): a fn unit whose fns have LLVM IR gets two
             // companions after the glue shards, its IR `u<N>.ll` and its helpers' C `u<N>.hc`,

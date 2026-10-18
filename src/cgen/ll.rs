@@ -2089,6 +2089,64 @@ pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections:
     picked.into_iter().map(|(_, g)| g).collect()
 }
 
+/// The fn ids whose C ABI wrapper (`f_<id>`) or trampoline (`tramp_<id>`) a C text names, as
+/// `(wrappers, trampolines)`. An LLVM fn's own C (its `code`) is the only text that has to
+/// define them; a unit keeps a wrapper or trampoline only when some text names it
+/// (`c_body`): most fns are called through `fl_<id>` only.
+#[derive(Default)]
+pub struct CRefs {
+    pub wrappers: HashSet<u64>,
+    pub tramps: HashSet<u64>,
+}
+
+impl CRefs {
+    /// Adds the `f_<id>` and `tramp_<id>` names in `text` (16 hex digits, whole words).
+    pub fn scan(&mut self, text: &str) {
+        let b = text.as_bytes();
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut i = 0;
+        while let Some(k) = text[i..].find('_') {
+            let at = i + k;
+            i = at + 1;
+            let (start, tramp) = if at >= 1 && b[at - 1] == b'f' {
+                (at - 1, false)
+            } else if at >= 5 && &b[at - 5..at] == b"tramp" {
+                (at - 5, true)
+            } else {
+                continue;
+            };
+            if start > 0 && word(b[start - 1]) {
+                continue;
+            }
+            let Some(hex) = text.get(at + 1..at + 17) else { continue };
+            if b.get(at + 17).is_some_and(|&c| word(c)) {
+                continue;
+            }
+            let Ok(id) = u64::from_str_radix(hex, 16) else { continue };
+            if tramp { self.tramps.insert(id) } else { self.wrappers.insert(id) };
+        }
+    }
+
+    /// The C of LLVM fn `id`'s `code` this build needs: its wrapper when some text calls it
+    /// or its trampoline is needed (the trampoline calls the wrapper), the trampoline when
+    /// some text names it, the `fl_` prototype with the wrapper. Empty when neither.
+    pub fn c_body(&self, code: &str, id: &str) -> String {
+        let Ok(n) = u64::from_str_radix(id, 16) else { return code.to_string() };
+        let tramp = self.tramps.contains(&n);
+        let wrapper = tramp || self.wrappers.contains(&n);
+        if !wrapper {
+            return String::new();
+        }
+        let t = format!(" tramp_{id}(");
+        let mut out = String::new();
+        for line in code.lines().filter(|l| tramp || !l.contains(&t)) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
 /// The `.ll` text of one release fn unit: the declarations its fns name (each once) and
 /// their definitions, then an `available_externally` copy of each fn in `inl`
 /// (`ll_inline_set`). Empty when no fn of the unit has LLVM IR.
@@ -2140,4 +2198,26 @@ pub fn ll_unit(fns: &[FnOut], slots: &[usize], inl: &[usize], triple: &str) -> S
         out.push_str(&fns[s].ll.replacen("\ndefine ", &format!("\ndefine {linkage} "), 1));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CRefs;
+
+    /// A unit keeps an LLVM fn's wrapper only when some text names it, and its trampoline only
+    /// when some text names that (the wrapper then too: the trampoline calls it).
+    #[test]
+    fn a_unit_keeps_only_the_named_wrappers_and_trampolines() {
+        let id = "00000000000000ab";
+        let code = format!("/* m::f */\nuint8_t fl_{id}(uint64_t);\nuint8_t f_{id}(uint64_t p1) {{ return fl_{id}(p1); }}\nuint8_t tramp_{id}(uint64_t p1) {{ return f_{id}(p1); }}\n");
+        let mut r = CRefs::default();
+        r.scan(&format!("x = fl_{id}(1); y = lust_f_{id}(2); z = f_{id}x(3); w = drop_f_{id};"));
+        assert_eq!(r.c_body(&code, id), "", "fl_, a longer word and a prefix are not names of the wrapper");
+        r.scan(&format!("v = f_{id}(4);"));
+        let w = r.c_body(&code, id);
+        assert!(w.contains(&format!(" f_{id}(")) && !w.contains("tramp_"), "{w}");
+        let mut t = CRefs::default();
+        t.scan(&format!("p = (void*)tramp_{id};"));
+        assert_eq!(t.c_body(&code, id), code);
+    }
 }
