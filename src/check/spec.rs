@@ -6,10 +6,11 @@
 // check can read. A window of items checks ahead in parallel against the
 // program as it is at the turn the window opens. Each window check logs
 // what it reads from the tables that materialize changes (`read`,
-// `read_all`), and the main thread logs each write to them with its turn
-// (`wrote`, `wrote_all`, `set_turn`). A window result stands at its item's
-// turn only when no key it read was written in or after the turn it read
-// (`stale_since`); else the item checks again in its turn. A result that
+// `read_all`), and the main thread logs each write to them with a stamp
+// (`wrote`, `wrote_all`, `new_stamp`: a new one each turn, and one after
+// materialize's early type interning). A window result stands at its
+// item's turn only when no key it read was written at or after the stamp
+// it read (`stale_since`); else the item checks again in its turn. A result that
 // stands read the same values the in-order check reads, so it is the same
 // result.
 //
@@ -129,11 +130,11 @@ impl Hasher for NoHash {
 }
 
 impl Log {
-    /// The table of one read that a write in turn `since` or later made
-    /// stale, if any: None when the check made at the start of turn
+    /// The table of one read that a write at stamp `since` or later made
+    /// stale, if any: None when the check made at the start of stamp
     /// `since` still holds now.
     pub fn stale_since(&self, w: &Writes, since: u32) -> Option<u8> {
-        let after = |turn: u32| turn > since;
+        let after = |stamp: u32| stamp >= since;
         for t in 0..64u8 {
             let bit = 1u64 << t;
             let (whole, keyed) = (w.all[t as usize], w.key_tabs[t as usize]);
@@ -151,19 +152,19 @@ impl Log {
 }
 
 /// What the main thread wrote to logged tables since its round began:
-/// per key, per table, and per whole table, the last turn that wrote it
-/// (plus one; 0 is never).
+/// per key, per table, and per whole table, the stamp of its last write
+/// (0 is never).
 pub struct Writes {
     keys: std::collections::HashMap<u64, u32, BuildHasherDefault<NoHash>>,
     key_tabs: [u32; 64],
     all: [u32; 64],
-    /// The turn running now, plus one.
-    turn: u32,
+    /// The stamp of the writes made now (`new_stamp`).
+    stamp: u32,
 }
 
 impl Default for Writes {
     fn default() -> Writes {
-        Writes { keys: Default::default(), key_tabs: [0; 64], all: [0; 64], turn: 1 }
+        Writes { keys: Default::default(), key_tabs: [0; 64], all: [0; 64], stamp: 1 }
     }
 }
 
@@ -204,9 +205,9 @@ pub fn wrote<K: Hash + ?Sized>(t: u8, k: &K) {
         let h = hash_key(t, k);
         WRITES.with(|w| {
             let mut w = w.borrow_mut();
-            let turn = w.turn;
-            w.keys.insert(h, turn);
-            w.key_tabs[t as usize] = turn;
+            let stamp = w.stamp;
+            w.keys.insert(h, stamp);
+            w.key_tabs[t as usize] = stamp;
         });
     }
 }
@@ -217,7 +218,7 @@ pub fn wrote_all(t: u8) {
     if mode() == WRITE {
         WRITES.with(|w| {
             let mut w = w.borrow_mut();
-            w.all[t as usize] = w.turn;
+            w.all[t as usize] = w.stamp;
         });
     }
 }
@@ -229,8 +230,8 @@ pub fn reading() -> bool {
 }
 
 /// Begins a round on the main thread: from now on its writes to logged
-/// tables are logged (`Writes`), each with its turn (`set_turn`), until
-/// `end_round`.
+/// tables are logged (`Writes`), each with the stamp of its time
+/// (`new_stamp`), until `end_round`.
 pub fn begin_round() {
     MODE.with(|m| m.set(WRITE));
     WRITES.with(|w| *w.borrow_mut() = Writes::default());
@@ -241,12 +242,17 @@ pub fn end_round() {
     WRITES.with(|w| *w.borrow_mut() = Writes::default());
 }
 
-/// The main thread's writes from now on are turn `turn`'s.
-pub fn set_turn(turn: u32) {
-    WRITES.with(|w| w.borrow_mut().turn = turn + 1);
+/// A new stamp for the main thread's writes from now on; a check made
+/// now reads the program as of this stamp.
+pub fn new_stamp() -> u32 {
+    WRITES.with(|w| {
+        let mut w = w.borrow_mut();
+        w.stamp += 1;
+        w.stamp
+    })
 }
 
-/// The table of one read of `reads` that a write in turn `since` or
+/// The table of one read of `reads` that a write at stamp `since` or
 /// later made stale (`Log::stale_since`).
 pub fn stale_since(reads: &Log, since: u32) -> Option<u8> {
     WRITES.with(|w| reads.stale_since(&w.borrow(), since))
@@ -489,16 +495,15 @@ mod tests {
         let mut m: Logged<u32, u32, { tab::CLOSURES }> = Logged::default();
         m.insert(1, 10);
         begin_round();
-        set_turn(0);
         m.insert(9, 90);
-        set_turn(1);
+        let at = new_stamp();
         let (_, reads, _, _) = speculate(u64::MAX, || (m.get(&1).copied(), m.get(&2).copied(), m.get(&9).copied())).unwrap();
         m.insert(3, 30);
-        assert_eq!(stale_since(&reads, 1), None, "a write before the check does not count");
-        set_turn(2);
+        assert_eq!(stale_since(&reads, at), None, "a write before the check does not count");
+        let later = new_stamp();
         m.insert(2, 20);
-        assert_eq!(stale_since(&reads, 1), Some(tab::CLOSURES));
-        assert_eq!(stale_since(&reads, 3), None);
+        assert_eq!(stale_since(&reads, at), Some(tab::CLOSURES));
+        assert_eq!(stale_since(&reads, later + 1), None);
         end_round();
     }
 
@@ -506,12 +511,13 @@ mod tests {
     fn a_whole_table_read_is_stale_after_any_write() {
         let mut m: Logged<u32, u32, { tab::CLOSURES }> = Logged::default();
         let mut other: Logged<u32, u32, { tab::INSTANCES }> = Logged::default();
-        let (_, reads, _, _) = speculate(u64::MAX, || m.len()).unwrap();
         begin_round();
+        let at = new_stamp();
+        let (_, reads, _, _) = speculate(u64::MAX, || m.len()).unwrap();
         other.insert(1, 1);
-        assert_eq!(stale_since(&reads, 0), None);
+        assert_eq!(stale_since(&reads, at), None);
         m.insert(7, 7);
-        assert_eq!(stale_since(&reads, 0), Some(tab::CLOSURES));
+        assert_eq!(stale_since(&reads, at), Some(tab::CLOSURES));
         end_round();
     }
 

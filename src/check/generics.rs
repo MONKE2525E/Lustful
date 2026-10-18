@@ -10625,7 +10625,7 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
     // A template whose check only reads the program (no closures to
     // register, no hidden type of its own) checks ahead in a window, as
     // discovery bodies do (`Ahead`); its writes go in at its turn.
-    let mut ahead: Ahead<TemplateBody> = Ahead::new(!p.record_reads && !reuse.on);
+    let mut ahead: Ahead<TemplateBody> = Ahead::new(!p.record_reads && !reuse.on, false);
     ahead.start(templates.len());
     for (k, &t) in templates.iter().enumerate() {
         crate::driver::graph::FpMemo::sync(p);
@@ -12418,7 +12418,10 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     let lints = reuse.on || !reuse.one_shot;
     // Window checks run only where a check records no reads: a read's
     // fingerprint can come from the deep memo, which logs no table read.
-    let mut ahead: Ahead<Found> = Ahead::new(!p.record_reads && !reuse.on);
+    // A build runs windows on one thread too: its early interning
+    // (below) decides the global type numbering, which the emitted C
+    // reads, so it must not depend on the thread count.
+    let mut ahead: Ahead<Found> = Ahead::new(!p.record_reads && !reuse.on, p.gx.walk_instances);
     let compare = std::env::var_os("LUST_CHECK_PARDISC");
     while !queue.is_empty() {
         rounds += 1;
@@ -12437,7 +12440,26 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         ahead.start(round.len());
         for (k, &fid) in round.iter().enumerate() {
             crate::driver::graph::FpMemo::sync(p);
-            ahead.fill(&round, k, |_| true, |&f| discover_one(p, f, lints));
+            if ahead.fill(&round, k, |_| true, |&f| discover_one(p, f, lints)) && p.gx.walk_instances {
+                // Early interning: every type the window's bodies name goes
+                // into the global store now, in turn order, rather than at
+                // each body's turn (its apply step below interns them
+                // anyway). A window result that checked such a type as a
+                // body type would go stale at the first earlier turn that
+                // interned it; the stale ones check again now, in parallel.
+                for found in ahead.window(k) {
+                    let (adt_tys, reqs, closures, vts) = &found.out;
+                    let args = reqs.iter().flat_map(|(_, a)| a).filter_map(|a| match a {
+                        OwnedArg::Ty(t) => Some(t),
+                        _ => None,
+                    });
+                    let closure_tys = closures.iter().flat_map(|c| [&c.env, &c.output].into_iter().chain(&c.inputs));
+                    for owned in adt_tys.iter().chain(args).chain(closure_tys).chain(vts.iter().flat_map(|(a, b)| [a, b])) {
+                        build_owned_ty(p, owned);
+                    }
+                }
+                ahead.recheck(&round, k, |&f| discover_one(p, f, lints));
+            }
             let adts_before = p.adts.len();
             if rounds == 1 && p.gx.fn_class.get(fid.0 as usize) == Some(&FnClass::Plain) {
                 p.gx.turn_marks.push((fid, p.gx.adt_created.len() as u32));
@@ -12784,13 +12806,14 @@ fn discover_one(p: &Program, fid: LocalDefId, lints: bool) -> Found {
 struct Ahead<R> {
     on: bool,
     /// Each window result: the check, what it read of the logged tables,
-    /// its `anon_wants` notes, the steps it took, and the turn whose
-    /// program state it read.
+    /// its `anon_wants` notes, the steps it took, and the write stamp of
+    /// the program state it read.
     found: Vec<Option<AheadResult<R>>>,
     /// The end of the last window.
     filled: usize,
-    /// Windows, results taken, results stale, checks that stopped early.
-    counts: [usize; 4],
+    /// Windows, results taken, results stale, checks that stopped early,
+    /// results checked again after early interning (`recheck`).
+    counts: [usize; 5],
     window_ms: f64,
     max_steps: u64,
     /// Stale results by the table of the read that made them stale.
@@ -12808,14 +12831,14 @@ const AHEAD_WIDTH: usize = 64;
 
 impl<R: Send> Ahead<R> {
     /// Windows run when `on` (a one-shot compile: no read is recorded and
-    /// no reuse store kept) with more than one thread, and not under
-    /// `LUST_NO_PARDISC=1`.
-    fn new(on: bool) -> Ahead<R> {
-        let on = on && crate::pool::threads() > 1 && std::env::var_os("LUST_NO_PARDISC").is_none();
+    /// no reuse store kept) with more than one thread or when `always`,
+    /// and not under `LUST_NO_PARDISC=1`.
+    fn new(on: bool, always: bool) -> Ahead<R> {
+        let on = on && (always || crate::pool::threads() > 1) && std::env::var_os("LUST_NO_PARDISC").is_none();
         if on {
             crate::check::spec::quiet_hook();
         }
-        Ahead { on, found: Vec::new(), filled: 0, counts: [0; 4], window_ms: 0.0, max_steps: 0, stale_by: [0; 64] }
+        Ahead { on, found: Vec::new(), filled: 0, counts: [0; 5], window_ms: 0.0, max_steps: 0, stale_by: [0; 64] }
     }
 
     /// A round of `n` items starts: the main thread logs its writes.
@@ -12837,31 +12860,58 @@ impl<R: Send> Ahead<R> {
     }
 
     /// Before item `k`'s check: when the last window ends at `k`, checks
-    /// the next window's items that `ahead` admits.
-    fn fill<T: Sync>(&mut self, round: &[T], k: usize, ahead: impl Fn(usize) -> bool, check: impl Fn(&T) -> R + Sync) {
+    /// the next window's items that `ahead` admits, and returns true.
+    fn fill<T: Sync>(&mut self, round: &[T], k: usize, ahead: impl Fn(usize) -> bool, check: impl Fn(&T) -> R + Sync) -> bool {
         if !self.on {
-            return;
+            return false;
         }
-        crate::check::spec::set_turn(k as u32);
+        let stamp = crate::check::spec::new_stamp();
         if k < self.filled || round.len() - k < 2 {
-            return;
+            return false;
         }
         let end = (k + AHEAD_WIDTH).min(round.len());
         let at: Vec<usize> = (k..end).filter(|&i| ahead(i)).collect();
         self.filled = end;
         if at.len() < 2 {
-            return;
+            return false;
         }
         self.counts[0] += 1;
+        self.check_at(round, &at, stamp, &check);
+        true
+    }
+
+    /// Checks items `at` of `round` in parallel against the program as of
+    /// write stamp `stamp` (now).
+    fn check_at<T: Sync>(&mut self, round: &[T], at: &[usize], stamp: u32, check: &(impl Fn(&T) -> R + Sync)) {
         let t0 = std::time::Instant::now();
-        let results = crate::pool::par_map(&at, |&i| crate::check::spec::speculate(AHEAD_FUEL, || check(&round[i])));
+        let results = crate::pool::par_map(at, |&i| crate::check::spec::speculate(AHEAD_FUEL, || check(&round[i])));
         self.window_ms += t0.elapsed().as_secs_f64() * 1e3;
         for (&i, r) in at.iter().zip(results) {
             match r {
-                Some((found, log, anon, steps)) => self.found[i] = Some((found, log, anon, steps, k as u32)),
-                None => self.counts[3] += 1,
+                Some((found, log, anon, steps)) => self.found[i] = Some((found, log, anon, steps, stamp)),
+                None => {
+                    self.found[i] = None;
+                    self.counts[3] += 1;
+                }
             }
         }
+    }
+
+    /// The results of the window that opened at `k`, in turn order.
+    fn window(&self, k: usize) -> impl Iterator<Item = &R> {
+        self.found[k..self.filled].iter().filter_map(|r| r.as_ref().map(|r| &r.0))
+    }
+
+    /// After the main thread wrote to logged tables between turns (early
+    /// interning, `materialize`): checks again, in parallel, each result
+    /// of the window that opened at `k` that those writes made stale.
+    fn recheck<T: Sync>(&mut self, round: &[T], k: usize, check: impl Fn(&T) -> R + Sync) {
+        let at: Vec<usize> = (k..self.filled)
+            .filter(|&i| self.found[i].as_ref().is_some_and(|r| crate::check::spec::stale_since(&r.1, r.4).is_some()))
+            .collect();
+        let stamp = crate::check::spec::new_stamp();
+        self.counts[4] += at.len();
+        self.check_at(round, &at, stamp, &check);
     }
 
     /// Item `k`'s window result, when nothing it read was written since.
@@ -12885,10 +12935,10 @@ impl<R: Send> Ahead<R> {
     /// appended to the file the value names.
     fn report(&self, what: &str) {
         let Some(to) = std::env::var_os("LUST_PARDISC_STATS").filter(|_| self.on) else { return };
-        let [w, taken, stale, out] = self.counts;
+        let [w, taken, stale, out, again] = self.counts;
         let by: Vec<String> = self.stale_by.iter().enumerate().filter(|(_, n)| **n > 0).map(|(t, n)| format!("{t}:{n}")).collect();
         let line = format!(
-            "pardisc-stats: {what}: windows {w} taken {taken} stale {stale} stopped {out} window-ms {:.1} max-steps {} stale-by-table {}\n",
+            "pardisc-stats: {what}: windows {w} taken {taken} stale {stale} stopped {out} rechecked {again} window-ms {:.1} max-steps {} stale-by-table {}\n",
             self.window_ms,
             self.max_steps,
             by.join(",")
