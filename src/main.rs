@@ -137,8 +137,9 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     let loaded = if compact { Err("compacting the image".to_string()) } else { image::load(dir) };
     let (mut sessions, loaded) = match loaded {
         Ok(roots) => {
-            let image::Roots { mut sessions, tables, stamps } = *roots;
+            let image::Roots { mut sessions, tables, stamps, graphs } = *roots;
             diag::put_global_tables(tables);
+            resolve::cargo::put_graph_cache(graphs);
             stamps.restore();
             sessions.iter_mut().for_each(|s| s.after_restore());
             (sessions, Ok(()))
@@ -205,7 +206,12 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
         return resps;
     }
     sessions.iter_mut().for_each(|s| s.settle());
-    let roots = Box::new(image::Roots { sessions, tables: diag::take_global_tables(), stamps: driver::Stamps::now() });
+    let roots = Box::new(image::Roots {
+        sessions,
+        tables: diag::take_global_tables(),
+        stamps: driver::Stamps::now(),
+        graphs: resolve::cargo::take_graph_cache(),
+    });
     if compact {
         let line = match image::save(dir, roots) {
             Ok(line) => format!("{} (compacted: cold rebuild and save in {:.0} ms)\n", line, t.elapsed().as_secs_f64() * 1e3),

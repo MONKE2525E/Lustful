@@ -482,6 +482,25 @@ fn graph_cache() -> &'static Mutex<std::collections::HashMap<u64, std::sync::Arc
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// The loaded graphs by graph key, as `graph_cache` holds them.
+pub type GraphCache = std::collections::HashMap<u64, std::sync::Arc<CrateGraph>>;
+
+/// Takes the in-process graph cache (it reads empty after), for a front
+/// image to carry to the next build (src/image.rs `Roots`): an image build
+/// is a new process, which would otherwise run `cargo metadata` every time.
+pub fn take_graph_cache() -> GraphCache {
+    std::mem::take(&mut *graph_cache().lock().unwrap())
+}
+
+/// Puts back a graph cache `take_graph_cache` gave an earlier build; each
+/// entry stands while its key and watch stamp do (`load_graph`). An entry
+/// that names a package manifest which is gone (a registry source removed
+/// since) is dropped: `cargo metadata` must run again to fetch it.
+pub fn put_graph_cache(mut cache: GraphCache) {
+    cache.retain(|_, g| g.packages.iter().all(|p| p.manifest_path.exists()));
+    *graph_cache().lock().unwrap() = cache;
+}
+
 /// Loads (or reuses) the Cargo graph for one request. Errors are message
 /// strings: the driver turns them into code-2 responses, since a graph
 /// Cargo itself rejects has no crate to attach a span diagnostic to.

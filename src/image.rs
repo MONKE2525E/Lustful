@@ -395,6 +395,8 @@ pub struct Roots {
     pub sessions: Vec<Box<crate::driver::Session>>,
     pub tables: crate::diag::GlobalTables,
     pub stamps: crate::driver::Stamps,
+    /// The Cargo graphs the builds loaded (`cargo::take_graph_cache`).
+    pub graphs: crate::resolve::cargo::GraphCache,
 }
 
 /// Address anchors: a function and a static of this binary and a libc
