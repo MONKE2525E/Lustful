@@ -313,7 +313,20 @@ pub fn llflags(debug: bool) -> String {
 /// runtime's inlinable copy (`compile_runtime_ir`), linked as builtin bitcode too. `nopre`:
 /// no PGO pre-inliner (see `build`).
 #[allow(clippy::too_many_arguments)]
-fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &str, hc: &str, obj: &Path, pgo: Option<&[String]>, rt_inl: Option<&Path>, nopre: bool) -> Result<(), String> {
+fn compile_pair(
+    spec: &CcSpec,
+    cflags: &[String],
+    debug: bool,
+    src: &Path,
+    ll: &str,
+    hc: &str,
+    obj: &Path,
+    pgo: Option<&[String]>,
+    rt_inl: Option<&Path>,
+    nopre: bool,
+    key: Option<&str>,
+) -> Result<(), String> {
+    let key_def: Vec<String> = key.map(|k| format!("-DLUST_UNIT_KEY={k}")).into_iter().collect();
     let bc = src.with_extension("c.bc");
     let ll_path = src.with_extension("ll");
     let hc_path = src.with_extension("hc.c");
@@ -358,6 +371,7 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
             .args(&words[1..])
             .args(cflags)
             .args(["-emit-llvm", "-Xclang", "-disable-llvm-passes", "-Xclang", "-no-enable-noundef-analysis", "-c"])
+            .args(&key_def)
             .arg(from)
             .arg("-o")
             .arg(to))
@@ -398,7 +412,7 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
         bytes.push(std::fs::read(p).map_err(|e| format!("cannot read {}: {e}\n", p.display()))?);
     }
     let (a, b) = crate::driver::cache::hash128(&bytes.iter().map(Vec::as_slice).collect::<Vec<_>>(), 53);
-    cmd.arg(format!("-DLUST_LINKED_DIGEST={a:016x}{b:016x}"));
+    cmd.arg(format!("-DLUST_LINKED_DIGEST={a:016x}{b:016x}")).args(&key_def);
     run(cmd.arg("-o").arg(obj))
 }
 
@@ -407,12 +421,12 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
 /// object `obj` from the IR with every internal symbol exported (no IR passes again), and
 /// `inl`, the bitcode of the copy the LLVM units inline from (fns of at most `max`
 /// instructions).
-fn compile_runtime_ir(spec: &CcSpec, cflags: &[String], src: &Path, obj: &Path, inl: &Path, max: usize, pgo: Option<&[String]>) -> Result<(), String> {
+fn compile_runtime_ir(spec: &CcSpec, cflags: &[String], src: &Path, obj: &Path, inl: &Path, max: usize, pgo: Option<&[String]>, key: Option<&str>) -> Result<(), String> {
     let words = &spec.cmd;
     let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
     let run = |extra: &[&str], input: &Path, out: &Path, pgo: Option<&[String]>| -> Result<(), String> {
         let mut cmd = Command::new(&prog);
-        cmd.args(&words[1..]).args(cflags).args(extra);
+        cmd.args(&words[1..]).args(cflags).args(extra).args(key.map(|k| format!("-DLUST_UNIT_KEY={k}")));
         match (pgo, input.parent(), input.file_name()) {
             (Some(flags), Some(dir), Some(file)) => cmd.args(flags).current_dir(dir).arg(file),
             _ => cmd.arg(input),
@@ -507,6 +521,11 @@ pub fn build(
     let gen_spec = if matches!(pgo, Some(pgo::Mode::Gen)) { Some(pgo::gen_spec(spec)?) } else { None };
     let spec = gen_spec.as_ref().unwrap_or(spec);
     let pre_of = |i: usize| if gen_spec.is_some() { None } else { pre[i].as_deref() };
+    // zig cc caches each compile by its source and args, which miss inputs lust's key holds
+    // (the bitcode an LLVM unit links, a profile, the environment a preprocessed text shows):
+    // every unit compile carries its exact key (`-DLUST_UNIT_KEY`), so zig can only hit where
+    // lust's key matches. Keys are made for zig builds without a lust cache too.
+    let keyed = cache.is_some() || is_zig(&spec.cmd[0]);
     // Largest units first, bounded workers: the tcc driver's shape
     // (src/tcc.rs), for the same reason (the tail is short units).
     let mut order: Vec<usize> = (0..units.len()).collect();
@@ -533,7 +552,7 @@ pub fn build(
         Some(r) => {
             let part = pgo_of(r).map(|m| m.key_part(&pfile(r)));
             // The marker is a declaration: the key reads the preprocessed text, without comments.
-            let key = cache.map(|_| unit_key(&format!("{}\ntypedef int lust_rtinl_{rt_max};\n", units[r].1), None, spec, debug, part.as_deref(), false));
+            let key = keyed.then(|| unit_key(&format!("{}\ntypedef int lust_rtinl_{rt_max};\n", units[r].1), None, spec, debug, part.as_deref(), false));
             let cached = matches!((cache, &key), (Some(c), Some(k)) if c.unit_object(k, &objs[r]) && c.unit_object(&format!("{k}-inl"), &rt_inl));
             if cached {
                 hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -541,7 +560,7 @@ pub fn build(
                 let src = work.join(format!("{}.c", names[r]));
                 std::fs::write(&src, &units[r].1).map_err(|e| format!("cannot write {}: {e}", src.display()))?;
                 let pf = pgo_of(r).map(|m| m.unit_flags(&pfile(r))).transpose()?;
-                compile_runtime_ir(spec, &flags, &src, &objs[r], &rt_inl, rt_max, pf.as_deref())
+                compile_runtime_ir(spec, &flags, &src, &objs[r], &rt_inl, rt_max, pf.as_deref(), key.as_deref())
                     .map_err(|e| format!("the C compiler failed for target {} (runtime IR):\n{e}", spec.triple))?;
                 if let (Some(c), Some(k)) = (cache, &key) {
                     c.store_unit_object(k, &objs[r]);
@@ -557,10 +576,12 @@ pub fn build(
     let keys: Vec<Option<String>> = crate::pool::par_map(&idx, |&i| {
         let (unit, c) = units[i];
         let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
-        cache.map(|_| match ll_of.get(unit.as_str()) {
+        keyed.then(|| match ll_of.get(unit.as_str()) {
+            // v4: a lust before b41791434 could store, through zig's cache, an LLVM object built
+            // from an older helpers' C under the current key; no build reads those.
             Some(ll) => {
                 let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
-                unit_key(&format!("{c}\n/* llvm-v3 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), None, spec, debug, part.as_deref(), false)
+                unit_key(&format!("{c}\n/* llvm-v4 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), None, spec, debug, part.as_deref(), false)
             }
             None => unit_key(c, pre_of(i), spec, debug, part.as_deref(), is_cxx(&names[i])),
         })
@@ -603,7 +624,7 @@ pub fn build(
                             continue;
                         }
                     };
-                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path()), nopre) {
+                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path()), nopre, keys[i].as_deref()) {
                         Ok(()) => {
                             if let (Some(cache), Some(key)) = (cache, &keys[i]) {
                                 cache.store_unit_object(key, obj);
@@ -618,6 +639,9 @@ pub fn build(
                 let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
                 let mut cmd = cc_command(prog);
                 cmd.args(&words[1..]).args(unit_flags).arg("-o").arg(obj);
+                if let Some(k) = &keys[i] {
+                    cmd.arg(format!("-DLUST_UNIT_KEY={k}"));
+                }
                 match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
                     Some(Ok(pf)) => {
                         cmd.args(pf).current_dir(work).arg("-c").arg(format!("{name}.c"));
@@ -761,7 +785,7 @@ mod tests {
         let ll = "declare i32 @h()\ndefine i32 @fl_aa() {\nentry:\n  %r = call i32 @h()\n  ret i32 %r\n}\n";
         let flags: Vec<String> = super::cflags(false).split_whitespace().map(str::to_string).collect();
         let calls = |hc: &str, callee: &str| {
-            super::compile_pair(&spec, &flags, false, &src, ll, hc, &obj, None, None, false).expect("compiles");
+            super::compile_pair(&spec, &flags, false, &src, ll, hc, &obj, None, None, false, None).expect("compiles");
             std::fs::read(&obj).unwrap().windows(callee.len()).any(|w| w == callee.as_bytes())
         };
         assert!(calls("int old_fn(void);\nint h(void) { return old_fn(); }\n", "old_fn"));
