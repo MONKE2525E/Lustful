@@ -1023,25 +1023,26 @@ impl ResolvedTables {
     /// ambiguous. A copy from any other source keeps the plain rules.
     pub fn insert_glob(&mut self, module: ModuleId, ns: Namespace, name: Sym, bind: Bind, src: ModuleId) -> InsertOut {
         let key = (module, ns_index(ns) as u8, name);
-        let stale = matches!(self.lookup(module, ns, name), Some(BindState::One(old)) if old.rank <= 1 && old.target != bind.target)
-            && self.glob_src.get(&key) == Some(&src)
-            && !self.std_glob_aliases.contains_key(&key);
-        // The mirror case: this source made the name ambiguous here
-        // (its own binding was ambiguous, propagated by the glob copy
-        // in `try_import`), and its binding has since settled to one
-        // item (its explicit import landed). The copy follows it back
-        // to that item; any other live glob that still brings a
-        // different item re-makes the ambiguity on a later sweep.
-        let settled = matches!(self.lookup(module, ns, name), Some(BindState::Ambiguous))
-            && self.glob_src.get(&key) == Some(&src)
-            && !self.std_glob_aliases.contains_key(&key);
-        if stale || settled {
+        // The name's binding here now, read once: a stale copy of this
+        // source (another item at glob rank), an ambiguity it made, or
+        // the same item.
+        let (stale, ambiguous, same_item) = match self.lookup(module, ns, name) {
+            Some(BindState::One(old)) => (old.rank <= 1 && old.target != bind.target, false, old.target == bind.target),
+            Some(BindState::Ambiguous) => (false, true, false),
+            None => (false, false, false),
+        };
+        // The mirror case of a stale copy: this source made the name
+        // ambiguous here (its own binding was ambiguous, propagated by
+        // the glob copy in `try_import`), and its binding has since
+        // settled to one item (its explicit import landed). The copy
+        // follows it back to that item; any other live glob that still
+        // brings a different item re-makes the ambiguity on a later sweep.
+        if (stale || ambiguous) && self.glob_src.get(&key) == Some(&src) && !self.std_glob_aliases.contains_key(&key) {
             self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
             self.touch(module, name);
             return InsertOut::Changed;
         }
         // A wider copy of the same item keeps the source it came from first.
-        let same_item = matches!(self.lookup(module, ns, name), Some(BindState::One(old)) if old.target == bind.target);
         let out = self.insert(module, ns, name, bind);
         match self.lookup(module, ns, name) {
             Some(BindState::One(_)) => {
