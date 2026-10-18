@@ -12066,6 +12066,13 @@ fn ensure_generic_hash(p: &mut Program, adt: AdtId) {
 /// (`written_hash`) for every hasher type the hash glue may feed them
 /// (W-STD-B): DefaultHasher and each concrete Adt with a written
 /// `Hasher` impl. Pairs made in an earlier pass stay.
+/// The sizes of `ensure_written_hash`'s inputs. During materialize they
+/// only grow (inserts of new keys; `written_hash` and `dyn_keys` are set
+/// before it), so an unchanged stamp means a pass would find nothing new.
+fn hash_stamp(p: &Program) -> Option<(usize, usize, usize, usize)> {
+    Some((p.gx.hasher_methods.len(), p.gx.written_hash.len(), p.gx.generic_hash.len(), p.gx.dyn_keys.len()))
+}
+
 fn ensure_written_hash(p: &mut Program, queue: &mut Vec<LocalDefId>) {
     use crate::ty::hash::{HashTy, mk_hash};
     if p.gx.written_hash.is_empty() && p.gx.generic_hash.is_empty() && p.gx.dyn_keys.is_empty() {
@@ -12285,6 +12292,8 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     queue.retain(|&f| !p.check_skips(f));
     let mut depths: FxMap<LocalDefId, usize> = FxMap::default();
     let mut rounds = 0usize;
+    // The input sizes of the last `ensure_written_hash` pass (`hash_stamp`).
+    let mut hash_done: Option<(usize, usize, usize, usize)> = None;
     p.gx.turn_marks.clear();
     let mut drop_done = 0u32;
     let mut drop_created = 0usize;
@@ -12471,7 +12480,13 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 ensure_generic_hash(p, a);
                 ensure_iter_methods(p, a, &mut next_queue);
             }
-            ensure_written_hash(p, &mut next_queue);
+            // A pass makes every (hashed Adt, hasher) instance it can, so
+            // a pass when none of its input tables grew makes none.
+            let stamp = hash_stamp(p);
+            if stamp != hash_done {
+                ensure_written_hash(p, &mut next_queue);
+                hash_done = hash_stamp(p);
+            }
         }
         // Deferred vtables whose closures this round registered; when no
         // work is left, the rest as they are (a closure that never came).
