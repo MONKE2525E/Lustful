@@ -38,8 +38,6 @@ pub enum Mode {
 
 /// A loaded profile, split by unit.
 pub struct Pgo {
-    /// The text profile's header (the IR-level flag lines).
-    head: String,
     /// Each unit's own records, sorted, by the file name the unit compiles as.
     own: HashMap<String, Vec<String>>,
     /// The flags that pin the summary thresholds to the whole profile's.
@@ -51,7 +49,10 @@ pub struct Pgo {
     absent: usize,
     /// The quantized profile and pins came from the last build's work dir (`load`).
     kept: bool,
-    work: PathBuf,
+    /// The whole quantized profile (`pgo-all.profdata`) every unit with records compiles
+    /// against, and its digest (the memo key).
+    all: PathBuf,
+    key: String,
 }
 
 impl Mode {
@@ -90,17 +91,16 @@ impl Mode {
             Mode::Use(p) => {
                 let mut flags = p.pins.clone();
                 flags.extend(nopre);
-                if let Some(recs) = p.own.get(file).filter(|r| !r.is_empty()) {
-                    let stem = file.strip_suffix(".c").unwrap_or(file);
-                    let (txt, out) = (p.work.join(format!("{stem}.proftext")), p.work.join(format!("{stem}.profdata")));
-                    let text = format!("{}{}\n\n", p.head, recs.join("\n\n"));
-                    std::fs::write(&txt, &text).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
-                    run(Command::new(profdata()).arg("merge").arg("-o").arg(&out).arg(&txt))?;
-                    flags.push(format!("-fprofile-use={}", out.display()));
-                    // zig cc caches a compile by its source and args, not by this file:
-                    // the profile's digest in the args keeps a changed profile from
-                    // getting the object of the last one at this path.
-                    flags.push(format!("-DLUST_PROFILE_DIGEST={}", digest(&[text.as_bytes()])));
+                // A unit with records reads the whole profile: clang takes only the records of
+                // its module's fns, and the pins hold the summary to the whole profile's, so
+                // the object is the one its own records would give, with no per-unit profile
+                // to write and merge. Its key still holds only its own records (`key_part`).
+                if p.own.get(file).is_some_and(|r| !r.is_empty()) {
+                    flags.push(format!("-fprofile-use={}", p.all.display()));
+                    // zig cc caches a compile by its source and args, not by this file: the
+                    // profile's digest in the args keeps another profile at this path from
+                    // getting the object of the last one.
+                    flags.push(format!("-DLUST_PROFILE_DIGEST={}", p.key));
                 }
                 Ok(flags)
             }
@@ -219,7 +219,7 @@ impl Pgo {
             .and_then(|m| m.strip_prefix(&format!("{key}\n")).map(|pins| pins.split_whitespace().map(str::to_string).collect::<Vec<_>>()))
             .and_then(|pins| std::fs::read_to_string(&txt).ok().map(|t| (parse(&t), pins)));
         let hit = kept.is_some();
-        let ((head, records), pins) = match kept {
+        let ((_, records), pins) = match kept {
             Some(k) => k,
             None => {
                 let _ = std::fs::remove_file(&memo);
@@ -240,8 +240,11 @@ impl Pgo {
                 ((head, records), pins)
             }
         };
+        if hit && !all.exists() {
+            run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
+        }
         let (own, helpers, absent) = split(&records, defs);
-        Ok(Pgo { head, own, pins, records: records.len(), helpers, absent, kept: hit, work: work.to_path_buf() })
+        Ok(Pgo { own, pins, records: records.len(), helpers, absent, kept: hit, all, key })
     }
 }
 
@@ -543,7 +546,7 @@ mod tests {
             statics: Vec::new(),
         };
         let (own, helpers, absent) = split(&recs, &defs);
-        Mode::Use(Pgo { head: String::new(), own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, kept: false, work: PathBuf::new() })
+        Mode::Use(Pgo { own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, kept: false, all: PathBuf::new(), key: String::new() })
     }
 
     /// A static fn's record (`STATIC_FILE;<fn>`) goes to every unit that defines a static fn
