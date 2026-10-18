@@ -643,24 +643,31 @@ fn push_snippet(out: &mut String, src: &str, map: &SourceMap, span: Span, note: 
     }
 }
 
-/// The total order diagnostics render in: by position, then by
-/// code, message, fix, labels, and edits, so the rendered text is
-/// the same whatever order the checks pushed them in. A warm
-/// delta path and a fresh full collect can push same-span
-/// diagnostics in either order; the daemon guard compares the
-/// rendered answers byte for byte, so the survivor of the
-/// same-span suppression in `render` must not depend on it.
-fn diag_order(a: &Diag, b: &Diag) -> std::cmp::Ordering {
-    fn key<'a>(d: &'a Diag) -> (FileId, u32, u32, &'static str, &'a str, &'a str) {
-        (d.span.file, d.span.lo, d.span.hi, d.code, d.message.as_str(), d.fix.as_str())
+/// The total order diagnostics render in: by file path and
+/// position, then by code, message, fix, labels, and edits, so
+/// the rendered text is the same whatever order the checks
+/// pushed them in. A warm delta path and a fresh full collect
+/// can push same-span diagnostics in either order; the daemon
+/// guard compares the rendered answers byte for byte, so the
+/// survivor of the same-span suppression in `render` must not
+/// depend on it. The path, not the session-local FileId, leads:
+/// a warm session appends files across edits while a fresh one
+/// loads them in canonical order, so the same two files can
+/// carry opposite ids in the two maps.
+fn diag_order(map: &SourceMap, a: &Diag, b: &Diag) -> std::cmp::Ordering {
+    fn sort_path<'m>(map: &'m SourceMap, f: FileId) -> &'m str {
+        map.files.get(f.0 as usize).map_or("", |sf| sf.path.as_str())
     }
-    key(a)
-        .cmp(&key(b))
+    fn key<'m, 'a>(map: &'m SourceMap, d: &'a Diag) -> (&'m str, u32, u32, &'static str, &'a str, &'a str) {
+        (sort_path(map, d.span.file), d.span.lo, d.span.hi, d.code, d.message.as_str(), d.fix.as_str())
+    }
+    key(map, a)
+        .cmp(&key(map, b))
         .then_with(|| {
             a.labels
                 .iter()
-                .map(|l| (l.span.file, l.span.lo, l.span.hi, l.text.as_str()))
-                .cmp(b.labels.iter().map(|l| (l.span.file, l.span.lo, l.span.hi, l.text.as_str())))
+                .map(|l| (sort_path(map, l.span.file), l.span.lo, l.span.hi, l.text.as_str()))
+                .cmp(b.labels.iter().map(|l| (sort_path(map, l.span.file), l.span.lo, l.span.hi, l.text.as_str())))
         })
         .then_with(|| {
             a.edits
@@ -693,8 +700,8 @@ fn same_diag(a: &Diag, b: &Diag) -> bool {
 /// push a diagnostic twice where another pushes it once; the
 /// rendered text and the caller's error count must agree either
 /// way, so the caller renders and counts only the front part.
-pub fn dedup_exact(diags: &mut [Diag]) -> usize {
-    diags.sort_by(diag_order);
+pub fn dedup_exact(diags: &mut [Diag], map: &SourceMap) -> usize {
+    diags.sort_by(|a, b| diag_order(map, a, b));
     let mut n = 0;
     for i in 0..diags.len() {
         if n == 0 || !same_diag(&diags[n - 1], &diags[i]) {
@@ -715,7 +722,7 @@ pub fn dedup_exact(diags: &mut [Diag]) -> usize {
 /// with the same code and span (cascade duplicates of one root error) are suppressed. When
 /// anything is suppressed or omitted, an explicit truncation record is emitted last.
 pub fn render(diags: &mut [Diag], map: &SourceMap, src: &str, json: bool, max_errors: usize) -> String {
-    diags.sort_by(diag_order);
+    diags.sort_by(|a, b| diag_order(map, a, b));
     let mut uniq: Vec<&Diag> = Vec::with_capacity(diags.len());
     for d in diags.iter() {
         match uniq.last() {
@@ -918,8 +925,28 @@ mod tests {
         let dup = render(&mut [mk("bound A"), mk("bound A")], &map, "fn bad() {}\n", false, 20);
         assert_eq!(dup.matches("bound A").count(), 1, "an exact duplicate renders once: {dup}");
         let mut ds = [mk("bound B"), mk("bound A"), mk("bound A")];
-        assert_eq!(dedup_exact(&mut ds), 2, "exact duplicates move past the count");
+        assert_eq!(dedup_exact(&mut ds, &map), 2, "exact duplicates move past the count");
         assert_eq!(ds[0].message, "bound A");
+    }
+
+    /// File ids are session-local (append-only in a warm session):
+    /// the same two files can carry opposite ids in a warm map and
+    /// a fresh one. Rendered order follows the file path, so both
+    /// maps render the same text (the daemon guard compares it
+    /// byte for byte).
+    #[test]
+    fn render_orders_by_path_not_file_id() {
+        let mut map1 = SourceMap::default();
+        let z1 = map1.add_file_with_text("z.rs", "fn z() {}\n");
+        let a1 = map1.add_file_with_text("a.rs", "fn a() {}\n");
+        let mut map2 = SourceMap::default();
+        let a2 = map2.add_file_with_text("a.rs", "fn a() {}\n");
+        let z2 = map2.add_file_with_text("z.rs", "fn z() {}\n");
+        assert_ne!(z1, z2);
+        let one = render(&mut [Diag::new("L0001", Span::new(z1, 0, 2), "in z", "Fix it."), Diag::new("L0001", Span::new(a1, 0, 2), "in a", "Fix it.")], &map1, "", false, 20);
+        let two = render(&mut [Diag::new("L0001", Span::new(z2, 0, 2), "in z", "Fix it."), Diag::new("L0001", Span::new(a2, 0, 2), "in a", "Fix it.")], &map2, "", false, 20);
+        assert_eq!(one, two, "render order follows file ids, not paths:\n{one}\n---\n{two}");
+        assert!(one.find("in a").unwrap() < one.find("in z").unwrap());
     }
 
     /// JSON diagnostics take `file` and line numbers from the span's file in the map.
