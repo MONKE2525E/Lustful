@@ -455,6 +455,9 @@ struct NewItem {
     fn_index: usize,
     item: usize,
     sub: Option<usize>,
+    /// The old `stmt_items` indexes of the body's items, in parse order
+    /// (`same_items`): each new one takes its old index.
+    items: Vec<u32>,
     /// The old fn's byte range (its first attribute through its body).
     old: (u32, u32),
     /// The new fn, parsed and rewritten into an Ast of its own: a free
@@ -655,7 +658,7 @@ pub(super) fn try_patch(
             fn_index: e.body.as_ref().map(|b| b.fn_index).or(e.item.as_ref().map(|i| i.fn_index)),
             // A header edit counts as not plain: the delta needs user generics.
             plain: e.item.is_none() && e.body.as_ref().is_none_or(|b| b.plain),
-            items: e.body.as_ref().map_or_else(Vec::new, |b| b.items.clone()),
+            items: e.body.as_ref().map(|b| b.items.clone()).or_else(|| e.item.as_ref().map(|i| i.items.clone())).unwrap_or_default(),
             nested: e.body.as_ref().and_then(|b| b.nested),
             hoisted: e.body.as_ref().map_or_else(Vec::new, |b| b.hoisted.clone()),
             old_exprs: e.body.as_ref().map(|b| b.old_exprs).or(e.item.as_ref().map(|i| i.old_exprs)).unwrap_or((0, 0)),
@@ -1135,10 +1138,9 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     let def = fn_def_at(ast, item, sub);
     // The outline holds the qualifiers, so the new fn is const too.
     let full = def.qual.is_const || matches!(&ast.items[item].kind, ItemKind::Impl(imp) if imp.trait_ref.is_some());
-    // No body items in the old fn (the new one is checked after the parse).
-    if ast.stmt_items.iter().any(|it| it.span.file == file && lo <= it.span.lo && it.span.hi <= hi) {
-        return Err(Some("item: body items"));
-    }
+    // Body items in the old fn: the header edit keeps them when the body's
+    // text stands (checked below, and `same_items` after the parse).
+    let has_items = ast.stmt_items.iter().any(|it| it.span.file == file && lo <= it.span.lo && it.span.hi <= hi);
     let new_hi = (hi as i64 + d) as u32;
     let lex = |t: Option<&str>| t.and_then(|t| lexer::lex(t, file, lo, &front.interner).ok().filter(balanced)).ok_or(Some("item lex"));
     let (old_lx, new_lx) = (lex(old.get(lo as usize..hi as usize))?, lex(text.get(lo as usize..new_hi as usize))?);
@@ -1183,10 +1185,17 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     // The body: the body patch's token rules, and no expander work.
     let body_lx = |lx: &lexer::Lexed, k: usize| lexer::Lexed { tokens: lx.tokens[k..].to_vec(), strings: lx.strings.clone() };
     let (ob, nb) = (body_lx(&old_lx, oo), body_lx(&new_lx, no));
+    // For `same_items` after the parse (the expander takes `nb`).
+    let nb_tokens = if has_items { nb.tokens.clone() } else { Vec::new() };
     // A body with pure builtin macros or attributes expands as the body
     // patch's does (`expand_pure`). A body the patch cannot expand alone
     // (a user macro) takes its stored expansion when its text stands.
     let same_body = old.get(ot[oo].span.lo as usize..hi as usize) == text.get(nt[no].span.lo as usize..new_hi as usize);
+    // A method's attributes seed its nested fns' (see `NewBody`); body
+    // items also need their body as it was.
+    if has_items && (!same_body || sub.is_some() && !def.attrs.is_empty()) {
+        return Err(Some("item: body items"));
+    }
     let module = *base.tables.fn_module.get(fn_index).ok_or(Some("state"))?;
     let plain = body_tokens_ok(&ob, ot[oo].span.lo as usize, hi as usize, &front.interner).and_then(|(oc, op)| {
         let (nc, np) = body_tokens_ok(&nb, nt[no].span.lo as usize, new_hi as usize, &front.interner)?;
@@ -1197,10 +1206,6 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
         Err(why) => return Err(Some(why)),
         Ok(_) => None,
     };
-    // A `static` would hoist into an item.
-    if nb.tokens.iter().any(|t| t.tok == Tok::Static) {
-        return Err(Some("item: body macro"));
-    }
     // Parse: a free fn as an item, a method inside a placeholder impl.
     let mut toks: Vec<lexer::Token> = Vec::with_capacity(nt.len() + 5);
     let edge = crate::diag::Span { file, lo, hi: lo, ctxt: CtxtId::ROOT };
@@ -1224,7 +1229,12 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
             let out = expand_pure(front, base, file, text, module, nb).map_err(Some)?;
             (out.tokens[..out.tokens.len() - 1].to_vec(), out.strings)
         }
-        _ => (nt[no..].to_vec(), new_lx.strings.clone()),
+        // A static's init closure hoists into a hidden fn, as the body
+        // patch's tokens do (both are body items, `same_items`).
+        _ => {
+            let out = crate::expand::lazy::hoist_static_closures(nb, &front.interner);
+            (out.tokens[..out.tokens.len() - 1].to_vec(), out.strings)
+        }
     };
     toks.extend_from_slice(&nt[..no]);
     toks.extend(body);
@@ -1235,9 +1245,22 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     let lexed = lexer::Lexed { tokens: toks, strings };
     let mut item_ast =
         crate::parser::parse_items(&lexed, 0..lexed.tokens.len(), &front.interner, &front.known).map_err(|_| Some("item parse"))?;
-    if item_ast.items.len() != 1 || !item_ast.stmt_items.is_empty() || !item_ast.inner_attrs.is_empty() {
+    if item_ast.items.len() != 1 || item_ast.stmt_items.is_empty() == has_items || !item_ast.inner_attrs.is_empty() {
         return Err(Some("item: body items"));
     }
+    // The body's items are the old ones at their moved places, each takes
+    // its old index (`same_items`, as the body patch's); no body impl.
+    let items = match has_items {
+        true => {
+            let span = ast.blocks[def.body.ok_or(Some("item range"))?.0 as usize].span;
+            let same = same_items(ast, old, text, (item, span), &item_ast, (&ob.tokens, &nb_tokens), edit).map_err(Some)?;
+            if same.inner.is_some() || !same.impls.is_empty() || same.is_impl.iter().any(|&i| i) {
+                return Err(Some("item: body items"));
+            }
+            same.items
+        }
+        false => Vec::new(),
+    };
     // The new fn takes the old one's flat name and the scope's allows
     // the whole parse seeded after its own attributes.
     let own_old = match sub {
@@ -1285,7 +1308,7 @@ fn find_item_edit(front: &Front, text: &str, edit: Edit) -> Result<NewItem, Opti
     item_ast.items.push(new_item);
     let old_exprs = def.exprs;
     let kept = kept.map(|body| KeptBody { fn_index, file, span: (nt[no].span.lo, new_hi), body });
-    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs, full, kept })
+    Ok(NewItem { fn_index, item, sub, old: (lo, hi), item_ast, name, old_exprs, full, kept, items })
 }
 
 /// Where the std splice starts in the new text: the new body or fn is
@@ -2035,7 +2058,31 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         let ast = &front.ast;
         let before = (ast.exprs.len(), ast.pats.len(), ast.tys.len(), ast.blocks.len(), ast.stmt_items.len());
         let ast = Arc::make_mut(&mut front.ast);
-        let (mut new_items, _, _) = ast.append_chunk(std::mem::take(&mut it.item_ast), before.4 as u32);
+        let stmt_base = before.4 as u32;
+        let (mut new_items, new_stmts, _) = ast.append_chunk(std::mem::take(&mut it.item_ast), stmt_base);
+        // Each body item takes its old index (`same_items`).
+        if new_stmts.len() != it.items.len() {
+            return Err("body items");
+        }
+        if !it.items.is_empty() {
+            let mut bad = false;
+            for blk in &mut ast.blocks[before.3..] {
+                for s in &mut blk.stmts {
+                    if let crate::ast::Stmt::Item(i) = s {
+                        match it.items.get((*i - stmt_base) as usize) {
+                            Some(&n) => *i = n,
+                            None => bad = true,
+                        }
+                    }
+                }
+            }
+            if bad {
+                return Err("body items");
+            }
+            for (st, &k) in new_stmts.into_iter().zip(&it.items) {
+                ast.stmt_items[k as usize] = st;
+            }
+        }
         let new_item = new_items.pop().ok_or("item parse")?;
         let crate::ast::Item { vis, attrs, kind, span } = new_item;
         match (kind, it.sub) {
@@ -4108,9 +4155,10 @@ pub fn run() -> i64 {
             ("    pub fn sum(&self, k: i64) -> i64 where u32: Copy {", "    pub fn sum(&self, k: i64) -> i64 where String: Copy {", "item", 1),
             ("    pub fn sum(&self, k: i64) -> i64 where String: Copy {", "    pub fn sum(&self, k: u8) -> i64 {", "item", 1),
             ("    pub fn sum(&self, k: u8) -> i64 {", sum, "item", 0),
-            // The method that holds the nested fn: a full resolve.
-            ("    pub fn nested(&self) -> i64 {", "    pub fn nested(&self) -> i64 where u32: Copy {", "resolve", 0),
-            ("    pub fn nested(&self) -> i64 where u32: Copy {", "    pub fn nested(&self) -> i64 {", "resolve", 0),
+            // The method that holds the nested fn: the item patch, which
+            // keeps the nested fn (`same_items`).
+            ("    pub fn nested(&self) -> i64 {", "    pub fn nested(&self) -> i64 where u32: Copy {", "item", 0),
+            ("    pub fn nested(&self) -> i64 where u32: Copy {", "    pub fn nested(&self) -> i64 {", "item", 0),
             // A body edit of the nested fn's method, then a header edit.
             ("            x + 1\n", "            x + 2\n", "patch", 0),
             (sum, "    pub fn sum(&self, k: i64) -> i64 where i64: Copy {", "item", 0),
