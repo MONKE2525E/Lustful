@@ -1,20 +1,43 @@
 /* The Unix calls behind the rustix adapter: see sysx.h. Included
-   only under LUST_IMPL, after the runtime's own includes. */
+   only under LUST_IMPL, after the runtime's own includes. The
+   Linux-only calls (inotify, fanotify, prctl, statx, getdents64,
+   the handle calls) compile only on Linux; off Linux their bodies
+   return ENOSYS so every program still links, and the rustix
+   adapter leaves those items out off Linux so a program that uses
+   one rejects at compile time instead of meeting the stub. */
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <poll.h>
+#ifdef __linux__
 #include <sys/fanotify.h>
 #include <sys/inotify.h>
-#include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#endif
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+/* pipe2 with the caller's O_CLOEXEC/O_NONBLOCK flag bits (the
+   target's values, from the rustix adapter): the call itself on
+   Linux, pipe plus fcntl on Darwin, as in sysio.c. */
+#ifdef __APPLE__
+static int lust_sysx_pipe2(int fds[2], int flags) {
+    if (pipe(fds) != 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        if (flags & O_CLOEXEC) fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+        if (flags & O_NONBLOCK) fcntl(fds[i], F_SETFL, O_NONBLOCK);
+    }
+    return 0;
+}
+#else
+static int lust_sysx_pipe2(int fds[2], int flags) { return pipe2(fds, flags); }
+#endif
 
 /* Appends `n` bytes to a Vec<u8> (the sysnet.c shape). */
 static void lust_sysx_push(lust_Vec *out, const void *p, uint64_t n) {
@@ -70,7 +93,12 @@ int32_t lust_sys_x_sigmask(int32_t how, uint64_t set) {
 }
 
 int32_t lust_sys_x_prctl_deathsig(int32_t sig) {
+#ifdef __linux__
     return prctl(PR_SET_PDEATHSIG, (unsigned long)sig, 0, 0, 0) == 0 ? 0 : errno;
+#else
+    (void)sig;
+    return ENOSYS;
+#endif
 }
 
 #ifndef PR_GET_THP_DISABLE
@@ -81,11 +109,17 @@ int32_t lust_sys_x_prctl_deathsig(int32_t sig) {
 #endif
 
 int32_t lust_sys_x_prctl_thp(int32_t mode, int32_t val) {
+#ifdef __linux__
     if (mode == 1) {
         return prctl(PR_SET_THP_DISABLE, val != 0, 0, 0, 0) == 0 ? 0 : -errno;
     }
     int r = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
     return r < 0 ? -errno : r;
+#else
+    (void)mode;
+    (void)val;
+    return -ENOSYS;
+#endif
 }
 
 int32_t lust_sys_x_getrlimit(int32_t resource, lust_Vec *out) {
@@ -119,9 +153,9 @@ static void lust_sysx_stat_rec(lust_Vec *out, const struct stat *st) {
     uint64_t f[16] = {(uint64_t)st->st_dev, (uint64_t)st->st_ino, (uint64_t)st->st_nlink,
                       (uint64_t)st->st_mode, (uint64_t)st->st_uid, (uint64_t)st->st_gid,
                       (uint64_t)st->st_rdev, (uint64_t)st->st_size, (uint64_t)st->st_blksize,
-                      (uint64_t)st->st_blocks, (uint64_t)st->st_atim.tv_sec, (uint64_t)st->st_atim.tv_nsec,
-                      (uint64_t)st->st_mtim.tv_sec, (uint64_t)st->st_mtim.tv_nsec,
-                      (uint64_t)st->st_ctim.tv_sec, (uint64_t)st->st_ctim.tv_nsec};
+                      (uint64_t)st->st_blocks, (uint64_t)LUST_ST_ATIME(*st).tv_sec, (uint64_t)LUST_ST_ATIME(*st).tv_nsec,
+                      (uint64_t)LUST_ST_MTIME(*st).tv_sec, (uint64_t)LUST_ST_MTIME(*st).tv_nsec,
+                      (uint64_t)LUST_ST_CTIME(*st).tv_sec, (uint64_t)LUST_ST_CTIME(*st).tv_nsec};
     for (int i = 0; i < 16; i++) lust_sysx_u64(out, f[i]);
 }
 
@@ -144,6 +178,7 @@ int32_t lust_sys_x_fstat(int32_t fd, lust_Vec *out) {
     return 0;
 }
 
+#ifdef __linux__
 /* The kernel's struct statx (stable ABI, 256 bytes), spelled
    out because tcc's headers do not expose glibc's. Field order
    is the kernel's: atime, btime, ctime, mtime. */
@@ -203,6 +238,12 @@ int32_t lust_sys_x_statx(int32_t dirfd, const uint8_t *p, uint64_t len, int32_t 
     for (int i = 0; i < 23; i++) lust_sysx_u64(out, f[i]);
     return 0;
 }
+#else
+int32_t lust_sys_x_statx(int32_t dirfd, const uint8_t *p, uint64_t len, int32_t flags, uint32_t mask, lust_Vec *out) {
+    (void)dirfd; (void)p; (void)len; (void)flags; (void)mask; (void)out;
+    return ENOSYS;
+}
+#endif
 
 int32_t lust_sys_x_accessat(int32_t dirfd, const uint8_t *p, uint64_t len, int32_t mode, int32_t flags) {
     char *s = lust_sysx_path(p, len);
@@ -252,7 +293,7 @@ int32_t lust_sys_x_fcntl_setfl(int32_t fd, int32_t flags) {
 
 int32_t lust_sys_x_pipe(int32_t flags, lust_Vec *out) {
     int fds[2];
-    if (pipe2(fds, flags) != 0) return errno;
+    if (lust_sysx_pipe2(fds, flags) != 0) return errno;
     lust_sysx_u64(out, (uint64_t)(uint32_t)fds[0]);
     lust_sysx_u64(out, (uint64_t)(uint32_t)fds[1]);
     return 0;
@@ -476,7 +517,7 @@ void lust_sys_sig_unregister_pipe(int32_t write_fd) {
 
 int32_t lust_sys_sig_pipe(lust_Vec *out) {
     int fds[2];
-    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) return -errno;
+    if (lust_sysx_pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) return -errno;
     lust_sysx_u64(out, (uint64_t)(uint32_t)fds[1]);
     return fds[0];
 }
@@ -534,6 +575,7 @@ void lust_sys_sig_abort(void) {
     abort();
 }
 
+#ifdef __linux__
 int32_t lust_sys_x_inotify_init1(int32_t flags) {
     int fd = inotify_init1(flags);
     return fd < 0 ? -errno : fd;
@@ -551,7 +593,24 @@ int32_t lust_sys_x_inotify_add_watch(int32_t fd, const uint8_t *p, uint64_t len,
 int32_t lust_sys_x_inotify_rm_watch(int32_t fd, int32_t wd) {
     return inotify_rm_watch(fd, wd) == 0 ? 0 : errno;
 }
+#else
+int32_t lust_sys_x_inotify_init1(int32_t flags) {
+    (void)flags;
+    return -ENOSYS;
+}
 
+int32_t lust_sys_x_inotify_add_watch(int32_t fd, const uint8_t *p, uint64_t len, uint32_t mask) {
+    (void)fd; (void)p; (void)len; (void)mask;
+    return -ENOSYS;
+}
+
+int32_t lust_sys_x_inotify_rm_watch(int32_t fd, int32_t wd) {
+    (void)fd; (void)wd;
+    return ENOSYS;
+}
+#endif
+
+#ifdef __linux__
 int64_t lust_sys_x_getdents(int32_t fd, uint64_t max, lust_Vec *out) {
     if (max == 0) {
         /* The kernel answers EINVAL for a zero-size buffer. */
@@ -566,6 +625,12 @@ int64_t lust_sys_x_getdents(int32_t fd, uint64_t max, lust_Vec *out) {
     free(buf);
     return r < 0 ? -e : (int64_t)r;
 }
+#else
+int64_t lust_sys_x_getdents(int32_t fd, uint64_t max, lust_Vec *out) {
+    (void)fd; (void)max; (void)out;
+    return -ENOSYS;
+}
+#endif
 
 /* The 11-field statvfs record: bsize, frsize, blocks, bfree,
    bavail, files, ffree, favail, fsid, flag, namemax. */
@@ -596,6 +661,7 @@ int32_t lust_sys_x_fstatvfs(int32_t fd, lust_Vec *out) {
     return 0;
 }
 
+#ifdef __linux__
 int32_t lust_sys_x_fanotify_init(uint32_t flags, uint32_t event_f_flags) {
     int fd = fanotify_init(flags, event_f_flags);
     return fd < 0 ? -errno : fd;
@@ -612,7 +678,19 @@ int32_t lust_sys_x_fanotify_mark(int32_t fd, uint32_t flags, uint64_t mask, int3
     free(s);
     return r != 0 ? e : 0;
 }
+#else
+int32_t lust_sys_x_fanotify_init(uint32_t flags, uint32_t event_f_flags) {
+    (void)flags; (void)event_f_flags;
+    return -ENOSYS;
+}
 
+int32_t lust_sys_x_fanotify_mark(int32_t fd, uint32_t flags, uint64_t mask, int32_t dirfd, int32_t has_path, const uint8_t *p, uint64_t len) {
+    (void)fd; (void)flags; (void)mask; (void)dirfd; (void)has_path; (void)p; (void)len;
+    return ENOSYS;
+}
+#endif
+
+#ifdef __linux__
 /* struct file_handle with a `cap`-byte handle tail. */
 struct lust_sysx_fhandle {
     uint32_t handle_bytes;
@@ -675,3 +753,14 @@ int32_t lust_sys_x_open_by_handle_at(int32_t mount_fd, int32_t handle_type, cons
     free(h);
     return r < 0 ? -e : (int32_t)r;
 }
+#else
+int32_t lust_sys_x_name_to_handle_at(int32_t dirfd, const uint8_t *p, uint64_t len, int32_t flags, lust_Vec *out) {
+    (void)dirfd; (void)p; (void)len; (void)flags; (void)out;
+    return ENOSYS;
+}
+
+int32_t lust_sys_x_open_by_handle_at(int32_t mount_fd, int32_t handle_type, const uint8_t *p, uint64_t len, int32_t flags) {
+    (void)mount_fd; (void)handle_type; (void)p; (void)len; (void)flags;
+    return -ENOSYS;
+}
+#endif

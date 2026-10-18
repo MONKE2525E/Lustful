@@ -12,8 +12,23 @@
 extern char **environ;
 
 /* glibc exposes pipe2 only under a feature macro this unit does not
-   set; declare it (the symbol is always in libc). */
+   set; declare it (the symbol is always in libc). Darwin has no
+   pipe2: pipe plus the two flags this file passes, set right after
+   (not atomic, as everywhere before pipe2 existed; a fork+exec in
+   another thread in between could inherit the fds for a moment). */
+#ifdef __APPLE__
+static int lust_pipe2(int fds[2], int flags) {
+    if (pipe(fds) != 0) return -1;
+    for (int i = 0; i < 2; i++) {
+        if (flags & O_CLOEXEC) fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+        if (flags & O_NONBLOCK) fcntl(fds[i], F_SETFL, O_NONBLOCK);
+    }
+    return 0;
+}
+#else
 int pipe2(int pipefd[2], int flags);
+static int lust_pipe2(int fds[2], int flags) { return pipe2(fds, flags); }
+#endif
 
 /* Appends `n` bytes to a Vec<u8>. */
 static void lust_sysio_push(lust_Vec *out, const void *p, uint64_t n) {
@@ -57,9 +72,19 @@ int32_t lust_sys_fd_dup(int32_t fd) {
     return n < 0 ? -errno : n;
 }
 
+/* On Darwin std's sync_all and sync_data are both fcntl(F_FULLFSYNC)
+   (std sys/fs/unix.rs os_fsync/os_datasync for target_vendor apple):
+   a plain fsync there does not ask the drive to flush. */
+#ifdef __APPLE__
+#define LUST_F_FULLFSYNC 51
+int32_t lust_sys_fd_sync(int32_t fd) { return fcntl(fd, LUST_F_FULLFSYNC) == 0 ? 0 : errno; }
+
+int32_t lust_sys_fd_sync_data(int32_t fd) { return fcntl(fd, LUST_F_FULLFSYNC) == 0 ? 0 : errno; }
+#else
 int32_t lust_sys_fd_sync(int32_t fd) { return fsync(fd) == 0 ? 0 : errno; }
 
 int32_t lust_sys_fd_sync_data(int32_t fd) { return fdatasync(fd) == 0 ? 0 : errno; }
+#endif
 
 int32_t lust_sys_fd_truncate(int32_t fd, uint64_t len) { return ftruncate(fd, (off_t)len) == 0 ? 0 : errno; }
 
@@ -97,9 +122,9 @@ int32_t lust_sys_fd_stat(int32_t fd, lust_Vec *out) {
     if (fstat(fd, &st) != 0) return errno;
     int64_t bsec = 0, bnsec = 0;
     int32_t has_btime = lust_sys_btime_fd(fd, &bsec, &bnsec);
-    uint64_t f[19] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec, st.st_uid, st.st_gid,
-                      (uint64_t)st.st_nlink, (uint64_t)st.st_ino, (uint64_t)st.st_dev, (uint64_t)st.st_atim.tv_sec,
-                      (uint64_t)st.st_atim.tv_nsec, (uint64_t)st.st_ctim.tv_sec, (uint64_t)st.st_ctim.tv_nsec, (uint64_t)st.st_blocks,
+    uint64_t f[19] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)LUST_ST_MTIME(st).tv_sec, (uint64_t)LUST_ST_MTIME(st).tv_nsec, st.st_uid, st.st_gid,
+                      (uint64_t)st.st_nlink, (uint64_t)st.st_ino, (uint64_t)st.st_dev, (uint64_t)LUST_ST_ATIME(st).tv_sec,
+                      (uint64_t)LUST_ST_ATIME(st).tv_nsec, (uint64_t)LUST_ST_CTIME(st).tv_sec, (uint64_t)LUST_ST_CTIME(st).tv_nsec, (uint64_t)st.st_blocks,
                       (uint64_t)st.st_blksize, (uint64_t)st.st_rdev, (uint64_t)bsec, (uint64_t)bnsec, (uint64_t)has_btime};
     for (int i = 0; i < 19; i++) {
         uint8_t b[8];
@@ -239,8 +264,20 @@ int64_t lust_sys_proc_wait(uint32_t pid, uint8_t block) {
 int32_t lust_sys_proc_kill(uint32_t pid) { return kill((pid_t)pid, SIGKILL) == 0 ? 0 : errno; }
 
 /* glibc's PATH-searching exec with an explicit environment; declared
-   here because no feature macro exposes it in this unit. */
+   here because no feature macro exposes it in this unit. Darwin has
+   no execvpe: the one caller runs in a forked child about to exec,
+   so swapping environ and calling execvp is the same call there
+   (the PATH search then reads the child's environment, as std's
+   spawn searches it). */
+#ifdef __APPLE__
+static int lust_execvpe(const char *file, char *const argv[], char *const envp[]) {
+    environ = (char **)envp;
+    return execvp(file, argv);
+}
+#else
 int execvpe(const char *file, char *const argv[], char *const envp[]);
+static int lust_execvpe(const char *file, char *const argv[], char *const envp[]) { return execvpe(file, argv, envp); }
+#endif
 
 /* Splits NUL-terminated packed strings (the argv and env formats of
    sysio.h) into a malloc'd, NULL-terminated array. The strings
@@ -318,10 +355,10 @@ int32_t lust_sys_proc_spawn(const uint8_t *prog, uint64_t proglen, const uint8_t
     int pipes[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
     int err = 0;
     for (int i = 0; i < 3 && !err; i++) {
-        if (spec[i] == 2 && pipe2(pipes[i], O_CLOEXEC) != 0) err = errno;
+        if (spec[i] == 2 && lust_pipe2(pipes[i], O_CLOEXEC) != 0) err = errno;
     }
     int errpipe[2] = {-1, -1};
-    if (!err && pipe2(errpipe, O_CLOEXEC) != 0) err = errno;
+    if (!err && lust_pipe2(errpipe, O_CLOEXEC) != 0) err = errno;
     if (err) {
         for (int i = 0; i < 3; i++) {
             if (pipes[i][0] >= 0) close(pipes[i][0]);
@@ -369,7 +406,7 @@ int32_t lust_sys_proc_spawn(const uint8_t *prog, uint64_t proglen, const uint8_t
         }
         if (have_cwd && chdir(cwd_s) != 0) goto child_err;
         signal(SIGPIPE, SIG_DFL);
-        execvpe(prog_s, argv, envp);
+        lust_execvpe(prog_s, argv, envp);
     child_err: {
             int e = errno;
             const uint8_t *p = (const uint8_t *)&e;
@@ -448,7 +485,7 @@ int32_t lust_sys_proc_exec(const uint8_t *prog, uint64_t proglen, const uint8_t 
             own[i] = 1;
         } else if (spec[i] == 2) {
             int pp[2];
-            if (pipe2(pp, O_CLOEXEC) != 0) {
+            if (lust_pipe2(pp, O_CLOEXEC) != 0) {
                 err = errno;
             } else {
                 theirs[i] = pp[i == 0 ? 0 : 1];

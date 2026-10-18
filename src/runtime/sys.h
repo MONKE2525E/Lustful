@@ -11,6 +11,21 @@
 #ifndef LUST_RT_SYS_H
 #define LUST_RT_SYS_H
 
+/* struct stat time fields by name: Linux spells them st_atim and kin,
+   Darwin st_atimespec and kin, and only Darwin's stat carries the
+   birth time in the stat itself (Linux reads it through statx). The
+   sys*.c files below read times through these spellings. */
+#ifdef __APPLE__
+#define LUST_ST_ATIME(st) (st).st_atimespec
+#define LUST_ST_MTIME(st) (st).st_mtimespec
+#define LUST_ST_CTIME(st) (st).st_ctimespec
+#define LUST_ST_BTIME(st) (st).st_birthtimespec
+#else
+#define LUST_ST_ATIME(st) (st).st_atim
+#define LUST_ST_MTIME(st) (st).st_mtim
+#define LUST_ST_CTIME(st) (st).st_ctim
+#endif
+
 /* Standard streams: writes go through the C stdio streams `print!` and
    `eprint!` use (stderr is flushed after each write, as Rust's stderr
    is unbuffered). */

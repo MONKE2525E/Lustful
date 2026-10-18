@@ -4,7 +4,9 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 
 extern char **environ;
 
@@ -334,10 +336,29 @@ int32_t lust_sys_rename(const uint8_t *a, uint64_t alen, const uint8_t *b, uint6
     return r == 0 ? 0 : e;
 }
 
-/* The statx birth time (std's `Metadata::created` on Linux reads
-   statx with AT_STATX_SYNC_AS_STAT): 1 when the filesystem reports
-   one (STATX_BTIME in the mask). The kernel's struct statx (stable
-   ABI, 256 bytes) is spelled out as in sysx.c, with its own name. */
+/* The birth time behind `Metadata::created`. On Linux std reads it
+   through statx with AT_STATX_SYNC_AS_STAT: 1 when the filesystem
+   reports one (STATX_BTIME in the mask). The kernel's struct statx
+   (stable ABI, 256 bytes) is spelled out as in sysx.c, with its own
+   name. On Darwin every stat carries st_birthtimespec and std
+   returns it as the created time, so one is always reported. */
+#ifdef __APPLE__
+int32_t lust_sys_btime_path(const char *path, int32_t follow, int64_t *sec, int64_t *nsec) {
+    struct stat st;
+    if ((follow ? stat(path, &st) : lstat(path, &st)) != 0) return 0;
+    *sec = (int64_t)LUST_ST_BTIME(st).tv_sec;
+    *nsec = (int64_t)LUST_ST_BTIME(st).tv_nsec;
+    return 1;
+}
+
+int32_t lust_sys_btime_fd(int32_t fd, int64_t *sec, int64_t *nsec) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    *sec = (int64_t)LUST_ST_BTIME(st).tv_sec;
+    *nsec = (int64_t)LUST_ST_BTIME(st).tv_nsec;
+    return 1;
+}
+#else
 struct lust_btime_time {
     int64_t tv_sec;
     uint32_t tv_nsec;
@@ -392,6 +413,8 @@ int32_t lust_sys_btime_fd(int32_t fd, int64_t *sec, int64_t *nsec) {
     return lust_btime_read(fd, "", 0x1000 /* AT_EMPTY_PATH */, sec, nsec);
 }
 
+#endif
+
 /* stat (follow != 0) or lstat into 8-byte little-endian fields of the
    Vec: mode, size, mtime seconds, mtime nanoseconds, uid, gid, nlink,
    ino, dev, atime s, atime ns, ctime s, ctime ns, blocks, blksize, rdev,
@@ -409,9 +432,9 @@ int32_t lust_sys_stat(const uint8_t *p, uint64_t len, uint8_t follow, lust_Vec *
     int64_t bsec = 0, bnsec = 0;
     int32_t has_btime = lust_sys_btime_path(s, follow, &bsec, &bnsec);
     free(s);
-    uint64_t f[19] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)st.st_mtim.tv_sec, (uint64_t)st.st_mtim.tv_nsec, st.st_uid, st.st_gid,
-                      (uint64_t)st.st_nlink, (uint64_t)st.st_ino, (uint64_t)st.st_dev, (uint64_t)st.st_atim.tv_sec,
-                      (uint64_t)st.st_atim.tv_nsec, (uint64_t)st.st_ctim.tv_sec, (uint64_t)st.st_ctim.tv_nsec, (uint64_t)st.st_blocks,
+    uint64_t f[19] = {st.st_mode, (uint64_t)st.st_size, (uint64_t)LUST_ST_MTIME(st).tv_sec, (uint64_t)LUST_ST_MTIME(st).tv_nsec, st.st_uid, st.st_gid,
+                      (uint64_t)st.st_nlink, (uint64_t)st.st_ino, (uint64_t)st.st_dev, (uint64_t)LUST_ST_ATIME(st).tv_sec,
+                      (uint64_t)LUST_ST_ATIME(st).tv_nsec, (uint64_t)LUST_ST_CTIME(st).tv_sec, (uint64_t)LUST_ST_CTIME(st).tv_nsec, (uint64_t)st.st_blocks,
                       (uint64_t)st.st_blksize, (uint64_t)st.st_rdev, (uint64_t)bsec, (uint64_t)bnsec, (uint64_t)has_btime};
     for (int i = 0; i < 19; i++) {
         uint8_t b[8];

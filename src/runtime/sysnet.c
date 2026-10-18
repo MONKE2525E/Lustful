@@ -13,8 +13,59 @@
 #include <unistd.h>
 
 /* glibc exposes accept4 only under _GNU_SOURCE, which this unit does not set (as with
-   pipe2 in sysio.c). gcc 14 makes the implicit declaration an error. */
+   pipe2 in sysio.c). gcc 14 makes the implicit declaration an error. Darwin has
+   neither accept4 nor the SOCK_CLOEXEC/SOCK_NONBLOCK type flags: the flags are
+   defined away in the create calls and set with fcntl right after, through
+   lust_sock_after_create (not atomic; a fork+exec in another thread in between
+   could inherit the fd for a moment, as with pipe2 in sysio.c). */
+#ifdef __APPLE__
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
+#ifndef SOCK_NONBLOCK
+#define SOCK_NONBLOCK 0
+#endif
+static void lust_sock_after_create(int fd, int nonblock) {
+    if (fd < 0) return;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (nonblock) {
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+}
+static int lust_accept_cloexec(int fd, struct sockaddr *addr, socklen_t *len) {
+    int n = accept(fd, addr, len);
+    lust_sock_after_create(n, 0);
+    return n;
+}
+#else
 int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags);
+static void lust_sock_after_create(int fd, int nonblock) {
+    (void)fd;
+    (void)nonblock;
+}
+static int lust_accept_cloexec(int fd, struct sockaddr *addr, socklen_t *len) {
+    return accept4(fd, addr, len, SOCK_CLOEXEC);
+}
+#endif
+
+/* The family of a socket, for the TTL option: SO_DOMAIN on Linux
+   (std's way); Darwin has no SO_DOMAIN, and getsockname reports the
+   family of a bound or unbound socket there. 0 with errno set when
+   neither works. */
+static int lust_sock_family(int fd) {
+#ifdef __APPLE__
+    struct sockaddr_storage ss;
+    socklen_t ll = sizeof ss;
+    if (getsockname(fd, (struct sockaddr *)&ss, &ll) != 0) return 0;
+    return ss.ss_family;
+#else
+    int fam = 0;
+    socklen_t ll = sizeof fam;
+    if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &fam, &ll) != 0) return 0;
+    return fam;
+#endif
+}
 
 /* Appends `n` bytes to a Vec<u8> (the sysio.c shape). */
 static void lust_sysnet_push(lust_Vec *out, const void *p, uint64_t n) {
@@ -147,6 +198,7 @@ static int32_t lust_sysnet_bind(const uint8_t *rec, uint64_t len, lust_Vec *out,
     if (fam < 0) return -EINVAL;
     int fd = socket(fam, type | SOCK_CLOEXEC, 0);
     if (fd < 0) return -errno;
+    lust_sock_after_create(fd, 0);
     if (listen_backlog >= 0) {
         int on = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
@@ -183,6 +235,7 @@ int32_t lust_sys_net_tcp_connect(const uint8_t *rec, uint64_t len, lust_Vec *out
     if (fam < 0) return -EINVAL;
     int fd = socket(fam, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -errno;
+    lust_sock_after_create(fd, 0);
     struct sockaddr_storage ss;
     socklen_t sl = lust_sysnet_read_addr(rec, len, &ss);
     if (connect(fd, (struct sockaddr *)&ss, sl) != 0) {
@@ -206,6 +259,7 @@ int32_t lust_sys_net_tcp_connect_timeout(const uint8_t *rec, uint64_t len, int64
     if (fam < 0) return -EINVAL;
     int fd = socket(fam, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return -errno;
+    lust_sock_after_create(fd, 1);
     struct sockaddr_storage ss;
     socklen_t sl = lust_sysnet_read_addr(rec, len, &ss);
     if (connect(fd, (struct sockaddr *)&ss, sl) != 0) {
@@ -269,7 +323,7 @@ int32_t lust_sys_net_connect_fd(int32_t fd, const uint8_t *rec, uint64_t len) {
 int32_t lust_sys_net_accept(int32_t fd, lust_Vec *out) {
     struct sockaddr_storage ss;
     socklen_t ll = sizeof ss;
-    int n = accept4(fd, (struct sockaddr *)&ss, &ll, SOCK_CLOEXEC);
+    int n = lust_accept_cloexec(fd, (struct sockaddr *)&ss, &ll);
     if (n < 0) return -errno;
     lust_sysnet_push_addr(out, (struct sockaddr *)&ss);
     return n;
@@ -295,9 +349,8 @@ int32_t lust_sys_net_setopt(int32_t fd, int32_t opt, int64_t val) {
         case 1: {
             /* std checks the ttl it read back on Linux happens in the
                Rust side only for values it sets; the syscall is plain. */
-            int fam = 0;
-            socklen_t ll = sizeof fam;
-            if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &fam, &ll) != 0) return errno;
+            int fam = lust_sock_family(fd);
+            if (fam == 0) return errno;
             if (fam == AF_INET6) return setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, sizeof v) == 0 ? 0 : errno;
             return setsockopt(fd, IPPROTO_IP, IP_TTL, &v, sizeof v) == 0 ? 0 : errno;
         }
@@ -324,9 +377,8 @@ int64_t lust_sys_net_getopt(int32_t fd, int32_t opt) {
     switch (opt) {
         case 0: return getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &v, &ll) == 0 ? v : -(int64_t)errno;
         case 1: {
-            int fam = 0;
-            socklen_t fl = sizeof fam;
-            if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &fam, &fl) != 0) return -(int64_t)errno;
+            int fam = lust_sock_family(fd);
+            if (fam == 0) return -(int64_t)errno;
             if (fam == AF_INET6) return getsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, &ll) == 0 ? v : -(int64_t)errno;
             return getsockopt(fd, IPPROTO_IP, IP_TTL, &v, &ll) == 0 ? v : -(int64_t)errno;
         }
@@ -384,17 +436,26 @@ int64_t lust_sys_net_recvfrom(int32_t fd, uint64_t max, int32_t flags, lust_Vec 
 static socklen_t lust_sysnet_unix_addr(const uint8_t *p, uint64_t len, int32_t abstract, struct sockaddr_un *un) {
     memset(un, 0, sizeof *un);
     un->sun_family = AF_UNIX;
+    socklen_t sl;
     if (abstract) {
         memcpy(un->sun_path + 1, p, (size_t)len);
-        return (socklen_t)(sizeof(sa_family_t) + 1 + len);
+        sl = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + len);
+    } else {
+        memcpy(un->sun_path, p, (size_t)len);
+        sl = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + len + 1);
     }
-    memcpy(un->sun_path, p, (size_t)len);
-    return (socklen_t)(sizeof(sa_family_t) + len + 1);
+#ifdef __APPLE__
+    /* Darwin's sockaddr_un carries its length in sun_len (its first
+       byte, before sun_family); the byte count here also covers that
+       byte on Darwin, where sa_family_t is one byte. */
+    un->sun_len = (unsigned char)sl;
+#endif
+    return sl;
 }
 
 /* One unix address record out: kind u64 then the name bytes. */
 static void lust_sysnet_push_unix_addr(lust_Vec *out, const struct sockaddr_un *un, socklen_t ll) {
-    uint64_t off = sizeof(sa_family_t);
+    uint64_t off = offsetof(struct sockaddr_un, sun_path);
     if (ll <= off) {
         lust_sysnet_put64(out, 0);
         return;
@@ -418,6 +479,8 @@ static void lust_sysnet_push_unix_addr(lust_Vec *out, const struct sockaddr_un *
 int32_t lust_sys_net_unix_pair(lust_Vec *out) {
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) != 0) return -errno;
+    lust_sock_after_create(fds[0], 0);
+    lust_sock_after_create(fds[1], 0);
     lust_sysnet_put64(out, (uint64_t)(uint32_t)fds[1]);
     return fds[0];
 }
@@ -425,6 +488,7 @@ int32_t lust_sys_net_unix_pair(lust_Vec *out) {
 int32_t lust_sys_net_unix_bind(const uint8_t *p, uint64_t len, int32_t abstract) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -errno;
+    lust_sock_after_create(fd, 0);
     struct sockaddr_un un;
     socklen_t sl = lust_sysnet_unix_addr(p, len, abstract, &un);
     if (bind(fd, (struct sockaddr *)&un, sl) != 0 || listen(fd, 128) != 0) {
@@ -438,6 +502,7 @@ int32_t lust_sys_net_unix_bind(const uint8_t *p, uint64_t len, int32_t abstract)
 int32_t lust_sys_net_unix_connect(const uint8_t *p, uint64_t len, int32_t abstract) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -errno;
+    lust_sock_after_create(fd, 0);
     struct sockaddr_un un;
     socklen_t sl = lust_sysnet_unix_addr(p, len, abstract, &un);
     if (connect(fd, (struct sockaddr *)&un, sl) != 0) {
@@ -451,7 +516,7 @@ int32_t lust_sys_net_unix_connect(const uint8_t *p, uint64_t len, int32_t abstra
 int32_t lust_sys_net_unix_accept(int32_t fd, lust_Vec *out) {
     struct sockaddr_un un;
     socklen_t ll = sizeof un;
-    int n = accept4(fd, (struct sockaddr *)&un, &ll, SOCK_CLOEXEC);
+    int n = lust_accept_cloexec(fd, (struct sockaddr *)&un, &ll);
     if (n < 0) return -errno;
     lust_sysnet_push_unix_addr(out, &un, ll);
     return n;

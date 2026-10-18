@@ -1425,8 +1425,10 @@ static void lust_mono_now(long ts[2]) LUST_BODY({
 #ifdef LUST_SYS_CLOCK_GETTIME
     syscall(LUST_SYS_CLOCK_GETTIME, 1 /* CLOCK_MONOTONIC */, ts);
 #elif defined(__APPLE__)
-    /* struct timespec is two longs on Darwin, as ts is. */
-    clock_gettime(CLOCK_MONOTONIC, (void *)ts);
+    /* struct timespec is two longs on Darwin, as ts is. std's
+       Instant on Apple is CLOCK_UPTIME_RAW (mach_absolute_time),
+       the clock its timeouts are measured against. */
+    clock_gettime(CLOCK_UPTIME_RAW, (void *)ts);
 #else
     ts[0] = 0;
     ts[1] = 0;

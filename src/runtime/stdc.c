@@ -13,7 +13,12 @@ static lust_u128 lust_clock_read(clockid_t clock) {
 }
 
 lust_u128 lust_clock_now_raw(void) {
+#ifdef __APPLE__
+    /* std's Instant on Apple is CLOCK_UPTIME_RAW. */
+    return lust_clock_read(CLOCK_UPTIME_RAW);
+#else
     return lust_clock_read(CLOCK_MONOTONIC);
+#endif
 }
 
 lust_u128 lust_system_time_raw(void) {
