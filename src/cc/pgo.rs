@@ -89,9 +89,14 @@ impl Mode {
                 if let Some(recs) = p.own.get(file).filter(|r| !r.is_empty()) {
                     let stem = file.strip_suffix(".c").unwrap_or(file);
                     let (txt, out) = (p.work.join(format!("{stem}.proftext")), p.work.join(format!("{stem}.profdata")));
-                    std::fs::write(&txt, format!("{}{}\n\n", p.head, recs.join("\n\n"))).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
+                    let text = format!("{}{}\n\n", p.head, recs.join("\n\n"));
+                    std::fs::write(&txt, &text).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
                     run(Command::new(profdata()).arg("merge").arg("-o").arg(&out).arg(&txt))?;
                     flags.push(format!("-fprofile-use={}", out.display()));
+                    // zig cc caches a compile by its source and args, not by this file:
+                    // the profile's digest in the args keeps a changed profile from
+                    // getting the object of the last one at this path.
+                    flags.push(format!("-DLUST_PROFILE_DIGEST={}", digest(&[text.as_bytes()])));
                 }
                 Ok(flags)
             }

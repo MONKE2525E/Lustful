@@ -378,13 +378,27 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
         _ => cmd.arg(&ll_path),
     };
     let abs = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut linked: Vec<&Path> = Vec::new();
     if merged.is_none() {
         cmd.args(["-Xclang", "-mlink-bitcode-file", "-Xclang"]).arg(abs(&bc));
+        linked.push(&bc);
     }
     cmd.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(abs(&hbc));
+    linked.push(&hbc);
     if let Some(rt) = rt_inl {
         cmd.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(abs(rt));
+        linked.push(rt);
     }
+    // zig cc caches a compile by its source (the IR) and its args, not by the bitcode it
+    // links through -Xclang: a unit whose IR stays while its C changes (a callee's id, a
+    // layout) would get the object of the last build at this path. Their digest goes in
+    // the args.
+    let mut bytes = Vec::with_capacity(linked.len());
+    for p in linked {
+        bytes.push(std::fs::read(p).map_err(|e| format!("cannot read {}: {e}\n", p.display()))?);
+    }
+    let (a, b) = crate::driver::cache::hash128(&bytes.iter().map(Vec::as_slice).collect::<Vec<_>>(), 53);
+    cmd.arg(format!("-DLUST_LINKED_DIGEST={a:016x}{b:016x}"));
     run(cmd.arg("-o").arg(obj))
 }
 
@@ -720,6 +734,30 @@ mod tests {
         let pre = super::preprocessed(text, &spec.cmd, &super::cflags(false), false).expect("the host C compiler preprocesses");
         let pre = String::from_utf8_lossy(&pre);
         assert!(pre.contains("\"Jan  1 1970\" \" \" \"00:00:00\""), "{pre}");
+    }
+
+    /// zig cc caches a compile by its source and args: an LLVM unit whose IR stays while the
+    /// C it links as bitcode changes must compile again, not get the last object at its path.
+    #[test]
+    fn an_llvm_unit_whose_c_changes_compiles_again_under_zig() {
+        if !super::on_path("zig") {
+            return;
+        }
+        let Ok(spec) = super::spec_for(crate::protocol::host_triple()) else { return };
+        let dir = std::env::temp_dir().join(format!("lust-zig-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, obj) = (dir.join("u9.c"), dir.join("u9.o"));
+        std::fs::write(&src, "").unwrap();
+        let ll = "declare i32 @h()\ndefine i32 @fl_aa() {\nentry:\n  %r = call i32 @h()\n  ret i32 %r\n}\n";
+        let flags: Vec<String> = super::cflags(false).split_whitespace().map(str::to_string).collect();
+        let calls = |hc: &str, callee: &str| {
+            super::compile_pair(&spec, &flags, false, &src, ll, hc, &obj, None, None, false).expect("compiles");
+            std::fs::read(&obj).unwrap().windows(callee.len()).any(|w| w == callee.as_bytes())
+        };
+        assert!(calls("int old_fn(void);\nint h(void) { return old_fn(); }\n", "old_fn"));
+        assert!(calls("int new_fn(void);\nint h(void) { return new_fn(); }\n", "new_fn"), "the object of the old C");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
