@@ -121,7 +121,7 @@ fn apply(
     // Entries this delta stores come after this stamp (`replay_bodies`).
     let start = crate::driver::gen_reuse::stamp_now();
     let instanced = super::patch::instanced_templates(p);
-    let fns = untouched_refusals(p, front, reach, edits, walk_instances, &instanced).map_err(|e| (e, true))?;
+    let fns = untouched_refusals(p, front, reach, edits, walk_instances).map_err(|e| (e, true))?;
     super::laps::mark("collect/delta refusals");
     let opaque_idents = opaque_body_idents(p);
     super::laps::mark("collect/delta opaque idents");
@@ -300,7 +300,6 @@ fn untouched_refusals(
     reach: Option<&ConstReach>,
     edits: &[HeaderEdit],
     walk_instances: bool,
-    instanced: &FxMap<LocalDefId, ()>,
 ) -> Result<Vec<usize>, &'static str> {
     if !p.gx.user_generics {
         return Err("sig flags");
@@ -322,7 +321,7 @@ fn untouched_refusals(
             return Err("sig class");
         }
         let f = LocalDefId(i as u32);
-        refusal(p, f, walk_instances, instanced)?;
+        refusal(p, f, walk_instances)?;
         // An inherent method: a root `Q::name` names it only when `Q` may
         // denote its Adt (`ConstReach::reaches_inherent`).
         // `refusal` took every fn that was const; the new header may be.
@@ -387,16 +386,14 @@ fn opaque_body_idents(p: &Program) -> Vec<(crate::def::DefId, Vec<crate::intern:
 /// Why fn `f` cannot take a header delta, if anything (see the module
 /// docs; `apply_headers` adds the const reach and `rpit_namers`). Reads
 /// the new Ast and the old program.
-fn refusal(p: &Program, f: LocalDefId, walk_instances: bool, instanced: &FxMap<LocalDefId, ()>) -> Result<(), &'static str> {
+fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'static str> {
     let i = f.0 as usize;
     // A template's instances keep their old signatures: a build's refuse.
     // A check's (with generic associated consts, `patch::instanced_templates`)
-    // take the new one (`generics::refresh_instance`), except for one that
-    // returns `impl Trait` (its instances generate the hidden type).
+    // take the new one (`generics::refresh_instance`).
     match p.gx.fn_class.get(i) {
         Some(FnClass::Plain) => {}
-        Some(FnClass::Template)
-            if !walk_instances && (!instanced.contains_key(&f) || !p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)))) => {}
+        Some(FnClass::Template) if !walk_instances => {}
         _ => return Err("sig class"),
     }
     let info = p.fn_info(f);
@@ -997,7 +994,7 @@ pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
         {
             continue;
         }
-        let why = refusal(p, f, false, &instanced).and_then(|()| rpit_namers(p, &opaque_idents, &[i], false, &instanced).map(drop)).err().unwrap_or("ok");
+        let why = refusal(p, f, false).and_then(|()| rpit_namers(p, &opaque_idents, &[i], false, &instanced).map(drop)).err().unwrap_or("ok");
         match out.iter_mut().find(|e| e.0 == why) {
             Some(e) => e.1 += 1,
             None => out.push((why, 1)),

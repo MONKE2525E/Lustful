@@ -11378,8 +11378,9 @@ pub(crate) fn instance_sig(p: &mut Program, template: LocalDefId, args: &[Generi
 
 /// Writes instance `inst`'s signature again from its template's (a header
 /// delta of the template, driver/kept_delta.rs), as `fn_instance` would
-/// make it now. Err when its owner or the form of its return moves: the
-/// method tables and generated closures would then differ.
+/// make it now. Err when its owner or its `impl Trait` return moves: the
+/// method tables and the opaque type callers keep would then differ (the
+/// template's own check proved its hidden type stands).
 pub(crate) fn refresh_instance(p: &mut Program, inst: LocalDefId) -> Result<(), &'static str> {
     let Some(info) = p.gx.instances.get(&inst) else { return Err("instance") };
     let Some(template) = info.template_local else { return Err("instance") };
@@ -11387,7 +11388,7 @@ pub(crate) fn refresh_instance(p: &mut Program, inst: LocalDefId) -> Result<(), 
     let def_id = p.def_id(inst);
     let s = instance_sig(p, template, &args, def_id);
     let i = inst.0 as usize;
-    if s.owner != p.fns[i].owner || s.opaque_ret.is_some() || p.gx.opaque_ret_of.contains_key(&inst) {
+    if s.owner != p.fns[i].owner || s.opaque_ret != p.gx.opaque_ret_of.get(&inst).copied() {
         return Err("instance owner");
     }
     if let Some(d) = p.defs.get_mut(def_id) {
