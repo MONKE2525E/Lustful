@@ -75,6 +75,14 @@ unsupported=0
 # the rest byte for byte.
 mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
 
+# mask_stdout <case file> <stdout file>: a program's stdout with the paths it can print
+# masked: the case's path as @CASE@ and the checkout root as @ROOT@ (`file!()`,
+# `Location::file()`, a panic location formatted and printed). rustc_oracle stores the
+# oracle's stdout masked this way, so one cache serves every checkout root: an unmasked
+# cached stdout holds the filling job's root and fails a job in another root on a pooled
+# boat box (tests/unwind/hooks.rs, rel-opt 05:21). Every stdout compare masks both sides.
+mask_stdout() { sed -e "s|$1|@CASE@|g" -e "s|$root|@ROOT@|g" "$2"; }
+
 # report ok|bad <name> [msg]: a case's result. Runs inside the case's subshell, in its dir.
 report() {
   echo "$1" >st
@@ -96,9 +104,11 @@ rustc_oracle() {
   if [ "$rustc_cache" != off ] && ! grep -qE 'env!|env::(var|vars|var_os|vars_os|current_dir|temp_dir|home_dir)\b' "$f"; then
     d=$(dirname "$f")
     key=$({
-      printf 'v2\n%s\n%s\n%s\n%s\n%s\n' "$rustc_version" "$mode" "$*" "${args[*]}" "$(basename "$f")"
-      # file!() and panic locations print the path; key those cases on the full path.
-      grep -qE 'file!|Location' "$f" && echo "$f"
+      # v3: rustc.out is stored masked with mask_stdout (older entries hold a raw root).
+      printf 'v3\n%s\n%s\n%s\n%s\n%s\n' "$rustc_version" "$mode" "$*" "${args[*]}" "$(basename "$f")"
+      # file!() and panic locations print the path; key those cases on the full path too
+      # (defense in depth next to the stdout mask, which is the root fix).
+      grep -qE 'file!|[Ll]ocation' "$f" && echo "$f"
       cat "$f"
       echo "${dep_hash[$d]:-}"
       grep -qE '^\s*(pub(\([^)]*\))?\s+)?mod\s+\w+\s*;|#\[path|include(_str|_bytes)?!' "$f" && echo "${sib_hash[$d]:-}"
@@ -115,11 +125,12 @@ rustc_oracle() {
   case_timeout=${ct:-$case_timeout} run_cc rustc "$@" -o rustc.bin "$f" 2>rustc.err; cc=$?
   echo $cc >rustc.cc
   if [ "$mode" = run ] && [ $cc -eq 0 ]; then
-    # stderr (panic text and location) is kept with the case's path as @CASE@, so a
-    # cached result serves any checkout.
+    # stderr (panic text and location) and stdout (paths a program prints) are kept
+    # masked (mask_stdout), so a cached result serves any checkout.
     run_to ./rustc.bin "${args[@]}" >rustc.out 2>rustc.stderr; rs=$?
     echo $rs >rustc.rs
     sed -i "s|$f|@CASE@|g" rustc.stderr
+    sed -i -e "s|$f|@CASE@|g" -e "s|$root|@ROOT@|g" rustc.out
   fi
   [ -n "$entry" ] && [ $cc -ne 124 ] && [ $cc -ne 137 ] && [ $rs -ne 124 ] && [ $rs -ne 137 ] || return 0
   tmp=$(mktemp -d "$rustc_cache/.tmp.XXXXXX") || return 0

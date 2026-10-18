@@ -10,8 +10,10 @@
 #   profile that asks for abort; a panic exits by SIGABRT, not 101).
 #   Both of these modes:
 #     tests/pass/*.rs: rustc and lust must both build. Stdout, exit status, and stderr
-#                      must match (stderr with the thread id masked and the case path as
-#                      @CASE@: panic text and location byte for byte, W-PANIC).
+#                      must match (stdout with the case path as @CASE@ and the checkout
+#                      root as @ROOT@, case-pool.sh mask_stdout; stderr with the thread
+#                      id masked and the case path as @CASE@: panic text and location
+#                      byte for byte, W-PANIC).
 #                      A `// panic: <text>` comment also requires <text> in lust's stderr.
 #     tests/fail/*.rs: rustc must reject the program, and `lust check` must report the code
 #                      named on the first line (`// expect: L0301`); `lust build` must reject it too.
@@ -163,7 +165,7 @@ sanitize_case() {
     else echo "sanitized build exit status $st, want $want: $(head -2 "$name.san.err" | tr '\n' ' ')"; fi
     return 1
   fi
-  if ! cmp -s "$expected" "$name.san.out"; then
+  if ! cmp -s "$expected" <(mask_stdout "$f" "$name.san.out"); then
     echo "sanitized build output differs"
     return 1
   fi
@@ -275,8 +277,8 @@ if [ "${PANIC:-abort}" = unwind ] || [ "${RELEASE:-0}" = 1 ]; then
     run_to "./$name.lust" >"$name.lust.out" 2>"$name.lust.stderr"; ls=$?
     if [ "$rs" -ne "$ls" ]; then
       report bad "$name" "exit status rustc=$rs lust=$ls: $(head -3 "$name.lust.stderr")"
-    elif ! cmp -s rustc.out "$name.lust.out"; then
-      report bad "$name" "stdout differs:"; diff rustc.out "$name.lust.out" | head -10
+    elif ! cmp -s rustc.out <(mask_stdout "$f" "$name.lust.out"); then
+      report bad "$name" "stdout differs:"; diff rustc.out <(mask_stdout "$f" "$name.lust.out") | head -10
     elif ! cmp -s <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames); then
       report bad "$name" "stderr differs:"; diff <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames) | head -10
     elif [ "${SANITIZE:-0}" = 1 ]; then
@@ -331,8 +333,8 @@ pass_case() {
   run_to "./$name.lust" >"$name.lust.out" 2>"$name.lust.stderr"; ls=$?
   if [ $rs -ne $ls ]; then
     report bad "$name" "exit status rustc=$rs lust=$ls"
-  elif ! diff -q rustc.out "$name.lust.out" >/dev/null; then
-    report bad "$name" "stdout differs:"; diff rustc.out "$name.lust.out" | head -10
+  elif ! cmp -s rustc.out <(mask_stdout "$f" "$name.lust.out"); then
+    report bad "$name" "stdout differs:"; diff rustc.out <(mask_stdout "$f" "$name.lust.out") | head -10
   elif ! cmp -s <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames); then
     report bad "$name" "stderr differs:"; diff <(mask_stderr rustc.stderr | no_frames) <(lust_stderr "$f" "$name.lust.stderr" | no_frames) | head -10
   elif [ -n "$panic_expect" ] && ! grep -qF "$panic_expect" "$name.lust.stderr"; then

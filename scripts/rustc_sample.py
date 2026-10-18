@@ -111,6 +111,14 @@ def norm_status(rc):
     return 128 - rc if isinstance(rc, int) and rc < 0 else rc
 
 
+def norm_stdout(text):
+    """A program's stdout with absolute .rs paths masked: a program that prints
+    `file!()` or a panic Location prints the path it was compiled from, which is
+    the fuzz crate's file for lust and this judge's temp main.rs for rustc.
+    Relative paths already agree (both sides invoke with a relative main.rs)."""
+    return re.sub(r"/\S*?\.rs\b", "@CASE@", text)
+
+
 def norm_stderr(text):
     """A program's stderr with the parts that differ by build and not by behavior masked:
     the thread id, the panicking file's path (lust and rustc compile different paths), and
@@ -185,9 +193,9 @@ class RunSample:
                                    timeout=timeout)
             except subprocess.TimeoutExpired:
                 return i, "unjudged", "rustc run timeout"
-            want = (norm_status(r.returncode), r.stdout, norm_stderr(r.stderr))
+            want = (norm_status(r.returncode), norm_stdout(r.stdout), norm_stderr(r.stderr))
             for side, got in (("warm", warm), ("cold", cold)):
-                have = (norm_status(got[0]), got[1], norm_stderr(got[2]))
+                have = (norm_status(got[0]), norm_stdout(got[1]), norm_stderr(got[2]))
                 if have != want:
                     what = [k for k, a, b in zip(("status", "stdout", "stderr"), have, want) if a != b]
                     return i, "mismatch", f"{side} lust differs in {'/'.join(what)}: lust={have!r:.300} rustc={want!r:.300}"

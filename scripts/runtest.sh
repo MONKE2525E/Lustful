@@ -47,7 +47,7 @@ runtest_case() {
     report bad "$name" "run took the $mode path, want $want_mode"
   elif [ $ms -ne $bs ] || [ $ms -ne $rs ]; then
     report bad "$name" "exit status memory=$ms built=$bs rustc=$rs"
-  elif ! cmp -s "$name.mem.out" "$name.lust.out" || ! cmp -s "$name.mem.out" rustc.out; then
+  elif ! cmp -s <(mask_stdout "$f" "$name.mem.out") <(mask_stdout "$f" "$name.lust.out") || ! cmp -s <(mask_stdout "$f" "$name.mem.out") rustc.out; then
     report bad "$name" "stdout differs (memory vs built vs rustc)"
   elif ! cmp -s <(mask_stderr "$name.mem.err") <(mask_stderr "$name.lust.err"); then
     report bad "$name" "stderr differs (memory vs built)"; diff <(mask_stderr "$name.mem.err") <(mask_stderr "$name.lust.err") | head -5
