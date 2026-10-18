@@ -403,19 +403,46 @@ fn hash_args(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, args: ArgsId) {
     let list = tys.args(args);
     (list.len() as u64).hash(h);
     for a in list {
-        match a {
-            GenericArg::Ty(t) => {
-                0u8.hash(h);
-                hash_ty(h, p, tys, *t);
-            }
-            GenericArg::Lifetime(r) => {
-                1u8.hash(h);
-                hash_region(h, *r);
-            }
-            GenericArg::Const(c) => {
-                2u8.hash(h);
-                hash_const(h, tys, *c);
-            }
+        hash_arg(h, p, tys, a);
+    }
+}
+
+fn hash_arg(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, a: &GenericArg) {
+    match a {
+        GenericArg::Ty(t) => {
+            0u8.hash(h);
+            hash_ty(h, p, tys, *t);
+        }
+        GenericArg::Lifetime(r) => {
+            1u8.hash(h);
+            hash_region(h, *r);
+        }
+        GenericArg::Const(c) => {
+            2u8.hash(h);
+            hash_const(h, tys, *c);
+        }
+    }
+}
+
+/// `hash_args` of a primitive builtin method's item type (`ty::prim_fn_def`, check's
+/// `prim_item_value`): its second arg is the method name's symbol, numbered by the
+/// interner in the order it meets names, which two processes do not share. So the name's
+/// text is hashed, and an instance over the item (`opt.map(RefCell::borrow)`) has one key,
+/// and one release fn name, in every build.
+fn hash_prim_item_args(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, args: ArgsId) {
+    let list = tys.args(args);
+    (list.len() as u64).hash(h);
+    for (i, a) in list.iter().enumerate() {
+        let name = match a {
+            GenericArg::Const(c) if i == 1 => match tys.const_kind(*c) {
+                ConstKind::Int(v) => Some(Sym(v as u32)),
+                _ => None,
+            },
+            _ => None,
+        };
+        match name {
+            Some(name) => (3u8, p.name(name)).hash(h),
+            None => hash_arg(h, p, tys, a),
         }
     }
 }
@@ -541,7 +568,11 @@ fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty) {
         TyKind::FnDef(def, args) => {
             15u8.hash(h);
             hash_def_pub(h, p, def);
-            hash_args(h, p, tys, args);
+            if def == crate::ty::prim_fn_def() {
+                hash_prim_item_args(h, p, tys, args);
+            } else {
+                hash_args(h, p, tys, args);
+            }
         }
         TyKind::Closure(def, args) => {
             16u8.hash(h);
@@ -3348,6 +3379,43 @@ fn main() {
     println!(\"{}\", y);
 }
 ";
+
+    /// A primitive builtin method's item type (`ty::prim_fn_def`) holds the method name's
+    /// symbol as a const. A symbol's number is its place in its interner shard, so two
+    /// processes that meet names in another order (a parallel parse) number the same name
+    /// apart. The type's fingerprint, and an instance key over it, hash the name's text: the
+    /// same item gives the same fingerprint in both.
+    #[test]
+    fn prim_item_fingerprint_hashes_the_name_not_its_symbol_number() {
+        let name = "zq_prim_method";
+        // A name in the same shard: met first, it moves `name`'s number.
+        let alone = Interner::default().intern(name);
+        let other = (0..)
+            .map(|i| format!("zq_shift_{i}"))
+            .find(|o| {
+                let i = Interner::default();
+                i.intern(o);
+                i.intern(name) != alone
+            })
+            .unwrap();
+        let item = |first: Option<&str>| {
+            let mut out = None;
+            with_program(SAMPLE, |interner, p| {
+                if let Some(o) = first {
+                    interner.intern(o);
+                }
+                let sym = interner.intern(name);
+                let (n, code) = (p.tys.intern_const(ConstKind::Int(sym.0 as u128)), p.tys.intern_const(ConstKind::Int(7)));
+                let args = p.tys.intern_args(&[GenericArg::Ty(BOOL), GenericArg::Const(n), GenericArg::Const(code)]);
+                let t = p.tys.intern(TyKind::FnDef(crate::ty::prim_fn_def(), args));
+                out = Some((sym, ty_fingerprint(p, t)));
+            });
+            out.unwrap()
+        };
+        let ((a, fa), (b, fb)) = (item(None), item(Some(&other)));
+        assert_ne!(a, b, "the two programs number the name apart");
+        assert_eq!(fa, fb);
+    }
 
     fn foo_head(p: &Program, interner: &Interner) -> Head {
         let a = p.type_names[&interner.intern("Foo")];
