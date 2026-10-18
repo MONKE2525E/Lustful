@@ -107,11 +107,13 @@ const BIG_FILE: u64 = 256 << 10;
 /// src/image.rs). The image holds one session per crate selection, as a
 /// daemon keeps them: a request takes its own session from the image, or
 /// a new persistent one. A release-driver run (cc requests) stops at the
-/// first failed target. Then the save. Returns the answers; a compile
+/// first failed target. Then the save, here or (`LUST_FRONT_SAVE=background`)
+/// in a forked child after this process answers. Returns the answers; a compile
 /// panic discards the image (an oracle failure answers code 3, as in a
 /// daemon; any other panic resumes).
 fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Response> {
     let t = std::time::Instant::now();
+    image::lock(dir);
     let (mut sessions, loaded) = match image::load(dir) {
         Ok(roots) => {
             let image::Roots { mut sessions, tables, stamps } = *roots;
@@ -169,7 +171,9 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     }
     sessions.iter_mut().for_each(|s| s.settle());
     let roots = Box::new(image::Roots { sessions, tables: diag::take_global_tables(), stamps: driver::Stamps::now() });
-    let line = match image::save(dir, roots) {
+    let background = std::env::var_os(image::SAVE_ENV).is_some_and(|v| v == "background");
+    let saved = if background { image::save_background(dir, roots) } else { image::save(dir, roots) };
+    let line = match saved {
         Ok(line) if verbose => line + "\n",
         Ok(_) => String::new(),
         Err(e) => format!("lust: front state not saved: {e}\n"),

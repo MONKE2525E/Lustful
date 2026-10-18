@@ -31,6 +31,12 @@
 //      written as zeros; pages with no live block are left out. The
 //      process-wide tables the session's spans index into
 //      (`diag::GlobalTables`) and the stamp counters ride in `Roots`.
+//      With `LUST_FRONT_SAVE=background` a forked child writes them while
+//      the build answers and exits (`save_background`). Every image
+//      process holds the state directory's lock (`lock`) from before its
+//      load to its exit, a background save's child to the save's end: a
+//      build waits for the save before it, and a release waits for its
+//      own (`flock <dir>/lock true`) before it caches the directory.
 //   4. The next run maps the layers back at their addresses, newest pages
 //      last (`load`: MAP_PRIVATE, so pages load lazily and no layer file is
 //      ever written), and uses the restored session. A free of a restored
@@ -52,8 +58,15 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 pub const STATE_ENV: &str = "LUST_FRONT_STATE";
 /// Set for the re-executed process: the arena base address, in hex.
 const ARENA_ENV: &str = "LUST_FRONT_ARENA";
+/// `LUST_FRONT_SAVE=background`: the build answers and exits first, a
+/// forked child saves (`save_background`).
+pub const SAVE_ENV: &str = "LUST_FRONT_SAVE";
 /// The image file in the state directory.
 const IMAGE_FILE: &str = "front.img";
+/// The state directory's lock file (`lock`).
+const LOCK_FILE: &str = "lock";
+/// A background save's result line, in the state directory.
+const SAVE_LOG: &str = "save.log";
 /// Image format. Bump on any change to the header or to what `Roots` holds.
 const MAGIC: &[u8; 8] = b"LUSTFIM3";
 /// Arena bases come from this window, one generation after another:
@@ -85,6 +98,11 @@ unsafe extern "C" {
     fn pread(fd: c_int, buf: *mut c_void, count: usize, off: i64) -> isize;
     fn pwrite(fd: c_int, buf: *const c_void, count: usize, off: i64) -> isize;
     fn copy_file_range(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: u32) -> isize;
+    fn flock(fd: c_int, op: c_int) -> c_int;
+    fn fork() -> c_int;
+    fn setsid() -> c_int;
+    fn dup2(old: c_int, new: c_int) -> c_int;
+    fn _exit(code: c_int) -> !;
     fn mi_manage_os_memory_ex(
         start: *mut c_void,
         size: usize,
@@ -106,6 +124,8 @@ const MAP_ANONYMOUS: c_int = 0x20;
 const MAP_NORESERVE: c_int = 0x4000;
 const MAP_FIXED_NOREPLACE: c_int = 0x10_0000;
 const ADDR_NO_RANDOMIZE: u64 = 0x0040000;
+const LOCK_EX: c_int = 2;
+const EINTR: i32 = 4;
 /// `mi_option_disallow_os_alloc` in mimalloc 3.3 (libmimalloc-sys 0.1.49).
 const MI_OPTION_DISALLOW_OS_ALLOC: c_int = 17;
 
@@ -274,6 +294,13 @@ pub fn reexec(dir: &Path) -> String {
     // again (that would loop).
     if REEXECED.load(Ordering::Relaxed) {
         return "arena setup failed".into();
+    }
+    // A background save of the build before this one writes the header
+    // read next: wait for its lock (`lock`), then let it go; the new
+    // process takes it again before its load.
+    if let Ok(f) = std::fs::File::open(dir.join(LOCK_FILE)) {
+        use std::os::fd::AsRawFd;
+        flock_wait(f.as_raw_fd());
     }
     // Above the image's regions, or the window's start when the image is
     // unusable or the window is used up (`load` then refuses the image).
@@ -931,28 +958,124 @@ fn modified_runs(runs: &[(usize, usize)]) -> Result<Vec<(usize, usize)>, String>
     Ok(out)
 }
 
+/// Set once this process holds the state directory's lock.
+static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Takes the state directory's lock for the rest of this process (call it
+/// before `load`): one image process per directory at a time, so a build
+/// waits for the one before it to end, background save included. The lock
+/// belongs to the file's open description, which a forked child shares;
+/// it goes when the last process holding it exits. Without it (no
+/// directory, no `flock`) the build still goes on.
+pub fn lock(dir: &Path) {
+    use std::os::fd::IntoRawFd;
+    let _ = std::fs::create_dir_all(dir);
+    let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(LOCK_FILE)) else { return };
+    // Never closed: the lock lasts to exit. Close-on-exec, so compilers
+    // and linkers the build starts do not hold it.
+    let fd = f.into_raw_fd();
+    if flock_wait(fd) {
+        LOCKED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Takes the lock on open file `fd`, waiting for its holder. False when
+/// `flock` fails.
+fn flock_wait(fd: c_int) -> bool {
+    loop {
+        // SAFETY: `fd` is an open file.
+        if unsafe { flock(fd, LOCK_EX) } == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(EINTR) {
+            return false;
+        }
+    }
+}
+
+/// Stops every other thread for a save: the pool's threads end (they
+/// start lazily, through a helper that may still be starting them), and
+/// detached drops finish. The pool stays stopped: the process exits after
+/// the save.
+fn quiesce() {
+    std::mem::forget(crate::pool::stop());
+    crate::pool::wait_detached();
+}
+
+/// `save` in a forked child (`LUST_FRONT_SAVE=background`), so the build
+/// answers and exits at once and a release publishes its artifact without
+/// waiting (a base save takes 10-18 s on tsgo). The child is this
+/// process's memory at the fork with this thread alone; it detaches (its
+/// own session, standard streams on /dev/null, so no pipe of the caller
+/// waits for it), holds the state lock until it exits (`lock`), and
+/// writes its result line to `save.log` in the state directory. Here the
+/// session is leaked: the process exits next. Saves here when the fork
+/// fails.
+pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
+    use std::os::fd::AsRawFd;
+    if !arena_on() {
+        return Err("not an image process".into());
+    }
+    // Before the fork: the child gets only this thread.
+    quiesce();
+    let log = dir.join(SAVE_LOG);
+    let _ = std::fs::remove_file(&log);
+    let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
+    // SAFETY: no other thread runs (`quiesce`), so the child's copy of
+    // the heap and of every lock in it is consistent.
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        // SAFETY: calls on this process's own session and descriptors.
+        unsafe {
+            setsid();
+            (0..3).for_each(|fd| {
+                dup2(null.as_raw_fd(), fd);
+            });
+        }
+        let line = write_image(dir, roots).unwrap_or_else(|e| format!("lust: front state not saved: {e}"));
+        let _ = std::fs::write(&log, line + "\n");
+        // SAFETY: ends the child now; the parent's exit handlers and
+        // buffered output are the parent's to run.
+        unsafe { _exit(0) }
+    }
+    if pid < 0 {
+        return write_image(dir, roots);
+    }
+    std::mem::forget(roots);
+    Ok(format!("lust: front state saving in the background: pid {pid}, result in {}", log.display()))
+}
+
 /// Writes the image of `roots` and returns a one-line summary. After a
 /// cold build, or when the deltas on the base grew large or many, a new
 /// base: the restored runs whole (zero pages as holes) plus the arena's
 /// live pages, and the old deltas go. Else a delta on top of the loaded
 /// layers: only the restored pages this process wrote, plus the arena's
 /// live pages. Files go through a temp name and a rename, so a mapped
-/// layer is never written. Nothing may run on other threads: the caller
-/// settles the session first.
+/// layer is never written. The caller settles the session first; other
+/// threads stop here (`quiesce`).
 pub fn save(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
-    use std::io::{Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
     if !arena_on() {
         return Err("not an image process".into());
     }
+    quiesce();
+    write_image(dir, roots)
+}
+
+/// `save` once no other thread runs.
+fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
     let t = std::time::Instant::now();
-    // No other thread may allocate or free from here on: the pool's
-    // threads end (they start lazily, through a helper that may still be
-    // starting them), and detached drops finish. The pool stays stopped:
-    // the process exits after the save.
-    std::mem::forget(crate::pool::stop());
-    crate::pool::wait_detached();
     std::fs::create_dir_all(dir).map_err(|e| format!("state dir: {e}"))?;
+    // Under the lock, a temp layer is that of a save that died (a killed
+    // background child): it would ride along in a cached directory.
+    if LOCKED.load(Ordering::Relaxed) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if e.file_name().to_string_lossy().starts_with("front.tmp") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let restored = restored_runs();
     let loaded = LOADED.get().filter(|_| !restored.is_empty());
     let delta = loaded.filter(|l| l.layers <= MAX_DELTAS && l.delta_bytes < l.base_live / 2);
