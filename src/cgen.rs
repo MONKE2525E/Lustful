@@ -4,6 +4,7 @@ use crate::ast::{BinOp, FmtKind, FmtSpec, UnOp};
 use crate::check::Builtin;
 use crate::check::collect::*;
 use crate::diag::{SourceMap, Span};
+use crate::ir::dropflags::Store;
 use crate::ir::*;
 use crate::ty::lang::{self, SigTy};
 use crate::ty::layout::{self, EnumTag, Layout, Niche, ReprKind, niche_tag_value};
@@ -2216,19 +2217,21 @@ fn inline_attr(p: &Program, f: LocalDefId) -> InlineAttr {
     out
 }
 
-/// Static drop flags (`ir::dropflags`): on for the C backends; off for the LLVM backend, whose
+/// Static drop flags (`ir::dropflags`): on for the C backends, with their runtime flags' static
+/// tests folded and their dead stores left out (`fine`); off for the LLVM backend, whose
 /// optimizer folds constant flags itself (with the pass, tsgo's LLVM build ran about 1% slower:
 /// small drop glue is called out of line more often). `LUST_DROPFLAGS=0` turns the pass off
-/// (every drop flag a runtime flag, as before it) and `LUST_DROPFLAGS=1` on for both backends,
-/// for A/B runs.
-fn static_drop_flags(p: &Program) -> bool {
-    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    let env = *ENV.get_or_init(|| match std::env::var("LUST_DROPFLAGS").as_deref() {
-        Ok("0") => Some(false),
-        Ok("1") => Some(true),
-        _ => None,
-    });
-    env.unwrap_or_else(|| !ll::on(p))
+/// (every drop flag a runtime flag, as before it), `=1` on for both backends, `=coarse` on with
+/// per-local flags only (round 5's form), for A/B runs. Returns (on, fine).
+fn static_drop_flags(p: &Program) -> (bool, bool) {
+    static ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let llvm = ll::on(p);
+    match ENV.get_or_init(|| std::env::var("LUST_DROPFLAGS").ok()).as_deref() {
+        Some("0") => (false, false),
+        Some("1") => (true, !llvm),
+        Some("coarse") => (true, false),
+        _ => (!llvm, !llvm),
+    }
 }
 
 impl<'b, 'p> FnGen<'b, 'p> {
@@ -2238,8 +2241,9 @@ impl<'b, 'p> FnGen<'b, 'p> {
         let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
         let local_drop: Vec<bool> = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
         let n_locals = local_cty.len();
-        let dflags = if static_drop_flags(p) {
-            crate::ir::dropflags::analyze(body, &local_drop)
+        let (on, fine) = static_drop_flags(p);
+        let dflags = if on {
+            crate::ir::dropflags::analyze(body, &local_drop, fine)
         } else {
             crate::ir::dropflags::DropFlags::all_runtime(n_locals)
         };
@@ -2451,7 +2455,7 @@ impl FnGen<'_, '_> {
                 } else if is_param {
                     frame_init.push(format!("L.l{i} = p{i};"));
                 }
-                if self.local_drop[i] && self.dflags.keeps(i as Local) {
+                if self.local_drop[i] && self.dflags.entry(i as Local) {
                     frame_init.push(format!("L.d{i} = {};", is_param as u8));
                 }
                 for k in 0..self.move_paths[i].len() {
@@ -2488,8 +2492,11 @@ impl FnGen<'_, '_> {
                     None => by_type.push((ct, vec![decl])),
                 }
             }
-            if self.local_drop[i] && self.dflags.keeps(i as Local) {
+            if self.local_drop[i] && self.dflags.entry(i as Local) {
                 flags.push(format!("d{i} = {}", is_param as u8));
+            } else if self.local_drop[i] && self.dflags.keeps(i as Local) {
+                // No test reads the entry value (`ir::dropflags` liveness).
+                flags.push(format!("d{i}"));
             }
             for k in 0..self.move_paths[i].len() {
                 flags.push(format!("m{i}_{k} = 1"));
@@ -2688,15 +2695,19 @@ impl FnGen<'_, '_> {
     fn drop_old_value(&mut self, dest: &Place, d: &str, dt: &CTy) -> (String, String) {
         let l = dest.local;
         if dest.proj.is_empty() {
-            if !self.dflags.keeps(l) {
-                // A static flag: the old value drops here on every path, or on none. The drop is
-                // made either way, so the glue it names stays wanted (other C names it too).
-                let old = self.elab_drop(l, &[]);
-                let old = if self.dflags.test(self.at, l) == Some(true) { old } else { String::new() };
-                return (old, self.reset_move_flags(l, &[]));
-            }
+            // A flag store no test reads is left out (`ir::dropflags` liveness).
+            let set = if self.dflags.store(self.at, l, Store::Set) { format!(" d{l} = 1;") } else { String::new() };
             let old = self.elab_drop(l, &[]);
-            return (format!(" if (d{l}) {{{old} }}"), format!(" d{l} = 1;{}", self.reset_move_flags(l, &[])));
+            return match self.dflags.test(self.at, l) {
+                // The old value drops here on every path, or on none. The drop is made either
+                // way, so the glue it names stays wanted (other C names it too).
+                Some(true) => {
+                    let clear = if self.dflags.store(self.at, l, Store::DropClear) { format!(" d{l} = 0;") } else { String::new() };
+                    (format!("{clear}{old}"), format!("{set}{}", self.reset_move_flags(l, &[])))
+                }
+                Some(false) => (String::new(), format!("{set}{}", self.reset_move_flags(l, &[]))),
+                None => (format!(" if (d{l}) {{{old} }}"), format!("{set}{}", self.reset_move_flags(l, &[]))),
+            };
         }
         if let Some(path) = self.steps_of(dest)
             && self.move_paths[l as usize].iter().any(|p| p.starts_with(&path))
@@ -3301,7 +3312,7 @@ impl FnGen<'_, '_> {
                     if pl.proj.is_empty() {
                         // Moving the whole local: it owns nothing now (a static flag has
                         // nothing to clear).
-                        if self.dflags.keeps(pl.local) {
+                        if self.dflags.store(self.at, pl.local, Store::Clear) {
                             post.push(format!("d{} = 0;", pl.local));
                         }
                     } else if let Some(path) = self.steps_of(pl)
@@ -3424,7 +3435,7 @@ impl FnGen<'_, '_> {
                 let (drop_old, refill) = self.drop_old_value(dest, &d, &dt);
                 // A drop that panics leaves the local unowned, so its
                 // cleanup does not drop it again.
-                let drop_old = if dest.proj.is_empty() && self.dflags.keeps(dest.local) {
+                let drop_old = if dest.proj.is_empty() && self.dflags.keeps(dest.local) && self.dflags.test(self.at, dest.local).is_none() {
                     drop_old.replacen(" {", &format!(" {{ d{} = 0;", dest.local), 1)
                 } else {
                     drop_old
@@ -3523,12 +3534,18 @@ impl FnGen<'_, '_> {
             StmtKind::Drop(l) => {
                 if self.local_drop[*l as usize] {
                     let what = self.elab_drop(*l, &[]);
-                    if self.dflags.keeps(*l) {
-                        let _ = writeln!(self.out, "  if (d{l}) {{ d{l} = 0;{what} }}");
-                    } else if self.dflags.test(self.at, *l) == Some(true) {
-                        // A static flag set on every path here: the drop is unconditional. (Clear
-                        // on every path: no drop, but its glue stays wanted, as other C names it.)
-                        let _ = writeln!(self.out, " {what}");
+                    match self.dflags.test(self.at, *l) {
+                        None => {
+                            let _ = writeln!(self.out, "  if (d{l}) {{ d{l} = 0;{what} }}");
+                        }
+                        // Set on every path here: the drop is unconditional; a runtime flag is
+                        // cleared first when a test can read it. (Clear on every path: no
+                        // drop, but its glue stays wanted, as other C names it.)
+                        Some(true) => {
+                            let clear = if self.dflags.store(self.at, *l, Store::DropClear) { format!(" d{l} = 0;") } else { String::new() };
+                            let _ = writeln!(self.out, " {clear}{what}");
+                        }
+                        Some(false) => {}
                     }
                 }
             }
@@ -3606,7 +3623,7 @@ impl FnGen<'_, '_> {
                     && matches!(target, CallTarget::Fn(_) | CallTarget::Dyn(_) | CallTarget::Indirect(_))
                     && (!needs_drop_c(self.p, &dest_cty)
                         || self.flags_at_term.get(self.cur_bb).is_some_and(|f| !f[dest.local as usize])
-                        || (!self.dflags.keeps(dest.local) && self.dflags.test(self.at, dest.local) == Some(false)));
+                        || self.dflags.test(self.at, dest.local) == Some(false));
                 if direct {
                     let d = self.place(dest, &loc).0;
                     self.out.push_str("  {\n");
@@ -3623,7 +3640,7 @@ impl FnGen<'_, '_> {
                     }
                     if needs_drop_c(self.p, &dest_cty) {
                         let l = dest.local;
-                        let set = if self.dflags.keeps(l) { format!(" d{l} = 1;") } else { String::new() };
+                        let set = if self.dflags.store(self.at, l, Store::Set) { format!(" d{l} = 1;") } else { String::new() };
                         let _ = writeln!(self.out, "   {set}{}", self.reset_move_flags(l, &[]));
                     }
                     self.out.push_str("  }\n");

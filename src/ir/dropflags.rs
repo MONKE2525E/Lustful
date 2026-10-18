@@ -21,8 +21,15 @@
 // its destination's flag clear for the old value's drop. That covers both unwinding modes (with
 // unwind tables a panic leaves from inside the statement; with flags, from the check after the
 // call that panicked).
+//
+// For the C backends (`fine`) a flag that stays a runtime flag is elaborated per test too: a test
+// that sees one value on every path folds to a constant, as rustc folds each drop site, and only
+// the tests that see either value read the flag. A backward liveness over the same edges then
+// finds the stores no such test can read before the next store (the entry value, a move's clear,
+// an assignment's set, the clear before a drop that always runs), and codegen leaves them out:
+// clang cannot, because the frame struct holding the flag escapes to the cleanup.
 // Move flags (`m{l}_{k}`, partial moves) are not changed here.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{Body, Local, Operand, Place, Proj, Rvalue, StmtKind, Terminator, rvalue_moves};
 
@@ -47,16 +54,32 @@ pub struct DropFlags {
     /// Per local: its flag stays a runtime flag (a test sees a value that depends on the path).
     /// A local with no flag counts as kept: codegen treats it as before this pass.
     dynamic: Vec<bool>,
-    /// For a local whose flag is static: the local tested at (block, statement index) and the
-    /// value its test sees. An index equal to the block's statement count names its `Call`
-    /// terminator.
-    tests: HashMap<(u32, u32), (Local, bool)>,
+    /// (block, statement index) -> the local tested there and the value its test sees (CLEAR,
+    /// SET or DYN). An index equal to the block's statement count names its `Call` terminator.
+    tests: HashMap<(u32, u32), (Local, u8)>,
+    /// Runtime flags too fold their static tests and leave out their dead stores (C backends).
+    fine: bool,
+    /// Per local: its flag's entry value can be read by a test (`fine` only).
+    entry_live: Vec<bool>,
+    /// Stores of a runtime flag no test reads before the next store (`fine` only).
+    dead: HashSet<(u32, u32, Local, Store)>,
+}
+
+/// A store to a runtime flag, by where codegen makes it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Store {
+    /// A move of the whole local clears it (`FnGen::operand`).
+    Clear,
+    /// An assignment to the whole local sets it after the old value (`drop_old_value`).
+    Set,
+    /// A drop that runs on every path clears it first: a `Drop`, an assignment's old value.
+    DropClear,
 }
 
 impl DropFlags {
     /// Every flag a runtime flag: codegen as before this pass (`LUST_DROPFLAGS=0`).
     pub fn all_runtime(n_locals: usize) -> DropFlags {
-        DropFlags { dynamic: vec![true; n_locals], tests: HashMap::new() }
+        DropFlags { dynamic: vec![true; n_locals], tests: HashMap::new(), fine: false, entry_live: Vec::new(), dead: HashSet::new() }
     }
 
     /// The local keeps a runtime flag (codegen declares, stores and tests `d{l}`).
@@ -64,21 +87,30 @@ impl DropFlags {
         self.dynamic.get(l as usize).copied().unwrap_or(true)
     }
 
-    /// The value the test of a static flag at (block, statement index) sees: true drops, false
-    /// does not. None for a runtime flag.
+    /// The value the test of `l`'s flag at (block, statement index) sees when it is the same on
+    /// every path: true drops, false does not. None: a runtime test of a runtime flag.
     pub fn test(&self, at: (u32, u32), l: Local) -> Option<bool> {
-        if self.keeps(l) {
-            return None;
-        }
         match self.tests.get(&at) {
-            Some(&(t, v)) if t == l => Some(v),
+            Some(&(t, v)) if t == l => (v != DYN && (self.fine || !self.keeps(l))).then_some(v == SET),
+            _ if self.keeps(l) => None,
             _ => panic!("drop flag of l{l} tested at {at:?} with no static value"),
         }
+    }
+
+    /// Codegen makes this store to `l`'s runtime flag at (block, statement index).
+    pub fn store(&self, at: (u32, u32), l: Local, kind: Store) -> bool {
+        self.keeps(l) && !self.dead.contains(&(at.0, at.1, l, kind))
+    }
+
+    /// Codegen gives `l`'s runtime flag its entry value.
+    pub fn entry(&self, l: Local) -> bool {
+        self.keeps(l) && self.entry_live.get(l as usize).copied().unwrap_or(true)
     }
 }
 
 /// The drop flags of `body`. `flagged[l]`: codegen gives local `l` a flag (its type needs drop).
-pub fn analyze(body: &Body, flagged: &[bool]) -> DropFlags {
+/// `fine`: also fold the static tests of runtime flags and find their dead stores.
+pub fn analyze(body: &Body, flagged: &[bool], fine: bool) -> DropFlags {
     let n = body.locals.len();
     let mut idx = vec![usize::MAX; n];
     let mut m = 0;
@@ -239,8 +271,248 @@ pub fn analyze(body: &Body, flagged: &[bool]) -> DropFlags {
             dynamic[l as usize] = true;
         }
     }
-    let tests = tests.into_iter().filter(|(_, (l, _))| !dynamic[*l as usize]).map(|(at, (l, v))| (at, (l, v == SET))).collect();
-    DropFlags { dynamic, tests }
+    let (entry_live, dead) = if fine { liveness(body, &dynamic, &idx, &tests, &unw) } else { (Vec::new(), HashSet::new()) };
+    DropFlags { dynamic, tests, fine, entry_live, dead }
+}
+
+/// A set of runtime flags, by their index among a body's runtime flags.
+#[derive(Clone, PartialEq)]
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn new(n: usize) -> Bits {
+        Bits(vec![0; n.div_ceil(64)])
+    }
+    fn has(&self, k: usize) -> bool {
+        self.0[k / 64] >> (k % 64) & 1 == 1
+    }
+    fn add(&mut self, k: usize) {
+        self.0[k / 64] |= 1 << (k % 64);
+    }
+    fn del(&mut self, k: usize) {
+        self.0[k / 64] &= !(1 << (k % 64));
+    }
+    fn or(&mut self, o: &Bits) {
+        self.0.iter_mut().zip(&o.0).for_each(|(a, b)| *a |= b);
+    }
+    fn or_but(&mut self, o: &Bits, k: usize) {
+        let had = self.has(k);
+        self.or(o);
+        if !had {
+            self.del(k);
+        }
+    }
+}
+
+/// Backward liveness of the runtime flags (`dynamic`): a flag is live where a runtime test (one
+/// whose value in `tests` is DYN: a `Drop`, an old-value drop, also in a cleanup reached by an
+/// unwind edge) may read it before the next store. Returns per local whether its entry value is
+/// live, and the dead stores. A folded test reads nothing; a drop that runs on every path clears
+/// the flag first (`Store::DropClear`), which a cleanup reached from inside that drop reads.
+fn liveness(
+    body: &Body,
+    dynamic: &[bool],
+    idx: &[usize],
+    tests: &HashMap<(u32, u32), (Local, u8)>,
+    unw: &HashMap<(u32, u32), usize>,
+) -> (Vec<bool>, HashSet<(u32, u32, Local, Store)>) {
+    let n = body.locals.len();
+    // Runtime flags only, by a dense index.
+    let mut kidx = vec![usize::MAX; n];
+    let mut local_of = Vec::new();
+    for l in 0..n {
+        if dynamic[l] && idx[l] != usize::MAX {
+            kidx[l] = local_of.len();
+            local_of.push(l as Local);
+        }
+    }
+    let m = local_of.len();
+    if m == 0 {
+        return (vec![false; n], HashSet::new());
+    }
+    let rt = |p: &Place| if p.proj.is_empty() { kidx.get(p.local as usize).copied().filter(|&k| k != usize::MAX) } else { None };
+    let nb = body.blocks.len();
+    let mut preds = vec![Vec::new(); nb];
+    for (b, block) in body.blocks.iter().enumerate() {
+        for t in super::succ(&block.term) {
+            preds[t.0 as usize].push(b);
+        }
+    }
+    for &(b, _, u) in &body.stmt_unwind {
+        preds[u.0 as usize].push(b.0 as usize);
+    }
+    let mut live_in = vec![Bits::new(m); nb];
+    let mut dead = HashSet::new();
+    // The value the test at a position sees, for its local.
+    let tv = |b: u32, i: u32, l: Local| tests.get(&(b, i)).filter(|(t, _)| *t == l).map(|&(_, v)| v);
+    let block_live = |b: usize, live_in: &[Bits], dead: &mut Option<&mut HashSet<(u32, u32, Local, Store)>>| -> Bits {
+        let block = &body.blocks[b];
+        let bu = b as u32;
+        let nst = block.stmts.len() as u32;
+        let mut mark = |at: u32, l: Local, kind: Store, live: bool| {
+            if !live && let Some(d) = dead.as_deref_mut() {
+                d.insert((bu, at, l, kind));
+            }
+        };
+        let edge = |i: u32| unw.get(&(bu, i)).map(|&u| &live_in[u]);
+        let mut live = Bits::new(m);
+        // An old value's drop at (block, index) of a flagged `dest`, after the statement's moves:
+        // `live` is what is live after the set that follows it.
+        let old_value = |live: &mut Bits, at: u32, dest: &Place, cleanup: Option<&Bits>, mark: &mut dyn FnMut(u32, Local, Store, bool)| {
+            let k = rt(dest);
+            if let Some(k) = k {
+                mark(at, dest.local, Store::Set, live.has(k));
+                live.del(k);
+            }
+            match tv(bu, at, dest.local) {
+                // A runtime test: the old value's drop unwinds with the flag already clear.
+                Some(DYN) | Some(NONE) => match (cleanup, k) {
+                    (Some(c), Some(k)) => {
+                        live.or_but(c, k);
+                        live.add(k);
+                    }
+                    (Some(c), None) => live.or(c),
+                    (None, Some(k)) => live.add(k),
+                    (None, None) => {}
+                },
+                Some(SET) => {
+                    if let Some(c) = cleanup {
+                        if let Some(k) = k {
+                            mark(at, dest.local, Store::DropClear, c.has(k));
+                            live.or_but(c, k);
+                        } else {
+                            live.or(c);
+                        }
+                    } else if k.is_some() {
+                        mark(at, dest.local, Store::DropClear, false);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if let Some(c) = cleanup {
+                        live.or(c);
+                    }
+                }
+            }
+        };
+        match &block.term {
+            Terminator::Goto(t) => live.or(&live_in[t.0 as usize]),
+            Terminator::If(_, a, c) => {
+                live.or(&live_in[a.0 as usize]);
+                live.or(&live_in[c.0 as usize]);
+            }
+            Terminator::Switch(_, cases, other) => {
+                for (_, t) in cases {
+                    live.or(&live_in[t.0 as usize]);
+                }
+                live.or(&live_in[other.0 as usize]);
+            }
+            Terminator::Call { args, dest, next, unwind, .. } => {
+                live.or(&live_in[next.0 as usize]);
+                let c = unwind.map(|u| &live_in[u.0 as usize]);
+                old_value(&mut live, nst, dest, c, &mut mark);
+                // The call itself unwinds with the destination's old value still there.
+                if let Some(c) = c {
+                    live.or(c);
+                }
+                for a in args {
+                    if let Operand::Move(p) = a
+                        && let Some(k) = rt(p)
+                    {
+                        mark(nst, p.local, Store::Clear, live.has(k));
+                        live.del(k);
+                    }
+                }
+            }
+            Terminator::Panic(_) | Terminator::Return | Terminator::Unreachable => {}
+        }
+        if !matches!(block.term, Terminator::Call { .. })
+            && let Some(c) = edge(nst)
+        {
+            live.or(c);
+        }
+        for (si, st) in block.stmts.iter().enumerate().rev() {
+            let si = si as u32;
+            let c = edge(si);
+            match &st.kind {
+                StmtKind::Assign(dest, rv) => {
+                    if idx.get(dest.local as usize).is_some_and(|&k| k != usize::MAX) && dest.proj.is_empty() {
+                        old_value(&mut live, si, dest, c, &mut mark);
+                    } else if let Some(c) = c {
+                        live.or(c);
+                    }
+                    let mut moved = Vec::new();
+                    rvalue_moves(rv, &mut moved);
+                    for p in moved {
+                        if let Some(k) = rt(p) {
+                            mark(si, p.local, Store::Clear, live.has(k));
+                            live.del(k);
+                        }
+                    }
+                    if let Some(c) = c
+                        && may_panic_before_moves(dest, rv)
+                    {
+                        live.or(c);
+                    }
+                }
+                StmtKind::Drop(l) => match tv(bu, si, *l) {
+                    Some(DYN) | Some(NONE) => {
+                        if let Some(c) = c {
+                            live.or(c);
+                        }
+                        if let Some(k) = rt(&Place::local(*l)) {
+                            live.add(k);
+                        }
+                    }
+                    Some(SET) => {
+                        let k = rt(&Place::local(*l));
+                        if let Some(c) = c {
+                            live.or(c);
+                        }
+                        if let Some(k) = k {
+                            mark(si, *l, Store::DropClear, live.has(k));
+                            live.del(k);
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some(c) = c {
+                            live.or(c);
+                        }
+                    }
+                },
+                StmtKind::Print { .. } | StmtKind::StorageDead(_) | StmtKind::FakeRead(_) => {
+                    if let Some(c) = c {
+                        live.or(c);
+                    }
+                }
+            }
+        }
+        live
+    };
+    let mut work: Vec<usize> = (0..nb).collect();
+    let mut queued = vec![true; nb];
+    while let Some(b) = work.pop() {
+        queued[b] = false;
+        let li = block_live(b, &live_in, &mut None);
+        if li != live_in[b] {
+            live_in[b] = li;
+            for &p in &preds[b] {
+                if !queued[p] {
+                    queued[p] = true;
+                    work.push(p);
+                }
+            }
+        }
+    }
+    for b in 0..nb {
+        block_live(b, &live_in, &mut Some(&mut dead));
+    }
+    let mut entry_live = vec![false; n];
+    for (k, &l) in local_of.iter().enumerate() {
+        entry_live[l as usize] = live_in[0].has(k);
+    }
+    (entry_live, dead)
 }
 
 /// Whether an assignment of `rv` to `dest` can panic before its moves are done: an indexed
