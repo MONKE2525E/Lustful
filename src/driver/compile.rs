@@ -275,13 +275,16 @@ struct Visits {
     reads: usize,
     /// Slots the keyed walk after a header delta answered (`keyed_dirty`).
     keyed: usize,
+    /// Generic reuse for this request: `on`, else why it was off (a
+    /// generic program then rechecks and regenerates every concrete body).
+    generic: &'static str,
 }
 
 impl Visits {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={} reads={} keyed={}",
+            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={} reads={} keyed={} generic={}",
             self.path,
             if self.why.is_empty() { "-".to_string() } else { self.why.replace(' ', "_") },
             self.files,
@@ -295,7 +298,8 @@ impl Visits {
             if self.kept.is_empty() { "-".to_string() } else { self.kept.replace(' ', "_") },
             self.prog_spans,
             self.reads,
-            self.keyed
+            self.keyed,
+            if self.generic.is_empty() { "-" } else { self.generic }
         );
     }
 }
@@ -1163,27 +1167,28 @@ fn file_text_hash(map: &SourceMap, file: FileId) -> u64 {
     std::hash::Hasher::finish(&h)
 }
 
-/// The Adt and top-level static indices `collect` will assign for
-/// one Ast under the session `DefOrder`, predicted with the same
-/// hash and rank rules collect uses, plus whether this Ast has a
-/// shape whose derived indices can shift on growth (a nested
-/// static). Instance Adt ids are session places that new instances
-/// do not move; the build checks them itself (`inst_adt_ids`) and
-/// regenerates C if one ever names another instance. The slot update
-/// compares the prediction with the last parse's indices: cached
-/// output carries session-local indices (CTy in glue and type
-/// sets, static indices in IR), so it is reusable only when every
-/// old def keeps its index.
+/// The Adt and static indices `collect` will assign for one Ast under the
+/// session `DefOrder`, predicted with the same hash and rank rules collect
+/// uses: every Adt (body types included) and every static (nested ones by
+/// `collect::nested_static_hashes` over `fns`, every fn's body and def
+/// hash in LocalDefId order) ranks by identity, append-only, so an added
+/// item moves no other item's index. Instance Adt ids are session places
+/// that new instances do not move; the build checks them itself
+/// (`inst_adt_ids`) and regenerates C if one ever names another instance.
+/// The slot update compares the prediction with the last parse's indices:
+/// cached output carries session-local indices (CTy in glue and type sets,
+/// static indices in IR), so it is reusable only when every old def keeps
+/// its index (a removed def moves the ranks after it).
 fn predicted_def_ids(
     ast: &Ast,
     interner: &Interner,
     stable: StableCrateHash,
     order: &collect::DefOrder,
-) -> (FxMap<crate::def::DefPathHash, u32>, FxMap<crate::def::DefPathHash, u32>, bool) {
+    fns: &[(Option<crate::ast::BlockId>, crate::def::DefPathHash)],
+) -> (FxMap<crate::def::DefPathHash, u32>, FxMap<crate::def::DefPathHash, u32>) {
     let mut adt_hashes: Vec<crate::def::DefPathHash> = Vec::new();
     let mut static_hashes: Vec<crate::def::DefPathHash> = Vec::new();
     let mut counts: FxMap<Sym, u32> = FxMap::default();
-    let mut fragile = false;
     for item in &ast.items {
         match &item.kind {
             ItemKind::Struct(s) => {
@@ -1238,11 +1243,8 @@ fn predicted_def_ids(
                 adt_hashes.push(h);
             }
         }
-        // A type item in a body can shift derived indexes like a
-        // nested static does: growth there still clears.
-        fragile |= ast.stmt_items.iter().any(|item| matches!(item.kind, ItemKind::Struct(_) | ItemKind::Enum(_)));
     }
-    fragile |= ast.stmt_items.iter().any(|item| matches!(item.kind, ItemKind::Static(_)));
+    static_hashes.extend(collect::nested_static_hashes(ast, interner, stable, fns).into_iter().flatten());
     // Collect also numbers the synthetic std Adts (check/collect.rs
     // pass 1), always (a user type of the same name only shadows its
     // flat name): predict the same extra hashes.
@@ -1254,7 +1256,20 @@ fn predicted_def_ids(
     };
     let adts = to_map(&adt_hashes, collect::stable_ranks_preview(&order.adts, &adt_hashes));
     let statics = to_map(&static_hashes, collect::stable_ranks_preview(&order.statics, &static_hashes));
-    (adts, statics, fragile)
+    (adts, statics)
+}
+
+/// True when every static of `prev` that `new` still has keeps its index
+/// (an index is a static's place in `Program::statics`).
+fn statics_kept(prev: &[crate::def::DefId], new: &[crate::def::DefId]) -> bool {
+    let at: FxMap<crate::def::DefId, usize> = new.iter().enumerate().map(|(i, d)| (*d, i)).collect();
+    prev.iter().enumerate().all(|(i, d)| at.get(d).is_none_or(|&j| j == i))
+}
+
+/// Every fn's body and def hash in LocalDefId order (`fn_loc` and its
+/// `fn_keys`), as `predicted_def_ids` takes them.
+fn fn_bodies(ast: &Ast, fn_loc: &[(usize, Option<usize>)], keys: &[FnKey]) -> Vec<(Option<crate::ast::BlockId>, crate::def::DefPathHash)> {
+    fn_loc.iter().zip(keys).map(|(&(item, sub), k)| (fn_def_at(ast, item, sub).body, k.disk.hash)).collect()
 }
 
 /// True when every def in `prev` is present in `new` at the same index.
@@ -1341,18 +1356,25 @@ fn slot_update(
         caches.derive_only = false;
     }
     let had_env = after_reject || front.env_hash.is_some();
+    // Fn keys (stable fn identities) first: nested statics fold their
+    // identity from the fn that holds them (`predicted_def_ids`).
+    let keys = narrow.is_none().then(|| {
+        let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
+        t.lap("slots: fn keys");
+        keys
+    });
     let (changed_names, nonfn_changed, ids_stable) = if narrow.is_some() {
         front.ids_forced_full = false;
         (changed_names, false, had_env)
     } else {
+        let fns = fn_bodies(&front.ast, &front.fn_loc, keys.as_deref().unwrap_or(&[]));
         // Cached output stays reusable in full mode when every Adt and
         // static of the last parse keeps its session-local index in
         // this parse (pure additions append at the end of the session
-        // order), except that growth in a fragile program (a nested
-        // static) can shift derived indices the maps do not name, so
-        // growth there still clears. (Instance Adt ids of a generic
-        // program shift too; a build regenerates C when they move.)
-        let (mut adt_ids, mut static_ids, mut fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+        // order; body items rank by identity like any other). (Instance
+        // Adt ids of a generic program are session places; a build
+        // regenerates C when they move.)
+        let (mut adt_ids, mut static_ids) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order, &fns);
         // A def order loaded from disk is trusted only when it names at
         // least one def of this parse (`def_order_stale`).
         if front.def_order_loaded {
@@ -1360,17 +1382,12 @@ fn slot_update(
             if def_order_stale(&front.def_order, &adt_ids, &static_ids) {
                 front.def_order = collect::DefOrder::default();
                 front.def_order_stored = 0;
-                (adt_ids, static_ids, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
+                (adt_ids, static_ids) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order, &fns);
             }
         }
-        let grew = adt_ids.len() > front.prev_adt_ids.len() || static_ids.len() > front.prev_static_ids.len();
-        let ids_stable = had_env
-            && ids_kept(&front.prev_adt_ids, &adt_ids)
-            && ids_kept(&front.prev_static_ids, &static_ids)
-            && !(grew && (fragile || front.prev_order_fragile));
+        let ids_stable = had_env && ids_kept(&front.prev_adt_ids, &adt_ids) && ids_kept(&front.prev_static_ids, &static_ids);
         front.prev_adt_ids = adt_ids;
         front.prev_static_ids = static_ids;
-        front.prev_order_fragile = fragile;
         // Bodies and signatures modes keep cached C, which names Adts and
         // statics by index. A fn or body edit can move those indices when a
         // body holds a type item or a static (a removed fn or body item
@@ -1494,8 +1511,7 @@ fn slot_update(
         }
         None
     } else {
-        let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
-        t.lap("slots: fn keys");
+        let keys = keys.expect("fn keys are made when the update is not narrow");
         let mut fn_slot = Vec::with_capacity(keys.len());
         for k in &keys {
             if let Err(c) = def::insert_path(&mut front.slot_paths, k.disk, &k.path) {
@@ -1692,11 +1708,11 @@ fn narrow_moved(front: &Front, crate_ids: CrateIds, edited: &[usize]) -> Option<
     if fn_locations(&front.ast) != front.fn_loc {
         return Some("fn locations");
     }
-    let (adts, statics, fragile) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order);
-    if adts != front.prev_adt_ids || statics != front.prev_static_ids || fragile != front.prev_order_fragile {
+    let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
+    let (adts, statics) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order, &fn_bodies(&front.ast, &front.fn_loc, &keys));
+    if adts != front.prev_adt_ids || statics != front.prev_static_ids {
         return Some("def ids");
     }
-    let keys = fn_keys(&front.ast, &front.fn_loc, &front.interner, crate_ids.stable);
     if keys.len() != front.fn_loc.len() || keys.iter().zip(&front.fn_slot).any(|(k, &s)| front.slot_of.get(&k.disk) != Some(&s)) {
         return Some("slot keys");
     }
@@ -2510,7 +2526,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         front.const_fn_pending = false;
         front.prev_adt_ids.clear();
         front.prev_static_ids.clear();
-        front.prev_order_fragile = false;
         front.prev_static_defs = None;
         front.items.clear();
         front.fn_loc.clear();
@@ -3208,7 +3223,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         changed.sort_unstable();
     }
     // The trait-system half of this joins after collect (`gen_ok`).
-    let mut gen_ok_here = caches.persistent && gen_env.is_some() && !const_fn_changed && !statics_may_move && !front.slots_renumbered;
+    // A const fn edit on a full resolve keeps generic reuse for now: after
+    // collect, if a const or static value of the last program moved, reuse
+    // goes and collect runs again (`ConstValuesFp`, below).
+    let const_fn_checked = const_fn_changed && !matches!(visits.path, "patch" | "item") && front.prev_const_values.is_some();
+    let mut gen_ok_here =
+        caches.persistent && gen_env.is_some() && (!const_fn_changed || const_fn_checked) && !statics_may_move && !front.slots_renumbered;
+    visits.generic = match () {
+        _ if gen_ok_here => "on",
+        _ if !caches.persistent => "one_shot",
+        _ if gen_env.is_none() => "no_env",
+        _ if const_fn_changed => "const_fn",
+        _ if statics_may_move => "statics_unknown",
+        _ => "renumbered",
+    };
     if !gen_ok_here {
         caches.gen_reuse.clear();
     }
@@ -3282,6 +3310,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             kept = Err("gen state");
             const_fn_changed = true;
             gen_ok_here = false;
+            visits.generic = "const_values";
             caches.gen_reuse.clear();
             // Added to the candidates already listed: a failed collect's
             // leftovers (`Front::const_fn_pending`) joined them above, and
@@ -3382,24 +3411,39 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // gives collect's answer (`Front::delta_errs`; the oracle compares it).
     let delta_errs = front.delta_errs.take();
     let delta_answered = delta_errs.is_some();
+    // A const fn edit keeps generic reuse only while no value moves: collect
+    // checks that before it uses an entry (`GenReuse::values_check`).
+    caches.gen_reuse.values_moved = false;
+    caches.gen_reuse.values_check = if const_fn_checked && gen_ok_here { front.prev_const_values.clone() } else { None };
     let collected = match kept {
         Some(r) => r,
         None if delta_errs.is_some() => Err(delta_errs.unwrap_or_default()),
         None => match collect(front, caches) {
-            // Nested statics moved after all (another static count or
-            // order): their indexes did too, so generic reuse goes and
-            // collect runs again without it.
-            Ok(p) if nested_statics && gen_ok_here && front.prev_static_defs.as_ref() != Some(&p.static_defs) => {
+            // A static moved after all (statics rank by identity, so only a
+            // removed one moves the ones after it): generic reuse goes and
+            // collect runs again without it. An added static moves none.
+            Ok(p) if nested_statics && gen_ok_here && !front.prev_static_defs.as_deref().is_some_and(|prev| statics_kept(prev, &p.static_defs)) => {
                 drop(p);
                 caches.gen_reuse.clear();
                 gen_ok_here = false;
+                visits.generic = "statics_moved";
                 collect(front, caches)
+            }
+            // A const fn edit moved a value after all: collect dropped the
+            // reuse entries before using any (`GenReuse::values_check`), so
+            // nothing reused holds an old value; the rest goes as with
+            // generic reuse off.
+            Ok(p) if caches.gen_reuse.values_moved => {
+                gen_ok_here = false;
+                visits.generic = "const_values";
+                Ok(p)
             }
             c => c,
         },
     };
     if let Ok(p) = &collected {
         front.prev_static_defs = Some(p.static_defs.clone());
+        front.prev_const_values = Some(crate::driver::graph::ConstValuesFp::of(p));
     }
     let mut program = match collected {
         Ok(p) => p,
@@ -3471,6 +3515,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue_stale = true;
     }
     let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed && !derives_moved;
+    if gen_ok_here && !gen_ok {
+        visits.generic = if caches.gen_reuse.trait_changed { "trait_key" } else { "derives" };
+    }
     // A program with no generics rechecks every body on a new trait
     // system too. Its plain bodies ask the impls of lang and std traits
     // with no recorded read (format glue's `has_display`/`require_fmt`,
@@ -5088,7 +5135,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
         let collect_src = |src: &str, order: &mut collect::DefOrder| {
             let lexed = lexer::lex(src, ROOT_FILE, 0, &interner).unwrap();
             let ast = parser::parse(&lexed, &interner, &known).unwrap();
-            let (adts, statics, _) = predicted_def_ids(&ast, &interner, ids.stable, order);
+            let (adts, statics) = predicted_def_ids(&ast, &interner, ids.stable, order, &[]);
             let program = collect::collect_with_order(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids, true, order).unwrap();
             for (hash, &id) in &adts {
                 // A synthetic std Adt carries its builtin def, not a

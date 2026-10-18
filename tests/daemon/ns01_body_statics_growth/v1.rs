@@ -1,0 +1,24 @@
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, Ordering};
+static TOP_A: AtomicU32 = AtomicU32::new(10);
+fn bump() -> u32 {
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    HITS.fetch_add(1, Ordering::Relaxed) + 1
+}
+fn label() -> &'static str {
+    static NAME: &str = "first";
+    NAME
+}
+thread_local! {
+    static DEPTH: Cell<u32> = const { Cell::new(5) };
+}
+fn depth() -> u32 {
+    DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get()
+    })
+}
+fn main() {
+    println!("{} {} {} {}", TOP_A.load(Ordering::Relaxed), bump(), bump(), label());
+    println!("{} {}", depth(), depth());
+}

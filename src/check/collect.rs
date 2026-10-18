@@ -5600,6 +5600,14 @@ pub fn collect_reuse(
     // the template checks and discovery that `finish_collect` runs.
     let key = crate::driver::gen_reuse::trait_key(&p, &impl_traits);
     p.gx.reuse.gate(key);
+    // After a const fn edit the entries hold only while every const and
+    // static value of the last program does (all are evaluated by now).
+    if let Some(prev) = p.gx.reuse.values_check.take()
+        && !prev.kept_in(&crate::driver::graph::ConstValuesFp::of(&p))
+    {
+        p.gx.reuse.clear();
+        p.gx.reuse.values_moved = true;
+    }
     // The spliced source std fns route before mono: its body checks
     // resolve `std::process::exit` and the like as the driver's do. A
     // missing fn is the driver's error (it routes again after collect).
@@ -6039,6 +6047,9 @@ struct PendingConst {
     is_static: Option<bool>,
     /// The index in `Program::statics` for a static item.
     static_idx: u32,
+    /// A static's identity (ARCH 1.7; set with `static_idx`): a top-level
+    /// static's item hash, a nested one's `nested_static_hashes` entry.
+    def_hash: crate::def::DefPathHash,
     /// Set for an associated const (never a plain-name lookup).
     assoc: Option<PendingAssoc>,
     /// Set for a `thread_local!` static: whether it is the `const`
@@ -6352,7 +6363,10 @@ fn eval_pending_items(
             }
         }
         let scope = stmt_idx.and_then(|si| scope_of_stmt.get(&si).cloned()).unwrap_or_default();
-        pending.push((PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx, assoc: None, tls, scope }, PendingState::Todo));
+        pending.push((
+            PendingConst { name, stmt_idx, ty, expr: value, span, is_static, static_idx, def_hash: crate::def::DefPathHash(0), assoc: None, tls, scope },
+            PendingState::Todo,
+        ));
     }
     // Associated consts evaluate in the same pending list, so a
     // free const can read an inherent associated const (and back)
@@ -6362,32 +6376,31 @@ fn eval_pending_items(
     if pending.is_empty() {
         return None;
     }
-    // Assign static indices now that registration is complete:
-    // top-level statics by session rank, nested statics in stmt
-    // order after them. Evaluation reads these indices, so this
-    // runs before any pending item evaluates.
+    // Assign static indices now that registration is complete: every
+    // static, nested ones included, by the session rank of its identity
+    // (`DefOrder::statics`, append-only), so an added static moves no
+    // other static's index. Evaluation reads these indices, so this runs
+    // before any pending item evaluates.
     {
-        let top_hashes: Vec<crate::def::DefPathHash> = pending
-            .iter()
-            .filter(|(it, _)| it.is_static.is_some() && it.stmt_idx.is_none())
-            .map(|(it, _)| crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, p.interner.get(it.name.unwrap()), 0))
-            .collect();
-        let ranks = stable_ranks(static_order, &top_hashes);
-        let mut top = 0usize;
-        let mut nested = top_hashes.len() as u32;
-        for (it, _) in pending.iter_mut() {
-            if it.is_static.is_none() {
-                continue;
-            }
-            if it.stmt_idx.is_none() {
-                it.static_idx = ranks[top];
-                top += 1;
-            } else {
-                it.static_idx = nested;
-                nested += 1;
-            }
+        let nested = if pending.iter().any(|(it, _)| it.is_static.is_some() && it.stmt_idx.is_some()) {
+            let fns: Vec<(Option<ast::BlockId>, crate::def::DefPathHash)> =
+                p.fns.iter().zip(&p.fn_defs).map(|(f, d)| (f.def(&p.ast).body, d.hash)).collect();
+            nested_static_hashes(&p.ast, &p.interner, p.stable_crate, &fns)
+        } else {
+            Vec::new()
+        };
+        for (it, _) in pending.iter_mut().filter(|(it, _)| it.is_static.is_some()) {
+            it.def_hash = match it.stmt_idx {
+                None => crate::def::item_hash(p.stable_crate, &[], crate::def::DefKind::Static, p.interner.get(it.name.unwrap()), 0),
+                Some(si) => nested[si as usize].expect("a body static has an identity"),
+            };
         }
-        static_count = nested;
+        let hashes: Vec<crate::def::DefPathHash> = pending.iter().filter(|(it, _)| it.is_static.is_some()).map(|(it, _)| it.def_hash).collect();
+        let ranks = stable_ranks(static_order, &hashes);
+        for ((it, _), &r) in pending.iter_mut().filter(|(it, _)| it.is_static.is_some()).zip(&ranks) {
+            it.static_idx = r;
+        }
+        static_count = ranks.iter().copied().max().map_or(0, |m| m + 1);
     }
     // Generic associated const templates: an initializer that
     // names a parameter of its impl (or trait) has one value per
@@ -6548,7 +6561,7 @@ fn install_const_items(
                     // A nested static's identity (ARCH 1.7): its C symbol
                     // and cached IR name it by this hash, so two nested
                     // statics must never share one.
-                    let def = DefId { krate: p.krate, hash: nested_static_hash(p, item.stmt_idx.unwrap(), name) };
+                    let def = DefId { krate: p.krate, hash: item.def_hash };
                     if p.static_defs.len() <= item.static_idx as usize {
                         p.static_defs.resize(item.static_idx as usize + 1, DefId { krate: p.krate, hash: crate::def::DefPathHash(0) });
                     }
@@ -6873,30 +6886,66 @@ fn outer_param_names(ast: &Ast, at: Span) -> Vec<Sym> {
     out
 }
 
-fn nested_static_hash(p: &Program, sidx: u32, name: Sym) -> crate::def::DefPathHash {
-    let ast = &*p.ast;
-    let at = ast.stmt_items[sidx as usize].span;
-    let parent = |span: Span| {
-        let mut best: Option<(u32, usize)> = None;
-        for (i, f) in p.fns.iter().enumerate() {
-            let Some(b) = f.def(&p.ast).body else { continue };
-            let s = ast.block(b).span;
-            if s.file == span.file && s.lo <= span.lo && span.hi <= s.hi && best.is_none_or(|(w, _)| s.hi - s.lo < w) {
-                best = Some((s.hi - s.lo, i));
-            }
+/// The identity of each static inside a fn body (ARCH 1.7), by
+/// `Ast::stmt_items` index (None for any other item): the innermost fn
+/// whose body holds it by span, folded with its name and its ordinal
+/// among that fn's same-name statics; statics no fn body holds fold from
+/// one `#body` root. `fns` is every fn in LocalDefId order (body, def
+/// hash): collect passes its own tables (instances after the AST fns),
+/// and the driver its fn keys, so both get the same identities
+/// (`predicted_def_ids`) and a static keeps its identity, and so its
+/// session rank, when other items come or go.
+pub(crate) fn nested_static_hashes(
+    ast: &Ast,
+    interner: &Interner,
+    stable: crate::def::StableCrateHash,
+    fns: &[(Option<ast::BlockId>, crate::def::DefPathHash)],
+) -> Vec<Option<crate::def::DefPathHash>> {
+    let mut out = vec![None; ast.stmt_items.len()];
+    let statics: Vec<usize> = (0..ast.stmt_items.len()).filter(|&j| matches!(ast.stmt_items[j].kind, ItemKind::Static(_))).collect();
+    if statics.is_empty() {
+        return out;
+    }
+    // Innermost body by span: fn bodies sorted by (file, start, longest
+    // first) form a nesting; a sweep keeps the bodies open at each static.
+    // An instance shares its template's body: the first fn with a body
+    // (the template, in LocalDefId order) is the parent.
+    let mut events: Vec<(u32, u32, std::cmp::Reverse<u32>, Option<usize>, usize)> = Vec::new();
+    let mut bodies: std::collections::HashSet<ast::BlockId> = Default::default();
+    for (i, (body, _)) in fns.iter().enumerate() {
+        if let Some(b) = body
+            && bodies.insert(*b)
+        {
+            let s = ast.block(*b).span;
+            events.push((s.file.0, s.lo, std::cmp::Reverse(s.hi), Some(i), 0));
         }
-        best.map(|(_, i)| i)
-    };
-    let me = parent(at);
-    let ordinal = ast.stmt_items[..sidx as usize]
-        .iter()
-        .filter(|it| matches!(&it.kind, ItemKind::Static(s) if s.name == name) && parent(it.span) == me)
-        .count() as u32;
-    let parent_hash = match me {
-        Some(i) => p.fn_defs[i].hash,
-        None => crate::def::item_hash(p.stable_crate, &["#body"], crate::def::DefKind::Static, "", 0),
-    };
-    crate::def::child_hash(parent_hash, crate::def::DefKind::Static, p.interner.get(name), ordinal)
+    }
+    for &j in &statics {
+        let s = ast.stmt_items[j].span;
+        events.push((s.file.0, s.lo, std::cmp::Reverse(s.hi), None, j));
+    }
+    events.sort_unstable();
+    let mut parent: Vec<Option<usize>> = vec![None; ast.stmt_items.len()];
+    let mut open: Vec<(u32, u32, usize)> = Vec::new();
+    for (file, lo, std::cmp::Reverse(hi), f, j) in events {
+        while open.last().is_some_and(|&(of, ohi, _)| of != file || ohi <= lo) {
+            open.pop();
+        }
+        match f {
+            Some(i) => open.push((file, hi, i)),
+            None => parent[j] = open.iter().rev().find(|&&(_, ohi, _)| hi <= ohi).map(|&(_, _, i)| i),
+        }
+    }
+    let root = crate::def::item_hash(stable, &["#body"], crate::def::DefKind::Static, "", 0);
+    let mut seen: HashMap<(Option<usize>, Sym), u32> = HashMap::default();
+    for &j in &statics {
+        let ItemKind::Static(st) = &ast.stmt_items[j].kind else { continue };
+        let ordinal = seen.entry((parent[j], st.name)).or_insert(0);
+        let parent_hash = parent[j].map_or(root, |i| fns[i].1);
+        out[j] = Some(crate::def::child_hash(parent_hash, crate::def::DefKind::Static, interner.get(st.name), *ordinal));
+        *ordinal += 1;
+    }
+    out
 }
 
 /// The owner Adt of an impl hoisted out of a fn body (`ImplDef::in_body`),
@@ -7003,6 +7052,7 @@ fn register_assoc_consts(
                         span: c.span,
                         is_static: None,
                         static_idx: 0,
+                        def_hash: crate::def::DefPathHash(0),
                         stmt_idx: None,
                         assoc: Some(PendingAssoc::TraitImpl { impl_def, assoc }),
                         tls: None,
@@ -7061,6 +7111,7 @@ fn register_assoc_consts(
                     span: c.span,
                     is_static: None,
                     static_idx: 0,
+                    def_hash: crate::def::DefPathHash(0),
                     stmt_idx: None,
                     assoc: Some(PendingAssoc::Inherent { owner, impl_def, self_pat, generics: impl_generics.clone() }),
                     tls: None, scope: Vec::new(),
@@ -7094,6 +7145,7 @@ fn register_assoc_consts(
                     span: c.span,
                     is_static: None,
                     static_idx: 0,
+                    def_hash: crate::def::DefPathHash(0),
                     stmt_idx: None,
                     assoc: Some(PendingAssoc::TraitDefault { trait_def, assoc }),
                     tls: None, scope: Vec::new(),
@@ -7518,6 +7570,7 @@ impl CollectCx<'_> {
             span: it.span,
             is_static: None,
             static_idx: 0,
+            def_hash: crate::def::DefPathHash(0),
             stmt_idx: None,
             assoc: Some(PendingAssoc::TraitImpl { impl_def, assoc }),
             tls: None,

@@ -1665,6 +1665,44 @@ pub(crate) fn glue_method_slots_fp(p: &Program, slots: &[u32]) -> u64 {
     h.finish()
 }
 
+/// The evaluated value of every const and static, by def, plus one
+/// fingerprint over the body consts in order: what a const fn edit can
+/// move. A full collect after a const fn edit keeps generic reuse when no
+/// value of the last program moved (driver/compile.rs).
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct ConstValuesFp {
+    by_def: FxMap<crate::def::DefId, u64>,
+    body: u64,
+}
+
+impl ConstValuesFp {
+    pub(crate) fn of(p: &Program) -> ConstValuesFp {
+        let fp = |v: &crate::ty::consteval::ConstValue| {
+            let mut h = FxHasher::default();
+            hash_const_value(&mut h, p, v, 0);
+            h.finish()
+        };
+        let mut by_def: FxMap<crate::def::DefId, u64> = FxMap::default();
+        for (d, c) in p.const_defs.iter().zip(&p.consts) {
+            by_def.insert(*d, fp(&c.value));
+        }
+        for (d, s) in p.static_defs.iter().zip(&p.statics) {
+            by_def.insert(*d, fp(&s.value));
+        }
+        let mut h = FxHasher::default();
+        for c in &p.body_consts {
+            fp(&c.value).hash(&mut h);
+        }
+        ConstValuesFp { by_def, body: h.finish() }
+    }
+
+    /// True when every value of `self` (the last program) that `new` still
+    /// has is the same, and the body consts are.
+    pub(crate) fn kept_in(&self, new: &ConstValuesFp) -> bool {
+        self.body == new.body && self.by_def.iter().all(|(d, v)| new.by_def.get(d).is_none_or(|n| n == v))
+    }
+}
+
 pub(crate) fn statics_fingerprint(p: &Program) -> u64 {
     let mut h = FxHasher::default();
     "statics-v1".hash(&mut h);

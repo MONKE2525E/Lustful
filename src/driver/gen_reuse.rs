@@ -262,6 +262,11 @@ pub struct GenReuse {
     /// True unless this collect's trait-system key equals the last one;
     /// then every entry was dropped, and the driver rechecks every body.
     pub trait_changed: bool,
+    /// For a collect after a const fn edit: the last program's const and
+    /// static values. Collect drops every entry right after `gate` when
+    /// one of them moved (`values_moved`), before any entry is used.
+    pub values_check: Option<crate::driver::graph::ConstValuesFp>,
+    pub values_moved: bool,
     /// True once this collect reached `gate`.
     gated: bool,
     /// The defs whose stored entry read each node a header delta can move

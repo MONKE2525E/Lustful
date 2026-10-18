@@ -54,13 +54,6 @@ pub(crate) struct Front {
     pub(crate) prev_adt_ids: FxMap<crate::def::DefPathHash, u32>,
     /// The static index of every top-level static at the last parse.
     pub(crate) prev_static_ids: FxMap<crate::def::DefPathHash, u32>,
-    /// True when the last parse had a shape whose derived indices (a
-    /// nested static's) can shift when a def is added even though the
-    /// defs in `prev_adt_ids` and `prev_static_ids` keep theirs.
-    /// Growth is then not reusable. Instance Adt ids of a generic
-    /// program are session places that growth does not move; builds
-    /// check them (`Caches::inst_ids`).
-    pub(crate) prev_order_fragile: bool,
     /// Set by the slot update when a bodies or signatures mode edit
     /// moved Adt or static ids and it rebuilt in full instead; the
     /// shared tail reads (and clears) it as full mode.
@@ -69,6 +62,10 @@ pub(crate) struct Front {
     /// (`Program::static_defs`): while a full resolve leaves them equal,
     /// nested statics kept their indexes and generic reuse holds.
     pub(crate) prev_static_defs: Option<Vec<crate::def::DefId>>,
+    /// The const and static values of the last program a request ended
+    /// with (`graph::ConstValuesFp`): a full collect after a const fn
+    /// edit keeps generic reuse when none of them moved.
+    pub(crate) prev_const_values: Option<crate::driver::graph::ConstValuesFp>,
     /// Set by a body patch whose const fn edit only const and static values
     /// can read (`ConstReach::revaluable`): the kept program must evaluate
     /// them again (`collect::const_values_hold`) before it stands.
@@ -424,9 +421,9 @@ impl Session {
                 def_order_loaded: false,
                 prev_adt_ids: FxMap::default(),
                 prev_static_ids: FxMap::default(),
-                prev_order_fragile: false,
                 ids_forced_full: false,
                 prev_static_defs: None,
+                prev_const_values: None,
                 revalue_consts: false,
                 rpit_edit: false,
                 kept_put_back: false,
