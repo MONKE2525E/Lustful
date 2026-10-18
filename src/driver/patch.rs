@@ -2398,8 +2398,11 @@ pub(super) fn reuse_kept(
         return Err("derive build");
     }
     let mut p = k.program;
-    // A check's templates with instances check again only as a build's do.
+    // A check's templates with instances check again only as a build's do,
+    // or in a request of body edits alone, whose instances of the edited
+    // templates replay below (`kept_delta::replay_discovery`).
     let instanced = instanced_templates(&p);
+    let bodies_only = edits.iter().all(|e| !e.header && e.derive.is_none());
     // Nested templates of edited bodies, with the edit's old node range.
     let mut nested_templates: Vec<(usize, (u32, u32))> = Vec::new();
     // The edits below change what fingerprints read.
@@ -2459,7 +2462,7 @@ pub(super) fn reuse_kept(
             // A template with closures stands when its closures are the
             // registered ones (checked below, before its template check),
             // and one that returns `impl Trait` while its hidden type does.
-            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) && !instanced.contains_key(&f) => {}
+            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) && (bodies_only || !instanced.contains_key(&f)) => {}
             _ => return Err("fn class"),
         }
     }
@@ -2590,6 +2593,8 @@ pub(super) fn reuse_kept(
     }
     let edited = edits.iter().filter_map(|e| e.fn_index);
     let nested: Vec<usize> = nested_templates.iter().map(|n| n.0).collect();
+    // Entries stored from here on are this patch's (the instance replay).
+    let start = crate::driver::gen_reuse::stamp_now();
     for fn_index in edited.chain(recheck.iter().copied()).chain(nested) {
         let header = edits.iter().any(|x| x.header && x.fn_index == Some(fn_index));
         if header || p.gx.fn_class.get(fn_index) != Some(&FnClass::Template) || seen.contains(&fn_index) {
@@ -2698,6 +2703,18 @@ pub(super) fn reuse_kept(
                     // replay does (lowering and codegen read it there).
                     for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
                         crate::check::generics::build_owned_ty(&mut p, t);
+                    }
+                }
+                // The instances of the templates that checked again, in a
+                // check with generic associated consts: as collect walks them.
+                if !walk_instances && walks_requests(&p) && seen.iter().any(|&t| instanced.contains_key(&LocalDefId(t as u32))) {
+                    let rechecked: Vec<LocalDefId> = seen.iter().map(|&t| LocalDefId(t as u32)).collect();
+                    let fn_count = front.fn_loc.len();
+                    let stands = |_: LocalDefId| false;
+                    if let Err(why) =
+                        super::kept_delta::replay_discovery(&mut p, caches, fn_count, false, start, &Vec::new(), &mut |_, _| false, &stands, None, &rechecked, false)
+                    {
+                        break 'discovery Some(why);
                     }
                 }
             }

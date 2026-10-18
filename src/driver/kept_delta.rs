@@ -711,7 +711,7 @@ fn replay_bodies(
             format!("replay templates: {} again; {}\n", times.len(), list.join(", "))
         });
         super::laps::mark("collect/delta replay templates");
-        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers), &rechecked)
+        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers), &rechecked, true)
     })();
     if followed {
         p.fp_memo.follow_end();
@@ -749,6 +749,7 @@ pub(super) fn replay_discovery(
     stands: &dyn Fn(LocalDefId) -> bool,
     readers: Option<&crate::intern::FxMap<crate::def::DefId, ()>>,
     rechecked: &[LocalDefId],
+    bodies: bool,
 ) -> Result<(), &'static str> {
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
@@ -772,7 +773,7 @@ pub(super) fn replay_discovery(
         // their reads, by their stored output.
         let mut counts = [0usize; 3];
         let t0 = std::time::Instant::now();
-        for g in (0..fn_count as u32).map(LocalDefId) {
+        for g in (0..fn_count as u32).map(LocalDefId).filter(|_| bodies) {
             if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Plain) || p.check_skips(g) {
                 continue;
             }

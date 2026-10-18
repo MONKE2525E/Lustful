@@ -221,7 +221,7 @@ pub(super) fn apply_derives(
         let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
         let stands = |g: LocalDefId| clean.get(g.0 as usize).copied().unwrap_or(false);
-        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None, &rechecked)
+        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None, &rechecked, true)
             .map_err(|why| (why, false))?;
         crate::driver::laps::mark("kept/derive discovery");
     }
