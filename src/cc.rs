@@ -104,7 +104,12 @@ pub fn spec_for(triple: &str) -> Result<CcSpec, String> {
 /// The C flags of every unit, one string so the cache key and the command
 /// line can never disagree.
 pub fn cflags(debug: bool) -> String {
-    let base = "-O2 -std=gnu11 -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fexceptions -fno-asynchronous-unwind-tables";
+    // -fsigned-char pins plain C char signed on every target (aarch64
+    // defaults to unsigned): generated code keeps Rust bytes in
+    // uint8_t and chars in uint32_t, so nothing should depend on it,
+    // and after this flag nothing can (it also matches MSVC where the
+    // windows-gnu build would otherwise differ on arm64).
+    let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fexceptions -fno-asynchronous-unwind-tables";
     if debug { format!("{base} -g") } else { base.into() }
 }
 
