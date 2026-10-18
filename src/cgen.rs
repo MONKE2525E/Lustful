@@ -2794,6 +2794,13 @@ impl FnGen<'_, '_> {
             };
             match self.path_place(pl.local, &path) {
                 Some((_, t)) if needs_drop_c(self.p, &t) => {
+                    // Drop elaboration reads the fields of each container on the path
+                    // (`elab_parts`): they need their definitions (`nested_block`).
+                    for k in 1..path.len() {
+                        if let Some((_, ct)) = self.path_place(pl.local, &path[..k]) {
+                            self.note_held(&ct);
+                        }
+                    }
                     if !self.move_paths[l].contains(&path) {
                         self.move_paths[l].push(path);
                     }
@@ -3002,7 +3009,8 @@ impl FnGen<'_, '_> {
                 let _ = write!(out, " lust_dealloc((void*){e}, sizeof({et}), _Alignof({et}));");
             }
             _ if is_enum && variant.is_none() => {
-                let _ = write!(out, " switch ({}) {{", disc_call(self.p, t, &format!("(&{e})")));
+                let d = self.disc(t, &format!("(&{e})"));
+                let _ = write!(out, " switch ({d}) {{");
                 for s in next_steps {
                     if let Step::Downcast(v) = s {
                         let body = self.elab_drop(l, &sub(s));
@@ -4161,8 +4169,16 @@ impl FnGen<'_, '_> {
     /// carries the explicit tag or the niche scalar as a member of
     /// its own, so tag and fields are set by the same designator.
     /// The same forms serve as constant initializers in `const_init`.
+    /// A variant literal of `t`: it names `t`'s fields (`nested_block`).
     fn make_variant(&mut self, t: &CTy, variant: usize, vals: &[String]) -> String {
+        self.note_held(t);
         variant_lit(self.p, t, variant, vals)
+    }
+
+    /// `disc_call`: the read needs `t`'s definition (`nested_block`).
+    fn disc(&mut self, t: &CTy, ptr: &str) -> String {
+        self.note_held(t);
+        disc_call(self.p, t, ptr)
     }
 
     fn rvalue(&mut self, rv: &Rvalue, loc: &str, post: &mut Vec<String>) -> String {
@@ -4410,6 +4426,8 @@ impl FnGen<'_, '_> {
             }
             Rvalue::Aggregate(a, v, ops) => {
                 let a = &self.p.tys.c_adt(*a);
+                // A literal names the fields (`nested_block`).
+                self.note_held(&CTy::Adt(*a));
                 let adt = self.p.adt(*a);
                 let vals: Vec<String> = ops.iter().map(|o| self.operand(o, loc, post).0).collect();
                 if adt.is_enum {
@@ -4584,7 +4602,7 @@ impl FnGen<'_, '_> {
             Rvalue::FormatArgs(env, parts) => self.format_args_value(env.as_ref(), parts, loc, post),
             Rvalue::Discriminant(pl) => {
                 let (e, t) = self.place(pl, loc);
-                disc_call(self.p, &t, &format!("(&{e})"))
+                self.disc(&t, &format!("(&{e})"))
             }
             Rvalue::StaticLoad(idx) => static_sym(self.p, *idx),
             Rvalue::StaticRef(idx) => format!("(&{})", static_sym(self.p, *idx)),
@@ -5283,7 +5301,8 @@ impl FnGen<'_, '_> {
         match (b, clo) {
             (B::SliceSortBy | B::SliceSortUnstableBy, Some(f)) => {
                 let (r, rt) = self.adapter_call_c(&mut body, &f, "ctx", &[a, bb]);
-                let _ = writeln!(body, "  return {} == 0;", disc_call(self.p, &rt, &format!("(&{r})")));
+                let d = self.disc(&rt, &format!("(&{r})"));
+                let _ = writeln!(body, "  return {d} == 0;");
             }
             (B::SliceSortByKey | B::SliceSortUnstableByKey, Some(f)) => {
                 let (ka, kt) = self.adapter_call_c(&mut body, &f, "ctx", &[a]);
@@ -5477,7 +5496,8 @@ impl FnGen<'_, '_> {
         match (b, clo) {
             (B::SliceBinarySearchBy, Some(f)) => {
                 let (r, rt) = self.adapter_call_c(&mut body, &f, "ctx", &[p]);
-                let _ = writeln!(body, "  return (int32_t){} - 1;", disc_call(self.p, &rt, &format!("(&{r})")));
+                let d = self.disc(&rt, &format!("(&{r})"));
+                let _ = writeln!(body, "  return (int32_t){d} - 1;");
             }
             (B::SliceBinarySearchByKey, Some(f)) => {
                 let (k, kt) = self.adapter_call_c(&mut body, &f, "((void**)ctx)[0]", &[p]);
@@ -5506,7 +5526,7 @@ impl FnGen<'_, '_> {
             // (read through the pointers: the enum's definition).
             CTy::Adt(_) if fieldless_enum(self.p, t) => {
                 self.note_held(t);
-                format!("({} == {})", disc_call(self.p, t, a), disc_call(self.p, t, b))
+                format!("({} == {})", self.disc(t, a), self.disc(t, b))
             }
             CTy::Int(i) if is128(*i) => format!("({a}->lo == {b}->lo && {a}->hi == {b}->hi)"),
             CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) => format!("(*{a} == *{b})"),
@@ -5686,7 +5706,7 @@ impl FnGen<'_, '_> {
                 if discs.is_empty() {
                     return scalar_lit(0, 16, true);
                 }
-                let idx = disc_call(self.p, t, &vals[0]);
+                let idx = self.disc(t, &vals[0]);
                 if discs_sequential(&discs) {
                     format!("((lust_i128){{(uint64_t)({idx}), 0}})")
                 } else {
@@ -10219,6 +10239,13 @@ fn inline_on() -> bool {
     *V.get_or_init(|| std::env::var_os("LUST_RELEASE_INLINE").is_none_or(|v| v != "0"))
 }
 
+/// Release C plain fn units declare the Adts only their types hold as blocks
+/// (`nested_block`); LUST_RELEASE_BLOCKS=0 defines them in full.
+fn blocks_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LUST_RELEASE_BLOCKS").is_none_or(|v| v != "0"))
+}
+
 /// The id in a release C prototype of a fn body (`T f_<id>(...);`).
 fn proto_body_id(e: &str) -> Option<&str> {
     let i = e.find(" f_").or_else(|| e.find("*f_"))? + 3;
@@ -10459,7 +10486,7 @@ pub fn fn_unit_parts(
     named.retain(|t| !types.contains(t));
     // Inline glue reads through pointers as a glue shard does: its types are declared one
     // step deep, as the shards do; the rest of the unit only by value.
-    let decls = if names::release() { Decls::ByValue } else { Decls::Full };
+    let decls = if names::release() { Decls::ByValue { blocks: !llvm && blocks_on() } } else { Decls::Full };
     named.retain(|t| !glue_types.contains(t));
     type_decls_with(p, &mut c, &types, &named, decls, &glue_types);
     c.push_str(&static_decls_for(p, &used));
@@ -10838,15 +10865,51 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
 }
 
 /// Which types `type_decls_with` defines (the rest of what it names gets a forward typedef).
+/// With `blocks` (release C plain C units, `blocks_on`), an Adt that only other definitions
+/// hold (not a root: no code of the unit reads its fields) is a block of its size and
+/// alignment when `nested_block` allows, so the unit does not change with its fields.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Decls {
     /// Every type the roots reach, through pointers too (dev C, the statics unit).
     Full,
     /// What the roots hold by value (release C fn units).
-    ByValue,
+    ByValue { blocks: bool },
     /// That, plus one step through the pointers in it (release C glue shards: a glue
     /// definition reads an `Rc`'s count block or sizes a `Box`'s pointee in place).
-    OneStep,
+    OneStep { blocks: bool },
+}
+
+/// The layout of an Adt that a release C unit may declare as a block of bytes when no code
+/// in the unit reads its fields (`Decls` `blocks`). Only where every C ABI passes the block
+/// and the struct alike: larger than 16 bytes (in memory or by reference on x86-64 SysV,
+/// Win64, AAPCS64 and wasm), and not a possible homogeneous float aggregate (AAPCS64 passes
+/// up to four floats or doubles in registers: 32 bytes at most). Only the program's own
+/// types: builtin code (`call_value`) writes the nested fields of std's types and of lust's
+/// builtin ones (`TrySendError<T>`, an instance of a builtin template) by path.
+fn nested_block(p: &Program, t: &CTy) -> Option<Layout> {
+    let CTy::Adt(a) = t else { return None };
+    let builtin = p.gx.adt_info.get(a.0 as usize).is_some_and(|(d, _)| d.krate == crate::ty::BUILTIN_CRATE);
+    let path = p.display_path(p.adt(*a).name);
+    if builtin || ["std::", "core::", "alloc::"].iter().any(|s| path.starts_with(s)) {
+        return None;
+    }
+    let l = c_layout(p, t)?;
+    (l.size > 16 && (l.size > 32 || !may_hold_float(p, t, &mut HashSet::new()))).then_some(l)
+}
+
+/// Whether a value of `t` may hold a float by value. Kinds it does not list count as yes.
+fn may_hold_float(p: &Program, t: &CTy, seen: &mut HashSet<CTy>) -> bool {
+    match t {
+        CTy::Float(_) => true,
+        CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Str | CTy::String | CTy::Vec(_) | CTy::Ref(_) | CTy::Ptr(_) | CTy::FatPtr(_) => false,
+        CTy::Slice(_) | CTy::Boxed(_) | CTy::Rc(_) | CTy::Weak(_) | CTy::BoxDyn | CTy::RcDyn | CTy::FnPtr(..) => false,
+        _ if !seen.insert(t.clone()) => false,
+        CTy::Adt(a) => p.adt(*a).variants.iter().flat_map(|v| &v.fields).any(|f| may_hold_float(p, &cty(&p.tys, f.ty), seen)),
+        CTy::Tuple(es) => es.iter().any(|e| may_hold_float(p, e, seen)),
+        CTy::Option(e) | CTy::Array(e, _) | CTy::Cell(e) => may_hold_float(p, e, seen),
+        CTy::Result(a, b) => may_hold_float(p, a, seen) || may_hold_float(p, b, seen),
+        _ => true,
+    }
 }
 
 /// `type_decls`, plus forward declarations of `named` (release C: types the code only
@@ -10855,13 +10918,18 @@ pub(crate) enum Decls {
 /// value; a type reached only through a pointer gets its forward typedef, so a unit does
 /// not change when a struct it only points at does. Glue and static data reach through
 /// pointers (a drop through an `Rc` reads its count block), so their units keep the
-/// whole closure.
+/// whole closure. With `blocks` (`Decls`), the roots (and `deep`, for its own walk) are the
+/// types whose fields the code reads: the Adts they only hold may be blocks.
 fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &HashSet<CTy>, decls: Decls, deep: &HashSet<CTy>) {
-    let by_value = |roots: Vec<CTy>| {
+    // With `open` (`blocks`), an Adt that `open` does not hold and `nested_block`
+    // allows goes to `blocks`, and its fields are not walked.
+    let by_value = |roots: Vec<CTy>, open: Option<&HashSet<CTy>>, blocks: &mut HashSet<CTy>| {
         let mut defined = HashSet::new();
         let mut stack = roots;
         while let Some(t) = stack.pop() {
-            if defined.insert(t.clone()) {
+            if open.is_some_and(|o| !o.contains(&t)) && nested_block(p, &t).is_some() {
+                blocks.insert(t);
+            } else if defined.insert(t.clone()) {
                 stack.extend(def_deps(p, &t));
                 // Table code and initializers size the elements (`sizeof`).
                 if let CTy::Hash(..) = t {
@@ -10876,20 +10944,30 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
     // the roots hold by value is read by its own glue, through a prototype; stepping from
     // every such struct too defined the pointees of the whole by-value closure, and a glue
     // shard or a unit with inline glue recompiled for most edits of a central struct.
-    let one_step = |roots: Vec<CTy>| {
+    // A glue definition reads the fields of its own types (`open`), and only addresses or
+    // sizes the types they hold.
+    let one_step = |roots: &HashSet<CTy>, open: Option<&HashSet<CTy>>, blocks: &mut HashSet<CTy>| {
         let step: Vec<CTy> = roots.iter().flat_map(|t| field_types(p, t)).chain(roots.iter().cloned()).collect();
-        by_value(step)
+        by_value(step, open, blocks)
     };
+    // The types declared as blocks: also in `defined`.
+    let mut blocks: HashSet<CTy> = HashSet::new();
     let defined: Option<HashSet<CTy>> = match decls {
         Decls::Full => None,
-        Decls::ByValue => {
-            let mut d = by_value(roots.iter().cloned().collect());
+        Decls::ByValue { blocks: b } | Decls::OneStep { blocks: b } => {
+            let mut d = if let Decls::OneStep { .. } = decls {
+                one_step(roots, b.then_some(roots), &mut blocks)
+            } else {
+                by_value(roots.iter().cloned().collect(), b.then_some(roots), &mut blocks)
+            };
             if !deep.is_empty() {
-                d.extend(one_step(deep.iter().cloned().collect()));
+                d.extend(one_step(deep, b.then_some(deep), &mut blocks));
             }
+            // A type one walk reads stays defined in full.
+            blocks.retain(|t| !d.contains(t));
+            d.extend(blocks.iter().cloned());
             Some(d)
         }
-        Decls::OneStep => Some(one_step(roots.iter().cloned().collect())),
     };
     // Close over field types (release C: one step out of each defined type).
     let mut wanted: HashSet<CTy> = HashSet::new();
@@ -10898,7 +10976,7 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         if !wanted.insert(t.clone()) {
             continue;
         }
-        if defined.as_ref().is_some_and(|d| !d.contains(&t)) {
+        if defined.as_ref().is_some_and(|d| !d.contains(&t)) || blocks.contains(&t) {
             continue;
         }
         stack.extend(field_types(p, &t));
@@ -10939,13 +11017,22 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         }
     }
     // Each definition comes after the types it holds by value.
-    fn emit(p: &Program, t: &CTy, emitted: &mut HashSet<CTy>, out: &mut String) {
+    fn emit(p: &Program, t: &CTy, blocks: &HashSet<CTy>, emitted: &mut HashSet<CTy>, out: &mut String) {
         if !emitted.insert(t.clone()) {
+            return;
+        }
+        if blocks.contains(t)
+            && let (CTy::Adt(a), Some(l)) = (t, nested_block(p, t))
+        {
+            let an = names::adt(*a);
+            let _ = writeln!(out, "/* {} */", p.display_path(p.adt(*a).name));
+            let _ = writeln!(out, "struct {an} {{ _Alignas({}) uint8_t b[{}]; }};", l.align, l.size);
+            layout_assert(out, &an, &l);
             return;
         }
         let deps = def_deps(p, t);
         for d in &deps {
-            emit(p, d, emitted, out);
+            emit(p, d, blocks, emitted, out);
         }
         if let CTy::Hash(k, _) = t
             && hash::has_struct(*k)
@@ -11156,7 +11243,7 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
     }
     let mut emitted = HashSet::new();
     for t in list.iter().filter(|t| defined.as_ref().is_none_or(|d| d.contains(*t))) {
-        emit(p, t, &mut emitted, out);
+        emit(p, t, &blocks, &mut emitted, out);
     }
     out.push('\n');
 }

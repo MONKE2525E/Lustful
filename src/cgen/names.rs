@@ -167,10 +167,10 @@ pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> S
 /// only prototypes (`GlueSet::shared` holds every key). Shards are content-defined
 /// chunks of the keys in prototype order, cut by each key's prototype and definition size
 /// (`cut_after`), so new glue changes only the shard it lands in. Each shard declares the
-/// types (`Decls::OneStep`), prototypes (its keys' and their callees') and externs its
-/// definitions need. Only the keys the fns in `out` reach (a dead slot's `FnOut` is empty),
-/// as a cold build has them: a session's set also keeps keys no fn reaches now (stale since
-/// a refresh, or left by a removed fn).
+/// types (`Decls::OneStep`, with blocks), prototypes (its keys' and their callees') and
+/// externs its definitions need. Only the keys the fns in `out` reach (a dead slot's `FnOut`
+/// is empty), as a cold build has them: a session's set also keeps keys no fn reaches now
+/// (stale since a refresh, or left by a removed fn).
 pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Vec<String> {
     let live = g.closure(out.iter().flat_map(|o| o.glue.iter()));
     let mut keys: Vec<&(Glue, CTy)> = live.into_iter().filter(|k| g.def_map.contains_key(*k)).collect();
@@ -209,7 +209,7 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
                 }
                 externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
             }
-            type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep, &HashSet::new());
+            type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep { blocks: super::blocks_on() }, &HashSet::new());
             externs.into_iter().for_each(|e| c.push_str(e));
             protos.into_iter().for_each(|x| c.push_str(x));
             for k in keys {
@@ -261,7 +261,8 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     }
     protos.sort();
     pointed.retain(|t| !types.contains(t));
-    type_decls_with(p, &mut c, &types, &pointed, Decls::ByValue, &HashSet::new());
+    // No blocks: an initializer names the fields of every type its value holds.
+    type_decls_with(p, &mut c, &types, &pointed, Decls::ByValue { blocks: false }, &HashSet::new());
     protos.into_iter().for_each(|x| c.push_str(x));
     c.push_str(&data);
     c
