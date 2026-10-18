@@ -157,6 +157,12 @@ extern lust_fnptr lust_tramps[];
    that holds main when it registers; NULL for a `()` main. */
 extern int (*lust_main_entry_p)(void);
 void lust_base_init(void);
+/* catch_unwind under unwind tables (panic.c, lust_unwind_mode 2): runs f(ctx) under a
+   catch point; 1 when a panic unwound to it. */
+int32_t lust_unw_try(void (*f)(void *), void *ctx);
+int32_t lust_unw_main_caught(void);
+void lust_unw_dtry(void (*f)(void *), void *arg, void **ux);
+void lust_unw_reraise(void *ux);
 
 /* A source location: (function id << 40) | (line within the function << 20) | column, with
    20 bits each for the relative line and the column. Lines are relative to each function's

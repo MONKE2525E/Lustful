@@ -1101,6 +1101,12 @@ struct FnGen<'b, 'p> {
     unw: Option<Unw>,
     /// The value being assigned comes from a `Call` terminator.
     unw_call: bool,
+    /// Unwind tables (`Program::unwind_tables`): this fn has a frame struct `L` (cgen/unwind.rs
+    /// `frame_struct`), the ladder entry its block stored last in `L.st`, and whether the
+    /// blocks being emitted are the cleanup fn's.
+    zc_frame: bool,
+    zc_st: Option<u32>,
+    zc_in_cleanup: bool,
     /// Where the body's str literal caches go in `out` (the prologue's
     /// end), and the cache of each distinct literal (cgen/kconst.rs).
     kdecl_at: Option<usize>,
@@ -1998,6 +2004,9 @@ impl<'b, 'p> FnGen<'b, 'p> {
             stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
             unw: None,
             unw_call: false,
+            zc_frame: false,
+            zc_st: None,
+            zc_in_cleanup: false,
             kdecl_at: None,
             kstrs: HashMap::new(),
             addr_only: false,
@@ -2110,6 +2119,38 @@ impl FnGen<'_, '_> {
         let p = self.p;
         let fid = self.body.fn_id;
         let slot = self.slots.of(fid);
+        let n = self.body.blocks.len();
+        let mut reachable = vec![false; n];
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            if std::mem::replace(&mut reachable[b], true) {
+                continue;
+            }
+            stack.extend(succ(&self.body.blocks[b].term).into_iter().map(|s| s.0 as usize));
+            stack.extend(self.body.stmt_unwind.iter().filter(|e| e.0.0 as usize == b).map(|e| e.2.0 as usize));
+        }
+        let order: Vec<usize> = (0..n).filter(|&b| reachable[b]).collect();
+        // Unwind tables: the cleanup blocks go to their own fn (`cleanup_fn`), and the
+        // locals they read live in the frame struct its cleanup variable points at.
+        let zc = p.unwind && p.unwind_tables;
+        let cl_order: Vec<usize> = if zc { order.iter().copied().filter(|&b| self.cleanup[b]).collect() } else { Vec::new() };
+        let order: Vec<usize> = if zc { order.into_iter().filter(|&b| !self.cleanup[b]).collect() } else { order };
+        let mut cl_text = String::new();
+        let mut members: Vec<Vec<String>> = Vec::new();
+        if !cl_order.is_empty() {
+            let saved = std::mem::take(&mut self.out);
+            self.zc_in_cleanup = true;
+            self.blocks(&cl_order);
+            self.zc_in_cleanup = false;
+            cl_text = std::mem::replace(&mut self.out, saved);
+        }
+        // A ladder with no call (only jumps and returns) drops nothing: no frame.
+        if cl_text.contains('(') {
+            members = unwind::frame_members(&cl_text, self.local_cty.len(), &self.move_paths, &self.local_drop, &self.body.promoted);
+            self.zc_frame = true;
+            let decls = self.frame_struct(slot, &members);
+            self.out.push_str(&decls);
+        }
         // Release C bodies are extern: other units call them directly (`names`).
         let linkage = if names::release() { "" } else { "static " };
         let _ = writeln!(self.out, "/* {} */\n{linkage}{} {{", p.display_path(p.fn_info(fid).name), fn_sig(p, fid, slot));
@@ -2119,9 +2160,29 @@ impl FnGen<'_, '_> {
         let mut flags = Vec::new();
         // Locals with alignment over 16 (see `overaligned_local`).
         let mut high: Vec<(usize, String, String)> = Vec::new();
+        let mut frame_init: Vec<String> = Vec::new();
         for (i, t) in self.local_cty.iter().enumerate() {
             // A byte string temp gets static storage below, not a frame local.
             if self.byte_blobs.get(i).is_some_and(|b| b.is_some()) {
+                continue;
+            }
+            // A local the cleanup ladder reads lives in the frame struct: its
+            // parameter copy and flags are set right after `L` is declared.
+            if members.get(i).is_some_and(|m| !m.is_empty()) {
+                let is_param = i >= 1 && i <= self.body.arg_count;
+                if is_param && param_dropped(p, t) {
+                    frame_init.push(format!("L.l{i} = {};", zero_lit(p, t)));
+                } else if is_param && param_by_ptr(p, t) {
+                    frame_init.push(format!("L.l{i} = *p{i};"));
+                } else if is_param {
+                    frame_init.push(format!("L.l{i} = p{i};"));
+                }
+                if self.local_drop[i] {
+                    frame_init.push(format!("L.d{i} = {};", is_param as u8));
+                }
+                for k in 0..self.move_paths[i].len() {
+                    frame_init.push(format!("L.m{i}_{k} = 1;"));
+                }
                 continue;
             }
             let is_param = i >= 1 && i <= self.body.arg_count;
@@ -2186,7 +2247,22 @@ impl FnGen<'_, '_> {
         if !flags.is_empty() {
             let _ = writeln!(self.out, "  uint8_t {};", flags.join(", "));
         }
-        if p.unwind {
+        if self.zc_frame {
+            let _ = writeln!(self.out, "  struct fr{slot} L __attribute__((cleanup(cl{slot})));\n  L.st = 0;");
+            for s in &frame_init {
+                let _ = writeln!(self.out, "  {s}");
+            }
+            for (i, names) in members.iter().enumerate() {
+                for nm in names {
+                    let _ = writeln!(self.out, "#define {nm} (L.{nm})");
+                }
+                let _ = i;
+            }
+        }
+        if zc {
+            // A panic never returns with unwind tables: no entry check.
+            self.out.push_str("  lust_exc ex;\n");
+        } else if p.unwind {
             // A call made while its thread has a pending exception comes
             // from code that runs on after a panic (glue, a runtime
             // callback): it returns at once, as if never called.
@@ -2194,25 +2270,39 @@ impl FnGen<'_, '_> {
   if (lust_unw_pending && lust_unw_mine()) {}", self.unwind_return());
         }
         self.kdecl_at = Some(self.out.len());
-        let n = self.body.blocks.len();
-        let mut reachable = vec![false; n];
-        let mut stack = vec![0usize];
-        while let Some(b) = stack.pop() {
-            if std::mem::replace(&mut reachable[b], true) {
-                continue;
-            }
-            stack.extend(succ(&self.body.blocks[b].term).into_iter().map(|s| s.0 as usize));
-            stack.extend(self.body.stmt_unwind.iter().filter(|e| e.0.0 as usize == b).map(|e| e.2.0 as usize));
+        self.blocks(&order);
+        self.kstr_finish();
+        self.out.push_str("}\n");
+        for (i, ..) in &high {
+            let _ = writeln!(self.out, "#undef l{i}");
         }
-        let order: Vec<usize> = (0..n).filter(|&b| reachable[b]).collect();
+        if self.zc_frame {
+            unwind::cleanup_fn(&mut self.out, slot, &members, &cl_order, &cl_text);
+            self.zc_frame = false;
+        }
+        self.out.push('\n');
+    }
+
+    /// Emits the blocks `order` (reachable, in this order): their labels, statements with
+    /// their unwind actions, and terminators.
+    fn blocks(&mut self, order: &[usize]) {
+        let zc = self.p.unwind && self.p.unwind_tables;
         for (k, &bi) in order.iter().enumerate() {
+            self.zc_st = None;
             let _ = writeln!(self.out, "bb{bi}:;");
             let block = self.body.block(Bb(bi as u32));
             for (si, s) in block.stmts.iter().enumerate() {
                 self.unw = self.stmt_action(bi, si).filter(|_| !matches!(s.kind, StmtKind::StorageDead(_) | StmtKind::FakeRead(_)));
+                // Unwind tables: the statement's ladder entry is in `L.st` before it runs;
+                // a panic inside never returns, so nothing follows it.
+                if zc && let Some(Unw::Goto(b)) = self.unw {
+                    self.zc_store(b);
+                }
                 let mark = self.out.len();
                 self.stmt(&s.kind, s.span);
-                if let Some(u) = self.unw.take() {
+                if let Some(u) = self.unw.take()
+                    && !zc
+                {
                     let check = u.check();
                     let text = unwind::wrap_calls(&self.out[mark..], &check);
                     self.out.truncate(mark);
@@ -2221,6 +2311,9 @@ impl FnGen<'_, '_> {
                 }
             }
             self.unw = self.stmt_action(bi, block.stmts.len());
+            if zc && let Some(Unw::Goto(b)) = self.unw {
+                self.zc_store(b);
+            }
             let next = order.get(k + 1).copied();
             if let Terminator::Goto(t) = &block.term
                 && Some(t.0 as usize) == next
@@ -2229,12 +2322,16 @@ impl FnGen<'_, '_> {
             }
             self.term(&block.term, block.term_span, next);
         }
-        self.kstr_finish();
-        self.out.push_str("}\n");
-        for (i, ..) in &high {
-            let _ = writeln!(self.out, "#undef l{i}");
+    }
+
+    /// Unwind tables: stores ladder entry `b` in the frame's `L.st` (once per run of
+    /// statements with the same entry). No frame (no cleanup to run) or a cleanup
+    /// block's own code stores nothing.
+    fn zc_store(&mut self, b: u32) {
+        if self.zc_frame && !self.zc_in_cleanup && self.zc_st != Some(b) {
+            let _ = writeln!(self.out, "  L.st = {b};");
+            self.zc_st = Some(b);
         }
-        self.out.push('\n');
     }
 
     /// The unwind action of statement `si` of block `bi` (`si` equal to
@@ -2279,6 +2376,22 @@ impl FnGen<'_, '_> {
         }
         self.want(Glue::Drop, dt);
         (format!(" drop_{}(&{d});", mangle(dt)), String::new())
+    }
+
+    /// Unwind tables: a cleanup variable that drops `v` (of type `t`, which a builtin owns)
+    /// when a panic unwinds before the disarm statement runs: the declaration, to emit before
+    /// the call or check that can panic, and the disarm, to emit after it. Empty when `t`
+    /// needs no drop.
+    pub(super) fn zc_guard(&mut self, v: &str, t: &CTy) -> (String, String) {
+        if !needs_drop_c(self.p, t) {
+            return (String::new(), String::new());
+        }
+        self.want(Glue::Drop, t);
+        let g = self.tmp();
+        (
+            format!(" struct lust_dguard {g} __attribute__((cleanup(lust_dguard_end))) = {{ (void (*)(void *))drop_{}, (void *)&{v}, 1 }};", mangle(t)),
+            format!(" {g}.armed = 0;"),
+        )
     }
 
     /// panic=unwind: C text that drops `v` (of type `t`), which a
@@ -2760,6 +2873,10 @@ impl FnGen<'_, '_> {
     /// cleanup at block `b` before any element is read. The `(void)`
     /// keeps `wrap_calls` from adding its own check in front of `b`.
     fn index_unw(&self, len: &str, base: &str, l: Local, loc: &str, b: u32) -> String {
+        if self.p.unwind_tables {
+            // The bounds panic never returns: the frame's cleanup runs from `L.st`.
+            return format!("(*({{ if (l{l} >= {len}) (void)lust_bounds(l{l}, {len}, {loc}); &{base}[l{l}]; }}))");
+        }
         format!("(*({{ if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))")
     }
 
@@ -2859,8 +2976,19 @@ impl FnGen<'_, '_> {
             for p in &post {
                 let _ = writeln!(self.out, "    {p}");
             }
-            let _ = writeln!(self.out, "    {}", u.check());
+            let zc = self.p.unwind_tables;
+            if !zc {
+                let _ = writeln!(self.out, "    {}", u.check());
+            }
+            if zc && drop && dest.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
+                // An index out of bounds panics before the value moves into the
+                // place: a guard drops the value as the panic unwinds.
+                let (gd, gdis) = self.zc_guard(&t, &dt);
+                let (pd, _) = self.place(dest, loc);
+                let _ = writeln!(self.out, "   {gd}\n    (void)&{pd};\n   {gdis}");
+            }
             if drop
+                && !zc
                 && let Unw::Goto(cb) = u
                 && dest.proj.iter().any(|p| matches!(p, Proj::Index(_)))
             {
@@ -3008,6 +3136,10 @@ impl FnGen<'_, '_> {
                 if self.unw != Some(Unw::Abort) {
                     self.unw = unwind.filter(|_| self.p.unwind).map(|u| Unw::Goto(u.0));
                 }
+                let zc = self.p.unwind && self.p.unwind_tables;
+                if zc && let Some(Unw::Goto(b)) = self.unw {
+                    self.zc_store(b);
+                }
                 let mark = self.out.len();
                 self.unw_call = true;
                 let mentions =
@@ -3043,7 +3175,9 @@ impl FnGen<'_, '_> {
                     });
                 }
                 self.unw_call = false;
-                if let Some(u) = self.unw.take() {
+                if let Some(u) = self.unw.take()
+                    && !zc
+                {
                     let text = unwind::wrap_calls(&self.out[mark..], &u.check());
                     self.out.truncate(mark);
                     self.out.push_str(&text);
@@ -3053,6 +3187,11 @@ impl FnGen<'_, '_> {
                 }
             }
             Terminator::Return => {
+                // Unwind tables: a normal return leaves no ladder to run (the frame's
+                // cleanup variable runs at scope exit too).
+                if self.zc_frame && !self.zc_in_cleanup {
+                    self.out.push_str("  L.st = 0;\n");
+                }
                 if self.ret_large {
                     self.out.push_str("  *out = l0; return;\n")
                 } else {
@@ -3060,7 +3199,9 @@ impl FnGen<'_, '_> {
                 }
             }
             // The last block of a cleanup ladder: the frame gives its
-            // exception back and leaves (panic=unwind).
+            // exception back and leaves (panic=unwind). With unwind tables
+            // the cleanup fn returns and the unwinder goes on.
+            Terminator::Unreachable if self.unw == Some(Unw::Abort) && self.zc_in_cleanup => self.out.push_str("  return;\n"),
             Terminator::Unreachable if self.unw == Some(Unw::Abort) => {
                 let _ = writeln!(self.out, "  lust_unw_resume(&ex);\n  {}", self.unwind_return());
             }
@@ -3080,7 +3221,9 @@ impl FnGen<'_, '_> {
                     let s = self.format(parts, &loc, &mut post, 0);
                     let _ = writeln!(self.out, "    lust_panic_lit(&{s}, {loc});\n  }}");
                 }
-                if let Some(Unw::Goto(b)) = self.unw {
+                if let Some(Unw::Goto(b)) = self.unw
+                    && !(self.p.unwind && self.p.unwind_tables)
+                {
                     let _ = writeln!(self.out, "  lust_unw_take(&ex);\n  goto bb{b};");
                 }
             }
@@ -3684,7 +3827,10 @@ impl FnGen<'_, '_> {
                 } else {
                     let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({i}_n, sizeof({et}), _Alignof({et}));");
                 }
-                if self.p.unwind {
+                // Unwind tables: a capacity overflow panic never returns. The frame still owns
+                // the moved value (its drop flag clears at the end of the statement), so the
+                // frame's cleanup drops it.
+                if self.p.unwind && !self.p.unwind_tables {
                     // A capacity overflow panic returns here under panic=unwind:
                     // fill nothing, drop the value, and unwind.
                     let _ = writeln!(self.out, "    if ({} < {i}_n) {i}_n = 0;", vec_cap(&et, &format!("&{t}")));
@@ -6535,6 +6681,16 @@ impl FnGen<'_, '_> {
                 // Read the index and the value before the shift: both can
                 // read the Vec itself, as in `v.insert(0, v[1])`.
                 let _ = writeln!(self.out, "    uint64_t {ti} = {i}; {et} {tx} = {x};");
+                if self.p.unwind_tables {
+                    // A bad index panics with the value still owned by `insert`: a guard
+                    // drops it as the panic unwinds.
+                    let (gd, gdis) = self.zc_guard(&tx, e);
+                    let _ = writeln!(
+                        self.out,
+                        "    {{{gd}\n    lust_vec_insert_at({vv}, {ti}, sizeof({et}), _Alignof({et}), {loc});{gdis} }}\n    (({et}*){vv}->ptr)[{ti}] = {tx};"
+                    );
+                    return "((lust_Unit){})".into();
+                }
                 if self.p.unwind {
                     // A bad index panics with the value still owned by
                     // `insert`, which drops it as it unwinds.
@@ -6659,7 +6815,11 @@ impl FnGen<'_, '_> {
                     );
                 }
                 let _ = writeln!(self.out, "    if ({n} <= {vv}->len) {{ {vv}->len = {n}; }} else {{");
-                if self.p.unwind {
+                if self.p.unwind_tables {
+                    // A capacity overflow panic never returns: a guard drops the value.
+                    let (gd, gdis) = self.zc_guard(&tv, e);
+                    let _ = writeln!(self.out, "      {{{gd} lust_vec_reserve({vv}, {n} - {vv}->len, sizeof({et}), _Alignof({et}));{gdis} }}");
+                } else if self.p.unwind {
                     // After a capacity overflow panic (panic=unwind) the Vec is
                     // unchanged and the value is dropped; `(void)` keeps
                     // `wrap_calls` from unwinding before that drop (the
@@ -6681,7 +6841,7 @@ impl FnGen<'_, '_> {
                         mangle(e)
                     );
                 }
-                if self.p.unwind {
+                if self.p.unwind && !self.p.unwind_tables {
                     if needs_drop_c(self.p, e) {
                         self.want(Glue::Drop, e);
                         // The frame holds the exception while the drop runs.
@@ -6724,8 +6884,25 @@ impl FnGen<'_, '_> {
                 let f = self.adapter_callee(&ops[1]);
                 let (w, r, c) = (self.tmp(), self.tmp(), self.tmp());
                 let mut body = String::new();
+                let zc = self.p.unwind_tables;
+                let rg = if zc { self.tmp() } else { String::new() };
+                if zc {
+                    body.push_str("    {\n");
+                }
                 let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
                 let _ = writeln!(body, "    uint64_t {w} = 0, {r} = 0;");
+                let mut env_disarm = String::new();
+                if zc {
+                    // Unwind tables: the env drops and the rest moves down behind the
+                    // kept ones (std's `BackshiftOnDrop`) as a panic unwinds; cleanup
+                    // variables run in reverse order, so the backshift goes first.
+                    let (gd, gdis) = self.zc_guard(&c, &tys[1]);
+                    env_disarm = gdis;
+                    let _ = writeln!(
+                        body,
+                        "   {gd}\n    struct lust_retain_guard {rg} __attribute__((cleanup(lust_retain_guard_end))) = {{ (lust_Vec *){vv}, &{r}, &{w}, sizeof({et}), 1 }};"
+                    );
+                }
                 let _ = writeln!(body, "    for (; {r} < {vv}->len; {r}++) {{");
                 let elem_r = format!("(&(({et}*){vv}->ptr)[{r}])");
                 let (keep, _) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[elem_r]);
@@ -6734,15 +6911,20 @@ impl FnGen<'_, '_> {
                 // removed. Either way the rest moves down behind the kept
                 // ones (std's `BackshiftOnDrop`), so nothing is lost.
                 let mine = "lust_unw_pending && lust_unw_mine()";
-                if self.p.unwind {
+                if self.p.unwind && !zc {
                     let _ = writeln!(body, "      if ({mine}) break;");
                 }
                 // A removed element drops as soon as it is rejected,
                 // before the predicate sees the next one, as in Rust.
                 let drop_rej = if needs_drop_c(self.p, e) {
                     self.want(Glue::Drop, e);
-                    let after = if self.p.unwind { format!(" if ({mine}) {{ {r}++; break; }}") } else { String::new() };
-                    format!("(void)(drop_{}(&(({et}*){vv}->ptr)[{r}]), 0);{after} ", mangle(e))
+                    if zc {
+                        // The element counts removed while its drop runs.
+                        format!("{r}++; drop_{}(&(({et}*){vv}->ptr)[{r} - 1]); {r}--; ", mangle(e))
+                    } else {
+                        let after = if self.p.unwind { format!(" if ({mine}) {{ {r}++; break; }}") } else { String::new() };
+                        format!("(void)(drop_{}(&(({et}*){vv}->ptr)[{r}]), 0);{after} ", mangle(e))
+                    }
                 } else {
                     String::new()
                 };
@@ -6751,7 +6933,9 @@ impl FnGen<'_, '_> {
                     "      if ({keep}) {{ if ({w} != {r}) (({et}*){vv}->ptr)[{w}] = (({et}*){vv}->ptr)[{r}]; {w}++; }} else {{ {drop_rej}}}"
                 );
                 let _ = writeln!(body, "    }}");
-                if self.p.unwind {
+                if zc {
+                    let _ = writeln!(body, "    {rg}.armed = 0; {vv}->len = {w};");
+                } else if self.p.unwind {
                     let n = self.tmp();
                     let _ = writeln!(body, "    uint64_t {n} = {vv}->len - {r}; {vv}->len = {w} + {n};");
                     let _ = writeln!(body, "    if ({n} && {w} != {r}) lust_memmove((({et}*){vv}->ptr) + {w}, (({et}*){vv}->ptr) + {r}, {n} * sizeof({et}));");
@@ -6760,12 +6944,17 @@ impl FnGen<'_, '_> {
                 }
                 if needs_drop_c(self.p, &tys[1]) {
                     self.want(Glue::Drop, &tys[1]);
-                    if self.p.unwind {
+                    if zc {
+                        let _ = writeln!(body, "   {env_disarm} drop_{}(&{c});", mangle(&tys[1]));
+                    } else if self.p.unwind {
                         let drop_c = self.unw_cleanup_drop(&c, &tys[1]);
                         let _ = writeln!(body, "    if ({mine}) {{{drop_c} }} else drop_{}(&{c});", mangle(&tys[1]));
                     } else {
                         let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
                     }
+                }
+                if zc {
+                    body.push_str("    }\n");
                 }
                 let _ = write!(self.out, "{body}");
                 "((lust_Unit){})".into()
@@ -8597,6 +8786,8 @@ pub struct SlotFiles<'a> {
 /// hook runner when the program can install a hook (`set_hook`).
 pub struct UnwindInit {
     pub unwind: bool,
+    /// Unwind tables (`Program::unwind_tables`): runtime mode 2, and main runs under a catch point.
+    pub tables: bool,
     pub ids: [u64; 4],
     pub hook_runner: Option<u32>,
 }
@@ -8616,7 +8807,7 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
         .map(|i| slot_of(LocalDefId(i as u32)));
     let (a, b) = crate::check::any::type_id_words(p, &p.tys, REF_STR);
     let (c, d) = crate::check::any::type_id_words(p, &p.tys, STRING);
-    Some(UnwindInit { unwind: p.unwind, ids: [a, b, c, d], hook_runner: runner })
+    Some(UnwindInit { unwind: p.unwind, tables: p.unwind_tables, ids: [a, b, c, d], hook_runner: runner })
 }
 
 /// The location unit: the per-slot line and file tables and
@@ -8655,10 +8846,11 @@ pub fn loc_unit(files: &SlotFiles, slot_lines: &[u32]) -> String {
 /// panic=unwind a `main` that ends by a panic exits 101.
 pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -> String {
     let unwind = init.as_ref().is_some_and(|i| i.unwind);
+    let tables = init.as_ref().is_some_and(|i| i.unwind && i.tables);
     let runner_slot = init.as_ref().and_then(|i| i.hook_runner);
     let (init, runner) = match init {
-        Some(UnwindInit { unwind, ids: [a, b, c, d], hook_runner }) => (
-            format!("\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);", unwind as u8),
+        Some(UnwindInit { unwind, tables, ids: [a, b, c, d], hook_runner }) => (
+            format!("\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);", if unwind && tables { 2 } else { unwind as u8 }),
             hook_runner.map_or(String::new(), |s| {
                 // Release C names the runner directly (only its address is taken here).
                 if names::release() { format!("\n  lust_hook_set_runner((lust_fnptr){});", names::body(s)) } else { format!("\n  lust_hook_set_runner(lust_fns[{s}]);") }
@@ -8681,6 +8873,13 @@ pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -
     for u in overlays {
         let _ = writeln!(c, "void lust_overlay_u{u}(void);");
     }
+    if tables {
+        // Main runs under a catch point (std's lang_start catches its panic).
+        let _ = writeln!(
+            c,
+            "static void lust_main_thunk(void *rc) {{ if (lust_main_entry_p) *(int *)rc = lust_main_entry_p(); else {main_call}; }}"
+        );
+    }
     let _ = writeln!(
         c,
         "int main(int argc, char **argv) {{\n  lust_argc = argc;\n  lust_argv = argv;\n  lust_loc_init();{}\n  lust_rt_init();\n  lust_base_init();\n  lust_kstatics_init();",
@@ -8692,6 +8891,10 @@ pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -
     c.push_str(runner.trim_start_matches('\n'));
     if !runner.is_empty() {
         c.push('\n');
+    }
+    if tables {
+        c.push_str("  int rc = 0;\n  if (lust_unw_try(lust_main_thunk, &rc)) rc = lust_unw_main_caught();\n  lust_tls_exit();\n  lust_flush();\n  return rc;\n}\n");
+        return c;
     }
     let _ = writeln!(
         c,
@@ -10290,7 +10493,18 @@ fn glue_def_value(
             }
             // panic=unwind: a panicking drop leaves the rest to drop as
             // cleanup, and the glue passes the exception on at its end.
-            if p.unwind && body.contains('(') {
+            // With unwind tables, glue whose type can reach a user Drop
+            // or a dyn drop runs its drops under catch points
+            // (`lust_unw_dtry`) and re-raises; other glue has no unwind code.
+            if p.unwind_tables {
+                body = body.replace(UNW_DSTEP, "").replace("UNW_DSTEP ", "");
+                if unwind::drop_may_unwind(p, t, &mut HashSet::new()) {
+                    let (text, any) = unwind::dtry_calls(&body);
+                    if any {
+                        body = format!("  void *ux = 0;\n{text}  if (ux) lust_unw_reraise(ux);\n");
+                    }
+                }
+            } else if p.unwind && body.contains('(') {
                 let dstep = UNW_DSTEP.trim();
                 body = unwind::wrap_calls(&body.replace("UNW_DSTEP ", UNW_DSTEP.trim_start()), dstep);
                 body = format!("  lust_exc ex; int32_t u = 0;\n{body}  if (u) lust_unw_resume(&ex);\n");

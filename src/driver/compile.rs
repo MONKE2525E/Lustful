@@ -3488,6 +3488,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     program.record_reads = caches.persistent;
     program.unwind = !session_key.profile.panic_abort;
     program.overflow_checks = session_key.profile.overflow_checks;
+    // Unwind tables need a C compiler with -fexceptions and a C++ driver, never tcc: a
+    // release driver build uses them (LUST_UNWIND_TABLES=0 turns them off); --emit-c
+    // in a one-shot process only with LUST_UNWIND_TABLES=1 (difftest EH=1).
+    let tables_env = std::env::var("LUST_UNWIND_TABLES").ok();
+    program.unwind_tables = program.unwind
+        && !caches.persistent
+        && if req.cc { tables_env.as_deref() != Some("0") } else { tables_env.as_deref() == Some("1") };
     // Route the spliced source std fns: resolve each registry row's
     // mangled name to the local fn the splice defined. A missing fn is
     // a broken std build (the loader found it standalone), so it is an
@@ -4487,6 +4494,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
             }
         }
+        // Unwind tables: the C++ half of a panic (throw and catch), for the C++ compiler.
+        if program.unwind_tables {
+            let _ = std::fs::write(format!("{}.eh.cc", p.display()), include_str!("../runtime/unwind.cc"));
+        }
         // A foreign emit-c build has no link step here: the emitted C
         // is the product, unless the cc release driver below links it.
         if foreign && !req.cc {
@@ -4506,7 +4517,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
         let built = crate::cc::spec_for(triple).and_then(|spec| {
             // Release C (`LUST_RELEASE_C=1`) already holds the content-addressed units.
-            let all: Vec<(String, String)> = if rgroups.is_some() {
+            let mut all: Vec<(String, String)> = if rgroups.is_some() {
                 units.iter().map(|(o, c)| (o.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned()), c.clone())).collect()
             } else {
                 [0, 1, 2, 3, LOC_UNIT]
@@ -4522,6 +4533,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     })
                     .collect()
             };
+            // Unwind tables: the C++ half of a panic (throw and catch), for the C++ driver.
+            if program.unwind_tables {
+                all.push(("eh.cc".to_string(), include_str!("../runtime/unwind.cc").to_string()));
+            }
             if let Some(parent) = req.out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }

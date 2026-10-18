@@ -51,7 +51,10 @@ static unsigned long long lust_os_tid(void) {
    comes from code that runs on after the first panic in the same C
    statement (it uses only safe placeholder values); it does nothing.
    `lust_unwind_mode` is 0 (panic=abort: every panic aborts, as before)
-   unless main sets it. The runtime object is the same in both modes. */
+   unless main sets it. The runtime object is the same in both modes.
+   Mode 2 (unwind tables, a clang or gcc build with -fexceptions; below)
+   has no pending state: a panic throws a C++ exception (unwind.cc) that
+   runs each frame's cleanup variable, and catch points catch it. */
 typedef struct {
     uint32_t kind; /* LUST_EXC_STR, LUST_EXC_STRING, or LUST_EXC_BOX */
     lust_str s;    /* the message bytes; LUST_EXC_STRING owns them */
@@ -97,7 +100,15 @@ typedef struct {
     /* While a custom hook runs: its panic's payload and location. */
     lust_dyn hook_payload;
     void *hook_loc;
+    /* Mode 2: the innermost catch point, the innermost unwind in flight,
+       and the unwind the last catch took. */
+    struct lust_catch *top;
+    struct lust_uexc *unwinding;
+    struct lust_uexc *caught;
 } lust_unw_state;
+#ifndef __TINYC__
+static void lust_unw_eh_raise(lust_unw_state *s, lust_exc *ex) __attribute__((noreturn));
+#endif
 static lust_pthread_key_t lust_unw_key;
 static lust_pthread_once_t lust_unw_once = LUST_PTHREAD_ONCE_INIT;
 /* Rust's FIRST_PANIC: the backtrace note prints for the first panic only. */
@@ -239,6 +250,9 @@ static void lust_unw_raise_exc(lust_exc *ex, const uint8_t *msg, uint64_t len, c
     if (s->pending) return;
     if (!s->in_hook) s->count++;
     lust_run_hook(ex, msg, len, file, line, col, s->count, &s->in_hook);
+#ifndef __TINYC__
+    if (lust_unwind_mode == 2) lust_unw_eh_raise(s, ex);
+#endif
     lust_unw_set_pending(s, ex);
 }
 
@@ -373,6 +387,139 @@ void lust_unw_dstep(lust_exc *ex, int32_t *u) LUST_BODY({
     *u = 1;
 })
 
+#ifdef LUST_IMPL
+#ifndef __TINYC__
+/* ---------- Unwind tables (lust_unwind_mode 2) ----------
+   A clang or gcc build compiles every unit with -fexceptions. A frame
+   with drops has one cleanup variable (cgen: the frame struct, with the
+   locals its cleanup ladder reads and the ladder entry stored before
+   each call that can unwind); builtins that own a value add small
+   guards. A panic runs the hook, then throws a C++ exception of a
+   private type (runtime/unwind.cc): the platform's C++ personality
+   unwinds, running those cleanups frame by frame, to the innermost
+   catch point (`lust_unw_try`: catch_unwind, a thread root, main), the
+   only place that catches it. Nothing runs after a call to check for a
+   panic, so a panic never returns. */
+void lust_unw_cxx_throw(void *x) __attribute__((noreturn));
+int32_t lust_unw_cxx_try(void (*f)(void *), void *ctx, void **caught);
+/* Weak fallbacks for a build without the C++ unit (a release build with
+   panic=abort or LUST_UNWIND_TABLES=0, gcc's sanitized builds): mode 2
+   never runs there. runtime/unwind.cc's definitions replace them. */
+__attribute__((weak, noreturn)) void lust_unw_cxx_throw(void *x) {
+    (void)x;
+    abort();
+}
+__attribute__((weak)) int32_t lust_unw_cxx_try(void (*f)(void *), void *ctx, void **caught) {
+    (void)caught;
+    f(ctx);
+    return 0;
+}
+struct lust_catch { struct lust_catch *prev; int32_t in_glue; };
+struct lust_uexc {
+    lust_exc exc;
+    struct lust_catch *target; /* the catch point this unwind goes to */
+    struct lust_uexc *outer;   /* the unwind in flight when this one began */
+};
+/* The innermost catch point that is not drop glue's (`lust_unw_dtry`): a panic
+   in a drop that cleanup runs aborts even when glue would catch it. */
+static struct lust_catch *lust_unw_outer_catch(struct lust_catch *c) {
+    while (c && c->in_glue) c = c->prev;
+    return c;
+}
+/* Throws `x`. A panic that would leave the cleanup of an unwind in flight (no
+   catch point began since that unwind did) is Rust's "panic in a destructor
+   during cleanup": it aborts before the throw, so no exception ever leaves a
+   cleanup variable's fn. */
+static void lust_unw_eh_go(lust_unw_state *s, struct lust_uexc *x) __attribute__((noreturn));
+static void lust_unw_eh_go(lust_unw_state *s, struct lust_uexc *x) {
+    if (!s->top) abort();
+    if (s->unwinding && lust_unw_outer_catch(s->top) == s->unwinding->target) lust_unw_cleanup_abort();
+    x->target = s->top;
+    x->outer = s->unwinding;
+    s->unwinding = x;
+    lust_unw_cxx_throw(x);
+}
+/* Raises `ex` (its hook already ran). */
+static void lust_unw_eh_raise(lust_unw_state *s, lust_exc *ex) {
+    struct lust_uexc *x = (struct lust_uexc *)calloc(1, sizeof *x);
+    if (!x) abort();
+    x->exc = *ex;
+    lust_unw_eh_go(s, x);
+}
+/* Runs f(ctx) under a catch point (`in_glue` for drop glue's). A caught
+   unwind is no longer in flight. */
+static int32_t lust_unw_catch_at(void (*f)(void *), void *ctx, int32_t in_glue, struct lust_uexc **out) {
+    lust_unw_state *s = lust_unw_get();
+    struct lust_catch c;
+    c.prev = s->top;
+    c.in_glue = in_glue;
+    s->top = &c;
+    void *x = 0;
+    int32_t r = lust_unw_cxx_try(f, ctx, &x);
+    s->top = c.prev;
+    if (r) {
+        struct lust_uexc *u = (struct lust_uexc *)x;
+        s->unwinding = u->outer;
+        *out = u;
+    }
+    return r;
+}
+int32_t lust_unw_try(void (*f)(void *), void *ctx) {
+    struct lust_uexc *u = 0;
+    if (!lust_unw_catch_at(f, ctx, 0, &u)) return 0;
+    lust_unw_get()->caught = u;
+    return 1;
+}
+/* A drop in drop glue that can panic (a user Drop, a dyn drop): Rust drops
+   the other fields as cleanup and passes the panic on at the glue's end
+   (`lust_unw_reraise`). The first panic's record is kept in `*ux`; a second
+   one in the same glue aborts. */
+void lust_unw_dtry(void (*f)(void *), void *arg, void **ux) {
+    struct lust_uexc *u = 0;
+    if (!lust_unw_catch_at(f, arg, 1, &u)) return;
+    if (*ux) lust_unw_cleanup_abort();
+    *ux = u;
+}
+/* The end of drop glue that caught a panic: it unwinds on (no hook; the panic
+   count stays). */
+void lust_unw_reraise(void *ux) { lust_unw_eh_go(lust_unw_get(), (struct lust_uexc *)ux); }
+static void lust_unw_eh_take(lust_exc *ex) {
+    lust_unw_state *s = lust_unw_get();
+    struct lust_uexc *x = s->caught;
+    s->caught = 0;
+    *ex = x->exc;
+    free(x);
+}
+#else
+int32_t lust_unw_try(void (*f)(void *), void *ctx) {
+    f(ctx);
+    return 0;
+}
+void lust_unw_dtry(void (*f)(void *), void *arg, void **ux) {
+    (void)ux;
+    f(arg);
+}
+void lust_unw_reraise(void *ux) {
+    (void)ux;
+    abort();
+}
+static void lust_unw_eh_take(lust_exc *ex) { (void)ex; abort(); }
+#endif
+/* A raise in either unwind mode: mode 2 never returns, mode 1 leaves the
+   exception pending. */
+static void lust_unw_raise_or_pend(lust_unw_state *s, lust_exc *ex) {
+#ifndef __TINYC__
+    if (lust_unwind_mode == 2) lust_unw_eh_raise(s, ex);
+#endif
+    lust_unw_set_pending(s, ex);
+}
+/* The exception a catch took: mode 2's caught one, else the pending one. */
+static void lust_unw_take_any(lust_exc *ex) {
+    if (lust_unwind_mode == 2) lust_unw_eh_take(ex);
+    else lust_unw_take(ex);
+}
+#endif
+
 /* Setup from main: the payload type ids (see lust_any_ids), and whether
    panics unwind. */
 void lust_unw_init(int32_t unwind, uint64_t str_lo, uint64_t str_hi, uint64_t string_lo, uint64_t string_hi) LUST_BODY({
@@ -443,13 +590,41 @@ void lust_hook_default(lust_str file, uint32_t line, uint32_t col, lust_str msg)
 })
 
 /* `catch_unwind`'s Err: takes the calling thread's pending exception
-   (the caller saw `lust_unw_mine`), ends its panic (the count falls), and
-   returns the payload as a Box<dyn Any + Send>. */
+   (the caller saw `lust_unw_mine`; in mode 2 the one its catch point
+   caught), ends its panic (the count falls), and returns the payload as
+   a Box<dyn Any + Send>. */
 lust_dyn lust_unw_catch(void) LUST_BODY({
     lust_exc ex;
-    lust_unw_take(&ex);
+    lust_unw_take_any(&ex);
     lust_unw_get()->count--;
     return lust_exc_box(&ex);
+})
+
+/* Unwind tables: a builtin's cleanup variable for a value it owns (cgen
+   `zc_guard`): the value drops when a panic unwinds before the builtin
+   disarms it. */
+struct lust_dguard { void (*drop)(void *); void *p; int32_t armed; };
+void lust_dguard_end(struct lust_dguard *g) LUST_BODY({
+    if (g->armed) g->drop(g->p);
+})
+/* `retain` under unwind tables: when the predicate or a rejected element's
+   drop panics, the unprocessed rest moves down behind the kept elements
+   (std's `BackshiftOnDrop`), so nothing is lost or dropped twice. */
+struct lust_retain_guard { lust_Vec *v; uint64_t *r; uint64_t *w; uint64_t es; int32_t armed; };
+void lust_retain_guard_end(struct lust_retain_guard *g) LUST_BODY({
+    if (!g->armed) return;
+    uint64_t r = *g->r, w = *g->w, n = g->v->len - r;
+    if (n && w != r) memmove((char *)g->v->ptr + w * g->es, (char *)g->v->ptr + r * g->es, n * g->es);
+    g->v->len = w + n;
+})
+
+/* Mode 2: after main's catch point caught a panic, std's lang_start drops
+   the payload and the process exits with 101. */
+int32_t lust_unw_main_caught(void) LUST_BODY({
+    lust_exc ex;
+    lust_unw_take_any(&ex);
+    lust_exc_drop(&ex);
+    return 101;
 })
 
 /* `resume_unwind(payload)`: the payload unwinds again with no hook. */
@@ -463,7 +638,7 @@ void lust_unw_resume_box(lust_dyn b) LUST_BODY({
     ex.box = b;
     ex.s.ptr = 0;
     ex.s.len = 0;
-    lust_unw_set_pending(s, &ex);
+    lust_unw_raise_or_pend(s, &ex);
 })
 
 /* After `main` returns: 101 when it ended by a panic (std's lang_start

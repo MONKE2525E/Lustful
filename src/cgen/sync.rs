@@ -1135,6 +1135,21 @@ impl FnGen<'_, '_> {
         // statement takes the call's unwind check (`unwind::wrap_calls`;
         // the `(void)` statements before it take none).
         let set = format!("({target})->v = {v}; lust_once_finish(&({target})->st); {after}");
+        if self.p.unwind_tables {
+            // Unwind tables: a guard at the top of the init block drops a by-ref env and
+            // empties the lock again when the init panics (runtime `lust_once_guard_end`).
+            let (dfn, denv) = if after.is_empty() {
+                ("0".to_string(), "0".to_string())
+            } else {
+                (format!("(void (*)(void *))drop_{}", mangle(&env_ty)), format!("(void *)&{ev}"))
+            };
+            let g = self.tmp();
+            let _ = writeln!(
+                self.out,
+                "    if (lust_once_begin(&({target})->st)) {{\n    struct lust_once_guard {g} __attribute__((cleanup(lust_once_guard_end))) = {{ &({target})->st, {denv}, {dfn}, 1 }};\n{body}  {g}.armed = 0; {set}\n    }} else {{ {drop_env} }}"
+            );
+            return format!("(&({target})->v)");
+        }
         let set = if self.p.unwind {
             let env = if after.is_empty() {
                 String::new()

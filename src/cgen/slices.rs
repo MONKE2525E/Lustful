@@ -262,10 +262,30 @@ impl FnGen<'_, '_> {
                 // keeps the element it saw; one in a duplicate's drop
                 // counts that one removed. The unchecked rest moves down
                 // behind the kept ones (std's `FillGapOnDrop`).
-                let unw = self.p.unwind;
+                // Unwind tables (`zc`): cleanup variables do the same as the panic
+                // unwinds (the keys, then the gap fill, then the env).
+                let zc = self.p.unwind_tables;
+                let unw = self.p.unwind && !zc;
                 let mine = "lust_unw_pending && lust_unw_mine()";
+                let rg = if zc { self.tmp() } else { String::new() };
+                if zc {
+                    body.push_str("    {\n");
+                }
                 let _ = writeln!(body, "    {} {c} = {};", ctype(&tys[1]), vals[1]);
-                let _ = writeln!(body, "    if ({vv}->len > 1) {{\n      uint64_t {w} = 1, {r} = 1;\n      for (; {r} < {vv}->len; {r}++) {{");
+                let mut env_disarm = String::new();
+                if zc {
+                    let (gd, gdis) = self.zc_guard(&c, &tys[1]);
+                    env_disarm = gdis;
+                    body.push_str(&format!("   {gd}\n"));
+                }
+                let _ = writeln!(body, "    if ({vv}->len > 1) {{\n      uint64_t {w} = 1, {r} = 1;");
+                if zc {
+                    let _ = writeln!(
+                        body,
+                        "      struct lust_retain_guard {rg} __attribute__((cleanup(lust_retain_guard_end))) = {{ (lust_Vec *){vv}, &{r}, &{w}, sizeof({et}), 1 }};"
+                    );
+                }
+                let _ = writeln!(body, "      for (; {r} < {vv}->len; {r}++) {{");
                 let cur = format!("(&(({et}*){vv}->ptr)[{r}])");
                 let prev = format!("(&(({et}*){vv}->ptr)[{w} - 1])");
                 let same = if b == B::VecDedupBy {
@@ -279,7 +299,11 @@ impl FnGen<'_, '_> {
                     if unw {
                         let _ = writeln!(body, "      if ({mine}) break;");
                     }
+                    let (ga, gadis) = if zc { self.zc_guard(&ka, &kt) } else { (String::new(), String::new()) };
+                    body.push_str(&ga);
                     let (kb, _) = self.adapter_call_c(&mut body, &f, &format!("&{c}"), &[prev]);
+                    let (gb, gbdis) = if zc { self.zc_guard(&kb, &kt) } else { (String::new(), String::new()) };
+                    body.push_str(&gb);
                     if unw {
                         let drop_ka = self.unw_cleanup_drop(&ka, &kt);
                         let _ = writeln!(body, "      if ({mine}) {{{drop_ka} break; }}");
@@ -295,14 +319,19 @@ impl FnGen<'_, '_> {
                     }
                     if needs_drop_c(self.p, &kt) {
                         self.want(Glue::Drop, &kt);
-                        let _ = writeln!(body, "      drop_{0}(&{kb}); drop_{0}(&{ka});", mangle(&kt));
+                        let _ = writeln!(body, "     {gbdis}{gadis} drop_{0}(&{kb}); drop_{0}(&{ka});", mangle(&kt));
                     }
                     s
                 };
                 let drop_dup = if needs_drop_c(self.p, &e) {
                     self.want(Glue::Drop, &e);
-                    let after = if unw { format!(" if ({mine}) {{ {r}++; break; }}") } else { String::new() };
-                    format!("(void)(drop_{}(&(({et}*){vv}->ptr)[{r}]), 0);{after} ", mangle(&e))
+                    if zc {
+                        // The duplicate counts removed while its drop runs.
+                        format!("{r}++; drop_{}(&(({et}*){vv}->ptr)[{r} - 1]); {r}--; ", mangle(&e))
+                    } else {
+                        let after = if unw { format!(" if ({mine}) {{ {r}++; break; }}") } else { String::new() };
+                        format!("(void)(drop_{}(&(({et}*){vv}->ptr)[{r}]), 0);{after} ", mangle(&e))
+                    }
                 } else {
                     String::new()
                 };
@@ -314,17 +343,24 @@ impl FnGen<'_, '_> {
                     let n = self.tmp();
                     let _ = writeln!(body, "      uint64_t {n} = {vv}->len - {r}; {vv}->len = {w} + {n};");
                     let _ = writeln!(body, "      if ({n} && {w} != {r}) lust_memmove((({et}*){vv}->ptr) + {w}, (({et}*){vv}->ptr) + {r}, {n} * sizeof({et}));\n    }}");
+                } else if zc {
+                    let _ = writeln!(body, "      {rg}.armed = 0; {vv}->len = {w};\n    }}");
                 } else {
                     let _ = writeln!(body, "      {vv}->len = {w};\n    }}");
                 }
                 if needs_drop_c(self.p, &tys[1]) {
                     self.want(Glue::Drop, &tys[1]);
-                    if unw {
+                    if zc {
+                        let _ = writeln!(body, "   {env_disarm} drop_{}(&{c});", mangle(&tys[1]));
+                    } else if unw {
                         let drop_c = self.unw_cleanup_drop(&c, &tys[1]);
                         let _ = writeln!(body, "    if ({mine}) {{{drop_c} }} else drop_{}(&{c});", mangle(&tys[1]));
                     } else {
                         let _ = writeln!(body, "    drop_{}(&{c});", mangle(&tys[1]));
                     }
+                }
+                if zc {
+                    body.push_str("    }\n");
                 }
                 let _ = write!(self.out, "{body}");
                 "((lust_Unit){})".into()

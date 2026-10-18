@@ -28,6 +28,8 @@
 #     unwind mode only (a form unwinding does not cover yet, such as
 #     thread::spawn) is UNSUPPORTED, and LUST_STRICT=1 makes it fail.
 #     The filter `unwind-` runs only the tests/unwind cases (their names get that prefix).
+#   EH=1 (with PANIC=unwind or RELEASE=1): lust's C with unwind tables (LUST_UNWIND_TABLES=1),
+#     built by clang -fexceptions (eh_build), in place of the tcc build.
 #   RELEASE=1 (rustc and lust both -C overflow-checks=off -C debug-assertions=off, a Cargo
 #     release profile's semantics; panics unwind unless PANIC=abort): tests/release/*.rs plus
 #     every tests/pass case (and tests/unwind when panics unwind), compared as in
@@ -158,6 +160,28 @@ sanitize_case() {
   fi
 }
 
+# eh_build <fixture> <name>: EH=1 (unwind tables, runtime/panic.c mode 2): lust emits the C with
+# LUST_UNWIND_TABLES=1, clang builds it with -fexceptions and the C++ unit (<name>.eh.cc, the
+# throw and the catch) with clang++, and clang++ links <name>.lust. Objects are cached per run
+# by the unit's hash, as the sanitized build's are.
+eh_obj=$work/eh-obj
+mkdir -p "$eh_obj"
+eh_build() {
+  local f=$1 name=$2 c o objs=()
+  (export LUST_UNWIND_TABLES=1; run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.tmp" --emit-c "$name") || return 1
+  for c in "$name".*.c "$name".eh.cc; do
+    o=$eh_obj/$(sha256sum <"$c" | cut -c1-40).o
+    objs+=("$o")
+    (
+      flock 9
+      local cc=clang
+      [[ "$c" == *.cc ]] && cc=clang++
+      [ -f "$o" ] || { $cc -O1 -fexceptions -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -w -Wno-error=implicit-function-declaration -c -o "$o.tmp" "$c" && mv "$o.tmp" "$o"; }
+    ) 9>"$o.lock" || return 1
+  done
+  clang++ -o "$name.lust" "${objs[@]}" -lm -lpthread
+}
+
 # lust_stderr <case file> <lust stderr>: lust's stderr as difftest compares it to rustc's
 # (mask_stderr, the case path as @CASE@). A panic inside lust's shipped std source reports
 # std's own library/ path and line (src/stdloc.rs), so the whole text compares exactly.
@@ -199,7 +223,12 @@ if [ "${PANIC:-abort}" = unwind ] || [ "${RELEASE:-0}" = 1 ]; then
       report bad "$name" "rustc ($mode) rejected it: $(head -3 rustc.err)"; return
     fi
     rs=$(cat rustc.rs)
-    if ! run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" 2>"$name.lust.err"; then
+    if [ "${EH:-0}" = 1 ]; then
+      eh_build "$f" "$name" 2>"$name.lust.err"
+    else
+      run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" 2>"$name.lust.err"
+    fi
+    if [ $? -ne 0 ]; then
       if [[ "$f" == */unwind/* || "$f" == */release/* ]] || [ "${LUST_STRICT:-0}" = 1 ]; then
         report bad "$name" "lust rejected it: $(head -3 "$name.lust.err")"; return
       fi

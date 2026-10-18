@@ -37,9 +37,12 @@ impl FnGen<'_, '_> {
         let (env, env_ty) = self.operand(&ops[0], loc, post);
         collect_types(&env_ty, &mut self.sig_types);
         let ret = self.callee_ret(&callee);
-        let res = CTy::Result(Box::new(ret), Box::new(CTy::BoxDyn));
+        let res = CTy::Result(Box::new(ret.clone()), Box::new(CTy::BoxDyn));
         collect_types(&res, &mut self.sig_types);
         let ev = self.tmp();
+        if self.p.unwind_tables {
+            return self.catch_unwind_tables(&callee, &env, &env_ty, &ret, &res, once);
+        }
         let _ = writeln!(self.out, "    {} {ev} = {env};", ctype(&env_ty));
         let mut call = String::new();
         let v = self.callee_call_c(&mut call, &callee, &ev, &[]);
@@ -62,6 +65,224 @@ impl FnGen<'_, '_> {
         }
         r
     }
+}
+
+impl FnGen<'_, '_> {
+    /// `catch_unwind(f)` with unwind tables: the call of `f` goes in a thunk (`cut<slot>_<n>`,
+    /// in the unit before this fn) that `lust_unw_try` runs under a catch point. The env and
+    /// the result sit in one context struct, so a panic leaves this frame's locals alone.
+    fn catch_unwind_tables(&mut self, callee: &sync::Callee, env: &str, env_ty: &CTy, ret: &CTy, res: &CTy, once: bool) -> String {
+        let slot = self.slots.of(self.body.fn_id);
+        let k = self.tmp();
+        let name = format!("cu{slot}_{k}");
+        let mut call = String::new();
+        let v = self.callee_call_c(&mut call, callee, "(c_->ev)", &[]);
+        let _ = writeln!(
+            self.prelude,
+            "struct {name} {{ {} ev; {} r; }};\nstatic void {name}_t(void *p_) {{\n  struct {name} *c_ = (struct {name} *)p_;\n{call}  c_->r = {v};\n}}",
+            ctype(env_ty),
+            ctype(ret)
+        );
+        let (c, caught) = (self.tmp(), self.tmp());
+        let _ = writeln!(self.out, "    struct {name} {c};\n    {c}.ev = {env};");
+        let _ = writeln!(
+            self.out,
+            "    lust_dyn {caught}p; int {caught} = lust_unw_try({name}_t, &{c}); if ({caught}) {caught}p = lust_unw_catch();"
+        );
+        if !once && needs_drop_c(self.p, env_ty) {
+            self.want(Glue::Drop, env_ty);
+            let _ = writeln!(self.out, "    drop_{}(&{c}.ev);", mangle(env_ty));
+        }
+        let r = self.tmp();
+        let ok = self.make_variant(res, 0, &[format!("{c}.r")]);
+        let err = self.make_variant(res, 1, &[format!("{caught}p")]);
+        let _ = writeln!(self.out, "    {} {r} = {caught} ? {err} : {ok};", ctype(res));
+        r
+    }
+}
+
+/// Unwind tables (`Program::unwind_tables`, runtime/panic.c mode 2): per local, the C names
+/// that live in the fn's frame struct because the cleanup blocks' C (`cl_text`) reads the
+/// local, its drop flag or one of its move flags; empty for every other local. A member
+/// local keeps its value, drop flag and move flags there, so the cleanup fn sees what the
+/// fn body last wrote. Promoted constants (static storage) never move there.
+pub(super) fn frame_members(cl_text: &str, n: usize, move_paths: &[Vec<Vec<Step>>], local_drop: &[bool], promoted: &[Local]) -> Vec<Vec<String>> {
+    let mut used = vec![false; n];
+    let b = cl_text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => i = skip_lit(b, i),
+            c if is_ident(c) && (i == 0 || !is_ident(b[i - 1])) => {
+                let start = i;
+                while i < b.len() && is_ident(b[i]) {
+                    i += 1;
+                }
+                let w = &cl_text[start..i];
+                let num = |s: &str| s.parse::<usize>().ok().filter(|&k| k < n);
+                let local = match w.as_bytes()[0] {
+                    b'l' | b'd' => num(&w[1..]),
+                    b'm' => w[1..].split_once('_').and_then(|(a, k)| num(a).filter(|_| k.parse::<u32>().is_ok())),
+                    _ => None,
+                };
+                if let Some(l) = local {
+                    used[l] = true;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    (0..n)
+        .map(|l| {
+            if !used[l] || promoted.contains(&(l as Local)) {
+                return Vec::new();
+            }
+            let mut names = vec![format!("l{l}")];
+            if local_drop[l] {
+                names.push(format!("d{l}"));
+            }
+            names.extend((0..move_paths[l].len()).map(|k| format!("m{l}_{k}")));
+            names
+        })
+        .collect()
+}
+
+impl FnGen<'_, '_> {
+    /// Unwind tables: the frame struct type of the fn in `slot` (the ladder entry `st`,
+    /// then each member local, its drop flag and move flags) and its cleanup fn's
+    /// prototype, both before the fn.
+    pub(super) fn frame_struct(&self, slot: u32, members: &[Vec<String>]) -> String {
+        let mut s = format!("struct fr{slot} {{\n  int32_t st;\n");
+        for (l, names) in members.iter().enumerate() {
+            for nm in names {
+                if nm.starts_with('l') {
+                    let t = &self.local_cty[l];
+                    let align = c_size_align(self.p, t).1;
+                    let al = if align > 16 { format!("_Alignas({align}) ") } else { String::new() };
+                    let _ = writeln!(s, "  {al}{} {nm};", ctype(t));
+                } else {
+                    let _ = writeln!(s, "  uint8_t {nm};");
+                }
+            }
+        }
+        let _ = writeln!(s, "}};\nstatic void cl{slot}(struct fr{slot} *Lc);");
+        s
+    }
+}
+
+/// Unwind tables: the cleanup fn of the fn in `slot`, after it. The unwinder calls it (the
+/// cleanup variable `L`) at each scope exit: a normal return stored `st = 0`; an unwind
+/// left the ladder entry of the call or statement that panicked, so it runs the cleanup
+/// blocks from there and returns, and the unwinder goes on. `cl_text` is the cleanup
+/// blocks' C, emitted with the members' names.
+pub(super) fn cleanup_fn(out: &mut String, slot: u32, members: &[Vec<String>], cl_order: &[usize], cl_text: &str) {
+    let names: Vec<&String> = members.iter().flatten().collect();
+    for nm in &names {
+        let _ = writeln!(out, "#undef {nm}");
+    }
+    let _ = writeln!(out, "static void cl{slot}(struct fr{slot} *Lc) {{");
+    for nm in &names {
+        let _ = writeln!(out, "#define {nm} (Lc->{nm})");
+    }
+    out.push_str("  lust_exc ex;\n  (void)ex;\n  switch (Lc->st) {\n  case 0: return;\n");
+    for b in cl_order {
+        let _ = writeln!(out, "  case {b}: goto bb{b};");
+    }
+    out.push_str("  default: return;\n  }\n");
+    out.push_str(cl_text);
+    out.push_str("}\n");
+    for nm in &names {
+        let _ = writeln!(out, "#undef {nm}");
+    }
+}
+
+/// Unwind tables: whether dropping a value of type `t` can panic, so its drop glue needs
+/// catch points: some part of it has a user `Drop` impl, or a dyn value whose drop is not
+/// known here. Conservative: a kind not listed counts as "can". `seen` stops at a type
+/// already on the walk (a recursive type adds nothing new there).
+pub(super) fn drop_may_unwind(p: &Program, t: &CTy, seen: &mut HashSet<CTy>) -> bool {
+    use CTy::*;
+    match t {
+        Unit | Bool | Char | Int(_) | Str | String | Float(_) | Ref(_) | Ptr(_) | FatPtr(_) | FnPtr(..) | Chars | Slice(_) | StrDrain
+        | ExitCode | Weak(_) | WeakDyn(_) | Guard(..) | DynGuard(_) => false,
+        Dyn | BoxDyn | RcDyn | DynCell => true,
+        Vec(e) | Option(e) | Boxed(e) | BoxSlice(e) | Rc(e) | Array(e, _) | VecIter(e) | ArrayIter(e, _) | OptIter(_, e) | VecDrain(e)
+        | RefCell(e) | Cell(e) => drop_may_unwind(p, e, seen),
+        Result(a, b) => drop_may_unwind(p, a, seen) || drop_may_unwind(p, b, seen),
+        Tuple(es) => es.iter().any(|e| drop_may_unwind(p, e, seen)),
+        Hash(_, args) => args.iter().any(|e| drop_may_unwind(p, e, seen)),
+        Adt(a) => {
+            if p.gx.drop_methods.contains_key(a) {
+                return true;
+            }
+            if !seen.insert(t.clone()) {
+                return false;
+            }
+            let fields: std::vec::Vec<CTy> = p.adt(*a).variants.iter().flat_map(|v| v.fields.iter().map(|f| cty(&p.tys, f.ty))).collect();
+            fields.iter().any(|f| drop_may_unwind(p, f, seen))
+        }
+        _ => true,
+    }
+}
+
+/// Unwind tables: drop glue's call statements that can panic, as catch points: a drop glue
+/// call `drop_X(a);` and a call through a cast fn pointer (a user Drop, a dyn drop entry)
+/// `((cast)f)(a);` become `lust_unw_dtry((void (*)(void *))f, (void *)(a), &ux);`.
+/// Returns the text and whether it made any.
+pub(super) fn dtry_calls(text: &str) -> (String, bool) {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 64);
+    let (mut i, mut copied, mut any) = (0, 0, false);
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => i = skip_lit(b, i),
+            b'(' if b.get(i + 1) == Some(&b'(') && stmt_start(b, i) => {
+                // `((cast)callee)(arg);`
+                let Some(close) = match_paren(b, i) else {
+                    i += 1;
+                    continue;
+                };
+                let callee = &text[i + 1..close];
+                let Some(close2) = b.get(close + 1).filter(|&&c| c == b'(').and_then(|_| match_paren(b, close + 1)) else {
+                    i += 1;
+                    continue;
+                };
+                if b.get(close2 + 1) != Some(&b';') {
+                    i += 1;
+                    continue;
+                }
+                let arg = &text[close + 2..close2];
+                out.push_str(&text[copied..i]);
+                let _ = write!(out, "lust_unw_dtry((void (*)(void *))({callee}), (void *)({arg}), &ux);");
+                any = true;
+                i = close2 + 2;
+                copied = i;
+            }
+            c if is_ident(c) && (i == 0 || !is_ident(b[i - 1])) => {
+                let start = i;
+                while i < b.len() && is_ident(b[i]) {
+                    i += 1;
+                }
+                let name = &text[start..i];
+                if !name.starts_with("drop_") || !stmt_start(b, start) || b.get(i) != Some(&b'(') {
+                    continue;
+                }
+                let Some(close) = match_paren(b, i) else { continue };
+                if b.get(close + 1) != Some(&b';') {
+                    continue;
+                }
+                let arg = &text[i + 1..close];
+                out.push_str(&text[copied..start]);
+                let _ = write!(out, "lust_unw_dtry((void (*)(void *)){name}, (void *)({arg}), &ux);");
+                any = true;
+                i = close + 2;
+                copied = i;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&text[copied..]);
+    (out, any)
 }
 
 /// The blocks of `body` that are cleanup: every block reachable from a

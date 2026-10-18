@@ -3587,7 +3587,7 @@ fallback gate. Rejected alternatives:
 | Abort only (today, `src/runtime.c:111-127`) | 0 | Ts-rust catches panics in 59 places. The LSP would die on a bad request. Not parity. |
 | `setjmp` per fn with a cleanup registry | One `setjmp` per fn with droppable locals, plus registry push/pop per scope | `setjmp` cost lands on every fn, and "which locals are live" at jump time needs the same cleanup metadata as explicit edges, with worse C semantics (volatile rules). |
 | `longjmp` from panic, skip drops | Near 0 | Wrong: skips drops, breaks rule zero wherever a drop prints or releases a lock. |
-| Real unwinding tables for tcc C | 0 until panic | tcc emits no unwind info. Writing it is a backend project. Revisit only if the backend bake-off picks an unwind-capable backend. |
+| Real unwinding tables for tcc C | 0 until panic | tcc emits no unwind info. Writing it is a backend project. Release builds use clang or zig cc, which emit it: 7.2a. |
 | Explicit propagation (chosen) | One global counter load after each call; duplicate drop code on cleanup edges | Simple C, exact drop order, works with tcc today. No C TLS (7.2). |
 
 ### 7.2 Explicit propagation design
@@ -3893,6 +3893,33 @@ These parts differ from the plan, and why:
 - Iterator expansions (lower/iter.rs) put each droppable local they
   make (a `vec::IntoIter`, a collected Vec) on the cleanup chain of
   the expanded call, so its values drop when a closure inside panics.
+
+### 7.2a Unwind tables in release builds
+
+The flags of 7.2 cost a load and a branch after every call. A release build (the
+release driver, `src/cc.rs`) compiles the C with clang or zig cc, which emit unwind
+tables, so it uses the platform's C++ exceptions instead (`Program::unwind_tables`,
+`lust_unwind_mode` 2 in `runtime/panic.c`):
+
+- A panic throws a private C++ type (`LustPanic` in `src/runtime/unwind.cc`, the one
+  C++ unit of the build) that holds the runtime's exception record. Only lust's catch
+  points catch it: `catch_unwind`, a thread's root, `main`, and drop glue that must go
+  on to drop the other fields. Other C++ exceptions pass through.
+- The generated units stay C, compiled with -fexceptions. A frame with drops keeps its
+  droppable locals and drop flags in one struct that is a cleanup variable
+  (`__attribute__((cleanup))`), and stores its ladder entry (`L.st`) before each
+  statement that can unwind. When an exception passes the frame, the cleanup function
+  runs the same cleanup ladder that 7.2 jumps to. A builtin that owns a value while it
+  can panic (`Vec::insert`, `resize`, `retain`, `dedup_by`, `OnceLock::get_or_init`)
+  keeps it in a guard (`lust_dguard` and its kin) for the same reason.
+- A panic while the cleanup of an exception runs, which the same catch point would
+  take, aborts before the throw ("panic in a destructor during cleanup"), as Rust
+  does. A `catch_unwind` inside a destructor still catches.
+- The tcc dev build keeps 7.2. One runtime serves both modes (`lust_unwind_mode`).
+
+Tests: `EH=1 PANIC=unwind scripts/difftest.sh` and `EH=1 RELEASE=1 scripts/difftest.sh`
+build every case this way (clang, clang++). `LUST_UNWIND_TABLES=0` turns it off in a
+release driver build; `LUST_UNWIND_TABLES=1` turns it on for `--emit-c`.
 
 ### 7.3 Threads, TLS, atomics, sync
 
@@ -4372,6 +4399,7 @@ dir no runner can execute is not a gate.
 |---|---|---|
 | `scripts/difftest.sh` | `tests/pass`, `tests/fail`, `tests/reject` with each compiler's defaults (panics unwind); `PANIC=abort` runs them with `-C panic=abort` on both sides | rustc with its defaults (or `-C panic=abort`) |
 | `PANIC=unwind scripts/difftest.sh` | `tests/unwind/` plus panic cases in `tests/pass` | rustc with `-C panic=unwind`, overflow checks on. Needed because abort mode cannot test recovered panics, poison, or unwind drops. |
+| `EH=1` with `PANIC=unwind` or `RELEASE=1` | as without `EH=1` | lust's C with unwind tables (7.2a), built by clang -fexceptions and clang++, in place of the tcc build. |
 | `RELEASE=1 scripts/difftest.sh` (with or without `PANIC=unwind`) | `tests/release/` plus every `tests/pass` case | rustc and lust both with `-C overflow-checks=off -C debug-assertions=off`, a release profile's semantics: wrapping arithmetic, masked shifts, no debug assertions. |
 | `scripts/test-crates.sh` | `tests/crates/*`: multi-file Cargo fixtures, each built by Cargo and by lust, stdout and exit compared. Sets target and features per fixture. | Cargo |
 | `scripts/test-macros.sh` | `tests/macros/`: token compare, executable hygiene cases, both-reject cases | `rustc -Zunpretty=expanded` tokens; rustc run output |

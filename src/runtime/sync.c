@@ -595,15 +595,24 @@ static void *lust_thread_entry(void *p) {
         pthread_setname_np(nm);
     }
 #endif
-    h->run(h);
-    void *alt = self->alt;
     /* A panic that reached the thread's root ends the thread; its payload
-       is the join's Err (std's spawn wrapper catches it). */
+       is the join's Err (std's spawn wrapper catches it). In mode 2 the
+       root is a catch point. */
     lust_exc ex;
-    if (lust_unwind_mode && lust_unw_pending && lust_unw_take(&ex)) {
-        h->payload = lust_exc_box(&ex);
-        h->panicked = 1;
+    if (lust_unwind_mode == 2) {
+        if (lust_unw_try((void (*)(void *))h->run, h)) {
+            lust_unw_take_any(&ex);
+            h->payload = lust_exc_box(&ex);
+            h->panicked = 1;
+        }
+    } else {
+        h->run(h);
+        if (lust_unwind_mode && lust_unw_pending && lust_unw_take(&ex)) {
+            h->payload = lust_exc_box(&ex);
+            h->panicked = 1;
+        }
     }
+    void *alt = self->alt;
     uint32_t one = 1;
     __atomic_store(&h->done, &one, 3);
     if (__atomic_sub_fetch(&h->rc, 1, 4) == 0) {
@@ -1645,6 +1654,16 @@ void lust_once_abort(uint32_t *st) LUST_BODY({
     uint32_t zero = 0;
     __atomic_store(st, &zero, 3);
     lust_futex_wake(st, 0x7fffffff);
+})
+
+/* `get_or_init` under unwind tables (runtime/panic.c mode 2): the init block's
+   cleanup variable. When the init panicked (still armed), it drops a by-ref
+   closure's env (std drops `f` inside the call) and empties the lock again. */
+struct lust_once_guard { uint32_t *st; void *env; void (*drop)(void *); int32_t armed; };
+void lust_once_guard_end(struct lust_once_guard *g) LUST_BODY({
+    if (!g->armed) return;
+    if (g->drop) g->drop(g->env);
+    lust_once_abort(g->st);
 })
 
 int lust_once_is_done(uint32_t *st) LUST_BODY({

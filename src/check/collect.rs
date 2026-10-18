@@ -434,6 +434,12 @@ pub struct Program {
     /// in a debug build. Off, they wrap and shift amounts are masked, as in a
     /// release build. Set by the driver after collection from the session's profile.
     pub overflow_checks: bool,
+    /// panic=unwind with unwind tables (`lust_unwind_mode` 2, runtime/panic.c): codegen gives
+    /// each frame with drops one cleanup variable and stores its ladder entry before calls
+    /// that can unwind, instead of a flag check after each call. Needs a C compiler with
+    /// -fexceptions (clang, gcc, zig cc) and its C++ driver for the throw and the catch
+    /// (runtime/unwind.cc), never tcc. Set by the driver.
+    pub unwind_tables: bool,
     /// Region signatures for the borrow checker (W-BORROW, ARCH 5): the
     /// signatures with their lifetimes kept, beside the erased ones above.
     pub regions: crate::borrowck::RegionTables,
@@ -3474,6 +3480,7 @@ pub fn collect_reuse(
         record_reads: true,
         unwind: false,
         overflow_checks: true,
+        unwind_tables: false,
         regions: Default::default(),
         fp_memo: Default::default(),
         const_goals: Vec::new(),

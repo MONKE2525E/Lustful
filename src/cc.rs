@@ -9,6 +9,10 @@
 // and -lunwind so a unit set built for zero-cost unwinding (rel-opt round
 // 2) links unchanged. `LUST_CC` replaces the compiler command (for example
 // `LUST_CC="clang-18"` on a box with no zig, for host-reachable targets).
+// A build with unwind tables has one C++ unit (a name ending in `.cc`, the
+// throw and the catch of src/runtime/unwind.cc): the C++ driver of the same
+// compiler (`CcSpec::cxx`) compiles it and links the binary, which brings
+// in the C++ runtime and personality.
 //
 // Objects go through the disk cache: `unit_key` below is the one seam a
 // smarter object cache (rel-cache) takes over. Its inputs are the C text,
@@ -25,6 +29,8 @@ pub struct CcSpec {
     pub triple: String,
     /// Compiler command words, for example ["zig", "cc", "-target", "aarch64-linux-musl"].
     pub cmd: Vec<String>,
+    /// The C++ driver of the same compiler (`cxx_for`), for a `.cc` unit and its link.
+    pub cxx: Vec<String>,
     /// Static link (musl release binaries, as ts-rust ships them).
     pub statik: bool,
     /// File name suffix of the output (".exe" on Windows triples).
@@ -46,6 +52,47 @@ pub fn zig_target(triple: &str) -> Option<&'static str> {
         "aarch64-pc-windows-msvc" => "aarch64-windows-gnu",
         _ => return None,
     })
+}
+
+/// True when `prog` names zig (`zig`, `/opt/zig/zig`).
+fn is_zig(prog: &str) -> bool {
+    Path::new(prog).file_stem().is_some_and(|s| s == "zig")
+}
+
+/// The C++ driver that goes with a C compiler command: `zig cc` -> `zig c++`,
+/// `clang[-N]` -> `clang++[-N]`, `[prefix-]gcc[-N]` -> `[prefix-]g++[-N]`, `cc` ->
+/// `c++`; other names stay (they must take C++ themselves). `LUST_CXX` (words)
+/// replaces it.
+fn cxx_for(cmd: &[String]) -> Vec<String> {
+    if let Ok(cxx) = std::env::var("LUST_CXX") {
+        let words: Vec<String> = cxx.split_whitespace().map(str::to_string).collect();
+        if !words.is_empty() {
+            return words;
+        }
+    }
+    let mut v = cmd.to_vec();
+    if v.first().is_some_and(|c| is_zig(c)) {
+        if let Some(w) = v.iter_mut().find(|w| *w == "cc") {
+            *w = "c++".into();
+        }
+        return v;
+    }
+    let Some(first) = v.first_mut() else { return v };
+    let path = Path::new(first.as_str());
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let cxx = if name.contains("++") {
+        name
+    } else if let Some(i) = name.rfind("clang") {
+        format!("{}clang++{}", &name[..i], &name[i + 5..])
+    } else if let Some(i) = name.rfind("gcc") {
+        format!("{}g++{}", &name[..i], &name[i + 3..])
+    } else if name == "cc" {
+        "c++".into()
+    } else {
+        name
+    };
+    *first = path.with_file_name(cxx).to_string_lossy().into_owned();
+    v
 }
 
 /// True when `prog` is an executable on PATH.
@@ -70,22 +117,19 @@ pub fn spec_for(triple: &str) -> Result<CcSpec, String> {
         if cmd.is_empty() {
             return Err("LUST_CC is empty".into());
         }
-        let is_zig = Path::new(&cmd[0]).file_stem().is_some_and(|s| s == "zig");
-        if is_zig && !cmd.iter().any(|a| a == "-target") {
+        if is_zig(&cmd[0]) && !cmd.iter().any(|a| a == "-target") {
             if cmd.len() == 1 {
                 cmd.push("cc".into());
             }
             cmd.extend(["-target".into(), zt.into()]);
         }
-        return Ok(CcSpec { triple: triple.into(), cmd, statik, exe_suffix });
+        let cxx = cxx_for(&cmd);
+        return Ok(CcSpec { triple: triple.into(), cmd, cxx, statik, exe_suffix });
     }
     if on_path("zig") {
-        return Ok(CcSpec {
-            triple: triple.into(),
-            cmd: vec!["zig".into(), "cc".into(), "-target".into(), zt.into()],
-            statik,
-            exe_suffix,
-        });
+        let cmd: Vec<String> = vec!["zig".into(), "cc".into(), "-target".into(), zt.into()];
+        let cxx = cxx_for(&cmd);
+        return Ok(CcSpec { triple: triple.into(), cmd, cxx, statik, exe_suffix });
     }
     let (arch, os) = (triple.split('-').next().unwrap_or(""), triple);
     let host_like = arch == std::env::consts::ARCH
@@ -94,7 +138,9 @@ pub fn spec_for(triple: &str) -> Result<CcSpec, String> {
         // A host clang/gcc reaches this target as far as this driver
         // checks (same arch and OS; a musl static link still needs the
         // musl toolchain, which the link error will name).
-        return Ok(CcSpec { triple: triple.into(), cmd: vec!["cc".into()], statik, exe_suffix });
+        let cmd = vec!["cc".to_string()];
+        let cxx = cxx_for(&cmd);
+        return Ok(CcSpec { triple: triple.into(), cmd, cxx, statik, exe_suffix });
     }
     Err(format!(
         "no C compiler for target `{triple}`: install zig (zig cc cross-compiles it) or set LUST_CC to a cross compiler command"
@@ -113,6 +159,12 @@ pub fn cflags(debug: bool) -> String {
     if debug { format!("{base} -g") } else { base.into() }
 }
 
+/// The flags of a `.cc` unit (the runtime's throw and catch).
+pub fn cxxflags(debug: bool) -> String {
+    let base = "-O2 -w -fexceptions";
+    if debug { format!("{base} -g") } else { base.into() }
+}
+
 /// The link-time extras for one spec: libm for the float methods, the
 /// unwinder for zig targets (its libc has none linked by default on musl
 /// and windows-gnu), static where the spec asks, and a strip for release
@@ -127,7 +179,7 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
     } else {
         v.push("-g".into());
     }
-    if spec.cmd.first().is_some_and(|c| Path::new(c).file_stem().is_some_and(|s| s == "zig")) {
+    if spec.cmd.first().is_some_and(|c| is_zig(c)) {
         v.push("-lunwind".into());
     }
     if !spec.triple.contains("windows") {
@@ -165,31 +217,31 @@ fn compiler_id(cmd: &[String]) -> String {
     id
 }
 
-/// The disk cache key of one unit's object under this backend: the C text,
-/// the compiler, the flags, the target, and `profile`, the digest of the PGO
-/// data this unit's object depends on (see `Pgo::unit_digest`). A unit that
-/// includes system headers (the runtime unit) keys on its preprocessed text
-/// instead, so a header or sysroot change moves its key; the other units
-/// include nothing.
-pub fn unit_key(c_text: &str, spec: &CcSpec, debug: bool, profile: Option<&str>) -> String {
-    let id = compiler_id(&spec.cmd);
-    let flags = cflags(debug);
-    let pre = c_text.contains("#include <").then(|| preprocessed(c_text, spec, &flags)).flatten();
+/// The disk cache key of one unit's object under this backend: the C (or,
+/// `cxx`, C++) text, the compiler, the flags, the target, and `profile`, the
+/// digest of the PGO data this unit's object depends on (see
+/// `Pgo::unit_digest`). A unit that includes system headers (the runtime
+/// unit, the C++ unit) keys on its preprocessed text instead, so a header or
+/// sysroot change moves its key; the other units include nothing.
+pub fn unit_key(c_text: &str, spec: &CcSpec, debug: bool, profile: Option<&str>, cxx: bool) -> String {
+    let (words, flags) = if cxx { (&spec.cxx, cxxflags(debug)) } else { (&spec.cmd, cflags(debug)) };
+    let id = compiler_id(words);
+    let pre = c_text.contains("#include <").then(|| preprocessed(c_text, words, &flags, cxx)).flatten();
     let text = pre.as_deref().unwrap_or(c_text.as_bytes());
     let (a, b) = crate::driver::cache::hash128(
-        &[b"cc-v2", spec.triple.as_bytes(), id.as_bytes(), flags.as_bytes(), &[debug as u8], profile.unwrap_or("").as_bytes(), text],
+        &[b"cc-v2", spec.triple.as_bytes(), id.as_bytes(), flags.as_bytes(), &[debug as u8, cxx as u8], profile.unwrap_or("").as_bytes(), text],
         37,
     );
     format!("{a:016x}{b:016x}")
 }
 
-/// `c_text` after the preprocessor of `spec` with `flags`, or None when it
-/// cannot run (the key then holds the raw text, and a failed compile reports
-/// the real error).
-fn preprocessed(c_text: &str, spec: &CcSpec, flags: &str) -> Option<Vec<u8>> {
+/// `c_text` (C++ text with `cxx`) after the preprocessor of the compiler
+/// `words` with `flags`, or None when it cannot run (the key then holds the
+/// raw text, and a failed compile reports the real error).
+fn preprocessed(c_text: &str, words: &[String], flags: &str, cxx: bool) -> Option<Vec<u8>> {
     use std::io::Write as _;
-    let mut cmd = Command::new(&spec.cmd[0]);
-    cmd.args(&spec.cmd[1..]).args(flags.split_whitespace()).args(["-E", "-P", "-x", "c", "-", "-o", "-"]);
+    let mut cmd = Command::new(&words[0]);
+    cmd.args(&words[1..]).args(flags.split_whitespace()).args(["-E", "-P", "-x", if cxx { "c++" } else { "c" }, "-", "-o", "-"]);
     let mut child = cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
     let mut stdin = child.stdin.take()?;
     let text = c_text.to_string();
@@ -200,8 +252,9 @@ fn preprocessed(c_text: &str, spec: &CcSpec, flags: &str) -> Option<Vec<u8>> {
 }
 
 /// Compiles every unit and links `out`. `units` are (name, C text) pairs in
-/// link order; `work` is a scratch dir for C files and objects the caller
-/// owns. Returns a one-line summary, or the compiler's error text.
+/// link order (a name ending in `.cc` is C++ text, for `spec.cxx`); `work`
+/// is a scratch dir for C files and objects the caller owns. Returns a
+/// one-line summary, or the compiler's error text.
 pub fn build(
     units: &[(String, String)],
     spec: &CcSpec,
@@ -212,12 +265,14 @@ pub fn build(
 ) -> Result<String, String> {
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
+    let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
+    let is_cxx = |name: &str| name.ends_with(".cc");
     // Largest units first, bounded workers: the tcc driver's shape
     // (src/tcc.rs), for the same reason (the tail is short units).
     let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len()));
     let objs: Vec<PathBuf> = units.iter().map(|(name, _)| work.join(format!("{name}.o"))).collect();
-    let keys: Vec<Option<String>> = units.iter().map(|(_, c)| cache.map(|_| unit_key(c, spec, debug, None))).collect();
+    let keys: Vec<Option<String>> = units.iter().map(|(name, c)| cache.map(|_| unit_key(c, spec, debug, None, is_cxx(name)))).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(String::new());
     let hits = std::sync::atomic::AtomicUsize::new(0);
@@ -235,14 +290,16 @@ pub fn build(
                     hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
-                let src = work.join(format!("{name}.c"));
+                let cxx = is_cxx(name);
+                let src = if cxx { work.join(name) } else { work.join(format!("{name}.c")) };
                 let fail = |msg: String| errors.lock().unwrap_or_else(|e| e.into_inner()).push_str(&msg);
                 if let Err(e) = std::fs::write(&src, c) {
                     fail(format!("cannot write {}: {e}\n", src.display()));
                     continue;
                 }
-                let mut cmd = Command::new(&spec.cmd[0]);
-                cmd.args(&spec.cmd[1..]).args(&flags).arg("-c").arg(&src).arg("-o").arg(obj);
+                let (words, unit_flags) = if cxx { (&spec.cxx, &cxx_flags) } else { (&spec.cmd, &flags) };
+                let mut cmd = Command::new(&words[0]);
+                cmd.args(&words[1..]).args(unit_flags).arg("-c").arg(&src).arg("-o").arg(obj);
                 match cmd.output() {
                     Ok(o) if o.status.success() => {
                         if let (Some(cache), Some(key)) = (cache, &keys[i]) {
@@ -254,7 +311,7 @@ pub fn build(
                         msg.push_str(&String::from_utf8_lossy(&o.stderr));
                         fail(msg);
                     }
-                    Err(e) => fail(format!("cannot run {}: {e}\n", spec.cmd.join(" "))),
+                    Err(e) => fail(format!("cannot run {}: {e}\n", words.join(" "))),
                 }
             });
         }
@@ -263,8 +320,10 @@ pub fn build(
     if !errors.is_empty() {
         return Err(format!("the C compiler failed for target {}:\n{errors}", spec.triple));
     }
-    let mut cmd = Command::new(&spec.cmd[0]);
-    cmd.args(&spec.cmd[1..]).args(ldflags(spec, debug)).args(&objs).arg("-o").arg(out);
+    // A build with a C++ unit links with the C++ driver (its runtime and personality).
+    let link = if units.iter().any(|(name, _)| is_cxx(name)) { &spec.cxx } else { &spec.cmd };
+    let mut cmd = Command::new(&link[0]);
+    cmd.args(&link[1..]).args(ldflags(spec, debug)).args(&objs).arg("-o").arg(out);
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(format!(
             "{} units ({} from cache), linked {}",
@@ -273,7 +332,7 @@ pub fn build(
             out.display()
         )),
         Ok(o) => Err(format!("link failed for target {} ({})\n{}", spec.triple, o.status, String::from_utf8_lossy(&o.stderr))),
-        Err(e) => Err(format!("cannot run {}: {e}", spec.cmd.join(" "))),
+        Err(e) => Err(format!("cannot run {}: {e}", link.join(" "))),
     }
 }
 
@@ -288,18 +347,28 @@ mod tests {
     }
 
     #[test]
+    fn cxx_driver_matches_the_c_driver() {
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<String>>();
+        assert_eq!(super::cxx_for(&words("zig cc -target x86_64-linux-musl")), words("zig c++ -target x86_64-linux-musl"));
+        assert_eq!(super::cxx_for(&words("/usr/bin/clang-18")), words("/usr/bin/clang++-18"));
+        assert_eq!(super::cxx_for(&words("x86_64-linux-musl-gcc")), words("x86_64-linux-musl-g++"));
+        assert_eq!(super::cxx_for(&words("cc")), words("c++"));
+        assert_eq!(super::cxx_for(&words("clang++")), words("clang++"));
+    }
+
+    #[test]
     fn unit_key_moves_with_every_input() {
-        let spec = |triple: &str, cmd: &str| super::CcSpec {
-            triple: triple.into(),
-            cmd: cmd.split_whitespace().map(str::to_string).collect(),
-            statik: false,
-            exe_suffix: "",
+        let spec = |triple: &str, cmd: &str| {
+            let cmd: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            super::CcSpec { triple: triple.into(), cxx: super::cxx_for(&cmd), cmd, statik: false, exe_suffix: "" }
         };
-        let base = super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false, None);
-        assert_ne!(base, super::unit_key("int g(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false, None), "C text");
-        assert_ne!(base, super::unit_key("int f(void);", &spec("x86_64-unknown-linux-musl", "zig cc"), false, None), "target");
-        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), true, None), "debug");
-        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "clang"), false, None), "compiler");
-        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false, Some("p1")), "profile");
+        let key = |text: &str, triple: &str, cmd: &str, debug: bool, profile: Option<&str>, cxx: bool| super::unit_key(text, &spec(triple, cmd), debug, profile, cxx);
+        let base = key("int f(void);", "aarch64-unknown-linux-musl", "zig cc", false, None, false);
+        assert_ne!(base, key("int g(void);", "aarch64-unknown-linux-musl", "zig cc", false, None, false), "C text");
+        assert_ne!(base, key("int f(void);", "x86_64-unknown-linux-musl", "zig cc", false, None, false), "target");
+        assert_ne!(base, key("int f(void);", "aarch64-unknown-linux-musl", "zig cc", true, None, false), "debug");
+        assert_ne!(base, key("int f(void);", "aarch64-unknown-linux-musl", "clang", false, None, false), "compiler");
+        assert_ne!(base, key("int f(void);", "aarch64-unknown-linux-musl", "zig cc", false, Some("p1"), false), "profile");
+        assert_ne!(base, key("int f(void);", "aarch64-unknown-linux-musl", "zig cc", false, None, true), "C++");
     }
 }
