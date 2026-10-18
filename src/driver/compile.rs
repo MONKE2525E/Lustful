@@ -4732,28 +4732,23 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let (c_jobs, fn_jobs) = jobs.split_at(5);
             let mut made = par_map(c_jobs, |&u| assemble(u, None));
             let c_refs = cgen::names::with(rn, || cgen::ll::on(&program)).then(|| {
+                // The C units and glue shards are made this build; each fn's C was read when
+                // its FnOut was made (`FnOut::ll_c_refs`; a C body's `code` is read here).
+                let texts: Vec<&str> = made.iter().map(|(_, c, _)| c.as_str()).chain(rshards.iter().map(String::as_str)).collect();
                 let mut r = cgen::ll::CRefs::default();
-                for (_, c, _) in &made {
-                    r.scan(c);
-                }
-                for c in &rshards {
-                    r.scan(c);
-                }
-                let per: Vec<cgen::ll::CRefs> = par_map(&caches.out.chunks(256).collect::<Vec<_>>(), |fs| {
+                for p in par_map(&texts, |t| {
                     let mut r = cgen::ll::CRefs::default();
-                    for f in fs.iter() {
-                        r.scan(&f.ll_c);
-                        if f.ll.is_empty() {
-                            r.scan(&f.code);
-                        } else if f.ll.contains("@f_") || f.ll.contains("@tramp_") {
-                            r.scan(&f.ll);
-                        }
-                    }
+                    r.scan(t);
                     r
-                });
-                for p in per {
-                    r.wrappers.extend(p.wrappers);
-                    r.tramps.extend(p.tramps);
+                }) {
+                    r.extend(&p);
+                }
+                for f in caches.out.iter() {
+                    if f.ll.is_empty() {
+                        r.scan(&f.code);
+                    } else {
+                        r.extend(&f.ll_c_refs);
+                    }
                 }
                 if let Some(id) = cgen::names::with(rn, || cgen::names::fn_tag_opt(main_slot)).and_then(|id| u64::from_str_radix(&id, 16).ok()) {
                     r.wrappers.insert(id);

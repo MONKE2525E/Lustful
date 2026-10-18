@@ -2093,7 +2093,7 @@ pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections:
 /// `(wrappers, trampolines)`. An LLVM fn's own C (its `code`) is the only text that has to
 /// define them; a unit keeps a wrapper or trampoline only when some text names it
 /// (`c_body`): most fns are called through `fl_<id>` only.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CRefs {
     pub wrappers: HashSet<u64>,
     pub tramps: HashSet<u64>,
@@ -2104,27 +2104,26 @@ impl CRefs {
     pub fn scan(&mut self, text: &str) {
         let b = text.as_bytes();
         let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-        let mut i = 0;
-        while let Some(k) = text[i..].find('_') {
-            let at = i + k;
-            i = at + 1;
-            let (start, tramp) = if at >= 1 && b[at - 1] == b'f' {
-                (at - 1, false)
-            } else if at >= 5 && &b[at - 5..at] == b"tramp" {
-                (at - 5, true)
-            } else {
-                continue;
-            };
-            if start > 0 && word(b[start - 1]) {
-                continue;
+        for (pat, tramp) in [("f_", false), ("tramp_", true)] {
+            for (at, _) in text.match_indices(pat) {
+                if at > 0 && word(b[at - 1]) {
+                    continue;
+                }
+                let h = at + pat.len();
+                let Some(hex) = text.get(h..h + 16) else { continue };
+                if b.get(h + 16).is_some_and(|&c| word(c)) {
+                    continue;
+                }
+                let Ok(id) = u64::from_str_radix(hex, 16) else { continue };
+                if tramp { self.tramps.insert(id) } else { self.wrappers.insert(id) };
             }
-            let Some(hex) = text.get(at + 1..at + 17) else { continue };
-            if b.get(at + 17).is_some_and(|&c| word(c)) {
-                continue;
-            }
-            let Ok(id) = u64::from_str_radix(hex, 16) else { continue };
-            if tramp { self.tramps.insert(id) } else { self.wrappers.insert(id) };
         }
+    }
+
+    /// Adds every id `other` holds.
+    pub fn extend(&mut self, other: &CRefs) {
+        self.wrappers.extend(&other.wrappers);
+        self.tramps.extend(&other.tramps);
     }
 
     /// The C of LLVM fn `id`'s `code` this build needs: its wrapper when some text calls it

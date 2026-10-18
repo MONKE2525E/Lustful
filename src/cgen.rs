@@ -1064,6 +1064,9 @@ pub struct FnOut {
     pub ll_c: String,
     /// The LLVM backend: the fn's size for cross-unit inlining (`ll::LlFn::cost`).
     pub ll_cost: u32,
+    /// The LLVM backend: the fn ids whose C ABI wrapper or trampoline this fn's helpers' C
+    /// names (`ll::CRefs`), read once here so a build does not scan every fn's C again.
+    pub ll_c_refs: ll::CRefs,
     /// The fn's `#[inline]` attribute, which release C inline definitions follow.
     pub inline: InlineAttr,
 }
@@ -2178,7 +2181,14 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     named.retain(|t| !types.contains(t));
     let (ll, ll_decls, ll_c, ll_cost) = llfn.map(|f| (f.def, f.decls, f.helpers, f.cost)).unwrap_or_default();
     let inline = if release { inline_attr(p, body.fn_id) } else { InlineAttr::None };
-    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, inline }
+    let mut ll_c_refs = ll::CRefs::default();
+    if !ll.is_empty() {
+        ll_c_refs.scan(&ll_c);
+        if ll.contains("@f_") || ll.contains("@tramp_") {
+            ll_c_refs.scan(&ll);
+        }
+    }
+    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, ll_c_refs, inline }
 }
 
 /// `f`'s `#[inline]` attribute (an instance has its template's). A closure body counts as
