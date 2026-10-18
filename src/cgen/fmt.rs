@@ -545,7 +545,7 @@ impl FnGen<'_, '_> {
     /// Release C: the count and lock blocks `fmt_expr` opens on its way to the formatted
     /// value (an `Rc`'s `->v`, a guard's `->f1`) must be defined in the unit
     /// (`type_decls_with`); what they point at is only named.
-    fn note_fmt_opens(&mut self, t: &CTy, kind: FmtKind) {
+    pub(super) fn note_fmt_opens(&mut self, t: &CTy, kind: FmtKind) {
         if !names::release() || kind == FmtKind::Pointer {
             return;
         }

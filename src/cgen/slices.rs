@@ -46,7 +46,7 @@ impl FnGen<'_, '_> {
         let (v, vt) = self.operand(&ops[0], loc, post);
         let (e, ptr, len) = slice_parts(&vt, &v);
         let st = ctype(&CTy::Slice(Box::new(e.clone())));
-        collect_types(dest, &mut self.sig_types);
+        self.note_held(dest);
         let dc = ctype(dest);
         let (t, p, n) = (self.tmp(), self.tmp(), self.tmp());
         let _ = writeln!(self.out, "    {} *{p} = {ptr}; uint64_t {n} = {len};", ctype(&e));
@@ -145,7 +145,7 @@ impl FnGen<'_, '_> {
         let (v, vt) = self.operand(&ops[0], loc, post);
         let sv = str_of(&v, &vt);
         let (mid, _) = self.operand(&ops[1], loc, post);
-        collect_types(dest, &mut self.sig_types);
+        self.note_held(dest);
         let dc = ctype(dest);
         let (t, sa, m) = (self.tmp(), self.tmp(), self.tmp());
         let _ = writeln!(self.out, "    lust_str {sa} = {sv}; uint64_t {m} = {mid};");

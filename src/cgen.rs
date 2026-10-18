@@ -836,6 +836,38 @@ fn field_offset(p: &Program, t: &CTy, variant: Option<u32>, i: u32) -> Option<(u
     }
 }
 
+/// Builtins whose C opens nothing behind their operands: they read a container's own
+/// fields (its length or emptiness: `->len`, a table's `->t`) or move values whole
+/// (`drop`, `forget`, `swap`, `replace`), so release C defines no element or pointee type
+/// for them (`FnGen::note_builtin`). `Vec::capacity` is not one: a zero-sized element's
+/// capacity is `usize::MAX`, so it tests `sizeof`.
+fn opens_nothing(b: Builtin) -> bool {
+    use Builtin as B;
+    matches!(
+        b,
+        B::MemDrop
+            | B::MemForget
+            | B::MemSwap
+            | B::MemReplace
+            | B::HintBlackBox
+            | B::VecLen
+            | B::VecIsEmpty
+            | B::VecIterLen
+            | B::VecDrainLen
+            | B::SliceLen
+            | B::SliceIsEmpty
+            | B::HashLen
+            | B::HashIsEmpty
+            | B::HashCapacity
+            | B::HashIterLen
+            | B::StrLen
+            | B::StrIsEmpty
+            | B::StringLen
+            | B::StringIsEmpty
+            | B::StringCapacity
+    )
+}
+
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
@@ -3610,18 +3642,33 @@ impl FnGen<'_, '_> {
         }
     }
 
+    /// A fn pointer type whose parameters and result a shim this fn emits takes and
+    /// returns by value (a definition needs them complete), and the type itself.
+    fn note_fn_sig(&mut self, t: &CTy) {
+        self.note_held(t);
+        if let CTy::FnPtr(ps, r) = t {
+            for x in ps.iter().chain(std::iter::once(&**r)) {
+                self.note_held(x);
+            }
+        }
+    }
+
     /// Release C: a builtin's operand or result type. Inline builtin code may open what
     /// the value points at, one step down: a reference's pointee, an `Rc`'s count block,
-    /// a container's elements (also of a referenced container). Kinds this does not
-    /// model keep the whole closure.
-    fn note_builtin(&mut self, t: &CTy) {
+    /// a container's elements (also of a referenced container); `opens` is false for a
+    /// builtin that opens nothing (`opens_nothing`).
+    /// Kinds this does not model keep the whole closure.
+    fn note_builtin(&mut self, t: &CTy, opens: bool) {
         self.note_held(t);
         match t {
             CTy::Ref(inner) | CTy::Boxed(inner) | CTy::Ptr(inner) => {
                 self.note_held(inner);
-                self.note_opened(inner);
+                if opens {
+                    self.note_opened(inner);
+                }
             }
-            _ => self.note_opened(t),
+            _ if opens => self.note_opened(t),
+            _ => {}
         }
     }
 
@@ -3640,6 +3687,15 @@ impl FnGen<'_, '_> {
                 x => self.note_opened(x),
             },
             CTy::Hash(k, _) if hash::is_table(*k) => self.note_held(&hash::elem_cty(t)),
+            // A cell or lock holds its value by value (`note_held` defines it); what the
+            // value points at is opened as for the value itself.
+            CTy::RefCell(e) | CTy::Cell(e) => self.note_opened(e),
+            CTy::Sync(k, e) if k.is_cell_struct() => self.note_opened(e),
+            // A `RefCell` guard points at the cell's block.
+            CTy::Guard(e, _) => {
+                self.sig_types.insert(CTy::RefCell(e.clone()));
+                collect_types(t, &mut self.sig_named);
+            }
             CTy::Int(_) | CTy::Float(_) | CTy::Bool | CTy::Char | CTy::Unit | CTy::Str | CTy::String | CTy::Adt(_) | CTy::Tuple(_) | CTy::Result(..) | CTy::FnPtr(..) => {}
             _ => collect_types(t, &mut self.sig_types),
         }
@@ -3662,10 +3718,11 @@ impl FnGen<'_, '_> {
         // point at (an `Rc`'s count block, a `Vec`'s elements), one step down
         // (`note_builtin`).
         if names::release() && matches!(target, CallTarget::Builtin(_) | CallTarget::Intrinsic(_)) {
-            self.note_builtin(dest_cty);
+            let opens = !matches!(target, CallTarget::Builtin(b) if opens_nothing(b));
+            self.note_builtin(dest_cty, opens);
             for o in args.iter().filter(|o| matches!(o, Operand::Move(_) | Operand::Copy(_))) {
                 let t = cty(&self.body.tys, self.callable_place_ty(o));
-                self.note_builtin(&t);
+                self.note_builtin(&t, opens);
             }
         }
         match target {
@@ -3737,7 +3794,7 @@ impl FnGen<'_, '_> {
                 };
                 let (ok_ct, err_ct) = (ctype(&ok), ctype(&err));
                 let res = CTy::Result(ok, err);
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, i) = (self.tmp(), self.tmp());
                 let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
                 let (ok_d, err_d) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
@@ -3764,7 +3821,7 @@ impl FnGen<'_, '_> {
                 let CTy::Array(el, n) = &**arr else { unreachable!("a boxed array") };
                 let n = *n;
                 let res = CTy::Result(ok.clone(), err);
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, v) = (self.tmp(), self.tmp());
                 let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
                 let (ok_d, err_d) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
@@ -3786,7 +3843,7 @@ impl FnGen<'_, '_> {
                 let CTy::Array(el, n) = &*ok else { unreachable!() };
                 let n = *n;
                 let res = CTy::Result(ok.clone(), err);
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 self.want(Glue::Drop, &sct);
                 let (t, v, i) = (self.tmp(), self.tmp(), self.tmp());
                 let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
@@ -4407,7 +4464,7 @@ impl FnGen<'_, '_> {
             }
             Rvalue::ItemShim(item, ty) => {
                 let t = cty(&self.body.tys, *ty);
-                collect_types(&t, &mut self.sig_types);
+                self.note_fn_sig(&t);
                 let name = match self.body.tys.kind(*item) {
                     TyKind::FnDef(def, _) if def == crate::ty::prim_fn_def() => self.prim_shim(*item, *ty, &t),
                     _ => self.item_shim(*item, &t),
@@ -4430,7 +4487,7 @@ impl FnGen<'_, '_> {
                         other => unreachable!("an owning slice from {other:?}"),
                     };
                     let sl = CTy::Slice(Box::new(cty(&self.body.tys, e)));
-                    collect_types(&sl, &mut self.sig_types);
+                    self.note_held(&sl);
                     let (st, et) = (ctype(&sl), ctype(&cty(&self.body.tys, e)));
                     let data = if at_value { format!("&({v})->v") } else { format!("({v})") };
                     return format!("(({st}){{ ({et}*)({data}), {n} }})");
@@ -4592,7 +4649,8 @@ impl FnGen<'_, '_> {
     /// calls through `VT_FMT_DEBUG` / `VT_FMT_DISPLAY`.
     fn vt_fmt_shim(&mut self, vt_name: &str, ct: &CTy, kind: FmtKind) -> String {
         let name = format!("{vt_name}_fmt{}", if kind == FmtKind::Debug { "D" } else { "S" });
-        collect_types(ct, &mut self.sig_types);
+        self.note_held(ct);
+        self.note_fmt_opens(ct, kind);
         let v = format!("(({ }*)self)", ctype(ct));
         let e = fmt::fmt_expr(ct, kind, "f", &v, &mut |g, t| self.want(g, t));
         let _ = writeln!(self.prelude, "static int {name}(void *self, lust_Formatter *f) {{ return {e}; }}");
@@ -4611,7 +4669,7 @@ impl FnGen<'_, '_> {
         let cts = ctype(&ct);
         let (params, ret, call) = match (p.tys.kind(vt.self_ty), &ct) {
             (TyKind::FnPtr(_), CTy::FnPtr(ps, r)) => {
-                collect_types(&ct, &mut self.sig_types);
+                self.note_fn_sig(&ct);
                 (ps.clone(), (**r).clone(), format!("(*({cts}*)self)"))
             }
             _ => {
@@ -4620,13 +4678,13 @@ impl FnGen<'_, '_> {
                 let info = p.fn_info(f);
                 let params: Vec<CTy> = info.params.iter().map(|&t| cty(&p.tys, t)).collect();
                 for t in &params {
-                    collect_types(t, &mut self.sig_types);
+                    self.note_held(t);
                 }
                 let call = self.slots.callee(p, f);
                 (params, cty(&p.tys, info.ret), call)
             }
         };
-        collect_types(&ret, &mut self.sig_types);
+        self.note_held(&ret);
         let rt = ctype(&ret);
         let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", param_ctype(p, t))).collect();
         let names: Vec<String> = (0..params.len()).map(|i| format!("a{i}")).collect();
@@ -4658,10 +4716,10 @@ impl FnGen<'_, '_> {
         let out_def = lang.output_of(lang.fn_once);
         let out = p.tys.bindings(pr.bindings).iter().find(|(d, _)| Some(*d) == out_def).and_then(|(_, g)| g.as_ty()).unwrap_or(UNIT);
         let ret = cty(&p.tys, out);
-        collect_types(&ret, &mut self.sig_types);
+        self.note_held(&ret);
         let params: Vec<CTy> = ins.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).collect();
         for t in &params {
-            collect_types(t, &mut self.sig_types);
+            self.note_held(t);
         }
         let rt = ctype(&ret);
         let decls: String = params.iter().enumerate().map(|(i, t)| format!(", {} a{i}", param_ctype(p, t))).collect();
@@ -4698,7 +4756,7 @@ impl FnGen<'_, '_> {
         let p = self.p;
         let info = p.fn_info(f);
         for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
-            collect_types(&cty(&p.tys, t), &mut self.sig_types);
+            self.note_held(&cty(&p.tys, t));
         }
         let name = format!("{vt_name}_m{j}");
         let ret = ctype(&cty(&p.tys, info.ret));
@@ -4940,7 +4998,7 @@ impl FnGen<'_, '_> {
         for _ in 0..c.1 {
             at = format!("(*(void**){at})");
         }
-        collect_types(&c.2, &mut self.sig_types);
+        self.note_held(&c.2);
         let value = format!("(*({}*){at})", ctype(&c.2));
         (self.callee_call_c(out, &c.0, &value, args), self.adapter_callee_ret(c))
     }
@@ -4974,9 +5032,9 @@ impl FnGen<'_, '_> {
     /// body's env first.
     fn fn_call_c(&mut self, out: &mut String, f: LocalDefId, args: &[String]) -> (String, CTy) {
         let rt = cty(&self.p.tys, self.p.fn_info(f).ret);
-        collect_types(&rt, &mut self.sig_types);
+        self.note_held(&rt);
         for &t in &self.p.fn_info(f).params {
-            collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
+            self.note_held(&cty(&self.p.tys, t));
         }
         let v = self.tmp();
         // The LLVM backend calls the fn's internal ABI entry (cgen/ll.rs).
@@ -5296,8 +5354,12 @@ impl FnGen<'_, '_> {
     fn eq_expr(&mut self, t: &CTy, a: &str, b: &str) -> String {
         match t {
             CTy::Unit => "1".into(),
-            // A fieldless enum with the structural `==`: equal discriminants, no glue call.
-            CTy::Adt(_) if fieldless_enum(self.p, t) => format!("({} == {})", disc_call(self.p, t, a), disc_call(self.p, t, b)),
+            // A fieldless enum with the structural `==`: equal discriminants, no glue call
+            // (read through the pointers: the enum's definition).
+            CTy::Adt(_) if fieldless_enum(self.p, t) => {
+                self.note_held(t);
+                format!("({} == {})", disc_call(self.p, t, a), disc_call(self.p, t, b))
+            }
             CTy::Int(i) if is128(*i) => format!("({a}->lo == {b}->lo && {a}->hi == {b}->hi)"),
             CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) => format!("(*{a} == *{b})"),
             _ => {
@@ -5674,7 +5736,7 @@ impl FnGen<'_, '_> {
                 };
                 let val_ty = CTy::Float(f);
                 let res = CTy::Result(Box::new(val_ty.clone()), Box::new(CTy::Adt(pfe)));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, v, kind) = (self.tmp(), self.tmp(), self.tmp());
                 let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
                 let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
@@ -5693,7 +5755,7 @@ impl FnGen<'_, '_> {
                     unreachable!("parse type-checks only with std's error Adts")
                 };
                 let res = CTy::Result(Box::new(CTy::Bool), Box::new(CTy::Adt(pbe)));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, v) = (self.tmp(), self.tmp());
                 let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
                 let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
@@ -5712,7 +5774,7 @@ impl FnGen<'_, '_> {
                     unreachable!("parse type-checks only with std's error Adts")
                 };
                 let res = CTy::Result(Box::new(CTy::Char), Box::new(CTy::Adt(pce)));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, v, kind) = (self.tmp(), self.tmp(), self.tmp());
                 let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
                 let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
@@ -6102,7 +6164,7 @@ impl FnGen<'_, '_> {
                 // `[T]::get`'s bounds, then both ends on char boundaries.
                 let a = str_of(&vals[0], &tys[0]);
                 let opt = CTy::Option(Box::new(CTy::Ref(Box::new(CTy::Str))));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, sa, s0, e0) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -6549,7 +6611,7 @@ impl FnGen<'_, '_> {
                 let w = deref_cty(&tys[0]);
                 let CTy::Weak(e) = &w else { unreachable!("Weak::upgrade on a Weak") };
                 let opt = CTy::Option(Box::new(CTy::Rc(e.clone())));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, p) = (self.tmp(), self.tmp());
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -6567,7 +6629,7 @@ impl FnGen<'_, '_> {
             B::RefCellNew => {
                 let t = self.tmp();
                 let rc = CTy::RefCell(Box::new(tys[0].clone()));
-                collect_types(&rc, &mut self.sig_types);
+                self.note_held(&rc);
                 let _ = writeln!(self.out, "    {} {t}; {t}.f0 = 0; {t}.f1 = {};", ctype(&rc), vals[0]);
                 t
             }
@@ -6602,7 +6664,7 @@ impl FnGen<'_, '_> {
                 let def = if m { crate::check::generics::borrow_mut_error_def() } else { crate::check::generics::borrow_error_def() };
                 let err = CTy::Adt(self.p.tys.local_adt_of(def).expect("the RefCell error Adts always exist"));
                 let res = CTy::Result(Box::new(CTy::Guard(el.clone(), m)), Box::new(err.clone()));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (p, t) = (self.tmp(), self.tmp());
                 let ok = self.make_variant(&res, 0, std::slice::from_ref(&p));
                 let fail = self.make_variant(&res, 1, &[zero_lit(self.p, &err)]);
@@ -6772,7 +6834,7 @@ impl FnGen<'_, '_> {
                 let r = self.tmp();
                 let _ = writeln!(self.out, "    int64_t {r} = lust_binary_search({ptr}, {len}, {size}, {cx}, {adapter});");
                 let res = CTy::Result(Box::new(CTy::Int(IntTy::Usize)), Box::new(CTy::Int(IntTy::Usize)));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let t = self.tmp();
                 let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
                 let (set_ok, set_err) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
@@ -6992,7 +7054,7 @@ impl FnGen<'_, '_> {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let sl = CTy::Slice(Box::new(e));
                 let opt = CTy::Option(Box::new(sl.clone()));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, s0, e0) = (self.tmp(), self.tmp(), self.tmp());
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -7418,7 +7480,7 @@ impl FnGen<'_, '_> {
                     self.adapter_callee_ret(&self.adapter_callee(&ops[1]))
                 };
                 let opt = CTy::Option(Box::new(elem));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let t = self.tmp();
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -7537,7 +7599,7 @@ impl FnGen<'_, '_> {
                 let a = str_of(&vals[0], &tys[0]);
                 let f = if b == B::StrFind { "lust_str_find" } else { "lust_str_rfind" };
                 let opt = CTy::Option(Box::new(CTy::Int(IntTy::Usize)));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, idx) = (self.tmp(), self.tmp());
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -7599,7 +7661,7 @@ impl FnGen<'_, '_> {
                 let it = &vals[0];
                 let chunk = CTy::Tuple(vec![CTy::Ref(Box::new(CTy::Str)), CTy::Slice(Box::new(CTy::Int(IntTy::U8)))]);
                 let opt = CTy::Option(Box::new(chunk.clone()));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, vl, us) = (self.tmp(), self.tmp(), self.tmp());
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -7772,7 +7834,7 @@ impl FnGen<'_, '_> {
         };
         let val_ty = CTy::Int(it);
         let res = CTy::Result(Box::new(val_ty.clone()), Box::new(CTy::Adt(pie)));
-        collect_types(&res, &mut self.sig_types);
+        self.note_held(&res);
         let (t, lo, hi, kind) = (self.tmp(), self.tmp(), self.tmp(), self.tmp());
         let (ok_f, err_f) = (variant_field(p, &res, &t, 0, 0), variant_field(p, &res, &t, 1, 0));
         let (ok_d, err_d) = (disc_set(p, &res, &t, 0), disc_set(p, &res, &t, 1));
@@ -10116,6 +10178,8 @@ pub fn fn_unit_parts(
     // Release C: small plain glue the unit calls (drop, eq, clone of simple types), as
     // inline definitions; the prototypes of what they call come along.
     let mut inl_glue: HashSet<&(Glue, CTy)> = HashSet::new();
+    // What the inline glue reads, one step through pointers (`type_decls_with`'s `deep`).
+    let mut glue_types: HashSet<CTy> = HashSet::new();
     if inline {
         let mut deps: Vec<&(Glue, CTy)> = Vec::new();
         for k in seen.iter().copied() {
@@ -10126,12 +10190,13 @@ pub fn fn_unit_parts(
                 && !d.contains("#define")
             {
                 inl_glue.insert(k);
-                g.def_types(k, &mut types);
+                g.def_types(k, &mut glue_types);
                 deps.extend(g.deps.get(k).into_iter().flatten());
             }
         }
+        // The glue the inline glue calls: prototypes, which take their types by pointer.
         for d in deps {
-            collect_types(&d.1, &mut types);
+            collect_types(&d.1, &mut named);
             seen.insert(d);
         }
         // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
@@ -10207,16 +10272,11 @@ pub fn fn_unit_parts(
         collect_types(&cty(&p.tys, p.statics[i].ty), &mut types);
     }
     named.retain(|t| !types.contains(t));
-    // Inline glue reads through pointers as a glue shard does: its unit declares types one
-    // step deep, as the shards do.
-    let decls = if !names::release() {
-        Decls::Full
-    } else if inl_glue.is_empty() {
-        Decls::ByValue
-    } else {
-        Decls::OneStep
-    };
-    type_decls_with(p, &mut c, &types, &named, decls);
+    // Inline glue reads through pointers as a glue shard does: its types are declared one
+    // step deep, as the shards do; the rest of the unit only by value.
+    let decls = if names::release() { Decls::ByValue } else { Decls::Full };
+    named.retain(|t| !glue_types.contains(t));
+    type_decls_with(p, &mut c, &types, &named, decls, &glue_types);
     c.push_str(&static_decls_for(p, &used));
     // Release C (`names`): the prototypes and location slots that the code (and its
     // static glue) names outside itself, in one sorted list.
@@ -10278,7 +10338,7 @@ pub fn fn_unit_parts(
             }
             let held: HashSet<CTy> = held.into_iter().collect();
             named.retain(|t| !held.contains(t));
-            type_decls_with(p, &mut c, &held, &named, Decls::ByValue);
+            type_decls_with(p, &mut c, &held, &named, Decls::ByValue, &HashSet::new());
         }
         h
     } else {
@@ -10597,7 +10657,7 @@ fn field_types(p: &Program, t: &CTy) -> HashSet<CTy> {
 }
 
 fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
-    type_decls_with(p, out, roots, &HashSet::new(), Decls::Full)
+    type_decls_with(p, out, roots, &HashSet::new(), Decls::Full, &HashSet::new())
 }
 
 /// Which types `type_decls_with` defines (the rest of what it names gets a forward typedef).
@@ -10613,12 +10673,13 @@ pub(crate) enum Decls {
 }
 
 /// `type_decls`, plus forward declarations of `named` (release C: types the code only
-/// points at). With `by_value` (release C fn units), define only what the roots hold by
+/// points at). `deep` (with `ByValue`): roots defined one step deep as `OneStep` does,
+/// for inline glue in a release C fn unit, which reads through pointers as a shard does. With `by_value` (release C fn units), define only what the roots hold by
 /// value; a type reached only through a pointer gets its forward typedef, so a unit does
 /// not change when a struct it only points at does. Glue and static data reach through
 /// pointers (a drop through an `Rc` reads its count block), so their units keep the
 /// whole closure.
-fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &HashSet<CTy>, decls: Decls) {
+fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &HashSet<CTy>, decls: Decls, deep: &HashSet<CTy>) {
     let by_value = |roots: Vec<CTy>| {
         let mut defined = HashSet::new();
         let mut stack = roots;
@@ -10633,14 +10694,21 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         }
         defined
     };
+    let one_step = |roots: Vec<CTy>| {
+        let first = by_value(roots);
+        let step: Vec<CTy> = first.iter().flat_map(|t| field_types(p, t)).chain(first.iter().cloned()).collect();
+        by_value(step)
+    };
     let defined: Option<HashSet<CTy>> = match decls {
         Decls::Full => None,
-        Decls::ByValue => Some(by_value(roots.iter().cloned().collect())),
-        Decls::OneStep => {
-            let first = by_value(roots.iter().cloned().collect());
-            let step: Vec<CTy> = first.iter().flat_map(|t| field_types(p, t)).chain(first.iter().cloned()).collect();
-            Some(by_value(step))
+        Decls::ByValue => {
+            let mut d = by_value(roots.iter().cloned().collect());
+            if !deep.is_empty() {
+                d.extend(one_step(deep.iter().cloned().collect()));
+            }
+            Some(d)
         }
+        Decls::OneStep => Some(one_step(roots.iter().cloned().collect())),
     };
     // Close over field types (release C: one step out of each defined type).
     let mut wanted: HashSet<CTy> = HashSet::new();
@@ -11030,7 +11098,7 @@ fn glue_def_value(
     }
     // The sync types' glue (cgen/sync.rs).
     if let CTy::Sync(k, e) = t {
-        sync::sync_glue_def(p, *g, *k, e, protos, defs, &mut need);
+        sync::sync_glue_def(p, *g, *k, e, protos, defs, &mut need, types);
         return;
     }
     match g {
@@ -12418,7 +12486,7 @@ impl FnGen<'_, '_> {
             _ => tys[1].clone(),
         };
         let cell = tls_cell(&t);
-        collect_types(&cell, &mut self.sig_types);
+        self.note_held(&cell);
         let (m, ct) = (mangle(&cell), ctype(&cell));
         let c = self.tmp();
         let _ = writeln!(self.out, "    {ct} *{c} = ({ct} *)lust_tls_cell((uint64_t *){}, sizeof({ct}), _Alignof({ct}));", vals[0]);
@@ -12432,12 +12500,12 @@ impl FnGen<'_, '_> {
         }
         if b == Builtin::TlsTryAccess {
             let opt = CTy::Option(Box::new(CTy::Ref(Box::new(t))));
-            collect_types(&opt, &mut self.sig_types);
+            self.note_held(&opt);
             let (some, none) = (self.make_variant(&opt, 1, &[format!("&{c}->f1")]), self.make_variant(&opt, 0, &[]));
             return format!("({c} ? {some} : {none})");
         }
         let opt = CTy::Option(Box::new(t.clone()));
-        collect_types(&opt, &mut self.sig_types);
+        self.note_held(&opt);
         let (r, v) = (self.tmp(), self.tmp());
         let register = if needs_drop_c(self.p, &t) {
             self.want(Glue::TlsDtor, &cell);

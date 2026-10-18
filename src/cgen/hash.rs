@@ -753,7 +753,7 @@ impl FnGen<'_, '_> {
             vals.push(v);
             tys.push(t);
         }
-        collect_types(dest, &mut self.sig_types);
+        self.note_held(dest);
         let dc = ctype(dest);
         // The receiver: a table or Entry behind `&`/`&mut`, or an Entry
         // by value.
@@ -824,7 +824,7 @@ impl FnGen<'_, '_> {
                 };
                 // The call can name the `&[u8]` struct (an integer write
                 // goes through `write`): this unit must declare it.
-                collect_types(&bytes_cty(), &mut self.sig_types);
+                self.note_held(&bytes_cty());
                 let call = hasher_call(self.p, self.slots, &hc, m, &format!("({})", vals[0]), vals.get(1).map_or("", |v| v.as_str()));
                 if m == 0 {
                     return Some(call);
@@ -1255,7 +1255,7 @@ impl FnGen<'_, '_> {
                 let item = match k {
                     HashTy::IterPairs => {
                         let it = CTy::Tuple(vec![CTy::Ref(Box::new(a[0].clone())), CTy::Ref(Box::new(a[1].clone()))]);
-                        collect_types(&it, &mut self.sig_types);
+                        self.note_held(&it);
                         format!("(({}){{ &{f}->f0, &{f}->f1 }})", ctype(&it))
                     }
                     HashTy::IterKeys if map => format!("(&{f}->f0)"),

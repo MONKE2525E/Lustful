@@ -35,10 +35,10 @@ impl FnGen<'_, '_> {
         let callee = self.callee_of(&ops[0]);
         let once = !matches!(callee, sync::Callee::Closure(_, false));
         let (env, env_ty) = self.operand(&ops[0], loc, post);
-        collect_types(&env_ty, &mut self.sig_types);
+        self.note_held(&env_ty);
         let ret = self.callee_ret(&callee);
         let res = CTy::Result(Box::new(ret.clone()), Box::new(CTy::BoxDyn));
-        collect_types(&res, &mut self.sig_types);
+        self.note_held(&res);
         let ev = self.tmp();
         if self.p.unwind_tables {
             return self.catch_unwind_tables(&callee, &env, &env_ty, &ret, &res, once);

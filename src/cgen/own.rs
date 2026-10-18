@@ -324,7 +324,7 @@ impl FnGen<'_, '_> {
                     let guard = CTy::DynLock(true);
                     let res =
                         CTy::Result(Box::new(guard.clone()), Box::new(CTy::Sync(crate::ty::sync::SyncTy::PoisonError, Box::new(guard))));
-                    collect_types(&res, &mut self.sig_types);
+                    self.note_held(&res);
                     let (g, t) = (self.tmp(), self.tmp());
                     let (f, e) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
                     let _ = writeln!(
@@ -360,7 +360,7 @@ impl FnGen<'_, '_> {
         Some(match b {
             B::RcGetMut | B::Sync(S::ArcGetMut) => {
                 let opt = CTy::Option(Box::new(view));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let t = self.tmp();
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -400,7 +400,7 @@ impl FnGen<'_, '_> {
             (B::WeakUpgrade | B::Sync(S::ArcWeakUpgrade), CTy::WeakDyn(arc)) => {
                 let ptr = if *arc { CTy::Own(Owner::Arc, Box::new(CTy::Dyn)) } else { CTy::RcDyn };
                 let opt = CTy::Option(Box::new(ptr));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, w) = (self.tmp(), self.tmp());
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -433,7 +433,7 @@ impl FnGen<'_, '_> {
             (B::WeakUpgrade | B::Sync(S::ArcWeakUpgrade), CTy::WeakOwn(arc, x)) => {
                 let k = if *arc { Owner::Arc } else { Owner::Rc };
                 let opt = CTy::Option(Box::new(CTy::Own(k, x.clone())));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, w) = (self.tmp(), self.tmp());
                 let hc = counts(x, &w);
                 let field = variant_field(self.p, &opt, &t, 1, 0);
@@ -514,7 +514,7 @@ impl FnGen<'_, '_> {
         let CTy::Own(_, s) = &**r else { unreachable!("OwnSliceAlloc takes &mut Rc<[T]>") };
         let CTy::Slice(e) = &**s else { unreachable!("OwnSliceAlloc takes &mut Rc<[T]>") };
         let et = ctype(e);
-        collect_types(s, &mut self.sig_types);
+        self.note_held(s);
         // (file, `Layout::array` unwrap line, `rc_inner_layout_for_value_layout` line)
         let (file, unwrap_line, extend_line) = match k {
             Owner::Arc => (super::STD_SYNC_RS, 2277, 416),
@@ -591,7 +591,7 @@ impl FnGen<'_, '_> {
         } else {
             ctype(&CTy::Slice(Box::new(e.clone())))
         };
-        collect_types(&CTy::Slice(Box::new(e.clone())), &mut self.sig_types);
+        self.note_held(&CTy::Slice(Box::new(e.clone())));
         let (r, n) = (self.tmp(), self.tmp());
         let _ = writeln!(self.out, "    uint64_t {n} = {len};\n    {ft} {r};\n    {r}.len = {n};");
         let size = format!("{n} * sizeof({et})");

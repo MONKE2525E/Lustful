@@ -43,7 +43,7 @@ impl FnGen<'_, '_> {
             vals.push(v);
             tys.push(t);
         }
-        collect_types(dest, &mut self.sig_types);
+        self.note_held(dest);
         let dc = ctype(dest);
         let t = self.tmp();
         match b {
@@ -72,7 +72,7 @@ impl FnGen<'_, '_> {
                     "    lust_str {t}_s; uint64_t {t}_i; lust_pat {t}_p = {pat}; int {t}_k = lust_matches_step((lust_split*)({s}), &{t}_p, {back}, &{t}_i, &{t}_s);"
                 );
                 let pair = CTy::Tuple(vec![CTy::Int(IntTy::Usize), CTy::Ref(Box::new(CTy::Str))]);
-                collect_types(&pair, &mut self.sig_types);
+                self.note_held(&pair);
                 let some = self.make_variant(dest, 1, &[format!("(({}){{ {t}_i, {t}_s }})", ctype(&pair))]);
                 let none = self.make_variant(dest, 0, &[]);
                 let _ = writeln!(self.out, "    {dc} {t} = {t}_k ? {some} : {none};");
@@ -188,7 +188,7 @@ impl FnGen<'_, '_> {
                     let _ = writeln!(self.out, "    drop_{}(&{t}_v);", mangle(&tys[1]));
                 }
                 let pair = CTy::Tuple(vec![CTy::Ref(Box::new(CTy::Str)), CTy::Ref(Box::new(CTy::Str))]);
-                collect_types(&pair, &mut self.sig_types);
+                self.note_held(&pair);
                 let some = self.make_variant(dest, 1, &[format!("(({}){{ {t}_a, {t}_b }})", ctype(&pair))]);
                 let none = self.make_variant(dest, 0, &[]);
                 let _ = writeln!(self.out, "    {dc} {t} = {t}_k ? {some} : {none};");
@@ -262,7 +262,7 @@ impl FnGen<'_, '_> {
             // A `fn(char) -> bool` pointer: the env is the stored pointer.
             TyKind::FnPtr(_) => {
                 let ct = cty(&self.body.tys, p);
-                collect_types(&ct, &mut self.sig_types);
+                self.note_held(&ct);
                 let name = format!("lust_splitp_{}_{}", super::names::fn_tag(self.slots.of(self.body.fn_id)), self.adapters);
                 self.adapters += 1;
                 let _ = writeln!(self.prelude, "static uint8_t {name}(void *env, uint32_t c) {{\n  return (*({}*)env)(c);\n}}", ctype(&ct));

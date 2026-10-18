@@ -209,7 +209,7 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
                 }
                 externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
             }
-            type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep);
+            type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep, &HashSet::new());
             externs.into_iter().for_each(|e| c.push_str(e));
             protos.into_iter().for_each(|x| c.push_str(x));
             for k in keys {

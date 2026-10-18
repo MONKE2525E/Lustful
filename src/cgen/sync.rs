@@ -125,7 +125,18 @@ pub(super) fn sync_collect_types(k: SyncTy, e: &CTy, out: &mut HashSet<CTy>) {
 /// The glue function `g` of a sync type: its prototype to `protos` and
 /// its definition to `defs`. Glue a type does not have is never asked
 /// for (check answers the trait as not implemented).
-pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &mut String, defs: &mut String, need: &mut dyn FnMut(Glue, &CTy)) {
+/// `types`: the C types a definition holds besides its own (release C units declare them).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sync_glue_def(
+    p: &Program,
+    g: Glue,
+    k: SyncTy,
+    e: &CTy,
+    protos: &mut String,
+    defs: &mut String,
+    need: &mut dyn FnMut(Glue, &CTy),
+    types: &mut Vec<CTy>,
+) {
     let t = CTy::Sync(k, Box::new(e.clone()));
     let (m, ct) = (mangle(&t), ctype(&t));
     let it = format!("RcI_{}", mangle(e));
@@ -201,7 +212,7 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
         (_, SyncTy::Mutex | SyncTy::RwLock | SyncTy::MutexGuard | SyncTy::RwLockReadGuard | SyncTy::RwLockWriteGuard | SyncTy::PoisonError) => {
             lock_glue_def(p, g, k, e, &m, &ct, protos, defs, need)
         }
-        (_, SyncTy::ThreadBuilder) => builder_glue_def(p, g, &m, &ct, protos, defs, need),
+        (_, SyncTy::ThreadBuilder) => builder_glue_def(p, g, &m, &ct, protos, defs, need, types),
         (_, SyncTy::JoinHandle | SyncTy::ScopedJoinHandle | SyncTy::Scope | SyncTy::Thread | SyncTy::ThreadId | SyncTy::JoinError) => {
             thread_glue_def(g, k, &m, &ct, protos, defs)
         }
@@ -238,7 +249,8 @@ pub(super) fn sync_glue_def(p: &Program, g: Glue, k: SyncTy, e: &CTy, protos: &m
 
 /// Glue of `thread::Builder`: drop frees the name; Debug is
 /// std's struct form over the name and stack size options.
-fn builder_glue_def(p: &Program, g: Glue, m: &str, ct: &str, protos: &mut String, defs: &mut String, need: &mut dyn FnMut(Glue, &CTy)) {
+#[allow(clippy::too_many_arguments)]
+fn builder_glue_def(p: &Program, g: Glue, m: &str, ct: &str, protos: &mut String, defs: &mut String, need: &mut dyn FnMut(Glue, &CTy), types: &mut Vec<CTy>) {
     let lit = |s: &str| format!("(lust_str){{(uint8_t*)\"{s}\", {}}}", s.len());
     match g {
         Glue::Drop => {
@@ -252,6 +264,7 @@ fn builder_glue_def(p: &Program, g: Glue, m: &str, ct: &str, protos: &mut String
             // Option only borrows the String for printing).
             let opt_str = CTy::Option(Box::new(CTy::String));
             let opt_usize = CTy::Option(Box::new(CTy::Int(IntTy::Usize)));
+            types.extend([opt_str.clone(), opt_usize.clone()]);
             let name_f = super::fmt::fmt_expr(&opt_str, FmtKind::Debug, "w", "(&no_)", need);
             let stack_f = super::fmt::fmt_expr(&opt_usize, FmtKind::Debug, "w", "(&so_)", need);
             let nf = variant_field(p, &opt_str, "no_", 1, 0);
@@ -577,7 +590,7 @@ impl FnGen<'_, '_> {
             S::AtomicCompareExchange | S::AtomicCompareExchangeWeak => {
                 let v = atomic(0);
                 let res = CTy::Result(Box::new(vt_of(v)), Box::new(vt_of(v)));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, old) = (self.tmp(), self.tmp());
                 let _ = writeln!(
                     self.out,
@@ -646,7 +659,7 @@ impl FnGen<'_, '_> {
                 };
                 // `Err(payload)` when the thread panicked (W-UNWIND).
                 let res = CTy::Result(Box::new(el.clone()), Box::new(CTy::BoxDyn));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, h) = (self.tmp(), self.tmp());
                 let f = variant_field(self.p, &res, &t, 0, 0);
                 let e = variant_field(self.p, &res, &t, 1, 0);
@@ -666,7 +679,7 @@ impl FnGen<'_, '_> {
             S::ThreadGetId => format!("((*{})->id)", vals[0]),
             S::ThreadGetName => {
                 let opt = CTy::Option(Box::new(CTy::Ref(Box::new(CTy::Str))));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, th) = (self.tmp(), self.tmp());
                 let f = variant_field(self.p, &opt, &t, 1, 0);
                 let _ = writeln!(
@@ -690,7 +703,7 @@ impl FnGen<'_, '_> {
                 let rx = CTy::Sync(SyncTy::Receiver, Box::new(el));
                 let field = if u == 2 { rx } else { CTy::Ref(Box::new(rx)) };
                 let it = CTy::Tuple(vec![field]);
-                collect_types(&it, &mut self.sig_types);
+                self.note_held(&it);
                 let t = self.tmp();
                 let _ = writeln!(self.out, "    {} {t}; {t}.f0 = {};", ctype(&it), vals[0]);
                 t
@@ -701,7 +714,7 @@ impl FnGen<'_, '_> {
                     other => unreachable!("a Receiver operand, found {other:?}"),
                 };
                 let opt = CTy::Option(Box::new(el));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let t = self.tmp();
                 let f = variant_field(self.p, &opt, &t, 1, 0);
                 let _ = writeln!(
@@ -763,7 +776,7 @@ impl FnGen<'_, '_> {
                     other => unreachable!("a Sender operand, found {other:?}"),
                 };
                 let res = CTy::Result(Box::new(CTy::Unit), Box::new(CTy::Sync(SyncTy::SendError, Box::new(el.clone()))));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, v) = (self.tmp(), self.tmp());
                 let err = variant_field(self.p, &res, &t, 1, 0);
                 let _ = writeln!(
@@ -786,7 +799,7 @@ impl FnGen<'_, '_> {
                 let def = if op == S::ChanRecv { crate::check::generics::recv_error_def() } else { crate::check::generics::try_recv_error_def() };
                 let et = self.p.tys.local_adt_of(def).map_or(CTy::Unit, CTy::Adt);
                 let res = CTy::Result(Box::new(el.clone()), Box::new(et.clone()));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, r) = (self.tmp(), self.tmp());
                 let ok = variant_field(self.p, &res, &t, 0, 0);
                 let err = variant_field(self.p, &res, &t, 1, 0);
@@ -816,7 +829,7 @@ impl FnGen<'_, '_> {
                 };
                 let et = self.p.tys.local_adt_of(crate::check::generics::recv_timeout_error_def()).map_or(CTy::Unit, CTy::Adt);
                 let res = CTy::Result(Box::new(el.clone()), Box::new(et.clone()));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (secs, nanos) =
                     if matches!(tys[1], CTy::Adt(_)) { (format!("({}).f0", vals[1]), format!("({}).f1", vals[1])) } else { (format!("({}).secs", vals[1]), format!("({}).nanos", vals[1])) };
                 let (t, r) = (self.tmp(), self.tmp());
@@ -917,9 +930,9 @@ impl FnGen<'_, '_> {
         let callee = self.callee_of(&ops[0]);
         let once = !matches!(callee, Callee::Closure(_, false));
         let (env, env_ty) = self.operand(&ops[0], loc, post);
-        collect_types(&env_ty, &mut self.sig_types);
+        self.note_held(&env_ty);
         let ret = self.callee_ret(&callee);
-        collect_types(&ret, &mut self.sig_types);
+        self.note_held(&ret);
         let it = format!("RcI_{}", mangle(&ret));
         let (h, ev, w) = (self.tmp(), self.tmp(), self.tmp());
         let _ = writeln!(
@@ -1005,7 +1018,9 @@ impl FnGen<'_, '_> {
             },
             _ => CTy::Unit,
         };
-        collect_types(pair, &mut self.sig_types);
+        // Both ends are pointers; the channel sizes the element (`sizeof`).
+        self.note_held(pair);
+        self.note_held(&el);
         let drop = if needs_drop_c(self.p, &el) {
             self.want(Glue::Drop, &el);
             format!("(void (*)(void *))drop_{}", mangle(&el))
@@ -1036,13 +1051,13 @@ impl FnGen<'_, '_> {
         let word = format!("uint{}_t", w * 8);
         let vt = vt_of(v);
         let (env, env_ty) = self.operand(&ops[3], loc, post);
-        collect_types(&env_ty, &mut self.sig_types);
+        self.note_held(&env_ty);
         let ev = self.tmp();
         let _ = writeln!(self.out, "    {} {ev} = {env};", ctype(&env_ty));
         let res = CTy::Result(Box::new(vt.clone()), Box::new(vt.clone()));
         let opt = CTy::Option(Box::new(vt.clone()));
-        collect_types(&res, &mut self.sig_types);
-        collect_types(&opt, &mut self.sig_types);
+        self.note_held(&res);
+        self.note_held(&opt);
         let (t, prev, old) = (self.tmp(), self.tmp(), self.tmp());
         let (sord, ford) = (ord(self.p, &so, &sot), ord(self.p, &fo, &fot));
         let _ = writeln!(self.out, "    {} {t}; {word} {prev} = lust_at_load_{w}(({word}*)({a}), {ford}, {loc});", ctype(&res));
@@ -1085,7 +1100,7 @@ impl FnGen<'_, '_> {
         // `dur.checked_sub(start.elapsed())` (the runtime's `lust_cv_left`).
         let dur = (op == SyncOp::CondvarWaitTimeoutWhile).then(|| self.operand(&ops[2], loc, post));
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
-        collect_types(&env_ty, &mut self.sig_types);
+        self.note_held(&env_ty);
         let ev = self.tmp();
         let _ = writeln!(self.out, "    {} {ev} = {env};", ctype(&env_ty));
         let drop_env = if needs_drop_c(self.p, &env_ty) {
@@ -1107,7 +1122,7 @@ impl FnGen<'_, '_> {
             let wtr = self.p.tys.local_adt_of(crate::check::generics::wait_timeout_result_def()).map_or(CTy::Unit, CTy::Adt);
             let pair = CTy::Tuple(vec![gt.clone(), wtr.clone()]);
             let res = CTy::Result(Box::new(pair.clone()), Box::new(CTy::Sync(SyncTy::PoisonError, Box::new(pair.clone()))));
-            collect_types(&res, &mut self.sig_types);
+            self.note_held(&res);
             let (pv, t) = (self.tmp(), self.tmp());
             let _ = writeln!(self.out, "    {} {pv}; {pv}.f0 = {g}; {pv}.f1 = ({}){{ {timed} }};", ctype(&pair), ctype(&wtr));
             let f = variant_field(self.p, &res, &t, 0, 0);
@@ -1119,7 +1134,7 @@ impl FnGen<'_, '_> {
             let _ = writeln!(body, "  if (!{r}) break; lust_cv_wait({target}, &({g})->st);");
             let _ = writeln!(self.out, "    for (;;) {{\n{body}    }}\n    {drop_env}");
             let res = CTy::Result(Box::new(gt.clone()), Box::new(CTy::Sync(SyncTy::PoisonError, Box::new(gt))));
-            collect_types(&res, &mut self.sig_types);
+            self.note_held(&res);
             let t = self.tmp();
             let f = variant_field(self.p, &res, &t, 0, 0);
             let _ = writeln!(self.out, "    {} {t}; {} {f} = {g};", ctype(&res), disc_set(self.p, &res, &t, 0));
@@ -1318,9 +1333,9 @@ impl FnGen<'_, '_> {
             }
             Callee::Fn(f) => {
                 let rt = cty(&self.p.tys, self.p.fn_info(*f).ret);
-                collect_types(&rt, &mut self.sig_types);
+                self.note_held(&rt);
                 for &t in &self.p.fn_info(*f).params {
-                    collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
+                    self.note_held(&cty(&self.p.tys, t));
                 }
                 self.note_callee(*f);
                 let mut args = args.to_vec();
@@ -1337,7 +1352,7 @@ impl FnGen<'_, '_> {
                 v
             }
             Callee::DynOnce(r, word) => {
-                collect_types(r, &mut self.sig_types);
+                self.note_held(r);
                 let v = self.tmp();
                 let rt = ctype(r);
                 if ret_by_out(self.p, r) {
@@ -1348,14 +1363,14 @@ impl FnGen<'_, '_> {
                 v
             }
             Callee::DynRef(r, params) => {
-                collect_types(r, &mut self.sig_types);
+                self.note_held(r);
                 // A zero-sized parameter is not in the entry's C
                 // signature (`param_dropped`), so its argument is not
                 // passed either.
                 let mut tys = vec!["void *".to_string()];
                 let mut pre = String::new();
                 for (t, a) in params.iter().zip(args) {
-                    collect_types(t, &mut self.sig_types);
+                    self.note_held(t);
                     if !param_dropped(self.p, t) {
                         tys.push(ctype(t));
                         let _ = write!(pre, ", {a}");
@@ -1415,9 +1430,9 @@ impl FnGen<'_, '_> {
             _ => "0".into(),
         };
         let (env, env_ty) = self.operand(&ops[ci], loc, post);
-        collect_types(&env_ty, &mut self.sig_types);
+        self.note_held(&env_ty);
         let ret = self.callee_ret(&callee);
-        collect_types(&ret, &mut self.sig_types);
+        self.note_held(&ret);
         let drop_env = |this: &mut Self, out: &mut String, e: &str| {
             if !once && needs_drop_c(this.p, &env_ty) {
                 this.want(Glue::Drop, &env_ty);
@@ -1473,7 +1488,7 @@ impl FnGen<'_, '_> {
                     .expect("Builder::spawn only lowers when std::io is loaded") as u32,
             );
             let res = CTy::Result(Box::new(jh), Box::new(CTy::Adt(err_a)));
-            collect_types(&res, &mut self.sig_types);
+            self.note_held(&res);
             let (t, e2) = (self.tmp(), self.tmp());
             let okv = variant_field(self.p, &res, &t, 0, 0);
             let errv = variant_field(self.p, &res, &t, 1, 0);
@@ -1549,7 +1564,7 @@ impl FnGen<'_, '_> {
         match op {
             S::LockNew(_) | S::LockFrom(_) => {
                 let lock = CTy::Sync(k, Box::new(elem));
-                collect_types(&lock, &mut self.sig_types);
+                self.note_held(&lock);
                 let t = self.tmp();
                 let set = if k == SyncTy::OnceLock { format!(" {t}.st = 2;") } else { String::new() };
                 let _ = writeln!(self.out, "    {} {t}; {} {t}.v = {};{set}", ctype(&lock), zero_c(&t), vals[0]);
@@ -1593,7 +1608,7 @@ impl FnGen<'_, '_> {
                     self.p.tys.local_adt_of(crate::check::generics::wait_timeout_result_def()).map_or(CTy::Unit, CTy::Adt)
                 };
                 let pair = CTy::Tuple(vec![guard.clone(), wtr.clone()]);
-                collect_types(&pair, &mut self.sig_types);
+                self.note_held(&pair);
                 let (tv, pv) = (self.tmp(), self.tmp());
                 let (secs, nanos) = if op == S::CondvarWaitTimeoutMs {
                     (format!("({} / 1000)", vals[2]), format!("((uint32_t)({} % 1000) * 1000000u)", vals[2]))
@@ -1615,7 +1630,7 @@ impl FnGen<'_, '_> {
             S::BarrierIsLeader => format!("(*{})", vals[0]),
             S::OnceGet | S::OnceGetMut => {
                 let opt = CTy::Option(Box::new(CTy::Ref(Box::new(elem.clone()))));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let t = self.tmp();
                 let f = variant_field(self.p, &opt, &t, 1, 0);
                 let o = &vals[0];
@@ -1630,7 +1645,7 @@ impl FnGen<'_, '_> {
             }
             S::OnceSet => {
                 let res = CTy::Result(Box::new(CTy::Unit), Box::new(elem.clone()));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let (t, v) = (self.tmp(), self.tmp());
                 let err = variant_field(self.p, &res, &t, 1, 0);
                 let o = &vals[0];
@@ -1647,7 +1662,7 @@ impl FnGen<'_, '_> {
             }
             S::OnceIntoInner | S::OnceTake => {
                 let opt = CTy::Option(Box::new(elem.clone()));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, o) = (self.tmp(), self.tmp());
                 let f = variant_field(self.p, &opt, &t, 1, 0);
                 let (decl, reset) = if op == S::OnceTake {
@@ -1691,7 +1706,7 @@ impl FnGen<'_, '_> {
         };
         let it = format!("RcI_{}", mangle(&elem));
         let arc = CTy::Sync(SyncTy::Arc, Box::new(elem.clone()));
-        collect_types(&arc, &mut self.sig_types);
+        self.note_held(&arc);
         let h = |v: &str| format!("((uint64_t*){v})");
         let free = |v: &str| format!("if (lust_arc_dec(&{v}->weak)) lust_dealloc((void*){v}, sizeof({it}), _Alignof({it}));");
         let clone_of = |this: &mut Self, src: &str| -> String {
@@ -1720,7 +1735,7 @@ impl FnGen<'_, '_> {
             }
             S::ArcGetMut => {
                 let opt = CTy::Option(Box::new(CTy::Ref(Box::new(elem.clone()))));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let t = self.tmp();
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
@@ -1749,7 +1764,7 @@ impl FnGen<'_, '_> {
             }
             S::ArcTryUnwrap => {
                 let res = CTy::Result(Box::new(elem.clone()), Box::new(arc.clone()));
-                collect_types(&res, &mut self.sig_types);
+                self.note_held(&res);
                 let t = self.tmp();
                 let v = &vals[0];
                 let ok_f = variant_field(self.p, &res, &t, 0, 0);
@@ -1774,7 +1789,7 @@ impl FnGen<'_, '_> {
                 let t = self.tmp();
                 if op == S::ArcIntoInner {
                     let opt = CTy::Option(Box::new(elem.clone()));
-                    collect_types(&opt, &mut self.sig_types);
+                    self.note_held(&opt);
                     let (f, some, none) = (variant_field(self.p, &opt, &t, 1, 0), disc_set(self.p, &opt, &t, 1), disc_set(self.p, &opt, &t, 0));
                     let _ = writeln!(
                         self.out,
@@ -1799,7 +1814,7 @@ impl FnGen<'_, '_> {
             S::ArcWeakNew => "((void*)~(uint64_t)0)".into(),
             S::ArcWeakUpgrade => {
                 let opt = CTy::Option(Box::new(arc.clone()));
-                collect_types(&opt, &mut self.sig_types);
+                self.note_held(&opt);
                 let (t, w) = (self.tmp(), self.tmp());
                 let field = variant_field(self.p, &opt, &t, 1, 0);
                 let some = disc_set(self.p, &opt, &t, 1);
