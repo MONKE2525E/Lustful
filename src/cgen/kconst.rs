@@ -212,6 +212,48 @@ impl FnGen<'_, '_> {
             && c_size_align(self.p, &self.local_cty[i]).0 > 0
     }
 
+    /// True when constant local `i` is interned at the fn's entry,
+    /// with its str literals (`kstr_finish`), not at each borrow: a
+    /// release build's promoted local whose value codegen computed
+    /// at compile time (`kstatic`), or a byte string temp (its static
+    /// is initialized). Its borrows read the slot with no check.
+    /// Identity is the run-time table's, as in dev builds; only the
+    /// time of the interning moves.
+    pub(super) fn kbatch_local(&self, i: usize) -> bool {
+        names::release()
+            && self.kconst_local(i)
+            && (self.kstatic.contains_key(&(i as Local)) || self.byte_blobs.get(i).is_some_and(|b| b.is_some()))
+    }
+
+    /// The declaration of a promoted local `i` with a compile-time
+    /// value (`kstatic`), None when `i` is not one. A value with no
+    /// pointer is a static const with that C initializer. A value that
+    /// holds strs is a zeroed static the fn's entry writes
+    /// (`kentry`), with each str read from its canonical literal slot
+    /// (`lks`), so the value interns as the dev path's does.
+    pub(super) fn kstatic_decl(&mut self, i: usize) -> Option<String> {
+        let cv = self.kstatic.get(&(i as Local))?.clone();
+        let ct = self.local_cty[i].clone();
+        if static_ok(&cv) {
+            let init = const_init(self.p, &cv, &ct, &mut self.prelude, &mut self.kcx, self.slots.as_slice(), None);
+            return Some(format!("  static const {} l{i} = {init};\n", ctype(&ct)));
+        }
+        self.kcx.lits = Some(std::mem::take(&mut self.kstrs));
+        let init = const_init(self.p, &cv, &ct, &mut self.prelude, &mut self.kcx, self.slots.as_slice(), None);
+        self.kstrs = self.kcx.lits.take().unwrap_or_default();
+        self.kentry.insert(i as Local, init);
+        Some(format!("  static {} l{i};\n", ctype(&ct)))
+    }
+
+    /// The call that interns constant local `i` into its slot `lk{i}`.
+    fn kintern_call(&self, i: usize) -> String {
+        let lt = &self.local_cty[i];
+        let (n, a) = c_size_align(self.p, lt);
+        let blob = self.byte_blobs.get(i).is_some_and(|b| b.is_some());
+        let desc = if !blob && kdesc(self.p, lt).is_some() { format!("lkd{i}") } else { "0".into() };
+        format!("lust_kintern(&lk{i}, &l{i}, {n}, {}, {desc});", a.max(1))
+    }
+
     /// The prologue lines of a constant local `i`: its site cache, and
     /// its layout descriptor when it has one.
     pub(super) fn kconst_decls(&self, i: usize) -> String {
@@ -235,14 +277,14 @@ impl FnGen<'_, '_> {
         }
         let base = format!("l{i}");
         let Some(rest) = e.strip_prefix(&base) else { return (e, t) };
-        let lt = &self.local_cty[i];
-        let (n, a) = c_size_align(self.p, lt);
-        let blob = self.byte_blobs.get(i).is_some_and(|b| b.is_some());
-        let desc = if !blob && kdesc(self.p, lt).is_some() { format!("lkd{i}") } else { "0".into() };
         // The first run interns (a statement before the use); every run
-        // then reads the cached address.
-        let _ = writeln!(self.out, "    if (!lk{i}) lust_kintern(&lk{i}, &l{i}, {n}, {}, {desc});", a.max(1));
-        (format!("(*({} *)lk{i}){rest}", ctype(lt)), t)
+        // then reads the cached address. A batched local's slot is set at
+        // the fn's entry.
+        if !self.kbatch_local(i) {
+            let call = self.kintern_call(i);
+            let _ = writeln!(self.out, "    if (!lk{i}) {call}");
+        }
+        (format!("(*({} *)lk{i}){rest}", ctype(&self.local_cty[i])), t)
     }
 
     /// A `&str` literal operand: its bytes interned, so equal literals
@@ -259,22 +301,42 @@ impl FnGen<'_, '_> {
     }
 
     /// Inserts the slots of the literals `kstr` made, and their interning,
-    /// at the prologue's end. Two threads may both intern on a first run:
+    /// at the prologue's end, with the batched constant locals
+    /// (`kbatch_local`). Two threads may both intern on a first run:
     /// both get the same addresses.
     pub(super) fn kstr_finish(&mut self) {
         let Some(at) = self.kdecl_at.take() else { return };
-        if self.kstrs.is_empty() {
-            return;
+        let text = self.kintern_block("  ");
+        self.out.insert_str(at, &text);
+        self.kstrs.clear();
+    }
+
+    /// The fn's first-run interning (`kstr_finish`; ll.rs puts it in a
+    /// helper): the literal slots `lks`, the `lks_ok` flag, and one
+    /// intern call per literal and batched local. Empty when it has none.
+    pub(super) fn kintern_block(&self, ind: &str) -> String {
+        let batch: Vec<usize> = (0..self.local_cty.len()).filter(|&i| self.kbatch_local(i)).collect();
+        if self.kstrs.is_empty() && batch.is_empty() {
+            return String::new();
         }
         let mut lits: Vec<(&Vec<u8>, &usize)> = self.kstrs.iter().collect();
         lits.sort_by_key(|(_, id)| **id);
-        let mut text = format!("  static const void *lks[{}];\n  static int32_t lks_ok;\n  if (!lks_ok) {{\n", lits.len());
-        for (b, id) in lits {
-            let _ = writeln!(text, "    lust_kintern(&lks[{id}], {}, {}, 1, 0);", c_string_lit(b), b.len());
+        let mut text = String::new();
+        if !lits.is_empty() {
+            let _ = writeln!(text, "{ind}static const void *lks[{}];", lits.len());
         }
-        text.push_str("    lks_ok = 1;\n  }\n");
-        self.out.insert_str(at, &text);
-        self.kstrs.clear();
+        let _ = writeln!(text, "{ind}static int32_t lks_ok;\n{ind}if (!lks_ok) {{");
+        for (b, id) in lits {
+            let _ = writeln!(text, "{ind}  lust_kintern(&lks[{id}], {}, {}, 1, 0);", c_string_lit(b), b.len());
+        }
+        for i in batch {
+            if let Some(init) = self.kentry.get(&(i as Local)) {
+                let _ = writeln!(text, "{ind}  l{i} = {init};");
+            }
+            let _ = writeln!(text, "{ind}  {}", self.kintern_call(i));
+        }
+        let _ = writeln!(text, "{ind}  lks_ok = 1;\n{ind}}}");
+        text
     }
 }
 
@@ -285,6 +347,10 @@ impl FnGen<'_, '_> {
 #[derive(Default)]
 pub(super) struct StaticCx {
     pub counter: u32,
+    /// The fn's str literal slots (`FnGen::kstrs`) while a promoted
+    /// value is rendered for its entry (`kstatic_decl`): a str then
+    /// reads its canonical slot `lks[id]`, not a static copy.
+    pub lits: Option<HashMap<Vec<u8>, usize>>,
     defs: HashMap<Vec<u8>, String>,
     alias: HashMap<String, String>,
     regs: Vec<(String, u64, u64, Option<Vec<u64>>)>,
@@ -321,6 +387,11 @@ pub(super) fn kdef(p: &Program, cx: &mut StaticCx, pre: &mut String, name: &str,
 pub(super) fn kstatic_str(cx: &mut StaticCx, pre: &mut String, bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return str_lit_c(bytes);
+    }
+    if let Some(lits) = &mut cx.lits {
+        let n = lits.len();
+        let id = *lits.entry(bytes.to_vec()).or_insert(n);
+        return format!("((lust_str){{(uint8_t*)lks[{id}], {}}})", bytes.len());
     }
     let key = image_key(bytes.to_vec(), vec![1; bytes.len()]);
     let name = match cx.defs.get(&key) {
@@ -459,4 +530,351 @@ pub(super) fn kstatics_init(cx: &StaticCx) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// The promoted locals of `body` whose value this evaluator can
+/// compute at compile time, as ConstValues (release builds give
+/// those a static initializer and intern them at the fn's entry,
+/// `kbatch_local`). A local's value is read only when the local is
+/// a temp written by exactly one whole-local assignment, never
+/// through a projection, a call, or a mutable borrow
+/// (`single_defs`), so a value read is the only value it can hold.
+/// One forward pass in block order; a definition that order has not
+/// reached is a miss. Literals, aggregates, field and index reads,
+/// and scalar arithmetic and casts evaluate; integers are kept in
+/// their type's range (wrapped at its width), and an operation
+/// that overflows, panics, or that the evaluator does not know is
+/// a miss: the local keeps the run-time path, never a wrong value.
+pub(super) fn eval_promoted(p: &Program, body: &Body) -> crate::intern::FxMap<Local, crate::ty::consteval::ConstValue> {
+    let single = single_defs(body);
+    let mut env: crate::intern::FxMap<Local, crate::ty::consteval::ConstValue> = crate::intern::FxMap::default();
+    for block in &body.blocks {
+        for stmt in &block.stmts {
+            let StmtKind::Assign(dest, rv) = &stmt.kind else { continue };
+            if !dest.proj.is_empty() || !single[dest.local as usize] {
+                continue;
+            }
+            let ty = body.locals[dest.local as usize].ty;
+            if let Some(v) = eval_rvalue(p, body, rv, &env).and_then(|v| fit(v, int_ty(body, ty))) {
+                env.insert(dest.local, v);
+            }
+        }
+    }
+    env.retain(|l, _| body.promoted.contains(l));
+    env
+}
+
+/// Per local: true for an unnamed non-parameter temp with exactly one
+/// whole-local assignment and no other write (a projection write, a
+/// call result, a mutable borrow), as `ir::byte_blob_locals` asks.
+fn single_defs(body: &Body) -> Vec<bool> {
+    let n = body.locals.len();
+    let mut count = vec![0u32; n];
+    let mut bad: Vec<bool> = body.locals.iter().enumerate().map(|(i, l)| i <= body.arg_count || l.name.is_some()).collect();
+    for b in &body.blocks {
+        for s in &b.stmts {
+            let StmtKind::Assign(dest, rv) = &s.kind else { continue };
+            match rv {
+                Rvalue::Ref(true, pl) => bad[pl.local as usize] = true,
+                Rvalue::Subslice { base, mutable: true, .. } => bad[base.local as usize] = true,
+                _ => {}
+            }
+            if dest.proj.is_empty() {
+                count[dest.local as usize] += 1;
+            } else {
+                bad[dest.local as usize] = true;
+            }
+        }
+        if let Terminator::Call { dest, .. } = &b.term {
+            bad[dest.local as usize] = true;
+        }
+    }
+    (0..n).map(|i| !bad[i] && count[i] == 1).collect()
+}
+
+/// True when a compile-time value can be a static initializer that
+/// interns like the run-time value (`kbatch_local`): no float
+/// (`const_init` renders one as a union read, not a C constant) and
+/// no pointer (a pointer word would name a copy of its pointee, not
+/// the canonical one the run-time value points at).
+pub(super) fn static_ok(v: &crate::ty::consteval::ConstValue) -> bool {
+    kvalue_ok(v, false)
+}
+
+/// True when a compile-time value can intern at the fn's entry: as
+/// `static_ok`, or with strs as its only pointers (the entry builds
+/// it from the canonical literal slots, `kstatic_decl`).
+pub(super) fn entry_ok(v: &crate::ty::consteval::ConstValue) -> bool {
+    kvalue_ok(v, true)
+}
+
+fn kvalue_ok(v: &crate::ty::consteval::ConstValue, strs: bool) -> bool {
+    use crate::ty::consteval::ConstValue as CV;
+    match v {
+        CV::Int(_) | CV::Bool(_) | CV::Char(_) | CV::Unit | CV::Bytes(_) => true,
+        CV::Str(_) | CV::StrBytes(_) => strs,
+        CV::Aggregate(vals) | CV::Variant(_, vals) => vals.iter().all(|x| kvalue_ok(x, strs)),
+        CV::Repeat(x, _) => kvalue_ok(x, strs),
+        _ => false,
+    }
+}
+
+/// The integer type of `ty`, if it is one.
+fn int_ty(body: &Body, ty: Ty) -> Option<crate::ty::IntTy> {
+    match body.tys.kind(ty) {
+        TyKind::Int(it) => Some(it),
+        _ => None,
+    }
+}
+
+/// `i` wrapped to `it`'s width: sign-extended for a signed type,
+/// zero-extended for an unsigned one (the form every Int here has).
+fn wrap(i: i128, it: crate::ty::IntTy) -> i128 {
+    let bits = it.bits();
+    if bits >= 128 {
+        return i;
+    }
+    let m = (i as u128) & ((1u128 << bits) - 1);
+    if it.signed() && (m >> (bits - 1)) & 1 == 1 { (m as i128) - (1i128 << bits) } else { m as i128 }
+}
+
+/// A value stored at a local of integer type `it`: an Int must already
+/// be in its range (else the operation overflowed: a miss). 128-bit
+/// types are a miss (u128 does not fit the i128 form).
+fn fit(v: crate::ty::consteval::ConstValue, it: Option<crate::ty::IntTy>) -> Option<crate::ty::consteval::ConstValue> {
+    use crate::ty::consteval::ConstValue as CV;
+    match (&v, it) {
+        (_, Some(it)) if it.bits() >= 128 => None,
+        (CV::Int(i), Some(it)) if wrap(*i, it) != *i => None,
+        _ => Some(v),
+    }
+}
+
+/// The integer type of an operand: a literal's, or a whole local's.
+/// None for anything else (arithmetic on it is a miss).
+fn op_int_ty(body: &Body, op: &Operand) -> Option<crate::ty::IntTy> {
+    match op {
+        Operand::Const(Const::Int(_, it)) => Some(*it),
+        Operand::Copy(pl) | Operand::Move(pl) if pl.proj.is_empty() => int_ty(body, body.locals[pl.local as usize].ty),
+        _ => None,
+    }
+}
+
+/// One operand's const value, if it has one under `env`.
+fn eval_operand(p: &Program, body: &Body, op: &Operand, env: &crate::intern::FxMap<Local, crate::ty::consteval::ConstValue>) -> Option<crate::ty::consteval::ConstValue> {
+    use crate::ty::consteval::ConstValue as CV;
+    match op {
+        Operand::Const(c) => Some(match c {
+            Const::Int(v, it) => {
+                if it.bits() >= 128 {
+                    return None;
+                }
+                CV::Int(wrap(*v as i128, *it))
+            }
+            Const::Float(bits, f) => CV::Float(*bits, *f),
+            Const::Bool(b) => CV::Bool(*b),
+            Const::Char(ch) => CV::Char(*ch),
+            Const::Str(i) => CV::Str(*i),
+            Const::StrBytes(b) => CV::StrBytes(b.clone()),
+            Const::Bytes(b) => CV::Bytes(b.clone()),
+            Const::Unit => CV::Unit,
+        }),
+        Operand::Copy(pl) | Operand::Move(pl) => eval_place(p, body, pl, env),
+    }
+}
+
+/// A place's const value: a whole local, a field of a struct or of the
+/// variant a downcast names, an element at a known index, or a deref
+/// of a reference value.
+fn eval_place(p: &Program, body: &Body, pl: &Place, env: &crate::intern::FxMap<Local, crate::ty::consteval::ConstValue>) -> Option<crate::ty::consteval::ConstValue> {
+    use crate::ty::consteval::ConstValue as CV;
+    let _ = (p, body);
+    let mut v = env.get(&pl.local)?.clone();
+    let mut variant: Option<u32> = None;
+    for proj in &pl.proj {
+        let at = |i: &Local| match env.get(i) {
+            Some(CV::Int(k)) if *k >= 0 => Some(*k as usize),
+            _ => None,
+        };
+        v = match (proj, v) {
+            (Proj::Downcast(k), v @ CV::Variant(..)) => {
+                variant = Some(*k);
+                v
+            }
+            (Proj::Field(i), CV::Aggregate(mut vals)) if variant.is_none() && (*i as usize) < vals.len() => vals.swap_remove(*i as usize),
+            (Proj::Field(i), CV::Variant(k, mut vals)) if variant == Some(k) && (*i as usize) < vals.len() => vals.swap_remove(*i as usize),
+            (Proj::Deref, CV::Ref(inner)) if variant.is_none() => *inner,
+            (Proj::Index(idx), CV::Aggregate(vals)) if variant.is_none() => vals.get(at(idx)?)?.clone(),
+            (Proj::Index(idx), CV::Repeat(x, n)) if variant.is_none() && (at(idx)? as u64) < n => *x,
+            (Proj::Index(idx), CV::Bytes(b)) if variant.is_none() => CV::Int(*b.as_slice().get(at(idx)?)? as i128),
+            _ => return None,
+        };
+        if !matches!(proj, Proj::Downcast(_)) {
+            variant = None;
+        }
+    }
+    if variant.is_some() {
+        return None;
+    }
+    Some(v)
+}
+
+/// An rvalue's const value, for the forms promotion allows
+/// (literals, aggregates, references, casts, scalar arithmetic).
+fn eval_rvalue(p: &Program, body: &Body, rv: &Rvalue, env: &crate::intern::FxMap<Local, crate::ty::consteval::ConstValue>) -> Option<crate::ty::consteval::ConstValue> {
+    use crate::ty::consteval::ConstValue as CV;
+    let ev = |op: &Operand| eval_operand(p, body, op, env);
+    let all = |ops: &[Operand]| ops.iter().map(ev).collect::<Option<Vec<CV>>>();
+    match rv {
+        Rvalue::Use(op) => ev(op),
+        Rvalue::Ref(false, pl) => Some(CV::Ref(Box::new(eval_place(p, body, pl, env)?))),
+        Rvalue::Aggregate(a, variant, ops) => {
+            let vals = all(ops)?;
+            Some(if p.adt(*a).is_enum { CV::Variant(*variant, vals) } else { CV::Aggregate(vals) })
+        }
+        Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => Some(CV::Aggregate(all(ops)?)),
+        Rvalue::ArrayRepeat(_, op, n) => Some(CV::Repeat(Box::new(ev(op)?), *n)),
+        Rvalue::Opt(_, x) => match x {
+            Some(op) => Some(CV::Variant(1, vec![ev(op)?])),
+            None => Some(CV::Variant(0, Vec::new())),
+        },
+        Rvalue::Res(_, ok, op) => Some(CV::Variant(if *ok { 0 } else { 1 }, vec![ev(op)?])),
+        Rvalue::Bin(op, a, b) => eval_binop(body, *op, a, b, ev(a)?, ev(b)?),
+        Rvalue::Un(op, a) => {
+            let it = op_int_ty(body, a);
+            match (op, ev(a)?) {
+                (crate::ast::UnOp::Neg, CV::Int(i)) if it.is_some_and(|t| t.signed()) => Some(CV::Int(i.checked_neg()?)),
+                (crate::ast::UnOp::Neg, CV::Float(bits, f)) => Some(CV::Float(neg_float(bits, f), f)),
+                (crate::ast::UnOp::Not, CV::Bool(b)) => Some(CV::Bool(!b)),
+                (crate::ast::UnOp::Not, CV::Int(i)) => Some(CV::Int(wrap(!i, it?))),
+                _ => None,
+            }
+        }
+        Rvalue::Cast(op, ty) => eval_cast(body, ev(op)?, *ty),
+        _ => None,
+    }
+}
+
+/// Scalar binary ops on const values. Integer operands must have a
+/// known type of at most 64 bits (`op_int_ty`); the result of `+ - *
+/// / %` must fit the left operand's type (`fit` at the destination
+/// checks it), and a shift amount must be under the width. Floats go
+/// through host IEEE arithmetic at their own width, as Rust's.
+fn eval_binop(
+    body: &Body,
+    op: crate::ast::BinOp,
+    a: &Operand,
+    b: &Operand,
+    x: crate::ty::consteval::ConstValue,
+    y: crate::ty::consteval::ConstValue,
+) -> Option<crate::ty::consteval::ConstValue> {
+    use crate::ast::BinOp as B;
+    use crate::ty::consteval::ConstValue as CV;
+    match (x, y) {
+        (CV::Int(i), CV::Int(j)) => {
+            let lt = op_int_ty(body, a)?;
+            op_int_ty(body, b)?;
+            let width = lt.bits() as i128;
+            Some(match op {
+                B::Add => CV::Int(i.checked_add(j)?),
+                B::Sub => CV::Int(i.checked_sub(j)?),
+                B::Mul => CV::Int(i.checked_mul(j)?),
+                B::Div if j != 0 => CV::Int(i.checked_div(j)?),
+                B::Rem if j != 0 => CV::Int(i.checked_rem(j)?),
+                B::BitAnd => CV::Int(i & j),
+                B::BitOr => CV::Int(i | j),
+                B::BitXor => CV::Int(i ^ j),
+                B::Shl if (0..width).contains(&j) => CV::Int(wrap(i << j, lt)),
+                B::Shr if (0..width).contains(&j) => CV::Int(i >> j),
+                B::Eq => CV::Bool(i == j),
+                B::Ne => CV::Bool(i != j),
+                B::Lt => CV::Bool(i < j),
+                B::Le => CV::Bool(i <= j),
+                B::Gt => CV::Bool(i > j),
+                B::Ge => CV::Bool(i >= j),
+                _ => return None,
+            })
+        }
+        (CV::Float(i, f), CV::Float(j, g)) if f == g => {
+            macro_rules! arith {
+                ($x:expr, $y:expr, $bits:expr) => {{
+                    let (x, y) = ($x, $y);
+                    Some(match op {
+                        B::Add => CV::Float($bits(x + y), f),
+                        B::Sub => CV::Float($bits(x - y), f),
+                        B::Mul => CV::Float($bits(x * y), f),
+                        B::Div => CV::Float($bits(x / y), f),
+                        B::Rem => CV::Float($bits(x % y), f),
+                        B::Eq => CV::Bool(x == y),
+                        B::Ne => CV::Bool(x != y),
+                        B::Lt => CV::Bool(x < y),
+                        B::Le => CV::Bool(x <= y),
+                        B::Gt => CV::Bool(x > y),
+                        B::Ge => CV::Bool(x >= y),
+                        _ => return None,
+                    })
+                }};
+            }
+            match f {
+                crate::ty::FloatTy::F64 => arith!(f64::from_bits(i), f64::from_bits(j), |r: f64| r.to_bits()),
+                crate::ty::FloatTy::F32 => arith!(f32::from_bits(i as u32), f32::from_bits(j as u32), |r: f32| r.to_bits() as u64),
+            }
+        }
+        (CV::Bool(i), CV::Bool(j)) => Some(match op {
+            B::Eq => CV::Bool(i == j),
+            B::Ne => CV::Bool(i != j),
+            B::BitAnd => CV::Bool(i & j),
+            B::BitOr => CV::Bool(i | j),
+            B::BitXor => CV::Bool(i ^ j),
+            _ => return None,
+        }),
+        (CV::Char(i), CV::Char(j)) => Some(match op {
+            B::Eq => CV::Bool(i == j),
+            B::Ne => CV::Bool(i != j),
+            B::Lt => CV::Bool(i < j),
+            B::Le => CV::Bool(i <= j),
+            B::Gt => CV::Bool(i > j),
+            B::Ge => CV::Bool(i >= j),
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+fn neg_float(bits: u64, f: crate::ty::FloatTy) -> u64 {
+    match f {
+        crate::ty::FloatTy::F64 => (-f64::from_bits(bits)).to_bits(),
+        crate::ty::FloatTy::F32 => (-f32::from_bits(bits as u32)).to_bits() as u64,
+    }
+}
+
+/// Numeric casts between scalar const values, as Rust's `as`:
+/// wrapping int to int, saturating float to int (NaN is 0), round to
+/// nearest int to float and float to float. Anything else is a miss.
+fn eval_cast(body: &Body, v: crate::ty::consteval::ConstValue, dst: Ty) -> Option<crate::ty::consteval::ConstValue> {
+    use crate::ty::FloatTy as F;
+    use crate::ty::consteval::ConstValue as CV;
+    match (v, body.tys.kind(dst)) {
+        (_, TyKind::Int(it)) if it.bits() >= 128 => None,
+        (CV::Int(i), TyKind::Int(it)) => Some(CV::Int(wrap(i, it))),
+        (CV::Char(c), TyKind::Int(it)) => Some(CV::Int(wrap(c as i128, it))),
+        (CV::Bool(b), TyKind::Int(_)) => Some(CV::Int(b as i128)),
+        (CV::Int(i), TyKind::Char) if (0..256).contains(&i) => char::from_u32(i as u32).map(CV::Char),
+        (CV::Int(i), TyKind::Float(F::F64)) => Some(CV::Float((i as f64).to_bits(), F::F64)),
+        (CV::Int(i), TyKind::Float(F::F32)) => Some(CV::Float((i as f32).to_bits() as u64, F::F32)),
+        (CV::Float(bits, f), TyKind::Int(it)) => {
+            let x = match f {
+                F::F64 => f64::from_bits(bits),
+                F::F32 => f32::from_bits(bits as u32) as f64,
+            };
+            let bits = it.bits();
+            let (lo, hi) = if it.signed() { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) } else { (0, (1i128 << bits) - 1) };
+            // `as i128` saturates and maps NaN to 0; every target here is narrower.
+            Some(CV::Int((x as i128).clamp(lo, hi)))
+        }
+        (CV::Float(bits, F::F32), TyKind::Float(F::F64)) => Some(CV::Float((f32::from_bits(bits as u32) as f64).to_bits(), F::F64)),
+        (CV::Float(bits, F::F64), TyKind::Float(F::F32)) => Some(CV::Float((f64::from_bits(bits) as f32).to_bits() as u64, F::F32)),
+        (v @ CV::Float(..), TyKind::Float(_)) => Some(v),
+        _ => None,
+    }
 }

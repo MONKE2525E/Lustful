@@ -1098,6 +1098,11 @@ impl<'s> Slots<'s> {
         Slots { map, used: Default::default(), externs: Default::default() }
     }
 
+    /// The LocalDefId-to-slot table as a slice (`const_init` reads it).
+    fn as_slice(&self) -> &[u32] {
+        self.map
+    }
+
     /// The slot of fn `f`, recorded as used.
     fn of(&self, f: LocalDefId) -> u32 {
         let s = self.map[f.0 as usize];
@@ -1229,6 +1234,18 @@ struct FnGen<'b, 'p> {
     /// end), and the cache of each distinct literal (cgen/kconst.rs).
     kdecl_at: Option<usize>,
     kstrs: HashMap<Vec<u8>, usize>,
+    /// Release builds: promoted locals whose value codegen computed at
+    /// compile time (`kconst::eval_promoted`), with no float and no
+    /// pointer but strs in it. Each is static data with that value
+    /// (its assignment never runs), interned once at the fn's entry
+    /// (`kconst::kbatch_local`). Empty in dev builds.
+    kstatic: crate::intern::FxMap<Local, crate::ty::consteval::ConstValue>,
+    /// The `const_init` state for those values (they hold no pointer
+    /// but strs, which read the literal slots, so it defines no pointee).
+    kcx: kconst::StaticCx,
+    /// The C value the fn's entry writes into each `kstatic` local that
+    /// holds strs (`kstatic_decl`).
+    kentry: HashMap<Local, String>,
     /// Release C: the place being emitted is only borrowed (`Rvalue::Ref`), so its
     /// type needs no definition (`place`).
     addr_only: bool,
@@ -2239,6 +2256,15 @@ impl<'b, 'p> FnGen<'b, 'p> {
     /// `ItemShim` builtin method's one-call body, `prim_shim`).
     fn new(p: &'p Program, body: &'b Body<'p>, map: &'b SourceMap, base_line: u32, slots: &'b Slots<'b>) -> Self {
         let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
+        let byte_blobs = crate::ir::byte_blob_locals(body);
+        let kstatic: crate::intern::FxMap<Local, crate::ty::consteval::ConstValue> = if names::release() {
+            kconst::eval_promoted(p, body)
+                .into_iter()
+                .filter(|(l, v)| !byte_blobs.get(*l as usize).is_some_and(|b| b.is_some()) && kconst::entry_ok(v))
+                .collect()
+        } else {
+            Default::default()
+        };
         let local_drop: Vec<bool> = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
         let n_locals = local_cty.len();
         let (on, fine) = static_drop_flags(p);
@@ -2274,7 +2300,10 @@ impl<'b, 'p> FnGen<'b, 'p> {
             adapters: 0,
             shims: HashMap::new(),
             cleanup: if p.unwind { unwind::cleanup_blocks(body) } else { Vec::new() },
-            byte_blobs: crate::ir::byte_blob_locals(body),
+            byte_blobs,
+            kstatic,
+            kcx: kconst::StaticCx::default(),
+            kentry: HashMap::new(),
             stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
             unw: None,
             unw_call: false,
@@ -2439,6 +2468,11 @@ impl FnGen<'_, '_> {
         // Locals with alignment over 16 (see `overaligned_local`).
         let mut high: Vec<(usize, String, String)> = Vec::new();
         let mut frame_init: Vec<String> = Vec::new();
+        // The compile-time promoted values' decls (`kstatic_decl`; it
+        // needs `self` mutably, so ahead of the loop).
+        let kdecls: Vec<Option<String>> = (0..self.local_cty.len())
+            .map(|i| if self.body.promoted.contains(&(i as Local)) { self.kstatic_decl(i) } else { None })
+            .collect();
         for (i, t) in self.local_cty.iter().enumerate() {
             // A byte string temp gets static storage below, not a frame local.
             if self.byte_blobs.get(i).is_some_and(|b| b.is_some()) {
@@ -2479,7 +2513,14 @@ impl FnGen<'_, '_> {
             if self.body.promoted.contains(&(i as Local)) {
                 // A promoted constant (`&5` borrowed for `'static`): static
                 // storage, written with the same value each time it runs.
-                let _ = writeln!(self.out, "  static {ct} {decl};");
+                // In release builds a value codegen computed at compile time
+                // is static data instead (its assignment is skipped in `stmt`).
+                match &kdecls[i] {
+                    Some(d) => self.out.push_str(d),
+                    None => {
+                        let _ = writeln!(self.out, "  static {ct} {decl};");
+                    }
+                }
                 if self.kconst_local(i) {
                     let d = self.kconst_decls(i);
                     self.out.push_str(&d);
@@ -3506,6 +3547,9 @@ impl FnGen<'_, '_> {
                     && self.byte_blobs.get(dest.local as usize).is_some_and(|x| x.as_ref().is_some_and(|x| x.as_slice() == b.as_slice())) =>
             {
             }
+            // A compile-time promoted local's value is its static
+            // initializer (`kstatic`): its defining assignment never runs.
+            StmtKind::Assign(dest, _) if dest.proj.is_empty() && self.kstatic.contains_key(&dest.local) => {}
             StmtKind::Assign(dest, rv) => {
                 // A promoted constant is the same value on every run: once its site has
                 // interned it (`lk{i}` set), the write is skipped, so threads do not all

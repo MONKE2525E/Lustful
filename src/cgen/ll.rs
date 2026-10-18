@@ -473,12 +473,15 @@ impl FnGen<'_, '_> {
                 "lp{u}:\n  %lpv{u} = landingpad {{ ptr, i32 }} cleanup\n  store {{ ptr, i32 }} %lpv{u}, ptr %exn\n  br label %bb{u}"
             );
         }
+        // The compile-time promoted values' decls (`kstatic_decl`) come first: a value
+        // that holds strs adds literals and an entry write to the entry helper.
+        let kdecls: Vec<Option<String>> = (0..self.local_cty.len()).map(|i| if ll.statics[i] { self.kstatic_decl(i) } else { None }).collect();
         let kstr_init = self.ll_kstr_init(&mut ll);
         let def = self.ll_define(&mut ll, kstr_init.as_deref());
         // The C sides: the helpers with the macros and statics they read; then the C ABI
         // wrapper and the trampoline, which stay in the unit's plain C.
         let saved = std::mem::take(&mut self.out);
-        self.ll_c_side(&ll, kstr_init.as_deref());
+        self.ll_c_side(&ll, kstr_init.as_deref(), &kdecls);
         let helpers = std::mem::replace(&mut self.out, saved);
         let wrapper = self.ll_wrapper(slot);
         let _ = writeln!(self.out, "/* {} */\n{wrapper}{}", p.display_path(p.fn_info(fid).name), trampoline(p, fid, slot));
@@ -581,21 +584,19 @@ impl FnGen<'_, '_> {
         }
     }
 
-    /// The prologue helper that interns the fn's str literals (`kstr`), if it has any.
+    /// The prologue helper that interns the fn's str literals (`kstr`) and its batched
+    /// constant locals (`kbatch_local`), if it has any (`kintern_block`; `ll_c_side`
+    /// declares the slots and the flag it reads).
     fn ll_kstr_init(&mut self, ll: &mut Ll) -> Option<String> {
         self.kdecl_at = None;
-        if self.kstrs.is_empty() {
+        let block = self.kintern_block("  ");
+        if block.is_empty() {
             return None;
         }
-        let mut lits: Vec<(&Vec<u8>, &usize)> = self.kstrs.iter().collect();
-        lits.sort_by_key(|(_, id)| **id);
+        // The slots and the flag are file statics on the C side (`ll_c_side`).
+        let body: String = block.lines().filter(|l| !l.trim_start().starts_with("static ")).map(|l| format!("{l}\n")).collect();
         let name = format!("lh_{}_k", ll.tag);
-        let mut text = format!("__attribute__((visibility(\"hidden\"), always_inline)) void {name}(void) {{\n  if (!lks_ok) {{\n");
-        for (b, id) in lits {
-            let _ = writeln!(text, "    lust_kintern(&lks[{id}], {}, {}, 1, 0);", c_string_lit(b), b.len());
-        }
-        text.push_str("    lks_ok = 1;\n  }\n}\n");
-        ll.helpers.push_str(&text);
+        let _ = write!(ll.helpers, "__attribute__((visibility(\"hidden\"), always_inline)) void {name}(void) {{\n{body}}}\n");
         ll.decls.insert(format!("declare void @{name}()"));
         Some(name)
     }
@@ -772,7 +773,7 @@ impl FnGen<'_, '_> {
     /// The helper side of a fn emitted as LLVM IR, into `self.out`: the prelude (vtables,
     /// shims, outlined panics), the frame macros and file statics the helpers read, and the
     /// helpers.
-    fn ll_c_side(&mut self, ll: &Ll, kstr_init: Option<&str>) {
+    fn ll_c_side(&mut self, ll: &Ll, kstr_init: Option<&str>, kdecls: &[Option<String>]) {
         let p = self.p;
         let fid = self.body.fn_id;
         let tag = &ll.tag;
@@ -805,9 +806,14 @@ impl FnGen<'_, '_> {
             def(&mut self.out, "ltc".into(), "(*qltc)".into());
         }
         if kstr_init.is_some() {
-            def(&mut self.out, "lks".into(), format!("lks_{tag}"));
+            if !self.kstrs.is_empty() {
+                def(&mut self.out, "lks".into(), format!("lks_{tag}"));
+            }
             def(&mut self.out, "lks_ok".into(), format!("lks_ok_{tag}"));
-            let _ = writeln!(self.out, "static const void *lks[{}];\nstatic int32_t lks_ok;", self.kstrs.len());
+            if !self.kstrs.is_empty() {
+                let _ = writeln!(self.out, "static const void *lks[{}];", self.kstrs.len());
+            }
+            self.out.push_str("static int32_t lks_ok;\n");
         }
         // Statics: promoted constants (zeroed, written by their statement) and byte string
         // temps (initialized here), with their interning slots.
@@ -816,12 +822,13 @@ impl FnGen<'_, '_> {
                 continue;
             }
             let ct = ctype(&self.local_cty[i]);
-            match self.byte_blobs.get(i).cloned().flatten() {
-                Some(b) => {
+            match (&kdecls[i], self.byte_blobs.get(i).cloned().flatten()) {
+                (Some(d), _) => self.out.push_str(d),
+                (None, Some(b)) => {
                     let init = if b.is_empty() { "{0}".to_string() } else { format!("{{ .v = {} }}", c_bytes_lit(b.as_slice())) };
                     let _ = writeln!(self.out, "static {ct} l{i} = {init};");
                 }
-                None => {
+                (None, None) => {
                     let _ = writeln!(self.out, "static {ct} l{i};");
                 }
             }
@@ -1721,6 +1728,9 @@ impl FnGen<'_, '_> {
     /// `unwind` is its cleanup entry (a drop can unwind).
     fn ll_native_stmt(&mut self, ll: &mut Ll, s: &Stmt, unwind: Option<u32>) -> bool {
         match &s.kind {
+            // A compile-time promoted local's value is its static
+            // initializer (`kstatic`): its defining assignment never runs.
+            StmtKind::Assign(dest, _) if dest.proj.is_empty() && self.kstatic.contains_key(&dest.local) => true,
             StmtKind::Assign(dest, rv) => {
                 let Some(dp) = self.ll_plan(ll, dest) else { return false };
                 if needs_drop_c(self.p, &dp.ty) {
