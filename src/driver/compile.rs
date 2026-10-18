@@ -4791,12 +4791,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let prepared = crate::cc::spec_for(triple).and_then(|spec| {
             // Release C (`LUST_RELEASE_C=1`) already holds the content-addressed units.
             let mut all: Vec<(String, String)> = if rgroups.is_some() {
-                // An LLVM companion keeps its `.ll` name (cc.rs pairs it with its C unit).
-                units
-                    .iter()
+                // An LLVM companion keeps its `.ll` name (cc.rs pairs it with its C unit). The
+                // texts move: nothing reads `units` after cc, and a copy of tsgo's is ~1 GB.
+                std::mem::take(&mut units)
+                    .into_iter()
                     .map(|(o, c)| {
                         let name = if o.extension().is_some_and(|e| e == "ll" || e == "hc") { o.file_name() } else { o.file_stem() };
-                        (name.map_or(String::new(), |s| s.to_string_lossy().into_owned()), c.clone())
+                        (name.map_or(String::new(), |s| s.to_string_lossy().into_owned()), c)
                     })
                     .collect()
             } else {
@@ -4835,7 +4836,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
         };
         let (out, debug, cc_dir) = (req.out.clone(), req.debug, dir.join("cc"));
-        let job = move || crate::cc::build(&all, &spec, &out, debug, cache.as_ref(), &cc_dir);
+        let job = move || {
+            let built = crate::cc::build(&all, &spec, &out, debug, cache.as_ref(), &cc_dir);
+            // A build that leaks at exit leaks the unit texts too (they moved out of `units`).
+            if leak_at_exit {
+                std::mem::forget(all);
+            }
+            built
+        };
         if DEFER_CC.with(std::cell::Cell::get) && !leak_at_exit {
             // Parked for the caller (`DeferredCc`): the session is final before it, as after
             // a build that links.
