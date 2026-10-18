@@ -27,6 +27,7 @@
 // unit.
 use super::CcSpec;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -42,7 +43,7 @@ pub struct Pgo {
     /// The digests (`Index`) of each unit's own record names, sorted, by the file name the
     /// unit compiles as (shared, not copied: a static fn of the unit header has a record in
     /// every unit).
-    own: HashMap<String, Vec<Arc<str>>>,
+    own: HashMap<String, Vec<u128>>,
     /// The flags that pin the summary thresholds to the whole profile's.
     pins: Vec<String>,
     records: usize,
@@ -119,8 +120,9 @@ impl Mode {
             Mode::Gen => format!("gen{nopre} {STATIC_FILE}"),
             Mode::Use(p) => {
                 let pins = p.pins.join(" ");
+                let own: Vec<[u8; 16]> = p.own.get(file).into_iter().flatten().map(|d| d.to_le_bytes()).collect();
                 let mut parts: Vec<&[u8]> = vec![pins.as_bytes(), nopre.as_bytes(), STATIC_FILE.as_bytes()];
-                parts.extend(p.own.get(file).into_iter().flatten().map(|r| r.as_bytes()));
+                parts.extend(own.iter().map(|b| b.as_slice()));
                 digest(&parts)
             }
         }
@@ -327,48 +329,62 @@ pub(super) fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
     UnitDefs { units, macro_made, statics }
 }
 
-/// The records of each unit (by the file name it compiles as), sorted, how many are of
-/// macro-made fns, and how many external ones went to no unit. An external fn's record goes
-/// to every unit that defines it, a static fn's (`STATIC_FILE;<fn>`) to every unit that
-/// defines a static fn of that name; a static record of another file goes to that file.
-fn split(index: &Index, defs: &UnitDefs) -> (HashMap<String, Vec<Arc<str>>>, usize, usize) {
-    let mut owner: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (file, names) in &defs.units {
-        for n in names {
-            owner.entry(n).or_default().push(file);
+/// The digests (`Index`) of each unit's own record names, by the file name it compiles as,
+/// sorted; how many of those names are of macro-made fns; how many external ones no unit
+/// defines. An external fn's record goes to every unit that defines it, a static fn's
+/// (`STATIC_FILE;<fn>`) to every unit that defines a static fn of that name, a static record of
+/// another file to that file. Each unit looks up the names it defines, on every thread (tsgo's
+/// LLVM build: 728k records over ~4,300 units, each with the unit header's static fns).
+fn split(index: &Index, defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, usize, usize) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let entries: Vec<(&str, u128)> = index.iter().map(|(n, (d, _))| (n.as_str(), *d)).collect();
+    let (mut ext, mut stat) = (HashMap::new(), HashMap::new());
+    let mut other: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (n, _)) in entries.iter().enumerate() {
+        match n.split_once(';') {
+            Some((STATIC_FILE, f)) => {
+                stat.insert(f, i);
+            }
+            Some((file, _)) => other.entry(file).or_default().push(i),
+            None => {
+                ext.insert(*n, i);
+            }
         }
     }
-    let mut static_owner: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (file, names) in &defs.statics {
-        for n in names {
-            static_owner.entry(n).or_default().push(file);
-        }
+    let mut files: HashMap<&str, (&[String], &[String])> = HashMap::new();
+    for (f, ns) in &defs.units {
+        files.entry(f.as_str()).or_default().0 = ns;
     }
-    let mut own: HashMap<String, Vec<Arc<str>>> = HashMap::new();
-    let (mut helpers, mut absent) = (0, 0);
-    for (name, (d, _)) in index {
-        let files: Vec<&str> = match name.split_once(';') {
-            Some((STATIC_FILE, f)) => static_owner.get(f).cloned().unwrap_or_default(),
-            Some((file, _)) => vec![file],
-            None => match owner.get(name.as_str()) {
-                Some(f) => {
-                    helpers += defs.macro_made.contains(name) as usize;
-                    f.clone()
-                }
-                None => {
-                    absent += 1;
-                    Vec::new()
-                }
-            },
+    for (f, ns) in &defs.statics {
+        files.entry(f.as_str()).or_default().1 = ns;
+    }
+    for f in other.keys() {
+        files.entry(f).or_default();
+    }
+    let files: Vec<(&str, &[String], &[String])> = files.into_iter().map(|(f, (e, s))| (f, e, s)).collect();
+    let claimed: Vec<AtomicBool> = entries.iter().map(|_| AtomicBool::new(false)).collect();
+    let own = crate::pool::par_map(&files, |&(f, exts, statics)| {
+        let mut ds = Vec::with_capacity(exts.len() + statics.len());
+        let mut take = |i: usize| {
+            ds.push(entries[i].1);
+            claimed[i].store(true, Relaxed);
         };
-        for f in files {
-            own.entry(f.to_string()).or_default().push(d.clone());
+        exts.iter().filter_map(|n| ext.get(n.as_str())).for_each(|&i| take(i));
+        statics.iter().filter_map(|n| stat.get(n.as_str())).for_each(|&i| take(i));
+        other.get(f).into_iter().flatten().for_each(|&i| take(i));
+        ds.sort_unstable();
+        (f.to_string(), ds)
+    });
+    let (mut helpers, mut absent) = (0, 0);
+    for ((n, _), c) in entries.iter().zip(&claimed) {
+        if !n.contains(';') {
+            match c.load(Relaxed) {
+                true => helpers += defs.macro_made.contains(*n) as usize,
+                false => absent += 1,
+            }
         }
     }
-    for r in own.values_mut() {
-        r.sort_unstable();
-    }
-    (own, helpers, absent)
+    (own.into_iter().filter(|(_, d)| !d.is_empty()).collect(), helpers, absent)
 }
 
 /// A text profile's records by fn name: every record of the name (static fns of one source
@@ -378,7 +394,7 @@ type Records = HashMap<String, Vec<Arc<str>>>;
 /// Per record name, the digest of its records (sorted) and their number: all a unit's key
 /// reads of the profile (`key_part`), so a warm build of the same profile reads this file
 /// (`pgo-all.index`) and not the profile text (tsgo's LLVM profile: 731k records).
-type Index = HashMap<String, (Arc<str>, usize)>;
+type Index = HashMap<String, (u128, usize)>;
 
 fn index(records: &Records) -> Index {
     records
@@ -386,7 +402,8 @@ fn index(records: &Records) -> Index {
         .map(|(n, rs)| {
             let mut rs: Vec<&[u8]> = rs.iter().map(|r| r.as_bytes()).collect();
             rs.sort_unstable();
-            (n.clone(), (Arc::from(digest(&rs)), rs.len()))
+            let (a, b) = crate::driver::cache::hash128(&rs, 41);
+            (n.clone(), (((a as u128) << 64) | b as u128, rs.len()))
         })
         .collect()
 }
@@ -394,12 +411,7 @@ fn index(records: &Records) -> Index {
 fn write_index(path: &Path, index: &Index) -> Result<(), String> {
     let mut text = String::with_capacity(index.len() * 64);
     for (n, (d, k)) in index {
-        text.push_str(n);
-        text.push('\t');
-        text.push_str(d);
-        text.push('\t');
-        text.push_str(&k.to_string());
-        text.push('\n');
+        let _ = writeln!(text, "{n}\t{d:032x}\t{k}");
     }
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
@@ -410,8 +422,8 @@ fn read_index(path: &Path) -> Option<Index> {
     let mut index = HashMap::with_capacity(text.len() / 64);
     for line in text.lines() {
         let mut f = line.rsplitn(3, '\t');
-        let (k, d, n) = (f.next()?.parse().ok()?, f.next()?, f.next()?);
-        index.insert(n.to_string(), (Arc::from(d), k));
+        let (k, d, n) = (f.next()?.parse().ok()?, u128::from_str_radix(f.next()?, 16).ok()?, f.next()?);
+        index.insert(n.to_string(), (d, k));
     }
     Some(index)
 }
@@ -682,8 +694,8 @@ mod tests {
         let ix = index(&recs);
         let (own, _, absent) = split(&ix, &defs);
         assert_eq!(own["x9.ll"].len(), 2);
-        assert_eq!(own["x7.c"], vec![ix["lust.c;lust_mix"].0.clone()]);
-        assert_eq!(own["x1.c"], vec![ix["x1.c;old"].0.clone()], "another file's static record stays with that file");
+        assert_eq!(own["x7.c"], vec![ix["lust.c;lust_mix"].0]);
+        assert_eq!(own["x1.c"], vec![ix["x1.c;old"].0], "another file's static record stays with that file");
         assert_eq!(absent, 0);
         assert_eq!(defined_statics("static inline int lust_mix(int a) {\n}\nstatic int g;\nint f(void) {\n}\n"), vec!["lust_mix"]);
     }
