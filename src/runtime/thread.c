@@ -33,11 +33,14 @@ void lust_tls_exit(void);
 /* The pthread calls, declared as runtime/sync.c declares them: no
    <pthread.h>, whose prototypes clash with those under tcc. On glibc a
    pthread_key_t is an unsigned int and a pthread_once_t an int (0 is
-   PTHREAD_ONCE_INIT). */
+   PTHREAD_ONCE_INIT). On Darwin runtime.h included the real header
+   and the lust_pthread_* types are its types. */
+#ifndef __APPLE__
 int pthread_key_create(unsigned int *key, void (*dtor)(void *));
 void *pthread_getspecific(unsigned int key);
 int pthread_setspecific(unsigned int key, const void *v);
 int pthread_once(int *once, void (*init)(void));
+#endif
 
 typedef struct {
     void *cell;
@@ -52,8 +55,8 @@ typedef struct {
     uint64_t dcap;
 } lust_tls_block;
 
-static unsigned int lust_tls_key;
-static int lust_tls_once;
+static lust_pthread_key_t lust_tls_key;
+static lust_pthread_once_t lust_tls_once = LUST_PTHREAD_ONCE_INIT;
 /* Set once the key exists: the fast path reads it before the key, and a
    program that never touches TLS makes no key at exit. Read and written
    with the `__atomic` builtins (tcc has them; runtime/sync.c owns the

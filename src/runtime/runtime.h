@@ -9,6 +9,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+/* pthread key and once types (thread.c, panic.c, sync.c). The runtime
+   hand-declares the pthread calls for tcc, whose <pthread.h> prototypes
+   clash with them, and the hand types (unsigned int key, int once with
+   0 as its init) match glibc and musl on Linux. On Darwin they are
+   wrong (the key is an unsigned long, the once is a 16-byte struct
+   whose valid init is not zero), so a Darwin build, which never uses
+   tcc, takes the real <pthread.h> types instead. */
+#ifdef __APPLE__
+#include <pthread.h>
+#include <time.h>
+typedef pthread_key_t lust_pthread_key_t;
+typedef pthread_once_t lust_pthread_once_t;
+#define LUST_PTHREAD_ONCE_INIT PTHREAD_ONCE_INIT
+#else
+typedef unsigned int lust_pthread_key_t;
+typedef int lust_pthread_once_t;
+#define LUST_PTHREAD_ONCE_INIT 0
+#endif
 #define LUST_BODY(...) __VA_ARGS__
 #else
 void free(void *);

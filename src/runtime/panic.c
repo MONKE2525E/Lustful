@@ -65,10 +65,14 @@ extern int32_t lust_unw_pending;
 #ifdef LUST_IMPL
 int32_t lust_unwind_mode;
 int32_t lust_unw_pending;
+/* Hand pthread declarations for tcc on Linux; on Darwin the real
+   <pthread.h> is included above (runtime.h has the type spellings). */
+#ifndef __APPLE__
 int pthread_key_create(unsigned int *key, void (*dtor)(void *));
 void *pthread_getspecific(unsigned int key);
 int pthread_setspecific(unsigned int key, const void *v);
 int pthread_once(int *once, void (*init)(void));
+#endif
 
 /* One thread's panic state. `count` is Rust's local panic count: it
    rises when a panic starts and falls when a catch takes it, so
@@ -89,8 +93,8 @@ typedef struct {
     lust_dyn hook_payload;
     void *hook_loc;
 } lust_unw_state;
-static unsigned int lust_unw_key;
-static int lust_unw_once;
+static lust_pthread_key_t lust_unw_key;
+static lust_pthread_once_t lust_unw_once = LUST_PTHREAD_ONCE_INIT;
 /* Rust's FIRST_PANIC: the backtrace note prints for the first panic only. */
 static int32_t lust_first_panic = 1;
 
@@ -810,10 +814,14 @@ int32_t lust_stdout_flush_soft(void) LUST_BODY({
    Rust puts a SIGSEGV/SIGBUS handler on an alternate stack: a fault in
    the guard region below the thread's stack prints
        \nthread 'main' (<os tid>) has overflowed its stack\nfatal runtime error: stack overflow, aborting\n
-   and aborts (134); any other fault gets the default action. Linux only
-   (the stack bounds come from pthread_getattr_np). The region counts 16
+   and aborts (134); any other fault gets the default action. The stack
+   bounds come from pthread_getattr_np on Linux and from
+   pthread_get_stackaddr_np on Darwin. The region counts 16
    MiB below the stack, as a tcc frame can step past one guard page. */
-#if defined(LUST_IMPL) && defined(__linux__)
+#if defined(LUST_IMPL) && (defined(__linux__) || defined(__APPLE__))
+#ifdef __APPLE__
+#include <sys/resource.h>
+#else
 /* No <pthread.h>: sync.c declares pthread_create with its own types.
    pthread_attr_t is opaque here (56 bytes on x86_64 and aarch64 glibc). */
 typedef union { char bytes[64]; long align; } lust_pthread_attr;
@@ -821,6 +829,7 @@ unsigned long pthread_self(void);
 int pthread_getattr_np(unsigned long, void *);
 int pthread_attr_getstack(const void *, void **, size_t *);
 int pthread_attr_destroy(void *);
+#endif
 static uintptr_t lust_guard_lo, lust_guard_hi;
 static char lust_alt_stack[65536];
 /* A spawned thread's guard window and name (sync.c): leaves the main
@@ -857,6 +866,21 @@ static void lust_segv(int sig, siginfo_t *info, void *ctx) {
 /* The calling thread's guard window: one page above the stack's low end
    down to 16 MiB below it (see above). False when the bounds are unknown. */
 static int lust_guard_window(uintptr_t *lo, uintptr_t *hi) {
+    uintptr_t low;
+#ifdef __APPLE__
+    pthread_t self = pthread_self();
+    void *top = pthread_get_stackaddr_np(self);
+    if (!top) return 0;
+    size_t size = pthread_get_stacksize_np(self);
+    if (pthread_main_np()) {
+        /* The main thread's size_np is not its stack size on macOS:
+           std reads the main stack size from RLIMIT_STACK there. */
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) size = (size_t)rl.rlim_cur;
+    }
+    if (!size || (uintptr_t)top < (uintptr_t)size) return 0;
+    low = (uintptr_t)top - (uintptr_t)size;
+#else
     lust_pthread_attr at;
     void *addr;
     size_t size;
@@ -864,9 +888,11 @@ static int lust_guard_window(uintptr_t *lo, uintptr_t *hi) {
     int ok = pthread_attr_getstack(&at, &addr, &size) == 0;
     pthread_attr_destroy(&at);
     if (!ok) return 0;
+    low = (uintptr_t)addr;
+#endif
     long page = sysconf(_SC_PAGESIZE);
-    *hi = (uintptr_t)addr + (uintptr_t)(page > 0 ? page : 4096);
-    *lo = (uintptr_t)addr > (16u << 20) ? (uintptr_t)addr - (16u << 20) : 0;
+    *hi = low + (uintptr_t)(page > 0 ? page : 4096);
+    *lo = low > (16u << 20) ? low - (16u << 20) : 0;
     return 1;
 }
 

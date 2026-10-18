@@ -268,12 +268,23 @@ long syscall(long number, ...);
 #define LUST_SYS_FUTEX 98
 #define LUST_SYS_SCHED_GETAFFINITY 123
 #endif
+#elif defined(__APPLE__)
+/* Darwin's futex: the ulock calls in libSystem (no public header;
+   UL_COMPARE_AND_WAIT sleeps while the u32 at the address equals the
+   value, with a timeout in microseconds, 0 for no limit; wake takes
+   ULF_WAKE_ALL to wake every waiter). */
+int __ulock_wait(uint32_t op, void *addr, uint64_t value, uint32_t timeout_us);
+int __ulock_wake(uint32_t op, void *addr, uint64_t wake_value);
+#define LUST_ULOCK_COMPARE_AND_WAIT 1u
+#define LUST_ULOCK_WAKE_ALL 0x100u
 #endif
 int sched_yield(void);
 /* Sleep while *p == v (spurious wakeups are fine: callers loop). */
 static void lust_futex_wait(uint32_t *p, uint32_t v) {
 #ifdef LUST_SYS_FUTEX
     syscall(LUST_SYS_FUTEX, p, 128 /* FUTEX_WAIT_PRIVATE */, v, (void *)0, (void *)0, 0);
+#elif defined(__APPLE__)
+    __ulock_wait(LUST_ULOCK_COMPARE_AND_WAIT, p, v, 0);
 #else
     (void)p; (void)v;
     sched_yield();
@@ -282,8 +293,30 @@ static void lust_futex_wait(uint32_t *p, uint32_t v) {
 static void lust_futex_wake(uint32_t *p, int n) {
 #ifdef LUST_SYS_FUTEX
     syscall(LUST_SYS_FUTEX, p, 129 /* FUTEX_WAKE_PRIVATE */, n, (void *)0, (void *)0, 0);
+#elif defined(__APPLE__)
+    __ulock_wake(LUST_ULOCK_COMPARE_AND_WAIT | (n == 1 ? 0 : LUST_ULOCK_WAKE_ALL), p, 0);
 #else
     (void)p; (void)n;
+#endif
+}
+/* The timed form of lust_futex_wait for the Condvar and channel
+   timeouts below: sleep while *p == v, at most rs seconds and rn
+   nanoseconds (callers recompute what is left and loop, so a capped
+   or early return is fine). */
+static void lust_futex_wait_for(uint32_t *p, uint32_t v, long rs, long rn) {
+#ifdef LUST_SYS_FUTEX
+    long rel[2];
+    rel[0] = rs;
+    rel[1] = rn;
+    syscall(LUST_SYS_FUTEX, p, 128 /* FUTEX_WAIT_PRIVATE */, v, rel, (void *)0, 0);
+#elif defined(__APPLE__)
+    uint64_t us = (uint64_t)rs * 1000000u + (uint64_t)rn / 1000u;
+    if (us == 0) us = 1;
+    if (us > 0xffffffffu) us = 0xffffffffu;
+    __ulock_wait(LUST_ULOCK_COMPARE_AND_WAIT, p, v, (uint32_t)us);
+#else
+    (void)p; (void)v; (void)rs; (void)rn;
+    sched_yield();
 #endif
 }
 #endif
@@ -429,7 +462,22 @@ typedef struct lust_JoinHdr {
     lust_dyn payload;
 } lust_JoinHdr;
 
+/* A JoinHdr's thread id as the pthread calls take it. The field is an
+   unsigned long on every target (pthread_t is a word on glibc and a
+   pointer on Darwin, both 8 bytes, so the packet layout cgen lays out
+   is the same); on Darwin the calls cast it to the real pthread_t. */
+#ifdef __APPLE__
+#define LUST_PTHREAD_ID_P(p) ((pthread_t *)(void *)(p))
+#define LUST_PTHREAD_ID(v) ((pthread_t)(uintptr_t)(v))
+#else
+#define LUST_PTHREAD_ID_P(p) (p)
+#define LUST_PTHREAD_ID(v) (v)
+#endif
+
 #ifdef LUST_IMPL
+/* Hand pthread declarations for tcc on Linux; on Darwin runtime.h
+   included the real <pthread.h> and these would clash with it. */
+#ifndef __APPLE__
 int pthread_create(unsigned long *t, const void *attr, void *(*start)(void *), void *arg);
 int pthread_join(unsigned long t, void **ret);
 int pthread_detach(unsigned long t);
@@ -437,8 +485,9 @@ int pthread_key_create(unsigned int *key, void (*dtor)(void *));
 void *pthread_getspecific(unsigned int key);
 int pthread_setspecific(unsigned int key, const void *v);
 int pthread_once(int *once, void (*init)(void));
-static unsigned int lust_cur_key;
-static int lust_cur_once;
+#endif
+static lust_pthread_key_t lust_cur_key;
+static lust_pthread_once_t lust_cur_once = LUST_PTHREAD_ONCE_INIT;
 /* ThreadId(1) is the main thread; spawned threads count from 2 in spawn
    order, as std assigns them. */
 static uint64_t lust_next_tid = 2;
@@ -469,7 +518,7 @@ static void lust_cur_thread_name(const uint8_t **p, uint64_t *n) {
     else { *p = (const uint8_t *)"<unnamed>"; *n = 9; }
 }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 /* The stack overflow handler's view of the calling thread (panic.c): a
    spawned thread's guard window and its name, "<unknown>" when it has
    none, as std's handler prints it. The main thread keeps the defaults. */
@@ -508,6 +557,19 @@ static void *lust_thread_entry(void *p) {
     lust_ThreadInfo *self = h->th;
     lust_thread_guard_init(&self->guard_lo, &self->guard_hi, &self->alt);
     pthread_setspecific(lust_cur_key, h->th);
+#ifdef __APPLE__
+    /* Darwin's pthread_setname_np names only the calling thread, so a
+       Builder name is set here, as std sets it in the spawned thread
+       on macOS (the parent-side call below is Linux's two-arg form). */
+    if (self->name) {
+        char nm[64];
+        uint64_t n = self->name_len < 63 ? self->name_len : 63;
+        uint64_t i = 0;
+        for (; i < n && self->name[i] != 0; i++) nm[i] = (char)self->name[i];
+        nm[i] = 0;
+        pthread_setname_np(nm);
+    }
+#endif
     h->run(h);
     void *alt = self->alt;
     /* A panic that reached the thread's root ends the thread; its payload
@@ -543,7 +605,7 @@ void lust_thread_spawn(lust_JoinHdr *h, lust_loc loc) LUST_BODY({
     h->rc = 2;
     h->done = 0;
     h->panicked = 0;
-    if (pthread_create(&h->t, 0, lust_thread_entry, h) != 0) lust_panic_cstr_owned("failed to spawn thread", loc);
+    if (pthread_create(LUST_PTHREAD_ID_P(&h->t), 0, lust_thread_entry, h) != 0) lust_panic_cstr_owned("failed to spawn thread", loc);
 })
 
 /* A `thread::Builder` value (cgen/sync.rs lays it out): the
@@ -556,10 +618,12 @@ typedef struct lust_ThreadBuilder {
     uint8_t has_stack;
 } lust_ThreadBuilder;
 
+#ifndef __APPLE__
 int pthread_attr_init(void *attr);
 int pthread_attr_destroy(void *attr);
 int pthread_attr_setstacksize(void *attr, uint64_t size);
 int pthread_setname_np(unsigned long t, const char *name);
+#endif
 
 /* `Builder::spawn`: lust_thread_spawn with the builder's name
    and stack size. 0, or the errno of the failed call (the caller
@@ -592,7 +656,26 @@ int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST
     h->panicked = 0;
     /* pthread_attr_t is opaque and platform-sized; a zeroed
        64-byte block covers glibc's (56 bytes) on the targets
-       lust runs on. */
+       lust runs on. On Darwin the real pthread_attr_t stands here:
+       a zeroed block is not a valid Darwin attr (it holds a
+       signature word pthread_attr_init writes). */
+#ifdef __APPLE__
+    pthread_attr_t attr;
+    void *attrp = 0;
+    if (b->has_stack) {
+        pthread_attr_init(&attr);
+        uint64_t sz = b->stack < 16384 ? 16384 : b->stack;
+        int e2 = pthread_attr_setstacksize(&attr, (size_t)sz);
+        if (e2 != 0) {
+            pthread_attr_destroy(&attr);
+            lust_thread_info_release(t);
+            lust_thread_info_release(t);
+            if (h->scope) __atomic_sub_fetch(&h->scope->live, 1, 5);
+            return e2;
+        }
+        attrp = &attr;
+    }
+#else
     uint64_t attr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     void *attrp = 0;
     if (b->has_stack) {
@@ -608,14 +691,16 @@ int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST
         }
         attrp = attr;
     }
-    int r = pthread_create(&h->t, attrp, lust_thread_entry, h);
-    if (attrp) pthread_attr_destroy(attr);
+#endif
+    int r = pthread_create(LUST_PTHREAD_ID_P(&h->t), attrp, lust_thread_entry, h);
+    if (attrp) pthread_attr_destroy(attrp);
     if (r != 0) {
         lust_thread_info_release(t);
         lust_thread_info_release(t);
         if (h->scope) __atomic_sub_fetch(&h->scope->live, 1, 5);
         return r;
     }
+#ifndef __APPLE__
     if (b->has_name) {
         char nm[16];
         uint64_t n = b->name.len < 15 ? b->name.len : 15;
@@ -624,6 +709,7 @@ int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST
         nm[i] = 0;
         pthread_setname_np(h->t, nm);
     }
+#endif
     return 0;
 })
 
@@ -1054,13 +1140,13 @@ uint64_t lust_avail_parallelism(int32_t *err) LUST_BODY({
 
 /* Waits for the thread; the caller then moves the result out and calls
    lust_join_free. */
-void lust_thread_join(lust_JoinHdr *h) LUST_BODY({ pthread_join(h->t, 0); })
+void lust_thread_join(lust_JoinHdr *h) LUST_BODY({ pthread_join(LUST_PTHREAD_ID(h->t), 0); })
 
 void lust_join_free(lust_JoinHdr *h) LUST_BODY({ lust_packet_free(h); })
 
 /* A dropped JoinHandle detaches its thread. */
 void lust_join_drop(lust_JoinHdr *h) LUST_BODY({
-    pthread_detach(h->t);
+    pthread_detach(LUST_PTHREAD_ID(h->t));
     if (__atomic_sub_fetch(&h->rc, 1, 4) == 0) {
         lust_packet_drop_result(h);
         lust_packet_free(h);
@@ -1338,6 +1424,9 @@ void lust_cv_notify(uint32_t *cv, int all) LUST_BODY({
 static void lust_mono_now(long ts[2]) LUST_BODY({
 #ifdef LUST_SYS_CLOCK_GETTIME
     syscall(LUST_SYS_CLOCK_GETTIME, 1 /* CLOCK_MONOTONIC */, ts);
+#elif defined(__APPLE__)
+    /* struct timespec is two longs on Darwin, as ts is. */
+    clock_gettime(CLOCK_MONOTONIC, (void *)ts);
 #else
     ts[0] = 0;
     ts[1] = 0;
@@ -1399,16 +1488,7 @@ int lust_cv_wait_timeout(uint32_t *cv, uint32_t *m, uint64_t secs, uint32_t nano
             timed = 1;
             break;
         }
-#ifdef LUST_SYS_FUTEX
-        {
-            long rel[2];
-            rel[0] = rs;
-            rel[1] = rn;
-            syscall(LUST_SYS_FUTEX, cv, 128 /* FUTEX_WAIT_PRIVATE */, s, rel, (void *)0, 0);
-        }
-#else
-        sched_yield();
-#endif
+        lust_futex_wait_for(cv, s, rs, rn);
     }
     lust_mutex_lock(m);
     return timed;
@@ -1459,16 +1539,7 @@ int lust_chan_recv_timeout(lust_Chan *c, void *out, uint64_t secs, uint32_t nano
         uint32_t s;
         __atomic_load(&c->seq, &s, 5);
         lust_mutex_unlock(&c->lock);
-#ifdef LUST_SYS_FUTEX
-        {
-            long rel[2];
-            rel[0] = rs;
-            rel[1] = rn;
-            syscall(LUST_SYS_FUTEX, &c->seq, 128 /* FUTEX_WAIT_PRIVATE */, s, rel, (void *)0, 0);
-        }
-#else
-        sched_yield();
-#endif
+        lust_futex_wait_for(&c->seq, s, rs, rn);
         lust_mutex_lock(&c->lock);
     }
 })
@@ -1579,7 +1650,8 @@ lust_u128 lust_dur_as(lust_Duration d, uint64_t per_sec, uint64_t nanos_per) LUS
 #endif
 
 /* `thread::sleep`: nanosleep through syscall (no <time.h> in the runtime
-   text), resumed after a signal. */
+   text), resumed after a signal. On Darwin, libc nanosleep (runtime.h
+   included <time.h> there), the same loop. */
 void lust_thread_sleep(lust_Duration d) LUST_BODY({
 #ifdef LUST_SYS_NANOSLEEP
     long ts[2], rem[2];
@@ -1590,6 +1662,16 @@ void lust_thread_sleep(lust_Duration d) LUST_BODY({
         d.secs -= s;
         d.nanos = 0;
         while (syscall(LUST_SYS_NANOSLEEP, ts, rem) != 0) { ts[0] = rem[0]; ts[1] = rem[1]; }
+    }
+#elif defined(__APPLE__)
+    long ts[2], rem[2];
+    while (d.secs > 0 || d.nanos > 0) {
+        uint64_t s = d.secs > 0x7fffffff ? 0x7fffffff : d.secs;
+        ts[0] = (long)s;
+        ts[1] = (long)d.nanos;
+        d.secs -= s;
+        d.nanos = 0;
+        while (nanosleep((void *)ts, (void *)rem) != 0) { ts[0] = rem[0]; ts[1] = rem[1]; }
     }
 #else
     (void)d;
