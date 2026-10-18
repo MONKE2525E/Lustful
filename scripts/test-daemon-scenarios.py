@@ -126,7 +126,7 @@ def daemon_env(srcdir):
 
 
 def expect_problems(tag, path, stderr):
-    """The `vN.expect` lines the warm run's last `lust-stats:` line breaks."""
+    """The `vN.expect` lines the last `lust-stats:` line of a warm request breaks."""
     lines = [l for l in stderr.splitlines() if l.startswith("lust-stats:")]
     if not lines:
         return [f"{tag}: no lust-stats line in the warm run (set LUST_STATS=1 in daemon_env)"]
@@ -266,10 +266,12 @@ def scenario(srcdir):
                 notes.append(f"{tag}: lust rejects valid Rust in both modes (unsupported today)")
             # `vN.expect` next to `vN`: `<stat><op><n>` lines (op >=, <=, ==) on the
             # warm run's `lust-stats:` counters (set LUST_STATS=1 in daemon_env),
-            # e.g. `reemitted>=1` proves the cached-IR re-emit ran.
+            # or the warm check's when the version only checks; e.g.
+            # `reemitted>=1` proves the cached-IR re-emit ran.
             expect_path = vpath.removesuffix(".rs") + ".expect"
             if os.path.isfile(expect_path):
-                problems.extend(expect_problems(tag, expect_path, werr if "run" in ops else ""))
+                warm_err = werr if "run" in ops else wkerr if "check" in ops else ""
+                problems.extend(expect_problems(tag, expect_path, warm_err))
             # Under LUST_CHECK_ITEMPATCH=1 the daemon logs each oracle failure
             # (and answers that request again from a fresh session).
             log.flush()

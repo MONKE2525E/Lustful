@@ -154,6 +154,9 @@ pub(crate) struct Front {
     /// lives as long as its slot number (it clears only where
     /// `slot_of` does); `Caches::ok` false marks a stale instance.
     pub(crate) inst_slot: Vec<bool>,
+    /// The instance count of the last program (its fns after the AST
+    /// fns): live slots for the compaction test, with the AST fns.
+    pub(crate) inst_live: usize,
     /// Per instance slot, the item-level environment (`GenReuse::env`)
     /// of its last check or read replay: a slot from another one
     /// replays its stored reads before reuse.
@@ -442,6 +445,7 @@ impl Session {
                 manifest_unit_bytes: 0,
                 slot_hash: Vec::new(),
                 inst_slot: Vec::new(),
+                inst_live: 0,
                 slot_env: Vec::new(),
                 ast_fn_count: 0,
                 slots_renumbered: false,

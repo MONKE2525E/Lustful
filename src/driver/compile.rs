@@ -1363,7 +1363,10 @@ fn slot_update(
     t.lap("slots: def ids");
     front.env_hash = Some(env);
     front.items = item_scans;
-    let compact = front.slot_of.len() > fn_count * 2 + 64;
+    // Live slots: the AST fns and the last program's instances (a check
+    // of a program with generic associated consts makes them too).
+    let live_slots = fn_count + front.inst_live;
+    let compact = front.slot_of.len() > live_slots * 2 + 64;
     // Full mode may keep the caches (and let the dirty walk pick the
     // work set) only when Adt and static ids are stable. Slot
     // compaction renumbers, but per-slot state remaps by stable
@@ -1417,7 +1420,7 @@ fn slot_update(
         // dead slots outnumber live fns by a wide margin does a full
         // rebuild compact: it renumbers in def order and the stored
         // manifest is rewritten (the base rebuild of 4.2, in slot form).
-        if front.slot_of.len() > fn_count * 2 + 64 {
+        if front.slot_of.len() > live_slots * 2 + 64 {
             front.slot_of.clear();
             front.slot_paths.clear();
             front.slot_manifest_stored = 0;
@@ -3529,6 +3532,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // reuse): `slot_hash` holds the source fingerprint of the last
     // check, and `ok` false marks one stale.
     front.fn_slot.truncate(fn_count);
+    front.inst_live = program.fns.len().saturating_sub(fn_count);
     if program.gx.has_generics {
         for i in fn_count..program.fns.len() {
             let disk = program.disk_id(LocalDefId(i as u32));
