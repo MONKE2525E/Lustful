@@ -23,7 +23,10 @@
 # release binary is a function of the source, the toolchain and the flags, whatever the
 # cache held (rel-cache round 4: the location unit's slot numbers came from the cache's
 # slot manifest). Each sequence ends with a no-change rebuild that must take every unit
-# from the object cache. --front also keeps a front image (LUST_FRONT_STATE, as
+# from the object cache.
+#
+# In every mode, a stored unit object must never change: a hit hard-links the entry into
+# a work dir, so a build that wrote an object path in place would change the entry. --front also keeps a front image (LUST_FRONT_STATE, as
 # scripts/release-x64.sh FRONT=1 does) across the cached builds: a front image build had
 # turned release C off, so every merge recompiled nearly every unit.
 #
@@ -33,7 +36,7 @@
 # Sequence 0 of every run is the fx-unitcache repro shape; with --release, sequence 1
 # drops and restores Debug glue (glue_drop_steps). Exit 0 = all same, 1 = a
 # difference, a build failure on one side, or a hang; 2 = setup error.
-import argparse, os, random, re, shutil, subprocess, sys, tempfile
+import argparse, hashlib, os, random, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -270,12 +273,36 @@ def build(cmd, env, cwd):
     return "ok" if r.returncode == 0 else "fail: " + r.stderr.decode(errors="replace")[:300].replace("\n", " ")
 
 
+def entry_digests(cache):
+    """The digest of each unit object in the cache dir `cache` (empty when it has none)."""
+    if not os.path.isdir(cache):
+        return {}
+    names = [n for n in os.listdir(cache) if n.startswith("unit-") and n.endswith(".o")]
+    out = {}
+    for n in names:
+        try:
+            out[n] = hashlib.sha1(open(os.path.join(cache, n), "rb").read()).hexdigest()
+        except FileNotFoundError:
+            pass  # evicted meanwhile
+    return out
+
+
 def check_seq(idx, srcs, threads, args, work):
     """Runs one sequence. Returns (idx, problems, stats)."""
     d = os.path.join(work, f"s{idx}")
     os.makedirs(d, exist_ok=True)
     base = {k: v for k, v in os.environ.items() if k not in ("LUST_DAEMON_SOCKET", "LUST_CACHE_DIR", "LUST_NO_CACHE", "LUST_THREADS")}
     problems, stats = [], {"steps": 0, "invalid": 0}
+    # Every unit object stored in the sequence's cache, by digest: an entry never changes
+    # once stored (a hit is a hard link into a work dir; no later build may write through it).
+    stored = {}
+
+    def entries_unchanged(where):
+        for name, digest in entry_digests(os.path.join(d, ".lust-cache")).items():
+            if stored.setdefault(name, digest) != digest:
+                problems.append(f"{where}: cache entry {name} changed after it was stored")
+                stored[name] = digest
+
     for step, src in enumerate(srcs):
         with open(os.path.join(d, "main.rs"), "w") as f:
             f.write(src)
@@ -299,6 +326,7 @@ def check_seq(idx, srcs, threads, args, work):
         sides = [("ref", ref), ("cached", cached)]
         if args.daemon:
             sides.append(("daemon", build([LUST, "build", "main.rs", "-o", "daemon.bin"], tenv, d)))
+        entries_unchanged(where)
         if ref != "ok" and all(r == ref for _, r in sides):
             # lust rejects the program on every path: a lust gap, not a cache bug. With
             # --rustc it is a reject of valid Rust; report it so it is not lost.
@@ -331,6 +359,7 @@ def check_seq(idx, srcs, threads, args, work):
             m = re.search(rb"(\d+) units \((\d+) from cache", r.stderr)
             if r.returncode != 0 or not m or m.group(1) != m.group(2):
                 problems.append(f"seq {idx}: a no-change release rebuild missed the object cache ({m.group(0).decode() if m else r.stderr.decode(errors='replace')[:200]})")
+            entries_unchanged(f"seq {idx} no-change rebuild")
     for sock in [f for f in os.listdir(d) if f.startswith(".lust-daemon-") and f.endswith(".sock")]:
         os.unlink(os.path.join(d, sock))  # removing the socket stops the daemon
     if problems and args.keep:

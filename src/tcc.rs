@@ -167,6 +167,11 @@ fn cstr(p: &Path) -> CString {
 
 /// Compiles `(object path, C source)` pairs.
 pub fn compile_units(units: &[(PathBuf, String)], debug: bool) -> Result<(), String> {
+    // An object may be a hard link to a disk cache entry (`Cache::unit_object`). tcc
+    // replaces its output file, but the cache must not depend on that.
+    for (obj, _) in units {
+        let _ = std::fs::remove_file(obj);
+    }
     if units.len() <= 2 {
         for (obj, src) in units {
             let tcc = Tcc::new(TCC_OUTPUT_OBJ, debug)?;

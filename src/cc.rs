@@ -522,6 +522,9 @@ pub fn build(
                     hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
+                // The object may be a hard link to a cache entry (`Cache::unit_object`);
+                // a compiler that wrote its output in place would change the entry.
+                let _ = std::fs::remove_file(obj);
                 let cxx = is_cxx(name);
                 let src = if cxx { work.join(name) } else { work.join(format!("{name}.c")) };
                 let fail = |msg: String| errors.lock().unwrap_or_else(|e| e.into_inner()).push_str(&msg);
@@ -617,6 +620,34 @@ mod tests {
         let ll = "define void @fl_aa(ptr %p) uwtable {\nentry:\n  ret void\n}\ndefine available_externally i64 @fl_bb() {\nentry:\n  ret i64 0\n}\ndefine internal void @k() {\nentry:\n  ret void\n}\n";
         let text = super::ll_profile_text(c, ll);
         assert_eq!(super::pgo::defined_externs(&text), vec!["f_aa", "fl_aa", "fl_bb"]);
+    }
+
+    /// A cache hit hard-links the object into the work dir; a later compile of other C to
+    /// the same object path must not write through the link into the cache entry.
+    #[test]
+    fn a_compile_never_writes_through_a_linked_cache_entry() {
+        let Ok(spec) = super::spec_for(crate::protocol::host_triple()) else { return };
+        let root = std::env::temp_dir().join(format!("lust-cc-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = crate::driver::cache::Cache::at(&root.join("cache"));
+        let (work, bin) = (root.join("work"), root.join("bin"));
+        let build = |ret: u32| {
+            let units = vec![("u0".to_string(), format!("int main(void) {{\n  return {ret};\n}}\n"))];
+            super::build(&units, &spec, &bin, false, Some(&cache), &work).unwrap()
+        };
+        build(1);
+        let entry = std::fs::read_dir(root.join("cache")).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "o")).unwrap();
+        let bytes = std::fs::read(&entry).unwrap();
+        assert!(build(1).contains("(1 from cache"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+            assert_eq!(ino(&entry), ino(&work.join("u0.o")), "a hit links the entry");
+        }
+        build(2);
+        assert_eq!(std::fs::read(&entry).unwrap(), bytes, "the compile of other C left the entry alone");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

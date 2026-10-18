@@ -233,6 +233,13 @@ impl Cache {
         self.dir.join(format!("req-{key}{ext}"))
     }
 
+    /// A cache in `dir` (tests).
+    #[cfg(test)]
+    pub(crate) fn at(dir: &Path) -> Cache {
+        std::fs::create_dir_all(dir).unwrap();
+        Cache { dir: dir.to_path_buf(), id: (1, 2) }
+    }
+
     /// The disk key of one C unit's object: compiler id, debug flag, and
     /// the unit's C text. See the module docs.
     pub fn unit_key(&self, c_text: &str, debug: bool) -> String {
@@ -240,13 +247,18 @@ impl Cache {
         format!("{a:016x}{b:016x}")
     }
 
-    /// Copies the cached unit object under `key` (see `unit_key`) to `dest`.
-    /// False on a miss (no entry, or the copy failed): the caller compiles
-    /// the unit with tcc. A hit makes the entry the most recently used.
+    /// Puts the cached unit object under `key` (see `unit_key`) at `dest`: a hard link
+    /// (a warm tsgo release takes ~500 MB of hits; a link moves no bytes), or a copy
+    /// across file systems. Whoever writes `dest` later removes it first: a compiler
+    /// that wrote its output in place would change the entry (gcc's as, tcc and clang
+    /// replace the file; the removal covers any other `LUST_CC`).
+    /// False on a miss (no entry, or neither worked): the caller compiles the unit. A
+    /// hit makes the entry the most recently used.
     pub fn unit_object(&self, key: &str, dest: &Path) -> bool {
         let name = format!("unit-{key}.o");
         let path = self.dir.join(&name);
-        if std::fs::copy(&path, dest).is_err() {
+        let _ = std::fs::remove_file(dest);
+        if std::fs::hard_link(&path, dest).is_err() && std::fs::copy(&path, dest).is_err() {
             return false;
         }
         let _ = std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
