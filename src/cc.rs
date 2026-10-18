@@ -173,6 +173,13 @@ pub fn mimalloc_unit() -> Option<String> {
     (!src.is_empty()).then(|| format!("#define MI_MALLOC_OVERRIDE 1\n{src}"))
 }
 
+/// Vector memcpy, memmove, memcmp, bcmp and memchr as one C unit for musl targets
+/// (src/runtime/memfast.c): musl's and zig's forms are byte or word loops, which a release
+/// tsgo spent 2.3 G instructions in on the TypeORM check. The results are libc's.
+pub fn memfast_unit() -> String {
+    include_str!("runtime/memfast.c").to_string()
+}
+
 /// The flags of a `.cc` unit (the runtime's throw and catch).
 pub fn cxxflags(debug: bool) -> String {
     let base = "-O2 -w -fexceptions -fomit-frame-pointer";

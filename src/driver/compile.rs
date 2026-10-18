@@ -4732,6 +4732,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             {
                 all.push(("mimalloc".to_string(), mi));
             }
+            // musl: vector mem* replace musl's and zig's loops (LUST_RELEASE_MEM=libc keeps them).
+            if triple.ends_with("-musl") && std::env::var("LUST_RELEASE_MEM").as_deref() != Ok("libc") {
+                all.push(("memfast".to_string(), crate::cc::memfast_unit()));
+            }
             if let Some(parent) = req.out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }

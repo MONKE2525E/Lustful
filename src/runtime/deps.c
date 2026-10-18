@@ -18,12 +18,70 @@ uint64_t lust_memrchr(uint32_t needle, const uint8_t *p, uint64_t len) {
     return UINT64_MAX;
 }
 
-/* memmem is a GNU extension too: libc memchr finds each candidate first
-   byte, memcmp confirms it. */
+#if !defined(__TINYC__) && defined(__x86_64__) && defined(__SSE2__)
+/* Byte ranks for memmem's prefilter, 0 the rarest: the byte frequencies of TypeScript
+   declarations (tsgo's bundled lib files) and Rust source, the text tsgo searches. */
+static const uint8_t lust_mm_rank[256] = {
+      0,   1,   2,   3,   4,   5,   6,   7,   8, 158, 245,   9,  10,  11,  12,  13,
+     14,  15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,  28,  29,
+    255, 185, 208, 174, 161, 159, 204, 182, 232, 233, 226, 164, 230, 202, 234, 236,
+    215, 197, 192, 183, 181, 176, 180, 172, 177, 173, 237, 225, 193, 219, 203, 175,
+    163, 212, 187, 209, 206, 220, 198, 199, 179, 210, 171, 190, 201, 200, 217, 207,
+    205, 162, 211, 223, 222, 184, 188, 189, 167, 165, 160, 195, 166, 194, 156, 242,
+    216, 248, 228, 243, 244, 254, 240, 231, 235, 247, 186, 218, 246, 238, 251, 252,
+    241, 178, 250, 249, 253, 239, 224, 221, 227, 229, 191, 214, 196, 213, 155,  30,
+    168,  31, 157,  97, 112, 135, 153, 113, 144, 114,  32, 136, 146, 125,  33,  34,
+    145,  35, 154, 138, 169,  98, 142, 134, 152, 115,  36,  37, 143, 116, 117, 139,
+     38,  99,  39, 118,  40, 126, 147,  41, 100, 149,  42, 101, 127,  43,  44,  45,
+    150, 120, 121, 102,  46,  47,  48,  49, 103, 104, 137, 128, 122, 129,  50, 130,
+     51,  52, 141, 151, 148, 105,  53,  54,  55,  56,  57,  58, 131,  59,  60, 119,
+     61,  62,  63,  64,  65,  66,  67,  68,  69,  70,  71,  72,  73,  74,  75,  76,
+     77, 132, 170, 106, 107, 133, 108, 123, 109, 110,  78,  79,  80, 111,  81, 124,
+    140,  82,  83,  84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,
+};
+typedef char lust_mm_v16 __attribute__((vector_size(16)));
+typedef char lust_mm_v16u __attribute__((vector_size(16), aligned(1)));
+#endif
+
+/* memmem is a GNU extension too. The first match is the answer: candidates are tried in
+   order. A clang or gcc build for x86_64 prefilters 16 candidate starts at a time on two
+   rare bytes of the needle (the memchr crate's packed-pair idea: the bytes of the needle
+   with the lowest `lust_mm_rank`, at their offsets), so the compare runs only where both
+   match; it never reads past the haystack. Other builds take libc memchr for the first
+   byte and memcmp to confirm. */
 uint64_t lust_memmem(const uint8_t *h, uint64_t hlen, const uint8_t *n, uint64_t nlen) {
     if (nlen == 0) return 0;
     if (nlen > hlen) return UINT64_MAX;
     uint64_t last = hlen - nlen, i = 0;
+#if !defined(__TINYC__) && defined(__x86_64__) && defined(__SSE2__)
+    if (nlen >= 2 && last >= 16) {
+        /* i1: the rarest byte; i2: the rarest other byte value (any other offset when
+           the needle repeats one byte). */
+        uint64_t i1 = 0;
+        for (uint64_t k = 1; k < nlen; k++)
+            if (lust_mm_rank[n[k]] < lust_mm_rank[n[i1]]) i1 = k;
+        uint64_t i2 = i1 == 0 ? 1 : 0;
+        int other = 0;
+        for (uint64_t k = 0; k < nlen; k++)
+            if (n[k] != n[i1] && (!other || lust_mm_rank[n[k]] < lust_mm_rank[n[i2]])) i2 = k, other = 1;
+        lust_mm_v16 b1 = (lust_mm_v16){0} + (char)n[i1], b2 = (lust_mm_v16){0} + (char)n[i2];
+        /* Starts i..i+15 are all candidates while i + 15 <= last; the loads end at
+           h + i + 15 + max(i1, i2) <= h + last + nlen - 1 = h + hlen - 1. */
+        for (; i + 15 <= last; i += 16) {
+            lust_mm_v16 e1 = *(const lust_mm_v16u *)(const void *)(h + i + i1) == b1;
+            lust_mm_v16 e2 = *(const lust_mm_v16u *)(const void *)(h + i + i2) == b2;
+            unsigned m = (unsigned)__builtin_ia32_pmovmskb128(e1 & e2);
+            while (m) {
+                uint64_t j = i + (uint64_t)__builtin_ctz(m);
+                if (memcmp(h + j, n, (size_t)nlen) == 0) return j;
+                m &= m - 1;
+            }
+        }
+        for (; i <= last; i++)
+            if (h[i + i1] == n[i1] && h[i + i2] == n[i2] && memcmp(h + i, n, (size_t)nlen) == 0) return i;
+        return UINT64_MAX;
+    }
+#endif
     while (i <= last) {
         const uint8_t *f = (const uint8_t *)memchr(h + i, n[0], (size_t)(last - i + 1));
         if (!f) return UINT64_MAX;
