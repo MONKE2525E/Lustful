@@ -1948,9 +1948,11 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     let release = names::release();
     for t in &g.local_cty {
         match t {
-            // Release C: a plain pointer local names its pointee; a deref of it records
-            // the pointee as used (`place`), and so does any emitter that sizes it.
+            // Release C: a plain pointer local names its pointee, and an `Rc` or `Arc`
+            // local its count block; a deref records what it opens (`place`), and so
+            // does a builtin (`call_value`).
             CTy::Ref(e) | CTy::Ptr(e) if release && pointee_is_struct(e) => collect_types(e, &mut named),
+            CTy::Rc(_) | CTy::Weak(_) | CTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak, _) if release => collect_types(t, &mut named),
             _ => collect_types(t, &mut types),
         }
     }
@@ -3091,6 +3093,16 @@ impl FnGen<'_, '_> {
     /// `lust_fns`, so a changed function can be swapped in without relinking
     /// its callers.
     fn call_value(&mut self, target: CallTarget, args: &[Operand], dest_cty: &CTy, loc: &str, post: &mut Vec<String>) -> String {
+        // Release C defines only what a unit holds by value or projects from
+        // (`type_decls_with`): a builtin may size or open what its operands and result
+        // point at (an `Rc`'s count block, a `Vec`'s elements), so it records them all.
+        if names::release() && matches!(target, CallTarget::Builtin(_) | CallTarget::Intrinsic(_)) {
+            collect_types(dest_cty, &mut self.sig_types);
+            for o in args.iter().filter(|o| matches!(o, Operand::Move(_) | Operand::Copy(_))) {
+                let t = cty(&self.body.tys, self.callable_place_ty(o));
+                collect_types(&t, &mut self.sig_types);
+            }
+        }
         match target {
             CallTarget::Fn(f) => {
                 self.note_callee(f);
