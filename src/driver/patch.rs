@@ -2886,14 +2886,32 @@ fn calls_cow_fn(p: &crate::check::collect::Program, fn_index: Option<usize>) -> 
     })
 }
 
-/// Moves the span keys and module spans of the resolver tables for one
-/// edit (`const_init_module` keys are item spans collect looks up).
+/// Moves the span keys, module spans and import record spans of the
+/// resolver tables for one edit (`const_init_module` keys are item spans
+/// collect looks up).
 fn shift_table_spans(tables: &mut ResolvedTables, edit: Edit) {
     if tables.const_init_module.keys().any(|s| edit.plain(*s) != *s) {
         tables.const_init_module = std::mem::take(&mut tables.const_init_module).into_iter().map(|(s, m)| (edit.plain(s), m)).collect();
     }
     for m in &mut tables.modules {
         m.span = edit.plain(m.span);
+    }
+    // The import records too: no later request reads them before a full
+    // resolve rebuilds them, but they stay what a cold resolve of the edited
+    // text holds (`LUST_CHECK_RESOLVE=1`, driver/resolve_oracle.rs).
+    if let Some((_, scope)) = tables.macro_scopes.get_mut(&edit.file) {
+        for e in &mut scope.events {
+            e.lo = edit.plain(crate::diag::Span { file: edit.file, lo: e.lo, hi: e.lo, ctxt: crate::diag::CtxtId::ROOT }).lo;
+        }
+    }
+    for b in &mut tables.single_binds {
+        b.0 = edit.plain(b.0);
+    }
+    for p in tables.pending_single.values_mut().flatten() {
+        p.span = edit.plain(p.span);
+    }
+    for a in &mut tables.ambig_single {
+        a.0.span = edit.plain(a.0.span);
     }
 }
 
