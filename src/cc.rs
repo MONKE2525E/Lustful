@@ -16,10 +16,13 @@
 //
 // Objects go through the disk cache: `unit_key` below is the one seam a
 // smarter object cache (rel-cache) takes over. Its inputs are the C text,
-// the compiler identity, the flag string, and the Rust target triple; an
-// object is a function of those alone.
+// the compiler identity, the flag string, the Rust target triple, and with
+// PGO (`cc/pgo.rs`) the unit's own part of the profile; an object is a
+// function of those alone.
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod pgo;
 
 /// One target's compiler setup: the command words, the flags every unit
 /// gets, and how the link differs from a host link.
@@ -220,7 +223,7 @@ fn compiler_id(cmd: &[String]) -> String {
 /// The disk cache key of one unit's object under this backend: the C (or,
 /// `cxx`, C++) text, the compiler, the flags, the target, and `profile`, the
 /// digest of the PGO data this unit's object depends on (see
-/// `Pgo::unit_digest`). A unit that includes system headers (the runtime
+/// `pgo::Mode::key_part`). A unit that includes system headers (the runtime
 /// unit, the C++ unit) keys on its preprocessed text instead, so a header or
 /// sysroot change moves its key; the other units include nothing.
 pub fn unit_key(c_text: &str, spec: &CcSpec, debug: bool, profile: Option<&str>, cxx: bool) -> String {
@@ -267,12 +270,31 @@ pub fn build(
     let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
     let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
     let is_cxx = |name: &str| name.ends_with(".cc");
+    // PGO (`pgo.rs`): the C units compile from inside `work` under content-derived
+    // names, as the profile names their static functions by file, and each key holds
+    // that unit's own part of the profile. The C++ unit is not profiled.
+    let pgo_on = std::env::var_os("LUST_PGO_GEN").is_some() || std::env::var_os("LUST_PGO_USE").is_some();
+    let work = &if pgo_on { std::fs::canonicalize(work).map_err(|e| format!("cannot resolve {}: {e}", work.display()))? } else { work.to_path_buf() };
+    let names: Vec<String> = units
+        .iter()
+        .map(|(name, c)| if pgo_on && !is_cxx(name) { pgo::stable_name(c).unwrap_or_else(|| name.clone()) } else { name.clone() })
+        .collect();
+    let files: Vec<(String, &str)> = names.iter().zip(units).filter(|(n, _)| !is_cxx(n)).map(|(n, (_, c))| (format!("{n}.c"), c.as_str())).collect();
+    let pgo = pgo::Mode::from_env(work, &files)?;
+    let pgo_of = |name: &str| pgo.as_ref().filter(|_| !is_cxx(name));
     // Largest units first, bounded workers: the tcc driver's shape
     // (src/tcc.rs), for the same reason (the tail is short units).
     let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len()));
-    let objs: Vec<PathBuf> = units.iter().map(|(name, _)| work.join(format!("{name}.o"))).collect();
-    let keys: Vec<Option<String>> = units.iter().map(|(name, c)| cache.map(|_| unit_key(c, spec, debug, None, is_cxx(name)))).collect();
+    let objs: Vec<PathBuf> = names.iter().map(|name| work.join(format!("{name}.o"))).collect();
+    let keys: Vec<Option<String>> = units
+        .iter()
+        .zip(&names)
+        .map(|((_, c), name)| {
+            let part = pgo_of(name).map(|m| m.key_part(&format!("{name}.c")));
+            cache.map(|_| unit_key(c, spec, debug, part.as_deref(), is_cxx(name)))
+        })
+        .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(String::new());
     let hits = std::sync::atomic::AtomicUsize::new(0);
@@ -283,7 +305,7 @@ pub fn build(
             scope.spawn(|| loop {
                 let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(&i) = order.get(k) else { return };
-                let (name, c) = &units[i];
+                let (name, c) = (&names[i], &units[i].1);
                 let obj = &objs[i];
                 if let (Some(cache), Some(key)) = (cache, &keys[i])
                     && cache.unit_object(key, obj)
@@ -299,8 +321,22 @@ pub fn build(
                     continue;
                 }
                 let (words, unit_flags) = if cxx { (&spec.cxx, &cxx_flags) } else { (&spec.cmd, &flags) };
-                let mut cmd = Command::new(&words[0]);
-                cmd.args(&words[1..]).args(unit_flags).arg("-c").arg(&src).arg("-o").arg(obj);
+                // A relative compiler path must not resolve against `work` (PGO compiles there).
+                let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
+                let mut cmd = Command::new(prog);
+                cmd.args(&words[1..]).args(unit_flags).arg("-o").arg(obj);
+                match pgo_of(name).map(|m| m.unit_flags(&format!("{name}.c"))) {
+                    Some(Ok(pf)) => {
+                        cmd.args(pf).current_dir(work).arg("-c").arg(format!("{name}.c"));
+                    }
+                    Some(Err(e)) => {
+                        fail(format!("--- unit {name}: {e}\n"));
+                        continue;
+                    }
+                    None => {
+                        cmd.arg("-c").arg(&src);
+                    }
+                }
                 match cmd.output() {
                     Ok(o) if o.status.success() => {
                         if let (Some(cache), Some(key)) = (cache, &keys[i]) {
@@ -326,14 +362,15 @@ pub fn build(
     // A build with a C++ unit links with the C++ driver (its runtime and personality).
     let link = if units.iter().any(|(name, _)| is_cxx(name)) { &spec.cxx } else { &spec.cmd };
     let mut cmd = Command::new(&link[0]);
-    cmd.args(&link[1..]).args(ldflags(spec, debug)).args(&objs).arg("-o").arg(out);
+    cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(format!(
-            "{} units ({} from cache, clang {:.2}s, link {:.2}s), linked {}",
+            "{} units ({} from cache, clang {:.2}s, link {:.2}s{}), linked {}",
             units.len(),
             hits.load(std::sync::atomic::Ordering::Relaxed),
             compile_s,
             t_link.elapsed().as_secs_f64(),
+            pgo.as_ref().map(|m| format!(", {}", m.describe())).unwrap_or_default(),
             out.display()
         )),
         Ok(o) => Err(format!("link failed for target {} ({})\n{}", spec.triple, o.status, String::from_utf8_lossy(&o.stderr))),
