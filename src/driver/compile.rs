@@ -1146,6 +1146,12 @@ pub(super) fn common_ends(a: &[u8], b: &[u8]) -> (usize, usize) {
 }
 
 fn errors(diags: &mut [Diag], map: &SourceMap, src: &str, req: &Request) -> Response {
+    // Exact duplicates first: a delta path and a full collect can
+    // push the same diagnostic a different number of times, and
+    // the daemon guard compares this answer byte for byte with a
+    // fresh session's (render order itself is `diag::diag_order`).
+    let n = diag::dedup_exact(diags);
+    let diags = &mut diags[..n];
     let json = req.json;
     let text = diag::render(diags, map, src, json, req.max_errors);
     let mut r = Response { code: 1, ..Default::default() };

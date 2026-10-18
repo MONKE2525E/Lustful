@@ -643,6 +643,68 @@ fn push_snippet(out: &mut String, src: &str, map: &SourceMap, span: Span, note: 
     }
 }
 
+/// The total order diagnostics render in: by position, then by
+/// code, message, fix, labels, and edits, so the rendered text is
+/// the same whatever order the checks pushed them in. A warm
+/// delta path and a fresh full collect can push same-span
+/// diagnostics in either order; the daemon guard compares the
+/// rendered answers byte for byte, so the survivor of the
+/// same-span suppression in `render` must not depend on it.
+fn diag_order(a: &Diag, b: &Diag) -> std::cmp::Ordering {
+    fn key<'a>(d: &'a Diag) -> (FileId, u32, u32, &'static str, &'a str, &'a str) {
+        (d.span.file, d.span.lo, d.span.hi, d.code, d.message.as_str(), d.fix.as_str())
+    }
+    key(a)
+        .cmp(&key(b))
+        .then_with(|| {
+            a.labels
+                .iter()
+                .map(|l| (l.span.file, l.span.lo, l.span.hi, l.text.as_str()))
+                .cmp(b.labels.iter().map(|l| (l.span.file, l.span.lo, l.span.hi, l.text.as_str())))
+        })
+        .then_with(|| {
+            a.edits
+                .iter()
+                .map(|e| (e.start, e.end, e.replacement.as_str(), e.auto))
+                .cmp(b.edits.iter().map(|e| (e.start, e.end, e.replacement.as_str(), e.auto)))
+        })
+        .then_with(|| a.severity.cmp(b.severity))
+}
+
+/// True when two diagnostics are the same in every field the
+/// renderer shows (a span's expansion context does not count:
+/// render maps it to the call site either way).
+fn same_diag(a: &Diag, b: &Diag) -> bool {
+    a.code == b.code
+        && a.severity == b.severity
+        && a.message == b.message
+        && a.fix == b.fix
+        && a.span.file == b.span.file
+        && a.span.lo == b.span.lo
+        && a.span.hi == b.span.hi
+        && a.labels.len() == b.labels.len()
+        && a.labels.iter().zip(&b.labels).all(|(x, y)| x.span.file == y.span.file && x.span.lo == y.span.lo && x.span.hi == y.span.hi && x.text == y.text)
+        && a.edits.len() == b.edits.len()
+        && a.edits.iter().zip(&b.edits).all(|(x, y)| x.start == y.start && x.end == y.end && x.replacement == y.replacement && x.auto == y.auto)
+}
+
+/// Moves the exact duplicates (same in every shown field) past
+/// the returned count, in render order. One compile path can
+/// push a diagnostic twice where another pushes it once; the
+/// rendered text and the caller's error count must agree either
+/// way, so the caller renders and counts only the front part.
+pub fn dedup_exact(diags: &mut [Diag]) -> usize {
+    diags.sort_by(diag_order);
+    let mut n = 0;
+    for i in 0..diags.len() {
+        if n == 0 || !same_diag(&diags[n - 1], &diags[i]) {
+            diags.swap(n, i);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Renders diagnostics, sorted by position, as human text or JSON lines.
 ///
 /// Paths and line numbers come from `map`; an expanded span reports at its call site.
@@ -653,7 +715,7 @@ fn push_snippet(out: &mut String, src: &str, map: &SourceMap, span: Span, note: 
 /// with the same code and span (cascade duplicates of one root error) are suppressed. When
 /// anything is suppressed or omitted, an explicit truncation record is emitted last.
 pub fn render(diags: &mut [Diag], map: &SourceMap, src: &str, json: bool, max_errors: usize) -> String {
-    diags.sort_by(|a, b| (a.span.file, a.span.lo, a.span.hi, a.code).cmp(&(b.span.file, b.span.lo, b.span.hi, b.code)));
+    diags.sort_by(diag_order);
     let mut uniq: Vec<&Diag> = Vec::with_capacity(diags.len());
     for d in diags.iter() {
         match uniq.last() {
@@ -836,6 +898,28 @@ mod tests {
         assert_eq!(clone.line_col(Span::new(a, 6, 7)), (3, 1));
         assert_eq!(clone.text(b), Some("x\n"));
         assert!(std::sync::Arc::ptr_eq(&map.files[b.0 as usize], &clone.files[b.0 as usize]));
+    }
+
+    /// Two diagnostics at one span with one code but different
+    /// messages render the same in any push order: a warm delta
+    /// path and a fresh full collect can push them in either
+    /// order, and the rendered text (the daemon guard compares it
+    /// byte for byte) must not care. Exact duplicates also come
+    /// out once.
+    #[test]
+    fn render_same_span_is_push_order_independent() {
+        let mut map = SourceMap::default();
+        let a = map.add_file_with_text("a.rs", "fn bad() {}\n");
+        let span = Span::new(a, 3, 6);
+        let mk = |msg: &str| Diag::new("L0612", span, msg, "Fix it.");
+        let one = render(&mut [mk("bound B"), mk("bound A"), mk("bound A")], &map, "fn bad() {}\n", false, 20);
+        let two = render(&mut [mk("bound A"), mk("bound A"), mk("bound B")], &map, "fn bad() {}\n", false, 20);
+        assert_eq!(one, two, "same-span diagnostics render in push order:\n{one}\n---\n{two}");
+        let dup = render(&mut [mk("bound A"), mk("bound A")], &map, "fn bad() {}\n", false, 20);
+        assert_eq!(dup.matches("bound A").count(), 1, "an exact duplicate renders once: {dup}");
+        let mut ds = [mk("bound B"), mk("bound A"), mk("bound A")];
+        assert_eq!(dedup_exact(&mut ds), 2, "exact duplicates move past the count");
+        assert_eq!(ds[0].message, "bound A");
     }
 
     /// JSON diagnostics take `file` and line numbers from the span's file in the map.
