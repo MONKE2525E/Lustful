@@ -5,22 +5,22 @@
 // zig compiler that build uses `LUST_PGO_CC`, a clang of zig's LLVM major version, for
 // the host (`gen_spec`; scripts/pgo-llvm.sh installs one). `LUST_PGO_USE=<file.profdata>`
 // builds with a merged profile, which must come from the compiler's LLVM major. A profile must not change every object's cache key, so each
-// unit compiles with a profile of only its own functions' records, and its key holds
-// exactly that (`Mode::key_part`): a refreshed or pinned profile recompiles only the
-// units whose own counts moved. The thresholds LLVM derives from a profile's summary
-// (hot, cold, the working-set size) would then be per unit; flags pin them to the
-// whole profile's instead (`pins`, in every key), rounded to a power of 2 so a retrain
-// keeps them, and size optimization keys on the pinned cold count only
-// (`-pgso-cold-code-only`). `LUST_PGO_BITS=<n>` keeps n significant bits of every
-// count (0 = exact), so a retrain on the same inputs moves fewer records (2 bits: 89%
-// of tsgo's units keep their records). `LUST_PROFDATA` names the llvm-profdata of the
-// compiler's LLVM.
+// unit's key holds only its own functions' records (`Mode::key_part`): a refreshed or
+// pinned profile recompiles only the units whose own counts moved. Every unit with
+// records compiles against the whole quantized profile (clang reads only the records of
+// its module's fns). The thresholds LLVM derives from a profile's summary (hot, cold,
+// the working-set size) are pinned to the whole profile's (`pins`, in every key),
+// rounded to a power of 2 so a retrain keeps them, and size optimization keys on the
+// pinned cold count only (`-pgso-cold-code-only`). `LUST_PGO_BITS=<n>` keeps n
+// significant bits of every count (0 = exact), so a retrain on the same inputs moves
+// fewer records (2 bits: 89% of tsgo's units keep their records). `LUST_PROFDATA` names
+// the llvm-profdata of the compiler's LLVM.
 //
 // Record names: an external function is its own name; a static one is
-// `<file>;<name>` with the file as given to the compiler, so units compile from inside
-// the work dir under content-derived names (`stable_name`). A unit owns the records of
-// the definitions it prints (`defined_externs`), and only those, so its key moves only
-// with its own fns' records. A unit with `#include`s (the runtime, mimalloc) makes some
+// `<file>;<name>`, and every unit compiles under one file name (`STATIC_FILE`), so a
+// static fn's record does not move when its unit's members do. A unit owns the records
+// of the definitions it prints (`defined_externs`, `defined_statics`), and only those, so
+// its key moves only with its own fns' records. A unit with `#include`s (the runtime, mimalloc) makes some
 // fns with macros (`LUST_ABS(int8_t, i8)`), so its definitions come from its
 // preprocessed text. A record no unit defines is of a fn this build does not have (a
 // profile from an older state, or a `lust_*` fn only inline copies held) and goes to no
@@ -29,6 +29,7 @@ use super::CcSpec;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 /// The PGO mode of one release build.
 pub enum Mode {
@@ -38,8 +39,9 @@ pub enum Mode {
 
 /// A loaded profile, split by unit.
 pub struct Pgo {
-    /// Each unit's own records, sorted, by the file name the unit compiles as.
-    own: HashMap<String, Vec<String>>,
+    /// Each unit's own records, sorted, by the file name the unit compiles as (shared, not
+    /// copied: a static fn of the unit header has a record in every unit).
+    own: HashMap<String, Vec<Arc<str>>>,
     /// The flags that pin the summary thresholds to the whole profile's.
     pins: Vec<String>,
     records: usize,
@@ -115,8 +117,10 @@ impl Mode {
         match self {
             Mode::Gen => format!("gen{nopre} {STATIC_FILE}"),
             Mode::Use(p) => {
-                let own = p.own.get(file).map(|r| r.join("\n\n")).unwrap_or_default();
-                digest(&[p.pins.join(" ").as_bytes(), nopre.as_bytes(), STATIC_FILE.as_bytes(), own.as_bytes()])
+                let pins = p.pins.join(" ");
+                let mut parts: Vec<&[u8]> = vec![pins.as_bytes(), nopre.as_bytes(), STATIC_FILE.as_bytes()];
+                parts.extend(p.own.get(file).into_iter().flatten().map(|r| r.as_bytes()));
+                digest(&parts)
             }
         }
     }
@@ -228,13 +232,13 @@ impl Pgo {
                 let text = run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(path))?;
                 let (head, mut records) = parse(&text);
                 if bits > 0 {
-                    for r in records.values_mut() {
-                        *r = quantize(r, bits);
+                    for r in records.values_mut().flatten() {
+                        *r = Arc::from(quantize(r, bits));
                     }
                 }
                 let mut names: Vec<&String> = records.keys().collect();
                 names.sort();
-                let body: Vec<&str> = names.iter().map(|n| records[*n].as_str()).collect();
+                let body: Vec<&str> = names.iter().flat_map(|n| records[*n].iter().map(|r| &**r)).collect();
                 std::fs::write(&txt, format!("{head}{}\n\n", body.join("\n\n"))).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
                 run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
                 let pins = pins(&run(Command::new(profdata()).args(["show", "--detailed-summary"]).arg(&all))?)?;
@@ -246,7 +250,7 @@ impl Pgo {
             run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
         }
         let (own, helpers, absent) = split(&records, defs);
-        Ok(Pgo { own, pins, records: records.len(), helpers, absent, kept: hit, all, key })
+        Ok(Pgo { own, pins, records: records.values().map(Vec::len).sum(), helpers, absent, kept: hit, all, key })
     }
 }
 
@@ -288,7 +292,7 @@ pub(super) fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
 /// macro-made fns, and how many external ones went to no unit. An external fn's record goes
 /// to every unit that defines it, a static fn's (`STATIC_FILE;<fn>`) to every unit that
 /// defines a static fn of that name; a static record of another file goes to that file.
-fn split(records: &HashMap<String, String>, defs: &UnitDefs) -> (HashMap<String, Vec<String>>, usize, usize) {
+fn split(records: &Records, defs: &UnitDefs) -> (HashMap<String, Vec<Arc<str>>>, usize, usize) {
     let mut owner: HashMap<&str, Vec<&str>> = HashMap::new();
     for (file, names) in &defs.units {
         for n in names {
@@ -301,9 +305,9 @@ fn split(records: &HashMap<String, String>, defs: &UnitDefs) -> (HashMap<String,
             static_owner.entry(n).or_default().push(file);
         }
     }
-    let mut own: HashMap<String, Vec<String>> = HashMap::new();
+    let mut own: HashMap<String, Vec<Arc<str>>> = HashMap::new();
     let (mut helpers, mut absent) = (0, 0);
-    for (name, r) in records {
+    for (name, rs) in records {
         let files: Vec<&str> = match name.split_once(';') {
             Some((STATIC_FILE, f)) => static_owner.get(f).cloned().unwrap_or_default(),
             Some((file, _)) => vec![file],
@@ -319,7 +323,7 @@ fn split(records: &HashMap<String, String>, defs: &UnitDefs) -> (HashMap<String,
             },
         };
         for f in files {
-            own.entry(f.to_string()).or_default().push(r.clone());
+            own.entry(f.to_string()).or_default().extend(rs.iter().cloned());
         }
     }
     for r in own.values_mut() {
@@ -328,8 +332,12 @@ fn split(records: &HashMap<String, String>, defs: &UnitDefs) -> (HashMap<String,
     (own, helpers, absent)
 }
 
-/// An IR PGO text profile: the header (flag lines) and each record by name.
-fn parse(text: &str) -> (String, HashMap<String, String>) {
+/// A text profile's records by fn name: every record of the name (static fns of one source
+/// name can differ in body, so in hash, across units).
+type Records = HashMap<String, Vec<Arc<str>>>;
+
+/// An IR PGO text profile: the header (flag lines) and the records by name.
+fn parse(text: &str) -> (String, Records) {
     let mut head = String::new();
     let mut lines = text.lines().peekable();
     while let Some(l) = lines.peek() {
@@ -342,12 +350,12 @@ fn parse(text: &str) -> (String, HashMap<String, String>) {
         }
     }
     // A record starts with its name, which never begins with `#` or `:`.
-    let mut records = HashMap::new();
+    let mut records: Records = HashMap::new();
     let mut cur: Vec<&str> = Vec::new();
     for l in lines.chain(std::iter::once("")) {
         if l.is_empty() {
             if let Some(name) = cur.first() {
-                records.insert(name.to_string(), cur.join("\n"));
+                records.entry(name.to_string()).or_default().push(Arc::from(cur.join("\n")));
             }
             cur.clear();
         } else {
@@ -541,7 +549,7 @@ mod tests {
     /// A loaded profile of `records` (name, count) over units that define `defs` (file,
     /// fn names; `macro_made` of them only a preprocessed text shows).
     fn split_mode(records: &[(&str, u64)], defs: &[(&str, &[&str])], macro_made: &[&str]) -> Mode {
-        let recs: HashMap<String, String> = records.iter().map(|(n, c)| (n.to_string(), rec(n, *c))).collect();
+        let recs: Records = records.iter().map(|(n, c)| (n.to_string(), vec![Arc::from(rec(n, *c))])).collect();
         let defs = UnitDefs {
             units: defs.iter().map(|(f, ns)| (f.to_string(), ns.iter().map(|n| n.to_string()).collect())).collect(),
             macro_made: macro_made.iter().map(|n| n.to_string()).collect(),
@@ -551,12 +559,21 @@ mod tests {
         Mode::Use(Pgo { own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, kept: false, all: PathBuf::new(), key: String::new() })
     }
 
+    /// Two static fns of one source name with different bodies are two records of one name:
+    /// the profile keeps both (clang picks the one whose CFG hash matches).
+    #[test]
+    fn a_name_keeps_every_record_it_has() {
+        let text = format!(":ir\n{}\n\n{}\n", rec("lust.c;h", 3), rec("lust.c;h", 4).replace("\n7\n", "\n8\n"));
+        let (_, recs) = parse(&text);
+        assert_eq!(recs["lust.c;h"].len(), 2);
+    }
+
     /// A static fn's record (`STATIC_FILE;<fn>`) goes to every unit that defines a static fn
     /// of that name, whatever the unit is called: a merge that renames a unit keeps it.
     #[test]
     fn a_static_record_follows_its_fn_not_its_unit() {
-        let recs: HashMap<String, String> =
-            [("lust.c;lh_aa_0", 5), ("lust.c;lust_mix", 2), ("x1.c;old", 3)].iter().map(|(n, c)| (n.to_string(), rec(n, *c))).collect();
+        let recs: Records =
+            [("lust.c;lh_aa_0", 5), ("lust.c;lust_mix", 2), ("x1.c;old", 3)].iter().map(|(n, c)| (n.to_string(), vec![Arc::from(rec(n, *c))])).collect();
         let st = |f: &str, ns: &[&str]| (f.to_string(), ns.iter().map(|n| n.to_string()).collect::<Vec<_>>());
         let defs = UnitDefs { units: Vec::new(), macro_made: Default::default(), statics: vec![st("x9.ll", &["lh_aa_0", "lust_mix"]), st("x7.c", &["lust_mix"])] };
         let (own, _, absent) = split(&recs, &defs);
