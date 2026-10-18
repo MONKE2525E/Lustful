@@ -259,12 +259,24 @@ pub fn unit_key(c_text: &str, spec: &CcSpec, debug: bool, profile: Option<&str>,
     format!("{a:016x}{b:016x}")
 }
 
+/// A command that runs the C compiler (or links through it). gcc 7+, clang 16+ and zig cc
+/// take `__DATE__` and `__TIME__` from `SOURCE_DATE_EPOCH`, fixed here unless the caller
+/// set it: mimalloc's unit prints them, so its object, and its key (the preprocessed text,
+/// `unit_key`), changed every second and a release binary with the build time.
+fn cc_command(prog: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(prog);
+    if std::env::var_os("SOURCE_DATE_EPOCH").is_none() {
+        cmd.env("SOURCE_DATE_EPOCH", "0");
+    }
+    cmd
+}
+
 /// `c_text` (C++ text with `cxx`) after the preprocessor of the compiler
 /// `words` with `flags`, or None when it cannot run (the key then holds the
 /// raw text, and a failed compile reports the real error).
 fn preprocessed(c_text: &str, words: &[String], flags: &str, cxx: bool) -> Option<Vec<u8>> {
     use std::io::Write as _;
-    let mut cmd = Command::new(&words[0]);
+    let mut cmd = cc_command(&words[0]);
     cmd.args(&words[1..]).args(flags.split_whitespace()).args(["-E", "-P", "-x", if cxx { "c++" } else { "c" }, "-", "-o", "-"]);
     let mut child = cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
     let mut stdin = child.stdin.take()?;
@@ -306,7 +318,7 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
     // No `noundef` on C values: the C halves pass aggregates' bits as integers
     // (cgen/ll.rs `Pass::Bits`, `Pass::Pair`), which may hold uninitialized bytes.
     let to_bc = |from: &Path, to: &Path| {
-        run(Command::new(&words[0])
+        run(cc_command(&words[0])
             .args(&words[1..])
             .args(cflags)
             .args(["-emit-llvm", "-Xclang", "-disable-llvm-passes", "-Xclang", "-no-enable-noundef-analysis", "-c"])
@@ -318,7 +330,7 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
     to_bc(&hc_path, &hbc)?;
     // A relative compiler path must not resolve against the work dir (PGO compiles there).
     let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
-    let mut cmd = Command::new(prog);
+    let mut cmd = cc_command(prog);
     cmd.args(&words[1..]).args(llflags(debug).split_whitespace()).arg("-c");
     match (pgo, ll_path.parent(), ll_path.file_name()) {
         (Some(flags), Some(dir), Some(file)) => cmd.args(flags).current_dir(dir).arg(file),
@@ -458,7 +470,7 @@ pub fn build(
                 let (words, unit_flags) = if cxx { (&spec.cxx, &cxx_flags) } else { (&spec.cmd, &flags) };
                 // A relative compiler path must not resolve against `work` (PGO compiles there).
                 let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
-                let mut cmd = Command::new(prog);
+                let mut cmd = cc_command(prog);
                 cmd.args(&words[1..]).args(unit_flags).arg("-o").arg(obj);
                 match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
                     Some(Ok(pf)) => {
@@ -496,7 +508,7 @@ pub fn build(
     let t_link = std::time::Instant::now();
     // A build with a C++ unit links with the C++ driver (its runtime and personality).
     let link = if units.iter().any(|(name, _)| is_cxx(name)) { &spec.cxx } else { &spec.cmd };
-    let mut cmd = Command::new(&link[0]);
+    let mut cmd = cc_command(&link[0]);
     cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(format!(
@@ -539,6 +551,20 @@ mod tests {
         assert_eq!(super::cxx_for(&words("x86_64-linux-musl-gcc")), words("x86_64-linux-musl-g++"));
         assert_eq!(super::cxx_for(&words("cc")), words("c++"));
         assert_eq!(super::cxx_for(&words("clang++")), words("clang++"));
+    }
+
+    /// The key text of a unit with `#include`s is its preprocessed text: `__DATE__` and
+    /// `__TIME__` in it must not be the clock's, or the unit misses the cache every second.
+    #[test]
+    fn the_preprocessor_sees_a_fixed_build_time() {
+        let Ok(spec) = super::spec_for(crate::protocol::host_triple()) else { return };
+        if std::env::var_os("SOURCE_DATE_EPOCH").is_some() {
+            return;
+        }
+        let text = "#include <stddef.h>\nconst char *built = __DATE__ \" \" __TIME__;\n";
+        let pre = super::preprocessed(text, &spec.cmd, &super::cflags(false), false).expect("the host C compiler preprocesses");
+        let pre = String::from_utf8_lossy(&pre);
+        assert!(pre.contains("\"Jan  1 1970\" \" \" \"00:00:00\""), "{pre}");
     }
 
     #[test]
