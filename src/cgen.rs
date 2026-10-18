@@ -8760,6 +8760,8 @@ pub(crate) fn unit_header() -> String {
     let mut c = String::with_capacity(64 * 1024);
     c.push_str(runtime_decls());
     c.push('\n');
+    // After the declarations: inline fast paths of hot helpers for non-tcc units.
+    c.push_str(include_str!("runtime/inl.h"));
     c
 }
 
