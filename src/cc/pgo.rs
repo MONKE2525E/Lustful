@@ -57,7 +57,7 @@ pub struct Pgo {
 impl Mode {
     /// The mode `LUST_PGO_GEN` / `LUST_PGO_USE` ask for, or None. `units` are (file name
     /// the unit compiles as, C text).
-    pub fn from_env(spec: &CcSpec, work: &Path, units: &[(String, &str)]) -> Result<Option<Mode>, String> {
+    pub fn from_env(spec: &CcSpec, work: &Path, units: &[(String, &str, Option<&[u8]>)]) -> Result<Option<Mode>, String> {
         if std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1") {
             return Ok(Some(Mode::Gen));
         }
@@ -70,7 +70,7 @@ impl Mode {
             return Err(format!("LUST_PROFDATA ({}) is LLVM {pd}, the compiler ({}) LLVM {cc}", profdata(), spec.cmd.join(" ")));
         }
         let bits = std::env::var("LUST_PGO_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
-        Pgo::load(Path::new(&path), bits, work, &tool, &unit_defs(spec, units)).map(|p| Some(Mode::Use(p)))
+        Pgo::load(Path::new(&path), bits, work, &tool, &unit_defs(units)).map(|p| Some(Mode::Use(p)))
     }
 
     /// Extra link flags: the profile runtime of an instrumented build.
@@ -235,23 +235,25 @@ struct UnitDefs {
     macro_made: std::collections::HashSet<String>,
 }
 
-/// The definitions of each unit (`defined_externs`): of its preprocessed text when it has
-/// `#include`s (`cc::preprocessed` with `spec`'s compiler; its text as given when that
-/// fails), so the fns its macros make count as its own.
-fn unit_defs(spec: &CcSpec, units: &[(String, &str)]) -> UnitDefs {
-    let flags = super::cflags(false);
+/// The definitions of each unit (`defined_externs`), on every thread: of its preprocessed
+/// text when the caller has one (a unit with `#include`s; `cc::preprocessed`, else its text
+/// as given), so the fns its macros make count as its own.
+fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
+    let per: Vec<(String, Vec<String>, Vec<String>)> = crate::pool::par_map(units, |(file, c, pre)| {
+        let raw: std::collections::HashSet<&str> = defined_externs(c).into_iter().collect();
+        let names: Vec<String> = match pre {
+            Some(pre) => defined_externs(&String::from_utf8_lossy(pre)).into_iter().map(str::to_string).collect(),
+            None => raw.iter().map(|n| n.to_string()).collect(),
+        };
+        let made = names.iter().filter(|n| !raw.contains(n.as_str())).cloned().collect();
+        (file.clone(), names, made)
+    });
     let mut macro_made = std::collections::HashSet::new();
-    let units = units
-        .iter()
-        .map(|(file, c)| {
-            let raw: std::collections::HashSet<&str> = defined_externs(c).into_iter().collect();
-            let pre = c.contains("#include <").then(|| super::preprocessed(c, &spec.cmd, &flags, false)).flatten();
-            let names: Vec<String> = match &pre {
-                Some(pre) => defined_externs(&String::from_utf8_lossy(pre)).into_iter().map(str::to_string).collect(),
-                None => raw.iter().map(|n| n.to_string()).collect(),
-            };
-            macro_made.extend(names.iter().filter(|n| !raw.contains(n.as_str())).cloned());
-            (file.clone(), names)
+    let units = per
+        .into_iter()
+        .map(|(file, names, made)| {
+            macro_made.extend(made);
+            (file, names)
         })
         .collect();
     UnitDefs { units, macro_made }
@@ -533,7 +535,8 @@ mod tests {
     fn macro_made_fns_belong_to_their_unit() {
         let Ok(spec) = super::super::spec_for(crate::protocol::host_triple()) else { return };
         let c = "#include <stddef.h>\n#define MK(n) int lust_##n(void) { return 0; }\nMK(a)\nint visible(void) {\n  return 1;\n}\n";
-        let d = unit_defs(&spec, &[("u2.c".to_string(), c)]);
+        let pre = super::super::preprocessed(c, &spec.cmd, &super::super::cflags(false), false);
+        let d = unit_defs(&[("u2.c".to_string(), c, pre.as_deref())]);
         let mut names = d.units[0].1.clone();
         names.sort();
         assert_eq!(names, vec!["lust_a", "visible"]);

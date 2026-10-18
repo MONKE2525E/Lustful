@@ -255,11 +255,11 @@ fn compiler_id(cmd: &[String]) -> String {
 /// `pgo::Mode::key_part`). A unit that includes system headers (the runtime
 /// unit, the C++ unit) keys on its preprocessed text instead, so a header or
 /// sysroot change moves its key; the other units include nothing.
-pub fn unit_key(c_text: &str, spec: &CcSpec, debug: bool, profile: Option<&str>, cxx: bool) -> String {
+pub fn unit_key(c_text: &str, pre: Option<&[u8]>, spec: &CcSpec, debug: bool, profile: Option<&str>, cxx: bool) -> String {
     let (words, flags) = if cxx { (&spec.cxx, cxxflags(debug)) } else { (&spec.cmd, cflags(debug)) };
     let id = compiler_id(words);
-    let pre = c_text.contains("#include <").then(|| preprocessed(c_text, words, &flags, cxx)).flatten();
-    let text = pre.as_deref().unwrap_or(c_text.as_bytes());
+    let own = pre.is_none().then(|| c_text.contains("#include <").then(|| preprocessed(c_text, words, &flags, cxx)).flatten()).flatten();
+    let text = pre.or(own.as_deref()).unwrap_or(c_text.as_bytes());
     let (a, b) = crate::driver::cache::hash128(
         &[b"cc-v2", spec.triple.as_bytes(), id.as_bytes(), flags.as_bytes(), &[debug as u8, cxx as u8], profile.unwrap_or("").as_bytes(), text],
         37,
@@ -479,23 +479,34 @@ pub fn build(
     // that unit's own part of the profile. The C++ unit is not profiled.
     let pgo_on = std::env::var_os("LUST_PGO_GEN").is_some() || std::env::var_os("LUST_PGO_USE").is_some();
     let work = &if pgo_on { std::fs::canonicalize(work).map_err(|e| format!("cannot resolve {}: {e}", work.display()))? } else { work.to_path_buf() };
+    // Per unit, on every thread (a warm build reads every unit's text here, ~1 GB for tsgo):
+    // the text the PGO split reads (an LLVM unit's C half plus its IR's definitions), the
+    // unit's file name, and the preprocessed text of a C unit with `#include`s, which its key
+    // and its PGO definitions both read.
     let ll_texts: Vec<Option<String>> =
-        units.iter().map(|(name, c)| ll_of.get(name.as_str()).filter(|_| pgo_on).map(|ll| ll_profile_text(c, ll))).collect();
-    let names: Vec<String> = units
-        .iter()
-        .zip(&ll_texts)
-        .map(|((name, c), llt)| if pgo_on && !is_cxx(name) { pgo::stable_name(llt.as_deref().unwrap_or(c)).unwrap_or_else(|| name.clone()) } else { name.clone() })
-        .collect();
+        crate::pool::par_map(&units, |(name, c)| ll_of.get(name.as_str()).filter(|_| pgo_on).map(|ll| ll_profile_text(c, ll)));
+    let idx: Vec<usize> = (0..units.len()).collect();
+    let names: Vec<String> = crate::pool::par_map(&idx, |&i| {
+        let (name, c) = units[i];
+        if pgo_on && !is_cxx(name) { pgo::stable_name(ll_texts[i].as_deref().unwrap_or(c)).unwrap_or_else(|| name.clone()) } else { name.clone() }
+    });
+    let cflags_text = cflags(debug);
+    let pre: Vec<Option<Vec<u8>>> = crate::pool::par_map(&units, |(name, c)| {
+        (!is_cxx(name) && c.contains("#include <")).then(|| preprocessed(c, &spec.cmd, &cflags_text, false)).flatten()
+    });
     // The LLVM units by their PGO names (`ll_of` and `hc_of` stay by unit name).
     let is_ll: Vec<bool> = units.iter().map(|(name, _)| ll_of.contains_key(name.as_str())).collect();
     let pfile = |i: usize| if is_ll[i] { format!("{}.ll", names[i]) } else { format!("{}.c", names[i]) };
-    let files: Vec<(String, &str)> =
-        (0..units.len()).filter(|&i| !is_cxx(&names[i])).map(|i| (pfile(i), ll_texts[i].as_deref().unwrap_or(&units[i].1))).collect();
+    let files: Vec<(String, &str, Option<&[u8]>)> = (0..units.len())
+        .filter(|&i| !is_cxx(&names[i]))
+        .map(|i| (pfile(i), ll_texts[i].as_deref().unwrap_or(&units[i].1), pre[i].as_deref()))
+        .collect();
     let pgo = pgo::Mode::from_env(spec, work, &files)?;
     let pgo_of = |i: usize| pgo.as_ref().filter(|_| !is_cxx(&names[i]));
     // An instrumented build needs a compiler with a profile runtime (`pgo::gen_spec`).
     let gen_spec = if matches!(pgo, Some(pgo::Mode::Gen)) { Some(pgo::gen_spec(spec)?) } else { None };
     let spec = gen_spec.as_ref().unwrap_or(spec);
+    let pre_of = |i: usize| if gen_spec.is_some() { None } else { pre[i].as_deref() };
     // Largest units first, bounded workers: the tcc driver's shape
     // (src/tcc.rs), for the same reason (the tail is short units).
     let mut order: Vec<usize> = (0..units.len()).collect();
@@ -521,7 +532,8 @@ pub fn build(
     let rt_digest = match rt {
         Some(r) => {
             let part = pgo_of(r).map(|m| m.key_part(&pfile(r)));
-            let key = cache.map(|_| unit_key(&format!("{}\n/* rtinl {rt_max} */", units[r].1), spec, debug, part.as_deref(), false));
+            // The marker is a declaration: the key reads the preprocessed text, without comments.
+            let key = cache.map(|_| unit_key(&format!("{}\ntypedef int lust_rtinl_{rt_max};\n", units[r].1), None, spec, debug, part.as_deref(), false));
             let cached = matches!((cache, &key), (Some(c), Some(k)) if c.unit_object(k, &objs[r]) && c.unit_object(&format!("{k}-inl"), &rt_inl));
             if cached {
                 hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -542,20 +554,17 @@ pub fn build(
         }
         None => String::new(),
     };
-    let keys: Vec<Option<String>> = units
-        .iter()
-        .enumerate()
-        .map(|(i, (unit, c))| {
-            let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
-            cache.map(|_| match ll_of.get(unit.as_str()) {
-                Some(ll) => {
-                    let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
-                    unit_key(&format!("{c}\n/* llvm-v3 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), spec, debug, part.as_deref(), false)
-                }
-                None => unit_key(c, spec, debug, part.as_deref(), is_cxx(&names[i])),
-            })
+    let keys: Vec<Option<String>> = crate::pool::par_map(&idx, |&i| {
+        let (unit, c) = units[i];
+        let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
+        cache.map(|_| match ll_of.get(unit.as_str()) {
+            Some(ll) => {
+                let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
+                unit_key(&format!("{c}\n/* llvm-v3 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), None, spec, debug, part.as_deref(), false)
+            }
+            None => unit_key(c, pre_of(i), spec, debug, part.as_deref(), is_cxx(&names[i])),
         })
-        .collect();
+    });
     let next = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(String::new());
     let limit = crate::pool::threads().max(1).min(units.len().max(1));
@@ -766,7 +775,7 @@ mod tests {
             let cmd: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
             super::CcSpec { triple: triple.into(), cxx: super::cxx_for(&cmd), cmd, statik: false, exe_suffix: "" }
         };
-        let key = |text: &str, triple: &str, cmd: &str, debug: bool, profile: Option<&str>, cxx: bool| super::unit_key(text, &spec(triple, cmd), debug, profile, cxx);
+        let key = |text: &str, triple: &str, cmd: &str, debug: bool, profile: Option<&str>, cxx: bool| super::unit_key(text, None, &spec(triple, cmd), debug, profile, cxx);
         let base = key("int f(void);", "aarch64-unknown-linux-musl", "zig cc", false, None, false);
         assert_ne!(base, key("int g(void);", "aarch64-unknown-linux-musl", "zig cc", false, None, false), "C text");
         assert_ne!(base, key("int f(void);", "x86_64-unknown-linux-musl", "zig cc", false, None, false), "target");
