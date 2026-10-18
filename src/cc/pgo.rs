@@ -39,8 +39,9 @@ pub enum Mode {
 
 /// A loaded profile, split by unit.
 pub struct Pgo {
-    /// Each unit's own records, sorted, by the file name the unit compiles as (shared, not
-    /// copied: a static fn of the unit header has a record in every unit).
+    /// The digests (`Index`) of each unit's own record names, sorted, by the file name the
+    /// unit compiles as (shared, not copied: a static fn of the unit header has a record in
+    /// every unit).
     own: HashMap<String, Vec<Arc<str>>>,
     /// The flags that pin the summary thresholds to the whole profile's.
     pins: Vec<String>,
@@ -251,15 +252,17 @@ impl Pgo {
         // The quantized profile and its pins depend only on the profile, `bits` and the
         // tool: a warm build of the same ones (a pinned profile, every merge) reads them
         // back from the last build's work dir instead of running llvm-profdata three times
-        // (~2.8 s for tsgo's). `memo` holds their digest and the pins, and is written last.
+        // (~2.8 s for tsgo's), and the records' index (`Index`) instead of the profile text.
+        // `memo` holds their digest and the pins, and is written last.
+        let idx = work.join("pgo-all.index");
         let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let key = digest(&[&bytes, &bits.to_le_bytes(), tool.as_bytes()]);
         let kept = std::fs::read_to_string(&memo)
             .ok()
             .and_then(|m| m.strip_prefix(&format!("{key}\n")).map(|pins| pins.split_whitespace().map(str::to_string).collect::<Vec<_>>()))
-            .and_then(|pins| std::fs::read_to_string(&txt).ok().map(|t| (parse(&t), pins)));
+            .and_then(|pins| read_index(&idx).map(|i| (i, pins)));
         let hit = kept.is_some();
-        let ((_, records), pins) = match kept {
+        let (index, pins) = match kept {
             Some(k) => k,
             None => {
                 let _ = std::fs::remove_file(&memo);
@@ -276,15 +279,17 @@ impl Pgo {
                 std::fs::write(&txt, format!("{head}{}\n\n", body.join("\n\n"))).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
                 run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
                 let pins = pins(&run(Command::new(profdata()).args(["show", "--detailed-summary"]).arg(&all))?)?;
+                let index = index(&records);
+                write_index(&idx, &index)?;
                 std::fs::write(&memo, format!("{key}\n{}\n", pins.join(" "))).map_err(|e| format!("cannot write {}: {e}", memo.display()))?;
-                ((head, records), pins)
+                (index, pins)
             }
         };
         if hit && !all.exists() {
             run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
         }
-        let (own, helpers, absent) = split(&records, defs);
-        Ok(Pgo { own, pins, records: records.values().map(Vec::len).sum(), helpers, absent, kept: hit, all, key })
+        let (own, helpers, absent) = split(&index, defs);
+        Ok(Pgo { own, pins, records: index.values().map(|(_, n)| n).sum(), helpers, absent, kept: hit, all, key })
     }
 }
 
@@ -326,7 +331,7 @@ pub(super) fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
 /// macro-made fns, and how many external ones went to no unit. An external fn's record goes
 /// to every unit that defines it, a static fn's (`STATIC_FILE;<fn>`) to every unit that
 /// defines a static fn of that name; a static record of another file goes to that file.
-fn split(records: &Records, defs: &UnitDefs) -> (HashMap<String, Vec<Arc<str>>>, usize, usize) {
+fn split(index: &Index, defs: &UnitDefs) -> (HashMap<String, Vec<Arc<str>>>, usize, usize) {
     let mut owner: HashMap<&str, Vec<&str>> = HashMap::new();
     for (file, names) in &defs.units {
         for n in names {
@@ -341,7 +346,7 @@ fn split(records: &Records, defs: &UnitDefs) -> (HashMap<String, Vec<Arc<str>>>,
     }
     let mut own: HashMap<String, Vec<Arc<str>>> = HashMap::new();
     let (mut helpers, mut absent) = (0, 0);
-    for (name, rs) in records {
+    for (name, (d, _)) in index {
         let files: Vec<&str> = match name.split_once(';') {
             Some((STATIC_FILE, f)) => static_owner.get(f).cloned().unwrap_or_default(),
             Some((file, _)) => vec![file],
@@ -357,7 +362,7 @@ fn split(records: &Records, defs: &UnitDefs) -> (HashMap<String, Vec<Arc<str>>>,
             },
         };
         for f in files {
-            own.entry(f.to_string()).or_default().extend(rs.iter().cloned());
+            own.entry(f.to_string()).or_default().push(d.clone());
         }
     }
     for r in own.values_mut() {
@@ -369,6 +374,47 @@ fn split(records: &Records, defs: &UnitDefs) -> (HashMap<String, Vec<Arc<str>>>,
 /// A text profile's records by fn name: every record of the name (static fns of one source
 /// name can differ in body, so in hash, across units).
 type Records = HashMap<String, Vec<Arc<str>>>;
+
+/// Per record name, the digest of its records (sorted) and their number: all a unit's key
+/// reads of the profile (`key_part`), so a warm build of the same profile reads this file
+/// (`pgo-all.index`) and not the profile text (tsgo's LLVM profile: 731k records).
+type Index = HashMap<String, (Arc<str>, usize)>;
+
+fn index(records: &Records) -> Index {
+    records
+        .iter()
+        .map(|(n, rs)| {
+            let mut rs: Vec<&[u8]> = rs.iter().map(|r| r.as_bytes()).collect();
+            rs.sort_unstable();
+            (n.clone(), (Arc::from(digest(&rs)), rs.len()))
+        })
+        .collect()
+}
+
+fn write_index(path: &Path, index: &Index) -> Result<(), String> {
+    let mut text = String::with_capacity(index.len() * 64);
+    for (n, (d, k)) in index {
+        text.push_str(n);
+        text.push('\t');
+        text.push_str(d);
+        text.push('\t');
+        text.push_str(&k.to_string());
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// None when the file is missing or not an index: the caller reads the profile again.
+fn read_index(path: &Path) -> Option<Index> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut index = HashMap::with_capacity(text.len() / 64);
+    for line in text.lines() {
+        let mut f = line.rsplitn(3, '\t');
+        let (k, d, n) = (f.next()?.parse().ok()?, f.next()?, f.next()?);
+        index.insert(n.to_string(), (Arc::from(d), k));
+    }
+    Some(index)
+}
 
 /// An IR PGO text profile: the header (flag lines) and the records by name.
 fn parse(text: &str) -> (String, Records) {
@@ -589,7 +635,7 @@ mod tests {
             macro_made: macro_made.iter().map(|n| n.to_string()).collect(),
             statics: Vec::new(),
         };
-        let (own, helpers, absent) = split(&recs, &defs);
+        let (own, helpers, absent) = split(&index(&recs), &defs);
         Mode::Use(Pgo { own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, kept: false, all: PathBuf::new(), key: String::new() })
     }
 
@@ -609,6 +655,22 @@ mod tests {
         assert_eq!(recs["lust.c;h"].len(), 2);
     }
 
+    /// The index a warm build reads back gives each name the digest and count it was written
+    /// with; a missing file is no index (the profile is read again).
+    #[test]
+    fn an_index_reads_back_as_written() {
+        let text = format!(":ir\n{}\n\n{}\n\n{}\n", rec("f", 3), rec("lust.c;h", 4), rec("lust.c;h", 5).replace("\n7\n", "\n8\n"));
+        let (_, recs) = parse(&text);
+        let ix = index(&recs);
+        let p = std::env::temp_dir().join(format!("lust-pgo-index-{}", std::process::id()));
+        write_index(&p, &ix).unwrap();
+        let back = read_index(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(back.as_ref(), Some(&ix));
+        assert_eq!(ix["lust.c;h"].1, 2);
+        assert!(read_index(&std::env::temp_dir().join("lust-pgo-no-such-index")).is_none());
+    }
+
     /// A static fn's record (`STATIC_FILE;<fn>`) goes to every unit that defines a static fn
     /// of that name, whatever the unit is called: a merge that renames a unit keeps it.
     #[test]
@@ -617,10 +679,11 @@ mod tests {
             [("lust.c;lh_aa_0", 5), ("lust.c;lust_mix", 2), ("x1.c;old", 3)].iter().map(|(n, c)| (n.to_string(), vec![Arc::from(rec(n, *c))])).collect();
         let st = |f: &str, ns: &[&str]| (f.to_string(), ns.iter().map(|n| n.to_string()).collect::<Vec<_>>());
         let defs = UnitDefs { units: Vec::new(), macro_made: Default::default(), statics: vec![st("x9.ll", &["lh_aa_0", "lust_mix"]), st("x7.c", &["lust_mix"])] };
-        let (own, _, absent) = split(&recs, &defs);
+        let ix = index(&recs);
+        let (own, _, absent) = split(&ix, &defs);
         assert_eq!(own["x9.ll"].len(), 2);
-        assert!(own["x7.c"][0].starts_with("lust.c;lust_mix"));
-        assert!(own["x1.c"][0].starts_with("x1.c;old"), "another file's static record stays with that file");
+        assert_eq!(own["x7.c"], vec![ix["lust.c;lust_mix"].0.clone()]);
+        assert_eq!(own["x1.c"], vec![ix["x1.c;old"].0.clone()], "another file's static record stays with that file");
         assert_eq!(absent, 0);
         assert_eq!(defined_statics("static inline int lust_mix(int a) {\n}\nstatic int g;\nint f(void) {\n}\n"), vec!["lust_mix"]);
     }
