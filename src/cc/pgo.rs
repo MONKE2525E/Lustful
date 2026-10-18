@@ -58,7 +58,8 @@ pub struct Pgo {
 impl Mode {
     /// The mode `LUST_PGO_GEN` / `LUST_PGO_USE` ask for, or None. `units` are (file name
     /// the unit compiles as, C text).
-    pub fn from_env(spec: &CcSpec, work: &Path, units: &[(String, &str, Option<&[u8]>)]) -> Result<Option<Mode>, String> {
+    /// `defs`: what each unit defines (`unit_defs`), with a profile to use.
+    pub fn from_env(spec: &CcSpec, work: &Path, defs: Option<&UnitDefs>) -> Result<Option<Mode>, String> {
         if std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1") {
             return Ok(Some(Mode::Gen));
         }
@@ -71,7 +72,8 @@ impl Mode {
             return Err(format!("LUST_PROFDATA ({}) is LLVM {pd}, the compiler ({}) LLVM {cc}", profdata(), spec.cmd.join(" ")));
         }
         let bits = std::env::var("LUST_PGO_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
-        Pgo::load(Path::new(&path), bits, work, &tool, &unit_defs(units)).map(|p| Some(Mode::Use(p)))
+        let defs = defs.ok_or("internal: a profile to use and no unit definitions")?;
+        Pgo::load(Path::new(&path), bits, work, &tool, defs).map(|p| Some(Mode::Use(p)))
     }
 
     /// Extra link flags: the profile runtime of an instrumented build.
@@ -250,16 +252,16 @@ impl Pgo {
 
 /// The external fns each unit defines, by the file name it compiles as, the names only a
 /// preprocessed text shows (macro-made), and the static fns each unit defines.
-struct UnitDefs {
-    units: Vec<(String, Vec<String>)>,
+pub(super) struct UnitDefs {
+    pub units: Vec<(String, Vec<String>)>,
     macro_made: std::collections::HashSet<String>,
-    statics: Vec<(String, Vec<String>)>,
+    pub statics: Vec<(String, Vec<String>)>,
 }
 
 /// The definitions of each unit (`defined_externs`), on every thread: of its preprocessed
 /// text when the caller has one (a unit with `#include`s; `cc::preprocessed`, else its text
 /// as given), so the fns its macros make count as its own.
-fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
+pub(super) fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
     let per: Vec<(String, Vec<String>, Vec<String>, Vec<String>)> = crate::pool::par_map(units, |(file, c, pre)| {
         let raw: std::collections::HashSet<&str> = defined_externs(c).into_iter().collect();
         let pre = pre.map(String::from_utf8_lossy);

@@ -22,8 +22,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod memo;
 pub(crate) mod pgo;
 mod rtinl;
+
+pub use memo::{CcError, UnitIn};
 
 /// One target's compiler setup: the command words, the flags every unit
 /// gets, and how the link differs from a host link.
@@ -473,31 +476,79 @@ fn ll_profile_text(c: &str, ll: &str, hc: &str) -> String {
     out
 }
 
-/// Compiles every unit and links `out`. `units` are (name, C text) pairs in
-/// link order (a name ending in `.cc` is C++ text, for `spec.cxx`); `work`
-/// is a scratch dir for C files and objects the caller owns. Returns a
-/// one-line summary, or the compiler's error text.
-pub fn build(
-    units: &[(String, String)],
-    spec: &CcSpec,
-    out: &Path,
-    debug: bool,
-    cache: Option<&crate::driver::cache::Cache>,
-    work: &Path,
-) -> Result<String, String> {
+/// What a unit key holds besides the unit's text (`unit_key`, `llflags`, the profile): a
+/// unit memo (`memo.rs`) written under another tag is dropped as a whole.
+fn memo_tag(spec: &CcSpec, debug: bool) -> String {
+    let profile = std::env::var_os("LUST_PGO_USE").map(|p| std::fs::read(&p).unwrap_or_default()).unwrap_or_default();
+    let pgo_env: Vec<String> = ["LUST_PGO_BITS", "LUST_PGO_PREINLINE", "LUST_PROFDATA"].iter().map(|v| std::env::var(v).unwrap_or_default()).collect();
+    let (a, b) = crate::driver::cache::hash128(
+        &[
+            env!("LUST_BUILD_HASH").as_bytes(),
+            spec.triple.as_bytes(),
+            compiler_id(&spec.cmd).as_bytes(),
+            cflags(debug).as_bytes(),
+            llflags(debug).as_bytes(),
+            pgo_env.join(" ").as_bytes(),
+            &profile,
+        ],
+        59,
+    );
+    format!("memo-v1 {a:016x}{b:016x}")
+}
+
+/// Compiles every unit and links `out`. `units` are in link order (a name ending in `.cc`
+/// is C++ text, for `spec.cxx`; `u<N>.ll` and `u<N>.hc` are the IR and helpers' C of the
+/// LLVM unit `u<N>`); `work` is a scratch dir for C files and objects the caller owns, and
+/// holds the unit memo (`memo.rs`) for the next build. A unit without text needs its
+/// fingerprint in the memo and its object in the cache, else `CcError::NeedText` names the
+/// units to pass again with text (an LLVM unit's three parts come with text or without as
+/// one). Returns a one-line summary, or the compiler's error text.
+pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Option<&crate::driver::cache::Cache>, work: &Path) -> Result<String, CcError> {
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
     let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
     let is_cxx = |name: &str| name.ends_with(".cc");
+    // The memo (`memo.rs`), for a build given fingerprints. Not with runtime IR
+    // (`LUST_LL_RTINL`): LLVM unit keys hold its digest, known only after it compiles.
+    let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let instrumented = std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1");
+    let tag = (units.iter().any(|u| u.fp.is_some()) && rt_max == 0 && !instrumented).then(|| memo_tag(spec, debug));
+    let memo = tag.as_deref().map(|t| memo::load(work, t)).unwrap_or_default();
+    let entry_of = |u: &UnitIn| u.fp.and_then(|fp| memo.get(&fp)).filter(|e| e.name == u.name);
+    // A unit without text: its memo entry, with the object in the cache. An LLVM unit's
+    // parts come as one (its key covers the three texts): with text, or all without.
+    let mut parts: std::collections::HashMap<&str, Vec<&UnitIn>> = std::collections::HashMap::new();
+    for u in units {
+        parts.entry(u.name.strip_suffix(".ll").or_else(|| u.name.strip_suffix(".hc")).unwrap_or(&u.name)).or_default().push(u);
+    }
+    let mut need: Vec<String> = Vec::new();
+    for (whole, ps) in &parts {
+        let bare = ps.iter().filter(|p| p.text.is_none()).count();
+        let known = || {
+            ps.iter().find(|p| p.name == *whole).and_then(|c| entry_of(c)).is_some_and(|e| cache.is_some_and(|k| k.has_unit_object(&e.key)))
+        };
+        if bare > 0 && (bare < ps.len() || !known()) {
+            need.extend(ps.iter().filter(|p| p.text.is_none()).map(|p| p.name.clone()));
+        }
+    }
+    if !need.is_empty() {
+        need.sort();
+        return Err(CcError::NeedText(need));
+    }
     // The LLVM backend (cgen/ll.rs): a unit `u<N>.ll` is the LLVM IR of the C unit `u<N>`, and
     // `u<N>.hc` the C of its helpers; the three compile as one module into `u<N>.o`
     // (`compile_pair`) and key on all three texts. For PGO such a unit is `<name>.ll`: the
     // profile names the combined module's static fns by the IR's file name.
     let ll_of: std::collections::HashMap<&str, &str> =
-        units.iter().filter_map(|(name, text)| name.strip_suffix(".ll").map(|stem| (stem, text.as_str()))).collect();
+        units.iter().filter_map(|u| Some((u.name.strip_suffix(".ll")?, u.text.as_deref()?))).collect();
     let hc_of: std::collections::HashMap<&str, &str> =
-        units.iter().filter_map(|(name, text)| name.strip_suffix(".hc").map(|stem| (stem, text.as_str()))).collect();
-    let units: Vec<&(String, String)> = units.iter().filter(|(name, _)| !name.ends_with(".ll") && !name.ends_with(".hc")).collect();
+        units.iter().filter_map(|u| Some((u.name.strip_suffix(".hc")?, u.text.as_deref()?))).collect();
+    let textless_parts: std::collections::HashSet<&str> =
+        units.iter().filter(|u| u.text.is_none() && (u.name.ends_with(".ll") || u.name.ends_with(".hc"))).map(|u| u.name.as_str()).collect();
+    let units: Vec<&UnitIn> = units.iter().filter(|u| !u.name.ends_with(".ll") && !u.name.ends_with(".hc")).collect();
+    // A unit without text is a memo entry; `text` is empty for it.
+    let entries: Vec<Option<&memo::Entry>> = units.iter().map(|u| u.text.is_none().then(|| entry_of(u)).flatten()).collect();
+    let text = |i: usize| units[i].text.as_deref().unwrap_or("");
     // PGO (`pgo.rs`): the C units compile from inside `work` under content-derived
     // names, as the profile names their static functions by file, and each key holds
     // that unit's own part of the profile. The C++ unit is not profiled.
@@ -507,27 +558,39 @@ pub fn build(
     // the text the PGO split reads (an LLVM unit's C half plus its IR's definitions), the
     // unit's file name, and the preprocessed text of a C unit with `#include`s, which its key
     // and its PGO definitions both read.
-    let ll_texts: Vec<Option<String>> =
-        crate::pool::par_map(&units, |(name, c)| {
-            ll_of.get(name.as_str()).filter(|_| pgo_on).map(|ll| ll_profile_text(c, ll, hc_of.get(name.as_str()).copied().unwrap_or("")))
-        });
     let idx: Vec<usize> = (0..units.len()).collect();
+    let ll_texts: Vec<Option<String>> =
+        crate::pool::par_map(&idx, |&i| {
+            let name = units[i].name.as_str();
+            ll_of.get(name).filter(|_| pgo_on).map(|ll| ll_profile_text(text(i), ll, hc_of.get(name).copied().unwrap_or("")))
+        });
     let names: Vec<String> = crate::pool::par_map(&idx, |&i| {
-        let (name, c) = units[i];
-        if pgo_on && !is_cxx(name) { pgo::stable_name(ll_texts[i].as_deref().unwrap_or(c)).unwrap_or_else(|| name.clone()) } else { name.clone() }
+        let name = &units[i].name;
+        match entries[i] {
+            Some(e) => e.file.rsplit_once('.').map_or(e.file.clone(), |(stem, _)| stem.to_string()),
+            None if pgo_on && !is_cxx(name) => pgo::stable_name(ll_texts[i].as_deref().unwrap_or(text(i))).unwrap_or_else(|| name.clone()),
+            None => name.clone(),
+        }
     });
     let cflags_text = cflags(debug);
-    let pre: Vec<Option<Vec<u8>>> = crate::pool::par_map(&units, |(name, c)| {
-        (!is_cxx(name) && c.contains("#include <")).then(|| preprocessed(c, &spec.cmd, &cflags_text, false)).flatten()
+    let pre: Vec<Option<Vec<u8>>> = crate::pool::par_map(&idx, |&i| {
+        (!is_cxx(&units[i].name) && text(i).contains("#include <")).then(|| preprocessed(text(i), &spec.cmd, &cflags_text, false)).flatten()
     });
     // The LLVM units by their PGO names (`ll_of` and `hc_of` stay by unit name).
-    let is_ll: Vec<bool> = units.iter().map(|(name, _)| ll_of.contains_key(name.as_str())).collect();
+    let is_ll: Vec<bool> = (0..units.len()).map(|i| entries[i].map_or(ll_of.contains_key(units[i].name.as_str()), |e| e.file.ends_with(".ll"))).collect();
     let pfile = |i: usize| if is_ll[i] { format!("{}.ll", names[i]) } else { format!("{}.c", names[i]) };
-    let files: Vec<(String, &str, Option<&[u8]>)> = (0..units.len())
-        .filter(|&i| !is_cxx(&names[i]))
-        .map(|i| (pfile(i), ll_texts[i].as_deref().unwrap_or(&units[i].1), pre[i].as_deref()))
-        .collect();
-    let pgo = pgo::Mode::from_env(spec, work, &files)?;
+    // What each unit defines, for a profile to use: from its text, or its memo entry.
+    let defs = std::env::var_os("LUST_PGO_USE").filter(|_| !instrumented).map(|_| {
+        let files: Vec<(String, &str, Option<&[u8]>)> = (0..units.len())
+            .filter(|&i| !is_cxx(&names[i]) && entries[i].is_none())
+            .map(|i| (pfile(i), ll_texts[i].as_deref().unwrap_or(text(i)), pre[i].as_deref()))
+            .collect();
+        let mut defs = pgo::unit_defs(&files);
+        defs.units.extend((0..units.len()).filter_map(|i| entries[i].map(|e| (e.file.clone(), e.defs.clone()))));
+        defs.statics.extend((0..units.len()).filter_map(|i| entries[i].map(|e| (e.file.clone(), e.statics.clone()))));
+        defs
+    });
+    let pgo = pgo::Mode::from_env(spec, work, defs.as_ref())?;
     let pgo_of = |i: usize| pgo.as_ref().filter(|_| !is_cxx(&names[i]));
     // An instrumented build needs a compiler with a profile runtime (`pgo::gen_spec`).
     let gen_spec = if matches!(pgo, Some(pgo::Mode::Gen)) { Some(pgo::gen_spec(spec)?) } else { None };
@@ -541,7 +604,8 @@ pub fn build(
     // Largest units first, bounded workers: the tcc driver's shape
     // (src/tcc.rs), for the same reason (the tail is short units).
     let mut order: Vec<usize> = (0..units.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len() + ll_of.get(units[i].0.as_str()).map_or(0, |l| l.len())));
+    let len = |i: usize| entries[i].map_or(text(i).len() + ll_of.get(units[i].name.as_str()).map_or(0, |l| l.len()), |e| e.len);
+    order.sort_by_key(|&i| std::cmp::Reverse(len(i)));
     let objs: Vec<PathBuf> = names.iter().map(|name| work.join(format!("{name}.o"))).collect();
     let hits = std::sync::atomic::AtomicUsize::new(0);
     // `LUST_LL_RTINL=<max instructions>` (0 or unset: off): with LLVM units, the runtime unit
@@ -550,9 +614,8 @@ pub fn build(
     // whose counters must stay the runtime's). LLVM unit keys hold that copy's digest.
     // Off by default: a PGO build lost half its fns' profile with it (the training build has
     // no runtime IR, and the PGO pre-inliner inlines runtime fns before it hashes CFGs).
-    let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let rt = (rt_max > 0 && !ll_of.is_empty() && !matches!(pgo, Some(pgo::Mode::Gen)))
-        .then(|| units.iter().position(|(_, c)| c.starts_with("#define LUST_IMPL 1\n")))
+        .then(|| (0..units.len()).position(|i| text(i).starts_with("#define LUST_IMPL 1\n")))
         .flatten();
     let rt_inl = work.join("runtime.inl.bc");
     // PGO with runtime IR: the training build has none (an instrumented runtime cannot be
@@ -565,7 +628,7 @@ pub fn build(
         Some(r) => {
             let part = pgo_of(r).map(|m| m.key_part(&pfile(r)));
             // The marker is a declaration: the key reads the preprocessed text, without comments.
-            let key = keyed.then(|| unit_key(&format!("{}\ntypedef int lust_rtinl_{rt_max};\n", units[r].1), None, spec, debug, part.as_deref(), false));
+            let key = keyed.then(|| unit_key(&format!("{}\ntypedef int lust_rtinl_{rt_max};\n", text(r)), None, spec, debug, part.as_deref(), false));
             let cached = matches!((cache, &key), (Some(c), Some(k)) if c.unit_object(k, &objs[r]) && c.unit_object(&format!("{k}-inl"), &rt_inl));
             if cached {
                 hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -578,7 +641,7 @@ pub fn build(
                     }
                     None => work.join(format!("{}.c", names[r])),
                 };
-                std::fs::write(&src, &units[r].1).map_err(|e| format!("cannot write {}: {e}", src.display()))?;
+                std::fs::write(&src, text(r)).map_err(|e| format!("cannot write {}: {e}", src.display()))?;
                 let pf = pgo_of(r).map(|m| m.unit_flags(&pfile(r))).transpose()?;
                 compile_runtime_ir(spec, &flags, &src, &objs[r], &rt_inl, rt_max, pf.as_deref(), key.as_deref())
                     .map_err(|e| format!("the C compiler failed for target {} (runtime IR):\n{e}", spec.triple))?;
@@ -594,7 +657,10 @@ pub fn build(
         None => String::new(),
     };
     let keys: Vec<Option<String>> = crate::pool::par_map(&idx, |&i| {
-        let (unit, c) = units[i];
+        if let Some(e) = entries[i] {
+            return Some(e.key.clone());
+        }
+        let (unit, c) = (&units[i].name, text(i));
         let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
         keyed.then(|| match ll_of.get(unit.as_str()) {
             // v4: a lust before b41791434 could store, through zig's cache, an LLVM object built
@@ -606,8 +672,40 @@ pub fn build(
             None => unit_key(c, pre_of(i), spec, debug, part.as_deref(), is_cxx(&names[i])),
         })
     });
+    // The memo for the next build: this build's units with a fingerprint (not those whose
+    // key reads a preprocessed text, so a header change is seen, nor the C++ unit). With
+    // LUST_CHECK_UNIT_FP=1 every unit comes with text, and a fingerprint the last build gave
+    // another key is a stale fingerprint: the session missed an input.
+    if let (Some(tag), true) = (&tag, keyed) {
+        let check = std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
+        let def_of: std::collections::HashMap<&str, &Vec<String>> = defs.as_ref().map(|d| d.units.iter().map(|(f, v)| (f.as_str(), v)).collect()).unwrap_or_default();
+        let static_of: std::collections::HashMap<&str, &Vec<String>> =
+            defs.as_ref().map(|d| d.statics.iter().map(|(f, v)| (f.as_str(), v)).collect()).unwrap_or_default();
+        let mut next = Vec::new();
+        for i in 0..units.len() {
+            let (Some(fp), Some(key)) = (units[i].fp, &keys[i]) else { continue };
+            if pre[i].is_some() || is_cxx(&units[i].name) || text(i).contains("#include <") {
+                continue;
+            }
+            if check && let Some(old) = memo.get(&fp).filter(|e| e.name == units[i].name && &e.key != key) {
+                panic!("LUST_CHECK_UNIT_FP: unit {} has the input fingerprint {fp:032x} of the last build, whose text had key {}; its text now has key {key}", units[i].name, old.key);
+            }
+            let entry = entries[i].cloned().unwrap_or_else(|| memo::Entry {
+                name: units[i].name.clone(),
+                key: key.clone(),
+                file: pfile(i),
+                len: len(i),
+                defs: def_of.get(pfile(i).as_str()).map(|d| (*d).clone()).unwrap_or_default(),
+                statics: static_of.get(pfile(i).as_str()).map(|d| (*d).clone()).unwrap_or_default(),
+            });
+            next.push((fp, entry));
+        }
+        memo::save(work, tag, &next)?;
+    }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(String::new());
+    // Memo units whose object left the cache since the check above (another build evicted it).
+    let lost = std::sync::Mutex::new(Vec::new());
     let limit = crate::pool::threads().max(1).min(units.len().max(1));
     let t_compile = std::time::Instant::now();
     std::thread::scope(|scope| {
@@ -618,12 +716,16 @@ pub fn build(
                 if Some(i) == rt {
                     continue;
                 }
-                let (name, c) = (&names[i], &units[i].1);
+                let (name, c) = (&names[i], text(i));
                 let obj = &objs[i];
                 if let (Some(cache), Some(key)) = (cache, &keys[i])
                     && cache.unit_object(key, obj)
                 {
                     hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                if entries[i].is_some() {
+                    lost.lock().unwrap_or_else(|e| e.into_inner()).push(units[i].name.clone());
                     continue;
                 }
                 // The object may be a hard link to a cache entry (`Cache::unit_object`);
@@ -632,7 +734,7 @@ pub fn build(
                 let cxx = is_cxx(name);
                 // PGO: a C unit compiles as `<unit>.d/lust.c`, so its static fns' records do not
                 // carry the unit's name (`pgo::STATIC_FILE`).
-                let pgo_dir = (!cxx && pgo_of(i).is_some() && !ll_of.contains_key(units[i].0.as_str())).then(|| work.join(format!("{name}.d")));
+                let pgo_dir = (!cxx && pgo_of(i).is_some() && !ll_of.contains_key(units[i].name.as_str())).then(|| work.join(format!("{name}.d")));
                 if let Some(d) = &pgo_dir
                     && let Err(e) = std::fs::create_dir_all(d)
                 {
@@ -649,7 +751,7 @@ pub fn build(
                     fail(format!("cannot write {}: {e}\n", src.display()));
                     continue;
                 }
-                if let Some(ll) = ll_of.get(units[i].0.as_str()) {
+                if let Some(ll) = ll_of.get(units[i].name.as_str()) {
                     let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i))).transpose() {
                         Ok(pf) => pf,
                         Err(e) => {
@@ -657,7 +759,7 @@ pub fn build(
                             continue;
                         }
                     };
-                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path()), nopre, keys[i].as_deref()) {
+                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].name.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path()), nopre, keys[i].as_deref()) {
                         Ok(()) => {
                             if let (Some(cache), Some(key)) = (cache, &keys[i]) {
                                 cache.store_unit_object(key, obj);
@@ -709,12 +811,19 @@ pub fn build(
     }
     let errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
     if !errors.is_empty() {
-        return Err(format!("the C compiler failed for target {}:\n{errors}", spec.triple));
+        return Err(CcError::Failed(format!("the C compiler failed for target {}:\n{errors}", spec.triple)));
+    }
+    let mut lost = lost.into_inner().unwrap_or_else(|e| e.into_inner());
+    if !lost.is_empty() {
+        let ll: Vec<String> = lost.iter().flat_map(|n| [format!("{n}.ll"), format!("{n}.hc")]).filter(|p| textless_parts.contains(p.as_str())).collect();
+        lost.extend(ll);
+        lost.sort();
+        return Err(CcError::NeedText(lost));
     }
     let compile_s = t_compile.elapsed().as_secs_f64();
     let t_link = std::time::Instant::now();
     // A build with a C++ unit links with the C++ driver (its runtime and personality).
-    let link = if units.iter().any(|(name, _)| is_cxx(name)) { &spec.cxx } else { &spec.cmd };
+    let link = if units.iter().any(|u| is_cxx(&u.name)) { &spec.cxx } else { &spec.cmd };
     let mut cmd = cc_command(&link[0]);
     cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
     match cmd.output() {
@@ -727,8 +836,8 @@ pub fn build(
             pgo.as_ref().map(|m| format!(", {}", m.describe())).unwrap_or_default(),
             out.display()
         )),
-        Ok(o) => Err(format!("link failed for target {} ({})\n{}", spec.triple, o.status, String::from_utf8_lossy(&o.stderr))),
-        Err(e) => Err(format!("cannot run {}: {e}", link.join(" "))),
+        Ok(o) => Err(CcError::Failed(format!("link failed for target {} ({})\n{}", spec.triple, o.status, String::from_utf8_lossy(&o.stderr)))),
+        Err(e) => Err(CcError::Failed(format!("cannot run {}: {e}", link.join(" ")))),
     }
 }
 
@@ -742,6 +851,38 @@ mod tests {
         assert_eq!(super::pgo::defined_externs(&text), vec!["f_aa", "fl_aa", "fl_bb"]);
     }
 
+    /// A unit passed without text links the object its fingerprint's text made in the last
+    /// build in the work dir; an unknown fingerprint, or an object the cache lost since,
+    /// asks for the text.
+    #[test]
+    fn a_unit_without_text_links_the_last_builds_object() {
+        use super::{CcError, UnitIn};
+        let Ok(spec) = super::spec_for(crate::protocol::host_triple()) else { return };
+        let root = std::env::temp_dir().join(format!("lust-cc-memo-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = crate::driver::cache::Cache::at(&root.join("cache"));
+        let (work, bin) = (root.join("work"), root.join("bin"));
+        let main = |ret: u32| Some(format!("int f(void);\nint main(void) {{\n  return f() + {ret};\n}}\n"));
+        let f = Some("int f(void) {\n  return 3;\n}\n".to_string());
+        let unit = |name: &str, fp: u128, text: Option<String>| UnitIn { name: name.into(), fp: Some(fp), text };
+        let run = |units: &[UnitIn]| super::build(units, &spec, &bin, false, Some(&cache), &work);
+        run(&[unit("u0", 1, main(1)), unit("u1", 7, f.clone())]).unwrap();
+        let r = run(&[unit("u0", 2, main(2)), unit("u1", 7, None)]).unwrap();
+        assert!(r.contains("2 units (1 from cache"), "u1 comes from its memo entry and the cache: {r}");
+        match run(&[unit("u0", 2, None), unit("u1", 8, None)]) {
+            Err(CcError::NeedText(n)) => assert_eq!(n, ["u1"], "an unknown fingerprint needs its text"),
+            r => panic!("{r:?}"),
+        }
+        for e in std::fs::read_dir(root.join("cache")).unwrap().flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+        match run(&[unit("u0", 2, None), unit("u1", 7, None)]) {
+            Err(CcError::NeedText(n)) => assert_eq!(n, ["u0", "u1"], "a memo entry whose object left the cache needs its text"),
+            r => panic!("{r:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A cache hit hard-links the object into the work dir; a later compile of other C to
     /// the same object path must not write through the link into the cache entry.
     #[test]
@@ -752,7 +893,7 @@ mod tests {
         let cache = crate::driver::cache::Cache::at(&root.join("cache"));
         let (work, bin) = (root.join("work"), root.join("bin"));
         let build = |ret: u32| {
-            let units = vec![("u0".to_string(), format!("int main(void) {{\n  return {ret};\n}}\n"))];
+            let units = vec![super::UnitIn::text("u0", format!("int main(void) {{\n  return {ret};\n}}\n"))];
             super::build(&units, &spec, &bin, false, Some(&cache), &work).unwrap()
         };
         build(1);

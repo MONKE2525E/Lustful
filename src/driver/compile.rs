@@ -4857,8 +4857,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
         };
         let (out, debug, cc_dir) = (req.out.clone(), req.debug, dir.join("cc"));
+        let all: Vec<crate::cc::UnitIn> = all.into_iter().map(|(name, text)| crate::cc::UnitIn::text(name, text)).collect();
         let job = move || {
-            let built = crate::cc::build(&all, &spec, &out, debug, cache.as_ref(), &cc_dir);
+            let built = crate::cc::build(&all, &spec, &out, debug, cache.as_ref(), &cc_dir).map_err(|e| e.to_string());
             // A build that leaks at exit leaks the unit texts too (they moved out of `units`).
             if leak_at_exit {
                 std::mem::forget(all);
