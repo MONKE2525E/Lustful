@@ -165,7 +165,13 @@ impl FnGen<'_, '_> {
                 }
             }
         }
-        let _ = writeln!(s, "}};\nstatic void cl{tag}(struct fr{tag} *Lc);");
+        // The cleanup variable names `clw<tag>`: every scope exit runs it, and a normal
+        // return left `st = 0`, so the call to the cleanup fn folds away there; an unwind
+        // left a ladder entry and runs the cleanup.
+        let _ = writeln!(
+            s,
+            "}};\nstatic void cl{tag}(struct fr{tag} *Lc);\nstatic inline __attribute__((always_inline)) void clw{tag}(struct fr{tag} *Lc) {{ if (__builtin_expect(Lc->st != 0, 0)) cl{tag}(Lc); }}"
+        );
         s
     }
 }
@@ -225,18 +231,26 @@ pub(super) fn drop_may_unwind(p: &Program, t: &CTy, seen: &mut HashSet<CTy>) -> 
     }
 }
 
-/// Unwind tables: drop glue's call statements that can panic, as catch points: a drop glue
-/// call `drop_X(a);` and a call through a cast fn pointer (a user Drop, a dyn drop entry)
-/// `((cast)f)(a);` become `lust_unw_dtry((void (*)(void *))f, (void *)(a), &ux);`.
-/// Returns the text and whether it made any.
-pub(super) fn dtry_calls(text: &str) -> (String, bool) {
+/// One call statement of drop glue that can panic (`glue_drop_stmts`): the byte range of
+/// the statement in the glue text (through its `;`) and its catch-point form.
+struct DropStmt {
+    start: usize,
+    end: usize,
+    dtry: String,
+}
+
+/// Drop glue's call statements that can panic: a drop glue call `drop_X(a);` and a call
+/// through a cast fn pointer (a user Drop, a dyn drop entry) `((cast)f)(a);`, each at the
+/// start of a statement; with `cases`, also right after an enum glue's `case N:` label.
+fn glue_drop_stmts(text: &str, cases: bool) -> Vec<DropStmt> {
+    let starts = |b: &[u8], at: usize| stmt_start(b, at) || (cases && after_case_label(b, at));
     let b = text.as_bytes();
-    let mut out = String::with_capacity(text.len() + 64);
-    let (mut i, mut copied, mut any) = (0, 0, false);
+    let mut out = Vec::new();
+    let mut i = 0;
     while i < b.len() {
         match b[i] {
             b'"' | b'\'' => i = skip_lit(b, i),
-            b'(' if b.get(i + 1) == Some(&b'(') && stmt_start(b, i) => {
+            b'(' if b.get(i + 1) == Some(&b'(') && starts(b, i) => {
                 // `((cast)callee)(arg);`
                 let Some(close) = match_paren(b, i) else {
                     i += 1;
@@ -252,11 +266,8 @@ pub(super) fn dtry_calls(text: &str) -> (String, bool) {
                     continue;
                 }
                 let arg = &text[close + 2..close2];
-                out.push_str(&text[copied..i]);
-                let _ = write!(out, "lust_unw_dtry((void (*)(void *))({callee}), (void *)({arg}), &ux);");
-                any = true;
+                out.push(DropStmt { start: i, end: close2 + 2, dtry: format!("lust_unw_dtry((void (*)(void *))({callee}), (void *)({arg}), &ux);") });
                 i = close2 + 2;
-                copied = i;
             }
             c if is_ident(c) && (i == 0 || !is_ident(b[i - 1])) => {
                 let start = i;
@@ -264,7 +275,7 @@ pub(super) fn dtry_calls(text: &str) -> (String, bool) {
                     i += 1;
                 }
                 let name = &text[start..i];
-                if !name.starts_with("drop_") || !stmt_start(b, start) || b.get(i) != Some(&b'(') {
+                if !name.starts_with("drop_") || !starts(b, start) || b.get(i) != Some(&b'(') {
                     continue;
                 }
                 let Some(close) = match_paren(b, i) else { continue };
@@ -272,17 +283,112 @@ pub(super) fn dtry_calls(text: &str) -> (String, bool) {
                     continue;
                 }
                 let arg = &text[i + 1..close];
-                out.push_str(&text[copied..start]);
-                let _ = write!(out, "lust_unw_dtry((void (*)(void *)){name}, (void *)({arg}), &ux);");
-                any = true;
+                out.push(DropStmt { start, end: close + 2, dtry: format!("lust_unw_dtry((void (*)(void *)){name}, (void *)({arg}), &ux);") });
                 i = close + 2;
-                copied = i;
             }
             _ => i += 1,
         }
     }
+    out
+}
+
+/// Unwind tables: drop glue's call statements that can panic (`glue_drop_stmts`) as catch
+/// points: each becomes `lust_unw_dtry((void (*)(void *))f, (void *)(a), &ux);`. Returns
+/// the text and whether it made any. The fallback of `frame_glue`.
+pub(super) fn dtry_calls(text: &str) -> (String, bool) {
+    let stmts = glue_drop_stmts(text, false);
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut copied = 0;
+    for d in &stmts {
+        out.push_str(&text[copied..d.start]);
+        out.push_str(&d.dtry);
+        copied = d.end;
+    }
     out.push_str(&text[copied..]);
-    (out, any)
+    (out, !stmts.is_empty())
+}
+
+/// Unwind tables: drop glue that can panic as one frame, with no work on the normal path
+/// beyond a state store per drop. Before its k-th drop statement (`glue_drop_stmts`) the
+/// glue stores `st = k` in its frame `L` (and the index of the element loop it is in);
+/// a panic there unwinds through the frame's cleanup variable, whose fn runs the rest of
+/// the glue from just after that statement (a copy of the body entered by `goto`, the loop
+/// index restored), as Rust's landing pad drops the other fields and elements; the unwind
+/// then goes on. A panic in that rest aborts (runtime/panic.c, panic in a destructor
+/// during cleanup). Returns the whole definition of `drop_<m>`, or None for a body this
+/// does not cover (none of its statements can panic, or a hash table's local iterator),
+/// which keeps `dtry_calls`.
+pub(super) fn frame_glue(m: &str, ct: &str, body: &str) -> Option<String> {
+    // Every drop is a state (enum arms too): a panic in one with no state of its own
+    // would resume at the last state stored and drop parts twice.
+    let stmts = glue_drop_stmts(body, true);
+    if stmts.is_empty() || body.contains("while (") || body.contains("#error") {
+        return None;
+    }
+    const FOR_I: &str = "for (uint64_t i = ";
+    let has_loop = body.contains(FOR_I);
+    // The body of a one-line element loop `for (uint64_t i = ..; ..; i++) STMT;`.
+    let in_loop = |d: &DropStmt| {
+        let line = &body[body[..d.start].rfind('\n').map_or(0, |n| n + 1)..d.start];
+        line.trim_start().starts_with(FOR_I)
+    };
+    let (mut fast, mut rest) = (String::with_capacity(body.len() + 64), String::with_capacity(body.len() + 64));
+    let mut copied = 0;
+    for (k, d) in stmts.iter().enumerate() {
+        let (pre, stmt) = (&body[copied..d.start], &body[d.start..d.end]);
+        fast.push_str(pre);
+        rest.push_str(pre);
+        let save_i = if in_loop(d) { " L.i = i;" } else { "" };
+        let _ = write!(fast, "{{ L.st = {};{save_i} {stmt} }}", k + 1);
+        let _ = write!(rest, "{{ {stmt} r{}:; }}", k + 1);
+        copied = d.end;
+    }
+    fast.push_str(&body[copied..]);
+    rest.push_str(&body[copied..]);
+    // In the rest, the loop index is the fn's (restored from the frame), and the body's
+    // own declarations (`uint64_t *h = ..;`: pure reads through `p`) go before the jump.
+    let rest = rest.replace(FOR_I, "for (i = ");
+    let (mut decls, mut tail) = (String::new(), String::new());
+    for line in rest.lines() {
+        let t = line.trim_start();
+        let is_decl = line.starts_with("  ")
+            && !line.starts_with("   ")
+            && t.split_once(" = ").is_some_and(|(lhs, _)| {
+                let mut w = lhs.split_whitespace();
+                matches!((w.next(), w.next(), w.next()), (Some(ty), Some(v), None) if ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && v.starts_with('*') && v[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            });
+        if is_decl {
+            decls.push_str(line);
+            decls.push('\n');
+        } else {
+            tail.push_str(line);
+            tail.push('\n');
+        }
+    }
+    let i_field = if has_loop { " uint64_t i;" } else { "" };
+    let i_init = if has_loop { " L.i = 0;" } else { "" };
+    let i_local = if has_loop { "  uint64_t i = Lc->i;\n" } else { "" };
+    let mut out = String::with_capacity(fast.len() + tail.len() + 512);
+    // The prototype first: a unit that keeps this glue to itself puts `static ` before the
+    // definition text (`fn_unit`), and the definition below then inherits that linkage.
+    let _ = writeln!(out, "void drop_{m}({ct} *p);");
+    let _ = writeln!(out, "struct dgf_{m} {{ int32_t st; {ct} *p;{i_field} }};");
+    let _ = writeln!(out, "static void dgc_{m}(struct dgf_{m} *Lc);");
+    let _ = writeln!(
+        out,
+        "static inline __attribute__((always_inline)) void dgw_{m}(struct dgf_{m} *Lc) {{ if (__builtin_expect(Lc->st != 0, 0)) dgc_{m}(Lc); }}"
+    );
+    let _ = writeln!(out, "void drop_{m}({ct} *p) {{\n  struct dgf_{m} L __attribute__((cleanup(dgw_{m})));\n  L.st = 0; L.p = p;{i_init}");
+    out.push_str(&fast);
+    out.push_str("  L.st = 0;\n}\n");
+    let _ = writeln!(out, "static void dgc_{m}(struct dgf_{m} *Lc) {{\n  {ct} *p = Lc->p;\n{i_local}{decls}  switch (Lc->st) {{");
+    for k in 1..=stmts.len() {
+        let _ = writeln!(out, "  case {k}: goto r{k};");
+    }
+    out.push_str("  default: return;\n  }\n");
+    out.push_str(&tail);
+    out.push_str("}\n");
+    Some(out)
 }
 
 /// The blocks of `body` that are cleanup: every block reachable from a
@@ -402,6 +508,22 @@ fn match_paren(b: &[u8], open: usize) -> Option<usize> {
 
 /// Whether the token at `at` starts a C statement: after `;`, `{`,
 /// `}`, `else`, the condition of `if`/`for`/`while`, or the start.
+/// True when `at` follows an enum glue's `case N:` label (and spaces).
+fn after_case_label(b: &[u8], at: usize) -> bool {
+    let mut j = at;
+    while j > 0 && b[j - 1] == b' ' {
+        j -= 1;
+    }
+    if j == 0 || b[j - 1] != b':' {
+        return false;
+    }
+    let mut k = j - 1;
+    while k > 0 && b[k - 1].is_ascii_digit() {
+        k -= 1;
+    }
+    k < j - 1 && k >= 5 && &b[k - 5..k] == b"case "
+}
+
 fn stmt_start(b: &[u8], at: usize) -> bool {
     let mut j = at;
     while j > 0 && b[j - 1].is_ascii_whitespace() {

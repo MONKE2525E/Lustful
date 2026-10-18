@@ -2343,7 +2343,7 @@ impl FnGen<'_, '_> {
         }
         if self.zc_frame {
             let tag = names::fn_tag(slot);
-            let _ = writeln!(self.out, "  struct fr{tag} L __attribute__((cleanup(cl{tag})));\n  L.st = 0;");
+            let _ = writeln!(self.out, "  struct fr{tag} L __attribute__((cleanup(clw{tag})));\n  L.st = 0;");
             for s in &frame_init {
                 let _ = writeln!(self.out, "  {s}");
             }
@@ -2771,8 +2771,9 @@ impl FnGen<'_, '_> {
             }
             CTy::Boxed(inner) => {
                 // Drop the still-owned part behind the pointer,
-                // then free the allocation itself.
+                // then free the allocation itself (its `sizeof` needs the type defined).
                 out += &self.elab_drop(l, &sub(Step::Deref));
+                self.note_held(inner);
                 let et = ctype(inner);
                 let _ = write!(out, " lust_dealloc((void*){e}, sizeof({et}), _Alignof({et}));");
             }
@@ -11074,6 +11075,12 @@ fn glue_def_value(
             if p.unwind_tables {
                 body = body.replace(UNW_DSTEP, "").replace("UNW_DSTEP ", "");
                 if unwind::drop_may_unwind(p, t, &mut HashSet::new()) {
+                    // One frame for the whole glue (no catch per drop), or else catch points.
+                    if let Some(def) = unwind::frame_glue(&m, &ct, &body) {
+                        defs.push_str(&def);
+                        defs.push('\n');
+                        return;
+                    }
                     let (text, any) = unwind::dtry_calls(&body);
                     if any {
                         body = format!("  void *ux = 0;\n{text}  if (ux) lust_unw_reraise(ux);\n");
