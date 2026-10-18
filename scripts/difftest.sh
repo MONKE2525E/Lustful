@@ -36,6 +36,9 @@
 #     tables, release C and its inline definitions with LUST_RELEASE_C=1.
 #     CC_TARGET=x86_64-unknown-linux-musl adds the musl allocator; its OS error and
 #     resolver texts and cfg(target_env) then differ from a glibc rustc's.
+#   LL=1 (with PANIC=unwind or RELEASE=1): the LLVM backend's release C and LLVM IR
+#     (LUST_RELEASE_C=1 LUST_RELEASE_BACKEND=llvm, unwind tables), built by scripts/llbuild.sh
+#     (ll_build, LL_OPT clang level, default -O1), in place of the tcc build.
 #   RELEASE=1 (rustc and lust both -C overflow-checks=off -C debug-assertions=off, a Cargo
 #     release profile's semantics; panics unwind unless PANIC=abort): tests/release/*.rs plus
 #     every tests/pass case (and tests/unwind when panics unwind), compared as in
@@ -193,6 +196,17 @@ cc_build() {
   run_lust "$lust" build "$1" --release --target "${CC_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}" -C "panic=$panic" -o "$2.lust"
 }
 
+# ll_build <fixture> <name>: LL=1 (with EH=1's modes): the LLVM backend (src/cgen/ll.rs):
+# lust emits release C with LLVM IR fn bodies (LUST_RELEASE_C=1 LUST_RELEASE_BACKEND=llvm, unwind
+# tables), and scripts/llbuild.sh compiles each unit pair as one module and links <name>.lust.
+ll_obj=$work/ll-obj
+mkdir -p "$ll_obj"
+ll_build() {
+  local f=$1 name=$2
+  (export LUST_UNWIND_TABLES=1 LUST_RELEASE_C=1 LUST_RELEASE_BACKEND=llvm; run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.tmp" --emit-c "$name") || return 1
+  LLOBJ=$ll_obj JOBS=2 OPT=${LL_OPT:--O1} "$root/scripts/llbuild.sh" "$name" "$name.lust"
+}
+
 # lust_stderr <case file> <lust stderr>: lust's stderr as difftest compares it to rustc's
 # (mask_stderr, the case path as @CASE@). A panic inside lust's shipped std source reports
 # std's own library/ path and line (src/stdloc.rs), so the whole text compares exactly.
@@ -234,8 +248,17 @@ if [ "${PANIC:-abort}" = unwind ] || [ "${RELEASE:-0}" = 1 ]; then
       report bad "$name" "rustc ($mode) rejected it: $(head -3 rustc.err)"; return
     fi
     rs=$(cat rustc.rs)
+    # An optimizing build may turn deep recursion into a loop (as rustc -O does), so a
+    # case that expects the unoptimized oracle's stack overflow says nothing in LL=1.
+    if [ "${LL:-0}" = 1 ] && grep -q "^// panic: .*overflowed its stack" "$f"; then
+      echo unsupported >st
+      echo "UNSUPPORTED $name ($mode LL=1): stack depth depends on the optimizer"
+      return
+    fi
     if [ "${CC_DRIVER:-0}" = 1 ]; then
       cc_build "$f" "$name" 2>"$name.lust.err"
+    elif [ "${LL:-0}" = 1 ]; then
+      ll_build "$f" "$name" 2>"$name.lust.err"
     elif [ "${EH:-0}" = 1 ]; then
       eh_build "$f" "$name" 2>"$name.lust.err"
     else

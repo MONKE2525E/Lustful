@@ -265,6 +265,80 @@ fn preprocessed(c_text: &str, words: &[String], flags: &str, cxx: bool) -> Optio
     out.status.success().then_some(out.stdout)
 }
 
+/// The flags of an LLVM unit's own compile (its IR plus its C half's bitcode).
+pub fn llflags(debug: bool) -> String {
+    let base = "-O2 -w -fexceptions";
+    if debug { format!("{base} -g") } else { base.into() }
+}
+
+/// Compiles one LLVM backend unit into `obj`: the C unit `src` and the helpers' C `hc` to
+/// bitcode with the C flags (no LLVM passes yet), then the IR `ll` with both linked in, so
+/// the optimizer sees one module (cgen/ll.rs: the C helpers inline into the LLVM fns). The
+/// helpers link as builtin bitcode: only what the IR names, internalized, so the copies
+/// left after inlining are dropped instead of compiled. `pgo`: the unit's PGO flags
+/// (`pgo::Mode::unit_flags`) for that last step, which then runs inside `src`'s dir on the
+/// IR's bare file name, as the profile names the module's static fns by it.
+fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &str, hc: &str, obj: &Path, pgo: Option<&[String]>) -> Result<(), String> {
+    let bc = src.with_extension("c.bc");
+    let ll_path = src.with_extension("ll");
+    let hc_path = src.with_extension("hc.c");
+    let hbc = src.with_extension("hc.bc");
+    std::fs::write(&ll_path, ll).map_err(|e| format!("cannot write {}: {e}\n", ll_path.display()))?;
+    std::fs::write(&hc_path, hc).map_err(|e| format!("cannot write {}: {e}\n", hc_path.display()))?;
+    let run = |cmd: &mut Command| -> Result<(), String> {
+        match cmd.output() {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(format!("({})\n{}", o.status, String::from_utf8_lossy(&o.stderr))),
+            Err(e) => Err(format!("cannot run {}: {e}\n", spec.cmd.join(" "))),
+        }
+    };
+    let words = &spec.cmd;
+    // No `noundef` on C values: the C halves pass aggregates' bits as integers
+    // (cgen/ll.rs `Pass::Bits`, `Pass::Pair`), which may hold uninitialized bytes.
+    let to_bc = |from: &Path, to: &Path| {
+        run(Command::new(&words[0])
+            .args(&words[1..])
+            .args(cflags)
+            .args(["-emit-llvm", "-Xclang", "-disable-llvm-passes", "-Xclang", "-no-enable-noundef-analysis", "-c"])
+            .arg(from)
+            .arg("-o")
+            .arg(to))
+    };
+    to_bc(src, &bc)?;
+    to_bc(&hc_path, &hbc)?;
+    // A relative compiler path must not resolve against the work dir (PGO compiles there).
+    let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
+    let mut cmd = Command::new(prog);
+    cmd.args(&words[1..]).args(llflags(debug).split_whitespace()).arg("-c");
+    match (pgo, ll_path.parent(), ll_path.file_name()) {
+        (Some(flags), Some(dir), Some(file)) => cmd.args(flags).current_dir(dir).arg(file),
+        _ => cmd.arg(&ll_path),
+    };
+    let abs = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    run(cmd
+        .args(["-Xclang", "-mlink-bitcode-file", "-Xclang"])
+        .arg(abs(&bc))
+        .args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"])
+        .arg(abs(&hbc))
+        .arg("-o")
+        .arg(obj))
+}
+
+/// What the PGO split (`pgo::defined_externs`, `pgo::stable_name`) reads for an LLVM unit:
+/// its C half, then a C definition line for each external fn its IR defines (its own and
+/// the `available_externally` copies, whose bodies the profile annotates too).
+fn ll_profile_text(c: &str, ll: &str) -> String {
+    let mut out = c.to_string();
+    for line in ll.lines().filter(|l| l.starts_with("define ") && !l.starts_with("define internal ") && !l.starts_with("define private ")) {
+        if let Some(at) = line.find(" @")
+            && let Some(len) = line[at + 2..].find('(')
+        {
+            out.push_str(&format!("\nvoid {}(void) {{\n}}\n", &line[at + 2..at + 2 + len]));
+        }
+    }
+    out
+}
+
 /// Compiles every unit and links `out`. `units` are (name, C text) pairs in
 /// link order (a name ending in `.cc` is C++ text, for `spec.cxx`); `work`
 /// is a scratch dir for C files and objects the caller owns. Returns a
@@ -281,29 +355,51 @@ pub fn build(
     let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
     let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
     let is_cxx = |name: &str| name.ends_with(".cc");
+    // The LLVM backend (cgen/ll.rs): a unit `u<N>.ll` is the LLVM IR of the C unit `u<N>`, and
+    // `u<N>.hc` the C of its helpers; the three compile as one module into `u<N>.o`
+    // (`compile_pair`) and key on all three texts. For PGO such a unit is `<name>.ll`: the
+    // profile names the combined module's static fns by the IR's file name.
+    let ll_of: std::collections::HashMap<&str, &str> =
+        units.iter().filter_map(|(name, text)| name.strip_suffix(".ll").map(|stem| (stem, text.as_str()))).collect();
+    let hc_of: std::collections::HashMap<&str, &str> =
+        units.iter().filter_map(|(name, text)| name.strip_suffix(".hc").map(|stem| (stem, text.as_str()))).collect();
+    let units: Vec<&(String, String)> = units.iter().filter(|(name, _)| !name.ends_with(".ll") && !name.ends_with(".hc")).collect();
     // PGO (`pgo.rs`): the C units compile from inside `work` under content-derived
     // names, as the profile names their static functions by file, and each key holds
     // that unit's own part of the profile. The C++ unit is not profiled.
     let pgo_on = std::env::var_os("LUST_PGO_GEN").is_some() || std::env::var_os("LUST_PGO_USE").is_some();
     let work = &if pgo_on { std::fs::canonicalize(work).map_err(|e| format!("cannot resolve {}: {e}", work.display()))? } else { work.to_path_buf() };
+    let ll_texts: Vec<Option<String>> =
+        units.iter().map(|(name, c)| ll_of.get(name.as_str()).filter(|_| pgo_on).map(|ll| ll_profile_text(c, ll))).collect();
     let names: Vec<String> = units
         .iter()
-        .map(|(name, c)| if pgo_on && !is_cxx(name) { pgo::stable_name(c).unwrap_or_else(|| name.clone()) } else { name.clone() })
+        .zip(&ll_texts)
+        .map(|((name, c), llt)| if pgo_on && !is_cxx(name) { pgo::stable_name(llt.as_deref().unwrap_or(c)).unwrap_or_else(|| name.clone()) } else { name.clone() })
         .collect();
-    let files: Vec<(String, &str)> = names.iter().zip(units).filter(|(n, _)| !is_cxx(n)).map(|(n, (_, c))| (format!("{n}.c"), c.as_str())).collect();
+    // The LLVM units by their PGO names (`ll_of` and `hc_of` stay by unit name).
+    let is_ll: Vec<bool> = units.iter().map(|(name, _)| ll_of.contains_key(name.as_str())).collect();
+    let pfile = |i: usize| if is_ll[i] { format!("{}.ll", names[i]) } else { format!("{}.c", names[i]) };
+    let files: Vec<(String, &str)> =
+        (0..units.len()).filter(|&i| !is_cxx(&names[i])).map(|i| (pfile(i), ll_texts[i].as_deref().unwrap_or(&units[i].1))).collect();
     let pgo = pgo::Mode::from_env(work, &files)?;
-    let pgo_of = |name: &str| pgo.as_ref().filter(|_| !is_cxx(name));
+    let pgo_of = |i: usize| pgo.as_ref().filter(|_| !is_cxx(&names[i]));
     // Largest units first, bounded workers: the tcc driver's shape
     // (src/tcc.rs), for the same reason (the tail is short units).
     let mut order: Vec<usize> = (0..units.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len()));
+    order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len() + ll_of.get(units[i].0.as_str()).map_or(0, |l| l.len())));
     let objs: Vec<PathBuf> = names.iter().map(|name| work.join(format!("{name}.o"))).collect();
     let keys: Vec<Option<String>> = units
         .iter()
-        .zip(&names)
-        .map(|((_, c), name)| {
-            let part = pgo_of(name).map(|m| m.key_part(&format!("{name}.c")));
-            cache.map(|_| unit_key(c, spec, debug, part.as_deref(), is_cxx(name)))
+        .enumerate()
+        .map(|(i, (unit, c))| {
+            let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
+            cache.map(|_| match ll_of.get(unit.as_str()) {
+                Some(ll) => {
+                    let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
+                    unit_key(&format!("{c}\n/* llvm-v2 */\n{ll}\n/* helpers */\n{hc}"), spec, debug, part.as_deref(), false)
+                }
+                None => unit_key(c, spec, debug, part.as_deref(), is_cxx(&names[i])),
+            })
         })
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -331,12 +427,30 @@ pub fn build(
                     fail(format!("cannot write {}: {e}\n", src.display()));
                     continue;
                 }
+                if let Some(ll) = ll_of.get(units[i].0.as_str()) {
+                    let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i))).transpose() {
+                        Ok(pf) => pf,
+                        Err(e) => {
+                            fail(format!("--- unit {name}: {e}\n"));
+                            continue;
+                        }
+                    };
+                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref()) {
+                        Ok(()) => {
+                            if let (Some(cache), Some(key)) = (cache, &keys[i]) {
+                                cache.store_unit_object(key, obj);
+                            }
+                        }
+                        Err(e) => fail(format!("--- unit {name} (LLVM)\n{e}")),
+                    }
+                    continue;
+                }
                 let (words, unit_flags) = if cxx { (&spec.cxx, &cxx_flags) } else { (&spec.cmd, &flags) };
                 // A relative compiler path must not resolve against `work` (PGO compiles there).
                 let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
                 let mut cmd = Command::new(prog);
                 cmd.args(&words[1..]).args(unit_flags).arg("-o").arg(obj);
-                match pgo_of(name).map(|m| m.unit_flags(&format!("{name}.c"))) {
+                match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
                     Some(Ok(pf)) => {
                         cmd.args(pf).current_dir(work).arg("-c").arg(format!("{name}.c"));
                     }
@@ -391,6 +505,14 @@ pub fn build(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_llvm_unit_owns_the_records_of_its_ir_fns_and_copies() {
+        let c = "void f_aa(void) {\n}\n";
+        let ll = "define void @fl_aa(ptr %p) uwtable {\nentry:\n  ret void\n}\ndefine available_externally i64 @fl_bb() {\nentry:\n  ret i64 0\n}\ndefine internal void @k() {\nentry:\n  ret void\n}\n";
+        let text = super::ll_profile_text(c, ll);
+        assert_eq!(super::pgo::defined_externs(&text), vec!["f_aa", "fl_aa", "fl_bb"]);
+    }
+
     #[test]
     fn zig_targets_cover_the_release_triples() {
         assert_eq!(super::zig_target("aarch64-unknown-linux-musl"), Some("aarch64-linux-musl"));

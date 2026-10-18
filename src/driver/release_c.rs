@@ -56,9 +56,14 @@ pub fn unit_bytes() -> usize {
 }
 
 pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32]) -> Vec<(String, Vec<usize>)> {
-    let target = unit_bytes();
     let live: Vec<usize> = (0..out.len()).filter(|&s| !out[s].code.is_empty()).collect();
-    let mean = (live.iter().map(|&s| out[s].code.len()).sum::<usize>() / live.len().max(1)).max(1);
+    // A fn's size: its C; with the LLVM backend its statement count (`FnOut::ll_cost`) at
+    // 200 bytes each, which no lowering, fact or ABI choice moves, so every such variant
+    // gets the same units (and about as many as C).
+    let llvm = live.iter().any(|&s| !out[s].ll.is_empty());
+    let size = |s: usize| if llvm { out[s].ll_cost as usize * 200 } else { out[s].code.len() };
+    let target = unit_bytes();
+    let mean = (live.iter().map(|&s| size(s)).sum::<usize>() / live.len().max(1)).max(1);
     let cut_every = (target / mean).max(1) as u64;
     let id = |s: usize| names.fns.get(s).and_then(|x| x.clone()).unwrap_or_else(|| format!("dead{s}"));
     let mut by_file: std::collections::BTreeMap<&str, Vec<(u32, String, usize)>> = Default::default();

@@ -23,6 +23,7 @@ pub mod names;
 mod own;
 mod slices;
 mod kconst;
+pub mod ll;
 use unwind::Unw;
 
 /// A body-independent type, so glue can be shared across functions.
@@ -1041,6 +1042,17 @@ pub struct FnOut {
     /// Release C: types the code only points at (a `&T` local it never derefs):
     /// declared, not defined (`type_decls_with`). Empty for numbered names.
     pub named: HashSet<CTy>,
+    /// The LLVM backend (cgen/ll.rs): the fn's LLVM IR definition and the declarations it
+    /// names; `ll_c` holds its helpers' C (with the prelude and statics they read), and
+    /// `code` only the C ABI wrapper and the trampoline. Empty for C bodies.
+    pub ll: String,
+    pub ll_decls: BTreeSet<String>,
+    pub ll_c: String,
+    /// The LLVM backend: the C types of the fn's parameters and result, which its C ABI
+    /// wrapper and trampoline (all of `code`) name by value.
+    pub ll_sig: Vec<CTy>,
+    /// The LLVM backend: the fn's size for cross-unit inlining (`ll::LlFn::cost`).
+    pub ll_cost: u32,
 }
 
 /// The LocalDefId to slot table cgen prints from, with a record of every
@@ -1980,7 +1992,16 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     if g.bad_move {
         return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
     }
-    g.function();
+    // The LLVM backend writes the C side (prelude and trampoline included) itself.
+    let mut llfn = None;
+    if ll::on(p) {
+        match g.function_ll() {
+            Ok(f) => llfn = Some(f),
+            Err(e) => return FnOut { error: Some(e), ..Default::default() },
+        }
+    } else {
+        g.function();
+    }
     if g.bad_move {
         return FnOut { error: Some(bad_move_error(p, body)), ..Default::default() };
     }
@@ -1990,10 +2011,12 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     if let Some(t) = g.bad_callable.get() {
         return FnOut { error: Some(bad_callable_error(p, body, t)), ..Default::default() };
     }
-    if !g.prelude.is_empty() {
-        g.out = std::mem::take(&mut g.prelude) + &g.out;
+    if llfn.is_none() {
+        if !g.prelude.is_empty() {
+            g.out = std::mem::take(&mut g.prelude) + &g.out;
+        }
+        g.out.push_str(&trampoline(p, body.fn_id, slots.of(body.fn_id)));
     }
-    g.out.push_str(&trampoline(p, body.fn_id, slots.of(body.fn_id)));
     // A `main` returning `Result` gets a Termination entry in its
     // unit (see `fn_unit`): it needs the error type's Debug glue
     // and the Result's own drop glue.
@@ -2029,7 +2052,14 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     let (code, glue) = (g.out, g.glue);
     let (used, externs) = slots.into_used();
     named.retain(|t| !types.contains(t));
-    FnOut { code, glue, types, error: None, used, externs, named }
+    let ll_sig = if llfn.is_some() {
+        let info = p.fn_info(body.fn_id);
+        info.params.iter().chain(std::iter::once(&info.ret)).map(|&t| cty(&p.tys, t)).collect()
+    } else {
+        Vec::new()
+    };
+    let (ll, ll_decls, ll_c, ll_cost) = llfn.map(|f| (f.def, f.decls, f.helpers, f.cost)).unwrap_or_default();
+    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_sig, ll_cost }
 }
 
 impl<'b, 'p> FnGen<'b, 'p> {
@@ -3545,6 +3575,10 @@ impl FnGen<'_, '_> {
                     self.note_held(&ct);
                 }
                 let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                // The LLVM backend calls the fn's internal ABI entry (cgen/ll.rs).
+                if ll::on(self.p) {
+                    return self.ll_fn_call(f, &args, loc);
+                }
                 let pts: Vec<CTy> = info.params.iter().map(|&t| cty(&self.p.tys, t)).collect();
                 let mut pre = String::new();
                 self.spill_by_ptr(&mut pre, &pts, &mut args);
@@ -4843,6 +4877,15 @@ impl FnGen<'_, '_> {
             collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
         }
         let v = self.tmp();
+        // The LLVM backend calls the fn's internal ABI entry (cgen/ll.rs).
+        if ll::on(self.p) {
+            let saved = std::mem::take(&mut self.out);
+            let e = self.ll_fn_call(f, args, "0");
+            let pre = std::mem::replace(&mut self.out, saved);
+            out.push_str(&pre);
+            let _ = writeln!(out, "  {} {v} = {e};", ctype(&rt));
+            return (v, rt);
+        }
         let call = self.slots.callee(self.p, f);
         // A dropped parameter (a zero-sized env taken by value, or a
         // zero-sized argument) is not in the C signature, so it is
@@ -9846,17 +9889,38 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, 
 /// `main_slot` is the slot of `p.main` (not its `LocalDefId`: slots are
 /// stable across edits, local ids are not).
 pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, register: &str, main_slot: Option<u32>) -> String {
+    fn_unit_parts(p, fns, slots, &[], g, register, main_slot).0
+}
+
+/// `fn_unit`, and for the LLVM backend (cgen/ll.rs) the C of the unit's helpers: the same
+/// declarations, then each fn's `ll_c` (empty when no fn of the unit has LLVM IR). The fns
+/// in `inl` (cross-unit inlining, `ll::ll_inline_set`) add their declarations and helpers.
+pub fn fn_unit_parts(
+    p: &Program,
+    fns: &[FnOut],
+    slots: &[usize],
+    ll_inl: &[usize],
+    g: &GlueSet,
+    register: &str,
+    main_slot: Option<u32>,
+) -> (String, String) {
     let mut c = unit_header();
+    let llvm = slots.iter().any(|&s| !fns[s].ll.is_empty());
+    // The LLVM backend's internal ABI returns 16-byte values as this pair (`ll::Pass::Pair`).
+    if llvm {
+        c.push_str(ll::PAIR_TYPEDEF);
+    }
     if p.unwind_tables {
         c.push_str(noreturn_decls());
     }
     let mut types = HashSet::new();
     let mut named = HashSet::new();
     let mut seen: HashSet<&(Glue, CTy)> = HashSet::new();
-    // Release C: small callees held by other units, as inline definitions here.
+    // Release C: small callees held by other units, as inline definitions here. The LLVM
+    // backend calls fns through `fl_<id>` and gets their copies from `ll_inl` instead.
     let own: HashSet<usize> = slots.iter().copied().collect();
     let inline = names::release() && inline_on();
-    let mut inl = if inline { inline_callees(fns, slots.iter().flat_map(|&s| &fns[s].externs), &own) } else { Vec::new() };
+    let mut inl = if inline && !llvm { inline_callees(fns, slots.iter().flat_map(|&s| &fns[s].externs), &own) } else { Vec::new() };
     // Deeper levels: the small callees of the inline callees.
     let mut frontier = inl.clone();
     for _ in 1..INLINE_DEPTH {
@@ -9868,7 +9932,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         inl.extend(&more);
         frontier = more;
     }
-    for f in slots.iter().chain(&inl).map(|&s| &fns[s]) {
+    for f in slots.iter().chain(&inl).chain(ll_inl).map(|&s| &fns[s]) {
         types.extend(f.types.iter().cloned());
         named.extend(f.named.iter().cloned());
         seen.extend(f.glue.iter());
@@ -9896,7 +9960,8 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         }
         // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
-        let more = inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip);
+        let more =
+            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip) };
         for &s in &more {
             types.extend(fns[s].types.iter().cloned());
             named.extend(fns[s].named.iter().cloned());
@@ -9955,7 +10020,8 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         slots
             .iter()
             .chain(&inl)
-            .map(|&s| fns[s].code.as_str())
+            .chain(ll_inl)
+            .flat_map(|&s| [fns[s].code.as_str(), fns[s].ll_c.as_str()])
             .chain(seen.iter().filter(|k| hybrid && !g.is_shared(k)).map(|k| g.def_map[*k].as_str())),
     );
     for &i in &used {
@@ -9976,7 +10042,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
     // Release C (`names`): the prototypes and location slots that the code (and its
     // static glue) names outside itself, in one sorted list.
     let mut externs: BTreeSet<&str> = BTreeSet::new();
-    for &s in slots.iter().chain(&inl) {
+    for &s in slots.iter().chain(&inl).chain(ll_inl) {
         externs.extend(fns[s].externs.iter().map(String::as_str));
     }
     // An inline callee's plain prototype would make its definition here external.
@@ -10015,6 +10081,27 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
     for (_, def) in &defs {
         let _ = write!(c, "inline {def}\n");
     }
+    let helpers = if llvm {
+        let mut h = c.clone();
+        slots.iter().chain(ll_inl).for_each(|&s| h.push_str(&fns[s].ll_c));
+        // The plain C of an LLVM unit holds only its fns' C ABI wrappers and trampolines:
+        // it declares only the types their signatures hold (a main entry keeps it all).
+        if term_main.is_none() {
+            c = unit_header();
+            c.push_str(ll::PAIR_TYPEDEF);
+            let (mut held, mut named) = (Vec::new(), HashSet::new());
+            for t in slots.iter().flat_map(|&s| &fns[s].ll_sig) {
+                by_value_deps(t, &mut held);
+                collect_types(t, &mut named);
+            }
+            let held: HashSet<CTy> = held.into_iter().collect();
+            named.retain(|t| !held.contains(t));
+            type_decls_with(p, &mut c, &held, &named, Decls::ByValue);
+        }
+        h
+    } else {
+        String::new()
+    };
     for f in slots.iter().map(|&s| &fns[s]) {
         c.push_str(&f.code);
     }
@@ -10079,7 +10166,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         let _ = writeln!(c, "  lust_main_entry_p = 0;");
     }
     c.push_str("}\n");
-    c
+    (c, helpers)
 }
 
 /// The members of one C struct for fields at layout offsets: fields in

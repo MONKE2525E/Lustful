@@ -362,12 +362,12 @@ pub(super) fn wrap_calls(text: &str, check: &str) -> String {
     out
 }
 
-fn is_ident(c: u8) -> bool {
+pub(super) fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
 /// The index after the string or char literal that starts at `i`.
-fn skip_lit(b: &[u8], i: usize) -> usize {
+pub(super) fn skip_lit(b: &[u8], i: usize) -> usize {
     let q = b[i];
     let mut j = i + 1;
     while j < b.len() && b[j] != q {

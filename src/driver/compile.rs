@@ -4588,28 +4588,55 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Some(rg) => {
             let mut jobs: Vec<usize> = vec![0, 1, 2, 3, LOC_UNIT];
             jobs.extend((0..rg.len()).map(|g| g + FIRST_FN_UNIT));
-            let mut units = par_map(&jobs, |&u| {
-                let c = cgen::names::with(rn, || match u {
-                    0 => cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])),
-                    1 => cgen::names::statics_unit(&program, &caches.glue),
-                    2 => cgen::runtime_unit(),
-                    3 => super::release_c::table_unit(&rg.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()),
+            // Cross-unit inlining for the LLVM backend (cgen/ll.rs `ll_inline_set`): per fn
+            // unit, the small fns of other units it gets a copy of.
+            let slot_of: std::collections::HashMap<&str, usize> = rn
+                .map(|n| n.fns.iter().enumerate().filter_map(|(s, id)| id.as_deref().map(|id| (id, s))).collect())
+                .unwrap_or_default();
+            let inl: Vec<Vec<usize>> = par_map(&(0..rg.len()).collect::<Vec<_>>(), |&g| cgen::ll::ll_inline_set(&caches.out, &rg[g].1, &slot_of));
+            let made = par_map(&jobs, |&u| {
+                let (c, helpers) = cgen::names::with(rn, || match u {
+                    0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
+                    1 => (cgen::names::statics_unit(&program, &caches.glue), String::new()),
+                    2 => (cgen::runtime_unit(), String::new()),
+                    3 => (super::release_c::table_unit(&rg.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
                     LOC_UNIT => {
                         let live = (0..caches.out.len()).filter(|&s| !caches.out[s].code.is_empty()).map(|s| s as u32);
-                        cgen::loc_unit(&files, &slot_lines) + &cgen::names::slot_table(live)
+                        (cgen::loc_unit(&files, &slot_lines) + &cgen::names::slot_table(live), String::new())
                     }
                     g => {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];
-                        cgen::fn_unit(&program, &caches.out, slots, &caches.glue, reg, Some(main_slot))
+                        cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot))
                     }
                 });
-                (base_obj(u), c)
+                (base_obj(u), c, helpers)
             });
+            let mut units: Vec<(PathBuf, String)> = Vec::with_capacity(made.len());
+            // The LLVM backend (cgen/ll.rs): a fn unit whose fns have LLVM IR gets two
+            // companions after the glue shards, its IR `u<N>.ll` and its helpers' C `u<N>.hc`,
+            // which cc.rs compiles with `u<N>` into one object.
+            let mut companions: Vec<(PathBuf, String)> = Vec::new();
+            for (o, c, helpers) in made {
+                if !helpers.is_empty() {
+                    companions.push((o.with_extension("hc"), helpers));
+                }
+                units.push((o, c));
+            }
             let first = FIRST_FN_UNIT + rg.len();
             units.extend(rshards.drain(..).enumerate().map(|(j, c)| (base_obj(first + j), c)));
+            let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
+            let lls = par_map(&(0..rg.len()).collect::<Vec<_>>(), |&g| cgen::ll::ll_unit(&caches.out, &rg[g].1, &inl[g], triple));
+            for (g, text) in lls.into_iter().enumerate() {
+                if !text.is_empty() {
+                    units.push((dir.join(format!("u{}.ll", g + FIRST_FN_UNIT)), text));
+                }
+            }
+            units.extend(companions);
             units
         }
     };
+    // The LLVM backend (cgen/ll.rs) wrote `.ll` companions: only cc.rs builds them.
+    let llvm = rgroups.is_some() && cgen::names::with(rn, || cgen::ll::on(&program));
     // The units the link takes after 1..4: release C has its own fn units and glue shards.
     let link_fn_units: Vec<usize> = match &rgroups {
         Some(rg) => (0..rg.len() + n_shards).map(|g| g + FIRST_FN_UNIT).collect(),
@@ -4620,6 +4647,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // rebuilt for this (possibly warm, incremental) build.
         if rgroups.is_some() {
             for (o, c) in &units {
+                // An LLVM companion (`u<N>.ll`, `u<N>.hc`) keeps its extension.
+                if o.extension().is_some_and(|e| e == "ll" || e == "hc") {
+                    let u = o.file_name().and_then(|s| s.to_str()).unwrap_or("ux.ll");
+                    let _ = std::fs::write(format!("{}.{u}", p.display()), c);
+                    continue;
+                }
                 let u = o.file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix('u')).unwrap_or("x");
                 let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
             }
@@ -4636,9 +4669,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         // A foreign emit-c build has no link step here: the emitted C
         // is the product, unless the cc release driver below links it.
-        if foreign && !req.cc {
+        // So is an LLVM backend build's (tcc cannot take its `.ll` units).
+        if (foreign || llvm) && !req.cc {
             return Response { code: 0, ..Default::default() };
         }
+    }
+    if llvm && !req.cc {
+        return Response {
+            stderr: "error: LUST_RELEASE_BACKEND=llvm builds through the release driver (`lust build --release --target <triple>`) or with --emit-c\n".into(),
+            code: 2,
+            ..Default::default()
+        };
     }
     t.lap("assemble C units (par)");
     // The release driver (src/cc.rs): the same self-contained unit set
@@ -4663,7 +4704,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let built = crate::cc::spec_for(triple).and_then(|spec| {
             // Release C (`LUST_RELEASE_C=1`) already holds the content-addressed units.
             let mut all: Vec<(String, String)> = if rgroups.is_some() {
-                units.iter().map(|(o, c)| (o.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned()), c.clone())).collect()
+                // An LLVM companion keeps its `.ll` name (cc.rs pairs it with its C unit).
+                units
+                    .iter()
+                    .map(|(o, c)| {
+                        let name = if o.extension().is_some_and(|e| e == "ll" || e == "hc") { o.file_name() } else { o.file_stem() };
+                        (name.map_or(String::new(), |s| s.to_string_lossy().into_owned()), c.clone())
+                    })
+                    .collect()
             } else {
                 let order: Vec<usize> = [0, 1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()).collect();
                 let fresh = par_map(&order, |&u| match u {

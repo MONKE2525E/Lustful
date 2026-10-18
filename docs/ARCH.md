@@ -2438,6 +2438,21 @@ and dev builds keep the numbered scheme (overlays need the
 table). Measured on the 12 ts-rust v0.6->v0.7 merges: see
 rel-cache's REPORT.md.
 
+LLVM backend for release C (`LUST_RELEASE_BACKEND=llvm`, with
+`LUST_RELEASE_C=1` and unwind tables or panic=abort;
+cgen/ll.rs). Each fn body becomes an LLVM IR fn `fl_<id>`:
+an alloca per local and flag, native control flow, unwinding
+as invoke/landingpad (the runtime's C++ throw and catch are
+unchanged), an internal ABI (small aggregates in registers),
+simple statements in IR and the rest as always_inline C
+helpers cut from cgen's own statement C. A unit is three
+texts (`u<N>.ll`, its helpers' C `u<N>.hc`, its C wrappers
+`u<N>`) that cc.rs compiles as one module and keys as one.
+`LUST_LL_INLINE=<cost>` adds `available_externally` copies of
+small callees from other units. C stays the default. Tests:
+difftest LL=1, and CC_DRIVER=1 with the switch; numbers in
+rel-llvm's REPORT.md.
+
 Locations and span remapping. Panic locations,
 `track_caller` locations, and cached diagnostics are
 position-dependent. A token hash that ignores whitespace
