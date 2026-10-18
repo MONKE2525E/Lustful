@@ -165,23 +165,21 @@ pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> S
 
 /// Release C glue: every glue definition lives in exactly one shard, and fn units hold
 /// only prototypes (`GlueSet::shared` holds every key). Shards are content-defined
-/// chunks of the keys in prototype order: a cut after each key whose prototype hash
-/// hits 1 in (`target` bytes / mean definition bytes), so new glue changes only the
-/// shard it lands in. Each shard declares the types (`Decls::OneStep`), prototypes (its
-/// keys' and their callees') and externs its definitions need. Only the keys the fns in
-/// `out` reach (a dead slot's `FnOut` is empty), as a cold build has them: a session's set
-/// also keeps keys no fn reaches now (stale since a refresh, or left by a removed fn).
+/// chunks of the keys in prototype order, cut by each key's prototype and definition size
+/// (`cut_after`), so new glue changes only the shard it lands in. Each shard declares the
+/// types (`Decls::OneStep`), prototypes (its keys' and their callees') and externs its
+/// definitions need. Only the keys the fns in `out` reach (a dead slot's `FnOut` is empty),
+/// as a cold build has them: a session's set also keeps keys no fn reaches now (stale since
+/// a refresh, or left by a removed fn).
 pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Vec<String> {
     let live = g.closure(out.iter().flat_map(|o| o.glue.iter()));
     let mut keys: Vec<&(Glue, CTy)> = live.into_iter().filter(|k| g.def_map.contains_key(*k)).collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
-    let mean = (keys.iter().map(|k| g.def_map[*k].len()).sum::<usize>() / keys.len().max(1)).max(1);
-    let cut_every = (target / mean).max(1) as u64;
     let mut shards: Vec<Vec<&(Glue, CTy)>> = Vec::new();
     let mut cur = Vec::new();
     for k in keys {
         cur.push(k);
-        if hash64(&g.protos[k]).is_multiple_of(cut_every) {
+        if cut_after(&g.protos[k], g.def_map[k].len(), target.max(1) as u64) {
             shards.push(std::mem::take(&mut cur));
         }
     }
@@ -249,6 +247,14 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     protos.into_iter().for_each(|x| c.push_str(x));
     c.push_str(&data);
     c
+}
+
+/// Whether a release C unit (or glue shard) ends after the fn (glue key) `id` of `size`
+/// bytes: with odds size / `target`, so a unit holds about `target` bytes, decided by the
+/// id and its own size only. A cut test that followed the program's mean size moved every
+/// cut when glue or code anywhere moved the mean across a step.
+pub fn cut_after(id: &str, size: usize, target: u64) -> bool {
+    hash64(id) % target < size as u64
 }
 
 fn hash64(s: &str) -> u64 {

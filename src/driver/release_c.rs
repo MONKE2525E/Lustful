@@ -80,9 +80,7 @@ pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: 
     // gets the same units (and about as many as C).
     let llvm = live.iter().any(|&s| !out[s].ll.is_empty());
     let size = |s: usize| if llvm { out[s].ll_cost as usize * 200 } else { out[s].code.len() };
-    let target = unit_bytes();
-    let mean = (live.iter().map(|&s| size(s)).sum::<usize>() / live.len().max(1)).max(1);
-    let cut_every = (target / mean).max(1) as u64;
+    let target = unit_bytes().max(1) as u64;
     let id = |s: usize| names.fns.get(s).and_then(|x| x.clone()).unwrap_or_else(|| format!("dead{s}"));
     let mut by_file: std::collections::BTreeMap<&str, Vec<(u32, String, usize)>> = Default::default();
     for &s in &live {
@@ -94,7 +92,7 @@ pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: 
         fns.sort();
         let mut cur: Vec<(String, usize)> = Vec::new();
         for (_, n, s) in fns {
-            let cut = hash64(&n).is_multiple_of(cut_every);
+            let cut = cgen::names::cut_after(&n, size(s), target);
             cur.push((n, s));
             if cut {
                 groups.push(std::mem::take(&mut cur));
@@ -152,9 +150,9 @@ mod tests {
         groups(out, names, file, line).into_iter().map(|(_, g)| g.into_iter().map(|s| names.fns[s].clone().unwrap()).collect()).collect()
     }
 
-    /// A fn's unit follows from its own identity and source order: inserting a fn in the
-    /// middle of a file changes only the unit it joins, and every other unit keeps its
-    /// fns (and so its registration name).
+    /// A fn's unit follows from its own identity, size and source order: inserting a fn
+    /// (here 12x the others' size) in the middle of a file changes only the unit it joins,
+    /// and every other unit keeps its fns (and so its registration name).
     #[test]
     fn inserting_a_fn_moves_no_other_unit() {
         let (out, names, file, line) = program(400, 4096);
@@ -162,7 +160,7 @@ mod tests {
         assert!(before.len() > 4, "a 1.6 MB file splits into several units: {}", before.len());
         // A new fn (slot 400) on line 1995, between slots 199 and 200.
         let (mut out2, mut names2, mut file2, mut line2) = (out, names, file, line);
-        out2.push(FnOut { code: "y".repeat(4096), ..Default::default() });
+        out2.push(FnOut { code: "y".repeat(50_000), ..Default::default() });
         names2.fns.push(Some(format!("{:016x}", hash64("new fn"))));
         file2.push("src/a.rs".to_string());
         line2.push(1995);
