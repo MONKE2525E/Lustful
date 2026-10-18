@@ -207,6 +207,21 @@
             : lust_vec_with_capacity(lust_n_, lust_e_, lust_al_);                                      \
     })
 
+/* A str slice range in bounds with both ends on char boundaries; the function panics in
+   Rust's order otherwise. */
+#define lust_str_range(ptr, lo, hi, inclusive, len, loc)                                               \
+    __extension__({                                                                                    \
+        const uint8_t *lust_sp_ = (ptr);                                                               \
+        uint64_t lust_lo_ = (lo), lust_hi_ = (hi), lust_len_ = (len);                                  \
+        int lust_inc_ = (inclusive);                                                                   \
+        uint64_t lust_end_ = lust_inc_ && lust_hi_ < lust_len_ ? lust_hi_ + 1 : lust_hi_;              \
+        __builtin_expect(lust_lo_ <= lust_end_ && lust_end_ <= lust_len_ && !(lust_inc_ && lust_hi_ == lust_len_) \
+                             && (lust_lo_ == lust_len_ || (lust_sp_[lust_lo_] & 0xC0) != 0x80)        \
+                             && (lust_end_ == lust_len_ || (lust_sp_[lust_end_] & 0xC0) != 0x80), 1)  \
+            ? lust_end_                                                                                \
+            : lust_str_range(lust_sp_, lust_lo_, lust_hi_, lust_inc_, lust_len_, (loc));               \
+    })
+
 #define lust_string_as_str(s) __extension__({ lust_String *lust_s_ = (s); (lust_str){lust_s_->ptr, lust_s_->len}; })
 #define lust_str_eq(...)                                                                               \
     __extension__({                                                                                    \

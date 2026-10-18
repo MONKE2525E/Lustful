@@ -2483,6 +2483,15 @@ int lust_utf8_check(const uint8_t *v, uint64_t len, uint64_t *valid_up_to, uint8
         uint8_t first = v[i];
         if (first < 0x80) {
             i++;
+            /* An ASCII run: 16 bytes per step while none has its high bit, as core's
+               validator skips ASCII by words (source text is mostly ASCII). */
+            while (i + 16 <= len) {
+                uint64_t a, b;
+                memcpy(&a, v + i, 8);
+                memcpy(&b, v + i + 8, 8);
+                if ((a | b) & 0x8080808080808080ull) break;
+                i += 16;
+            }
             continue;
         }
         uint8_t el = 1;
