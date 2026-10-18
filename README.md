@@ -219,7 +219,7 @@ fn main() {
 
 ## Supported subset
 
-`lust capabilities` prints the long lists: every std method lust knows, and the messages of its rejects. Some of its item and reject lines are older than the code. The lists below come from probes run against rustc on 2026-10-17.
+`lust capabilities` prints the long lists: every std method lust knows, and the messages of its rejects. Each of its item, type, attribute, syntax, and reject lines has a probe in [tests/capabilities](tests/capabilities) that the gate runs (`scripts/test-capabilities.py`), so a stale line fails the gate. The lists below come from probes run against rustc on 2026-10-17.
 
 Supported today:
 

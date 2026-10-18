@@ -1613,82 +1613,68 @@ fn pat_label(p: &Pat) -> &'static str {
 
 /// Features lust rejects, with the code it reports. The strings mirror the messages at the
 /// `unsupported(...)` and `not_yet(...)` call sites; the agentkit test greps the former.
+/// Each line has a probe in tests/capabilities/ (scripts/test-capabilities.py runs them),
+/// so a line that goes stale fails the gate.
 const REJECTED: &[(&str, &str)] = &[
     ("references in struct and enum fields without a lifetime (E0106)", "L0201"),
-    ("lifetimes in body type annotations, fn pointer types, dyn trait args, trait params, and `T: 'a` bounds", "L0203"),
+    ("lifetimes in `dyn` trait arguments, `T: 'a` bounds on a type's parameters, and fns with `T: 'a` bounds used as values", "L0203"),
     ("explicit lifetime turbofish args", "L0731"),
     ("format macros (format_args! and kin) outside expression position", "L0401"),
     ("attributes lust does not know by name (named in the message)", "L0402"),
-    ("known attributes such as non_exhaustive (named in the message)", "L0522"),
-    ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, Hash (named in the message)", "L0403"),
+    ("known attributes lust does not handle yet, such as `target_feature`, `crate_name` and `no_implicit_prelude` (named in the message)", "L0522"),
+    ("`deny` and `forbid` of a lint lust does not check (named in the message)", "L0531"),
+    ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, and Default (named in the message)", "L0403"),
     ("`unsafe` blocks and functions", "L0404"),
     ("`async` functions and blocks", "L0405"),
-    ("moving a field out of a struct or enum", "L9001"),
+    ("moving a field out of a struct or enum (a fallback that no known program reaches)", "L9001"),
     ("`extend` with items of type `&T` into a VecDeque, BTreeSet, BTreeMap, IndexMap, or IndexSet whose element a later use fixes to `T` (their `Extend<&T>`)", "L9001"),
     ("destructuring in `let` without an initializer", "L9001"),
     ("non-scalar const patterns", "L9001"),
     ("match guards over a by-value slice-pattern middle", "L9001"),
     ("match guards over a bound map Entry payload", "L9001"),
     ("a map Entry variant matched through a reference or with this payload pattern", "L9001"),
-    ("ranges outside `for` loops", "L9001"),
-    ("std items lust does not have yet, by module path (named in the message)", "L0505"),
-    ("refutable patterns here (in `let` and parameters)", "L9001"),
-    ("`mem::take` on this type", "L9001"),
-    ("`cmp::max`/`cmp::min` on this type", "L9001"),
+    ("std and sysroot crate items lust does not have yet, by module path (named in the message)", "L0505"),
+    ("refutable patterns here (a const pattern in a closure parameter; rustc rejects it too, E0005)", "L9001"),
+    ("`mem::take` on this type (a generic `T: Default`)", "L9001"),
+    ("`cmp::max`/`cmp::min` on this type (one that a later use fixes)", "L9001"),
+    ("`cmp::max`/`cmp::min` on tuples (`Ord::max` as a function)", "L0641"),
     ("this std function used as a value", "L9001"),
-    ("#[derive(PartialOrd)]", "L9001"),
-    ("#[derive(Ord)]", "L9001"),
-    ("#[derive(Default)]", "L9001"),
-    ("the `BTreeMap` type", "L0641"),
-    ("a Box of an unsized type", "L0641"),
-    ("an Rc of an unsized type", "L0641"),
-    ("a Mutex of an unsized type", "L0641"),
-    ("this fn on a shared pointer to `str`, `[T]`, or `dyn Tr` (`as_ptr`; `downgrade` for `str` and `[T]`)", "L0641"),
+    ("the `BTreeMap` or `Arc` type where the resolver has no rule for it (a fallback that no known program reaches)", "L0641"),
+    ("a Cell, RefCell, or Mutex of `str` or `[T]`", "L0641"),
     ("methods other than `borrow`/`borrow_mut` (`lock`) on a `RefCell<dyn Tr>` (`Mutex<dyn Tr>`)", "L0641"),
-    ("the `Arc` type", "L0641"),
-    ("the `RefCell` type", "L0641"),
-    ("the `Cell` type", "L0641"),
-    ("items from other crates", "L0505"),
-    ("typed `self` parameters on smart-pointer types (Box, Rc, Arc)", "L0641"),
     ("generic parameter defaults that name a lifetime", "L0614"),
     ("negative impls", "L0614"),
-    ("generic fns as values through a qualified path", "L0614"),
-    ("associated consts", "L0621"),
+    ("generic associated types and associated type defaults", "L0621"),
     ("dependency crates with no lust adapter or shim yet (named in the message)", "L0508"),
-    ("`impl Trait` types", "L0602"),
-    ("`dyn` with a std trait other than the Fn family, `Any`, `Error`, `Debug` and `Display` (`dyn Iterator`), or no principal trait", "L0702"),
+    ("`impl Trait` inside another type (`Vec<impl Fn()>`), in trait method return types, and outside fn signatures", "L0602"),
+    ("`dyn` with a std trait other than the Fn family, `Any`, `Error`, `Debug` and `Display` (`dyn Iterator`, `dyn Hasher`)", "L0702"),
     ("`dyn` for traits with associated types or std supertraits other than `Debug` and `Display`", "L0702"),
     ("`dyn` coercions in const and static initializers", "L0702"),
-    ("`Box<dyn Trait>`, `Rc<dyn Trait>`, `Arc<dyn Trait>`", "L0641"),
-    ("traits, unions, generic type aliases, and type items named like builtin types inside function bodies", "L0820"),
+    ("traits, generic type aliases, and type items named like builtin types inside function bodies", "L0820"),
     ("a non-pub member of an impl inside a function body when a block `use` is in scope or the self type does not resolve", "L0820"),
-    ("closures as `dyn Fn` values", "L0820"),
-    ("captured-variable uses outside the closure capture analysis (named in the message)", "L0820"),
-    ("format spec forms other than {} and {:?} (named in the message)", "L0641"),
-    ("#[test] functions inside impl blocks", "L9001"),
-    ("inferred expressions (`_`)", "L0820"),
+    ("#[test] functions inside impl blocks (in `lust test`; rustc rejects them too)", "L0402"),
     ("raw references (`&raw`)", "L0820"),
     ("tuple struct patterns with field numbers", "L0820"),
-    ("variadic parameters", "L0820"),
+    ("variadic parameters (rustc rejects them outside `extern` blocks too)", "L0820"),
     ("extern blocks", "L0810"),
     ("extern functions", "L0810"),
     ("C string literals", "L0641"),
-    ("higher-ranked (`for<..>`) types and bounds", "L0614"),
     ("unions", "L0602"),
     ("extern function types", "L0602"),
-    ("raw pointer types", "L0602"),
-    ("inferred types (`_`)", "L0602"),
-    ("this type form", "L0602"),
+    ("inferred types (`_`) in signatures", "L0602"),
 ];
 
 const ITEMS: &[&str] = &[
     "fn",
     "struct (named fields, tuple fields, or unit)",
     "enum (unit, tuple, and struct variants)",
-    "impl (inherent only)",
-    "use (parsed, no effect yet)",
+    "trait (default methods, associated types and consts, generic traits, supertraits)",
+    "impl (inherent, trait, and generic impls)",
+    "use (paths, renames, globs, and groups)",
+    "mod (inline modules and `mod name;` files)",
     "const and static items",
-    "macro_rules (definitions and calls, one file)",
+    "type aliases",
+    "macro_rules (definitions and calls, #[macro_export])",
 ];
 
 const TYPES: &[&str] = &[
@@ -1703,12 +1689,19 @@ const TYPES: &[&str] = &[
     "Result<T, E>",
     "&T",
     "&mut T",
-    "user structs and enums",
+    "user structs and enums, with type, lifetime, and const generic parameters",
     "f32 and f64",
     "tuples",
     "arrays [T; n]",
     "slices &[T] and &mut [T]",
-    "&dyn Trait and &mut dyn Trait for traits defined in the crate, with + Send / + Sync",
+    "dyn Trait behind &, &mut, Box, Rc, and Arc, for crate traits and `Any`, `Error`, `Debug`, `Display`, and the Fn traits, with + Send / + Sync",
+    "Box<T>, Rc<T>, Arc<T>, and their Weak pointers, also of `str`, `[T]`, and `dyn Trait`",
+    "Cell<T> and RefCell<T>",
+    "HashMap<K, V> and HashSet<T>",
+    "Mutex, RwLock, Condvar, Barrier, atomics, mpsc channels, and std::thread (spawn, scope, Builder)",
+    "closures, fn items, and fn pointers",
+    "`impl Trait` as a whole fn argument or return type",
+    "raw pointers *const T and *mut T (safe methods only; a deref needs `unsafe`)",
     "std::env::Args (from std::env::args())",
     "str::Chars (from s.chars())",
     "std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH} and core::time::Duration (std source modules; no layout queries)",
@@ -1716,8 +1709,8 @@ const TYPES: &[&str] = &[
     "std::cmp::Reverse<T> with reversed Ord and PartialOrd, Debug, Hash, Default, Clone (std source)",
     "std::io::copy on std's stack-buffer path (not for &[u8], VecDeque, BufReader readers, Vec<u8> or BufWriter writers, or an OS handle on both sides)",
     "std::ops::ControlFlow<B, C> with `?`, is_break/is_continue, break_value/continue_value, map_break/map_continue (std source)",
-    "std::cell::{OnceCell, LazyCell} and std::sync::{OnceLock, LazyLock, Once} (std source; single-threaded; static LazyLock not yet; no Once::call_once_force)",
-    "std::collections::{BTreeMap, BTreeSet, VecDeque} with btree_map::Entry, owned-item Extend, From arrays, and collect into all three (std source; keys with derived or std order only; no Index or range yet)",
+    "std::cell::{OnceCell, LazyCell} and std::sync::{OnceLock, LazyLock, Once} (std source; single-threaded; no Once::call_once_force)",
+    "std::collections::{BTreeMap, BTreeSet, VecDeque} with btree_map::Entry, owned-item Extend, From arrays, Index and range, and collect into all three (std source; keys with derived or std order only)",
 ];
 
 const CONTROL_FLOW: &[&str] = &[
@@ -1728,7 +1721,7 @@ const CONTROL_FLOW: &[&str] = &[
     "loop (break with a value)",
     "while",
     "while let",
-    "for over ranges, &Vec, &mut Vec, and s.chars()",
+    "for over any IntoIterator (ranges, collections, iterator chains, s.chars())",
     "break and continue, with labels",
     "labeled blocks with break values",
     "early return",
@@ -1758,15 +1751,30 @@ const EXPRESSIONS: &[&str] = &[
     "indexing v[i] and a[i]",
     "tuple values and tuple field access .0",
     "array literals and [value; count] repeat",
-    "ranges a..b and a..=b (in for)",
-    "casts with as (between integers, from bool and char, u8 to char)",
-    "format strings with {}, {:?}, positions, and captured names",
+    "ranges (a..b, a..=b, a.., ..b, and ..)",
+    "casts with as (numeric, bool and char to integers, u8 to char, references to raw pointers)",
+    "closures (Fn, FnMut, FnOnce, and move)",
+    "format strings with {}, {:?}, positions, captured names, and width, fill, precision, sign, # and radix specs",
     "vec! literals with [value; count]",
     "assignment and compound assignment",
     "the ? operator on Option and Result, with From error conversion",
 ];
 
-const DERIVES: &[&str] = &["Debug", "Clone", "Copy", "PartialEq", "Eq (accepted, no effect yet)", "Hash (accepted, no effect yet)"];
+const ATTRIBUTES: &[&str] = &[
+    "derive",
+    "test, ignore, should_panic (`lust test` runs top-level #[test] fns, not ones inside a module)",
+    "allow, warn, and expect; deny and forbid for `unsafe_code` and tool lints",
+    "cfg and cfg_attr",
+    "doc",
+    "inline, cold, must_use, deprecated, track_caller",
+    "repr",
+    "non_exhaustive",
+    "default (on an enum variant, for #[derive(Default)])",
+    "path, macro_use, macro_export",
+    "recursion_limit",
+];
+
+const DERIVES: &[&str] = &["Debug", "Clone", "Copy", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash", "Default"];
 
 /// Grouped std surface: type name to sorted method or associated-function names.
 fn grouped(want: Call) -> Vec<(String, Vec<String>)> {
@@ -1842,8 +1850,6 @@ pub fn run(args: &[String]) -> i32 {
     let int_types: Vec<String> = IntTy::ALL_SUPPORTED.iter().map(|t| t.name().to_string()).collect();
     let mut macros: Vec<String> = ALL_MACROS.iter().map(|&m| format!("{}!", interner.get(macro_name(m, &known)))).collect();
     macros.extend(TOKEN_MACROS.iter().map(|m| format!("{m}!")));
-    let attributes: Vec<String> =
-        [known.derive, known.test, known.allow, known.warn, known.deny].iter().map(|&s| interner.get(s).to_string()).collect();
     let binops: Vec<String> = [
         BinOp::Add,
         BinOp::Sub,
@@ -1908,7 +1914,7 @@ pub fn run(args: &[String]) -> i32 {
             json_groups(&associated),
             json_groups(&functions),
             json_arr(&macros),
-            json_arr(&attributes),
+            json_str_arr(ATTRIBUTES),
             json_str_arr(DERIVES),
             json_arr(&binops),
             json_arr(&unops),
@@ -1939,12 +1945,13 @@ pub fn run(args: &[String]) -> i32 {
             println!("functions in {t}: {}", names.join(", "));
         }
         list("macros", &macros);
-        list("attributes", &attributes);
+        list("attributes", &ATTRIBUTES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         list("derives", &DERIVES.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         list("binary operators", &binops);
         list("unary operators", &unops);
         list("control flow", &CONTROL_FLOW.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         list("patterns", &PATTERNS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        list("expressions", &EXPRESSIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         println!("rejected features ({}):", REJECTED.len());
         for (f, c) in REJECTED {
             println!("  {f} [{c}]");

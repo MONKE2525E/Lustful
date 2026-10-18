@@ -155,6 +155,8 @@ assert codes == doc_codes, (sorted(codes - doc_codes), sorted(doc_codes - codes)
 PYEOF
 check cap-content $? "see the python assert above"
 "$lust" capabilities > "$work/cap.txt" 2>/dev/null; grep -q "methods on Vec<T>" "$work/cap.txt"; check cap-human $? "human output must list methods"
+# Every supported and rejected line has a probe in tests/capabilities/ that shows it.
+python3 "$root/scripts/test-capabilities.py" "$lust" > "$work/cap-probes.txt" 2>&1; check cap-probes $? "a capability line is stale (scripts/test-capabilities.py): $(grep FAIL "$work/cap-probes.txt" | head -5)"
 
 # --- 5. test command edges (parity with rustc is in testtest.sh) ---
 "$lust" test "$root/tests/testrun/basic.rs" --list > "$work/test-list.txt" 2>/dev/null; grep -q "test_add: test" "$work/test-list.txt"; check test-list $? "--list must name the tests"
