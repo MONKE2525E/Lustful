@@ -4947,6 +4947,8 @@ impl FnGen<'_, '_> {
     fn eq_expr(&mut self, t: &CTy, a: &str, b: &str) -> String {
         match t {
             CTy::Unit => "1".into(),
+            // A fieldless enum with the structural `==`: equal discriminants, no glue call.
+            CTy::Adt(_) if fieldless_enum(self.p, t) => format!("({} == {})", disc_call(self.p, t, a), disc_call(self.p, t, b)),
             CTy::Int(i) if is128(*i) => format!("({a}->lo == {b}->lo && {a}->hi == {b}->hi)"),
             CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) | CTy::FnPtr(..) => format!("(*{a} == *{b})"),
             _ => {
@@ -8531,6 +8533,17 @@ impl GlueSet {
     }
 }
 
+/// True for an enum whose variants have no fields and whose `==` is structural (no
+/// written `PartialEq`): two values are equal when their discriminants are.
+fn fieldless_enum(p: &Program, t: &CTy) -> bool {
+    let CTy::Adt(a) = t else { return false };
+    let adt = p.adt(*a);
+    adt.is_enum
+        && !adt.variants.is_empty()
+        && adt.variants.iter().all(|v| v.fields.is_empty())
+        && !p.gx.glue_methods.contains_key(&(*a, p.gx.lang.partial_eq))
+}
+
 /// The runtime's panic entry points, declared again as noreturn and cold for a unit of a
 /// program with unwind tables: there they throw (mode 2) or abort (mode 0), never return,
 /// so the C compiler drops the code after them and keeps them out of the hot path.
@@ -10912,6 +10925,10 @@ fn glue_def_value(
                         body,
                         "  if (a->len != b->len) return 0;\n  for (uint64_t i = 0; i < a->len; i++) if (!{c}) return 0;\n  return 1;"
                     );
+                }
+                // An enum with no fields: equal discriminants (no switch over the variants).
+                CTy::Adt(_) if fieldless_enum(p, t) => {
+                    let _ = writeln!(body, "  return {} == {};", disc_call(p, t, "a"), disc_call(p, t, "b"));
                 }
                 CTy::Adt(a) => {
                     let adt = p.adt(*a);
