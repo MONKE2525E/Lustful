@@ -1053,6 +1053,20 @@ pub struct FnOut {
     pub ll_sig: Vec<CTy>,
     /// The LLVM backend: the fn's size for cross-unit inlining (`ll::LlFn::cost`).
     pub ll_cost: u32,
+    /// The fn's `#[inline]` attribute, which release C inline definitions follow.
+    pub inline: InlineAttr,
+}
+
+/// A fn's `#[inline]` attribute (`inline_attr`). rustc inlines a `#[inline]` fn into other
+/// crates, and an `#[inline(always)]` one wherever it can; release C copies them past
+/// the plain size limit (`inline_limit`), and never copies an `#[inline(never)]` fn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InlineAttr {
+    #[default]
+    None,
+    Hint,
+    Always,
+    Never,
 }
 
 /// The LocalDefId to slot table cgen prints from, with a record of every
@@ -2059,7 +2073,29 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         Vec::new()
     };
     let (ll, ll_decls, ll_c, ll_cost) = llfn.map(|f| (f.def, f.decls, f.helpers, f.cost)).unwrap_or_default();
-    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_sig, ll_cost }
+    let inline = if release { inline_attr(p, body.fn_id) } else { InlineAttr::None };
+    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_sig, ll_cost, inline }
+}
+
+/// `f`'s `#[inline]` attribute (an instance has its template's). A closure body fn or a
+/// trait method stub has none.
+fn inline_attr(p: &Program, f: LocalDefId) -> InlineAttr {
+    use crate::ast::AttrInput;
+    use crate::lexer::{Tok, TokenTree};
+    if p.gx.closure_fns.contains_key(&f) || matches!(p.gx.fn_class.get(f.0 as usize), Some(crate::check::generics::FnClass::Stub)) {
+        return InlineAttr::None;
+    }
+    let mut out = InlineAttr::None;
+    for a in p.fn_info(f).def(&p.ast).attrs.iter().filter(|a| a.path.len() == 1 && p.name(a.path[0].name) == "inline") {
+        out = match &a.input {
+            AttrInput::List(_, t) => match t.as_slice() {
+                [TokenTree::Token(x)] if matches!(x.tok, Tok::Ident(s) if p.name(s) == "always") => InlineAttr::Always,
+                _ => InlineAttr::Never,
+            },
+            _ => InlineAttr::Hint,
+        };
+    }
+    out
 }
 
 impl<'b, 'p> FnGen<'b, 'p> {
@@ -3485,11 +3521,10 @@ impl FnGen<'_, '_> {
             std::iter::once("lust_loc qloc".to_string()).chain(used.iter().map(|n| format!("{} *q{n}", ctype(&self.local_cty[*n])))).collect();
         let defs: String = used.iter().map(|n| format!("#define l{n} (*q{n})\n")).collect();
         let undefs: String = used.iter().map(|n| format!("#undef l{n}\n")).collect();
-        let _ = writeln!(
-            self.prelude,
-            "static void __attribute__((cold, noinline, noreturn)) {name}({}) {{\n{defs}{body}{undefs}}}",
-            params.join(", ")
-        );
+        // Release C: external, so another unit's inline copy of this fn calls it
+        // (`plain_fn_def`); the tag makes the name unique in the program.
+        let linkage = if names::release() { "" } else { "static " };
+        let _ = writeln!(self.prelude, "{linkage}{PK_ATTRS}{name}({}) {{\n{defs}{body}{undefs}}}", params.join(", "));
         let args: Vec<String> = std::iter::once(loc.to_string()).chain(used.iter().map(|n| format!("&l{n}"))).collect();
         Some(format!("{name}({});", args.join(", ")))
     }
@@ -9827,12 +9862,28 @@ fn used_statics<'a>(p: &Program, texts: impl Iterator<Item = &'a str>) -> HashSe
     (0..p.statics.len()).filter(|&i| p.static_live(i) && syms.contains(static_sym(p, i as u32).as_str())).collect()
 }
 
-/// Release C inline definitions (`inline_callees`): the largest fn or glue code a unit
-/// copies, in bytes, and how many call levels it follows from its own fns. Measured on
-/// tsgo: depth gains more than size; 1500 bytes and 3 levels cost +36% cold compile for
-/// about -27% run time without LTO.
+/// Release C inline definitions (`inline_callees`): the largest plain fn definition (its
+/// text alone, not its comment or trampoline) or glue a unit copies, in bytes, and how
+/// many call levels it follows from its own fns. Measured on tsgo: depth gains more than
+/// size; 1500 bytes and 3 levels cost +36% cold compile for about -27% run time without
+/// LTO.
 const INLINE_BYTES: usize = 1500;
 const INLINE_DEPTH: usize = 3;
+/// Past `INLINE_DEPTH`, levels to `INLINE_DEPTH_TINY` copy only tiny fns (an accessor
+/// behind an accessor) and `#[inline]` ones.
+const INLINE_DEPTH_TINY: usize = 6;
+const INLINE_TINY_BYTES: usize = 400;
+
+/// The largest fn definition a unit copies (`inline_callees`), by its `#[inline]`
+/// attribute; 0 copies none.
+fn inline_limit(a: InlineAttr) -> usize {
+    match a {
+        InlineAttr::None => INLINE_BYTES,
+        InlineAttr::Hint => 4 * INLINE_BYTES,
+        InlineAttr::Always => 8 * INLINE_BYTES,
+        InlineAttr::Never => 0,
+    }
+}
 
 /// False when `LUST_RELEASE_INLINE=0`: each release C unit then calls other units' fns and
 /// glue (smaller units, less recompiled when a small fn changes).
@@ -9848,27 +9899,51 @@ fn proto_body_id(e: &str) -> Option<&str> {
     (e.as_bytes().get(i + 16) == Some(&b'(') && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
 }
 
-/// The one fn definition at the start of `code` (after its comment line), and its
-/// header: None when the text holds anything an inline definition may not have
+/// The attributes and result of an outlined panic fn (`panic_outlined`), as its
+/// definition starts in release C.
+const PK_ATTRS: &str = "void __attribute__((cold, noinline, noreturn)) ";
+
+/// The fn definition in `code` that a unit can copy as an inline definition.
+struct PlainDef<'a> {
+    /// The definition's first line, without ` {`.
+    head: &'a str,
+    def: &'a str,
+    /// The headers of the outlined panic fns before it: external in release C, so the
+    /// copy's unit declares them.
+    pks: Vec<&'a str>,
+    /// The definition's size in bytes (not its comment, panic fns or trampoline).
+    len: usize,
+}
+
+/// The one fn definition at the start of `code` (after its outlined panics and its
+/// comment line): None when the text holds anything an inline definition may not have
 /// (static storage, a static helper, a frame's cleanup variable).
-fn plain_fn_def(code: &str) -> Option<(&str, &str)> {
-    // The fn alone: its comment line first (a prelude before it holds static helpers
-    // the fn calls: vtables, thunks, outlined panics).
-    if !code.starts_with("/* ") {
+fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
+    let mut rest = code;
+    let mut pks = Vec::new();
+    while rest.starts_with(PK_ATTRS) {
+        pks.push(&rest[..rest.find(" {\n")?]);
+        rest = &rest[rest.find("\n}\n")? + 3..];
+    }
+    // Then the fn alone: its comment line first (any other prelude holds static helpers
+    // the fn calls: vtables, thunks).
+    if !rest.starts_with("/* ") {
         return None;
     }
-    let start = code.find(" */\n")? + 4;
-    let end = code[start..].find("\n}\n")? + start + 3;
-    let def = &code[start..end];
+    let start = rest.find(" */\n")? + 4;
+    let end = rest[start..].find("\n}\n")? + start + 3;
+    let def = &rest[start..end];
     let head = def.split(" {\n").next()?;
     // `#define`: an over-aligned local's macro, whose `#undef` follows the fn.
-    (!def.contains("static ") && !def.contains("__attribute__") && !def.contains("#define") && !head.contains('\n')).then_some((head, def))
+    (!def.contains("static ") && !def.contains("__attribute__") && !def.contains("#define") && !head.contains('\n'))
+        .then_some(PlainDef { head, def, pks, len: def.len() })
 }
 
 /// Release C: the small fns that the fns in `slots` call and another unit holds; this
 /// unit gets them as C99 inline definitions, so the C compiler can inline them without
 /// LTO (their holder keeps the external definition, so calls and addresses are the same).
-fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, skip: &HashSet<usize>) -> Vec<usize> {
+/// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns.
+fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, skip: &HashSet<usize>, deep: bool) -> Vec<usize> {
     let mut out = BTreeSet::new();
     for e in externs {
         if let Some(id) = proto_body_id(e)
@@ -9876,8 +9951,9 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, 
             && let Some(f) = fns.get(c as usize)
             && !skip.contains(&(c as usize))
             && f.error.is_none()
-            && f.code.len() <= INLINE_BYTES
-            && plain_fn_def(&f.code).is_some()
+            && plain_fn_def(&f.code).is_some_and(|d| {
+                d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
+            })
         {
             out.insert(c as usize);
         }
@@ -9921,12 +9997,12 @@ pub fn fn_unit_parts(
     // backend calls fns through `fl_<id>` and gets their copies from `ll_inl` instead.
     let own: HashSet<usize> = slots.iter().copied().collect();
     let inline = names::release() && inline_on();
-    let mut inl = if inline && !llvm { inline_callees(fns, slots.iter().flat_map(|&s| &fns[s].externs), &own) } else { Vec::new() };
+    let mut inl = if inline && !llvm { inline_callees(fns, slots.iter().flat_map(|&s| &fns[s].externs), &own, false) } else { Vec::new() };
     // Deeper levels: the small callees of the inline callees.
     let mut frontier = inl.clone();
-    for _ in 1..INLINE_DEPTH {
+    for level in 1..INLINE_DEPTH_TINY {
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
-        let more = inline_callees(fns, frontier.iter().flat_map(|&s| &fns[s].externs), &skip);
+        let more = inline_callees(fns, frontier.iter().flat_map(|&s| &fns[s].externs), &skip, level >= INLINE_DEPTH);
         if more.is_empty() {
             break;
         }
@@ -9962,7 +10038,7 @@ pub fn fn_unit_parts(
         // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
         let more =
-            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip) };
+            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip, false) };
         for &s in &more {
             types.extend(fns[s].types.iter().cloned());
             named.extend(fns[s].named.iter().cloned());
@@ -10055,9 +10131,12 @@ pub fn fn_unit_parts(
     externs.retain(|e| proto_body_id(e).is_none_or(|id| !inl_ids.contains(id)));
     externs.into_iter().for_each(|e| c.push_str(e));
     // Inline fn definitions: declared before any glue or body can call them.
-    let defs: Vec<(&str, &str)> = inl.iter().filter_map(|&s| plain_fn_def(&fns[s].code)).collect();
-    for (head, _) in &defs {
-        let _ = writeln!(c, "inline {head};");
+    let defs: Vec<PlainDef> = inl.iter().filter_map(|&s| plain_fn_def(&fns[s].code)).collect();
+    for d in &defs {
+        for pk in &d.pks {
+            let _ = writeln!(c, "{pk};");
+        }
+        let _ = writeln!(c, "inline {};", d.head);
     }
     let mut keys: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
@@ -10079,8 +10158,8 @@ pub fn fn_unit_parts(
             c.push_str(&g.def_map[*k]);
         }
     }
-    for (_, def) in &defs {
-        let _ = write!(c, "inline {def}\n");
+    for d in &defs {
+        let _ = write!(c, "inline {}\n", d.def);
     }
     let helpers = if llvm {
         let mut h = c.clone();
