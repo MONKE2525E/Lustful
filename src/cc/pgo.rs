@@ -49,6 +49,8 @@ pub struct Pgo {
     helpers: usize,
     /// Other records no unit defines (fns this build does not have): in no profile.
     absent: usize,
+    /// The quantized profile and pins came from the last build's work dir (`load`).
+    kept: bool,
     work: PathBuf,
 }
 
@@ -62,13 +64,13 @@ impl Mode {
         let Some(path) = std::env::var_os("LUST_PGO_USE") else { return Ok(None) };
         // The profile format and the fns' CFG hashes are those of one LLVM major.
         let cc = clang_major(&spec.cmd)?;
-        let pd = run(Command::new(profdata()).arg("--version"))?;
-        let pd = major_after(&pd, "LLVM version ")?;
+        let tool = run(Command::new(profdata()).arg("--version"))?;
+        let pd = major_after(&tool, "LLVM version ")?;
         if pd != cc {
             return Err(format!("LUST_PROFDATA ({}) is LLVM {pd}, the compiler ({}) LLVM {cc}", profdata(), spec.cmd.join(" ")));
         }
         let bits = std::env::var("LUST_PGO_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
-        Pgo::load(Path::new(&path), bits, work, &unit_defs(spec, units)).map(|p| Some(Mode::Use(p)))
+        Pgo::load(Path::new(&path), bits, work, &tool, &unit_defs(spec, units)).map(|p| Some(Mode::Use(p)))
     }
 
     /// Extra link flags: the profile runtime of an instrumented build.
@@ -118,7 +120,7 @@ impl Mode {
     pub fn describe(&self) -> String {
         match self {
             Mode::Gen => "pgo instrumented".into(),
-            Mode::Use(p) => format!("pgo {} records, {} runtime helpers, {} of fns not in this build", p.records, p.helpers, p.absent),
+            Mode::Use(p) => format!("pgo {} records{}, {} runtime helpers, {} of fns not in this build", p.records, if p.kept { " (kept)" } else { "" }, p.helpers, p.absent),
         }
     }
 }
@@ -184,25 +186,45 @@ fn digest(parts: &[&[u8]]) -> String {
 
 impl Pgo {
     /// Reads `path` (an indexed profile), quantizes it to `bits`, pins the summary
-    /// thresholds of the whole quantized profile, and splits the records by unit.
-    fn load(path: &Path, bits: u32, work: &Path, defs: &UnitDefs) -> Result<Pgo, String> {
-        let text = run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(path))?;
-        let (head, mut records) = parse(&text);
-        if bits > 0 {
-            for r in records.values_mut() {
-                *r = quantize(r, bits);
-            }
-        }
+    /// thresholds of the whole quantized profile, and splits the records by unit. `tool` is
+    /// the `llvm-profdata --version` text.
+    fn load(path: &Path, bits: u32, work: &Path, tool: &str, defs: &UnitDefs) -> Result<Pgo, String> {
         std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
-        let (txt, all) = (work.join("pgo-all.proftext"), work.join("pgo-all.profdata"));
-        let mut names: Vec<&String> = records.keys().collect();
-        names.sort();
-        let body: Vec<&str> = names.iter().map(|n| records[*n].as_str()).collect();
-        std::fs::write(&txt, format!("{head}{}\n\n", body.join("\n\n"))).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
-        run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
-        let pins = pins(&run(Command::new(profdata()).args(["show", "--detailed-summary"]).arg(&all))?)?;
+        let (txt, all, memo) = (work.join("pgo-all.proftext"), work.join("pgo-all.profdata"), work.join("pgo-all.memo"));
+        // The quantized profile and its pins depend only on the profile, `bits` and the
+        // tool: a warm build of the same ones (a pinned profile, every merge) reads them
+        // back from the last build's work dir instead of running llvm-profdata three times
+        // (~2.8 s for tsgo's). `memo` holds their digest and the pins, and is written last.
+        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let key = digest(&[&bytes, &bits.to_le_bytes(), tool.as_bytes()]);
+        let kept = std::fs::read_to_string(&memo)
+            .ok()
+            .and_then(|m| m.strip_prefix(&format!("{key}\n")).map(|pins| pins.split_whitespace().map(str::to_string).collect::<Vec<_>>()))
+            .and_then(|pins| std::fs::read_to_string(&txt).ok().map(|t| (parse(&t), pins)));
+        let hit = kept.is_some();
+        let ((head, records), pins) = match kept {
+            Some(k) => k,
+            None => {
+                let _ = std::fs::remove_file(&memo);
+                let text = run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(path))?;
+                let (head, mut records) = parse(&text);
+                if bits > 0 {
+                    for r in records.values_mut() {
+                        *r = quantize(r, bits);
+                    }
+                }
+                let mut names: Vec<&String> = records.keys().collect();
+                names.sort();
+                let body: Vec<&str> = names.iter().map(|n| records[*n].as_str()).collect();
+                std::fs::write(&txt, format!("{head}{}\n\n", body.join("\n\n"))).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
+                run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
+                let pins = pins(&run(Command::new(profdata()).args(["show", "--detailed-summary"]).arg(&all))?)?;
+                std::fs::write(&memo, format!("{key}\n{}\n", pins.join(" "))).map_err(|e| format!("cannot write {}: {e}", memo.display()))?;
+                ((head, records), pins)
+            }
+        };
         let (own, helpers, absent) = split(&records, defs);
-        Ok(Pgo { head, own, pins, records: records.len(), helpers, absent, work: work.to_path_buf() })
+        Ok(Pgo { head, own, pins, records: records.len(), helpers, absent, kept: hit, work: work.to_path_buf() })
     }
 }
 
@@ -480,7 +502,7 @@ mod tests {
             macro_made: macro_made.iter().map(|n| n.to_string()).collect(),
         };
         let (own, helpers, absent) = split(&recs, &defs);
-        Mode::Use(Pgo { head: String::new(), own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, work: PathBuf::new() })
+        Mode::Use(Pgo { head: String::new(), own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, kept: false, work: PathBuf::new() })
     }
 
     /// A unit's key moves only with the records of the fns it defines (the runtime unit's
