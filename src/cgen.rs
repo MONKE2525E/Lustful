@@ -3891,13 +3891,16 @@ impl FnGen<'_, '_> {
                 let (ok_ct, err_ct) = (ctype(&ok), ctype(&err));
                 let res = CTy::Result(ok, err);
                 self.note_held(&res);
-                let (t, i) = (self.tmp(), self.tmp());
+                let t = self.tmp();
                 let (ok_f, err_f) = (variant_field(self.p, &res, &t, 0, 0), variant_field(self.p, &res, &t, 1, 0));
                 let (ok_d, err_d) = (disc_set(self.p, &res, &t, 0), disc_set(self.p, &res, &t, 1));
+                // By value the elements are Copy (core's impl): one memcpy, which the C
+                // compiler makes a single load and store for a small array (byte by byte,
+                // a following 8-byte read of the array stalled on store forwarding).
                 let ok_assign = if by_ref {
                     format!("{ok_f} = ({ok_ct}){ptr};")
                 } else {
-                    format!("for (uint64_t {i} = 0; {i} < {n}; {i}++) {ok_f}.v[{i}] = {ptr}[{i}];")
+                    format!("lust_memcpy({ok_f}.v, {ptr}, {n} * sizeof({ok_f}.v[0]));")
                 };
                 let te = self.tmp();
                 let _ = writeln!(self.out, "    {} {t}; {err_ct} {te}; {te}.f0 = ((lust_Unit){{}});", ctype(&res));
