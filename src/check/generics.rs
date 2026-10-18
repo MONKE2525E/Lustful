@@ -10462,12 +10462,10 @@ pub fn instance_for(p: &Program, src: &dyn TyIntern, template: LocalDefId, args:
             other => lifted.push(other),
         }
     }
-    for ((def, aid), local) in &p.gx.instance_by_key {
-        if *def == template_def && p.tys.args(*aid) == lifted.as_slice() {
-            return Some(*local);
-        }
-    }
-    None
+    // The global store hash-conses arg lists, so equal args are one id:
+    // a direct lookup finds what a scan of every instance would.
+    let args_id = p.tys.get_args(&lifted)?;
+    p.gx.instance_by_key.get(&(template_def, args_id)).copied()
 }
 
 /// One signature fn per method of each trait a template's env names,
