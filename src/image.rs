@@ -26,7 +26,12 @@
 //      Zero pages (freed blocks among them) are holes in every layer. Each
 //      layer has a header (format, compiler build, address anchors, the
 //      `Roots` pointer, the next arena base, its parent layer), a region
-//      table, then pages. Arena pages hold the live blocks mimalloc
+//      table, then pages. With `LUST_FRONT_ZSTD=1` (and the system's
+//      libzstd) a layer is written packed (`pack`): its raw form in 8 MB
+//      zstd sections, which the next run reads in one pass and unpacks in
+//      parallel into a memfd (`unpack`): on a CI disk, page faults on a
+//      raw tsgo chain (13.2 GB) cost a fresh merge 12.8 s, and the chain
+//      packs to 1.1 GB. Arena pages hold the live blocks mimalloc
 //      reports (`mi_heap_visit_blocks`), with the bytes of free blocks
 //      written as zeros; pages with no live block are left out. The
 //      process-wide tables the session's spans index into
@@ -85,6 +90,14 @@ const NO_COMPACT: &str = "nocompact";
 const COMPACT_DUE: &str = "compact-due";
 /// Image format. Bump on any change to the header or to what `Roots` holds.
 const MAGIC: &[u8; 8] = b"LUSTFIM3";
+/// A packed layer (`pack`): the raw (`MAGIC`) layer in zstd sections.
+const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ1";
+/// `LUST_FRONT_ZSTD=1`: saves write packed layers (when libzstd loads).
+const PACK_ENV: &str = "LUST_FRONT_ZSTD";
+/// Raw bytes per packed section; sections pack and unpack in parallel.
+const SECTION: usize = 8 << 20;
+const RTLD_NOW: c_int = 2;
+const MFD_CLOEXEC: std::ffi::c_uint = 1;
 /// Arena bases come from this window, one generation after another:
 /// 16 TiB to 80 TiB, below where Linux puts a non-randomized binary
 /// (0x5555_5555_4000) and its mmap area.
@@ -132,6 +145,9 @@ unsafe extern "C" {
     ) -> bool;
     fn mi_option_set(option: c_int, value: std::ffi::c_long);
     fn mi_heap_visit_blocks(heap: *mut c_void, visit_blocks: bool, visitor: Visitor, arg: *mut c_void) -> bool;
+    fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn memfd_create(name: *const c_char, flags: std::ffi::c_uint) -> c_int;
 }
 
 const PROT_RW: c_int = 0x1 | 0x2;
@@ -399,8 +415,11 @@ struct Header {
     /// This layer's id, and its parent's (0 for a base).
     id: u64,
     parent: u64,
-    /// (address, length, file offset), all page-aligned.
+    /// (address, length, file offset), all page-aligned. A packed layer's
+    /// offsets are in its raw form.
     regions: Vec<(u64, u64, u64)>,
+    /// A packed layer's raw length and sections (file offset, packed length).
+    packed: Option<(u64, Vec<(u64, u64)>)>,
 }
 
 impl Header {
@@ -443,20 +462,56 @@ fn read_header(path: &Path) -> Result<Header, String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("no image: {e}"))?;
     let mut head = vec![0u8; HEADER];
     f.read_exact(&mut head).map_err(|_| "short image".to_string())?;
+    let word = |b: &[u8], i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    if &head[..8] == MAGIC_PACKED {
+        // A packed layer (`pack`): raw length, section count and the raw
+        // header's length, the raw header, then the section table.
+        let (raw_len, n, head_len) = (word(&head, 8), word(&head, 16), word(&head, 24));
+        if n > 1 << 24 || head_len > 1 << 30 || (head_len as usize) < HEADER {
+            return Err("packed image header".into());
+        }
+        // The first HEADER bytes are read; the rest of the head follows.
+        let mut all = head.clone();
+        all.resize(32 + head_len as usize + n as usize * 16, 0);
+        f.read_exact(&mut all[HEADER..]).map_err(|_| "short packed image".to_string())?;
+        let file_len = f.metadata().map_err(|e| format!("image: {e}"))?.len();
+        let inner = &all[32..32 + head_len as usize];
+        let mut h = parse_header(&inner[..HEADER], &inner[HEADER..], raw_len)?;
+        let table = &all[32 + head_len as usize..];
+        let sections: Vec<(u64, u64)> = table.chunks_exact(16).map(|c| (word(c, 0), word(c, 8))).collect();
+        if sections.len() != raw_len.div_ceil(SECTION as u64) as usize || sections.iter().any(|&(o, l)| o.checked_add(l).is_none_or(|e| e > file_len)) {
+            return Err("packed image section table".into());
+        }
+        h.packed = Some((raw_len, sections));
+        return Ok(h);
+    }
     if &head[..8] != MAGIC {
         return Err("image format".into());
     }
-    let word = |b: &[u8], i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-    let mut build = [0u8; 64];
-    build.copy_from_slice(&head[8..72]);
-    let anchors = [word(&head, 72), word(&head, 80), word(&head, 88), word(&head, 96)];
-    let [root, next_base, generation, live, id, parent, n] = std::array::from_fn(|i| word(&head, 104 + 8 * i));
+    let n = word(&head, 104 + 8 * 6);
     if n > 1 << 24 {
         return Err("image region count".into());
     }
     let mut table = vec![0u8; n as usize * 24];
     f.read_exact(&mut table).map_err(|_| "short image table".to_string())?;
     let len = f.metadata().map_err(|e| format!("image: {e}"))?.len();
+    parse_header(&head, &table, len)
+}
+
+/// A raw layer's header and region table, its regions checked against the
+/// layer's (raw) length.
+fn parse_header(head: &[u8], table: &[u8], len: u64) -> Result<Header, String> {
+    let word = |b: &[u8], i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    if head.len() < HEADER || &head[..8] != MAGIC {
+        return Err("image format".into());
+    }
+    let mut build = [0u8; 64];
+    build.copy_from_slice(&head[8..72]);
+    let anchors = [word(head, 72), word(head, 80), word(head, 88), word(head, 96)];
+    let [root, next_base, generation, live, id, parent, n] = std::array::from_fn(|i| word(head, 104 + 8 * i));
+    if table.len() as u64 != n.saturating_mul(24) {
+        return Err("image region table".into());
+    }
     let regions: Vec<(u64, u64, u64)> = table.chunks_exact(24).map(|c| (word(c, 0), word(c, 8), word(c, 16))).collect();
     if regions
         .iter()
@@ -464,7 +519,188 @@ fn read_header(path: &Path) -> Result<Header, String> {
     {
         return Err("image region table".into());
     }
-    Ok(Header { build, anchors, root, next_base, generation, live, id, parent, regions })
+    Ok(Header { build, anchors, root, next_base, generation, live, id, parent, regions, packed: None })
+}
+
+/// The system's libzstd, opened on first use with dlopen (no build-time
+/// link): packed layers (`pack`, `unpack`). None when it is missing; saves
+/// then write raw layers, and a packed image does not load.
+struct Zstd {
+    compress: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, c_int) -> usize,
+    decompress: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize) -> usize,
+    bound: unsafe extern "C" fn(usize) -> usize,
+    is_error: unsafe extern "C" fn(usize) -> std::ffi::c_uint,
+}
+
+fn zstd() -> Option<&'static Zstd> {
+    static Z: std::sync::OnceLock<Option<Zstd>> = std::sync::OnceLock::new();
+    Z.get_or_init(|| {
+        // SAFETY: dlopen and dlsym by name; each symbol is libzstd's stable
+        // API (zstd.h) with exactly the signature it is cast to.
+        unsafe {
+            let lib = dlopen(c"libzstd.so.1".as_ptr(), RTLD_NOW);
+            if lib.is_null() {
+                return None;
+            }
+            let sym = |name: &std::ffi::CStr| dlsym(lib, name.as_ptr());
+            let (c, d, b, e) = (sym(c"ZSTD_compress"), sym(c"ZSTD_decompress"), sym(c"ZSTD_compressBound"), sym(c"ZSTD_isError"));
+            if c.is_null() || d.is_null() || b.is_null() || e.is_null() {
+                return None;
+            }
+            Some(Zstd {
+                compress: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, c_int) -> usize>(c),
+                decompress: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize) -> usize>(d),
+                bound: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(usize) -> usize>(b),
+                is_error: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(usize) -> std::ffi::c_uint>(e),
+            })
+        }
+    })
+    .as_ref()
+}
+
+/// The threads that pack or unpack a layer's sections.
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16)
+}
+
+/// Fills `buf` from `f` at `off` (a hole reads as zeros).
+fn read_full_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> bool {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, off).is_ok()
+}
+
+/// Writes raw layer `raw` (`len` bytes; `head` is its header and region
+/// table) to `out` packed: a short header (`MAGIC_PACKED`, the raw length,
+/// the section count, `head`'s length), `head` itself (so the chain reads
+/// without unpacking), the section table, then the raw form cut into
+/// `SECTION`-byte sections, each one zstd frame, packed in parallel.
+/// Returns the packed length.
+fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: &Zstd) -> Result<u64, String> {
+    use std::io::Write;
+    let n = (len as usize).div_ceil(SECTION);
+    let level: c_int = std::env::var("LUST_FRONT_ZSTD_LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let parts: Vec<std::sync::Mutex<Option<Vec<u8>>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..workers().min(n.max(1)) {
+            s.spawn(|| {
+                let mut rbuf = vec![0u8; SECTION];
+                loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= n || failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let at = k * SECTION;
+                    let rlen = (len as usize - at).min(SECTION);
+                    if !read_full_at(raw, &mut rbuf[..rlen], at as u64) {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
+                    let bound = unsafe { (z.bound)(rlen) };
+                    let mut cbuf = vec![0u8; bound];
+                    let c = unsafe { (z.compress)(cbuf.as_mut_ptr() as *mut c_void, bound, rbuf.as_ptr() as *const c_void, rlen, level) };
+                    if unsafe { (z.is_error)(c) } != 0 {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    cbuf.truncate(c);
+                    *parts[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(cbuf);
+                }
+            });
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        return Err("image pack failed".into());
+    }
+    let parts: Vec<Vec<u8>> = parts.into_iter().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or_default()).collect();
+    let mut at = (32 + head.len() + n * 16) as u64;
+    let mut table = Vec::with_capacity(n * 16);
+    for p in &parts {
+        table.extend_from_slice(&at.to_le_bytes());
+        table.extend_from_slice(&(p.len() as u64).to_le_bytes());
+        at += p.len() as u64;
+    }
+    let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
+    let mut top = Vec::with_capacity(32);
+    top.extend_from_slice(MAGIC_PACKED);
+    for v in [len, n as u64, head.len() as u64] {
+        top.extend_from_slice(&v.to_le_bytes());
+    }
+    let ok = w.write_all(&top).is_ok() && w.write_all(head).is_ok() && w.write_all(&table).is_ok() && parts.iter().all(|p| w.write_all(p).is_ok()) && w.flush().is_ok();
+    if !ok {
+        return Err("image pack write failed".into());
+    }
+    Ok(at)
+}
+
+/// Packed layer `path` back in its raw form, in a new memfd that the
+/// regions then map privately (`load`): the sections unpacked in parallel,
+/// each section's zero pages left out, so they stay holes and read as zero.
+fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64)], z: &Zstd) -> Result<std::fs::File, String> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileExt;
+    let src = std::fs::File::open(path).map_err(|e| format!("image: {e}"))?;
+    // SAFETY: a new anonymous file; the File below owns its descriptor.
+    let fd = unsafe { memfd_create(c"lust-front-layer".as_ptr(), MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err("memfd_create failed".into());
+    }
+    // SAFETY: `fd` is a fresh descriptor no one else holds.
+    let mem = unsafe { std::fs::File::from_raw_fd(fd) };
+    mem.set_len(raw_len).map_err(|e| format!("image memfd: {e}"))?;
+    let next = AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..workers().min(sections.len().max(1)) {
+            s.spawn(|| {
+                let mut cbuf: Vec<u8> = Vec::new();
+                let mut rbuf = vec![0u8; SECTION];
+                loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= sections.len() || failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let (off, clen) = sections[k];
+                    let at = k * SECTION;
+                    let rlen = (raw_len as usize - at).min(SECTION);
+                    cbuf.resize(clen as usize, 0);
+                    if !read_full_at(&src, &mut cbuf, off) {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
+                    let d = unsafe { (z.decompress)(rbuf.as_mut_ptr() as *mut c_void, rlen, cbuf.as_ptr() as *const c_void, cbuf.len()) };
+                    if unsafe { (z.is_error)(d) } != 0 || d != rlen {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    // Runs of pages with a nonzero byte; zero pages stay holes.
+                    let zero = |q: usize| rbuf[q..(q + PAGE).min(rlen)].chunks(8).all(|c| c.iter().all(|&b| b == 0));
+                    let mut q = 0;
+                    while q < rlen {
+                        if zero(q) {
+                            q += PAGE;
+                            continue;
+                        }
+                        let s0 = q;
+                        while q < rlen && !zero(q) {
+                            q += PAGE;
+                        }
+                        let e = q.min(rlen);
+                        if mem.write_all_at(&rbuf[s0..e], (at + s0) as u64).is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        return Err(format!("cannot unpack {}", path.display()));
+    }
+    Ok(mem)
 }
 
 /// The layers that make up the image in `dir`: the base, then each delta
@@ -513,9 +749,14 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     if window_taken(arena) {
         return Err("image window in use".into());
     }
+    // A packed layer unpacks into a memfd with its raw form: one read of the
+    // file instead of page faults on it (a CI disk serves those slowly).
     let mut files = Vec::with_capacity(chain.len());
-    for k in 0..chain.len() {
-        files.push(std::fs::File::open(layer_path(dir, k)).map_err(|e| format!("image: {e}"))?);
+    for (k, h) in chain.iter().enumerate() {
+        files.push(match &h.packed {
+            Some((raw_len, sections)) => unpack(&layer_path(dir, k), *raw_len, sections, zstd().ok_or("a packed image, and no libzstd")?)?,
+            None => std::fs::File::open(layer_path(dir, k)).map_err(|e| format!("image: {e}"))?,
+        });
     }
     let mut mapped: Vec<(usize, usize)> = Vec::new();
     let unmap_all = |mapped: &[(usize, usize)]| {
@@ -560,7 +801,7 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     // The deltas' data on disk (their holes cost nothing): past half the
     // base's live bytes, the next save writes a new base.
     let deltas: u64 = files[1..].iter().map(|f| f.metadata().map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512)).sum();
-    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live });
+    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live, files });
     // SAFETY: the root was a leaked `Box<Roots>` of a process running this
     // same binary at the same addresses (checked: build id, anchors), and
     // every page it reaches is mapped back above.
@@ -581,6 +822,9 @@ struct Loaded {
     delta_bytes: u64,
     /// The session's live bytes when the top layer was written (estimate).
     live: u64,
+    /// Each layer's raw form (the file, or a packed layer's memfd), which
+    /// a base write copies untouched pages from.
+    files: Vec<std::fs::File>,
 }
 
 static LOADED: std::sync::OnceLock<Loaded> = std::sync::OnceLock::new();
@@ -1231,7 +1475,7 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     // Both are found now: nothing may allocate between the two passes.
     let base_from: Option<(Vec<(usize, usize)>, Vec<std::fs::File>)> = match loaded {
         Some(l) if delta.is_none() => {
-            let files = (0..l.layers).map(|k| std::fs::File::open(layer_path(dir, k))).collect::<Result<Vec<_>, _>>().map_err(|e| format!("image: {e}"))?;
+            let files = l.files.iter().map(std::fs::File::try_clone).collect::<Result<Vec<_>, _>>().map_err(|e| format!("image: {e}"))?;
             Some((modified_runs(restored)?, files))
         }
         _ => None,
@@ -1239,7 +1483,22 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     let base_fds: Vec<c_int> = base_from.as_ref().map_or(Vec::new(), |(_, f)| f.iter().map(|f| f.as_raw_fd()).collect());
     let path = layer_path(dir, layer);
     let tmp = dir.join(format!("front.tmp{}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("image: {e}"))?;
+    // Packed (`LUST_FRONT_ZSTD=1`): the raw layer goes to a memfd first, then
+    // `pack` writes it to the temp file.
+    let packer = zstd().filter(|_| std::env::var_os(PACK_ENV).is_some_and(|v| v == "1"));
+    let mut file = match packer {
+        Some(_) => {
+            use std::os::fd::FromRawFd;
+            // SAFETY: a new anonymous file; the File owns its descriptor.
+            let fd = unsafe { memfd_create(c"lust-front-save".as_ptr(), MFD_CLOEXEC) };
+            if fd < 0 {
+                return Err("memfd_create failed".into());
+            }
+            // SAFETY: `fd` is a fresh descriptor no one else holds.
+            unsafe { std::fs::File::from_raw_fd(fd) }
+        }
+        None => std::fs::File::create(&tmp).map_err(|e| format!("image: {e}"))?,
+    };
     let fail = |tmp: &Path, e: String| {
         let _ = std::fs::remove_file(tmp);
         Err(e)
@@ -1400,6 +1659,7 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         id,
         parent,
         regions,
+        packed: None,
     };
     // A trailing hole leaves the file short of its last region's end.
     ok = ok && file.set_len(off).is_ok();
@@ -1407,6 +1667,17 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     ok = ok && file.metadata().is_ok_and(|m| m.len() == off);
     if !ok {
         return fail(&tmp, "image write failed".into());
+    }
+    let mut packed_len = None;
+    if let Some(z) = packer {
+        let mut out = match std::fs::File::create(&tmp) {
+            Ok(f) => f,
+            Err(e) => return fail(&tmp, format!("image: {e}")),
+        };
+        match pack(&file, off, &h.bytes(), &mut out, z) {
+            Ok(n) => packed_len = Some(n),
+            Err(e) => return fail(&tmp, e),
+        }
     }
     drop(file);
     if let Err(e) = std::fs::rename(&tmp, &path) {
@@ -1418,7 +1689,7 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         k += 1;
     }
     Ok(format!(
-        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}, {:.0} ms, {} MB live ({} MB of restored blocks freed)",
+        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}, {:.0} ms, {} MB live ({} MB of restored blocks freed){}",
         h.generation,
         if layer == 0 { "base".to_string() } else { format!("delta {layer}") },
         w.blocks,
@@ -1427,7 +1698,8 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         if layer == 0 { "kept" } else { "rewritten" },
         t.elapsed().as_secs_f64() * 1e3,
         live >> 20,
-        OLD_FREED.load(Ordering::Relaxed) >> 20
+        OLD_FREED.load(Ordering::Relaxed) >> 20,
+        packed_len.map_or(String::new(), |n| format!(", packed to {} MB", n >> 20))
     ))
 }
 
@@ -1439,6 +1711,39 @@ pub fn discard(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw layer packs and unpacks to the same bytes, and its zero pages
+    /// stay holes in the memfd. Skipped where libzstd is missing.
+    #[test]
+    fn pack_round_trip() {
+        let Some(z) = zstd() else { return };
+        let dir = std::env::temp_dir().join(format!("lust-pack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let len = 3 * SECTION + 5 * PAGE;
+        // Every third page zero, the others a pattern.
+        let data: Vec<u8> = (0..len).map(|i| if (i / PAGE) % 3 == 1 { 0 } else { (i * 31 % 251) as u8 }).collect();
+        std::fs::write(dir.join("raw"), &data).unwrap();
+        let raw = std::fs::File::open(dir.join("raw")).unwrap();
+        let head = vec![7u8; HEADER];
+        let mut out = std::fs::File::create(dir.join("packed")).unwrap();
+        let n = pack(&raw, len as u64, &head, &mut out, z).unwrap();
+        drop(out);
+        let packed = std::fs::read(dir.join("packed")).unwrap();
+        assert_eq!(packed.len() as u64, n);
+        assert_eq!(&packed[..8], MAGIC_PACKED);
+        let word = |i: usize| u64::from_le_bytes(packed[i..i + 8].try_into().unwrap());
+        assert_eq!((word(8), word(24)), (len as u64, HEADER as u64));
+        let at = 32 + HEADER;
+        let sections: Vec<(u64, u64)> = (0..word(16) as usize).map(|k| (word(at + 16 * k), word(at + 16 * k + 8))).collect();
+        assert_eq!(sections.len(), len.div_ceil(SECTION));
+        let mem = unpack(&dir.join("packed"), len as u64, &sections, z).unwrap();
+        let mut back = vec![0u8; len];
+        assert!(read_full_at(&mem, &mut back, 0));
+        assert!(back == data, "unpacked bytes differ");
+        let allocated = std::os::unix::fs::MetadataExt::blocks(&mem.metadata().unwrap()) * 512;
+        assert!(allocated < len as u64 * 3 / 4, "zero pages were written: {allocated} of {len} bytes allocated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn overlay_keeps_the_topmost_layer() {
@@ -1496,6 +1801,7 @@ mod tests {
             id,
             parent,
             regions: vec![(0x1000_0000_0000, 2 * PAGE as u64, PAGE as u64), (0x1000_0010_0000, PAGE as u64, 3 * PAGE as u64)],
+            packed: None,
         }
     }
 
