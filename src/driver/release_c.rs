@@ -43,7 +43,7 @@ pub fn names(program: &Program, fn_slot: &[u32], n_slots: usize, inst_adts: &[(u
             (None, None) => format!("x{a}"),
         })
         .collect();
-    Arc::new(cgen::names::Names { fns, adts })
+    Arc::new(cgen::names::Names { fns, adts, by_id: Default::default() })
 }
 
 /// The release fn units: (registration fn name, slots in unit order), in a stable
@@ -116,7 +116,11 @@ mod tests {
     /// `n` fns in one file, slot `s` on line `10 * s` with `size` bytes of code each.
     fn program(n: usize, size: usize) -> (Vec<FnOut>, cgen::names::Names, Vec<String>, Vec<u32>) {
         let out = (0..n).map(|_| FnOut { code: "x".repeat(size), ..Default::default() }).collect();
-        let names = cgen::names::Names { fns: (0..n).map(|s| Some(format!("{:016x}", hash64(&format!("fn{s}"))))).collect(), adts: Vec::new() };
+        let names = cgen::names::Names {
+            fns: (0..n).map(|s| Some(format!("{:016x}", hash64(&format!("fn{s}"))))).collect(),
+            adts: Vec::new(),
+            by_id: Default::default(),
+        };
         (out, names, vec!["src/a.rs".to_string(); n], (0..n as u32).map(|s| 10 * s).collect())
     }
 

@@ -9577,6 +9577,64 @@ fn used_statics<'a>(p: &Program, texts: impl Iterator<Item = &'a str>) -> HashSe
     (0..p.statics.len()).filter(|&i| syms.contains(static_sym(p, i as u32).as_str())).collect()
 }
 
+/// Release C inline definitions (`inline_callees`): the largest fn or glue code a unit
+/// copies, in bytes, and how many call levels it follows from its own fns. Measured on
+/// tsgo: depth gains more than size; 1500 bytes and 3 levels cost +36% cold compile for
+/// about -27% run time without LTO.
+const INLINE_BYTES: usize = 1500;
+const INLINE_DEPTH: usize = 3;
+
+/// False when `LUST_RELEASE_INLINE=0`: each release C unit then calls other units' fns and
+/// glue (smaller units, less recompiled when a small fn changes).
+fn inline_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LUST_RELEASE_INLINE").is_none_or(|v| v != "0"))
+}
+
+/// The id in a release C prototype of a fn body (`T f_<id>(...);`).
+fn proto_body_id(e: &str) -> Option<&str> {
+    let i = e.find(" f_").or_else(|| e.find("*f_"))? + 3;
+    let id = e.get(i..i + 16)?;
+    (e.as_bytes().get(i + 16) == Some(&b'(') && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
+}
+
+/// The one fn definition at the start of `code` (after its comment line), and its
+/// header: None when the text holds anything an inline definition may not have
+/// (static storage, a static helper, a frame's cleanup variable).
+fn plain_fn_def(code: &str) -> Option<(&str, &str)> {
+    // The fn alone: its comment line first (a prelude before it holds static helpers
+    // the fn calls: vtables, thunks, outlined panics).
+    if !code.starts_with("/* ") {
+        return None;
+    }
+    let start = code.find(" */\n")? + 4;
+    let end = code[start..].find("\n}\n")? + start + 3;
+    let def = &code[start..end];
+    let head = def.split(" {\n").next()?;
+    // `#define`: an over-aligned local's macro, whose `#undef` follows the fn.
+    (!def.contains("static ") && !def.contains("__attribute__") && !def.contains("#define") && !head.contains('\n')).then_some((head, def))
+}
+
+/// Release C: the small fns that the fns in `slots` call and another unit holds; this
+/// unit gets them as C99 inline definitions, so the C compiler can inline them without
+/// LTO (their holder keeps the external definition, so calls and addresses are the same).
+fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, skip: &HashSet<usize>) -> Vec<usize> {
+    let mut out = BTreeSet::new();
+    for e in externs {
+        if let Some(id) = proto_body_id(e)
+            && let Some(c) = names::slot_of_id(id)
+            && let Some(f) = fns.get(c as usize)
+            && !skip.contains(&(c as usize))
+            && f.error.is_none()
+            && f.code.len() <= INLINE_BYTES
+            && plain_fn_def(&f.code).is_some()
+        {
+            out.insert(c as usize);
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// The unit for `slots` (`fns` is indexed by slot; empty slots have no code). Its
 /// functions are static; the function `register` stores them in `lust_fns`.
 /// `main_slot` is the slot of `p.main` (not its `LocalDefId`: slots are
@@ -9589,10 +9647,56 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
     let mut types = HashSet::new();
     let mut named = HashSet::new();
     let mut seen: HashSet<&(Glue, CTy)> = HashSet::new();
-    for f in slots.iter().map(|&s| &fns[s]) {
+    // Release C: small callees held by other units, as inline definitions here.
+    let own: HashSet<usize> = slots.iter().copied().collect();
+    let inline = names::release() && inline_on();
+    let mut inl = if inline { inline_callees(fns, slots.iter().flat_map(|&s| &fns[s].externs), &own) } else { Vec::new() };
+    // Deeper levels: the small callees of the inline callees.
+    let mut frontier = inl.clone();
+    for _ in 1..INLINE_DEPTH {
+        let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
+        let more = inline_callees(fns, frontier.iter().flat_map(|&s| &fns[s].externs), &skip);
+        if more.is_empty() {
+            break;
+        }
+        inl.extend(&more);
+        frontier = more;
+    }
+    for f in slots.iter().chain(&inl).map(|&s| &fns[s]) {
         types.extend(f.types.iter().cloned());
         named.extend(f.named.iter().cloned());
         seen.extend(f.glue.iter());
+    }
+    // Release C: small plain glue the unit calls (drop, eq, clone of simple types), as
+    // inline definitions; the prototypes of what they call come along.
+    let mut inl_glue: HashSet<&(Glue, CTy)> = HashSet::new();
+    if inline {
+        let mut deps: Vec<&(Glue, CTy)> = Vec::new();
+        for k in seen.iter().copied() {
+            if let Some(d) = g.def_map.get(k)
+                && d.len() <= INLINE_BYTES
+                && !d.contains("static ")
+                && !d.contains("__attribute__")
+                && !d.contains("#define")
+            {
+                inl_glue.insert(k);
+                g.def_types(k, &mut types);
+                deps.extend(g.deps.get(k).into_iter().flatten());
+            }
+        }
+        for d in deps {
+            collect_types(&d.1, &mut types);
+            seen.insert(d);
+        }
+        // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
+        let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
+        let more = inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip);
+        for &s in &more {
+            types.extend(fns[s].types.iter().cloned());
+            named.extend(fns[s].named.iter().cloned());
+            seen.extend(fns[s].glue.iter());
+        }
+        inl.extend(more);
     }
     // The termination entry below names main's return type directly.
     // Declare it in this unit even when main's cached `FnOut` predates
@@ -9634,6 +9738,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         p,
         slots
             .iter()
+            .chain(&inl)
             .map(|&s| fns[s].code.as_str())
             .chain(seen.iter().filter(|k| hybrid && !g.is_shared(k)).map(|k| g.def_map[*k].as_str())),
     );
@@ -9641,31 +9746,58 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         collect_types(&cty(&p.tys, p.statics[i].ty), &mut types);
     }
     named.retain(|t| !types.contains(t));
-    type_decls_with(p, &mut c, &types, &named, if names::release() { Decls::ByValue } else { Decls::Full });
+    // Inline glue reads through pointers as a glue shard does: its unit declares types one
+    // step deep, as the shards do.
+    let decls = if !names::release() {
+        Decls::Full
+    } else if inl_glue.is_empty() {
+        Decls::ByValue
+    } else {
+        Decls::OneStep
+    };
+    type_decls_with(p, &mut c, &types, &named, decls);
     c.push_str(&static_decls_for(p, &used));
     // Release C (`names`): the prototypes and location slots that the code (and its
     // static glue) names outside itself, in one sorted list.
     let mut externs: BTreeSet<&str> = BTreeSet::new();
-    for &s in slots {
+    for &s in slots.iter().chain(&inl) {
         externs.extend(fns[s].externs.iter().map(String::as_str));
     }
-    for k in seen.iter().filter(|k| hybrid && !g.is_shared(k)) {
+    // An inline callee's plain prototype would make its definition here external.
+    let inl_ids: HashSet<String> = inl.iter().filter_map(|&s| names::fn_tag_opt(s as u32)).collect();
+    externs.retain(|e| proto_body_id(e).is_none_or(|id| !inl_ids.contains(id)));
+    for k in seen.iter().filter(|k| (hybrid && !g.is_shared(k)) || inl_glue.contains(*k)) {
         externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
     }
+    externs.retain(|e| proto_body_id(e).is_none_or(|id| !inl_ids.contains(id)));
     externs.into_iter().for_each(|e| c.push_str(e));
+    // Inline fn definitions: declared before any glue or body can call them.
+    let defs: Vec<(&str, &str)> = inl.iter().filter_map(|&s| plain_fn_def(&fns[s].code)).collect();
+    for (head, _) in &defs {
+        let _ = writeln!(c, "inline {head};");
+    }
     let mut keys: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
     for k in &keys {
         if hybrid && !g.is_shared(k) {
             c.push_str("static ");
+        } else if inl_glue.contains(*k) {
+            c.push_str("inline ");
         }
         c.push_str(&g.protos[*k]);
+    }
+    for k in keys.iter().filter(|k| inl_glue.contains(**k)) {
+        c.push_str("inline ");
+        c.push_str(&g.def_map[*k]);
     }
     if hybrid {
         for k in keys.iter().filter(|k| !g.is_shared(k)) {
             c.push_str("static ");
             c.push_str(&g.def_map[*k]);
         }
+    }
+    for (_, def) in &defs {
+        let _ = write!(c, "inline {def}\n");
     }
     for f in slots.iter().map(|&s| &fns[s]) {
         c.push_str(&f.code);

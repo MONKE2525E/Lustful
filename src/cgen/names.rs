@@ -23,6 +23,18 @@ pub struct Names {
     pub fns: Vec<Option<String>>,
     /// By Adt id: the name after `A`/`N` (`d<def hash>` or `i<instance key hash>`).
     pub adts: Vec<String>,
+    /// The slot of each fn id, built on first use (`slot_of_id`).
+    pub by_id: std::sync::OnceLock<crate::intern::FxMap<String, u32>>,
+}
+
+/// The slot whose fn has id `id` (16 hex digits), in release C.
+pub(crate) fn slot_of_id(id: &str) -> Option<u32> {
+    CUR.with(|c| {
+        let n = c.borrow();
+        let n = n.as_ref()?;
+        let map = n.by_id.get_or_init(|| n.fns.iter().enumerate().filter_map(|(s, id)| Some((id.clone()?, s as u32))).collect());
+        map.get(id).copied()
+    })
 }
 
 thread_local! {
@@ -65,6 +77,11 @@ pub(crate) fn unsized_adt(a: AdtId) -> String {
 /// The C name of the body of the fn in `slot`.
 pub(crate) fn body(slot: u32) -> String {
     fn_id(slot).map_or_else(|| format!("f{slot}"), |id| format!("f_{id}"))
+}
+
+/// The fn id of `slot` in release C (None: numbered names or no fn).
+pub(crate) fn fn_tag_opt(slot: u32) -> Option<String> {
+    fn_id(slot).filter(|id| !id.starts_with("dead"))
 }
 
 /// The C name of the trampoline of the fn in `slot`.
