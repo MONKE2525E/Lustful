@@ -539,3 +539,30 @@ int32_t lust_sys_remove_dir_all(const uint8_t *p, uint64_t len) {
 }
 
 uint32_t lust_sys_getpid(void) { return (uint32_t)getpid(); }
+
+/* `env::current_exe`: std reads /proc/self/exe on Linux and
+   _NSGetExecutablePath on Darwin (two calls: the size with a NULL
+   buffer, then the path, its trailing NUL left off). */
+#ifdef __APPLE__
+int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
+
+int32_t lust_sys_current_exe(lust_Vec *out) {
+    uint32_t cap = 0;
+    _NSGetExecutablePath(NULL, &cap);
+    if (cap == 0) return errno ? errno : EIO;
+    char *buf = malloc(cap);
+    if (!buf) lust_oom();
+    if (_NSGetExecutablePath(buf, &cap) != 0) {
+        int e = errno ? errno : EIO;
+        free(buf);
+        return e;
+    }
+    lust_sys_push(out, buf, cap - 1);
+    free(buf);
+    return 0;
+}
+#else
+int32_t lust_sys_current_exe(lust_Vec *out) {
+    return lust_sys_readlink((const uint8_t *)"/proc/self/exe", 14, out);
+}
+#endif

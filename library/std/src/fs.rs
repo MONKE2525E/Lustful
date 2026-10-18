@@ -701,6 +701,9 @@ pub struct Metadata {
     pub(crate) blocks: u64,
     pub(crate) blksize: u64,
     pub(crate) rdev: u64,
+    pub(crate) btime: i64,
+    pub(crate) btime_nsec: i64,
+    pub(crate) has_btime: u64,
 }
 
 impl Metadata {
@@ -733,6 +736,13 @@ impl Metadata {
     pub fn permissions(&self) -> Permissions {
         Permissions { mode: self.mode }
     }
+
+    /// The birth time fields, for the std splice's `created()`
+    /// (fs_time.rs, which cannot read this crate's fields and cannot
+    /// name them through `MetadataExt`, as std has no such accessor).
+    pub fn __lust_btime(&self) -> (i64, i64, bool) {
+        (self.btime, self.btime_nsec, self.has_btime != 0)
+    }
 }
 
 /// The metadata from the runtime's 8-byte stat fields (sys.c
@@ -763,6 +773,9 @@ fn metadata_from_raw(raw: &[u8]) -> Metadata {
         blocks: field(13),
         blksize: field(14),
         rdev: field(15),
+        btime: field(16) as i64,
+        btime_nsec: field(17) as i64,
+        has_btime: field(18),
     }
 }
 

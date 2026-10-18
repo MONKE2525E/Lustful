@@ -80,6 +80,12 @@ int32_t lust_sys_btime_fd(int32_t fd, int64_t *sec, int64_t *nsec);
 
 uint32_t lust_sys_getpid(void);
 
+/* The running executable's path appended to the Vec (`env::current_exe`):
+   /proc/self/exe on Linux, _NSGetExecutablePath on Darwin (no NUL
+   appended). Returns 0 or the errno of the failed call, as std's
+   last_os_error forms read it. */
+int32_t lust_sys_current_exe(lust_Vec *out);
+
 /* The OS text of an error code, as std's `error_string` (strerror). */
 void lust_sys_os_error_text(int32_t code, lust_String *out);
 

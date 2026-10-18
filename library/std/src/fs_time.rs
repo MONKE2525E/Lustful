@@ -23,6 +23,20 @@ impl Metadata {
     pub fn accessed(&self) -> io::Result<SystemTime> {
         system_time(self.atime(), self.atime_nsec())
     }
+
+    /// The creation (birth) time: the statx btime on Linux, the
+    /// stat birth time on macOS, as std's. No birth time from the
+    /// filesystem is std's Unsupported error.
+    pub fn created(&self) -> io::Result<SystemTime> {
+        let (sec, nsec, has) = self.__lust_btime();
+        if !has {
+            return Err(io::Error::__lust_adapter_simple_message(
+                io::ErrorKind::Unsupported,
+                "creation time is not available on this platform currently",
+            ));
+        }
+        system_time(sec, nsec)
+    }
 }
 
 /// std's `SystemTime::new(tv_sec, tv_nsec)` on Linux (sys/time/unix.rs
@@ -31,6 +45,13 @@ impl Metadata {
 /// `tv_nsec` is outside `0..1_000_000_000`. The epoch arithmetic gives
 /// std's (seconds, nanoseconds) pair for every i64 `tv_sec`.
 fn system_time(tv_sec: i64, tv_nsec: i64) -> io::Result<SystemTime> {
+    // On Apple OS a pre-epoch time is tv_sec <= 0 with a negative
+    // tv_nsec (std's Timespec::new compensates to the common form).
+    let (tv_sec, tv_nsec) = if cfg!(target_os = "macos") && tv_sec <= 0 && tv_sec > i64::MIN && tv_nsec < 0 && tv_nsec > -1_000_000_000 {
+        (tv_sec - 1, tv_nsec + 1_000_000_000)
+    } else {
+        (tv_sec, tv_nsec)
+    };
     if !(0..1_000_000_000).contains(&tv_nsec) {
         return Err(io::Error::__lust_adapter_simple_message(io::ErrorKind::InvalidData, "invalid timestamp"));
     }

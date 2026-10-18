@@ -28,6 +28,7 @@ pub fn exit(code: i32) -> ! {
 }
 
 /// The name of a signal number, as std prints it on Linux.
+#[cfg(target_os = "linux")]
 fn signal_name(sig: i32) -> Option<&'static str> {
     Some(match sig {
         1 => "SIGHUP",
@@ -61,6 +62,47 @@ fn signal_name(sig: i32) -> Option<&'static str> {
         29 => "SIGIO",
         30 => "SIGPWR",
         31 => "SIGSYS",
+        _ => return None,
+    })
+}
+
+/// The name of a signal number, as std prints it on macOS: the same
+/// names by signal, with Darwin's numbers (SIGEMT and SIGINFO exist
+/// there, SIGSTKFLT and SIGPWR do not).
+#[cfg(target_os = "macos")]
+fn signal_name(sig: i32) -> Option<&'static str> {
+    Some(match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGEMT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGBUS",
+        11 => "SIGSEGV",
+        12 => "SIGSYS",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        16 => "SIGURG",
+        17 => "SIGSTOP",
+        18 => "SIGTSTP",
+        19 => "SIGCONT",
+        20 => "SIGCHLD",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
+        23 => "SIGIO",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        26 => "SIGVTALRM",
+        27 => "SIGPROF",
+        28 => "SIGWINCH",
+        29 => "SIGINFO",
+        30 => "SIGUSR1",
+        31 => "SIGUSR2",
         _ => return None,
     })
 }

@@ -342,6 +342,7 @@ impl ErrorKind {
 }
 
 /// The kind of an OS error code, as std's `decode_error_kind` on Linux.
+#[cfg(target_os = "linux")]
 fn decode_error_kind(code: i32) -> ErrorKind {
     match code {
         1 => ErrorKind::PermissionDenied,
@@ -386,6 +387,58 @@ fn decode_error_kind(code: i32) -> ErrorKind {
         115 => ErrorKind::__InProgress,
         116 => ErrorKind::StaleNetworkFileHandle,
         122 => ErrorKind::QuotaExceeded,
+        _ => ErrorKind::__Uncategorized,
+    }
+}
+
+/// The kind of an OS error code, as std's `decode_error_kind` on
+/// macOS: the same map by errno name, with Darwin's numbers
+/// (EAGAIN is WouldBlock, as EWOULDBLOCK is EAGAIN there).
+#[cfg(target_os = "macos")]
+fn decode_error_kind(code: i32) -> ErrorKind {
+    match code {
+        1 => ErrorKind::PermissionDenied,
+        2 => ErrorKind::NotFound,
+        4 => ErrorKind::Interrupted,
+        5 => ErrorKind::__InputOutputError,
+        7 => ErrorKind::ArgumentListTooLong,
+        11 => ErrorKind::Deadlock,
+        12 => ErrorKind::OutOfMemory,
+        13 => ErrorKind::PermissionDenied,
+        16 => ErrorKind::ResourceBusy,
+        17 => ErrorKind::AlreadyExists,
+        18 => ErrorKind::CrossesDevices,
+        20 => ErrorKind::NotADirectory,
+        21 => ErrorKind::IsADirectory,
+        22 => ErrorKind::InvalidInput,
+        23 => ErrorKind::__TooManyOpenFiles,
+        24 => ErrorKind::__TooManyOpenFiles,
+        26 => ErrorKind::ExecutableFileBusy,
+        27 => ErrorKind::FileTooLarge,
+        28 => ErrorKind::StorageFull,
+        29 => ErrorKind::NotSeekable,
+        30 => ErrorKind::ReadOnlyFilesystem,
+        31 => ErrorKind::TooManyLinks,
+        32 => ErrorKind::BrokenPipe,
+        35 => ErrorKind::WouldBlock,
+        36 => ErrorKind::__InProgress,
+        48 => ErrorKind::AddrInUse,
+        49 => ErrorKind::AddrNotAvailable,
+        50 => ErrorKind::NetworkDown,
+        51 => ErrorKind::NetworkUnreachable,
+        53 => ErrorKind::ConnectionAborted,
+        54 => ErrorKind::ConnectionReset,
+        57 => ErrorKind::NotConnected,
+        60 => ErrorKind::TimedOut,
+        61 => ErrorKind::ConnectionRefused,
+        62 => ErrorKind::__FilesystemLoop,
+        63 => ErrorKind::InvalidFilename,
+        65 => ErrorKind::HostUnreachable,
+        66 => ErrorKind::DirectoryNotEmpty,
+        69 => ErrorKind::QuotaExceeded,
+        70 => ErrorKind::StaleNetworkFileHandle,
+        78 => ErrorKind::Unsupported,
+        102 => ErrorKind::Unsupported,
         _ => ErrorKind::__Uncategorized,
     }
 }

@@ -973,6 +973,16 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     },
     // getpid.
     IntrinsicDef { name: "sys_getpid", c_symbol: "lust_sys_getpid", params: &[], ret: S::U32, allowed: &[C::Std, C::Rustix], implemented: true },
+    // The running executable's path into the Vec (env::current_exe, sys.h).
+    // 0 or errno.
+    IntrinsicDef {
+        name: "sys_current_exe",
+        c_symbol: "lust_sys_current_exe",
+        params: &[S::VecU8Mut],
+        ret: S::I32,
+        allowed: ONLY_STD,
+        implemented: true,
+    },
     // Appends the OS text of an error code (strerror) to the String.
     IntrinsicDef {
         name: "sys_os_error_text",

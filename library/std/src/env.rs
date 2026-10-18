@@ -190,13 +190,20 @@ pub fn temp_dir() -> PathBuf {
     }
 }
 
-/// The path of the running executable (`/proc/self/exe`).
+/// The path of the running executable (`/proc/self/exe` on Linux,
+/// `_NSGetExecutablePath` on macOS; the runtime picks).
 pub fn current_exe() -> io::Result<PathBuf> {
     let mut buf: Vec<u8> = Vec::new();
-    match core::intrinsics::sys_readlink(&b"/proc/self/exe"[..], &mut buf) {
+    match core::intrinsics::sys_current_exe(&mut buf) {
         0 => Ok(PathBuf::from_os_string(OsString::__from_vec(buf))),
-        2 => Err(io::Error::simple_message(io::ErrorKind::__Uncategorized, "no /proc/self/exe available. Is /proc mounted?")),
-        code => Err(io::Error::from_raw_os_error(code)),
+        code => {
+            // std's Linux form: a /proc with no self/exe is its own message.
+            if cfg!(target_os = "linux") && code == 2 {
+                Err(io::Error::simple_message(io::ErrorKind::__Uncategorized, "no /proc/self/exe available. Is /proc mounted?"))
+            } else {
+                Err(io::Error::from_raw_os_error(code))
+            }
+        }
     }
 }
 
@@ -206,7 +213,11 @@ pub fn current_exe() -> io::Result<PathBuf> {
 pub mod consts {
     #[cfg(target_os = "linux")]
     pub const OS: &str = "linux";
+    #[cfg(target_os = "macos")]
+    pub const OS: &str = "macos";
     #[cfg(target_os = "linux")]
+    pub const FAMILY: &str = "unix";
+    #[cfg(target_os = "macos")]
     pub const FAMILY: &str = "unix";
     #[cfg(target_arch = "x86_64")]
     pub const ARCH: &str = "x86_64";
