@@ -131,8 +131,8 @@ pub(crate) fn slot_table(live: impl Iterator<Item = u32>) -> String {
 /// only prototypes (`GlueSet::shared` holds every key). Shards are content-defined
 /// chunks of the keys in prototype order: a cut after each key whose prototype hash
 /// hits 1 in (`target` bytes / mean definition bytes), so new glue changes only the
-/// shard it lands in. Each shard declares the types, prototypes (its keys' and their
-/// callees') and externs its definitions need.
+/// shard it lands in. Each shard declares the types (`Decls::OneStep`), prototypes (its
+/// keys' and their callees') and externs its definitions need.
 pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
     let mut keys: Vec<&(Glue, CTy)> = g.def_map.keys().collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
@@ -165,7 +165,7 @@ pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
                 }
                 externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
             }
-            type_decls(p, &mut c, &types);
+            type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep);
             externs.into_iter().for_each(|e| c.push_str(e));
             protos.into_iter().for_each(|x| c.push_str(x));
             for k in &keys {

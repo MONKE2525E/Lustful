@@ -2610,6 +2610,7 @@ impl FnGen<'_, '_> {
             if names::release() {
                 match (pr, &t) {
                     (Proj::Deref, CTy::Ref(_) | CTy::Boxed(_) | CTy::Ptr(_)) | (Proj::Downcast(_), _) => {}
+                    (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) if c_layout(self.p, inner).is_some() => {}
                     (Proj::Index(_), CTy::Vec(el) | CTy::Slice(el) | CTy::BoxSlice(el)) => collect_types(el, &mut self.sig_types),
                     _ => collect_types(&t, &mut self.sig_types),
                 }
@@ -2634,7 +2635,16 @@ impl FnGen<'_, '_> {
                     t = *inner;
                 }
                 (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) => {
-                    e = format!("{e}->v");
+                    // Release C reaches the value by its offset in the count block
+                    // (two words, then the value at its alignment), so a unit that
+                    // only borrows through an `Rc` needs no definition of the block.
+                    e = match c_layout(self.p, &inner) {
+                        Some(l) if names::release() && l.align > 0 => {
+                            let off = 16u64.div_ceil(l.align) * l.align;
+                            format!("(*({}*)((uint8_t*)({e}) + {off}))", ctype(&inner))
+                        }
+                        _ => format!("{e}->v"),
+                    };
                     t = *inner;
                 }
                 (Proj::Deref, CTy::Guard(inner, _)) => {
@@ -9288,7 +9298,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         collect_types(&cty(&p.tys, p.statics[i].ty), &mut types);
     }
     named.retain(|t| !types.contains(t));
-    type_decls_with(p, &mut c, &types, &named, names::release());
+    type_decls_with(p, &mut c, &types, &named, if names::release() { Decls::ByValue } else { Decls::Full });
     c.push_str(&static_decls_for(p, &used));
     // Release C (`names`): the prototypes and location slots that the code (and its
     // static glue) names outside itself, in one sorted list.
@@ -9596,8 +9606,50 @@ fn def_deps(p: &Program, t: &CTy) -> Vec<CTy> {
     deps
 }
 
+/// The named C types the definition of `t` mentions (fields behind pointers too), for
+/// `type_decls_with`'s closure.
+fn field_types(p: &Program, t: &CTy) -> HashSet<CTy> {
+    let mut inner = HashSet::new();
+    match t {
+        CTy::Adt(a) => p.adt(*a).variants.iter().flat_map(|v| &v.fields).for_each(|f| collect_types(&cty(&p.tys, f.ty), &mut inner)),
+        CTy::Option(e) => collect_types(e, &mut inner),
+        CTy::Result(a, b) => {
+            collect_types(a, &mut inner);
+            collect_types(b, &mut inner);
+        }
+        CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
+        CTy::Array(e, _) => collect_types(e, &mut inner),
+        CTy::ArrayIter(e, n) => collect_types(&CTy::Array(e.clone(), *n), &mut inner),
+        CTy::OptIter(_, e) => collect_types(&CTy::Option(e.clone()), &mut inner),
+        CTy::Slice(e) => collect_types(e, &mut inner),
+        CTy::Rc(e) | CTy::RefCell(e) => collect_types(e, &mut inner),
+        CTy::FnPtr(ps, r) => {
+            ps.iter().for_each(|e| collect_types(e, &mut inner));
+            collect_types(r, &mut inner);
+        }
+        CTy::Hash(_, args) => {
+            args.iter().for_each(|e| collect_types(e, &mut inner));
+            collect_types(&hash::elem_cty(t), &mut inner);
+        }
+        _ => {}
+    }
+    inner
+}
+
 fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
-    type_decls_with(p, out, roots, &HashSet::new(), false)
+    type_decls_with(p, out, roots, &HashSet::new(), Decls::Full)
+}
+
+/// Which types `type_decls_with` defines (the rest of what it names gets a forward typedef).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Decls {
+    /// Every type the roots reach, through pointers too (dev C, the statics unit).
+    Full,
+    /// What the roots hold by value (release C fn units).
+    ByValue,
+    /// That, plus one step through the pointers in it (release C glue shards: a glue
+    /// definition reads an `Rc`'s count block or sizes a `Box`'s pointee in place).
+    OneStep,
 }
 
 /// `type_decls`, plus forward declarations of `named` (release C: types the code only
@@ -9606,10 +9658,10 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
 /// not change when a struct it only points at does. Glue and static data reach through
 /// pointers (a drop through an `Rc` reads its count block), so their units keep the
 /// whole closure.
-fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &HashSet<CTy>, by_value: bool) {
-    let defined: Option<HashSet<CTy>> = by_value.then(|| {
+fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &HashSet<CTy>, decls: Decls) {
+    let by_value = |roots: Vec<CTy>| {
         let mut defined = HashSet::new();
-        let mut stack: Vec<CTy> = roots.iter().cloned().collect();
+        let mut stack = roots;
         while let Some(t) = stack.pop() {
             if defined.insert(t.clone()) {
                 stack.extend(def_deps(p, &t));
@@ -9620,7 +9672,16 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
             }
         }
         defined
-    });
+    };
+    let defined: Option<HashSet<CTy>> = match decls {
+        Decls::Full => None,
+        Decls::ByValue => Some(by_value(roots.iter().cloned().collect())),
+        Decls::OneStep => {
+            let first = by_value(roots.iter().cloned().collect());
+            let step: Vec<CTy> = first.iter().flat_map(|t| field_types(p, t)).chain(first.iter().cloned()).collect();
+            Some(by_value(step))
+        }
+    };
     // Close over field types (release C: one step out of each defined type).
     let mut wanted: HashSet<CTy> = HashSet::new();
     let mut stack: Vec<CTy> = defined.as_ref().map_or_else(|| roots.iter().cloned().collect(), |d| d.iter().chain(named).cloned().collect());
@@ -9631,31 +9692,7 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         if defined.as_ref().is_some_and(|d| !d.contains(&t)) {
             continue;
         }
-        let mut inner = HashSet::new();
-        match &t {
-            CTy::Adt(a) => p.adt(*a).variants.iter().flat_map(|v| &v.fields).for_each(|f| collect_types(&cty(&p.tys, f.ty), &mut inner)),
-            CTy::Option(e) => collect_types(e, &mut inner),
-            CTy::Result(a, b) => {
-                collect_types(a, &mut inner);
-                collect_types(b, &mut inner);
-            }
-            CTy::Tuple(es) => es.iter().for_each(|e| collect_types(e, &mut inner)),
-            CTy::Array(e, _) => collect_types(e, &mut inner),
-            CTy::ArrayIter(e, n) => collect_types(&CTy::Array(e.clone(), *n), &mut inner),
-            CTy::OptIter(_, e) => collect_types(&CTy::Option(e.clone()), &mut inner),
-            CTy::Slice(e) => collect_types(e, &mut inner),
-            CTy::Rc(e) | CTy::RefCell(e) => collect_types(e, &mut inner),
-            CTy::FnPtr(ps, r) => {
-                ps.iter().for_each(|e| collect_types(e, &mut inner));
-                collect_types(r, &mut inner);
-            }
-            CTy::Hash(_, args) => {
-                args.iter().for_each(|e| collect_types(e, &mut inner));
-                collect_types(&hash::elem_cty(&t), &mut inner);
-            }
-            _ => {}
-        }
-        stack.extend(inner);
+        stack.extend(field_types(p, &t));
     }
     // The hash core's declarations, only in units that name a hash type
     // (see `runtime_source`).
