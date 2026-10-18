@@ -207,6 +207,8 @@ struct Ll {
     asserts: BTreeSet<String>,
     /// Temporaries native code needs (call arguments and results), as entry-block allocas.
     allocas: String,
+    /// Per block: the locals whose drop flag may be set at its terminator (`flags_maybe_set`).
+    flags_at_term: Vec<Vec<bool>>,
 }
 
 impl FnGen<'_, '_> {
@@ -431,6 +433,7 @@ impl FnGen<'_, '_> {
             error: None,
             asserts: BTreeSet::new(),
             allocas: String::new(),
+            flags_at_term: self.flags_maybe_set(),
         };
         // Str literal caches (`kstr`) are on: the slots and their interning go in a prologue
         // helper below.
@@ -513,7 +516,10 @@ impl FnGen<'_, '_> {
                 ll.body.push_str(" ]\n");
             }
             Terminator::Call { target: CallTarget::Fn(f), args, dest, next, unwind: call_unwind }
-                if native_on() && self.ll_native_call(ll, *f, args, dest, if cleanup || !self.p.unwind { None } else { call_unwind.map(|u| u.0) }) =>
+                if native_on() && {
+                    let dest_clear = !ll.flags_at_term[bi][dest.local as usize];
+                    self.ll_native_call(ll, *f, args, dest, dest_clear, if cleanup || !self.p.unwind { None } else { call_unwind.map(|u| u.0) })
+                } =>
             {
                 let _ = writeln!(ll.body, "  br label %bb{}", next.0);
             }
@@ -1357,7 +1363,9 @@ impl FnGen<'_, '_> {
     /// them from the start, as cgen's `emit_assign`), an `invoke` when `unwind` names a
     /// cleanup entry, then the result stored to `dest`, dropping the value a whole local
     /// held. False (nothing emitted) for any other shape.
-    fn ll_native_call(&mut self, ll: &mut Ll, f: LocalDefId, args: &[Operand], dest: &Place, unwind: Option<u32>) -> bool {
+    /// `dest_clear`: the destination local's drop flag is surely clear here, so it holds no
+    /// old value (a result can go straight into it).
+    fn ll_native_call(&mut self, ll: &mut Ll, f: LocalDefId, args: &[Operand], dest: &Place, dest_clear: bool, unwind: Option<u32>) -> bool {
         let p = self.p;
         if !has_generated_body(p, f) || crate::check::caller::is_track_caller(p, f) {
             return false;
@@ -1428,10 +1436,13 @@ impl FnGen<'_, '_> {
             .collect();
         let direct_locals: Vec<usize> =
             args.iter().zip(&direct).filter(|(_, d)| **d).filter_map(|(a, _)| if let Operand::Move(pl) = a { Some(pl.local as usize) } else { None }).collect();
-        // The result goes straight to a whole-local destination that owns nothing to drop
-        // (a panic before the end leaves nothing that reads it), unless that local is an
-        // argument passed as itself.
-        let ret_direct = rp == Pass::Mem && dest.proj.is_empty() && !drop_old && !ll.statics[dl] && !direct_locals.contains(&dl);
+        // An old value the call result replaces (dropped after the call returns), unless the
+        // destination's flag is surely clear here.
+        let old_live = drop_old && !dest_clear;
+        // The result goes straight to a whole-local destination that holds nothing to drop
+        // (a panic before the end leaves nothing that reads it: its flag is clear), unless
+        // that local is an argument passed as itself.
+        let ret_direct = rp == Pass::Mem && dest.proj.is_empty() && !old_live && !ll.statics[dl] && !direct_locals.contains(&dl);
         if rp == Pass::Mem {
             if ret_direct {
                 vals.push(format!("ptr %l{dl}"));
@@ -1519,7 +1530,7 @@ impl FnGen<'_, '_> {
             let _ = writeln!(ll.body, "  call void @llvm.lifetime.end.p0(i64 {size}, ptr {t})");
         }
         // The old value of a whole local drops once the call returned (`drop_old_value`).
-        if drop_old {
+        if old_live {
             let glue = format!("drop_{}", mangle(&dp.ty));
             self.want(Glue::Drop, &dp.ty);
             ll.decls.insert(format!("declare void @{glue}(ptr)"));
@@ -1567,6 +1578,87 @@ impl FnGen<'_, '_> {
             let _ = writeln!(ll.body, "  store i8 1, ptr %d{dl}");
         }
         true
+    }
+
+    /// For each block, the locals whose drop flag may be set at its terminator: a write to a
+    /// local (an assign to it or a part, a call result) may set its flag; a move of the whole
+    /// local or its drop clears it. A move this does not model counts as still set, so a
+    /// clear answer is exact.
+    fn flags_maybe_set(&self) -> Vec<Vec<bool>> {
+        let body = self.body;
+        let (nl, nb) = (body.locals.len(), body.blocks.len());
+        let mut entry: Vec<Option<Vec<bool>>> = vec![None; nb];
+        let mut at_term = vec![vec![true; nl]; nb];
+        // Parameters own their values at entry.
+        entry[0] = Some((0..nl).map(|l| l >= 1 && l <= body.arg_count).collect());
+        let mut work = vec![0usize];
+        fn join(entry: &mut [Option<Vec<bool>>], work: &mut Vec<usize>, b: Bb, st: &[bool]) {
+            let b = b.0 as usize;
+            match &mut entry[b] {
+                Some(e) => {
+                    let mut grew = false;
+                    for (x, &y) in e.iter_mut().zip(st) {
+                        grew |= y && !*x;
+                        *x |= y;
+                    }
+                    if grew {
+                        work.push(b);
+                    }
+                }
+                None => {
+                    entry[b] = Some(st.to_vec());
+                    work.push(b);
+                }
+            }
+        }
+        while let Some(b) = work.pop() {
+            let mut st = entry[b].clone().expect("queued blocks have a state");
+            for s in &body.blocks[b].stmts {
+                match &s.kind {
+                    StmtKind::Assign(pl, rv) => {
+                        if let Rvalue::Use(Operand::Move(src)) = rv
+                            && src.proj.is_empty()
+                        {
+                            st[src.local as usize] = false;
+                        }
+                        st[pl.local as usize] = true;
+                    }
+                    StmtKind::Drop(l) => st[*l as usize] = false,
+                    _ => {}
+                }
+            }
+            at_term[b] = st.clone();
+            match &body.blocks[b].term {
+                Terminator::Call { args, dest, next, unwind, .. } => {
+                    // A call owns its moved arguments from the start.
+                    for a in args {
+                        if let Operand::Move(p) = a
+                            && p.proj.is_empty()
+                        {
+                            st[p.local as usize] = false;
+                        }
+                    }
+                    if let Some(u) = unwind {
+                        join(&mut entry, &mut work, *u, &st);
+                    }
+                    st[dest.local as usize] = true;
+                    join(&mut entry, &mut work, *next, &st);
+                }
+                Terminator::Goto(t) => join(&mut entry, &mut work, *t, &st),
+                Terminator::If(_, a, c) => {
+                    join(&mut entry, &mut work, *a, &st);
+                    join(&mut entry, &mut work, *c, &st);
+                }
+                Terminator::Switch(_, cases, other) => {
+                    for (_, t) in cases {
+                        join(&mut entry, &mut work, *t, &st);
+                    }
+                    join(&mut entry, &mut work, *other, &st);
+                }
+                Terminator::Return | Terminator::Unreachable | Terminator::Panic(_) => {}
+            }
+        }
+        at_term
     }
 
     /// `ll_scalar` without the move's flag clear: a call clears its arguments' flags itself.
