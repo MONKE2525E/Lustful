@@ -25,10 +25,12 @@ pub fn on(persistent: bool, cc: bool) -> bool {
 }
 
 /// What decides a slot's C besides its program: release C or not, debug info, unwind
-/// tables, and the switches of the release backends. A persistent session makes every
-/// slot's C again when it moves.
+/// tables, and the switches of the release backends and of drop elaboration
+/// (`LUST_DROPFLAGS`). A persistent session makes every slot's C again when it moves.
 pub fn codegen_key(release: bool, debug: bool, unwind_tables: bool) -> u64 {
-    let mut vars: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("LUST_RELEASE_") || k.starts_with("LUST_LL_")).collect();
+    let mut vars: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("LUST_RELEASE_") || k.starts_with("LUST_LL_") || k == "LUST_DROPFLAGS")
+        .collect();
     vars.sort();
     let mut x = crate::intern::FxHasher::default();
     std::hash::Hash::hash(&(release, debug, unwind_tables, vars), &mut x);

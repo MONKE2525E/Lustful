@@ -1137,6 +1137,13 @@ struct FnGen<'b, 'p> {
     glue: HashSet<(Glue, CTy)>,
     local_cty: Vec<CTy>,
     local_drop: Vec<bool>,
+    /// Which whole-local drop flags stay runtime flags, and the value each test of a static
+    /// one sees (`ir::dropflags`, drop elaboration): a static flag has no `d{l}`, no stores,
+    /// and its tests are constants.
+    dflags: crate::ir::dropflags::DropFlags,
+    /// The (block, statement index) being emitted: where `dflags` looks up a static flag's
+    /// value (an index equal to the statement count is the terminator).
+    at: (u32, u32),
     /// Per local, the field paths the body moves out of it (partial
     /// moves) whose value needs a drop. Each has a C flag
     /// `m{local}_{index}` that a move clears; drops of the local
@@ -2208,13 +2215,33 @@ fn inline_attr(p: &Program, f: LocalDefId) -> InlineAttr {
     out
 }
 
+/// Static drop flags (`ir::dropflags`): on for the C backends; off for the LLVM backend, whose
+/// optimizer folds constant flags itself (with the pass, tsgo's LLVM build ran about 1% slower:
+/// small drop glue is called out of line more often). `LUST_DROPFLAGS=0` turns the pass off
+/// (every drop flag a runtime flag, as before it) and `LUST_DROPFLAGS=1` on for both backends,
+/// for A/B runs.
+fn static_drop_flags(p: &Program) -> bool {
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("LUST_DROPFLAGS").as_deref() {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        _ => None,
+    });
+    env.unwrap_or_else(|| !ll::on(p))
+}
+
 impl<'b, 'p> FnGen<'b, 'p> {
     /// A generator for `body` with nothing emitted yet (`gen_fn`; an
     /// `ItemShim` builtin method's one-call body, `prim_shim`).
     fn new(p: &'p Program, body: &'b Body<'p>, map: &'b SourceMap, base_line: u32, slots: &'b Slots<'b>) -> Self {
         let local_cty: Vec<CTy> = body.locals.iter().map(|l| cty(&body.tys, l.ty)).collect();
-        let local_drop = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
+        let local_drop: Vec<bool> = local_cty.iter().map(|t| needs_drop_c(p, t)).collect();
         let n_locals = local_cty.len();
+        let dflags = if static_drop_flags(p) {
+            crate::ir::dropflags::analyze(body, &local_drop)
+        } else {
+            crate::ir::dropflags::DropFlags::all_runtime(n_locals)
+        };
         FnGen {
             p,
             body,
@@ -2222,6 +2249,8 @@ impl<'b, 'p> FnGen<'b, 'p> {
             glue: HashSet::new(),
             local_cty,
             local_drop,
+            dflags,
+            at: (u32::MAX, u32::MAX),
             move_paths: vec![Vec::new(); n_locals],
             bad_move: false,
             bad_callee: None,
@@ -2389,7 +2418,8 @@ impl FnGen<'_, '_> {
         }
         // A ladder with no call (only jumps and returns) drops nothing: no frame.
         if cl_text.contains('(') {
-            members = unwind::frame_members(&cl_text, self.local_cty.len(), &self.move_paths, &self.local_drop, &self.body.promoted);
+            let kept: Vec<bool> = (0..self.local_cty.len()).map(|l| self.local_drop[l] && self.dflags.keeps(l as Local)).collect();
+            members = unwind::frame_members(&cl_text, self.local_cty.len(), &self.move_paths, &kept, &self.body.promoted);
             self.zc_frame = true;
             let decls = self.frame_struct(&names::fn_tag(slot), &members);
             self.out.push_str(&decls);
@@ -2420,7 +2450,7 @@ impl FnGen<'_, '_> {
                 } else if is_param {
                     frame_init.push(format!("L.l{i} = p{i};"));
                 }
-                if self.local_drop[i] {
+                if self.local_drop[i] && self.dflags.keeps(i as Local) {
                     frame_init.push(format!("L.d{i} = {};", is_param as u8));
                 }
                 for k in 0..self.move_paths[i].len() {
@@ -2457,7 +2487,7 @@ impl FnGen<'_, '_> {
                     None => by_type.push((ct, vec![decl])),
                 }
             }
-            if self.local_drop[i] {
+            if self.local_drop[i] && self.dflags.keeps(i as Local) {
                 flags.push(format!("d{i} = {}", is_param as u8));
             }
             for k in 0..self.move_paths[i].len() {
@@ -2541,6 +2571,7 @@ impl FnGen<'_, '_> {
             let _ = writeln!(self.out, "bb{bi}:;");
             let block = self.body.block(Bb(bi as u32));
             for (si, s) in block.stmts.iter().enumerate() {
+                self.at = (bi as u32, si as u32);
                 self.unw = self.stmt_action(bi, si).filter(|_| !matches!(s.kind, StmtKind::StorageDead(_) | StmtKind::FakeRead(_)));
                 // Unwind tables: the statement's ladder entry is in `L.st` before it runs;
                 // a panic inside never returns, so nothing follows it.
@@ -2559,6 +2590,7 @@ impl FnGen<'_, '_> {
                     let _ = writeln!(self.out, "  {check}");
                 }
             }
+            self.at = (bi as u32, block.stmts.len() as u32);
             self.unw = self.stmt_action(bi, block.stmts.len());
             if zc && let Some(Unw::Goto(b)) = self.unw {
                 self.zc_store(b);
@@ -2655,6 +2687,13 @@ impl FnGen<'_, '_> {
     fn drop_old_value(&mut self, dest: &Place, d: &str, dt: &CTy) -> (String, String) {
         let l = dest.local;
         if dest.proj.is_empty() {
+            if !self.dflags.keeps(l) {
+                // A static flag: the old value drops here on every path, or on none. The drop is
+                // made either way, so the glue it names stays wanted (other C names it too).
+                let old = self.elab_drop(l, &[]);
+                let old = if self.dflags.test(self.at, l) == Some(true) { old } else { String::new() };
+                return (old, self.reset_move_flags(l, &[]));
+            }
             let old = self.elab_drop(l, &[]);
             return (format!(" if (d{l}) {{{old} }}"), format!(" d{l} = 1;{}", self.reset_move_flags(l, &[])));
         }
@@ -3251,8 +3290,11 @@ impl FnGen<'_, '_> {
                 let (e, t) = self.place(pl, loc);
                 if self.local_drop[pl.local as usize] {
                     if pl.proj.is_empty() {
-                        // Moving the whole local: it owns nothing now.
-                        post.push(format!("d{} = 0;", pl.local));
+                        // Moving the whole local: it owns nothing now (a static flag has
+                        // nothing to clear).
+                        if self.dflags.keeps(pl.local) {
+                            post.push(format!("d{} = 0;", pl.local));
+                        }
                     } else if let Some(path) = self.steps_of(pl)
                         && let Some(k) = self.move_flag(pl.local, &path)
                     {
@@ -3373,7 +3415,11 @@ impl FnGen<'_, '_> {
                 let (drop_old, refill) = self.drop_old_value(dest, &d, &dt);
                 // A drop that panics leaves the local unowned, so its
                 // cleanup does not drop it again.
-                let drop_old = if dest.proj.is_empty() { drop_old.replacen(" {", &format!(" {{ d{} = 0;", dest.local), 1) } else { drop_old };
+                let drop_old = if dest.proj.is_empty() && self.dflags.keeps(dest.local) {
+                    drop_old.replacen(" {", &format!(" {{ d{} = 0;", dest.local), 1)
+                } else {
+                    drop_old
+                };
                 let _ = writeln!(self.out, "   {drop_old}\n    {d} = {t};\n   {refill}");
             } else {
                 let _ = writeln!(self.out, "    {d} = {t};");
@@ -3468,7 +3514,13 @@ impl FnGen<'_, '_> {
             StmtKind::Drop(l) => {
                 if self.local_drop[*l as usize] {
                     let what = self.elab_drop(*l, &[]);
-                    let _ = writeln!(self.out, "  if (d{l}) {{ d{l} = 0;{what} }}");
+                    if self.dflags.keeps(*l) {
+                        let _ = writeln!(self.out, "  if (d{l}) {{ d{l} = 0;{what} }}");
+                    } else if self.dflags.test(self.at, *l) == Some(true) {
+                        // A static flag set on every path here: the drop is unconditional. (Clear
+                        // on every path: no drop, but its glue stays wanted, as other C names it.)
+                        let _ = writeln!(self.out, " {what}");
+                    }
                 }
             }
             StmtKind::StorageDead(_) | StmtKind::FakeRead(_) => {}
@@ -3533,16 +3585,19 @@ impl FnGen<'_, '_> {
                     CallTarget::Builtin(_) | CallTarget::Dyn(_) => false,
                 };
                 // Unwind tables: a call into a whole local that its arguments do not read, with no
-                // old value to drop (a type without drop glue, or a flag `flags_maybe_set` proves
-                // clear), writes the local itself, and a large return gets it as the out-pointer:
-                // a panic inside never returns here, and the cleanup sees the clear flag.
+                // old value to drop (a type without drop glue, a flag `flags_maybe_set` proves
+                // clear, or a static flag clear here), writes the local itself, and a large return
+                // gets it as the out-pointer: a panic inside never returns here, and the cleanup
+                // sees the clear flag.
                 let direct = zc
                     && !self.zc_in_cleanup
                     && dest.proj.is_empty()
                     && !mentions
                     && !ret_unit
                     && matches!(target, CallTarget::Fn(_) | CallTarget::Dyn(_) | CallTarget::Indirect(_))
-                    && (!needs_drop_c(self.p, &dest_cty) || self.flags_at_term.get(self.cur_bb).is_some_and(|f| !f[dest.local as usize]));
+                    && (!needs_drop_c(self.p, &dest_cty)
+                        || self.flags_at_term.get(self.cur_bb).is_some_and(|f| !f[dest.local as usize])
+                        || (!self.dflags.keeps(dest.local) && self.dflags.test(self.at, dest.local) == Some(false)));
                 if direct {
                     let d = self.place(dest, &loc).0;
                     self.out.push_str("  {\n");
@@ -3559,7 +3614,8 @@ impl FnGen<'_, '_> {
                     }
                     if needs_drop_c(self.p, &dest_cty) {
                         let l = dest.local;
-                        let _ = writeln!(self.out, "    d{l} = 1;{}", self.reset_move_flags(l, &[]));
+                        let set = if self.dflags.keeps(l) { format!(" d{l} = 1;") } else { String::new() };
+                        let _ = writeln!(self.out, "   {set}{}", self.reset_move_flags(l, &[]));
                     }
                     self.out.push_str("  }\n");
                 } else if *target == CallTarget::Builtin(Builtin::DefaultGlue) {
@@ -12096,84 +12152,6 @@ fn place_mentions(p: &Place, l: Local) -> bool {
     p.local == l || p.proj.iter().any(|x| matches!(x, Proj::Index(i) if *i == l))
 }
 
-/// Collects the place of `o` when it is a move.
-fn operand_moves<'r>(o: &'r Operand, out: &mut Vec<&'r Place>) {
-    if let Operand::Move(pl) = o {
-        out.push(pl);
-    }
-}
-
-fn parts_moves<'r>(parts: &'r [FmtPart], out: &mut Vec<&'r Place>) {
-    for part in parts {
-        if let FmtPart::Arg { value, .. } = part {
-            operand_moves(value, out);
-        }
-    }
-}
-
-/// Calls `op` for every operand one rvalue reads and `pl` for
-/// every place it reads without an operand (a borrow, a
-/// discriminant, a slice or length base). The one exhaustive
-/// rvalue scan in this file: the move scan and the mentions scan
-/// both go through it, so a new `Rvalue` variant updates both.
-fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: &mut impl FnMut(&'r Place)) {
-    match rv {
-        Rvalue::Use(o)
-        | Rvalue::Un(_, o)
-        | Rvalue::Cast(o, _)
-        | Rvalue::ArrayRepeat(_, o, _)
-        | Rvalue::Res(_, _, o)
-        | Rvalue::MakeDyn { ptr: o, .. }
-        | Rvalue::DynUpcast { ptr: o, .. }
-        | Rvalue::DynMeta { ptr: o, .. }
-        | Rvalue::DynData { ptr: o, .. } => op(o),
-        Rvalue::Bin(_, a, b)
-        | Rvalue::StrCmp(_, a, b)
-        | Rvalue::StringAdd(a, b)
-        | Rvalue::VecRepeat(_, a, b)
-        | Rvalue::Eq { a, b, .. }
-        | Rvalue::Cmp { a, b, .. } => {
-            op(a);
-            op(b);
-        }
-        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {
-            ops.iter().for_each(|o| op(o))
-        }
-        Rvalue::Opt(_, o) => {
-            if let Some(o) = o {
-                op(o);
-            }
-        }
-        Rvalue::Format(parts) | Rvalue::FormatArgs(None, parts) => parts.iter().for_each(|p| {
-            if let FmtPart::Arg { value, .. } = p {
-                op(value);
-            }
-        }),
-        Rvalue::WriteFmt(dst, parts, _) | Rvalue::FormatArgs(Some(dst), parts) => {
-            op(dst);
-            parts.iter().for_each(|p| {
-                if let FmtPart::Arg { value, .. } = p {
-                    op(value);
-                }
-            })
-        }
-        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) => pl(p),
-        Rvalue::Subslice { base, lo, hi, .. } => {
-            pl(base);
-            op(lo);
-            if let Some(h) = hi {
-                op(h);
-            }
-        }
-        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) | Rvalue::ItemShim(..) => {}
-    }
-}
-
-/// Collects the moved places among the operands of one rvalue.
-fn rvalue_moves<'r>(rv: &'r Rvalue, out: &mut Vec<&'r Place>) {
-    visit_rvalue_reads(rv, &mut |o| operand_moves(o, out), &mut |_| {});
-}
-
 fn operand_mentions(o: &Operand, l: Local) -> bool {
     matches!(o, Operand::Copy(p) | Operand::Move(p) if place_mentions(p, l))
 }
@@ -12184,15 +12162,6 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
     op_hit || pl_hit
 }
 
-fn succ(t: &Terminator) -> Vec<Bb> {
-    match t {
-        Terminator::Goto(b) => vec![*b],
-        Terminator::If(_, a, b) => vec![*a, *b],
-        Terminator::Switch(_, cases, other) => cases.iter().map(|c| c.1).chain(std::iter::once(*other)).collect(),
-        Terminator::Call { next, unwind, .. } => std::iter::once(*next).chain(*unwind).collect(),
-        Terminator::Return | Terminator::Unreachable | Terminator::Panic(_) => Vec::new(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -242,7 +242,7 @@ impl FnGen<'_, '_> {
                         _ if w == "ltc" => Some(Name::Ltc),
                         _ if w == "ex" => Some(Name::Ex),
                         b'l' => num(&w[1..], n).map(Name::Local),
-                        b'd' => num(&w[1..], n).filter(|&k| self.local_drop[k]).map(Name::Drop),
+                        b'd' => num(&w[1..], n).filter(|&k| self.local_drop[k] && self.dflags.keeps(k as Local)).map(Name::Drop),
                         b'm' => w[1..].split_once('_').and_then(|(a, k)| {
                             let l = num(a, n)?;
                             Some(Name::Move(l, num(k, self.move_paths[l].len())?))
@@ -352,6 +352,7 @@ impl FnGen<'_, '_> {
     /// The C of statement `s` (block `bi`, index `si`) as cgen writes it for a fn with no
     /// frame struct.
     fn stmt_text(&mut self, bi: usize, si: usize, s: &Stmt) -> String {
+        self.at = (bi as u32, si as u32);
         self.unw = self.stmt_action(bi, si).filter(|_| !matches!(s.kind, StmtKind::StorageDead(_) | StmtKind::FakeRead(_)));
         let saved = std::mem::take(&mut self.out);
         self.stmt(&s.kind, s.span);
@@ -447,6 +448,7 @@ impl FnGen<'_, '_> {
                     continue;
                 }
                 let unwind = if cleanup || !p.unwind { None } else { self.stmt_unw.get(&(bi as u32, si as u32)).copied() };
+                self.at = (bi as u32, si as u32);
                 if native_on() && self.ll_native_stmt(&mut ll, s, unwind) {
                     continue;
                 }
@@ -458,6 +460,7 @@ impl FnGen<'_, '_> {
                 self.ll_call(&mut ll, &h, unwind);
             }
             let term_unwind = if cleanup { None } else { self.stmt_unw.get(&(bi as u32, block.stmts.len() as u32)).copied() };
+            self.at = (bi as u32, block.stmts.len() as u32);
             self.ll_term(&mut ll, bi, cleanup, term_unwind.filter(|_| p.unwind));
         }
         if let Some(e) = ll.error.take() {
@@ -696,7 +699,8 @@ impl FnGen<'_, '_> {
             }
         }
         let mut flags = String::new();
-        let n_flags: usize = (0..self.local_cty.len()).map(|i| self.local_drop[i] as usize + self.move_paths[i].len()).sum();
+        let n_flags: usize =
+            (0..self.local_cty.len()).map(|i| (self.local_drop[i] && self.dflags.keeps(i as Local)) as usize + self.move_paths[i].len()).sum();
         // Drop and move flags live in memory (an empty asm use makes them escape, as cgen's
         // frame struct does) when a fn has many of them and many landing pads: promoting
         // them puts a phi per flag on every merge of the cleanup paths, and SROA then runs
@@ -707,7 +711,7 @@ impl FnGen<'_, '_> {
         for i in 0..self.local_cty.len() {
             let param = i >= 1 && i <= self.body.arg_count;
             let mut names: Vec<String> = Vec::new();
-            if self.local_drop[i] {
+            if self.local_drop[i] && self.dflags.keeps(i as Local) {
                 let _ = writeln!(flags, "  store i8 {}, ptr %d{i}", param as u8);
                 names.push(format!("%d{i}"));
             }
@@ -790,7 +794,7 @@ impl FnGen<'_, '_> {
             } else {
                 def(&mut self.out, format!("l{i}"), format!("(*q{i})"));
             }
-            if self.local_drop[i] {
+            if self.local_drop[i] && self.dflags.keeps(i as Local) {
                 def(&mut self.out, format!("d{i}"), format!("(*qd{i})"));
             }
             for k in 0..self.move_paths[i].len() {
@@ -1111,11 +1115,11 @@ impl FnGen<'_, '_> {
                 }
                 let mut clear = None;
                 if matches!(o, Operand::Move(_)) && self.local_drop[pl.local as usize] {
-                    clear = Some(if pl.proj.is_empty() {
-                        format!("%d{}", pl.local)
+                    clear = if pl.proj.is_empty() {
+                        self.dflags.keeps(pl.local).then(|| format!("%d{}", pl.local))
                     } else {
-                        format!("%m{}_{}", pl.local, self.move_flag(pl.local, &self.steps_of(pl)?)?)
-                    });
+                        Some(format!("%m{}_{}", pl.local, self.move_flag(pl.local, &self.steps_of(pl)?)?))
+                    };
                 }
                 Some((plan.ty, clear))
             }
@@ -1417,7 +1421,9 @@ impl FnGen<'_, '_> {
                 && self.local_drop[pl.local as usize]
             {
                 if pl.proj.is_empty() {
-                    clears.push(format!("%d{}", pl.local));
+                    if self.dflags.keeps(pl.local) {
+                        clears.push(format!("%d{}", pl.local));
+                    }
                 } else {
                     match self.steps_of(pl).and_then(|path| self.move_flag(pl.local, &path)) {
                         Some(k) => clears.push(format!("%m{}_{k}", pl.local)),
@@ -1450,7 +1456,13 @@ impl FnGen<'_, '_> {
             args.iter().zip(&direct).filter(|(_, d)| **d).filter_map(|(a, _)| if let Operand::Move(pl) = a { Some(pl.local as usize) } else { None }).collect();
         // An old value the call result replaces (dropped after the call returns), unless the
         // destination's flag is surely clear here.
-        let old_live = drop_old && !dest_clear;
+        // A static flag (`ir::dropflags`) says whether the old value is there on every path.
+        let static_old = if drop_old && !self.dflags.keeps(dest.local) { self.dflags.test(self.at, dest.local) } else { None };
+        let old_live = drop_old && !dest_clear && static_old != Some(false);
+        if drop_old && !dest_clear && !old_live {
+            // No old value on any path: its glue stays wanted all the same, as other C names it.
+            self.want(Glue::Drop, &dp.ty);
+        }
         // The result goes straight to a whole-local destination that holds nothing to drop
         // (a panic before the end leaves nothing that reads it: its flag is clear), unless
         // that local is an argument passed as itself.
@@ -1564,10 +1576,14 @@ impl FnGen<'_, '_> {
             let glue = format!("drop_{}", mangle(&dp.ty));
             self.want(Glue::Drop, &dp.ty);
             ll.decls.insert(format!("declare void @{glue}(ptr)"));
-            let _ = writeln!(
-                ll.body,
-                "  %o{k} = load i8, ptr %d{dl}\n  %oc{k} = icmp ne i8 %o{k}, 0\n  br i1 %oc{k}, label %od{k}, label %on{k}\nod{k}:\n  store i8 0, ptr %d{dl}"
-            );
+            if static_old.is_some() {
+                let _ = writeln!(ll.body, "  br label %od{k}\nod{k}:");
+            } else {
+                let _ = writeln!(
+                    ll.body,
+                    "  %o{k} = load i8, ptr %d{dl}\n  %oc{k} = icmp ne i8 %o{k}, 0\n  br i1 %oc{k}, label %od{k}, label %on{k}\nod{k}:\n  store i8 0, ptr %d{dl}"
+                );
+            }
             match unwind {
                 Some(u) => {
                     let _ = writeln!(ll.body, "  invoke void @{glue}(ptr %l{dl}) to label %on{k} unwind label %lp{u}");
@@ -1604,7 +1620,7 @@ impl FnGen<'_, '_> {
             }
             Pass::Skip => {}
         }
-        if drop_old {
+        if drop_old && static_old.is_none() {
             let _ = writeln!(ll.body, "  store i8 1, ptr %d{dl}");
         }
         true
@@ -1720,7 +1736,7 @@ impl FnGen<'_, '_> {
                         let mut clear: Option<String> = None;
                         if matches!(o, Operand::Move(_)) && self.local_drop[src.local as usize] {
                             if src.proj.is_empty() {
-                                clear = Some(format!("%d{}", src.local));
+                                clear = self.dflags.keeps(src.local).then(|| format!("%d{}", src.local));
                             } else {
                                 match self.steps_of(src).and_then(|path| self.move_flag(src.local, &path)) {
                                     Some(k) => clear = Some(format!("%m{}_{k}", src.local)),
@@ -1789,16 +1805,26 @@ impl FnGen<'_, '_> {
                 if !self.move_paths[l].is_empty() || ll.statics[l] {
                     return false;
                 }
+                // A static flag (`ir::dropflags`): drop on every path here, or on none.
+                let static_drop = if self.dflags.keeps(l as Local) { None } else { self.dflags.test(self.at, l as Local) };
                 let t = self.local_cty[l].clone();
+                // Wanted even with no drop here: other C names the glue too.
                 self.want(Glue::Drop, &t);
+                if static_drop == Some(false) {
+                    return true;
+                }
                 let glue = format!("drop_{}", mangle(&t));
                 ll.decls.insert(format!("declare void @{glue}(ptr)"));
                 ll.conts += 1;
                 let k = ll.conts;
-                let _ = writeln!(
-                    ll.body,
-                    "  %v{k} = load i8, ptr %d{l}\n  %c{k} = icmp ne i8 %v{k}, 0\n  br i1 %c{k}, label %dr{k}, label %dn{k}\ndr{k}:\n  store i8 0, ptr %d{l}"
-                );
+                if static_drop.is_some() {
+                    let _ = writeln!(ll.body, "  br label %dr{k}\ndr{k}:");
+                } else {
+                    let _ = writeln!(
+                        ll.body,
+                        "  %v{k} = load i8, ptr %d{l}\n  %c{k} = icmp ne i8 %v{k}, 0\n  br i1 %c{k}, label %dr{k}, label %dn{k}\ndr{k}:\n  store i8 0, ptr %d{l}"
+                    );
+                }
                 match unwind {
                     Some(u) => {
                         ll.pads.insert(u);

@@ -7,6 +7,8 @@ use crate::diag::Span;
 use crate::driver::graph::Reads;
 use crate::ty::{AdtId, IntTy, Ty, Tys};
 
+pub mod dropflags;
+
 pub type Local = u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -417,4 +419,93 @@ pub fn byte_blob_locals(body: &Body) -> Vec<Option<crate::ast::ByteBlob>> {
         }
     }
     blob
+}
+
+/// Collects the place of `o` when it is a move.
+pub fn operand_moves<'r>(o: &'r Operand, out: &mut Vec<&'r Place>) {
+    if let Operand::Move(pl) = o {
+        out.push(pl);
+    }
+}
+
+pub fn parts_moves<'r>(parts: &'r [FmtPart], out: &mut Vec<&'r Place>) {
+    for part in parts {
+        if let FmtPart::Arg { value, .. } = part {
+            operand_moves(value, out);
+        }
+    }
+}
+
+/// Calls `op` for every operand one rvalue reads and `pl` for
+/// every place it reads without an operand (a borrow, a
+/// discriminant, a slice or length base). The one exhaustive
+/// rvalue scan: cgen's move and mentions scans and the drop flag pass
+/// (`dropflags`) all go through it, so a new `Rvalue` variant updates each.
+pub fn visit_rvalue_reads<'r>(rv: &'r Rvalue, op: &mut impl FnMut(&'r Operand), pl: &mut impl FnMut(&'r Place)) {
+    match rv {
+        Rvalue::Use(o)
+        | Rvalue::Un(_, o)
+        | Rvalue::Cast(o, _)
+        | Rvalue::ArrayRepeat(_, o, _)
+        | Rvalue::Res(_, _, o)
+        | Rvalue::MakeDyn { ptr: o, .. }
+        | Rvalue::DynUpcast { ptr: o, .. }
+        | Rvalue::DynMeta { ptr: o, .. }
+        | Rvalue::DynData { ptr: o, .. } => op(o),
+        Rvalue::Bin(_, a, b)
+        | Rvalue::StrCmp(_, a, b)
+        | Rvalue::StringAdd(a, b)
+        | Rvalue::VecRepeat(_, a, b)
+        | Rvalue::Eq { a, b, .. }
+        | Rvalue::Cmp { a, b, .. } => {
+            op(a);
+            op(b);
+        }
+        Rvalue::Aggregate(_, _, ops) | Rvalue::VecLit(_, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => {
+            ops.iter().for_each(|o| op(o))
+        }
+        Rvalue::Opt(_, o) => {
+            if let Some(o) = o {
+                op(o);
+            }
+        }
+        Rvalue::Format(parts) | Rvalue::FormatArgs(None, parts) => parts.iter().for_each(|p| {
+            if let FmtPart::Arg { value, .. } = p {
+                op(value);
+            }
+        }),
+        Rvalue::WriteFmt(dst, parts, _) | Rvalue::FormatArgs(Some(dst), parts) => {
+            op(dst);
+            parts.iter().for_each(|p| {
+                if let FmtPart::Arg { value, .. } = p {
+                    op(value);
+                }
+            })
+        }
+        Rvalue::Ref(_, p) | Rvalue::Discriminant(p) | Rvalue::SliceOf(p) | Rvalue::LenOf(p) => pl(p),
+        Rvalue::Subslice { base, lo, hi, .. } => {
+            pl(base);
+            op(lo);
+            if let Some(h) = hi {
+                op(h);
+            }
+        }
+        Rvalue::StaticLoad(_) | Rvalue::StaticRef(_) | Rvalue::FnValue(..) | Rvalue::ItemShim(..) => {}
+    }
+}
+
+/// Collects the moved places among the operands of one rvalue.
+pub fn rvalue_moves<'r>(rv: &'r Rvalue, out: &mut Vec<&'r Place>) {
+    visit_rvalue_reads(rv, &mut |o| operand_moves(o, out), &mut |_| {});
+}
+
+/// The successors of a block through its terminator (a call's unwind successor too).
+pub fn succ(t: &Terminator) -> Vec<Bb> {
+    match t {
+        Terminator::Goto(b) => vec![*b],
+        Terminator::If(_, a, b) => vec![*a, *b],
+        Terminator::Switch(_, cases, other) => cases.iter().map(|c| c.1).chain(std::iter::once(*other)).collect(),
+        Terminator::Call { next, unwind, .. } => std::iter::once(*next).chain(*unwind).collect(),
+        Terminator::Return | Terminator::Unreachable | Terminator::Panic(_) => Vec::new(),
+    }
 }
