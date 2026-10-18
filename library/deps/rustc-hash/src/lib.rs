@@ -102,18 +102,14 @@ fn multiply_mix(x: u64, y: u64) -> u64 {
     (full as u64) ^ ((full >> 64) as u64)
 }
 
+// Little-endian reads; `hash_bytes` calls them only in bounds. One copy of 8 (or 4)
+// bytes, which a release build's C compiler makes a single load.
 fn read_u64(b: &[u8], at: usize) -> u64 {
-    let mut v: u64 = 0;
-    let mut i = 8;
-    while i > 0 {
-        i -= 1;
-        v = (v << 8) | b[at + i] as u64;
-    }
-    v
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
 fn read_u32(b: &[u8], at: usize) -> u32 {
-    (b[at] as u32) | (b[at + 1] as u32) << 8 | (b[at + 2] as u32) << 16 | (b[at + 3] as u32) << 24
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
 
 /// Compresses a byte string to one u64 (little-endian reads, as upstream).

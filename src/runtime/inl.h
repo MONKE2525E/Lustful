@@ -64,6 +64,11 @@
         __builtin_expect(lust_d_ != 0 && !(lust_a_ == INT64_MIN && lust_d_ == -1), 1) ? lust_a_ % lust_d_ : lust_rem_i64(lust_a_, lust_d_, (loc)); \
     })
 
+/* The C compiler's own memcpy and memmove: a small constant copy (a from_le_bytes, a
+   moved value) becomes loads and stores instead of two calls. */
+#define lust_memcpy(d, s, n) ((void)__builtin_memcpy((d), (s), (n)))
+#define lust_memmove(d, s, n) ((void)__builtin_memmove((d), (s), (n)))
+
 /* A push or reserve that fits the capacity; growth (and zero-sized elements) take the
    function. */
 #define lust_vec_push_slot(v, elem, align)                                                             \
