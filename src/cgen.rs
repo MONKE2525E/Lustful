@@ -792,6 +792,49 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
     }
 }
 
+/// Release C: a place reached through a pointer, as the pointer's C expression and a
+/// byte offset (`FnGen::place`). `plain` is the ordinary deref, used while no field
+/// offset has been added.
+struct OffsetPlace {
+    ptr: String,
+    off: u64,
+    fields: bool,
+    plain: String,
+}
+
+impl OffsetPlace {
+    /// The place as a C lvalue of type `t`.
+    fn render(&self, t: &CTy) -> String {
+        if self.fields { format!("(*({}*)((uint8_t*)({}) + {}))", ctype(t), self.ptr, self.off) } else { self.plain.clone() }
+    }
+}
+
+/// The layout of `t` when its fields can be read by offset (a struct, enum or tuple
+/// with a known C layout, not packed).
+fn offset_layout(p: &Program, t: &CTy) -> Option<Layout> {
+    match t {
+        CTy::Adt(a) if p.adt(*a).repr.pack.is_none() => c_layout(p, t),
+        CTy::Tuple(_) => c_layout(p, t),
+        _ => None,
+    }
+}
+
+/// The byte offset and C type of field `i` of `t` (in `variant` for an enum), when
+/// it can be read by offset.
+fn field_offset(p: &Program, t: &CTy, variant: Option<u32>, i: u32) -> Option<(u64, CTy)> {
+    let l = offset_layout(p, t)?;
+    match t {
+        CTy::Adt(a) => {
+            let adt = p.adt(*a);
+            let v = variant.unwrap_or(0) as usize;
+            let off = if adt.is_enum { *l.variant_offsets.get(v)?.get(i as usize)? } else { *l.field_offsets.get(i as usize)? };
+            Some((off, cty(&p.tys, adt.variants.get(v)?.fields.get(i as usize)?.ty)))
+        }
+        CTy::Tuple(es) => Some((*l.field_offsets.get(i as usize)?, es.get(i as usize)?.clone())),
+        _ => None,
+    }
+}
+
 /// Named types that `t` holds by value, so their C definitions must come first.
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
@@ -1069,6 +1112,8 @@ struct FnGen<'b, 'p> {
     map: &'b SourceMap,
     /// Types in the signatures of called functions, needed for the call casts.
     sig_types: HashSet<CTy>,
+    /// Release C: types the code names only behind a pointer (see `note_held`).
+    sig_named: HashSet<CTy>,
     /// Line of the function's `fn` keyword. Locations are stored relative to it, so the C for
     /// an unchanged function stays valid when code above it moves.
     base_line: u32,
@@ -1944,7 +1989,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         }
     }
     let mut types = std::mem::take(&mut g.sig_types);
-    let mut named = HashSet::new();
+    let mut named = std::mem::take(&mut g.sig_named);
     let release = names::release();
     for t in &g.local_cty {
         if release {
@@ -1991,6 +2036,7 @@ impl<'b, 'p> FnGen<'b, 'p> {
             index_spans: index_spans(body),
             map,
             sig_types: HashSet::new(),
+            sig_named: HashSet::new(),
             base_line,
             slots,
             tmp: 0,
@@ -2712,11 +2758,67 @@ impl FnGen<'_, '_> {
 
     // ---------- Places and operands ----------
 
+    /// Release C: a deref that starts an offset place (`OffsetPlace`): a `&`, `Box` or
+    /// raw pointer to a struct or tuple with a known layout, or an `Rc`/`Arc` value
+    /// (its offset in the count block). Returns the place, the plain C form of the
+    /// deref (for a place that ends there) and the pointee type.
+    fn offset_start(&self, pr: &Proj, t: &CTy, via: &mut Option<OffsetPlace>, e: &str) -> Option<(OffsetPlace, String, CTy)> {
+        let (inner, off) = match (pr, t) {
+            (Proj::Deref, CTy::Ref(inner) | CTy::Boxed(inner) | CTy::Ptr(inner)) if offset_layout(self.p, inner).is_some() => ((**inner).clone(), 0),
+            (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) => {
+                let l = c_layout(self.p, inner).filter(|l| l.align > 0)?;
+                ((**inner).clone(), 16u64.div_ceil(l.align) * l.align)
+            }
+            _ => return None,
+        };
+        // The pointer itself may sit at an offset (a field of an offset place).
+        let ptr = match via.take() {
+            Some(v) => v.render(t),
+            None => e.to_string(),
+        };
+        let plain = if off == 0 { format!("(*{ptr})") } else { format!("(*({}*)((uint8_t*)({ptr}) + {off}))", ctype(&inner)) };
+        Some((OffsetPlace { ptr, off, fields: off != 0, plain: plain.clone() }, plain, inner))
+    }
+
     fn place(&mut self, pl: &Place, loc: &str) -> (String, CTy) {
         let mut e = format!("l{}", pl.local);
         let mut t = self.local_cty[pl.local as usize].clone();
         let mut variant: Option<u32> = None;
+        let release = names::release();
+        // Release C reads fields through a pointer by offset (`OffsetPlace`): the unit
+        // then depends on the offsets it reads and the field types, not on the whole
+        // container, so a field added to a struct changes only units whose offsets move.
+        let mut via: Option<OffsetPlace> = None;
         for pr in &pl.proj {
+            if release {
+                // An offset place casts to a pointer to its current type (`render`): the
+                // unit needs what a `&T` local would.
+                if let Some(start) = self.offset_start(pr, &t, &mut via, &e) {
+                    (via, e, t) = (Some(start.0), start.1, start.2);
+                    self.note_held(&CTy::Ref(Box::new(t.clone())));
+                    continue;
+                }
+                if let Some(v) = via.as_mut() {
+                    match (pr, &t) {
+                        (Proj::Downcast(k), CTy::Adt(_) | CTy::Tuple(_)) => {
+                            variant = Some(*k);
+                            continue;
+                        }
+                        (Proj::Field(i), _) if let Some((off, ft)) = field_offset(self.p, &t, variant, *i) => {
+                            variant = None;
+                            v.off += off;
+                            v.fields = true;
+                            t = ft;
+                            self.note_held(&CTy::Ref(Box::new(t.clone())));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(v) = via.take() {
+                    e = v.render(&t);
+                }
+            }
             // Release C defines only what a unit holds by value (`type_decls`): a field
             // or element read needs its container defined (behind a pointer too), an
             // index the element type, a deref of an `Rc` or a guard the block it reads.
@@ -2724,8 +2826,21 @@ impl FnGen<'_, '_> {
             if names::release() {
                 match (pr, &t) {
                     (Proj::Deref, CTy::Ref(_) | CTy::Boxed(_) | CTy::Ptr(_)) | (Proj::Downcast(_), _) => {}
-                    (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) if c_layout(self.p, inner).is_some() => {}
-                    (Proj::Index(_), CTy::Vec(el) | CTy::Slice(el) | CTy::BoxSlice(el)) => collect_types(el, &mut self.sig_types),
+                    // (`offset_start` reads an `Rc` value with a layout by offset.)
+                    (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) if c_layout(self.p, inner).is_some_and(|l| l.align > 0) => {}
+                    (Proj::Index(_), CTy::Vec(el) | CTy::Slice(el) | CTy::BoxSlice(el)) => {
+                        let el = (**el).clone();
+                        self.note_held(&el)
+                    }
+                    // A field of a value (`l1.u.v1.f0`) needs the container's definition, not
+                    // what its fields point at. A kind with no struct of its own keeps the
+                    // whole closure.
+                    (Proj::Field(_), _) => {
+                        let t = t.clone();
+                        let mut held = Vec::new();
+                        by_value_deps(&t, &mut held);
+                        if held.is_empty() { collect_types(&t, &mut self.sig_types) } else { self.note_held(&t) }
+                    }
                     _ => collect_types(&t, &mut self.sig_types),
                 }
             }
@@ -2862,9 +2977,12 @@ impl FnGen<'_, '_> {
                 (pr, t) => panic!("bad projection in codegen: {pr:?} on {t:?}"),
             }
         }
+        if let Some(v) = via.take() {
+            e = v.render(&t);
+        }
         // A place read by value or by discriminant needs its type defined.
         if names::release() && !self.addr_only {
-            collect_types(&t, &mut self.sig_types);
+            self.note_held(&t);
         }
         (e, t)
     }
@@ -3326,6 +3444,56 @@ impl FnGen<'_, '_> {
         Some(format!("{name}({});", args.join(", ")))
     }
 
+    /// Records a type the code uses by value (a call's parameter or result, a place it
+    /// reads, an element it indexes). Release C defines only what `t` holds by value and
+    /// names what it points at, so a unit does not change when a struct behind an `Rc` or
+    /// a `&` does. Dev C defines all of it.
+    fn note_held(&mut self, t: &CTy) {
+        if names::release() {
+            let mut held = Vec::new();
+            by_value_deps(t, &mut held);
+            self.sig_types.extend(held);
+            collect_types(t, &mut self.sig_named);
+        } else {
+            collect_types(t, &mut self.sig_types);
+        }
+    }
+
+    /// Release C: a builtin's operand or result type. Inline builtin code may open what
+    /// the value points at, one step down: a reference's pointee, an `Rc`'s count block,
+    /// a container's elements (also of a referenced container). Kinds this does not
+    /// model keep the whole closure.
+    fn note_builtin(&mut self, t: &CTy) {
+        self.note_held(t);
+        match t {
+            CTy::Ref(inner) | CTy::Boxed(inner) | CTy::Ptr(inner) => {
+                self.note_held(inner);
+                self.note_opened(inner);
+            }
+            _ => self.note_opened(t),
+        }
+    }
+
+    /// The blocks and elements behind a value of `t` that builtin code reads (`note_builtin`).
+    fn note_opened(&mut self, t: &CTy) {
+        use crate::ty::sync::SyncTy;
+        match t {
+            // An `Arc` and the weak handles share the `Rc` count block (`RcI_<T>`).
+            CTy::Rc(e) | CTy::Weak(e) | CTy::Sync(SyncTy::Arc | SyncTy::ArcWeak, e) => {
+                self.sig_types.insert(CTy::Rc(e.clone()));
+                collect_types(t, &mut self.sig_named);
+            }
+            CTy::Vec(e) | CTy::Slice(e) | CTy::BoxSlice(e) | CTy::VecIter(e) | CTy::VecDrain(e) | CTy::Array(e, _) => self.note_held(e),
+            CTy::Option(e) => match &**e {
+                CTy::Ref(x) | CTy::Boxed(x) => self.note_held(x),
+                x => self.note_opened(x),
+            },
+            CTy::Hash(k, _) if hash::is_table(*k) => self.note_held(&hash::elem_cty(t)),
+            CTy::Int(_) | CTy::Float(_) | CTy::Bool | CTy::Char | CTy::Unit | CTy::Str | CTy::String | CTy::Adt(_) | CTy::Tuple(_) | CTy::Result(..) | CTy::FnPtr(..) => {}
+            _ => collect_types(t, &mut self.sig_types),
+        }
+    }
+
     /// Records `f` as `bad_callee` when its slot will have no C: every
     /// reference to another fn's slot goes through here first.
     fn note_callee(&mut self, f: LocalDefId) {
@@ -3340,12 +3508,13 @@ impl FnGen<'_, '_> {
     fn call_value(&mut self, target: CallTarget, args: &[Operand], dest_cty: &CTy, loc: &str, post: &mut Vec<String>) -> String {
         // Release C defines only what a unit holds by value or projects from
         // (`type_decls_with`): a builtin may size or open what its operands and result
-        // point at (an `Rc`'s count block, a `Vec`'s elements), so it records them all.
+        // point at (an `Rc`'s count block, a `Vec`'s elements), one step down
+        // (`note_builtin`).
         if names::release() && matches!(target, CallTarget::Builtin(_) | CallTarget::Intrinsic(_)) {
-            collect_types(dest_cty, &mut self.sig_types);
+            self.note_builtin(dest_cty);
             for o in args.iter().filter(|o| matches!(o, Operand::Move(_) | Operand::Copy(_))) {
                 let t = cty(&self.body.tys, self.callable_place_ty(o));
-                collect_types(&t, &mut self.sig_types);
+                self.note_builtin(&t);
             }
         }
         match target {
@@ -3354,7 +3523,7 @@ impl FnGen<'_, '_> {
                 let info = self.p.fn_info(f);
                 for &t in info.params.iter().chain(std::iter::once(&info.ret)) {
                     let ct = cty(&self.p.tys, t);
-                    collect_types(&ct, &mut self.sig_types);
+                    self.note_held(&ct);
                 }
                 let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
                 let pts: Vec<CTy> = info.params.iter().map(|&t| cty(&self.p.tys, t)).collect();
@@ -3572,7 +3741,7 @@ impl FnGen<'_, '_> {
                 let mut pts: Vec<CTy> = Vec::new();
                 for o in &args[1..] {
                     let (v, t) = self.operand(o, loc, post);
-                    collect_types(&t, &mut self.sig_types);
+                    self.note_held(&t);
                     if !param_dropped(self.p, &t) {
                         pts.push(t);
                         vals.push(v);
@@ -3584,7 +3753,7 @@ impl FnGen<'_, '_> {
                 let mut tys: Vec<String> = vec!["void *".into()];
                 tys.extend(pts.iter().map(|t| param_ctype(self.p, t)));
                 let ret = dest_cty.clone();
-                collect_types(&ret, &mut self.sig_types);
+                self.note_held(&ret);
                 let rc = ctype(&ret);
                 let pre: String = vals.iter().map(|v| format!(", {v}")).collect();
                 if ret_by_out(self.p, &ret) {
@@ -3599,7 +3768,10 @@ impl FnGen<'_, '_> {
             CallTarget::Indirect(callee) => {
                 let ct = self.local_cty[callee as usize].clone();
                 let CTy::FnPtr(ps, ret) = &ct else { panic!("indirect call through a non-fn-pointer local") };
-                collect_types(&ct, &mut self.sig_types);
+                // The call passes and returns by value what the pointer's type names.
+                for t in ps.iter().chain(std::iter::once(&**ret)).chain(std::iter::once(&ct)) {
+                    self.note_held(t);
+                }
                 let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
                 let mut pre = String::new();
                 self.spill_by_ptr(&mut pre, ps, &mut args);
@@ -3687,6 +3859,11 @@ impl FnGen<'_, '_> {
             }
             Rvalue::Subslice { base, lo, hi, inclusive, .. } => {
                 let (e, t) = self.kplace(base, loc);
+                // `ptr + lo` steps over elements: the element type by value.
+                if let CTy::Array(el, _) | CTy::Slice(el) | CTy::Vec(el) = &t {
+                    let el = (**el).clone();
+                    self.note_held(&el);
+                }
                 let (ptr, len) = self.slice_ptr_len(&e, &t);
                 let (lo_v, _) = self.operand(lo, loc, post);
                 let ct = match &t {
@@ -3885,7 +4062,10 @@ impl FnGen<'_, '_> {
                 }
             }
             Rvalue::VecLit(elem, ops) => {
-                let et = ctype(&cty(&self.body.tys, *elem));
+                // `sizeof` and the element stores need the element type by value.
+                let ec = cty(&self.body.tys, *elem);
+                self.note_held(&ec);
+                let et = ctype(&ec);
                 let t = self.tmp();
                 let _ = writeln!(self.out, "    lust_Vec {t} = lust_vec_with_capacity({}, sizeof({et}), _Alignof({et}));", ops.len());
                 for (i, o) in ops.iter().enumerate() {
@@ -4062,7 +4242,7 @@ impl FnGen<'_, '_> {
                 match t {
                     CTy::FnPtr(..) => {
                         self.note_callee(*f);
-                        collect_types(&t, &mut self.sig_types);
+                        self.note_held(&t);
                         format!("(({}){})", ctype(&t), self.slots.fn_value(self.p, *f))
                     }
                     // A bare fn item value is a zero-sized type.
@@ -4083,6 +4263,10 @@ impl FnGen<'_, '_> {
                 let (v, ct) = self.operand(ptr, loc, post);
                 // An Rc or Arc points the fat value at its value, after the counts.
                 let at_value = matches!(ct, CTy::Rc(_) | CTy::Sync(crate::ty::sync::SyncTy::Arc, _));
+                // That (and a Weak's) `->v` needs the count block defined.
+                if at_value || matches!(ct, CTy::Weak(_) | CTy::Sync(crate::ty::sync::SyncTy::ArcWeak, _)) {
+                    collect_types(&ct, &mut self.sig_types);
+                }
                 // `Box<[T; N]>`, `Rc<[T; N]>`, or `Arc<[T; N]>` to the
                 // `[T]` form: the element pointer and the constant length.
                 if let TyKind::Slice(e) = self.body.tys.kind(*dyn_ty) {
@@ -4131,6 +4315,7 @@ impl FnGen<'_, '_> {
                     // An `Rc<T>` or `Arc<T>` points at its allocation, the
                     // counts first.
                     CTy::Rc(e) | CTy::Sync(crate::ty::sync::SyncTy::Arc, e) => {
+                        collect_types(&ct, &mut self.sig_types);
                         let rc = format!("RcI_{}", mangle(e));
                         format!("(({rc} *)((char *)({v}).data - (uintptr_t)&(({rc} *)0)->v))")
                     }
@@ -9718,7 +9903,17 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
         let mut stack: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
         while let Some(k) = stack.pop() {
             if g.is_shared(k) {
-                collect_types(&k.1, &mut types);
+                // Only its prototype is here, which takes its type by pointer: release C
+                // needs what a `&T` does (fn pointer typedefs have no forward form) and
+                // declares the rest; dev C defines it all.
+                if names::release() {
+                    let mut held = Vec::new();
+                    by_value_deps(&CTy::Ref(Box::new(k.1.clone())), &mut held);
+                    types.extend(held);
+                    collect_types(&k.1, &mut named);
+                } else {
+                    collect_types(&k.1, &mut types);
+                }
             } else {
                 g.def_types(k, &mut types);
                 if let Some(deps) = g.deps.get(k) {

@@ -542,6 +542,34 @@ fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &Slots, this: &str
 }
 
 impl FnGen<'_, '_> {
+    /// Release C: the count and lock blocks `fmt_expr` opens on its way to the formatted
+    /// value (an `Rc`'s `->v`, a guard's `->f1`) must be defined in the unit
+    /// (`type_decls_with`); what they point at is only named.
+    fn note_fmt_opens(&mut self, t: &CTy, kind: FmtKind) {
+        if !names::release() || kind == FmtKind::Pointer {
+            return;
+        }
+        match t {
+            CTy::Ref(inner) | CTy::Boxed(inner) | CTy::Own(_, inner) => self.note_fmt_opens(inner, kind),
+            // An `Arc` shares the `Rc` count block (`RcI_<T>`).
+            CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => {
+                self.sig_types.insert(CTy::Rc(inner.clone()));
+                collect_types(t, &mut self.sig_named);
+                self.note_fmt_opens(inner, kind);
+            }
+            CTy::Guard(inner, _) => {
+                self.sig_types.insert(CTy::RefCell(inner.clone()));
+                collect_types(t, &mut self.sig_named);
+                self.note_fmt_opens(inner, kind);
+            }
+            CTy::Sync(k, inner) if k.guard().is_some() => {
+                collect_types(t, &mut self.sig_types);
+                self.note_fmt_opens(inner, kind);
+            }
+            _ => {}
+        }
+    }
+
     /// True for an unsized format argument (`str`, `[T]`, or an unsized
     /// newtype such as `Path`): it arrives as its fat value, and the
     /// formatters take a pointer to it.
@@ -798,6 +826,7 @@ impl FnGen<'_, '_> {
                         v
                     };
                     let mut want: Vec<(Glue, CTy)> = Vec::new();
+                    self.note_fmt_opens(&t, spec.kind);
                     let e = fmt_expr(&t, spec.kind, &format!("(&{s}f)"), &ptr, &mut |g, t| want.push((g, t.clone())));
                     for (g, t) in want {
                         self.want(g, &t);
@@ -1229,6 +1258,7 @@ impl FnGen<'_, '_> {
                         v
                     };
                     let mut want: Vec<(Glue, CTy)> = Vec::new();
+                    self.note_fmt_opens(&t, spec.kind);
                     let e = fmt_expr(&t, spec.kind, &format!("(&{s}f)"), &ptr, &mut |g, t| want.push((g, t.clone())));
                     for (g, t) in want {
                         self.want(g, &t);
