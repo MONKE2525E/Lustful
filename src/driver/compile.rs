@@ -4409,10 +4409,21 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Nothing reads the IR after codegen. A one-shot build leaks it at exit
     // (`leak_at_exit`), but on a large program it is the largest block
     // alive at the peak (ts-rust's bins: about 2.4 GB of 9.4 GB, through
-    // tcc and the link), so a large build frees it now.
+    // tcc and the link), so a large build frees it now, in chunks on the
+    // pool (one thread took 0.3 s on tsgo).
     let n_bodies = bodies.len();
     let bodies = if leak_at_exit && n_bodies >= 10_000 {
-        drop(bodies);
+        let per = n_bodies.div_ceil(crate::pool::threads().max(1) * 4);
+        let mut chunks: Vec<std::sync::Mutex<Vec<(usize, ir::Body)>>> = Vec::new();
+        let mut rest = bodies.into_iter();
+        loop {
+            let chunk: Vec<(usize, ir::Body)> = rest.by_ref().take(per).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            chunks.push(std::sync::Mutex::new(chunk));
+        }
+        par_map(&chunks, |c| drop(std::mem::take(&mut *c.lock().unwrap_or_else(|e| e.into_inner()))));
         t.lap("free IR");
         Vec::new()
     } else {
@@ -4530,7 +4541,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Hybrid glue: glue reached by 3 or more units stays in the shared glue unit, the rest is
     // static per unit. The set is frozen until the next fresh base (see cgen::GlueSet). The
     // glue unit's C is built below, only when unit 1 is in `todo`.
-    if fresh_base || caches.glue.shared.is_none() {
+    // Release C sets its own shared set below, so it skips this count.
+    if rnames.is_none() && (fresh_base || caches.glue.shared.is_none()) {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
     // Release C: every glue key is shared (fn units hold its prototype, `glue_shards`
@@ -4561,10 +4573,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
     // Release C glue shards come after the fn units (`link_fn_units` counts both).
-    let rshards: Vec<String> = match &rgroups {
+    let mut rshards: Vec<String> = match &rgroups {
         Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, super::release_c::unit_bytes())),
         None => Vec::new(),
     };
+    let n_shards = rshards.len();
     let mut units: Vec<(PathBuf, String)> = match &rgroups {
         None => par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay))),
         Some(rg) => {
@@ -4588,13 +4601,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 (base_obj(u), c)
             });
             let first = FIRST_FN_UNIT + rg.len();
-            units.extend(rshards.iter().enumerate().map(|(j, c)| (base_obj(first + j), c.clone())));
+            units.extend(rshards.drain(..).enumerate().map(|(j, c)| (base_obj(first + j), c)));
             units
         }
     };
     // The units the link takes after 1..4: release C has its own fn units and glue shards.
     let link_fn_units: Vec<usize> = match &rgroups {
-        Some(rg) => (0..rg.len() + rshards.len()).map(|g| g + FIRST_FN_UNIT).collect(),
+        Some(rg) => (0..rg.len() + n_shards).map(|g| g + FIRST_FN_UNIT).collect(),
         None => fn_units.clone(),
     };
     if let Some(p) = &req.emit_c {
