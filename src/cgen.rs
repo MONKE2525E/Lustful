@@ -6118,9 +6118,16 @@ impl FnGen<'_, '_> {
                 let et = ctype(e);
                 // The value must be read before `lust_vec_push_slot` can reallocate the
                 // buffer: `v.push(v[0])` in one C assignment could read the freed buffer.
-                let t = self.tmp();
-                let _ = writeln!(self.out, "    {et} {t} = {};", vals[1]);
-                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et}), _Alignof({et})) = {t};", vals[0]);
+                // A whole local or a constant is never in that buffer: it goes straight
+                // to the slot, with no copy in between.
+                let src = if matches!(&ops[1], Operand::Const(_)) || matches!(&ops[1], Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty()) {
+                    vals[1].clone()
+                } else {
+                    let t = self.tmp();
+                    let _ = writeln!(self.out, "    {et} {t} = {};", vals[1]);
+                    t
+                };
+                let _ = writeln!(self.out, "    *({et}*)lust_vec_push_slot({}, sizeof({et}), _Alignof({et})) = {src};", vals[0]);
                 "((lust_Unit){})".into()
             }
             B::Clone => {
