@@ -167,10 +167,13 @@ pub fn cflags(debug: bool) -> String {
 
 /// mimalloc as one C unit that replaces malloc and free (`MI_MALLOC_OVERRIDE`): the
 /// allocator of musl release builds, whose own malloc ran tsgo 3.2x slower. Allocation
-/// strategy is not observable. None when the build had no mimalloc source (build.rs).
+/// strategy is not observable. `MI_BUILD_RELEASE`: without it (or NDEBUG) mimalloc builds
+/// its debug mode, with asserts on every call and warnings on stderr when memory runs out
+/// (rustc's binary prints only its own message). None when the build had no mimalloc
+/// source (build.rs).
 pub fn mimalloc_unit() -> Option<String> {
     let src = include_str!(concat!(env!("OUT_DIR"), "/mimalloc.c"));
-    (!src.is_empty()).then(|| format!("#define MI_MALLOC_OVERRIDE 1\n{src}"))
+    (!src.is_empty()).then(|| format!("#define MI_MALLOC_OVERRIDE 1\n#define MI_BUILD_RELEASE 1\n{src}"))
 }
 
 /// Vector memcpy, memmove, memcmp, bcmp and memchr as one C unit for musl targets
