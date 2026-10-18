@@ -1251,7 +1251,7 @@ fn scalar_lit(bits: u128, size: u64, signed: bool) -> String {
 /// C names fields and types, so its body text holds no such layout and
 /// takes no read (a warm dev build checks fewer bodies again).
 fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
-    let tag = LAYOUT_PHASE.with(std::cell::Cell::get);
+    let tag = phase_tag();
     if tag != 0
         && let Some(hit) = LAYOUTS.with(|c| {
             let mut c = c.borrow_mut();
@@ -1299,9 +1299,20 @@ pub fn in_layout_phase<R>(tag: u64, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// The codegen phase whose `c_layout` answers this thread keeps, or 0. It is 0 while
+/// release C records `Layout` reads for the body being made (a session that records
+/// reads, such as a front image build): an answer kept from another body would skip
+/// that body's reads (`c_layout`), and the body would keep a stale layout when one moves.
+fn phase_tag() -> u64 {
+    if names::release() && crate::check::derive_delta::open() {
+        return 0;
+    }
+    LAYOUT_PHASE.with(std::cell::Cell::get)
+}
+
 /// This thread's layout of `t` in its codegen phase, when one was found.
 fn phase_layout(t: &CTy) -> Option<Layout> {
-    if LAYOUT_PHASE.with(std::cell::Cell::get) == 0 {
+    if phase_tag() == 0 {
         return None;
     }
     LAYOUTS.with(|c| c.borrow().1.get(t).cloned().flatten())
@@ -12204,6 +12215,31 @@ mod tests {
         own.fn_id = stub;
         let err = gen_fn(&program, &own, &map, 1, &slots).error.expect("a stub is never generated");
         assert!(err.contains("has no generated body"), "{err}");
+    }
+
+    /// In release C, a body that a thread makes after another body asked the same layout
+    /// in one codegen phase still takes the `Layout` read (`c_layout`, `phase_tag`). A
+    /// front image build kept the old field offsets of such a body when the layout moved.
+    #[test]
+    fn release_layout_reads_hold_in_a_layout_phase() {
+        let src = "struct T { a: u64 }\nstruct S { t: T, y: u64 }\nfn get(p: &S) -> u64 { p.y }\nfn main() { let s = S { t: T { a: 1 }, y: 2 }; println!(\"{}\", get(&s) + s.t.a); }\n";
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let p = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        let a = p.type_names[&interner.intern("S")];
+        let names = std::sync::Arc::new(names::Names { fns: Vec::new(), adts: Vec::new(), by_id: Default::default() });
+        let reads = names::with(Some(&names), || {
+            in_layout_phase(layout_phase(), || {
+                (0..2).map(|_| crate::check::derive_delta::scoped(true, || c_layout(&p, &CTy::Adt(a))).1).collect::<Vec<_>>()
+            })
+        });
+        let def = p.def_of_adt(a);
+        for (body, r) in reads.iter().enumerate() {
+            assert!(r.iter().any(|&(d, bits)| d == def && bits & crate::check::derive_delta::bit::LAYOUT != 0), "body {body} reads S's layout: {r:?}");
+        }
     }
 
     /// Derived glue regenerates when a field type changes under the
