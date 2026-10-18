@@ -113,8 +113,29 @@ const BIG_FILE: u64 = 256 << 10;
 /// daemon; any other panic resumes).
 fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Response> {
     let t = std::time::Instant::now();
-    image::lock(dir);
-    let (mut sessions, loaded) = match image::load(dir) {
+    // Compact mode (src/image.rs `compact_exec`): a background save found the image too
+    // scattered and started this run of the same command to rebuild it cold. It holds the
+    // save child's lock, loads nothing, makes no artifact (every cc step is parked and
+    // dropped), and writes the new image as a base.
+    let compact = image::compact_mode();
+    if compact && !reqs.iter().all(|r| r.cc) {
+        image::refuse_compaction(dir, "a compaction of a run that is not all release driver builds");
+        return Vec::new();
+    }
+    if compact {
+        if !image::adopt_lock() {
+            image::refuse_compaction(dir, "no state lock to adopt");
+            return Vec::new();
+        }
+    } else {
+        image::lock(dir);
+    }
+    image::allow_compaction(!compact && reqs.iter().all(|r| r.cc));
+    if compact {
+        image::wait_for_build();
+    }
+    let loaded = if compact { Err("compacting the image".to_string()) } else { image::load(dir) };
+    let (mut sessions, loaded) = match loaded {
         Ok(roots) => {
             let image::Roots { mut sessions, tables, stamps } = *roots;
             diag::put_global_tables(tables);
@@ -149,9 +170,12 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
         let session = &mut sessions[i];
         // The last release build parks its cc step (`driver::defer_cc`), so the background
         // save below forks first and writes the image while clang runs.
-        driver::defer_cc(background && req.cc && k + 1 == reqs.len());
+        driver::defer_cc(if compact { req.cc } else { background && req.cc && k + 1 == reqs.len() });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, session)));
         driver::defer_cc(false);
+        if compact {
+            driver::drop_parked_cc();
+        }
         match result {
             Ok(mut resp) => {
                 if verbose {
@@ -175,8 +199,24 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
             }
         }
     }
+    if compact && resps.iter().any(|r| r.code != 0) {
+        image::refuse_compaction(dir, "the cold rebuild failed");
+        let _ = std::fs::write(dir.join("save.log"), "lust: front state not compacted: the cold rebuild failed\n");
+        return resps;
+    }
     sessions.iter_mut().for_each(|s| s.settle());
     let roots = Box::new(image::Roots { sessions, tables: diag::take_global_tables(), stamps: driver::Stamps::now() });
+    if compact {
+        let line = match image::save(dir, roots) {
+            Ok(line) => format!("{} (compacted: cold rebuild and save in {:.0} ms)\n", line, t.elapsed().as_secs_f64() * 1e3),
+            Err(e) => {
+                image::refuse_compaction(dir, &e);
+                format!("lust: front state not compacted: {e}\n")
+            }
+        };
+        let _ = std::fs::write(dir.join("save.log"), line);
+        return resps;
+    }
     let saved = if background { image::save_background(dir, roots) } else { image::save(dir, roots) };
     let line = match saved {
         Ok(line) if verbose => line + "\n",
@@ -239,7 +279,13 @@ fn main() {
                     resps.iter().for_each(|r| eprint!("{}", r.stderr));
                     std::process::exit(resps.iter().map(|r| r.code).find(|&c| c != 0).unwrap_or(0));
                 }
-                eprintln!("lust: front state off: {}", image::reexec(&dir));
+                let why = image::reexec(&dir);
+                // A compacting process (src/image.rs `compact_exec`) builds nothing without the image.
+                if image::compact_mode() {
+                    image::refuse_compaction(&dir, &why);
+                    std::process::exit(0);
+                }
+                eprintln!("lust: front state off: {why}");
             }
             let mut code = 0;
             for req in &reqs {
@@ -273,6 +319,10 @@ fn main() {
                     protocol::finish(resp, run, &req.out, &args);
                 }
                 let why = image::reexec(&dir);
+                if image::compact_mode() {
+                    image::refuse_compaction(&dir, &why);
+                    std::process::exit(0);
+                }
                 eprintln!("lust: front state off: {why}");
             }
             let start = std::time::Instant::now();

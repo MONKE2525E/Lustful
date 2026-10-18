@@ -54,7 +54,7 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 /// The state directory variable (`LUST_FRONT_STATE=<dir>`).
 pub const STATE_ENV: &str = "LUST_FRONT_STATE";
@@ -69,6 +69,15 @@ const IMAGE_FILE: &str = "front.img";
 const LOCK_FILE: &str = "lock";
 /// A background save's result line, in the state directory.
 const SAVE_LOG: &str = "save.log";
+/// `LUST_FRONT_COMPACT=1`: this process rebuilds the image cold and writes it as a new base
+/// (`compact_exec`, `main::image_run`).
+const COMPACT_ENV: &str = "LUST_FRONT_COMPACT";
+/// The state lock's descriptor, which a compacting process inherits (`compact_exec`).
+const LOCK_FD_ENV: &str = "LUST_FRONT_LOCK_FD";
+/// The build process a compacting process waits for before it starts (`compact_exec`).
+const WAIT_PID_ENV: &str = "LUST_FRONT_WAIT_PID";
+/// Left by a compaction that did not finish: later saves write a plain base (`compaction_due`).
+const NO_COMPACT: &str = "nocompact";
 /// Image format. Bump on any change to the header or to what `Roots` holds.
 const MAGIC: &[u8; 8] = b"LUSTFIM3";
 /// Arena bases come from this window, one generation after another:
@@ -101,6 +110,7 @@ unsafe extern "C" {
     fn pwrite(fd: c_int, buf: *const c_void, count: usize, off: i64) -> isize;
     fn copy_file_range(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: u32) -> isize;
     fn flock(fd: c_int, op: c_int) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
     fn fork() -> c_int;
     fn setsid() -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
@@ -127,6 +137,8 @@ const MAP_NORESERVE: c_int = 0x4000;
 const MAP_FIXED_NOREPLACE: c_int = 0x10_0000;
 const ADDR_NO_RANDOMIZE: u64 = 0x0040000;
 const LOCK_EX: c_int = 2;
+const F_SETFD: c_int = 2;
+const FD_CLOEXEC: c_int = 1;
 const EINTR: i32 = 4;
 /// `mi_option_disallow_os_alloc` in mimalloc 3.3 (libmimalloc-sys 0.1.49).
 const MI_OPTION_DISALLOW_OS_ALLOC: c_int = 17;
@@ -300,7 +312,9 @@ pub fn reexec(dir: &Path) -> String {
     // A background save of the build before this one writes the header
     // read next: wait for its lock (`lock`), then let it go; the new
     // process takes it again before its load.
-    if let Ok(f) = std::fs::File::open(dir.join(LOCK_FILE)) {
+    // A compacting process holds the lock already (`compact_exec`) and builds cold.
+    let compact = compact_mode();
+    if !compact && let Ok(f) = std::fs::File::open(dir.join(LOCK_FILE)) {
         use std::os::fd::AsRawFd;
         flock_wait(f.as_raw_fd());
     }
@@ -308,7 +322,7 @@ pub fn reexec(dir: &Path) -> String {
     // unusable or the window is used up (`load` then refuses the image).
     // Anchors are checked by `load` in the new process: this one runs
     // with randomization on, so its addresses differ anyway.
-    let top = read_chain(dir).ok().and_then(|mut c| c.pop());
+    let top = if compact { None } else { read_chain(dir).ok().and_then(|mut c| c.pop()) };
     let base = match top {
         Some(h) if h.build == build_id() && valid_base(h.next_base as usize) => h.next_base as usize,
         _ => WINDOW_LO,
@@ -962,6 +976,10 @@ fn modified_runs(runs: &[(usize, usize)]) -> Result<Vec<(usize, usize)>, String>
 
 /// Set once this process holds the state directory's lock.
 static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The lock's descriptor (`lock`, `adopt_lock`).
+static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
+/// Set by a run whose saves may compact the image (`allow_compaction`).
+static COMPACT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Takes the state directory's lock for the rest of this process (call it
 /// before `load`): one image process per directory at a time, so a build
@@ -978,7 +996,94 @@ pub fn lock(dir: &Path) {
     let fd = f.into_raw_fd();
     if flock_wait(fd) {
         LOCKED.store(true, Ordering::Relaxed);
+        LOCK_FD.store(fd, Ordering::Relaxed);
     }
+}
+
+/// True in a process that rebuilds the image cold (`compact_exec`).
+pub fn compact_mode() -> bool {
+    std::env::var_os(COMPACT_ENV).is_some_and(|v| v == "1")
+}
+
+/// The state lock in a compacting process: the save child's descriptor, inherited across the
+/// exec (`compact_exec`), close-on-exec again so the compilers this run starts do not hold it.
+/// False when there is none: the process then must not touch the state.
+pub fn adopt_lock() -> bool {
+    let Some(fd) = std::env::var(LOCK_FD_ENV).ok().and_then(|v| v.parse::<c_int>().ok()) else { return false };
+    // SAFETY: fcntl on a descriptor of this process.
+    if unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } < 0 {
+        return false;
+    }
+    LOCK_FD.store(fd, Ordering::Relaxed);
+    LOCKED.store(true, Ordering::Relaxed);
+    true
+}
+
+/// In a compacting process: waits until the build that started its save has exited (its cc
+/// step and link run after the fork, `driver::defer_cc`), so the cold rebuild runs after the
+/// artifact, not beside clang.
+pub fn wait_for_build() {
+    let Some(pid) = std::env::var(WAIT_PID_ENV).ok().filter(|p| !p.is_empty()) else { return };
+    let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let start = std::time::Instant::now();
+    while proc.exists() && start.elapsed() < std::time::Duration::from_secs(3600) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Lets this run's background save compact the image (`compaction_due`): only a run of release
+/// driver builds, whose compaction parks and drops every cc step, so it writes no artifact.
+pub fn allow_compaction(on: bool) {
+    COMPACT_OK.store(on, Ordering::Relaxed);
+}
+
+/// Stops compaction for this state directory, with why (a compaction that failed would
+/// otherwise run again at every save).
+pub fn refuse_compaction(dir: &Path, why: &str) {
+    let _ = std::fs::write(dir.join(NO_COMPACT), format!("{why}\n"));
+}
+
+/// True when a base is due (`write_image`): too many deltas, or their data passes half the base.
+fn base_due(l: &Loaded) -> bool {
+    !(l.layers <= MAX_DELTAS && l.delta_bytes < l.base_live / 2)
+}
+
+/// True when this save should rebuild the image cold instead of writing a base from this
+/// heap: a base is due and the image's restored span passes `LUST_FRONT_COMPACT_RATIO` (default
+/// 1.5, 0 for never) times its live bytes. Restored
+/// memory is never reused and a page that holds a live block is kept whole, so a base from
+/// this heap keeps every such page (tsgo's 12-merge replay: 8.7, 12.7, 17.0 GB bases for 4.7,
+/// 5.2, 5.7 GB live).
+fn compaction_due(dir: &Path) -> bool {
+    let Some(l) = LOADED.get() else { return false };
+    let ratio = std::env::var("LUST_FRONT_COMPACT_RATIO").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5);
+    let span: usize = l.runs.iter().map(|&(a, e)| e - a).sum();
+    COMPACT_OK.load(Ordering::Relaxed)
+        && ratio > 0.0
+        && base_due(l)
+        && span as f64 > l.live as f64 * ratio
+        && !dir.join(NO_COMPACT).exists()
+}
+
+/// Replaces this save child with a fresh run of the same command that rebuilds the image cold
+/// and writes it as a new base (`main::image_run` in compact mode). The state lock's descriptor
+/// stays open across the exec, so the lock holds until that run ends. Returns only when the
+/// exec failed.
+fn compact_exec(build_pid: u32) -> String {
+    use std::os::unix::process::CommandExt;
+    let fd = LOCK_FD.load(Ordering::Relaxed);
+    // SAFETY: fcntl on a descriptor of this process.
+    if fd < 0 || unsafe { fcntl(fd, F_SETFD, 0) } < 0 {
+        return "no state lock descriptor".into();
+    }
+    let mut cmd = std::process::Command::new("/proc/self/exe");
+    cmd.args(std::env::args_os().skip(1))
+        .env(COMPACT_ENV, "1")
+        .env(LOCK_FD_ENV, fd.to_string())
+        .env(WAIT_PID_ENV, build_pid.to_string())
+        .env_remove(SAVE_ENV)
+        .env_remove(ARENA_ENV);
+    format!("compaction exec failed: {}", cmd.exec())
 }
 
 /// Takes the lock on open file `fd`, waiting for its holder. False when
@@ -1022,6 +1127,7 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
     }
     // Before the fork: the child gets only this thread.
     quiesce();
+    let build_pid = std::process::id();
     let log = dir.join(SAVE_LOG);
     let _ = std::fs::remove_file(&log);
     let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
@@ -1039,6 +1145,12 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
         // The parent runs a parked cc step after the fork (`driver::defer_cc`): its unit
         // texts are freed here, so they are not live blocks of the image.
         crate::driver::drop_parked_cc();
+        // A base from this heap would keep its scattered pages: rebuild the image cold instead
+        // (`compaction_due`). On success the exec does not return.
+        if compaction_due(dir) {
+            let why = compact_exec(build_pid);
+            refuse_compaction(dir, &why);
+        }
         let line = write_image(dir, roots).unwrap_or_else(|e| format!("lust: front state not saved: {e}"));
         let _ = std::fs::write(&log, line + "\n");
         // SAFETY: ends the child now; the parent's exit handlers and
@@ -1087,7 +1199,11 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     }
     let restored = restored_runs();
     let loaded = LOADED.get().filter(|_| !restored.is_empty());
-    let delta = loaded.filter(|l| l.layers <= MAX_DELTAS && l.delta_bytes < l.base_live / 2);
+    let delta = loaded.filter(|l| !base_due(l));
+    if loaded.is_none() {
+        // A cold base (a cold build, or a compaction): compaction may run again.
+        let _ = std::fs::remove_file(dir.join(NO_COMPACT));
+    }
     let (layer, parent) = match delta {
         Some(l) => (l.layers, l.top_id),
         None => (0, 0),
@@ -1286,14 +1402,16 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         k += 1;
     }
     Ok(format!(
-        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}, {:.0} ms",
+        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}, {:.0} ms, {} MB live ({} MB of restored blocks freed)",
         h.generation,
         if layer == 0 { "base".to_string() } else { format!("delta {layer}") },
         w.blocks,
         arena_bytes >> 20,
         old_bytes >> 20,
         if layer == 0 { "kept" } else { "rewritten" },
-        t.elapsed().as_secs_f64() * 1e3
+        t.elapsed().as_secs_f64() * 1e3,
+        live >> 20,
+        OLD_FREED.load(Ordering::Relaxed) >> 20
     ))
 }
 
