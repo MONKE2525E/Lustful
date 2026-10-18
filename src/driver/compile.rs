@@ -55,9 +55,16 @@ fn expand_tokens(
     src: &str,
     test: bool,
     profile: crate::protocol::ProfileFlags,
+    session: &crate::protocol::SessionKey,
 ) -> Result<(lexer::Lexed, Vec<expand::Dep>), Diag> {
     let mut ctx = expand::ExpandCtx::for_file(&front.interner, &front.known, file, src, test);
     ctx.client = &front.client;
+    // The root file sees the session target's cfg facts, as every other
+    // file of a crate session does through the worklist: a foreign
+    // `--target` must change `cfg!` and `#[cfg]` here too, not leave
+    // the host facts of `for_file` in place.
+    let env = crate::resolve::cfg::CfgEnv::new(&session.target_triple, &session.features, test, profile);
+    ctx.cfg = crate::resolve::worklist::expand_cfg(&env);
     ctx.cfg.panic_unwind = !profile.panic_abort;
     ctx.cfg.debug_assertions = profile.debug_assertions;
     expand::expand_lexed_with_deps(lexed, &ctx)
@@ -2374,9 +2381,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
     }
     // Lust builds for the host target today. A named non-host triple is a
-    // clear error, not a host binary under a foreign name.
+    // clear error, not a host binary under a foreign name. A check may
+    // name a release triple (cfg::CfgEnv::is_release_target): its full
+    // cfg table matches rustc, so the check sees the same code rustc
+    // would for that target.
     let triple = &req.session.target_triple;
-    if !triple.is_empty() && triple != crate::protocol::host_triple() {
+    let foreign_check = matches!(req.cmd, crate::protocol::Cmd::Check) && crate::resolve::cfg::CfgEnv::is_release_target(triple);
+    if !triple.is_empty() && triple != crate::protocol::host_triple() && !foreign_check {
         return Response {
             stderr: format!(
                 "error: unsupported target `{triple}`: lust builds for the host target `{}` today\n",
@@ -2656,7 +2667,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let test_mode = req.harness || req.session.krate.test;
     let fresh = par_map(&need, |&i| {
         let (a, b) = ranges[i];
-        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile)).map(
+        lexer::lex(&src[a..b], ROOT_FILE, a as u32, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile, &req.session)).map(
             |(l, deps)| {
                 let mut sc = scan::scan(&l);
                 fold_fn_text(&mut sc, &l, &src);
@@ -2683,7 +2694,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // A chunk cut a comment or string the scanner did not see, or the text is bad, or the
         // file has an inner attribute (`has_inner_attr`): lex the whole file. Its error is the
         // answer; if it lexes, compile as one chunk. Never panic.
-        match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile)) {
+        match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile, &req.session)) {
             Err(mut d) => return errors(std::slice::from_mut(&mut d), &map, &src, req),
             Ok((whole, deps)) => {
                 let mut sc = scan::scan(&whole);
@@ -3046,7 +3057,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         } else {
             // Re-parse serially for an exact error.
             let whole =
-                match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile)) {
+                match lexer::lex(&src, ROOT_FILE, 0, &front.interner).and_then(|l| expand_tokens(front, l, &req.file, &src, test_mode, req.session.profile, &req.session)) {
                     Ok((w, _deps)) => w,
                     Err(mut d) => {
                         front.env_hash = None;

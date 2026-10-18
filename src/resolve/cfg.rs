@@ -130,15 +130,18 @@ impl CfgEnv {
         } else {
             (parts.get(1).zip(parts.get(2)).map(|(&v, &o)| (v, o)), 3usize)
         };
+        let mut os_name = "";
+        let mut env_part = "";
         if let Some((vendor, os)) = vendor_os {
             env.pair("target_vendor", vendor);
-            let (os_name, family) = match os {
+            let (name, family) = match os {
                 "darwin" => ("macos", "unix"),
                 "windows" => ("windows", "windows"),
                 "wasip1" | "wasip2" | "wasi" => ("wasi", "wasm"),
                 "emscripten" => ("emscripten", "unix"),
                 other => (other, "unix"),
             };
+            os_name = name;
             env.pair("target_os", os_name);
             env.pair("target_family", family);
             if family == "unix" {
@@ -147,25 +150,46 @@ impl CfgEnv {
             if family == "windows" {
                 env.flags.insert("windows".into());
             }
-            let env_part = parts.get(env_abi_at).copied().unwrap_or("");
+            env_part = parts.get(env_abi_at).copied().unwrap_or("");
             // `gnu`/`msvc`/`musl` may carry an ABI suffix (`gnueabi`); keep the
             // written value, and the abi as its own pair only when a 5th part
             // exists (for example `x86_64-pc-windows-msvc` has empty abi).
             env.pair("target_env", env_part);
             env.pair("target_abi", parts.get(env_abi_at + 1).copied().unwrap_or(""));
         }
-        // Atomics: the tier-1 table. Widths up to the pointer width, plus
-        // 64 on x86_64/aarch64 (both are 64-bit pointer targets here).
+        // Atomics and target features for the release triples, copied from
+        // `rustc --print cfg` (1.99) per triple. Width 128 exists where
+        // rustc lists it (aarch64 everywhere here, x86_64 on macOS and
+        // Windows, not on Linux). Another triple keeps the old base row:
+        // widths to 64 and the x86_64 baseline features, classification
+        // only, as the doc comment above says.
         if arch != "wasm32" {
             for w in ["8", "16", "32", "64", "ptr"] {
                 env.pair("target_has_atomic", w);
                 env.pair("target_has_atomic_primitive_alignment", w);
             }
-        }
-        if arch == "x86_64" {
-            for f in ["fxsr", "sse", "sse2"] {
-                env.pair("target_feature", f);
+            if arch == "aarch64" || (arch == "x86_64" && matches!(os_name, "macos" | "windows")) {
+                env.pair("target_has_atomic", "128");
+                env.pair("target_has_atomic_primitive_alignment", "128");
             }
+        }
+        let features: &[&str] = match (arch, os_name, env_part) {
+            ("x86_64", "linux", "musl") => &["crt-static", "fxsr", "sse", "sse2"],
+            ("aarch64", "linux", "musl") => &["crt-static", "neon"],
+            ("aarch64", "linux", _) => &["neon"],
+            ("x86_64", "macos", _) => &["cmpxchg16b", "fxsr", "sse", "sse2", "sse3", "sse4.1", "ssse3"],
+            ("aarch64", "macos", _) => &[
+                "aes", "crc", "dit", "dotprod", "dpb", "dpb2", "fcma", "fhm", "flagm", "fp16", "frintts", "jsconv", "lor",
+                "lse", "neon", "paca", "pacg", "pan", "pmuv3", "ras", "rcpc", "rcpc2", "rdm", "sb", "sha2", "sha3", "ssbs",
+                "vh",
+            ],
+            ("x86_64", "windows", _) => &["cmpxchg16b", "fxsr", "sse", "sse2", "sse3"],
+            ("aarch64", "windows", _) => &["neon"],
+            ("x86_64", _, _) => &["fxsr", "sse", "sse2"],
+            _ => &[],
+        };
+        for f in features {
+            env.pair("target_feature", f);
         }
         if !arch.starts_with("wasm") {
             env.flags.insert("target_thread_local".into());
@@ -181,6 +205,27 @@ impl CfgEnv {
             env.flags.insert("test".into());
         }
         env
+    }
+
+    /// True for the release triples whose full cfg table above is copied
+    /// from rustc (the six ts-rust release targets, both Linux libc
+    /// flavors, and x86_64 windows-gnu). A foreign `--target` names one
+    /// of these or it stays a clear error: for another triple the table
+    /// is classification only and a check could accept where rustc
+    /// rejects.
+    pub fn is_release_target(triple: &str) -> bool {
+        matches!(
+            triple,
+            "x86_64-unknown-linux-gnu"
+                | "x86_64-unknown-linux-musl"
+                | "aarch64-unknown-linux-gnu"
+                | "aarch64-unknown-linux-musl"
+                | "aarch64-apple-darwin"
+                | "x86_64-apple-darwin"
+                | "x86_64-pc-windows-msvc"
+                | "aarch64-pc-windows-msvc"
+                | "x86_64-pc-windows-gnu"
+        )
     }
 
     fn pair(&mut self, name: &str, value: &str) {
@@ -527,6 +572,32 @@ mod tests {
         let wasi = CfgEnv::new("wasm32-wasip1", &[], false, ProfileFlags::DEV);
         assert!(eval_pred(&wasi, "target_os = \"wasi\"").unwrap());
         assert!(!eval_pred(&wasi, "target_pointer_width = \"64\"").unwrap());
+    }
+
+    #[test]
+    fn release_triples_match_rustc_cfg() {
+        // Per `rustc --print cfg` 1.99: 128-bit atomics on aarch64 and on
+        // x86_64 macOS/Windows, not on x86_64 Linux; musl is crt-static.
+        let a64 = CfgEnv::new("aarch64-unknown-linux-musl", &[], false, ProfileFlags::DEV);
+        assert!(eval_pred(&a64, "target_has_atomic = \"128\"").unwrap());
+        assert!(eval_pred(&a64, "target_feature = \"crt-static\"").unwrap());
+        assert!(eval_pred(&a64, "target_feature = \"neon\"").unwrap());
+        assert!(eval_pred(&a64, "target_env = \"musl\"").unwrap());
+        let x64 = CfgEnv::new("x86_64-unknown-linux-musl", &[], false, ProfileFlags::DEV);
+        assert!(!eval_pred(&x64, "target_has_atomic = \"128\"").unwrap());
+        assert!(eval_pred(&x64, "target_feature = \"crt-static\"").unwrap());
+        let mac = CfgEnv::new("aarch64-apple-darwin", &[], false, ProfileFlags::DEV);
+        assert!(eval_pred(&mac, "target_has_atomic = \"128\"").unwrap());
+        assert!(eval_pred(&mac, "target_feature = \"lse\"").unwrap());
+        assert!(eval_pred(&mac, "target_env = \"\"").unwrap());
+        let win = CfgEnv::new("x86_64-pc-windows-msvc", &[], false, ProfileFlags::DEV);
+        assert!(eval_pred(&win, "windows").unwrap());
+        assert!(eval_pred(&win, "target_has_atomic = \"128\"").unwrap());
+        assert!(eval_pred(&win, "target_feature = \"cmpxchg16b\"").unwrap());
+        assert!(eval_pred(&win, "target_env = \"msvc\"").unwrap());
+        assert!(CfgEnv::is_release_target("aarch64-pc-windows-msvc"));
+        assert!(!CfgEnv::is_release_target("wasm32-wasip1"));
+        assert!(!CfgEnv::is_release_target("riscv64gc-unknown-linux-gnu"));
     }
 
     #[test]
