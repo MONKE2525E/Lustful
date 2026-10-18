@@ -5826,7 +5826,7 @@ pub struct GenTables {
     /// The hidden type of each `impl Trait` return, over its defining
     /// fn's params (check/opaque.rs): from `reveal_plain` and the
     /// template check. A revealed check substitutes a use's args.
-    pub opaque_hidden: FxMap<DefId, Ty>,
+    pub opaque_hidden: crate::check::spec::Logged<DefId, Ty, { crate::check::spec::tab::OPAQUE_HIDDEN }>,
     /// The anonymous consts of signatures (`note_anon_const`).
     pub(crate) anon_wants: AnonWants,
 }
@@ -5911,7 +5911,7 @@ impl Default for GenTables {
             param_defaults: FxMap::default(),
             opaques: FxMap::default(),
             opaque_ret_of: Default::default(),
-            opaque_hidden: FxMap::default(),
+            opaque_hidden: Default::default(),
             anon_wants: Default::default(),
         }
     }
@@ -10616,20 +10616,28 @@ fn template_check(p: &mut Program) -> Vec<Diag> {
     }
     let mut errs: Vec<Diag> = Vec::new();
     let mut reuse = std::mem::take(&mut p.gx.reuse);
-    for t in templates {
-        // The lang enum methods (checked when the library was built)
-        // check only when mono makes their first instance (`materialize`):
-        // a compile splices all of them and instantiates a few.
-        if p.is_lang_method(t) {
-            continue;
+    // The lang enum methods (checked when the library was built) check
+    // only when mono makes their first instance (`materialize`): a
+    // compile splices all of them and instantiates a few. A std platform
+    // template in `lust check` (`Program::check_skips`) does not check,
+    // unless callers need the hidden type of its `impl Trait`.
+    templates.retain(|&t| !p.is_lang_method(t) && (!p.check_skips(t) || p.gx.opaques.contains_key(&opaque_def(p.def_id(t)))));
+    // A template whose check only reads the program (no closures to
+    // register, no hidden type of its own) checks ahead in a window, as
+    // discovery bodies do (`Ahead`); its writes go in at its turn.
+    let mut ahead: Ahead<TemplateBody> = Ahead::new(!p.record_reads && !reuse.on);
+    ahead.start(templates.len());
+    for (k, &t) in templates.iter().enumerate() {
+        crate::driver::graph::FpMemo::sync(p);
+        let reads_only = |p: &Program, t: LocalDefId| !fn_has_closures(p, t) && !p.gx.opaques.contains_key(&opaque_def(p.def_id(t)));
+        ahead.fill(&templates, k, |i| reads_only(p, templates[i]), |&t| template_body(p, t, &[]));
+        match ahead.take(&p.gx.anon_wants, k) {
+            Some(body) => errs.extend(finish_template(p, t, &mut reuse, body, &[], &Vec::new())),
+            None => errs.extend(check_template(p, t, &mut reuse)),
         }
-        // A std platform template in `lust check` (`Program::check_skips`),
-        // unless callers need the hidden type of its `impl Trait`.
-        if p.check_skips(t) && !p.gx.opaques.contains_key(&opaque_def(p.def_id(t))) {
-            continue;
-        }
-        errs.extend(check_template(p, t, &mut reuse));
     }
+    ahead.end();
+    ahead.report("templates");
     p.gx.reuse = reuse;
     errs
 }
@@ -11322,7 +11330,7 @@ pub(crate) fn instance_sig(p: &mut Program, template: LocalDefId, args: &[Generi
             let hidden = std::mem::take(&mut p.gx.opaque_hidden);
             // A hidden type can name a projection of the params
             // (`I::IntoIter`), which the args now decide (normalized).
-            let r = crate::check::opaque::reveal_global(p, &hidden, o);
+            let r = crate::check::opaque::reveal_global(p, hidden.as_map(), o);
             p.gx.opaque_hidden = hidden;
             r
         }
@@ -12410,7 +12418,8 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     let lints = reuse.on || !reuse.one_shot;
     // Window checks run only where a check records no reads: a read's
     // fingerprint can come from the deep memo, which logs no table read.
-    let mut ahead = Ahead::new(!p.record_reads && !reuse.on);
+    let mut ahead: Ahead<Found> = Ahead::new(!p.record_reads && !reuse.on);
+    let compare = std::env::var_os("LUST_CHECK_PARDISC");
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -12428,7 +12437,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         ahead.start(round.len());
         for (k, &fid) in round.iter().enumerate() {
             crate::driver::graph::FpMemo::sync(p);
-            ahead.fill(p, &round, k, lints);
+            ahead.fill(&round, k, |_| true, |&f| discover_one(p, f, lints));
             let adts_before = p.adts.len();
             if rounds == 1 && p.gx.fn_class.get(fid.0 as usize) == Some(&FnClass::Plain) {
                 p.gx.turn_marks.push((fid, p.gx.adt_created.len() as u32));
@@ -12444,8 +12453,13 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 stored
             } else {
                 reuse.discovery_checked += 1;
-                let checked = match ahead.take(p, k, fid, lints) {
-                    Some(found) => found,
+                let checked = match ahead.take(&p.gx.anon_wants, k) {
+                    Some(found) => {
+                        if let Some(path) = &compare {
+                            compare_found(p, fid, lints, &found, path);
+                        }
+                        found
+                    }
                     None => discover_one(p, fid, lints),
                 };
                 let clean = checked.clean;
@@ -12603,7 +12617,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         queue = next_queue;
     }
     p.gx.reuse = reuse;
-    ahead.report();
+    ahead.report("discovery");
     crate::check::opaque::finish_opaque_rets(p);
     p.gx.mono_done = true;
     // W-SHIM: instances whose behavior lust cannot make exact. A
@@ -12761,25 +12775,20 @@ fn discover_one(p: &Program, fid: LocalDefId, lints: bool) -> Found {
     Found { out, closure_map_pending, closure_kind_pending, clean: discarded.is_empty(), reads: checked.reads }
 }
 
-/// A window check's result: the check, what it read of the logged
-/// tables, its `anon_wants` notes, and the steps it took.
-type Ahead1 = (Found, crate::check::spec::Log, Vec<(u32, Option<ConstScalar>)>, u64);
-
-/// Discovery checks of a round run ahead in windows (check/spec.rs): at
-/// the turn of body `k`, `fill` checks the next bodies of the round in
-/// parallel against the program as it is then, and each one's turn takes
-/// its result (`take`) only when nothing it read changed since; else the
-/// body checks in its turn as before.
-struct Ahead {
+/// Checks of one round run ahead in windows (check/spec.rs): at the turn
+/// of item `k`, `fill` checks the next items of the round in parallel
+/// against the program as it is then, and each item's turn takes its
+/// result (`take`) only when nothing it read was written since; else
+/// the item checks in its turn as before. Materialize's discovery bodies
+/// and the template checks use it.
+struct Ahead<R> {
     on: bool,
-    found: Vec<Option<Ahead1>>,
-    /// The end of the open window.
+    /// Each window result: the check, what it read of the logged tables,
+    /// its `anon_wants` notes, the steps it took, and the turn whose
+    /// program state it read.
+    found: Vec<Option<AheadResult<R>>>,
+    /// The end of the last window.
     filled: usize,
-    /// Bodies the next window checks.
-    width: usize,
-    /// `LUST_CHECK_PARDISC=<log>`: every result taken is checked again in
-    /// order, and a difference is logged.
-    compare: Option<std::ffi::OsString>,
     /// Windows, results taken, results stale, checks that stopped early.
     counts: [usize; 4],
     window_ms: f64,
@@ -12788,69 +12797,78 @@ struct Ahead {
     stale_by: [usize; 64],
 }
 
+type AheadResult<R> = (R, crate::check::spec::Log, Vec<(u32, Option<ConstScalar>)>, u64, u32);
+
 /// Steps (trait selections and new body types) a window check may take
-/// before it stops; the body then checks in its turn.
+/// before it stops; the item then checks in its turn.
 const AHEAD_FUEL: u64 = 2_000_000;
 
-impl Ahead {
-    fn new(on: bool) -> Ahead {
+/// Items per window.
+const AHEAD_WIDTH: usize = 64;
+
+impl<R: Send> Ahead<R> {
+    /// Windows run when `on` (a one-shot compile: no read is recorded and
+    /// no reuse store kept) with more than one thread, and not under
+    /// `LUST_NO_PARDISC=1`.
+    fn new(on: bool) -> Ahead<R> {
         let on = on && crate::pool::threads() > 1 && std::env::var_os("LUST_NO_PARDISC").is_none();
         if on {
             crate::check::spec::quiet_hook();
         }
-        Ahead {
-            on,
-            found: Vec::new(),
-            filled: 0,
-            width: 64,
-            compare: std::env::var_os("LUST_CHECK_PARDISC"),
-            counts: [0; 4],
-            window_ms: 0.0,
-            max_steps: 0,
-            stale_by: [0; 64],
-        }
+        Ahead { on, found: Vec::new(), filled: 0, counts: [0; 4], window_ms: 0.0, max_steps: 0, stale_by: [0; 64] }
     }
 
-    /// A round of `n` bodies starts.
+    /// A round of `n` items starts: the main thread logs its writes.
     fn start(&mut self, n: usize) {
         self.found.clear();
         self.found.resize_with(n, || None);
         self.filled = 0;
+        if self.on {
+            crate::check::spec::begin_round();
+        }
     }
 
     /// The round's last turn ended.
     fn end(&mut self) {
-        crate::check::spec::close_window();
+        if self.on {
+            crate::check::spec::end_round();
+        }
         self.found.clear();
     }
 
-    /// Before body `k`'s check: when the open window ends at `k`, checks
-    /// the next window.
-    fn fill(&mut self, p: &Program, round: &[LocalDefId], k: usize, lints: bool) {
-        if !self.on || k < self.filled || round.len() - k < 2 {
+    /// Before item `k`'s check: when the last window ends at `k`, checks
+    /// the next window's items that `ahead` admits.
+    fn fill<T: Sync>(&mut self, round: &[T], k: usize, ahead: impl Fn(usize) -> bool, check: impl Fn(&T) -> R + Sync) {
+        if !self.on {
             return;
         }
-        crate::check::spec::close_window();
-        let end = (k + self.width).min(round.len());
-        let t0 = std::time::Instant::now();
-        let results = crate::pool::par_map(&round[k..end], |&f| crate::check::spec::speculate(AHEAD_FUEL, || discover_one(p, f, lints)));
-        self.window_ms += t0.elapsed().as_secs_f64() * 1e3;
+        crate::check::spec::set_turn(k as u32);
+        if k < self.filled || round.len() - k < 2 {
+            return;
+        }
+        let end = (k + AHEAD_WIDTH).min(round.len());
+        let at: Vec<usize> = (k..end).filter(|&i| ahead(i)).collect();
+        self.filled = end;
+        if at.len() < 2 {
+            return;
+        }
         self.counts[0] += 1;
-        for (i, r) in results.into_iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        let results = crate::pool::par_map(&at, |&i| crate::check::spec::speculate(AHEAD_FUEL, || check(&round[i])));
+        self.window_ms += t0.elapsed().as_secs_f64() * 1e3;
+        for (&i, r) in at.iter().zip(results) {
             match r {
-                Some(r) => self.found[k + i] = Some(r),
+                Some((found, log, anon, steps)) => self.found[i] = Some((found, log, anon, steps, k as u32)),
                 None => self.counts[3] += 1,
             }
         }
-        self.filled = end;
-        crate::check::spec::open_window();
     }
 
-    /// Body `k`'s window result, when nothing it read was written since
-    /// its window opened. Its `anon_wants` notes go in now, in turn order.
-    fn take(&mut self, p: &Program, k: usize, fid: LocalDefId, lints: bool) -> Option<Found> {
-        let (found, log, anon, steps) = self.found.get_mut(k)?.take()?;
-        if let Some(t) = crate::check::spec::with_writes(|w| log.stale_by(w)) {
+    /// Item `k`'s window result, when nothing it read was written since.
+    /// Its `anon_wants` notes go in now, in turn order.
+    fn take(&mut self, anon_wants: &AnonWants, k: usize) -> Option<R> {
+        let (found, log, anon, steps, turn) = self.found.get_mut(k)?.take()?;
+        if let Some(t) = crate::check::spec::stale_since(&log, turn) {
             self.counts[2] += 1;
             self.stale_by[t as usize] += 1;
             return None;
@@ -12858,42 +12876,19 @@ impl Ahead {
         self.counts[1] += 1;
         self.max_steps = self.max_steps.max(steps);
         for (e, want) in anon {
-            put_anon_want(&p.gx.anon_wants, e, want);
-        }
-        if let Some(path) = &self.compare {
-            let fresh = discover_one(p, fid, lints);
-            if !fresh.same(&found) {
-                let (a, b) = (&found.out, &fresh.out);
-                let line = format!(
-                    "pardisc: {} {} differs: adt_tys {} reqs {} closures {} vtables {} map_pending {} kind_pending {} clean {} reads {}\n",
-                    std::env::args().skip(2).find(|a| a.ends_with(".rs")).unwrap_or_default(),
-                    p.interner.get(p.fn_info(fid).name),
-                    a.0 != b.0,
-                    a.1 != b.1,
-                    a.2 != b.2,
-                    a.3 != b.3,
-                    found.closure_map_pending != fresh.closure_map_pending,
-                    found.closure_kind_pending != fresh.closure_kind_pending,
-                    found.clean != fresh.clean,
-                    format!("{:?}", found.reads) != format!("{:?}", fresh.reads),
-                );
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                    let _ = f.write_all(line.as_bytes());
-                }
-            }
+            put_anon_want(anon_wants, e, want);
         }
         Some(found)
     }
 
     /// `LUST_PARDISC_STATS`: one line of counts, to stderr (`1`) or
     /// appended to the file the value names.
-    fn report(&self) {
+    fn report(&self, what: &str) {
         let Some(to) = std::env::var_os("LUST_PARDISC_STATS").filter(|_| self.on) else { return };
         let [w, taken, stale, out] = self.counts;
         let by: Vec<String> = self.stale_by.iter().enumerate().filter(|(_, n)| **n > 0).map(|(t, n)| format!("{t}:{n}")).collect();
         let line = format!(
-            "pardisc-stats: windows {w} taken {taken} stale {stale} stopped {out} window-ms {:.1} max-steps {} stale-by-table {}\n",
+            "pardisc-stats: {what}: windows {w} taken {taken} stale {stale} stopped {out} window-ms {:.1} max-steps {} stale-by-table {}\n",
             self.window_ms,
             self.max_steps,
             by.join(",")
@@ -12904,6 +12899,33 @@ impl Ahead {
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
         }
+    }
+}
+
+/// `LUST_CHECK_PARDISC=<log>`: checks discovery body `fid` again in order
+/// and logs a difference from its window result `found`.
+fn compare_found(p: &Program, fid: LocalDefId, lints: bool, found: &Found, path: &std::ffi::OsStr) {
+    let fresh = discover_one(p, fid, lints);
+    if fresh.same(found) {
+        return;
+    }
+    let (a, b) = (&found.out, &fresh.out);
+    let line = format!(
+        "pardisc: {} {} differs: adt_tys {} reqs {} closures {} vtables {} map_pending {} kind_pending {} clean {} reads {}\n",
+        std::env::args().skip(2).find(|a| a.ends_with(".rs")).unwrap_or_default(),
+        p.interner.get(p.fn_info(fid).name),
+        a.0 != b.0,
+        a.1 != b.1,
+        a.2 != b.2,
+        a.3 != b.3,
+        found.closure_map_pending != fresh.closure_map_pending,
+        found.closure_kind_pending != fresh.closure_kind_pending,
+        found.clean != fresh.clean,
+        format!("{:?}", found.reads) != format!("{:?}", fresh.reads),
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 

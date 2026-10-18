@@ -1,23 +1,24 @@
-// Speculative discovery checks (materialize, check/generics.rs).
+// Speculative checks (materialize's template and discovery checks,
+// check/generics.rs `Ahead`).
 //
-// Discovery checks the bodies of a round in order, and each turn's apply
-// step adds instances, closures, glue rows and types that a later body's
-// check can read. A window of bodies checks ahead in parallel against the
-// program as it is when the window opens. Each window check logs what it
-// reads from the tables that discovery changes (`read`, `read_all`), and
-// the main thread logs what the turns after the window opened write to
-// them (`wrote`, `wrote_all`). A window result stands at its body's turn
-// only when no key it read was written since the window opened
-// (`Log::holds`); else the body checks again in its turn. A result that
+// Materialize checks the items of a round in order, and each turn's apply
+// step adds instances, closures, glue rows and types that a later item's
+// check can read. A window of items checks ahead in parallel against the
+// program as it is at the turn the window opens. Each window check logs
+// what it reads from the tables that materialize changes (`read`,
+// `read_all`), and the main thread logs each write to them with its turn
+// (`wrote`, `wrote_all`, `set_turn`). A window result stands at its item's
+// turn only when no key it read was written in or after the turn it read
+// (`stale_since`); else the item checks again in its turn. A result that
 // stands read the same values the in-order check reads, so it is the same
 // result.
 //
 // The logged tables are `Logged` maps (no `Deref`: each read and write
 // goes through a method that logs it), the global type store's arenas and
-// maps (ty/mod.rs), and `GenTables::anon_wants`, which a check also writes:
-// a window check writes it into its own overlay (`note_anon`), replayed in
-// order at the body's turn (`replay_anon`). Keys are 64-bit hashes; a
-// collision only makes a body check again.
+// maps (ty/mod.rs), `Defs`, and `GenTables::anon_wants`, which a check also
+// writes: a window check writes it into its own overlay (`note_anon`),
+// which `Ahead::take` replays in turn order. Keys are 64-bit hashes; a
+// collision only makes an item check again.
 
 use crate::intern::FxMap;
 use std::cell::{Cell, RefCell};
@@ -91,15 +92,16 @@ thread_local! {
     /// writes (the main thread while a window is open).
     static MODE: Cell<u8> = const { Cell::new(OFF) };
     static LOG: RefCell<Log> = RefCell::new(Log::default());
+    /// The main thread's writes since its round began (`begin_round`).
+    static WRITES: RefCell<Writes> = RefCell::new(Writes::default());
     /// The `anon_wants` notes of this thread's window check, in order.
     static ANON: RefCell<Vec<(u32, Option<crate::check::generics::ConstScalar>)>> = const { RefCell::new(Vec::new()) };
     /// Steps left before this thread's window check gives up (`step`).
     static FUEL: Cell<u64> = const { Cell::new(u64::MAX) };
 }
 
-/// What one window check read, or what the turns since a window opened
-/// wrote: key hashes, the tables those keys are in, and whole-table
-/// accesses (an iteration, a length).
+/// What one window check read: key hashes, the tables those keys are
+/// in, and whole-table reads (an iteration, a length).
 #[derive(Default, Debug)]
 pub struct Log {
     keys: std::collections::HashSet<u64, BuildHasherDefault<NoHash>>,
@@ -127,24 +129,41 @@ impl Hasher for NoHash {
 }
 
 impl Log {
-    /// True when nothing this read log names is in `writes`.
-    pub fn holds(&self, writes: &Log) -> bool {
-        self.stale_by(writes).is_none()
-    }
-
-    /// The table of one read that `writes` makes stale, if any.
-    pub fn stale_by(&self, writes: &Log) -> Option<u8> {
-        let whole = self.all & (writes.all | writes.key_tabs) | self.key_tabs & writes.all;
-        if whole != 0 {
-            return Some(whole.trailing_zeros() as u8);
+    /// The table of one read that a write in turn `since` or later made
+    /// stale, if any: None when the check made at the start of turn
+    /// `since` still holds now.
+    pub fn stale_since(&self, w: &Writes, since: u32) -> Option<u8> {
+        let after = |turn: u32| turn > since;
+        for t in 0..64u8 {
+            let bit = 1u64 << t;
+            let (whole, keyed) = (w.all[t as usize], w.key_tabs[t as usize]);
+            if self.all & bit != 0 && (after(whole) || after(keyed)) || self.key_tabs & bit != 0 && after(whole) {
+                return Some(t);
+            }
         }
-        let (small, big) = if self.keys.len() <= writes.keys.len() { (&self.keys, &writes.keys) } else { (&writes.keys, &self.keys) };
-        small.iter().find(|k| big.contains(k)).map(|k| (k >> 56) as u8)
+        self.keys.iter().find(|k| w.keys.get(k).is_some_and(|&turn| after(turn))).map(|k| (k >> 56) as u8)
     }
 
     fn key(&mut self, t: u8, k: u64) {
         self.keys.insert(k);
         self.key_tabs |= 1 << t;
+    }
+}
+
+/// What the main thread wrote to logged tables since its round began:
+/// per key, per table, and per whole table, the last turn that wrote it
+/// (plus one; 0 is never).
+pub struct Writes {
+    keys: std::collections::HashMap<u64, u32, BuildHasherDefault<NoHash>>,
+    key_tabs: [u32; 64],
+    all: [u32; 64],
+    /// The turn running now, plus one.
+    turn: u32,
+}
+
+impl Default for Writes {
+    fn default() -> Writes {
+        Writes { keys: Default::default(), key_tabs: [0; 64], all: [0; 64], turn: 1 }
     }
 }
 
@@ -178,12 +197,17 @@ pub fn read_all(t: u8) {
     }
 }
 
-/// Notes a write of key `k` of table `t` (the main thread, window open).
+/// Notes a write of key `k` of table `t` (the main thread in a round).
 #[inline]
 pub fn wrote<K: Hash + ?Sized>(t: u8, k: &K) {
     if mode() == WRITE {
         let h = hash_key(t, k);
-        LOG.with(|l| l.borrow_mut().key(t, h));
+        WRITES.with(|w| {
+            let mut w = w.borrow_mut();
+            let turn = w.turn;
+            w.keys.insert(h, turn);
+            w.key_tabs[t as usize] = turn;
+        });
     }
 }
 
@@ -191,7 +215,10 @@ pub fn wrote<K: Hash + ?Sized>(t: u8, k: &K) {
 #[inline]
 pub fn wrote_all(t: u8) {
     if mode() == WRITE {
-        LOG.with(|l| l.borrow_mut().all |= 1 << t);
+        WRITES.with(|w| {
+            let mut w = w.borrow_mut();
+            w.all[t as usize] = w.turn;
+        });
     }
 }
 
@@ -201,22 +228,28 @@ pub fn reading() -> bool {
     mode() == READ
 }
 
-/// Opens a window on the main thread: from now on its writes to logged
-/// tables are logged (`writes`), until `close_window`.
-pub fn open_window() {
+/// Begins a round on the main thread: from now on its writes to logged
+/// tables are logged (`Writes`), each with its turn (`set_turn`), until
+/// `end_round`.
+pub fn begin_round() {
     MODE.with(|m| m.set(WRITE));
-    LOG.with(|l| *l.borrow_mut() = Log::default());
+    WRITES.with(|w| *w.borrow_mut() = Writes::default());
 }
 
-pub fn close_window() {
+pub fn end_round() {
     MODE.with(|m| m.set(OFF));
-    LOG.with(|l| *l.borrow_mut() = Log::default());
+    WRITES.with(|w| *w.borrow_mut() = Writes::default());
 }
 
-/// Runs `f` on this thread with what the main thread's open window logs;
-/// `holds` asks it.
-pub fn with_writes<R>(f: impl FnOnce(&Log) -> R) -> R {
-    LOG.with(|l| f(&l.borrow()))
+/// The main thread's writes from now on are turn `turn`'s.
+pub fn set_turn(turn: u32) {
+    WRITES.with(|w| w.borrow_mut().turn = turn + 1);
+}
+
+/// The table of one read of `reads` that a write in turn `since` or
+/// later made stale (`Log::stale_since`).
+pub fn stale_since(reads: &Log, since: u32) -> Option<u8> {
+    WRITES.with(|w| reads.stale_since(&w.borrow(), since))
 }
 
 /// Why a window check stopped early (`step`); not a panic, so no hook
@@ -455,13 +488,18 @@ mod tests {
     fn a_read_holds_until_its_key_is_written() {
         let mut m: Logged<u32, u32, { tab::CLOSURES }> = Logged::default();
         m.insert(1, 10);
-        let (_, reads, _, _) = speculate(u64::MAX, || (m.get(&1).copied(), m.get(&2).copied())).unwrap();
-        open_window();
+        begin_round();
+        set_turn(0);
+        m.insert(9, 90);
+        set_turn(1);
+        let (_, reads, _, _) = speculate(u64::MAX, || (m.get(&1).copied(), m.get(&2).copied(), m.get(&9).copied())).unwrap();
         m.insert(3, 30);
-        assert!(with_writes(|w| reads.holds(w)));
+        assert_eq!(stale_since(&reads, 1), None, "a write before the check does not count");
+        set_turn(2);
         m.insert(2, 20);
-        assert!(!with_writes(|w| reads.holds(w)));
-        close_window();
+        assert_eq!(stale_since(&reads, 1), Some(tab::CLOSURES));
+        assert_eq!(stale_since(&reads, 3), None);
+        end_round();
     }
 
     #[test]
@@ -469,12 +507,12 @@ mod tests {
         let mut m: Logged<u32, u32, { tab::CLOSURES }> = Logged::default();
         let mut other: Logged<u32, u32, { tab::INSTANCES }> = Logged::default();
         let (_, reads, _, _) = speculate(u64::MAX, || m.len()).unwrap();
-        open_window();
+        begin_round();
         other.insert(1, 1);
-        assert!(with_writes(|w| reads.holds(w)));
+        assert_eq!(stale_since(&reads, 0), None);
         m.insert(7, 7);
-        assert!(!with_writes(|w| reads.holds(w)));
-        close_window();
+        assert_eq!(stale_since(&reads, 0), Some(tab::CLOSURES));
+        end_round();
     }
 
     #[test]

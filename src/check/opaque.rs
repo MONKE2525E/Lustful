@@ -311,7 +311,7 @@ impl Ctx<'_> {
         }
         let p = self.p;
         let mut found: Vec<Ty> = Vec::new();
-        collect_opaques_deep(&p.gx.opaque_hidden, &mut self.tys, t, &mut found);
+        collect_opaques_deep(p.gx.opaque_hidden.as_map(), &mut self.tys, t, &mut found);
         for o in found {
             if let TyKind::Opaque(od, _) = self.tys.kind(o)
                 && let Some(info) = p.gx.opaques.get(&od)
@@ -361,8 +361,8 @@ impl Ctx<'_> {
         for t in std::mem::take(&mut self.opaque_calls) {
             self.default_literal_vars(t);
             let t = self.deep(t);
-            collect_opaques_deep(&p.gx.opaque_hidden, &mut self.tys, t, &mut found);
-            let r = reveal(&p.gx.opaque_hidden, &mut self.tys, t, 0);
+            collect_opaques_deep(p.gx.opaque_hidden.as_map(), &mut self.tys, t, &mut found);
+            let r = reveal(p.gx.opaque_hidden.as_map(), &mut self.tys, t, 0);
             bare_iter_args(&self.tys, r, &mut bare);
         }
         // The inner iterators the call types became once their args
@@ -1024,7 +1024,7 @@ impl Ctx<'_> {
     /// still be variables here (`pass(Cnt(0))`); body end fixes the slots
     /// they become (`build_closure_map`, `iter_arg_map`).
     pub(super) fn reveal_here(&mut self, t: Ty) -> Ty {
-        let t = reveal(&self.p.gx.opaque_hidden, &mut self.tys, t, 0);
+        let t = reveal(self.p.gx.opaque_hidden.as_map(), &mut self.tys, t, 0);
         let mut bare = Vec::new();
         bare_iter_args(&self.tys, t, &mut bare);
         let map = self.canon_iter_args(bare);
@@ -1081,10 +1081,10 @@ pub(crate) fn finish_opaque_rets(p: &mut Program) {
             continue;
         }
         let hidden = std::mem::take(&mut p.gx.opaque_hidden);
-        let r = reveal(&hidden, &mut p.tys, opaque, 0);
+        let r = reveal(hidden.as_map(), &mut p.tys, opaque, 0);
         let r = generics::normalize_global(p, r);
         let mut found: Vec<Ty> = Vec::new();
-        collect_opaques_deep(&hidden, &mut p.tys, opaque, &mut found);
+        collect_opaques_deep(hidden.as_map(), &mut p.tys, opaque, &mut found);
         let mut map: Vec<(Ty, DefId)> = Vec::new();
         // Innermost first, as in `build_closure_map`.
         for o in found.into_iter().rev() {
@@ -1096,7 +1096,7 @@ pub(crate) fn finish_opaque_rets(p: &mut Program) {
             let args: Vec<GenericArg> = p.tys.args(args).to_vec();
             let args: Vec<GenericArg> = args.into_iter().map(|g| map_arg_closures(&mut p.tys, g, &map)).collect();
             let Some(inst) = generics::instance_for(p, &p.tys, template, &args).filter(|&i| i != template) else { continue };
-            let h = reveal(&hidden, &mut p.tys, o, 0);
+            let h = reveal(hidden.as_map(), &mut p.tys, o, 0);
             let h = generics::normalize_global(p, h);
             map.extend(instance_closure_map(p, &p.tys, h, template, p.def_id(inst)));
         }
@@ -1261,6 +1261,6 @@ pub fn reveal_plain_rets(p: &mut Program) {
     let hidden = p.gx.opaque_hidden.clone();
     for f in revealed {
         let r = p.fns[f.0 as usize].ret;
-        p.fns[f.0 as usize].ret = reveal_global(p, &hidden, r);
+        p.fns[f.0 as usize].ret = reveal_global(p, hidden.as_map(), r);
     }
 }
