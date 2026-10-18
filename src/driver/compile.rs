@@ -4613,8 +4613,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 .map(|n| n.fns.iter().enumerate().filter_map(|(s, id)| id.as_deref().map(|id| (id, s))).collect())
                 .unwrap_or_default();
             let inl: Vec<Vec<usize>> = par_map(&(0..rg.len()).collect::<Vec<_>>(), |&g| cgen::ll::ll_inline_set(&caches.out, &rg[g].1, &slot_of));
+            // One layout phase (cgen `in_layout_phase`): the program is frozen, so each
+            // worker keeps its `c_layout` answers across the units it assembles.
+            let asm_tag = cgen::layout_phase();
             let made = par_map(&jobs, |&u| {
-                let (c, helpers) = cgen::names::with(rn, || match u {
+                let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
                     1 => (cgen::names::statics_unit(&program, &caches.glue), String::new()),
                     2 => (cgen::runtime_unit(), String::new()),
@@ -4627,7 +4630,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];
                         cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot))
                     }
-                });
+                }));
                 (base_obj(u), c, helpers)
             });
             let mut units: Vec<(PathBuf, String)> = Vec::with_capacity(made.len());

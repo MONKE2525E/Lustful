@@ -9933,15 +9933,21 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
     }
 }
 
-/// The live statics in emission order: by index, or in release C by symbol (a
+/// Static indices in emission order: by index, or in release C by symbol (a
 /// persistent session's static indices carry its history, and its units are a
 /// one-shot build's, byte for byte).
-fn statics_in_order(p: &Program) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..p.statics.len()).filter(|&i| p.static_live(i)).collect();
+fn order_statics(p: &Program, mut v: Vec<usize>) -> Vec<usize> {
     if names::release() {
-        order.sort_by_cached_key(|&i| static_sym(p, i as u32));
+        v.sort_by_cached_key(|&i| (static_sym(p, i as u32), i));
+    } else {
+        v.sort_unstable();
     }
-    order
+    v
+}
+
+/// The live statics in emission order (`order_statics`).
+fn statics_in_order(p: &Program) -> Vec<usize> {
+    order_statics(p, (0..p.statics.len()).filter(|&i| p.static_live(i)).collect())
 }
 
 /// Definitions of the program's statics as C globals (ARCH 2.13 static data).
@@ -9994,7 +10000,8 @@ fn static_decls(p: &Program) -> String {
 /// Extern declarations of the statics at `keep` indices, for function units.
 fn static_decls_for(p: &Program, keep: &HashSet<usize>) -> String {
     let mut out = String::new();
-    for i in statics_in_order(p).into_iter().filter(|i| keep.contains(i)) {
+    // Only the kept statics are ordered: a unit keeps few of the program's.
+    for i in order_statics(p, keep.iter().copied().filter(|&i| i < p.statics.len() && p.static_live(i)).collect()) {
         let _ = writeln!(out, "extern {} {};", ctype(&cty(&p.tys, p.statics[i].ty)), static_sym(p, i as u32));
     }
     out

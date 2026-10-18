@@ -189,10 +189,12 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
         shards.push(cur);
     }
     // Each shard is its own unit: built in parallel (in order), each worker
-    // under this thread's naming context.
+    // under this thread's naming context, in one layout phase (the program is
+    // frozen: a worker keeps its `c_layout` answers across its shards).
     let names = CUR.with(|c| c.borrow().clone());
+    let tag = super::layout_phase();
     crate::pool::par_map(&shards, |keys| {
-        with(names.as_ref(), || {
+        super::in_layout_phase(tag, || with(names.as_ref(), || {
             let mut c = unit_header();
             if p.unwind_tables {
                 c.push_str(noreturn_decls());
@@ -216,7 +218,7 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
                 c.push_str(&g.def_map[*k]);
             }
             c
-        })
+        }))
     })
 }
 
