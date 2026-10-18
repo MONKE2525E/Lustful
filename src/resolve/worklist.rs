@@ -4919,13 +4919,25 @@ fn register_items(
                 {
                     tables.alloc_roots.push(module);
                 }
+                let target = if e.name == interner.intern("self") {
+                    Some(Target::Module(tables.root_of(module)))
+                } else {
+                    tables.extern_by_name(module, interner.get(e.name)).map(|i| tables.extern_target(i))
+                };
+                if e.name == interner.intern("self") && e.rename.is_none() {
+                    diags.push(Diag::new(
+                        "L0001",
+                        e.span,
+                        "`extern crate self;` requires renaming",
+                        "Write `extern crate self as name;`.",
+                    ));
+                } else if target.is_none() && interner.get(e.name) != "proc_macro" {
+                    // rustc accepts `extern crate proc_macro;` in any
+                    // crate; a path through it rejects later (L0505).
+                    diags.push(extern_crate_not_found(interner.get(e.name), e.name_span));
+                }
                 if bind_name != interner.intern("_") {
                     check_dup(seen, Namespace::Type, bind_name, e.span, &mut reported, diags);
-                    let target = if e.name == interner.intern("self") {
-                        Some(Target::Module(tables.root_of(module)))
-                    } else {
-                        tables.extern_by_name(module, interner.get(e.name)).map(|i| tables.extern_target(i))
-                    };
                     if let Some(target) = target {
                         bind(tables, Namespace::Type, bind_name, target, vis());
                     }
@@ -4937,6 +4949,26 @@ fn register_items(
             _ => {}
         }
     }
+}
+
+/// L0506 for `extern crate name;` naming no crate of this build: not
+/// std, core, alloc, or a dependency (rustc E0463), or the unstable
+/// `test` crate (rustc E0658). Before this, the item was dropped silently.
+fn extern_crate_not_found(name: &str, span: Span) -> Diag {
+    if name == "test" {
+        return Diag::new(
+            "L0506",
+            span,
+            "the `test` crate is unstable: rustc needs `#![feature(test)]` (E0658)",
+            "Remove the `extern crate test;`; `#[test]` fns need no extern crate.",
+        );
+    }
+    Diag::new(
+        "L0506",
+        span,
+        format!("cannot find crate `{name}`"),
+        "Add the crate to [dependencies] in Cargo.toml and build the Cargo project, or remove the `extern crate`.",
+    )
 }
 
 /// Records one struct's def info and field visibility.
