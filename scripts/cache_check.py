@@ -26,7 +26,15 @@
 # from the object cache.
 #
 # In every mode, a stored unit object must never change: a hit hard-links the entry into
-# a work dir, so a build that wrote an object path in place would change the entry. --front also keeps a front image (LUST_FRONT_STATE, as
+# a work dir, so a build that wrote an object path in place would change the entry.
+#
+# --zig (with --release --front): the target is x86_64-unknown-linux-musl through zig cc,
+# and zig's own compile cache must be transparent: the cached builds share one warm zig
+# cache (the front image keeps their work dir, so zig sees the same paths and args again),
+# the reference builds a fresh copy of a base zig cache that holds only zig's libc and
+# runtime, and the binaries must be byte-identical. zig keys a compile on its source and
+# args, not on files it reads by path or on the environment (rel-llvm b41791434: stale
+# LLVM objects). --backend llvm runs the sequences through the LLVM backend. --front also keeps a front image (LUST_FRONT_STATE, as
 # scripts/release-x64.sh FRONT=1 does) across the cached builds: a front image build had
 # turned release C off, so every merge recompiled nearly every unit.
 #
@@ -287,6 +295,28 @@ def entry_digests(cache):
     return out
 
 
+def zig_epoch_check(args, work):
+    """Same unit text, another input zig does not key on: the musl build links mimalloc,
+    whose object holds __DATE__, and SOURCE_DATE_EPOCH sets it (cc.rs). Two builds through
+    the front image and the warm zig cache under two epochs must each hold their own date;
+    zig keys a compile on its source and args, so only lust's unit key in the args
+    (LUST_UNIT_KEY) keeps it from serving the first build's object. Returns problems."""
+    d = os.path.join(work, "epoch")
+    os.makedirs(d)
+    with open(os.path.join(d, "main.rs"), "w") as f:
+        f.write('fn main() {\n    let v: Vec<u64> = (1..10).collect();\n    println!("{}", v.iter().sum::<u64>());\n}\n')
+    env = dict(os.environ, LUST_RELEASE_C="1", LUST_NO_DAEMON="1", LUST_FRONT_STATE=os.path.join(d, "front"),
+               ZIG_GLOBAL_CACHE_DIR=args.zig_warm, ZIG_LOCAL_CACHE_DIR=args.zig_warm, **args.backend_env)
+    problems = []
+    for epoch, date in [("100000", b"Jan  2 1970"), ("200000", b"Jan  3 1970")]:
+        r = build([LUST, "build", "main.rs", "--release", "--target", args.host, "-o", "e.bin"], dict(env, SOURCE_DATE_EPOCH=epoch), d)
+        if r != "ok":
+            problems.append(f"epoch {epoch}: build {r[:200]}")
+        elif date not in open(os.path.join(d, "e.bin"), "rb").read():
+            problems.append(f"epoch {epoch}: the binary does not hold {date.decode()}: zig served an object of another epoch")
+    return problems
+
+
 def check_seq(idx, srcs, threads, args, work):
     """Runs one sequence. Returns (idx, problems, stats)."""
     d = os.path.join(work, f"s{idx}")
@@ -319,10 +349,20 @@ def check_seq(idx, srcs, threads, args, work):
                 break
             outs["rustc"] = run_bin("./rustc.bin", d)
         rel = ["--release", "--target", args.host, "--timings"] if args.release else []
-        renv = dict(tenv, LUST_RELEASE_C="1") if args.release else tenv
+        renv = dict(tenv, LUST_RELEASE_C="1", **args.backend_env) if args.release else tenv
         cenv = dict(renv, LUST_NO_DAEMON="1", **({"LUST_FRONT_STATE": os.path.join(d, "front")} if args.front else {}))
-        ref = build([LUST, "build", "main.rs", *rel, "-o", "ref.bin"], dict(renv, LUST_NO_CACHE="1", LUST_NO_DAEMON="1"), d)
+        refenv = dict(renv, LUST_NO_CACHE="1", LUST_NO_DAEMON="1")
+        if args.zig:
+            # A fresh zig cache with only zig's libc and runtime for the reference, the
+            # sequence-wide warm one for the cached build.
+            cold = os.path.join(d, f"zig-cold-{step}")
+            subprocess.run(["cp", "-al", args.zig_base, cold], check=True)
+            refenv = dict(refenv, ZIG_GLOBAL_CACHE_DIR=cold, ZIG_LOCAL_CACHE_DIR=cold)
+            cenv = dict(cenv, ZIG_GLOBAL_CACHE_DIR=args.zig_warm, ZIG_LOCAL_CACHE_DIR=args.zig_warm)
+        ref = build([LUST, "build", "main.rs", *rel, "-o", "ref.bin"], refenv, d)
         cached = build([LUST, "build", "main.rs", *rel, "-o", "cached.bin"], cenv, d)
+        if args.zig:
+            shutil.rmtree(cold, ignore_errors=True)
         sides = [("ref", ref), ("cached", cached)]
         if args.daemon:
             sides.append(("daemon", build([LUST, "build", "main.rs", "-o", "daemon.bin"], tenv, d)))
@@ -385,6 +425,8 @@ def main():
     ap.add_argument("--daemon", action="store_true")
     ap.add_argument("--release", action="store_true", help="release driver builds; binaries must be byte-identical")
     ap.add_argument("--front", action="store_true", help="with --release: the cached builds keep a front image")
+    ap.add_argument("--zig", action="store_true", help="with --release --front: musl through zig cc; zig's cache must not change a binary")
+    ap.add_argument("--backend", default="c", choices=["c", "llvm"], help="with --release: the release backend")
     ap.add_argument("--keep", help="copy the steps of each failing sequence here")
     args = ap.parse_args()
     if not os.access(LUST, os.X_OK):
@@ -397,7 +439,24 @@ def main():
             return 2
         v = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
         args.host = next((l.split()[1] for l in v.splitlines() if l.startswith("host:")), "x86_64-unknown-linux-gnu")
+    args.backend_env = {"LUST_RELEASE_BACKEND": "llvm"} if args.backend == "llvm" else {}
     work = tempfile.mkdtemp(prefix="cache-check.", dir=os.environ.get("TMPDIR"))
+    if args.zig:
+        if not (args.release and args.front) or not shutil.which("zig"):
+            print("error: --zig needs --release --front and zig on PATH")
+            return 2
+        args.host = "x86_64-unknown-linux-musl"
+        # The base zig cache: zig's musl libc and runtime, built once by a first build.
+        args.zig_base, args.zig_warm = os.path.join(work, "zig-base"), os.path.join(work, "zig-warm")
+        seed = os.path.join(work, "seed")
+        os.makedirs(seed)
+        with open(os.path.join(seed, "main.rs"), "w") as f:
+            f.write('fn main() {\n    println!("{}", std::env::args().count());\n}\n')
+        zenv = dict(os.environ, LUST_RELEASE_C="1", LUST_NO_CACHE="1", LUST_NO_DAEMON="1", ZIG_GLOBAL_CACHE_DIR=args.zig_base, ZIG_LOCAL_CACHE_DIR=args.zig_base, **args.backend_env)
+        if build([LUST, "build", "main.rs", "--release", "--target", args.host, "-o", "seed.bin"], zenv, seed) != "ok":
+            print("error: the zig seed build failed")
+            return 2
+        subprocess.run(["cp", "-al", args.zig_base, args.zig_warm], check=True)
     jobs = []
     for i in range(args.seqs):
         srcs = repro_steps() if i == 0 else glue_drop_steps() if i == 1 and args.release else sequence(args.seed * 1_000_003 + i, args.steps, args.fill)
@@ -405,6 +464,10 @@ def main():
         th = threads[i % len(threads):] + threads[:i % len(threads)] if threads else []
         jobs.append((i, srcs, th))
     bad = steps = invalid = 0
+    if args.zig:
+        for p in zig_epoch_check(args, work):
+            print("PROBLEM zig cache: " + p)
+            bad += 1
     with ThreadPoolExecutor(max(1, args.jobs)) as pool:
         for idx, problems, stats in pool.map(lambda j: check_seq(j[0], j[1], j[2], args, work), jobs):
             steps += stats["steps"]
