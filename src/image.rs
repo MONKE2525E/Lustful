@@ -21,7 +21,9 @@
 //      (`front.img`) after a cold build, then one delta per build
 //      (`front.d<k>.img`) holding only the restored pages this process
 //      wrote (`/proc/self/pagemap`) plus the new arena's live pages; after
-//      MAX_DELTAS deltas, or deltas past half the base, a new base. Each
+//      MAX_DELTAS deltas, or deltas whose data passes half the base, a new
+//      base, which copies the untouched pages from the old layer files.
+//      Zero pages (freed blocks among them) are holes in every layer. Each
 //      layer has a header (format, compiler build, address anchors, the
 //      `Roots` pointer, the next arena base, its parent layer), a region
 //      table, then pages. Arena pages hold the live blocks mimalloc
@@ -69,6 +71,9 @@ const PAGE: usize = 4096;
 const HEADER: usize = 8 + 64 + 8 * 4 + 8 * 7;
 /// Deltas on one base before a save writes a new base.
 const MAX_DELTAS: usize = 16;
+/// The mapped span (every restored run plus the new arena's pages) past
+/// which a save drops the image instead (the next build is cold).
+const MAX_SPAN: usize = 128 << 30;
 
 unsafe extern "C" {
     fn getenv(name: *const c_char) -> *const c_char;
@@ -76,6 +81,10 @@ unsafe extern "C" {
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn personality(persona: u64) -> c_int;
     fn writev(fd: c_int, iov: *const IoVec, cnt: c_int) -> isize;
+    fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
+    fn pread(fd: c_int, buf: *mut c_void, count: usize, off: i64) -> isize;
+    fn pwrite(fd: c_int, buf: *const c_void, count: usize, off: i64) -> isize;
+    fn copy_file_range(fd_in: c_int, off_in: *mut i64, fd_out: c_int, off_out: *mut i64, len: usize, flags: u32) -> isize;
     fn mi_manage_os_memory_ex(
         start: *mut c_void,
         size: usize,
@@ -490,12 +499,20 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
             _ => runs.push((a, a + l)),
         }
     }
+    let mut src: Vec<(usize, usize, usize, u64)> = Vec::new();
+    for (k, h) in chain.iter().enumerate() {
+        let mut layer: Vec<(usize, usize, usize, u64)> = h.regions.iter().map(|&(a, l, o)| (a as usize, (a + l) as usize, k, o)).collect();
+        layer.sort_unstable_by_key(|r| r.0);
+        src = overlay(&src, &layer);
+    }
     let top = chain.last().expect("a chain has its base");
     OLD_LO.store(runs.first().map_or(0, |r| r.0), Ordering::Relaxed);
     OLD_LEN.store(runs.last().map_or(0, |r| r.1) - runs.first().map_or(0, |r| r.0), Ordering::Relaxed);
     GEN.store(top.generation as usize + 1, Ordering::Relaxed);
-    let deltas: u64 = chain[1..].iter().map(|h| h.regions.iter().map(|r| r.1).sum::<u64>()).sum();
-    let _ = LOADED.set(Loaded { runs, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live });
+    // The deltas' data on disk (their holes cost nothing): past half the
+    // base's live bytes, the next save writes a new base.
+    let deltas: u64 = files[1..].iter().map(|f| f.metadata().map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512)).sum();
+    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live });
     // SAFETY: the root was a leaked `Box<Roots>` of a process running this
     // same binary at the same addresses (checked: build id, anchors), and
     // every page it reaches is mapped back above.
@@ -506,6 +523,10 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
 struct Loaded {
     /// The restored page runs (start, end), sorted and disjoint.
     runs: Vec<(usize, usize)>,
+    /// Where each restored page came from: (start, end, layer, file
+    /// offset of start), sorted and disjoint, the topmost layer's
+    /// (`overlay`). A base write copies untouched pages from there.
+    src: Vec<(usize, usize, usize, u64)>,
     layers: usize,
     top_id: u64,
     base_live: u64,
@@ -723,6 +744,162 @@ fn write_sparse(file: &mut std::fs::File, a: usize, len: usize) -> bool {
     true
 }
 
+/// `top`'s intervals over `under`'s, each (start, end, layer, file offset
+/// of start), sorted and disjoint: the parts of `under` that `top` covers
+/// go (a delta page replaces the older page at its address).
+fn overlay(under: &[(usize, usize, usize, u64)], top: &[(usize, usize, usize, u64)]) -> Vec<(usize, usize, usize, u64)> {
+    let mut out = Vec::with_capacity(under.len() + 2 * top.len());
+    let mut j = 0;
+    for &(a, b, k, o) in under {
+        while j < top.len() && top[j].1 <= a {
+            j += 1;
+        }
+        let mut x = a;
+        let mut jj = j;
+        while x < b {
+            match top.get(jj) {
+                Some(&(ta, tb, _, _)) if ta < b => {
+                    if ta > x {
+                        out.push((x, ta, k, o + (x - a) as u64));
+                    }
+                    x = x.max(tb);
+                    jj += 1;
+                }
+                _ => {
+                    out.push((x, b, k, o + (x - a) as u64));
+                    x = b;
+                }
+            }
+        }
+    }
+    out.extend_from_slice(top);
+    out.sort_unstable_by_key(|r| r.0);
+    out
+}
+
+/// Writes restored run [a, e) of a new base at file offset `out`: the pages
+/// this process wrote from memory (zero pages as holes, `write_sparse_at`),
+/// the rest copied from the layer files they came from (`src`, `fds`) with
+/// their holes kept (`copy_extents`). An untouched page is never read
+/// through its mapping, which would fault it in: a long-lived image maps
+/// many times its live bytes. Allocates nothing (it runs between the
+/// save's two passes).
+fn write_base_run(file: &std::fs::File, out: u64, a: usize, e: usize, modified: &[(usize, usize)], src: &[(usize, usize, usize, u64)], fds: &[c_int]) -> bool {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut mi = modified.partition_point(|m| m.1 <= a);
+    let mut si = src.partition_point(|s| s.1 <= a);
+    let mut x = a;
+    while x < e {
+        if let Some(&(ms, me)) = modified.get(mi)
+            && ms <= x
+        {
+            let end = me.min(e);
+            if !write_sparse_at(file, out + (x - a) as u64, x, end - x) {
+                return false;
+            }
+            x = end;
+            if me <= x {
+                mi += 1;
+            }
+            continue;
+        }
+        let end = modified.get(mi).map_or(e, |m| m.0).min(e);
+        while x < end {
+            let Some(&(ss, se, k, so)) = src.get(si) else { return false };
+            if se <= x {
+                si += 1;
+                continue;
+            }
+            if ss > x || k >= fds.len() {
+                return false;
+            }
+            let stop = se.min(end);
+            if !copy_extents(fds[k], so + (x - ss) as u64, fd, out + (x - a) as u64, (stop - x) as u64) {
+                return false;
+            }
+            x = stop;
+        }
+    }
+    true
+}
+
+/// `write_sparse` at file offset `out`, with positional writes.
+fn write_sparse_at(file: &std::fs::File, out: u64, a: usize, len: usize) -> bool {
+    use std::os::unix::fs::FileExt;
+    // SAFETY: [a, a + len) holds pages this process wrote: mapped and resident.
+    let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, len) };
+    let zero = |p: &[u8]| p.chunks_exact(8).all(|w| w == [0u8; 8]);
+    let mut at = 0;
+    while at < len {
+        let start = at;
+        let z = zero(&bytes[at..at + PAGE]);
+        while at < len && zero(&bytes[at..at + PAGE]) == z {
+            at += PAGE;
+        }
+        if !z && file.write_all_at(&bytes[start..at], out + start as u64).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Copies `len` bytes of file `src` at `off` to file `dst` at `out`, data
+/// extents only (`SEEK_DATA`, `SEEK_HOLE`): a hole stays a hole. In the
+/// kernel (`copy_file_range`), or through a stack buffer where that
+/// fails. Allocates nothing.
+fn copy_extents(src: c_int, mut off: u64, dst: c_int, mut out: u64, len: u64) -> bool {
+    const SEEK_DATA: c_int = 3;
+    const SEEK_HOLE: c_int = 4;
+    let end = off + len;
+    while off < end {
+        // SAFETY: lseek on an open fd; copies use explicit offsets.
+        let data = unsafe { lseek(src, off as i64, SEEK_DATA) };
+        if data < 0 || data as u64 >= end {
+            return true;
+        }
+        out += data as u64 - off;
+        off = data as u64;
+        // SAFETY: as above.
+        let hole = unsafe { lseek(src, off as i64, SEEK_HOLE) };
+        let stop = if hole < 0 { end } else { (hole as u64).min(end) };
+        while off < stop {
+            let (mut i, mut o) = (off as i64, out as i64);
+            // SAFETY: two open fds, offsets owned here.
+            let n = unsafe { copy_file_range(src, &mut i, dst, &mut o, (stop - off) as usize, 0) };
+            let n = if n > 0 { n as u64 } else { copy_slow(src, off, dst, out, stop - off) };
+            if n == 0 {
+                return false;
+            }
+            off += n;
+            out += n;
+        }
+    }
+    true
+}
+
+/// One `pread`/`pwrite` step of `copy_extents` through a stack buffer;
+/// the bytes copied, 0 on failure.
+fn copy_slow(src: c_int, off: u64, dst: c_int, out: u64, len: u64) -> u64 {
+    let mut buf = [0u8; 1 << 16];
+    let n = (len as usize).min(buf.len());
+    // SAFETY: a stack buffer of at least n bytes; both fds are open.
+    let r = unsafe { pread(src, buf.as_mut_ptr() as *mut c_void, n, off as i64) };
+    if r <= 0 {
+        return 0;
+    }
+    let mut w = 0usize;
+    while w < r as usize {
+        // SAFETY: the first r bytes of the buffer, as above.
+        let k = unsafe { pwrite(dst, buf.as_ptr().add(w) as *const c_void, r as usize - w, (out + w as u64) as i64) };
+        if k <= 0 {
+            return 0;
+        }
+        w += k as usize;
+    }
+    r as u64
+}
+
 /// Pages of the restored runs this process wrote (copy-on-write made them
 /// anonymous) or that went to swap: `/proc/self/pagemap` bit 63 present,
 /// 62 swapped, 61 file page. Untouched and read-only pages are still the
@@ -785,6 +962,17 @@ pub fn save(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     };
     // A delta: the pages this process wrote. A base: the runs whole.
     let old_runs: Vec<(usize, usize)> = if delta.is_some() { modified_runs(restored)? } else { restored.to_vec() };
+    // A base over restored runs copies their untouched pages from the
+    // layer files (`write_base_run`); the written ones come from memory.
+    // Both are found now: nothing may allocate between the two passes.
+    let base_from: Option<(Vec<(usize, usize)>, Vec<std::fs::File>)> = match loaded {
+        Some(l) if delta.is_none() => {
+            let files = (0..l.layers).map(|k| std::fs::File::open(layer_path(dir, k))).collect::<Result<Vec<_>, _>>().map_err(|e| format!("image: {e}"))?;
+            Some((modified_runs(restored)?, files))
+        }
+        _ => None,
+    };
+    let base_fds: Vec<c_int> = base_from.as_ref().map_or(Vec::new(), |(_, f)| f.iter().map(|f| f.as_raw_fd()).collect());
     let path = layer_path(dir, layer);
     let tmp = dir.join(format!("front.tmp{}", std::process::id()));
     let mut file = std::fs::File::create(&tmp).map_err(|e| format!("image: {e}"))?;
@@ -870,12 +1058,17 @@ pub fn save(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     }
     // The session's live bytes after this save (estimate): the restored
     // ones not freed, plus the arena's. The image maps every restored run,
-    // dead space included; past 4x the live bytes it is dropped, so the
-    // next build is cold and writes a compact image.
+    // dead space included. Dead blocks are zero (frees of restored blocks
+    // zero them), so a base writes them as holes and the files stay near
+    // the live size: a full rebuild's large delta makes the next save a
+    // base (`delta` above). Only the span grows, and mapping costs nothing
+    // until touched; past `MAX_SPAN` (the pagemap scan of a delta save and
+    // the run count grow with it) the image goes and the next build is
+    // cold.
     let old_live = loaded.map_or(0, |l| (l.live as usize).saturating_sub(OLD_FREED.load(Ordering::Relaxed)));
     let live = old_live + w.live;
     let span: usize = restored.iter().map(|&(a, e)| e - a).sum::<usize>() + arena_bytes;
-    if span > 4 * live + (1 << 30) {
+    if span > MAX_SPAN {
         unraw(bitmap);
         unraw(iov);
         unraw(runs_mem);
@@ -892,14 +1085,16 @@ pub fn save(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     let mut old_bytes = 0;
     for &(a, e) in &old_runs {
         ok = ok
-            && if delta.is_some() {
-                // SAFETY: restored pages this process wrote: mapped and resident.
-                file.write_all(unsafe { std::slice::from_raw_parts(a as *const u8, e - a) }).is_ok()
-            } else {
-                write_sparse(&mut file, a, e - a)
+            && match (&base_from, loaded) {
+                (Some((modified, _)), Some(l)) => write_base_run(&file, (data_at + old_bytes) as u64, a, e, modified, &l.src, &base_fds),
+                // A delta: the restored pages this process wrote, zero ones
+                // (freed blocks) as holes, which map back as zero pages.
+                _ => write_sparse(&mut file, a, e - a),
             };
         old_bytes += e - a;
     }
+    // `write_base_run` writes at offsets: put the file where pass 2 goes on.
+    ok = ok && file.seek(SeekFrom::Start((data_at + old_bytes) as u64)).is_ok();
     w.pass = 2;
     w.last_end = 0;
     w.runs = runs;
@@ -978,6 +1173,51 @@ pub fn discard(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_keeps_the_topmost_layer() {
+        let base = vec![(0x1000, 0x5000, 0, 100), (0x8000, 0x9000, 0, 200)];
+        let delta = vec![(0x2000, 0x3000, 1, 10), (0x4000, 0x8800, 1, 20)];
+        let want = vec![
+            (0x1000, 0x2000, 0, 100),
+            (0x2000, 0x3000, 1, 10),
+            (0x3000, 0x4000, 0, 100 + 0x2000),
+            (0x4000, 0x8800, 1, 20),
+            (0x8800, 0x9000, 0, 200 + 0x800),
+        ];
+        assert_eq!(overlay(&base, &delta), want);
+        assert_eq!(overlay(&[], &base), base);
+    }
+
+    /// A copy keeps the source's data and its holes (a sparse base stays
+    /// sparse), at another offset.
+    #[test]
+    fn copy_extents_keeps_holes() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join(format!("lust-image-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sp, dp) = (dir.join("src"), dir.join("dst"));
+        let src = std::fs::File::options().create(true).truncate(true).read(true).write(true).open(&sp).unwrap();
+        src.write_all_at(&[7u8; PAGE], 0).unwrap();
+        src.write_all_at(&[9u8; PAGE], 64 * PAGE as u64).unwrap();
+        let dst = std::fs::File::options().create(true).truncate(true).read(true).write(true).open(&dp).unwrap();
+        assert!(copy_extents(src.as_raw_fd(), 0, dst.as_raw_fd(), PAGE as u64, 65 * PAGE as u64));
+        dst.set_len(66 * PAGE as u64).unwrap();
+        let mut page = vec![0u8; PAGE];
+        dst.read_exact_at(&mut page, PAGE as u64).unwrap();
+        assert!(page.iter().all(|&b| b == 7));
+        dst.read_exact_at(&mut page, 65 * PAGE as u64).unwrap();
+        assert!(page.iter().all(|&b| b == 9));
+        dst.read_exact_at(&mut page, 30 * PAGE as u64).unwrap();
+        assert!(page.iter().all(|&b| b == 0));
+        // The gap is a hole on file systems that keep them (data starts
+        // again only at the second page's copy).
+        // SAFETY: lseek on an open fd.
+        let next = unsafe { lseek(dst.as_raw_fd(), 2 * PAGE as i64, 3) };
+        assert!(next < 0 || next as usize >= 2 * PAGE, "data at {next}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn header(id: u64, parent: u64) -> Header {
         Header {
