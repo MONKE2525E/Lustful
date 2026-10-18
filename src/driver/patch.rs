@@ -2470,7 +2470,9 @@ pub(super) fn reuse_kept(
             // A template with closures stands when its closures are the
             // registered ones (checked below, before its template check),
             // and one that returns `impl Trait` while its hidden type does.
-            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) && (bodies_only || !instanced.contains_key(&f)) => {}
+            // A header edit's instances take the new signature in the
+            // header delta (`generics::refresh_instance`).
+            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) && (bodies_only || e.header || !instanced.contains_key(&f)) => {}
             _ => return Err("fn class"),
         }
     }

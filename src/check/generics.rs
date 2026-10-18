@@ -11256,29 +11256,20 @@ pub(crate) fn template_closures_stand(p: &mut Program, t: LocalDefId) -> bool {
     true
 }
 
-/// Creates (or finds) the concrete instance of one template.
-fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> LocalDefId {
-    // A trait method stub has no body of its own (a lang method's stub
-    // borrows the first fn's def as a placeholder), so an instance of
-    // it would run that unrelated body: wrong code or endless
-    // recursion at run time (seen: `Ord::cmp` on `&T`, `Clone::clone`
-    // on a tuple, reached through a generic `T: Ord`/`T: Clone` call in
-    // an instance). Stop the compile instead (W-STD-C; the pick replay
-    // that leads here is W-CHECK-G/W-TRAITS code).
-    assert!(
-        p.gx.fn_class.get(template.0 as usize) != Some(&FnClass::Stub),
-        "internal: the trait method stub `{}` reached instantiation (a generic call on a builtin type lust cannot dispatch yet)",
-        p.name(p.fn_info(template).name)
-    );
-    let template_def = p.def_id(template);
-    let args_id = p.tys.intern_args(args);
-    if let Some(&existing) = p.gx.instance_by_key.get(&(template_def, args_id)) {
-        return existing;
-    }
-    let (loc, name, self_kind) = {
-        let f = p.fn_info(template);
-        (f.loc, f.name, f.self_kind)
-    };
+/// The signature of the instance of `template` at `args` whose def is
+/// `def_id`: what `fn_instance` writes for it, and what `refresh_instance`
+/// writes again after a header delta of its template.
+pub(crate) struct InstanceSig {
+    params: Vec<Ty>,
+    ret: Ty,
+    opaque_ret: Option<Ty>,
+    owner: Option<AdtId>,
+    ret_borrows_from: Option<usize>,
+    scope: Scope,
+}
+
+pub(crate) fn instance_sig(p: &mut Program, template: LocalDefId, args: &[GenericArg], def_id: DefId) -> InstanceSig {
+    let self_kind = p.fn_info(template).self_kind;
     let raw_params: Vec<Ty> = p.fn_info(template).params.clone();
     let raw_ret = p.fn_info(template).ret;
     let ret_borrows_from = p.fn_info(template).ret_borrows_from;
@@ -11300,17 +11291,6 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
         None => ret,
     };
     let owner = instance_owner(p, &params, self_kind);
-    // Instance identity: template disk identity plus the args
-    // fingerprint (the InstanceKeyHash of section 4.2).
-    let key = crate::driver::graph::InstanceKey { def: template_def, args: args_id };
-    let kh = p.instance_key_hash(&key);
-    // The instance def lives under an "<instance>" module with
-    // the key hash in its name, so it can never collide with a
-    // user def's path hash in the slot registry.
-    let def_id = DefId {
-        krate: p.krate,
-        hash: crate::def::item_hash(p.stable_crate, &["<instance>"], crate::def::DefKind::Fn, &format!("{}#{}", p.name(name), kh.0), 0),
-    };
     // The hidden type's closures are this instance's own.
     let ret = match opaque_ret {
         Some(_) => {
@@ -11319,27 +11299,6 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
         }
         None => ret,
     };
-    let id = LocalDefId(p.fns.len() as u32);
-    p.fn_defs.push(def_id);
-    p.def_by_hash.entry(def_id.hash).or_insert(id);
-    let (name_span, is_const) = {
-        let def = loc.def(&p.ast);
-        (def.name_span, def.qual.is_const)
-    };
-    let mut data = crate::ty::defs::DefData::skeleton(
-        if owner.is_some() { crate::ty::defs::DefKind::Method } else { crate::ty::defs::DefKind::Fn },
-        None,
-        name,
-        crate::ty::defs::Vis::Priv,
-        name_span,
-    );
-    data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
-    p.defs.insert(def_id, data);
-    p.fns.push(crate::check::collect::FnInfo { name, loc, owner, self_kind, params, ret, ret_borrows_from, is_const });
-    if let Some(o) = opaque_ret {
-        p.gx.opaque_ret_of.insert(id, o);
-    }
-    p.gx.fn_templates.push(None);
     // The body scope of an instance: no parameters, the concrete
     // Self type, and the template's assoc sources substituted. Self
     // comes from the template's scope (a trait default assoc fn has
@@ -11376,6 +11335,76 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
         }
         sc
     };
+    InstanceSig { params, ret, opaque_ret, owner, ret_borrows_from, scope }
+}
+
+/// Writes instance `inst`'s signature again from its template's (a header
+/// delta of the template, driver/kept_delta.rs), as `fn_instance` would
+/// make it now. Err when its owner or the form of its return moves: the
+/// method tables and generated closures would then differ.
+pub(crate) fn refresh_instance(p: &mut Program, inst: LocalDefId) -> Result<(), &'static str> {
+    let Some(info) = p.gx.instances.get(&inst) else { return Err("instance") };
+    let Some(template) = info.template_local else { return Err("instance") };
+    let args: Vec<GenericArg> = p.tys.args(info.args).to_vec();
+    let def_id = p.def_id(inst);
+    let s = instance_sig(p, template, &args, def_id);
+    let i = inst.0 as usize;
+    if s.owner != p.fns[i].owner || s.opaque_ret.is_some() || p.gx.opaque_ret_of.contains_key(&inst) {
+        return Err("instance owner");
+    }
+    if let Some(d) = p.defs.get_mut(def_id) {
+        d.sig = crate::ty::defs::SigData::Fn { params: s.params.clone(), ret: s.ret };
+    }
+    let f = &mut p.fns[i];
+    (f.params, f.ret, f.ret_borrows_from) = (s.params, s.ret, s.ret_borrows_from);
+    p.gx.fn_scopes[i] = FnScope { env: Vec::new(), scope: s.scope };
+    Ok(())
+}
+
+/// Creates (or finds) the concrete instance of one template.
+fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> LocalDefId {
+    let template_def = p.def_id(template);
+    let args_id = p.tys.intern_args(args);
+    if let Some(&existing) = p.gx.instance_by_key.get(&(template_def, args_id)) {
+        return existing;
+    }
+    let (loc, name, self_kind) = {
+        let f = p.fn_info(template);
+        (f.loc, f.name, f.self_kind)
+    };
+    // Instance identity: template disk identity plus the args
+    // fingerprint (the InstanceKeyHash of section 4.2).
+    let key = crate::driver::graph::InstanceKey { def: template_def, args: args_id };
+    let kh = p.instance_key_hash(&key);
+    // The instance def lives under an "<instance>" module with
+    // the key hash in its name, so it can never collide with a
+    // user def's path hash in the slot registry.
+    let def_id = DefId {
+        krate: p.krate,
+        hash: crate::def::item_hash(p.stable_crate, &["<instance>"], crate::def::DefKind::Fn, &format!("{}#{}", p.name(name), kh.0), 0),
+    };
+    let InstanceSig { params, ret, opaque_ret, owner, ret_borrows_from, scope } = instance_sig(p, template, args, def_id);
+    let id = LocalDefId(p.fns.len() as u32);
+    p.fn_defs.push(def_id);
+    p.def_by_hash.entry(def_id.hash).or_insert(id);
+    let (name_span, is_const) = {
+        let def = loc.def(&p.ast);
+        (def.name_span, def.qual.is_const)
+    };
+    let mut data = crate::ty::defs::DefData::skeleton(
+        if owner.is_some() { crate::ty::defs::DefKind::Method } else { crate::ty::defs::DefKind::Fn },
+        None,
+        name,
+        crate::ty::defs::Vis::Priv,
+        name_span,
+    );
+    data.sig = crate::ty::defs::SigData::Fn { params: params.clone(), ret };
+    p.defs.insert(def_id, data);
+    p.fns.push(crate::check::collect::FnInfo { name, loc, owner, self_kind, params, ret, ret_borrows_from, is_const });
+    if let Some(o) = opaque_ret {
+        p.gx.opaque_ret_of.insert(id, o);
+    }
+    p.gx.fn_templates.push(None);
     p.gx.fn_scopes.push(FnScope { env: Vec::new(), scope });
     p.gx.fn_class.push(FnClass::Instance);
     p.gx.instances.insert(id, InstanceInfo { template_def, template_local: Some(template), args: args_id });

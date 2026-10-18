@@ -133,6 +133,12 @@ fn apply(
     let mut errs: Vec<Diag> = Vec::new();
     let mut old_rets = Vec::with_capacity(fns.len());
     let mut undos = Vec::with_capacity(fns.len());
+    // An edited template's generic params: its instances' args fit only
+    // while they stand.
+    let params_of = |p: &Program, i: usize| {
+        p.gx.fn_templates.get(i).and_then(|t| t.as_ref()).map(|t| t.generics.params.iter().map(|d| (d.name, d.kind)).collect::<Vec<_>>())
+    };
+    let old_params: Vec<_> = fns.iter().map(|&i| params_of(p, i)).collect();
     for &i in &fns {
         let f = LocalDefId(i as u32);
         let rpit = p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)));
@@ -168,6 +174,25 @@ fn apply(
             }
         } else if rpit && let Err(why) = crate::check::delta_audit::reveal_again(p, f, old_ret) {
             return Err(fail(p, caches, &mut undos, why));
+        }
+    }
+    // An edited template's instances in a check's program take its new
+    // signature, as collect's `fn_instance` would make them; their bodies
+    // replay below (`replay_discovery`). These writes have no undo.
+    for (k, &i) in fns.iter().enumerate() {
+        let f = LocalDefId(i as u32);
+        if !instanced.contains_key(&f) {
+            continue;
+        }
+        if params_of(p, i) != old_params[k] {
+            return Err(fail(p, caches, &mut undos, "sig params"));
+        }
+        undos = None;
+        let insts: Vec<LocalDefId> = p.gx.instances.iter().filter(|(_, info)| info.template_local == Some(f)).map(|(&g, _)| g).collect();
+        for g in insts {
+            if let Err(why) = generics::refresh_instance(p, g) {
+                return Err(fail(p, caches, &mut undos, why));
+            }
         }
     }
     // A plain fn that reveals an opaque type and names an edited fn: its
@@ -364,12 +389,14 @@ fn opaque_body_idents(p: &Program) -> Vec<(crate::def::DefId, Vec<crate::intern:
 /// the new Ast and the old program.
 fn refusal(p: &Program, f: LocalDefId, walk_instances: bool, instanced: &FxMap<LocalDefId, ()>) -> Result<(), &'static str> {
     let i = f.0 as usize;
-    // A template's instances keep their old signatures: only a check that
-    // made none of it (not a build; with generic associated consts a check
-    // makes instances, `patch::instanced_templates`) takes it.
+    // A template's instances keep their old signatures: a build's refuse.
+    // A check's (with generic associated consts, `patch::instanced_templates`)
+    // take the new one (`generics::refresh_instance`), except for one that
+    // returns `impl Trait` (its instances generate the hidden type).
     match p.gx.fn_class.get(i) {
         Some(FnClass::Plain) => {}
-        Some(FnClass::Template) if !walk_instances && !instanced.contains_key(&f) => {}
+        Some(FnClass::Template)
+            if !walk_instances && (!instanced.contains_key(&f) || !p.gx.opaques.contains_key(&generics::opaque_def(p.def_id(f)))) => {}
         _ => return Err("sig class"),
     }
     let info = p.fn_info(f);
@@ -693,7 +720,9 @@ fn replay_bodies(
         if !again.is_empty() && walk_instances {
             return Err("sig template");
         }
-        let rechecked = again.clone();
+        // The edited templates' instances replay too (`refresh_instance`).
+        let mut rechecked = again.clone();
+        rechecked.extend(fns.iter().map(|&i| LocalDefId(i as u32)).filter(|f| p.gx.fn_class[f.0 as usize] == FnClass::Template));
         let mut times: Vec<(f64, LocalDefId)> = Vec::new();
         for t in again {
             let (lo, hi) = p.fn_def(t).exprs;
