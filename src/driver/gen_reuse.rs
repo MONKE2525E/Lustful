@@ -98,6 +98,37 @@ pub(crate) struct OutCopy {
     vtables: Vec<(OwnedTy, OwnedTy)>,
 }
 
+/// A discovery type as a tree for `LUST_DERIVE_LOG`: every variant with
+/// its defs (by hash), args, regions and leaves.
+fn owned_tree(t: &OwnedTy) -> String {
+    use crate::check::generics::OwnedArg as A;
+    let args = |xs: &[A]| {
+        xs.iter()
+            .map(|a| match a {
+                A::Ty(t) => owned_tree(t),
+                A::Lifetime(r) => format!("{r:?}"),
+                A::Const(c) => format!("{c:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match t {
+        OwnedTy::Leaf(k) => format!("{k:?}"),
+        OwnedTy::Ref(r, m, x) => format!("Ref({r:?}, {m:?}, {})", owned_tree(x)),
+        OwnedTy::RawPtr(m, x) => format!("Ptr({m:?}, {})", owned_tree(x)),
+        OwnedTy::Slice(x) => format!("Slice({})", owned_tree(x)),
+        OwnedTy::Array(x, c) => format!("Array({}, {c:?})", owned_tree(x)),
+        OwnedTy::Tuple(xs) => format!("Tuple({})", xs.iter().map(owned_tree).collect::<Vec<_>>().join(", ")),
+        OwnedTy::Adt(d, xs) => format!("Adt({:x}, [{}])", d.hash.0, args(xs)),
+        OwnedTy::FnDef(d, xs) => format!("FnDef({:x}, [{}])", d.hash.0, args(xs)),
+        OwnedTy::Closure(d, xs) => format!("Closure({:x}, [{}])", d.hash.0, args(xs)),
+        OwnedTy::Opaque(d, xs) => format!("Opaque({:x}, [{}])", d.hash.0, args(xs)),
+        OwnedTy::Projection(a, xs) => format!("Proj({a:?}, [{}])", args(xs)),
+        OwnedTy::FnPtr(..) => "FnPtr(..)".into(),
+        OwnedTy::Dyn(p, auto, r) => format!("Dyn({}, {auto:?}, {r:?})", p.as_ref().map_or("none".into(), |(d, xs, _)| format!("{:x} [{}]", d.hash.0, args(xs)))),
+    }
+}
+
 impl OutCopy {
     /// True when fn `f`'s new discovery output `out` equals this copy
     /// where it can make anything: the closures, vtables, and the types
@@ -154,6 +185,11 @@ impl OutCopy {
             let gone: Vec<String> = a.iter().filter(|t| !b.contains(t)).take(3).map(|t| owned_str(p, t)).collect();
             let new: Vec<String> = b.iter().filter(|t| !a.contains(t)).take(3).map(|t| owned_str(p, t)).collect();
             parts.push(format!("makers {} -> {} (same set {same_set}; gone {gone:?}, new {new:?})", makers(&self.adt_tys), makers(adt_tys)));
+            // The first pair that differs, as trees (`owned_str` leaves out
+            // a closure's args and a region's form).
+            if let (Some(x), Some(y)) = (a.iter().find(|t| !b.contains(t)), b.iter().find(|t| !a.contains(t))) {
+                parts.push(format!("first gone {}, first new {}", owned_tree(x), owned_tree(y)));
+            }
         }
         if self.vtables != *vtables {
             parts.push(format!("vtables {} -> {}", self.vtables.len(), vtables.len()));
