@@ -351,6 +351,11 @@ pub struct ResolvedTables {
     /// only there (and in shipped std source) does `alloc` name the
     /// alloc crate, as in rustc edition 2024 (`extern_in_scope`).
     pub alloc_roots: Vec<ModuleId>,
+    /// The file each `mod name;` without `#[path]` did not take:
+    /// `name/mod.rs` beside the `name.rs` it loaded, or the reverse. Once
+    /// one appears a cold resolve rejects that module (L0502); the body
+    /// patch checks them (driver/patch.rs `find_edits`).
+    pub module_alts: Vec<std::path::PathBuf>,
 }
 
 /// The std modules whose items can come from the shipped platform
@@ -449,6 +454,7 @@ impl ResolvedTables {
             std_splice_lo: None,
             std_ranges: Vec::new(),
             alloc_roots: Vec::new(),
+            module_alts: Vec::new(),
         }
     }
 

@@ -2058,6 +2058,13 @@ fn outline_mods(
             let inline_names: Vec<String> = decl.container.iter().map(|s| interner.get(*s).to_string()).collect();
             match modules::module_file(&file_path, dir_owner, &inline_names, interner.get(decl.name), decl.path_attr.as_deref(), decl.span) {
                 Ok(f) => {
+                    // The candidate this declaration did not take: once it
+                    // appears a cold resolve rejects the pair (L0502), so
+                    // the body patch checks it (`module_alts`).
+                    if decl.path_attr.is_none() {
+                        let (flat, nested) = modules::module_candidates(&file_path, dir_owner, &inline_names, interner.get(decl.name));
+                        tables.module_alts.push(if f == flat { nested } else { flat });
+                    }
                     let fcanon = modules::canonical_string(&f);
                     let ftext = match shared.text_by_path.get(&fcanon) {
                         Some(t) => t.clone(),

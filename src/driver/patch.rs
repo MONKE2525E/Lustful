@@ -768,6 +768,11 @@ fn find_edits(front: &mut Front, inputs: u64, root: &str, request_start: SystemT
         }
         changed.push((file, text));
     }
+    // Each `mod name;` stands while the file it did not take stays absent
+    // (`ResolvedTables::module_alts`): with both, a cold resolve rejects it.
+    if base.tables.module_alts.iter().any(|p| p.is_file()) {
+        return Err("module file added");
+    }
     if !changed.is_empty() {
         let base = front.patch.as_mut().ok_or("no base")?;
         if base.local_names.is_none() {

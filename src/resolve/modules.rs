@@ -90,9 +90,7 @@ pub fn module_file(
             "Create the file, or fix the `#[path]` value.",
         ));
     }
-    let dir = search_dir(file, owns_dir, inline_path);
-    let flat = dir.join(format!("{name}.rs"));
-    let nested = dir.join(name).join("mod.rs");
+    let (flat, nested) = module_candidates(file, owns_dir, inline_path, name);
     match (flat.is_file(), nested.is_file()) {
         (true, true) => Err(Diag::new(
             "L0502",
@@ -109,6 +107,13 @@ pub fn module_file(
             "Create one of the two files, or add `#[path = \"...\"]` to the `mod` item.",
         )),
     }
+}
+
+/// The two files a `mod name;` without `#[path]` may name: `name.rs` and
+/// `name/mod.rs` in the search directory.
+pub fn module_candidates(file: &Path, owns_dir: bool, inline_path: &[String], name: &str) -> (PathBuf, PathBuf) {
+    let dir = search_dir(file, owns_dir, inline_path);
+    (dir.join(format!("{name}.rs")), dir.join(name).join("mod.rs"))
 }
 
 /// The canonical path string a file is keyed by in the session file
