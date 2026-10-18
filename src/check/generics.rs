@@ -12343,6 +12343,9 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     if !p.gx.has_generics {
         return Vec::new();
     }
+    if p.gx.reuse.on {
+        prefill_value_fps(p);
+    }
     // Templates check once against their param env first; a
     // template error rejects the program before any instance is made.
     add_trait_method_stubs(p);
@@ -12668,6 +12671,25 @@ fn lift_request(p: &mut Program, owned_args: &[OwnedArg]) -> Vec<GenericArg> {
             OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
         })
         .collect()
+}
+
+/// Makes the value fingerprint of every const and static on the pool
+/// (`graph::value_fp`) before a warm build's reuse checks ask for them one
+/// by one (a const's `Sig` read folds it; tsgo's large tables made it a
+/// quarter second of serial work per build). Each is a function of the
+/// item's evaluated value only, made once per item, so the order it is
+/// made in does not matter.
+fn prefill_value_fps(p: &Program) {
+    let consts: Vec<usize> = (0..p.consts.len()).collect();
+    crate::pool::par_map(&consts, |&i| {
+        let c = &p.consts[i];
+        crate::driver::graph::value_fp(p, &c.value, &c.value_fp);
+    });
+    let statics: Vec<usize> = (0..p.statics.len()).collect();
+    crate::pool::par_map(&statics, |&i| {
+        let s = &p.statics[i];
+        crate::driver::graph::value_fp(p, &s.value, &s.value_fp);
+    });
 }
 
 /// Builds the vtable of one discovery output's unsizing coercion
