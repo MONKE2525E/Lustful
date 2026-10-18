@@ -155,7 +155,7 @@ pub(super) fn apply_derives(
         if let Err(why) = replay_templates(p, front, caches, &reach, keyed, start) {
             // A parallel template check failed before the replays wrote
             // (`recheck_par`): the delta undoes as a refusal above does.
-            if why == TEMPLATE_DIAG {
+            if why == TEMPLATE_DIAG || why == TEMPLATE_INSTANCES {
                 caches.gen_reuse.forget_answers();
                 undo.restore(p);
                 return Err((why, true));
@@ -282,6 +282,10 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
 /// The refusal of a template body check that failed before any write
 /// (`recheck_par`); `p` is then as the derive delta left it.
 const TEMPLATE_DIAG: &str = "derive template diag";
+
+/// The refusal of a template to check again that has instances in a
+/// check's program, before any write (`replay_templates`).
+const TEMPLATE_INSTANCES: &str = "derive template instances";
 
 /// `kept_delta::recheck_template` for templates `ts`, which have no
 /// closures and define no opaque type: their body checks only read the
@@ -414,6 +418,15 @@ fn replay_templates(
             again.push(t);
         }
         crate::driver::laps::mark("kept/derive templates walk");
+        // A check's instances replay their templates' checks
+        // (`patch::instanced_templates`): one with instances refuses, before
+        // any template check writes.
+        if !again.is_empty() {
+            let instanced = super::patch::instanced_templates(p);
+            if again.iter().any(|t| instanced.contains_key(t)) {
+                return Err(TEMPLATE_INSTANCES);
+            }
+        }
         // Templates with no closures and no opaque type of their own check
         // in parallel (`recheck_par`); the others, and a check the other
         // mode stored, one at a time in fn order.

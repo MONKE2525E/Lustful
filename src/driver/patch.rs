@@ -2380,8 +2380,12 @@ pub(super) fn reuse_kept(
     front.kept_put_back = k.prefer;
     let mut bases = k.bases;
     let recheck = k.recheck;
-    // A build's instances replay its templates' checks.
-    if walk_instances && !recheck.is_empty() {
+    // A build's instances replay its templates' checks, as a check's do
+    // (`instanced_templates`).
+    if !recheck.is_empty() && (walk_instances || {
+        let inst = instanced_templates(&k.program);
+        recheck.iter().any(|&i| inst.contains_key(&LocalDefId(i as u32)))
+    }) {
         return Err("template errors");
     }
     let mut edits = match k.edits {
@@ -2394,6 +2398,8 @@ pub(super) fn reuse_kept(
         return Err("derive build");
     }
     let mut p = k.program;
+    // A check's templates with instances check again only as a build's do.
+    let instanced = instanced_templates(&p);
     // Nested templates of edited bodies, with the edit's old node range.
     let mut nested_templates: Vec<(usize, (u32, u32))> = Vec::new();
     // The edits below change what fingerprints read.
@@ -2428,7 +2434,9 @@ pub(super) fn reuse_kept(
         for f in body_fns.chain(e.hoisted.iter().map(|&j| LocalDefId(j as u32))) {
             match p.gx.fn_class.get(f.0 as usize) {
                 Some(FnClass::Plain) => {}
-                Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) => nested_templates.push((f.0 as usize, e.old_exprs)),
+                Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) && !instanced.contains_key(&f) => {
+                    nested_templates.push((f.0 as usize, e.old_exprs))
+                }
                 _ => return Err("body items"),
             }
         }
@@ -2451,7 +2459,7 @@ pub(super) fn reuse_kept(
             // A template with closures stands when its closures are the
             // registered ones (checked below, before its template check),
             // and one that returns `impl Trait` while its hidden type does.
-            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) => {}
+            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(f) && !instanced.contains_key(&f) => {}
             _ => return Err("fn class"),
         }
     }
@@ -2726,6 +2734,30 @@ fn put_back(front: &mut Front, caches: &mut Caches, p: crate::check::collect::Pr
 /// (`materialize`). An edited body's requests must then stay the same.
 pub(super) fn walks_requests(p: &crate::check::collect::Program) -> bool {
     p.gx.walk_instances || !p.gx.assoc_const_tmpls.is_empty()
+}
+
+/// The local templates with instances in a check's program (a check of
+/// a program with generic associated consts makes them, `walks_requests`),
+/// a closure's instances counting for the fn that owns it. An instance
+/// replays its template's check, so a kept program may check one of these
+/// again only as a build would (it refuses). Empty for a build's program,
+/// whose own rules refuse first, and when the check makes no instances.
+pub(super) fn instanced_templates(p: &crate::check::collect::Program) -> crate::intern::FxMap<crate::def::LocalDefId, ()> {
+    let mut out = crate::intern::FxMap::default();
+    if p.gx.walk_instances || !walks_requests(p) {
+        return out;
+    }
+    for info in p.gx.instances.values() {
+        let mut f = info.template_local;
+        // A closure body fn up to its parent, through nested closures.
+        while let Some(g) = f {
+            if out.insert(g, ()).is_some() {
+                break;
+            }
+            f = p.gx.closure_fns.get(&g).and_then(|d| p.gx.closures.get(d)).map(|e| e.parent);
+        }
+    }
+    out
 }
 
 /// True when `old` and `new`, the instance-making types of fn `x`'s base

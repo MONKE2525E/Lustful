@@ -47,6 +47,7 @@ use crate::check::generics::{self, FnClass};
 use crate::def::LocalDefId;
 use crate::diag::Diag;
 use crate::driver::graph::{BindingRes, Head, ReadKey};
+use crate::intern::FxMap;
 
 /// One header edit: the edited AST fn (its `LocalDefId` index) and its
 /// old body's expression range (a template's picks key on it).
@@ -119,11 +120,12 @@ fn apply(
 ) -> Result<(), (&'static str, bool)> {
     // Entries this delta stores come after this stamp (`replay_bodies`).
     let start = crate::driver::gen_reuse::stamp_now();
-    let fns = untouched_refusals(p, front, reach, edits, walk_instances).map_err(|e| (e, true))?;
+    let instanced = super::patch::instanced_templates(p);
+    let fns = untouched_refusals(p, front, reach, edits, walk_instances, &instanced).map_err(|e| (e, true))?;
     super::laps::mark("collect/delta refusals");
     let opaque_idents = opaque_body_idents(p);
     super::laps::mark("collect/delta opaque idents");
-    let (namers, template_namers) = rpit_namers(p, &opaque_idents, &fns, walk_instances).map_err(|e| (e, true))?;
+    let (namers, template_namers) = rpit_namers(p, &opaque_idents, &fns, walk_instances, &instanced).map_err(|e| (e, true))?;
     super::laps::mark("collect/delta rpit namers");
     // The node answers of the last collect describe the old signatures.
     caches.gen_reuse.forget_answers();
@@ -273,6 +275,7 @@ fn untouched_refusals(
     reach: Option<&ConstReach>,
     edits: &[HeaderEdit],
     walk_instances: bool,
+    instanced: &FxMap<LocalDefId, ()>,
 ) -> Result<Vec<usize>, &'static str> {
     if !p.gx.user_generics {
         return Err("sig flags");
@@ -294,7 +297,7 @@ fn untouched_refusals(
             return Err("sig class");
         }
         let f = LocalDefId(i as u32);
-        refusal(p, f, walk_instances)?;
+        refusal(p, f, walk_instances, instanced)?;
         // An inherent method: a root `Q::name` names it only when `Q` may
         // denote its Adt (`ConstReach::reaches_inherent`).
         // `refusal` took every fn that was const; the new header may be.
@@ -359,13 +362,14 @@ fn opaque_body_idents(p: &Program) -> Vec<(crate::def::DefId, Vec<crate::intern:
 /// Why fn `f` cannot take a header delta, if anything (see the module
 /// docs; `apply_headers` adds the const reach and `rpit_namers`). Reads
 /// the new Ast and the old program.
-fn refusal(p: &Program, f: LocalDefId, walk_instances: bool) -> Result<(), &'static str> {
+fn refusal(p: &Program, f: LocalDefId, walk_instances: bool, instanced: &FxMap<LocalDefId, ()>) -> Result<(), &'static str> {
     let i = f.0 as usize;
     // A template's instances keep their old signatures: only a check that
-    // walks none (no build, no generic associated consts) takes it.
+    // made none of it (not a build; with generic associated consts a check
+    // makes instances, `patch::instanced_templates`) takes it.
     match p.gx.fn_class.get(i) {
         Some(FnClass::Plain) => {}
-        Some(FnClass::Template) if !walk_instances && p.gx.assoc_const_tmpls.is_empty() => {}
+        Some(FnClass::Template) if !walk_instances && !instanced.contains_key(&f) => {}
         _ => return Err("sig class"),
     }
     let info = p.fn_info(f);
@@ -574,6 +578,7 @@ fn rpit_namers(
     opaque_idents: &[(crate::def::DefId, Vec<crate::intern::Sym>)],
     fns: &[usize],
     walk_instances: bool,
+    instanced: &FxMap<LocalDefId, ()>,
 ) -> Result<(Vec<LocalDefId>, Vec<LocalDefId>), &'static str> {
     let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
     let (mut plain, mut tmpl) = (Vec::new(), Vec::new());
@@ -587,7 +592,7 @@ fn rpit_namers(
         }
         match p.gx.fn_class.get(g.0 as usize) {
             Some(FnClass::Plain) if p.gx.opaque_ret_of.contains_key(&g) => plain.push(g),
-            Some(FnClass::Template) if !walk_instances && p.gx.assoc_const_tmpls.is_empty() && !p.is_lang_method(g) => tmpl.push(g),
+            Some(FnClass::Template) if !walk_instances && !instanced.contains_key(&g) && !p.is_lang_method(g) => tmpl.push(g),
             c => {
                 crate::check::derive_delta::log(&|| {
                     let lang = p.is_lang_method(g);
@@ -681,8 +686,11 @@ fn replay_bodies(
         }
         // A template whose check no longer holds checks again, as collect
         // does, in a check only: a build's instances of it would keep
-        // their old checks.
-        if !again.is_empty() && walk_instances {
+        // their old checks, as a check's would (`patch::instanced_templates`).
+        if !again.is_empty() && (walk_instances || {
+            let instanced = super::patch::instanced_templates(p);
+            again.iter().any(|t| instanced.contains_key(t))
+        }) {
             return Err("sig template");
         }
         let mut times: Vec<(f64, LocalDefId)> = Vec::new();
@@ -888,6 +896,7 @@ pub(super) fn replay_discovery(
 /// patch base); std and lang fns are left out.
 pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
     let opaque_idents = opaque_body_idents(p);
+    let instanced = super::patch::instanced_templates(p);
     let mut out: Vec<(&'static str, usize)> = Vec::new();
     for i in 0..p.fns.len() {
         let f = LocalDefId(i as u32);
@@ -899,7 +908,7 @@ pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
         {
             continue;
         }
-        let why = refusal(p, f, false).and_then(|()| rpit_namers(p, &opaque_idents, &[i], false).map(drop)).err().unwrap_or("ok");
+        let why = refusal(p, f, false, &instanced).and_then(|()| rpit_namers(p, &opaque_idents, &[i], false, &instanced).map(drop)).err().unwrap_or("ok");
         match out.iter_mut().find(|e| e.0 == why) {
             Some(e) => e.1 += 1,
             None => out.push((why, 1)),
