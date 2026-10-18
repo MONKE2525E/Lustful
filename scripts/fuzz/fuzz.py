@@ -577,7 +577,7 @@ class Harness:
         for line in lines:
             if "guard:" in line:
                 self._guard += 1
-            if "itempatch oracle:" in line:
+            if "itempatch oracle:" in line or "resolve oracle:" in line:
                 self._oracle += 1
                 print(f"ORACLE {line.strip()[:400]}", flush=True)
             if "guard-check: start " in line:

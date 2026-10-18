@@ -324,7 +324,7 @@ def scenario(srcdir):
             # (and answers that request again from a fresh session).
             log.flush()
             with open(os.path.join(work, "daemon.log")) as f:
-                hits = [l.strip() for l in f if "itempatch oracle:" in l]
+                hits = [l.strip() for l in f if "itempatch oracle:" in l or "resolve oracle:" in l]
             if len(hits) > oracle_seen:
                 problems.append(f"{tag}: {hits[oracle_seen][:300]}")
                 oracle_seen = len(hits)

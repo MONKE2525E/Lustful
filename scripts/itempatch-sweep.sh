@@ -7,6 +7,9 @@
 # never retried. A suite fails on any line but `itempatch oracle: ok ...` in its oracle log, and a
 # daemon suite fails when its log has no `ok` line (the oracle saw none of its edits). difftest
 # and crates compile cold only (no daemon): they run as the rule-zero net, with no oracle count.
+# With LUST_CHECK_RESOLVE=1 set as well, the resolve oracle (src/driver/resolve_oracle.rs) checks
+# every request's resolver state against a cold resolve and logs `resolve oracle: ...` lines to
+# the same logs.
 #
 # Suites (default: all but tsedit):
 #   difftest crates driver scenarios   scripts/difftest.sh, test-crates.sh, test-driver.sh,
@@ -37,7 +40,7 @@ suites=("$@")
 bad=0
 for s in "${suites[@]}"; do
   log=$out/$s.log
-  export LUST_ITEMPATCH_LOG=$out/$s.oracle
+  export LUST_ITEMPATCH_LOG=$out/$s.oracle LUST_RESOLVE_LOG=$out/$s.oracle
   rm -f "$LUST_ITEMPATCH_LOG"
   fz=(python3 scripts/fuzz/fuzz.py run --edits "$edits" --sig-ops --rustc "${base[@]}" --out "$out/fuzz-$s")
   case $s in
@@ -57,8 +60,8 @@ for s in "${suites[@]}"; do
     *) echo "itempatch-sweep: unknown suite $s" >&2; exit 2 ;;
   esac
   rc=$?
-  ok=$(grep -c '^itempatch oracle: ok' "$LUST_ITEMPATCH_LOG" 2>/dev/null || true)
-  fail=$(grep -vc '^itempatch oracle: ok' "$LUST_ITEMPATCH_LOG" 2>/dev/null || true)
+  ok=$(grep -Ec '^(itempatch|resolve) oracle: ok' "$LUST_ITEMPATCH_LOG" 2>/dev/null || true)
+  fail=$(grep -Evc '^(itempatch|resolve) oracle: ok' "$LUST_ITEMPATCH_LOG" 2>/dev/null || true)
   cold=0
   case $s in difftest|crates) cold=1 ;; esac
   [ "$rc" = 0 ] && [ "${fail:-0}" = 0 ] || bad=1
@@ -68,9 +71,9 @@ for s in "${suites[@]}"; do
   fi
   tail -3 "$log"
   grep -h '^sigops:\|^paths:' "$log" | head -6
-  [ "${fail:-0}" = 0 ] || grep -v '^itempatch oracle: ok' "$LUST_ITEMPATCH_LOG" | sort | uniq -c | sort -rn | head -5
+  [ "${fail:-0}" = 0 ] || grep -Ev '^(itempatch|resolve) oracle: ok' "$LUST_ITEMPATCH_LOG" | sort | uniq -c | sort -rn | head -5
   # Coverage: oracle checks by kind and path (path=item is the item patch).
-  [ "$cold" = 1 ] || echo "sweep: $s checks by path: $(grep '^itempatch oracle: ok' "$LUST_ITEMPATCH_LOG" 2>/dev/null | awk '{print $4"/"$5}' | sort | uniq -c | sort -rn | tr -s ' ' | tr '\n' ';')"
+  [ "$cold" = 1 ] || echo "sweep: $s checks by path: $(grep -E '^(itempatch|resolve) oracle: ok' "$LUST_ITEMPATCH_LOG" 2>/dev/null | awk '{print $1"/"$4"/"$5}' | sort | uniq -c | sort -rn | tr -s ' ' | tr '\n' ';')"
   if [ "$cold" = 1 ]; then ok="n/a (cold suite)"; fi
   echo "sweep: $s rc=$rc oracle_ok=${ok:-0} oracle_fail=${fail:-0}"
 done

@@ -487,6 +487,38 @@ pub fn reshift_ctxt(ctxt: CtxtId, shift: &dyn Fn(Span) -> Span, memo: &mut crate
     out
 }
 
+/// A hash of what `ctxt` stands for, not of its id: each expansion's macro
+/// def, call site and parent context, its hygiene mark and no-capture flag,
+/// through the whole chain. Contexts registered apart for the same expansion
+/// hash the same, so the resolve oracle (driver/resolve_oracle.rs) compares a
+/// warm Ast with a cold one by it. `memo` maps ids to their hash.
+pub fn ctxt_hash(ctxt: CtxtId, memo: &mut crate::intern::FxMap<u32, u64>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if ctxt == CtxtId::ROOT {
+        return 0;
+    }
+    if let Some(&h) = memo.get(&ctxt.0) {
+        return h;
+    }
+    let mut h = crate::intern::FxHasher::default();
+    match global_expansion(ctxt) {
+        Some(e) => {
+            (e.macro_def, e.call_span.file, e.call_span.lo, e.call_span.hi).hash(&mut h);
+            ctxt_hash(e.call_span.ctxt, memo).hash(&mut h);
+            ctxt_hash(e.parent, memo).hash(&mut h);
+        }
+        None => ctxt.0.hash(&mut h),
+    }
+    if let Some(m) = hygiene_mark(ctxt) {
+        (m.def_span.file, m.def_span.lo, m.def_span.hi, m.local_def).hash(&mut h);
+        ctxt_hash(m.def_span.ctxt, memo).hash(&mut h);
+    }
+    is_no_capture(ctxt).hash(&mut h);
+    let out = h.finish() | 1;
+    memo.insert(ctxt.0, out);
+    out
+}
+
 /// The expansion record for a context id from the process-wide table, if any.
 fn global_expansion(ctxt: CtxtId) -> Option<Expansion> {
     if ctxt == CtxtId::ROOT {

@@ -2118,6 +2118,13 @@ fn resolved_setup(
     let has_deps = !externs.is_empty();
     let patched =
         if ast_bloated(front) { Err("ast compaction") } else { super::patch::try_patch(front, caches, inputs, &root_text, request_start) };
+    if super::resolve_oracle::on()
+        && let Ok(p) = &patched
+    {
+        let items = p.item_scans.as_deref().unwrap_or(&front.items);
+        let reused = reusable.as_ref().filter(|_| p.files == 0).map(|r| &r.1);
+        super::resolve_oracle::check_patch(front, &p.tables, items, &p.fn_lines, reused);
+    }
     match patched {
         // Nothing changed since the last check of this same request:
         // its answer stands (`check_fingerprint`).
@@ -2275,7 +2282,7 @@ fn resolved_setup(
             display_root: front.display_root.clone(),
         };
         let out = worklist::resolve_crate_with(&input, &front.interner, &front.known, &mut front.resolve_cache, plan.platform);
-        if super::item_oracle::on() {
+        if super::item_oracle::on() || super::resolve_oracle::on() {
             oracle_input = Some(super::item_oracle::ColdInput { input: input.clone(), platform: plan.platform });
         }
         let (user, platform) = match &out {
@@ -2292,6 +2299,12 @@ fn resolved_setup(
         plan = seen;
         t.lap("resolve: std plan retry");
     };
+    if super::resolve_oracle::on()
+        && caches.persistent
+        && let Some(cold_in) = &oracle_input
+    {
+        super::resolve_oracle::check_full(front, cold_in, &resolved, visits.why);
+    }
     let resolved = match resolved {
         Ok(r) => r,
         Err(e) => {
