@@ -22,16 +22,16 @@
 //      (`front.d<k>.img`) holding only the restored pages this process
 //      wrote (`/proc/self/pagemap`) plus the new arena's live pages; after
 //      MAX_DELTAS deltas, or deltas whose data passes half the base, a new
-//      base, which copies the untouched pages from the old layer files.
+//      base, which copies the untouched pages from the old layer files (or
+//      from memory, after `fill`).
 //      Zero pages (freed blocks among them) are holes in every layer. Each
 //      layer has a header (format, compiler build, address anchors, the
 //      `Roots` pointer, the next arena base, its parent layer), a region
 //      table, then pages. When the system's libzstd loads (and unless
 //      `LUST_FRONT_ZSTD=0`) a layer is written packed (`pack`): its raw form in 8 MB
 //      zstd sections, which the next run reads in one pass and unpacks in
-//      parallel into a memfd (`unpack`): on a CI disk, page faults on a
-//      raw tsgo chain (13.2 GB) cost a fresh merge 12.8 s, and the chain
-//      packs to 1.1 GB. Arena pages hold the live blocks mimalloc
+//      parallel: on a CI disk, page faults on a raw tsgo chain (13.2 GB)
+//      cost a fresh merge 12.8 s, and the chain packs to 1.1 GB. Arena pages hold the live blocks mimalloc
 //      reports (`mi_heap_visit_blocks`), with the bytes of free blocks
 //      written as zeros; pages with no live block are left out. The
 //      process-wide tables the session's spans index into
@@ -44,11 +44,16 @@
 //      load to its exit, a background save's child to the save's end: a
 //      build waits for the save before it, and a release waits for its
 //      own (`flock <dir>/lock true`) before it caches the directory.
-//   4. The next run maps the layers back at their addresses, newest pages
-//      last (`load`: MAP_PRIVATE, so pages load lazily and no layer file is
-//      ever written), and uses the restored session. A free of a restored
-//      block zeroes it and never reuses it; new blocks come from a fresh
-//      arena above the restored regions.
+//   4. The next run puts the layers back at their addresses (`load`) and
+//      uses the restored session. Packed layers unpack straight into
+//      anonymous memory, each page from the newest layer that holds it,
+//      with a hash of each page placed (`fill`): a delta takes the pages
+//      whose hash moved (`changed_runs`). Raw layer files (and, with
+//      `LUST_FRONT_RESTORE=memfd`, packed layers unpacked into memfds)
+//      map MAP_PRIVATE, newest pages last, so copy-on-write marks the
+//      written pages and no layer is ever written. A free of a restored block zeroes it and
+//      never reuses it; new blocks come from a fresh arena above the
+//      restored regions.
 //
 // Any doubt is a cold build that writes a fresh image: a missing or
 // foreign image (format, build, anchors), a region that cannot map, a
@@ -59,7 +64,7 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::ffi::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 /// The state directory variable (`LUST_FRONT_STATE=<dir>`).
 pub const STATE_ENV: &str = "LUST_FRONT_STATE";
@@ -95,10 +100,14 @@ const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ2";
 /// Saves write packed layers when libzstd loads; `LUST_FRONT_ZSTD=0` keeps
 /// them raw.
 const PACK_ENV: &str = "LUST_FRONT_ZSTD";
+/// Packed layers unpack into anonymous memory (`fill`);
+/// `LUST_FRONT_RESTORE=memfd` unpacks them into memfds instead (`unpack`).
+const RESTORE_ENV: &str = "LUST_FRONT_RESTORE";
 /// Raw bytes per packed section; sections pack and unpack in parallel.
 const SECTION: usize = 8 << 20;
 const RTLD_NOW: c_int = 2;
 const MFD_CLOEXEC: std::ffi::c_uint = 1;
+const MADV_NOHUGEPAGE: c_int = 15;
 /// Arena bases come from this window, one generation after another:
 /// 16 TiB to 80 TiB, below where Linux puts a non-randomized binary
 /// (0x5555_5555_4000) and its mmap area.
@@ -149,6 +158,7 @@ unsafe extern "C" {
     fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn memfd_create(name: *const c_char, flags: std::ffi::c_uint) -> c_int;
+    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
 }
 
 const PROT_RW: c_int = 0x1 | 0x2;
@@ -733,6 +743,265 @@ fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64, u64)], z: &Zstd) -> 
     Ok(mem)
 }
 
+/// The restored span of `chain` as sorted, disjoint page runs (overlapping
+/// layers merged), and where each of its pages comes from: (start, end,
+/// layer, offset in that layer's raw form), the newest layer's (`overlay`).
+fn spans(chain: &[Header]) -> (Vec<(usize, usize)>, Vec<(usize, usize, usize, u64)>) {
+    let mut all: Vec<(usize, usize)> = chain.iter().flat_map(|h| h.regions.iter().map(|&(a, l, _)| (a as usize, (a + l) as usize))).collect();
+    all.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (a, e) in all {
+        match runs.last_mut() {
+            Some((_, end)) if a <= *end => *end = (*end).max(e),
+            _ => runs.push((a, e)),
+        }
+    }
+    let mut src: Vec<(usize, usize, usize, u64)> = Vec::new();
+    for (k, h) in chain.iter().enumerate() {
+        let mut layer: Vec<(usize, usize, usize, u64)> = h.regions.iter().map(|&(a, l, o)| (a as usize, (a + l) as usize, k, o)).collect();
+        layer.sort_unstable_by_key(|r| r.0);
+        src = overlay(&src, &layer);
+    }
+    (runs, src)
+}
+
+/// True for a page of zero bytes.
+fn zero_page(b: &[u8]) -> bool {
+    b.chunks_exact(8).all(|w| w == [0u8; 8])
+}
+
+/// Unpacks packed layers straight into the anonymous runs `load` mapped:
+/// each page from the newest layer that holds it (`src`), zero pages left
+/// untouched (they read as zero), and the hash of each page placed into
+/// `hashes` (two words per page of `runs`, in run order), which tells a
+/// save the pages this process changed (`changed_runs`). The sections of
+/// all layers share one pool of workers, and a section that no newest page
+/// comes from is not read.
+/// Returns the deltas' data (`base_due`): the nonzero bytes of the delta
+/// sections it read; and a note of what the fill read, unpacked and placed,
+/// and the workers' time in each, for the build line (`layers_note`).
+fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: &[(usize, usize)], hashes: &[AtomicU64], z: &Zstd) -> Result<(u64, String), String> {
+    // The index of each run's first page.
+    let mut first = Vec::with_capacity(runs.len());
+    let mut pages = 0;
+    for &(a, e) in runs {
+        first.push(pages);
+        pages += (e - a) / PAGE;
+    }
+    let page_index = |a: usize| {
+        let r = runs.partition_point(|&(_, e)| e <= a);
+        first[r] + (a - runs[r].0) / PAGE
+    };
+    // Per layer and section: the parts of it that land in memory (address,
+    // offset in the section, length), all page aligned.
+    let mut parts: Vec<Vec<Vec<(usize, usize, usize)>>> = chain.iter().map(|h| vec![Vec::new(); h.packed.as_ref().map_or(0, |(_, s)| s.len())]).collect();
+    for &(s, e, k, o) in src {
+        let (mut a, mut off) = (s, o as usize);
+        while a < e {
+            let sec = off / SECTION;
+            let n = (e - a).min((sec + 1) * SECTION - off);
+            parts[k].get_mut(sec).ok_or("image region past its layer's sections")?.push((a, off % SECTION, n));
+            a += n;
+            off += n;
+        }
+    }
+    let jobs: Vec<(usize, usize)> = parts.iter().enumerate().flat_map(|(k, p)| p.iter().enumerate().filter(|(_, v)| !v.is_empty()).map(move |(sec, _)| (k, sec))).collect();
+    let files = (0..chain.len()).map(|k| std::fs::File::open(layer_path(dir, k))).collect::<Result<Vec<_>, _>>().map_err(|e| format!("image: {e}"))?;
+    let next = AtomicUsize::new(0);
+    let data = AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    // Bytes read, unpacked, placed; then the nanoseconds spent on each.
+    let stats: [AtomicU64; 6] = Default::default();
+    let threads = workers().min(jobs.len().max(1));
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut cbuf: Vec<u8> = Vec::new();
+                let mut rbuf = vec![0u8; SECTION];
+                let mut mine = [0u64; 6];
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= jobs.len() || failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let (k, sec) = jobs[i];
+                    let Some((raw_len, sections)) = &chain[k].packed else {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    };
+                    let (off, clen, check) = sections[sec];
+                    let rlen = (*raw_len as usize).saturating_sub(sec * SECTION).min(SECTION);
+                    cbuf.resize(clen as usize, 0);
+                    let t0 = std::time::Instant::now();
+                    let mut ok = read_full_at(&files[k], &mut cbuf, off) && section_check(&cbuf) == check && parts[k][sec].iter().all(|&(_, at, n)| at % PAGE == 0 && n % PAGE == 0 && at + n <= rlen);
+                    let t1 = std::time::Instant::now();
+                    if ok {
+                        // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
+                        let d = unsafe { (z.decompress)(rbuf.as_mut_ptr() as *mut c_void, rlen, cbuf.as_ptr() as *const c_void, cbuf.len()) };
+                        ok = d == rlen;
+                    }
+                    if !ok {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let t2 = std::time::Instant::now();
+                    for &(a, at, n) in &parts[k][sec] {
+                        let index = page_index(a);
+                        let mut q = 0;
+                        while q < n {
+                            if zero_page(&rbuf[at + q..at + q + PAGE]) {
+                                q += PAGE;
+                                continue;
+                            }
+                            let s0 = q;
+                            while q < n && !zero_page(&rbuf[at + q..at + q + PAGE]) {
+                                q += PAGE;
+                            }
+                            // SAFETY: [a + s0, a + q) lies in a run `load` mapped
+                            // read-write for this fill, and only this worker
+                            // writes it (`src` ranges are disjoint).
+                            unsafe { std::ptr::copy_nonoverlapping(rbuf.as_ptr().add(at + s0), (a + s0) as *mut u8, q - s0) };
+                            mine[2] += (q - s0) as u64;
+                            for j in (s0..q).step_by(PAGE) {
+                                let h = page_hash(&rbuf[at + j..at + j + PAGE]);
+                                let w = 2 * (index + j / PAGE);
+                                hashes[w].store(h.0, Ordering::Relaxed);
+                                hashes[w + 1].store(h.1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let t3 = std::time::Instant::now();
+                    mine[0] += clen;
+                    mine[1] += rlen as u64;
+                    mine[3] += (t1 - t0).as_nanos() as u64;
+                    mine[4] += (t2 - t1).as_nanos() as u64;
+                    mine[5] += (t3 - t2).as_nanos() as u64;
+                    if k > 0 {
+                        // A delta's data: its whole section's nonzero pages, as a
+                        // memfd's blocks count them (`unpack`).
+                        let nonzero = rbuf[..rlen].chunks(PAGE).filter(|p| !zero_page(p)).count();
+                        data.fetch_add(nonzero * PAGE, Ordering::Relaxed);
+                    }
+                }
+                for (total, m) in stats.iter().zip(mine) {
+                    total.fetch_add(m, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        return Err(format!("cannot unpack the image in {}", dir.display()));
+    }
+    let [read, unpacked, placed, t_read, t_unpack, t_place] = stats.map(|a| a.into_inner());
+    let (mb, s) = (|b: u64| b >> 20, |ns: u64| ns as f64 / 1e9);
+    let note = format!(
+        "{} MB read, {} MB unpacked, {} MB placed; worker time read {:.1} s, unpack {:.1} s, place {:.1} s, {threads} workers",
+        mb(read),
+        mb(unpacked),
+        mb(placed),
+        s(t_read),
+        s(t_unpack),
+        s(t_place)
+    );
+    Ok((data.into_inner() as u64, note))
+}
+
+/// The hash of a page as `fill` placed it; a page it left zero keeps
+/// (0, 0) (`changed_runs`).
+fn page_hash(p: &[u8]) -> (u64, u64) {
+    crate::driver::cache::hash128(&[p], 0)
+}
+
+/// The page hashes `fill` stored for the restored runs of `l`: two words
+/// per page, in run order.
+fn hash_words(l: &'static Loaded) -> &'static [AtomicU64] {
+    let pages: usize = l.runs.iter().map(|&(a, e)| (e - a) / PAGE).sum();
+    // SAFETY: `load` mapped 16 zeroed bytes per page there (`raw`, page
+    // aligned) and never unmaps them.
+    unsafe { std::slice::from_raw_parts(l.hashes as *const AtomicU64, 2 * pages) }
+}
+
+/// Pages of the restored runs whose bytes differ from what `fill` placed:
+/// resident ones (`/proc/self/pagemap` bits 63 present, 62 swapped) whose
+/// hash is not the stored one, or that hold a nonzero byte where `fill`
+/// left zero. A page never touched is still zero. In parallel, by chunks
+/// of up to 64 MB.
+fn changed_runs(runs: &[(usize, usize)], hashes: &[AtomicU64]) -> Result<Vec<(usize, usize)>, String> {
+    use std::os::unix::fs::FileExt;
+    const CHUNK: usize = PAGE << 14;
+    // (start, end, index of its first page)
+    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut first = 0;
+    for &(a, e) in runs {
+        let mut x = a;
+        while x < e {
+            let y = e.min(x + CHUNK);
+            chunks.push((x, y, first));
+            first += (y - x) / PAGE;
+            x = y;
+        }
+    }
+    let found: Vec<std::sync::Mutex<Vec<(usize, usize)>>> = chunks.iter().map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let next = AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..workers().min(chunks.len().max(1)) {
+            s.spawn(|| {
+                let Ok(pagemap) = std::fs::File::open("/proc/self/pagemap") else {
+                    failed.store(true, Ordering::Relaxed);
+                    return;
+                };
+                let mut buf = vec![0u8; CHUNK / PAGE * 8];
+                loop {
+                    let c = next.fetch_add(1, Ordering::Relaxed);
+                    if c >= chunks.len() || failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let (x, y, first) = chunks[c];
+                    let n = (y - x) / PAGE;
+                    if pagemap.read_exact_at(&mut buf[..n * 8], (x / PAGE * 8) as u64).is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let mut out: Vec<(usize, usize)> = Vec::new();
+                    for (i, w) in buf[..n * 8].chunks_exact(8).enumerate() {
+                        let v = u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+                        if v >> 62 & 3 == 0 {
+                            continue;
+                        }
+                        let at = x + i * PAGE;
+                        // SAFETY: a resident page of a restored run, mapped read-write by `load`.
+                        let page = unsafe { std::slice::from_raw_parts(at as *const u8, PAGE) };
+                        let k = 2 * (first + i);
+                        let stored = (hashes[k].load(Ordering::Relaxed), hashes[k + 1].load(Ordering::Relaxed));
+                        let changed = if stored == (0, 0) { !zero_page(page) } else { page_hash(page) != stored };
+                        if changed {
+                            match out.last_mut() {
+                                Some((_, end)) if *end == at => *end += PAGE,
+                                _ => out.push((at, at + PAGE)),
+                            }
+                        }
+                    }
+                    *found[c].lock().unwrap_or_else(|e| e.into_inner()) = out;
+                }
+            });
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        return Err("pagemap: cannot read the restored runs".into());
+    }
+    let mut runs_out: Vec<(usize, usize)> = Vec::new();
+    for f in found {
+        for (a, e) in f.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            match runs_out.last_mut() {
+                Some((_, end)) if *end == a => *end = e,
+                _ => runs_out.push((a, e)),
+            }
+        }
+    }
+    Ok(runs_out)
+}
+
 /// The layers that make up the image in `dir`: the base, then each delta
 /// whose parent is the layer before it (a stale delta ends the chain).
 fn read_chain(dir: &Path) -> Result<Vec<Header>, String> {
@@ -779,15 +1048,7 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     if window_taken(arena) {
         return Err("image window in use".into());
     }
-    // A packed layer unpacks into a memfd with its raw form: one read of the
-    // file instead of page faults on it (a CI disk serves those slowly).
-    let mut files = Vec::with_capacity(chain.len());
-    for (k, h) in chain.iter().enumerate() {
-        files.push(match &h.packed {
-            Some((raw_len, sections)) => unpack(&layer_path(dir, k), *raw_len, sections, zstd().ok_or("a packed image, and no libzstd")?)?,
-            None => std::fs::File::open(layer_path(dir, k)).map_err(|e| format!("image: {e}"))?,
-        });
-    }
+    let (runs, src) = spans(&chain);
     let mut mapped: Vec<(usize, usize)> = Vec::new();
     let unmap_all = |mapped: &[(usize, usize)]| {
         for &(a, l) in mapped {
@@ -795,44 +1056,80 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
             unsafe { munmap(a as *mut c_void, l) };
         }
     };
-    for (k, h) in chain.iter().enumerate() {
-        let fd = files[k].as_raw_fd();
-        for &(a, l, o) in &h.regions {
-            // SAFETY: a private mapping in the image window, which holds
-            // only this call's own earlier layers (`window_taken`): a delta
-            // page replaces the older page at its address.
-            let p = unsafe { mmap(a as *mut c_void, l as usize, PROT_RW, MAP_PRIVATE | MAP_FIXED, fd, o as i64) };
-            if p as usize != a as usize {
+    // Packed layers unpack straight into anonymous memory, with a hash of
+    // each page placed, which tells a save the pages this process changed
+    // (`fill`). With `LUST_FRONT_RESTORE=memfd` they unpack into memfds
+    // that the regions map privately, where copy-on-write tells them
+    // (`unpack`). Either way one read of each file instead of page faults
+    // on it (a CI disk serves those slowly). Raw layers map their files.
+    let anon = chain.iter().all(|h| h.packed.is_some()) && std::env::var_os(RESTORE_ENV).is_none_or(|v| v != "memfd");
+    let mut files = Vec::new();
+    // The deltas' data (their holes cost nothing): past half the base's
+    // live bytes, the next save writes a new base.
+    let deltas: u64;
+    let mut fill_note = String::new();
+    let mut hashes = 0;
+    if anon {
+        let z = zstd().ok_or("a packed image, and no libzstd")?;
+        for &(a, e) in &runs {
+            // SAFETY: a private anonymous mapping in the image window, which
+            // holds nothing else (`window_taken`).
+            let p = unsafe { mmap(a as *mut c_void, e - a, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) };
+            if p as usize != a {
                 unmap_all(&mapped);
-                return Err(format!("cannot map image region {a:#x}"));
+                return Err(format!("cannot map image run {a:#x}"));
             }
-            mapped.push((a as usize, l as usize));
+            mapped.push((a, e - a));
+            // Small pages only: memory for the pages placed, not for the
+            // zero pages around them. (No THP in the kernel: nothing to
+            // turn off.)
+            // SAFETY: the run just mapped.
+            unsafe { madvise(p, e - a, MADV_NOHUGEPAGE) };
         }
-    }
-    // The restored span, as page runs (overlapping layers merged).
-    mapped.sort_unstable();
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (a, l) in mapped {
-        match runs.last_mut() {
-            Some((_, e)) if a <= *e => *e = (*e).max(a + l),
-            _ => runs.push((a, a + l)),
+        let pages: usize = runs.iter().map(|&(a, e)| (e - a) / PAGE).sum();
+        let Some((words, _)) = raw(16 * pages) else {
+            unmap_all(&mapped);
+            return Err("no memory for the page hashes".into());
+        };
+        hashes = words as usize;
+        // SAFETY: 16 zeroed bytes per page, page aligned, never unmapped.
+        let words = unsafe { std::slice::from_raw_parts(words as *const AtomicU64, 2 * pages) };
+        match fill(dir, &chain, &src, &runs, words, z) {
+            Ok((d, note)) => (deltas, fill_note) = (d, note),
+            Err(e) => {
+                unmap_all(&mapped);
+                return Err(e);
+            }
         }
-    }
-    let mut src: Vec<(usize, usize, usize, u64)> = Vec::new();
-    for (k, h) in chain.iter().enumerate() {
-        let mut layer: Vec<(usize, usize, usize, u64)> = h.regions.iter().map(|&(a, l, o)| (a as usize, (a + l) as usize, k, o)).collect();
-        layer.sort_unstable_by_key(|r| r.0);
-        src = overlay(&src, &layer);
+    } else {
+        for (k, h) in chain.iter().enumerate() {
+            files.push(match &h.packed {
+                Some((raw_len, sections)) => unpack(&layer_path(dir, k), *raw_len, sections, zstd().ok_or("a packed image, and no libzstd")?)?,
+                None => std::fs::File::open(layer_path(dir, k)).map_err(|e| format!("image: {e}"))?,
+            });
+        }
+        for (k, h) in chain.iter().enumerate() {
+            let fd = files[k].as_raw_fd();
+            for &(a, l, o) in &h.regions {
+                // SAFETY: a private mapping in the image window, which holds
+                // only this call's own earlier layers (`window_taken`): a delta
+                // page replaces the older page at its address.
+                let p = unsafe { mmap(a as *mut c_void, l as usize, PROT_RW, MAP_PRIVATE | MAP_FIXED, fd, o as i64) };
+                if p as usize != a as usize {
+                    unmap_all(&mapped);
+                    return Err(format!("cannot map image region {a:#x}"));
+                }
+                mapped.push((a as usize, l as usize));
+            }
+        }
+        deltas = files[1..].iter().map(|f| f.metadata().map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512)).sum();
     }
     let top = chain.last().expect("a chain has its base");
     OLD_LO.store(runs.first().map_or(0, |r| r.0), Ordering::Relaxed);
     OLD_LEN.store(runs.last().map_or(0, |r| r.1) - runs.first().map_or(0, |r| r.0), Ordering::Relaxed);
     GEN.store(top.generation as usize + 1, Ordering::Relaxed);
-    // The deltas' data on disk (their holes cost nothing): past half the
-    // base's live bytes, the next save writes a new base.
-    let deltas: u64 = files[1..].iter().map(|f| f.metadata().map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512)).sum();
     let packed = chain.iter().filter(|h| h.packed.is_some()).count();
-    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live, files, packed });
+    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live, files, packed, anon, fill_note, hashes });
     // SAFETY: the root was a leaked `Box<Roots>` of a process running this
     // same binary at the same addresses (checked: build id, anchors), and
     // every page it reaches is mapped back above.
@@ -854,10 +1151,18 @@ struct Loaded {
     /// The session's live bytes when the top layer was written (estimate).
     live: u64,
     /// Each layer's raw form (the file, or a packed layer's memfd), which
-    /// a base write copies untouched pages from.
+    /// a base write copies untouched pages from. Empty after `fill`.
     files: Vec<std::fs::File>,
     /// How many layers were packed.
     packed: usize,
+    /// The layers were unpacked into anonymous memory (`fill`): page hashes
+    /// tell the pages this process changed (`changed_runs`), and a base
+    /// writes every page from memory.
+    anon: bool,
+    /// What `fill` did, for the build line.
+    fill_note: String,
+    /// The address of `fill`'s page hashes (`hash_words`); 0 without.
+    hashes: usize,
 }
 
 static LOADED: std::sync::OnceLock<Loaded> = std::sync::OnceLock::new();
@@ -870,12 +1175,14 @@ pub fn generation() -> usize {
     GEN.load(Ordering::Relaxed)
 }
 
-/// The form of the restored layers, for the build line: `packed`, or why
-/// they (and this run's saves) are raw.
+/// The form of the restored layers, for the build line: `packed` and what
+/// `fill` did, `packed, memfd restore` (`unpack`), or why they (and this
+/// run's saves) are raw.
 pub fn layers_note() -> String {
-    match LOADED.get().map(|l| (l.packed, l.layers)) {
-        Some((p, n)) if p == n => "packed".into(),
-        Some((p, _)) if p > 0 => format!("packed and raw; saves {}", raw_why().map_or("pack", |_| "stay raw")),
+    match LOADED.get().map(|l| (l.packed, l.layers, l.anon.then_some(&l.fill_note))) {
+        Some((p, n, Some(note))) if p == n => format!("packed; {note}"),
+        Some((p, n, None)) if p == n => "packed, memfd restore".into(),
+        Some((p, _, _)) if p > 0 => format!("packed and raw; saves {}", raw_why().map_or("pack", |_| "stay raw")),
         _ => raw_why().map_or_else(|| "raw; saves pack".to_string(), str::to_string),
     }
 }
@@ -1159,6 +1466,40 @@ fn write_base_run(file: &std::fs::File, out: u64, a: usize, e: usize, modified: 
     true
 }
 
+/// Writes restored run [a, e) of a new base at file offset `out`, all from
+/// memory (after `fill`): its resident pages (`pagemap` bits 63 present, 62
+/// swapped), zero ones as holes. A page never touched is zero: it stays a
+/// hole and is not read. Allocates nothing (it runs between the save's two
+/// passes).
+fn write_resident_run(file: &std::fs::File, pagemap: &std::fs::File, out: u64, a: usize, e: usize) -> bool {
+    use std::os::unix::fs::FileExt;
+    let mut buf = [0u8; 4096];
+    let mut stretch: Option<usize> = None;
+    let mut p = a;
+    while p < e {
+        let n = ((e - p) / PAGE).min(buf.len() / 8);
+        if pagemap.read_exact_at(&mut buf[..n * 8], (p / PAGE * 8) as u64).is_err() {
+            return false;
+        }
+        for (i, c) in buf[..n * 8].chunks_exact(8).enumerate() {
+            let v = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+            let at = p + i * PAGE;
+            match (v >> 62 & 3 != 0, stretch) {
+                (true, None) => stretch = Some(at),
+                (false, Some(s)) => {
+                    if !write_sparse_at(file, out + (s - a) as u64, s, at - s) {
+                        return false;
+                    }
+                    stretch = None;
+                }
+                _ => {}
+            }
+        }
+        p += n * PAGE;
+    }
+    stretch.is_none_or(|s| write_sparse_at(file, out + (s - a) as u64, s, e - s))
+}
+
 /// `write_sparse` at file offset `out`, with positional writes.
 fn write_sparse_at(file: &std::fs::File, out: u64, a: usize, len: usize) -> bool {
     use std::os::unix::fs::FileExt;
@@ -1238,7 +1579,7 @@ fn copy_slow(src: c_int, off: u64, dst: c_int, out: u64, len: u64) -> u64 {
 /// Pages of the restored runs this process wrote (copy-on-write made them
 /// anonymous) or that went to swap: `/proc/self/pagemap` bit 63 present,
 /// 62 swapped, 61 file page. Untouched and read-only pages are still the
-/// layers' own.
+/// layers' own. (After `fill`, `changed_runs` tells them.)
 fn modified_runs(runs: &[(usize, usize)]) -> Result<Vec<(usize, usize)>, String> {
     use std::os::unix::fs::FileExt;
     let f = std::fs::File::open("/proc/self/pagemap").map_err(|e| format!("pagemap: {e}"))?;
@@ -1513,16 +1854,26 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         Some(l) => (l.layers, l.top_id),
         None => (0, 0),
     };
+    let anon = loaded.is_some_and(|l| l.anon);
     // A delta: the pages this process wrote. A base: the runs whole.
-    let old_runs: Vec<(usize, usize)> = if delta.is_some() { modified_runs(restored)? } else { restored.to_vec() };
+    let old_runs: Vec<(usize, usize)> = match delta {
+        Some(l) if l.anon => changed_runs(restored, hash_words(l))?,
+        Some(_) => modified_runs(restored)?,
+        None => restored.to_vec(),
+    };
     // A base over restored runs copies their untouched pages from the
     // layer files (`write_base_run`); the written ones come from memory.
-    // Both are found now: nothing may allocate between the two passes.
+    // After `fill` every page comes from memory (`write_resident_run`).
+    // All of it is found now: nothing may allocate between the two passes.
     let base_from: Option<(Vec<(usize, usize)>, Vec<std::fs::File>)> = match loaded {
-        Some(l) if delta.is_none() => {
+        Some(l) if delta.is_none() && !anon => {
             let files = l.files.iter().map(std::fs::File::try_clone).collect::<Result<Vec<_>, _>>().map_err(|e| format!("image: {e}"))?;
             Some((modified_runs(restored)?, files))
         }
+        _ => None,
+    };
+    let pagemap = match loaded {
+        Some(_) if delta.is_none() && anon => Some(std::fs::File::open("/proc/self/pagemap").map_err(|e| format!("pagemap: {e}"))?),
         _ => None,
     };
     let base_fds: Vec<c_int> = base_from.as_ref().map_or(Vec::new(), |(_, f)| f.iter().map(|f| f.as_raw_fd()).collect());
@@ -1653,8 +2004,9 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     let mut old_bytes = 0;
     for &(a, e) in &old_runs {
         ok = ok
-            && match (&base_from, loaded) {
-                (Some((modified, _)), Some(l)) => write_base_run(&file, (data_at + old_bytes) as u64, a, e, modified, &l.src, &base_fds),
+            && match (&base_from, loaded, &pagemap) {
+                (Some((modified, _)), Some(l), _) => write_base_run(&file, (data_at + old_bytes) as u64, a, e, modified, &l.src, &base_fds),
+                (_, _, Some(pm)) => write_resident_run(&file, pm, (data_at + old_bytes) as u64, a, e),
                 // A delta: the restored pages this process wrote, zero ones
                 // (freed blocks) as holes, which map back as zero pages.
                 _ => write_sparse(&mut file, a, e - a),
