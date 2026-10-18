@@ -5611,6 +5611,10 @@ pub struct GenTables {
     /// Inherent method templates by (Adt template def, name), in
     /// registration order; disjoint Self patterns may share a name.
     pub inherent_methods: FxMap<(DefId, Sym), Vec<LocalDefId>>,
+    /// Every fn in `inherent_methods`, built at the first ask
+    /// (`is_inherent_template`): collect fills `inherent_methods` before
+    /// mono makes any instance, and nothing changes it after.
+    pub inherent_tmpls: std::sync::OnceLock<FxMap<LocalDefId, ()>>,
     /// Inherent methods std source defines on a primitive type
     /// (`impl char` in `core::char`, TRIAGE T8), by (Self type,
     /// name). User source cannot add inherent impls on primitives.
@@ -5845,6 +5849,7 @@ impl Default for GenTables {
             template_calls: FxMap::default(),
             instance_by_key: FxMap::default(),
             inherent_methods: FxMap::default(),
+            inherent_tmpls: std::sync::OnceLock::new(),
             prim_inherent_methods: FxMap::default(),
             inherent_self_pats: FxMap::default(),
             inherent_impl_self: FxMap::default(),
@@ -11378,7 +11383,7 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
     p.gx.mono_counts.1 += 1;
     // Inherent instances join the compat method table.
     if let Some(owner) = owner
-        && p.gx.inherent_methods.values().any(|ts| ts.contains(&template))
+        && is_inherent_template(p, template)
     {
         let cands = p.methods.entry((owner, name)).or_default();
         if !cands.contains(&id) {
@@ -11386,6 +11391,11 @@ fn fn_instance(p: &mut Program, template: LocalDefId, args: &[GenericArg]) -> Lo
         }
     }
     id
+}
+
+/// True when fn `t` is in some `GenTables::inherent_methods` list.
+fn is_inherent_template(p: &Program, t: LocalDefId) -> bool {
+    p.gx.inherent_tmpls.get_or_init(|| p.gx.inherent_methods.values().flatten().map(|&f| (f, ())).collect()).contains_key(&t)
 }
 
 /// Walks one checked type for generic Adt applications mono has

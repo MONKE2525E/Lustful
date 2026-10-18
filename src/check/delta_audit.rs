@@ -150,6 +150,7 @@ fn gen_digest(gx: &GenTables, out: &mut Vec<(&'static str, u64)>) {
         template_calls: _,        // rerun (template checks)
         instance_by_key,          // rerun (materialize)
         inherent_methods,         // same (outline)
+        inherent_tmpls: _,        // derived from inherent_methods
         prim_inherent_methods: _, // same (std splice)
         inherent_self_pats,       // same (impl headers)
         inherent_impl_self: _,    // same

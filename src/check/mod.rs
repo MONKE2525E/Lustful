@@ -2448,26 +2448,9 @@ pub(crate) fn check_fn_with<'p>(p: &'p Program, fid: LocalDefId, lints: bool) ->
         scalar_reads::scoped(p.record_reads, || derive_delta::scoped(p.record_reads, || check_fn_noted(p, fid)));
     derive_delta::record(p, &mut ck.reads, &noted);
     scalar_reads::record(p, &mut ck.reads, &called);
-    // Drop-check overflow (rustc E0320) is judged on the generic body,
-    // never an instance; a closure's body is its parent's check.
-    let class = p.gx.fn_class.get(fid.0 as usize).copied().unwrap_or_default();
     if lints
         && errs.is_empty()
-        && matches!(class, generics::FnClass::Plain | generics::FnClass::Template)
-        && !p.in_lang_methods(p.fn_def(fid).name_span)
-        && p.fn_shipped_crate(fid).is_none()
-        && let Some(d) = deny_lints::check_body(p, fid, &ck)
-            .or_else(|| depth::check_uses(p, fid, &ck, where_overflow::recursion_limit(p)))
-            .or_else(|| dropck::check_body(p, fid, &mut ck))
-            .or_else(|| {
-                // Build-only: `cargo check` asks no `Copy` or layout query of locals.
-                let types: Vec<(Ty, Span)> = if p.gx.walk_instances {
-                    dropck::body_types(p, fid, &ck).into_iter().map(|(t, s, _)| (t, s)).collect()
-                } else {
-                    Vec::new()
-                };
-                depth::check_locals(p, &types, &ck.tys, where_overflow::recursion_limit(p))
-            })
+        && let Some(d) = lint_tail(p, fid, &mut ck)
     {
         errs.push(d);
     }
@@ -2486,6 +2469,32 @@ pub(crate) fn check_fn_with<'p>(p: &'p Program, fid: LocalDefId, lints: bool) ->
         ));
     }
     (ck, errs)
+}
+
+/// The body lints that run after a clean check (`check_fn_with`): deny
+/// lints, depth, drop check, local type depth. The first error, if any.
+/// Drop-check overflow (rustc E0320) is judged on the generic body,
+/// never an instance; a closure's body is its parent's check.
+pub(crate) fn lint_tail(p: &Program, fid: LocalDefId, ck: &mut Checked) -> Option<Diag> {
+    let class = p.gx.fn_class.get(fid.0 as usize).copied().unwrap_or_default();
+    if !matches!(class, generics::FnClass::Plain | generics::FnClass::Template)
+        || p.in_lang_methods(p.fn_def(fid).name_span)
+        || p.fn_shipped_crate(fid).is_some()
+    {
+        return None;
+    }
+    deny_lints::check_body(p, fid, ck)
+        .or_else(|| depth::check_uses(p, fid, ck, where_overflow::recursion_limit(p)))
+        .or_else(|| dropck::check_body(p, fid, ck))
+        .or_else(|| {
+            // Build-only: `cargo check` asks no `Copy` or layout query of locals.
+            let types: Vec<(Ty, Span)> = if p.gx.walk_instances {
+                dropck::body_types(p, fid, ck).into_iter().map(|(t, s, _)| (t, s)).collect()
+            } else {
+                Vec::new()
+            };
+            depth::check_locals(p, &types, &ck.tys, where_overflow::recursion_limit(p))
+        })
 }
 
 fn check_fn_noted<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'p>, Vec<Diag>) {
