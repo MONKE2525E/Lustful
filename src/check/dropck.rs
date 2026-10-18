@@ -78,7 +78,9 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &mut Checked) -> Option<Diag
     let mut seen: FxSet<Ty> = FxSet::default();
     let mut cx = Dropck { p, limit: crate::check::where_overflow::recursion_limit(p), tys: &mut ck.tys, adts: FxMap::default() };
     for (t, span, boring) in found {
-        if !seen.insert(t) || trivial(&*cx.tys, p, t) {
+        // A trivial type is skipped every time, so only the others need
+        // the dedup set (most body types are scalars and references).
+        if trivial(&*cx.tys, p, t) || !seen.insert(t) {
             continue;
         }
         // A body local whose type names a region is checked only where
