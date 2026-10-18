@@ -3676,6 +3676,7 @@ fn resolve_one(
             &mut inner_diags,
         );
     }
+    lap!("resolve: strip+register");
     match run_imports(tables, &imports, interner) {
         Ok(ds) => inner_diags.extend(ds),
         Err(e) => inner_diags.push(Diag::new("L0506", Span::default(), e, "This is a lust bug; report it.")),
@@ -3691,6 +3692,7 @@ fn resolve_one(
         }
     }
     let mdr_imports = crate::resolve::mdr::on().then(|| crate::resolve::mdr::imports_part(tables, &imports, interner));
+    lap!("resolve: imports");
     if !inner_diags.is_empty() {
         return Err(OneError { diags: inner_diags, seen, std_asks });
     }
@@ -3703,7 +3705,7 @@ fn resolve_one(
     if !inner_diags.is_empty() {
         return Err(OneError { diags: inner_diags, seen, std_asks });
     }
-    lap!("resolve: strip+register");
+    lap!("resolve: visibility");
     // The tables are frozen now. Every file whose cached final
     // chunk was stored under this exact epoch (and expanded
     // stream) rewrites to that chunk, so its rewrite walk is
