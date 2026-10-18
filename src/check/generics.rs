@@ -12457,6 +12457,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                     for owned in adt_tys.iter().chain(args).chain(closure_tys).chain(vts.iter().flat_map(|(a, b)| [a, b])) {
                         build_owned_ty(p, owned);
                     }
+                    // Each request's instance key, as its apply step makes it
+                    // (`lift_request`): a caller's `instance_for` asks for it.
+                    for (_, owned_args) in reqs {
+                        let lifted = lift_request(p, owned_args);
+                        p.tys.intern_args(&lifted);
+                    }
                 }
                 ahead.recheck(&round, k, |&f| discover_one(p, f, lints));
             }
@@ -12563,17 +12569,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                     ));
                     continue;
                 }
-                let mut lifted: Vec<GenericArg> = Vec::with_capacity(owned_args.len());
-                for a in &owned_args {
-                    lifted.push(match a {
-                        OwnedArg::Ty(e) => {
-                            let gt = build_owned_ty(p, e);
-                            GenericArg::Ty(normalize_global(p, gt))
-                        }
-                        OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
-                        OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
-                    });
-                }
+                let lifted = lift_request(p, &owned_args);
                 let template_def = p.def_id(template);
                 let args_id = p.tys.intern_args(&lifted);
                 if let Some(&had) = p.gx.instance_by_key.get(&(template_def, args_id)) {
@@ -12656,6 +12652,22 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         errs.extend(crate::check::platform::io_copy_instance(p, f));
     }
     errs
+}
+
+/// The global args of one discovery request: each type built and
+/// normalized, each const interned (`materialize`).
+fn lift_request(p: &mut Program, owned_args: &[OwnedArg]) -> Vec<GenericArg> {
+    owned_args
+        .iter()
+        .map(|a| match a {
+            OwnedArg::Ty(e) => {
+                let gt = build_owned_ty(p, e);
+                GenericArg::Ty(normalize_global(p, gt))
+            }
+            OwnedArg::Const(k) => GenericArg::Const(p.tys.intern_const(*k)),
+            OwnedArg::Lifetime(r) => GenericArg::Lifetime(*r),
+        })
+        .collect()
 }
 
 /// Builds the vtable of one discovery output's unsizing coercion
@@ -12948,6 +12960,16 @@ impl<R: Send> Ahead<R> {
         } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(to) {
             use std::io::Write;
             let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// A round cut short (an error, a cancelled background compile) still
+/// stops the main thread's write log.
+impl<R> Drop for Ahead<R> {
+    fn drop(&mut self) {
+        if self.on {
+            crate::check::spec::end_round();
         }
     }
 }

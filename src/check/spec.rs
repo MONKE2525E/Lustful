@@ -265,7 +265,7 @@ pub struct OutOfFuel;
 /// One window check of `f`: its result, its read log, its `anon_wants`
 /// notes and the steps it took; None when it panicked or ran out of
 /// `fuel` steps (the body then checks in its turn, which repeats a real
-/// panic there).
+/// panic there). A cancel of a background compile goes on unwinding.
 #[allow(clippy::type_complexity)]
 pub fn speculate<R>(fuel: u64, f: impl FnOnce() -> R) -> Option<(R, Log, Vec<(u32, Option<crate::check::generics::ConstScalar>)>, u64)> {
     let prev = MODE.with(|m| m.replace(READ));
@@ -278,7 +278,13 @@ pub fn speculate<R>(fuel: u64, f: impl FnOnce() -> R) -> Option<(R, Log, Vec<(u3
     let log = LOG.with(|l| std::mem::replace(&mut *l.borrow_mut(), saved));
     let anon = ANON.with(|a| std::mem::take(&mut *a.borrow_mut()));
     MODE.with(|m| m.set(prev));
-    r.ok().map(|r| (r, log, anon, fuel - left))
+    match r {
+        Ok(r) => Some((r, log, anon, fuel - left)),
+        // A cancelled background compile (`pool::Cancelled`) stops here
+        // too, not only in the item's turn.
+        Err(payload) if payload.is::<crate::pool::Cancelled>() => std::panic::resume_unwind(payload),
+        Err(_) => None,
+    }
 }
 
 /// Counts `n` steps of a window check; one past its fuel stops it. Called
