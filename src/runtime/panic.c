@@ -5,18 +5,22 @@
    is Rust's LineWriter (below): an abort loses the bytes it still holds. */
 
 #ifdef LUST_IMPL
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <errno.h>
 #include <signal.h>
 #ifdef __APPLE__
 #include <pthread.h>
-#else
+#elif !defined(_WIN32)
 #include <sys/syscall.h>
 #endif
 
 /* The OS thread id Rust's default hook prints (`thread::current_os_id`). */
 static unsigned long long lust_os_tid(void) {
-#ifdef __APPLE__
+#ifdef _WIN32
+    return (unsigned long long)GetCurrentThreadId();
+#elif defined(__APPLE__)
     uint64_t t = 0;
     pthread_threadid_np(NULL, &t);
     return (unsigned long long)t;
@@ -66,8 +70,9 @@ extern int32_t lust_unw_pending;
 int32_t lust_unwind_mode;
 int32_t lust_unw_pending;
 /* Hand pthread declarations for tcc on Linux; on Darwin the real
-   <pthread.h> is included above (runtime.h has the type spellings). */
-#ifndef __APPLE__
+   <pthread.h> is included above (runtime.h has the type spellings),
+   and on Windows runtime.h maps these names to its Win32 wrappers. */
+#if !defined(__APPLE__) && !defined(_WIN32)
 int pthread_key_create(unsigned int *key, void (*dtor)(void *));
 void *pthread_getspecific(unsigned int key);
 int pthread_setspecific(unsigned int key, const void *v);
@@ -739,7 +744,13 @@ static int lust_out_soft, lust_out_err;
 
 static void lust_out_raw(const uint8_t *p, uint64_t n) {
     while (n) {
+#ifdef _WIN32
+        DWORD done = 0;
+        int64_t w = WriteFile(GetStdHandle((DWORD)-11), p, (DWORD)(n > 0x7fffffff ? 0x7fffffff : n), &done, 0) ? (int64_t)done : -1;
+        if (w < 0) errno = (int)GetLastError();
+#else
         ssize_t w = write(1, p, n);
+#endif
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) {
             int e = w < 0 ? errno : 0;
@@ -943,7 +954,9 @@ static void lust_thread_guard_fini(void *alt) { (void)alt; }
 /* Runtime setup before main: Rust ignores SIGPIPE and reports a stack
    overflow (above). */
 void lust_rt_init(void) LUST_BODY({
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
     lust_stack_guard_init();
 })
 

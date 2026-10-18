@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "sysnetwin.c"
+#else
 /* Bodies of the socket intrinsics declared in sysnet.h
    (w-cinterop). */
 #include <poll.h>
@@ -530,3 +533,5 @@ int32_t lust_sys_net_unix_addr(int32_t fd, int32_t peer, lust_Vec *out) {
     lust_sysnet_push_unix_addr(out, &un, ll);
     return 0;
 }
+
+#endif

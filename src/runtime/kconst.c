@@ -231,7 +231,11 @@ static const void *lust_kfind(const void *p, uint64_t n, uint64_t align, const u
            16) finds this copy, as rustc raises a shared constant's
            alignment to its strictest use. */
         uint64_t al = align < 16 ? 16 : align;
+#ifdef _WIN32
+        void *c = _aligned_malloc((size_t)((n + al - 1) / al * al), (size_t)al);
+#else
         void *c = aligned_alloc(al, (n + al - 1) / al * al);
+#endif
         if (!c) lust_oom_size(n);
         memcpy(c, key, n);
         e->addr = c;

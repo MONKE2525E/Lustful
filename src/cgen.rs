@@ -8202,15 +8202,17 @@ fn runtime_source(with_impls: bool) -> String {
     let stdc =
         include_str!("runtime/stdc.h").replacen("#include \"stdc.c\"", if with_impls { include_str!("runtime/stdc.c") } else { "" }, 1);
     let src = src.replacen("#include \"stdc.h\"", &stdc, 1);
-    let sys = include_str!("runtime/sys.h").replacen("#include \"sys.c\"", if with_impls { include_str!("runtime/sys.c") } else { "" }, 1);
+    let sys_body = include_str!("runtime/sys.c").replacen("#include \"syswin.c\"", include_str!("runtime/syswin.c"), 1);
+    let sys = include_str!("runtime/sys.h").replacen("#include \"sys.c\"", if with_impls { &sys_body } else { "" }, 1);
     let src = src.replacen("#include \"sys.h\"", &sys, 1);
-    let sysio =
-        include_str!("runtime/sysio.h").replacen("#include \"sysio.c\"", if with_impls { include_str!("runtime/sysio.c") } else { "" }, 1);
+    let sysio_body = include_str!("runtime/sysio.c").replacen("#include \"sysiowin.c\"", include_str!("runtime/sysiowin.c"), 1);
+    let sysio = include_str!("runtime/sysio.h").replacen("#include \"sysio.c\"", if with_impls { &sysio_body } else { "" }, 1);
     let src = src.replacen("#include \"sysio.h\"", &sysio, 1);
-    let sysnet =
-        include_str!("runtime/sysnet.h").replacen("#include \"sysnet.c\"", if with_impls { include_str!("runtime/sysnet.c") } else { "" }, 1);
+    let sysnet_body = include_str!("runtime/sysnet.c").replacen("#include \"sysnetwin.c\"", include_str!("runtime/sysnetwin.c"), 1);
+    let sysnet = include_str!("runtime/sysnet.h").replacen("#include \"sysnet.c\"", if with_impls { &sysnet_body } else { "" }, 1);
     let src = src.replacen("#include \"sysnet.h\"", &sysnet, 1);
-    let sysx = include_str!("runtime/sysx.h").replacen("#include \"sysx.c\"", if with_impls { include_str!("runtime/sysx.c") } else { "" }, 1);
+    let sysx_body = include_str!("runtime/sysx.c").replacen("#include \"sysxwin.c\"", include_str!("runtime/sysxwin.c"), 1);
+    let sysx = include_str!("runtime/sysx.h").replacen("#include \"sysx.c\"", if with_impls { &sysx_body } else { "" }, 1);
     src.replacen("#include \"sysx.h\"", &sysx, 1)
 }
 

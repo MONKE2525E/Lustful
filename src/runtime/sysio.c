@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "sysiowin.c"
+#else
 /* Bodies of the fd and process intrinsics declared in sysio.h
    (W-SHIM phase 2). */
 #include <errno.h>
@@ -549,3 +552,5 @@ int32_t lust_sys_proc_exec(const uint8_t *prog, uint64_t proglen, const uint8_t 
     free(cwd_s);
     return err;
 }
+
+#endif

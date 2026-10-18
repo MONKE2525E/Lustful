@@ -65,9 +65,13 @@ void lust_oom_size(uint64_t n) LUST_BODY({
 void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     if (!size) return (void *)(uintptr_t)(align ? align : 1);
     void *p = 0;
+#ifdef _WIN32
+    p = align <= 16 ? malloc(size) : _aligned_malloc((size_t)size, (size_t)align);
+#else
     if (align <= 16) p = malloc(size);
     else if (size % align == 0) p = aligned_alloc(align, size);
     else if (posix_memalign(&p, align, size) != 0) p = 0;
+#endif
     if (!p) lust_oom_size(size);
     return p;
 })
@@ -96,8 +100,12 @@ int32_t lust_is_zeroed(const void *p, uint64_t n) LUST_BODY({
 })
 
 void lust_dealloc(void *ptr, uint64_t size, uint64_t align) LUST_BODY({
+    if (!size) return;
+#ifdef _WIN32
+    if (align > 16) { _aligned_free(ptr); return; }
+#endif
     (void)align;
-    if (size) free(ptr);
+    free(ptr);
 })
 
 /* realloc(ptr, old_size, align, new_size): the Rust GlobalAlloc argument
@@ -111,7 +119,7 @@ void *lust_realloc(void *ptr, uint64_t old_size, uint64_t align, uint64_t new_si
     if (!old_size) return lust_alloc(new_size, align);
     void *p = lust_alloc(new_size, align);
     memcpy(p, ptr, old_size < new_size ? old_size : new_size);
-    free(ptr);
+    lust_dealloc(ptr, old_size, align);
     return p;
 })
 

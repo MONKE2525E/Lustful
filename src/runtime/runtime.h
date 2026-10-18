@@ -16,7 +16,12 @@
    wrong (the key is an unsigned long, the once is a 16-byte struct
    whose valid init is not zero), so a Darwin build, which never uses
    tcc, takes the real <pthread.h> types instead. */
-#ifdef __APPLE__
+#ifdef _WIN32
+/* A Fls index and an INIT_ONCE (a pointer word, zero-init). */
+typedef unsigned int lust_pthread_key_t;
+typedef int64_t lust_pthread_once_t;
+#define LUST_PTHREAD_ONCE_INIT 0
+#elif defined(__APPLE__)
 #include <pthread.h>
 #include <time.h>
 typedef pthread_key_t lust_pthread_key_t;
@@ -34,6 +39,77 @@ void abort(void);
 void *memset(void *, int, size_t);
 void *memcpy(void *, const void *, size_t);
 #define LUST_BODY(...) ;
+#endif
+
+
+#if defined(_WIN32) && defined(LUST_IMPL)
+/* The Win32 thread layer (rel-win): the runtime names pthread calls
+   with hand declarations (no <pthread.h>, as under tcc); on Windows
+   those names are these small wrappers over CreateThread, FlsAlloc
+   and InitOnceExecuteOnce. A thread handle rides in a uintptr_t (the
+   JoinHdr word is uintptr_t for this: a HANDLE does not fit the
+   32-bit Windows long). Fls destructors run at thread exit, as
+   pthread key destructors do; the main thread runs its TLS
+   destructors from lust_tls_exit, as on Linux. */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+void _lock_file(FILE *);
+void _unlock_file(FILE *);
+#define flockfile _lock_file
+#define funlockfile _unlock_file
+static int lust_win_key_create(unsigned int *key, void (*dtor)(void *)) {
+    DWORD i = FlsAlloc((PFLS_CALLBACK_FUNCTION)dtor);
+    if (i == 0xFFFFFFFFu) return 1;
+    *key = (unsigned int)i;
+    return 0;
+}
+static void *lust_win_getspecific(unsigned int key) { return FlsGetValue((DWORD)key); }
+static int lust_win_setspecific(unsigned int key, const void *v) { return FlsSetValue((DWORD)key, (void *)v) ? 0 : 1; }
+typedef struct { void (*init)(void); } lust_win_once_arg;
+static BOOL CALLBACK lust_win_once_cb(PINIT_ONCE o, void *p, void **c) {
+    (void)o; (void)c;
+    ((lust_win_once_arg *)p)->init();
+    return TRUE;
+}
+static int lust_win_once(lust_pthread_once_t *once, void (*init)(void)) {
+    lust_win_once_arg a = {init};
+    return InitOnceExecuteOnce((PINIT_ONCE)once, lust_win_once_cb, &a, 0) ? 0 : 1;
+}
+typedef struct { void *(*start)(void *); void *arg; } lust_win_start;
+static DWORD WINAPI lust_win_thread_cb(void *p) {
+    lust_win_start s = *(lust_win_start *)p;
+    free(p);
+    s.start(s.arg);
+    return 0;
+}
+static int lust_win_thread_create(uintptr_t *t, const void *attr, void *(*start)(void *), void *arg) {
+    (void)attr;
+    lust_win_start *s = (lust_win_start *)malloc(sizeof *s);
+    if (!s) return 1;
+    s->start = start;
+    s->arg = arg;
+    HANDLE h = CreateThread(0, 0, lust_win_thread_cb, s, 0, 0);
+    if (!h) { free(s); return 1; }
+    *t = (uintptr_t)h;
+    return 0;
+}
+static int lust_win_thread_join(uintptr_t t, void **ret) {
+    (void)ret;
+    WaitForSingleObject((HANDLE)t, INFINITE);
+    CloseHandle((HANDLE)t);
+    return 0;
+}
+static int lust_win_thread_detach(uintptr_t t) { CloseHandle((HANDLE)t); return 0; }
+static int lust_win_yield(void) { SwitchToThread(); return 0; }
+#define pthread_key_create lust_win_key_create
+#define pthread_getspecific lust_win_getspecific
+#define pthread_setspecific lust_win_setspecific
+#define pthread_once lust_win_once
+#define pthread_create lust_win_thread_create
+#define pthread_join lust_win_thread_join
+#define pthread_detach lust_win_thread_detach
+#define sched_yield lust_win_yield
 #endif
 
 /* 128-bit integers. tcc has no __int128 (spike K3-13), so codegen uses a

@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "syswin.c"
+#else
 /* Bodies of the std platform intrinsics declared in sys.h (W-SHIM). */
 #include <errno.h>
 #include <unistd.h>
@@ -565,4 +568,5 @@ int32_t lust_sys_current_exe(lust_Vec *out) {
 int32_t lust_sys_current_exe(lust_Vec *out) {
     return lust_sys_readlink((const uint8_t *)"/proc/self/exe", 14, out);
 }
+#endif
 #endif

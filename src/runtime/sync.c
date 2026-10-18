@@ -280,8 +280,27 @@ int __ulock_wake(uint32_t op, void *addr, uint64_t wake_value);
 #endif
 int sched_yield(void);
 /* Sleep while *p == v (spurious wakeups are fine: callers loop). */
+#ifdef _WIN32
+/* WaitOnAddress and its wakes live behind an api-set with no zig
+   import library: resolve them from kernel32 on first use. */
+typedef int (*lust_woa_fn)(volatile void *, void *, size_t, uint32_t);
+typedef void (*lust_wake_fn)(void *);
+static lust_woa_fn lust_woa;
+static lust_wake_fn lust_wake1, lust_wakeall;
+static void lust_woa_init(void) {
+    HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    lust_woa = (lust_woa_fn)GetProcAddress(k, "WaitOnAddress");
+    lust_wake1 = (lust_wake_fn)GetProcAddress(k, "WakeByAddressSingle");
+    lust_wakeall = (lust_wake_fn)GetProcAddress(k, "WakeByAddressAll");
+}
+static lust_pthread_once_t lust_woa_once = LUST_PTHREAD_ONCE_INIT;
+#endif
 static void lust_futex_wait(uint32_t *p, uint32_t v) {
-#ifdef LUST_SYS_FUTEX
+#ifdef _WIN32
+    pthread_once(&lust_woa_once, lust_woa_init);
+    if (lust_woa) lust_woa(p, &v, sizeof v, 0xFFFFFFFFu);
+    else SwitchToThread();
+#elif defined(LUST_SYS_FUTEX)
     syscall(LUST_SYS_FUTEX, p, 128 /* FUTEX_WAIT_PRIVATE */, v, (void *)0, (void *)0, 0);
 #elif defined(__APPLE__)
     __ulock_wait(LUST_ULOCK_COMPARE_AND_WAIT, p, v, 0);
@@ -291,7 +310,10 @@ static void lust_futex_wait(uint32_t *p, uint32_t v) {
 #endif
 }
 static void lust_futex_wake(uint32_t *p, int n) {
-#ifdef LUST_SYS_FUTEX
+#ifdef _WIN32
+    pthread_once(&lust_woa_once, lust_woa_init);
+    if (n == 1) { if (lust_wake1) lust_wake1(p); } else if (lust_wakeall) lust_wakeall(p);
+#elif defined(LUST_SYS_FUTEX)
     syscall(LUST_SYS_FUTEX, p, 129 /* FUTEX_WAKE_PRIVATE */, n, (void *)0, (void *)0, 0);
 #elif defined(__APPLE__)
     __ulock_wake(LUST_ULOCK_COMPARE_AND_WAIT | (n == 1 ? 0 : LUST_ULOCK_WAKE_ALL), p, 0);
@@ -451,7 +473,7 @@ typedef struct lust_Scope {
 } lust_Scope;
 
 typedef struct lust_JoinHdr {
-    unsigned long t; /* pthread_t */
+    uintptr_t t; /* pthread_t on POSIX, a HANDLE as a word on Windows */
     lust_ThreadInfo *th;
     uint32_t rc;
     uint32_t done;
@@ -476,11 +498,14 @@ typedef struct lust_JoinHdr {
 
 #ifdef LUST_IMPL
 /* Hand pthread declarations for tcc on Linux; on Darwin runtime.h
-   included the real <pthread.h> and these would clash with it. */
-#ifndef __APPLE__
-int pthread_create(unsigned long *t, const void *attr, void *(*start)(void *), void *arg);
-int pthread_join(unsigned long t, void **ret);
-int pthread_detach(unsigned long t);
+   included the real <pthread.h> and these would clash with it, and
+   on Windows runtime.h maps these names to its Win32 wrappers.
+   The thread word is uintptr_t: a HANDLE on Windows, where the
+   32-bit long cannot hold one (same size as unsigned long here). */
+#if !defined(__APPLE__) && !defined(_WIN32)
+int pthread_create(uintptr_t *t, const void *attr, void *(*start)(void *), void *arg);
+int pthread_join(uintptr_t t, void **ret);
+int pthread_detach(uintptr_t t);
 int pthread_key_create(unsigned int *key, void (*dtor)(void *));
 void *pthread_getspecific(unsigned int key);
 int pthread_setspecific(unsigned int key, const void *v);
@@ -618,11 +643,11 @@ typedef struct lust_ThreadBuilder {
     uint8_t has_stack;
 } lust_ThreadBuilder;
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 int pthread_attr_init(void *attr);
 int pthread_attr_destroy(void *attr);
 int pthread_attr_setstacksize(void *attr, uint64_t size);
-int pthread_setname_np(unsigned long t, const char *name);
+int pthread_setname_np(uintptr_t t, const char *name);
 #endif
 
 /* `Builder::spawn`: lust_thread_spawn with the builder's name
@@ -678,6 +703,7 @@ int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST
 #else
     uint64_t attr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     void *attrp = 0;
+#ifndef _WIN32
     if (b->has_stack) {
         pthread_attr_init(attr);
         uint64_t sz = b->stack < 16384 ? 16384 : b->stack;
@@ -692,8 +718,11 @@ int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST
         attrp = attr;
     }
 #endif
+#endif
     int r = pthread_create(LUST_PTHREAD_ID_P(&h->t), attrp, lust_thread_entry, h);
+#ifndef _WIN32
     if (attrp) pthread_attr_destroy(attrp);
+#endif
     if (r != 0) {
         lust_thread_info_release(t);
         lust_thread_info_release(t);
@@ -707,7 +736,11 @@ int lust_thread_spawn_builder(lust_JoinHdr *h, const lust_ThreadBuilder *b) LUST
         uint64_t i = 0;
         for (; i < n && b->name.ptr[i] != 0; i++) nm[i] = (char)b->name.ptr[i];
         nm[i] = 0;
+        #ifndef _WIN32
+
         pthread_setname_np(h->t, nm);
+
+        #endif
     }
 #endif
     return 0;
@@ -1126,7 +1159,13 @@ uint64_t lust_avail_parallelism(int32_t *err) LUST_BODY({
     }
 #endif
 #endif
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    long cpus = (long)si.dwNumberOfProcessors;
+#else
     long cpus = sysconf(LUST_SC_NPROCESSORS_ONLN);
+#endif
     if (cpus == -1) {
         *err = errno;
         return 0;
@@ -1422,7 +1461,13 @@ void lust_cv_notify(uint32_t *cv, int all) LUST_BODY({
 #endif
 
 static void lust_mono_now(long ts[2]) LUST_BODY({
-#ifdef LUST_SYS_CLOCK_GETTIME
+#ifdef _WIN32
+    LARGE_INTEGER freq, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    ts[0] = (long)(now.QuadPart / freq.QuadPart);
+    ts[1] = (long)(((now.QuadPart % freq.QuadPart) * 1000000000) / freq.QuadPart);
+#elif defined(LUST_SYS_CLOCK_GETTIME)
     syscall(LUST_SYS_CLOCK_GETTIME, 1 /* CLOCK_MONOTONIC */, ts);
 #elif defined(__APPLE__)
     /* struct timespec is two longs on Darwin, as ts is. std's
@@ -1655,7 +1700,13 @@ lust_u128 lust_dur_as(lust_Duration d, uint64_t per_sec, uint64_t nanos_per) LUS
    text), resumed after a signal. On Darwin, libc nanosleep (runtime.h
    included <time.h> there), the same loop. */
 void lust_thread_sleep(lust_Duration d) LUST_BODY({
-#ifdef LUST_SYS_NANOSLEEP
+#ifdef _WIN32
+    while (d.secs > 0 || d.nanos > 0) {
+        uint64_t ms = d.secs > 4000000 ? 4000000000ull : d.secs * 1000 + d.nanos / 1000000;
+        Sleep((DWORD)ms);
+        if (d.secs > 4000000) d.secs -= 4000000; else { d.secs = 0; d.nanos = 0; }
+    }
+#elif defined(LUST_SYS_NANOSLEEP)
     long ts[2], rem[2];
     while (d.secs > 0 || d.nanos > 0) {
         uint64_t s = d.secs > 0x7fffffff ? 0x7fffffff : d.secs;

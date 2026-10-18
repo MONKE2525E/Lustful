@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "sysxwin.c"
+#else
 /* The Unix calls behind the rustix adapter: see sysx.h. Included
    only under LUST_IMPL, after the runtime's own includes. The
    Linux-only calls (inotify, fanotify, prctl, statx, getdents64,
@@ -763,6 +766,8 @@ int32_t lust_sys_x_open_by_handle_at(int32_t mount_fd, int32_t handle_type, cons
     (void)mount_fd; (void)handle_type; (void)p; (void)len; (void)flags;
     return -ENOSYS;
 }
+
+#endif
 #endif
 
 /* kqueue/kevent for the nix adapter's sys::event (Darwin only; the

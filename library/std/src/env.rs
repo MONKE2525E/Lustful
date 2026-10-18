@@ -215,10 +215,14 @@ pub mod consts {
     pub const OS: &str = "linux";
     #[cfg(target_os = "macos")]
     pub const OS: &str = "macos";
+    #[cfg(target_os = "windows")]
+    pub const OS: &str = "windows";
     #[cfg(target_os = "linux")]
     pub const FAMILY: &str = "unix";
     #[cfg(target_os = "macos")]
     pub const FAMILY: &str = "unix";
+    #[cfg(target_os = "windows")]
+    pub const FAMILY: &str = "windows";
     #[cfg(target_arch = "x86_64")]
     pub const ARCH: &str = "x86_64";
     #[cfg(target_arch = "aarch64")]

@@ -34,8 +34,9 @@ void lust_tls_exit(void);
    <pthread.h>, whose prototypes clash with those under tcc. On glibc a
    pthread_key_t is an unsigned int and a pthread_once_t an int (0 is
    PTHREAD_ONCE_INIT). On Darwin runtime.h included the real header
-   and the lust_pthread_* types are its types. */
-#ifndef __APPLE__
+   and the lust_pthread_* types are its types; on Windows they are
+   a Fls index and an INIT_ONCE, and runtime.h maps the calls. */
+#if !defined(__APPLE__) && !defined(_WIN32)
 int pthread_key_create(unsigned int *key, void (*dtor)(void *));
 void *pthread_getspecific(unsigned int key);
 int pthread_setspecific(unsigned int key, const void *v);

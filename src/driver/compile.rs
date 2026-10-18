@@ -2380,17 +2380,23 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             ..Default::default()
         };
     }
-    // Lust builds for the host target today. A named non-host triple is a
-    // clear error, not a host binary under a foreign name. A check may
-    // name a release triple (cfg::CfgEnv::is_release_target): its full
-    // cfg table matches rustc, so the check sees the same code rustc
-    // would for that target.
+    // Lust links for the host target only (tcc). A named non-host triple
+    // is a clear error for a link, not a host binary under a foreign
+    // name. A check may name a release triple
+    // (cfg::CfgEnv::is_release_target): its full cfg table matches
+    // rustc, so the check sees the same code rustc would for that
+    // target. A build that only emits C (`--emit-c`) may also use a
+    // foreign triple: the C then builds with an external compiler
+    // (the release cross path; rel-win owns the windows-gnu runtime).
     let triple = &req.session.target_triple;
+    let foreign = !triple.is_empty() && triple != crate::protocol::host_triple();
     let foreign_check = matches!(req.cmd, crate::protocol::Cmd::Check) && crate::resolve::cfg::CfgEnv::is_release_target(triple);
     // A release-driver build (cc backend) may name a release triple (or
-    // the host): its C goes to the cross compiler, never to tcc.
+    // the host): its C goes to the cross compiler, never to tcc. A plain
+    // `--emit-c` build may also use a foreign triple (the C is the
+    // product; no link runs).
     let cc_build = req.cc && (triple.is_empty() || crate::resolve::cfg::CfgEnv::is_release_target(triple));
-    if !triple.is_empty() && triple != crate::protocol::host_triple() && !foreign_check && !cc_build {
+    if foreign && !foreign_check && !cc_build && req.emit_c.is_none() {
         return Response {
             stderr: format!(
                 "error: unsupported target `{triple}`: lust builds for the host target `{}` today\n",
@@ -4413,6 +4419,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // The standalone main unit registers no overlays; `lust_base_init` covers all units.
             let c = if u == 0 { cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])) } else { gen_unit(u, false) };
             let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
+        }
+        // A foreign emit-c build has no link step here: the emitted C
+        // is the product, unless the cc release driver below links it.
+        if foreign && !req.cc {
+            return Response { code: 0, ..Default::default() };
         }
     }
     t.lap("assemble C units (par)");
