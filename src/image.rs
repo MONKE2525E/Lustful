@@ -96,7 +96,7 @@ const COMPACT_DUE: &str = "compact-due";
 /// Image format. Bump on any change to the header or to what `Roots` holds.
 const MAGIC: &[u8; 8] = b"LUSTFIM3";
 /// A packed layer (`pack`): the raw (`MAGIC`) layer in zstd sections.
-const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ2";
+const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ3";
 /// Saves write packed layers when libzstd loads; `LUST_FRONT_ZSTD=0` keeps
 /// them raw.
 const PACK_ENV: &str = "LUST_FRONT_ZSTD";
@@ -607,14 +607,72 @@ fn read_full_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> bool {
     std::os::unix::fs::FileExt::read_exact_at(f, buf, off).is_ok()
 }
 
+/// The room a decompressed section needs: its run list (a count, then a
+/// pair per run, at most one run per two pages) and `SECTION` bytes.
+const UNPACKED_MAX: usize = SECTION + 4 + 4 * (SECTION / PAGE / 2 + 1);
+
+/// A section's frame content (`pack`): its nonzero pages as runs, a u32
+/// count and one (first page, pages) pair of u16s per run, then the runs'
+/// bytes back to back. Zero pages are left out.
+fn encode_runs(raw: &[u8], out: &mut Vec<u8>) {
+    let pages = raw.len() / PAGE;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut p = 0;
+    while p < pages {
+        if zero_page(&raw[p * PAGE..(p + 1) * PAGE]) {
+            p += 1;
+            continue;
+        }
+        let s = p;
+        while p < pages && !zero_page(&raw[p * PAGE..(p + 1) * PAGE]) {
+            p += 1;
+        }
+        runs.push((s, p - s));
+    }
+    out.clear();
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    for &(s, n) in &runs {
+        out.extend_from_slice(&(s as u16).to_le_bytes());
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    }
+    for &(s, n) in &runs {
+        out.extend_from_slice(&raw[s * PAGE..(s + n) * PAGE]);
+    }
+}
+
+/// The runs of a decompressed section (`encode_runs`) as (byte offset in
+/// the section, length, offset of the bytes in `buf`), ascending; None when
+/// the list does not match `buf` or leaves the section's `rlen` bytes.
+fn decode_runs(buf: &[u8], rlen: usize) -> Option<Vec<(usize, usize, usize)>> {
+    let count = u32::from_le_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let mut at = 4usize.checked_add(count.checked_mul(4)?)?;
+    let mut out = Vec::with_capacity(count);
+    let mut end = 0;
+    for i in 0..count {
+        let e = buf.get(4 + 4 * i..8 + 4 * i)?;
+        let (s, n) = (u16::from_le_bytes([e[0], e[1]]) as usize * PAGE, u16::from_le_bytes([e[2], e[3]]) as usize * PAGE);
+        if n == 0 || s < end || s + n > rlen {
+            return None;
+        }
+        out.push((s, n, at));
+        at += n;
+        end = s + n;
+    }
+    (at == buf.len()).then_some(out)
+}
+
 /// Writes raw layer `raw` (`len` bytes; `head` is its header and region
 /// table) to `out` packed: a short header (`MAGIC_PACKED`, the raw length,
 /// the section count, `head`'s length), `head` itself (so the chain reads
 /// without unpacking), the section table (file offset, packed length,
 /// `section_check`), then the raw form cut into `SECTION`-byte sections,
-/// each one zstd frame, packed in parallel. Returns the packed length.
+/// each one zstd frame of its nonzero pages (`encode_runs`), packed in
+/// parallel. Returns the packed length.
 fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: &Zstd) -> Result<u64, String> {
     use std::io::Write;
+    if len % PAGE as u64 != 0 {
+        return Err("image pack: a raw length that is not whole pages".into());
+    }
     let n = (len as usize).div_ceil(SECTION);
     let level: c_int = std::env::var("LUST_FRONT_ZSTD_LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let parts: Vec<std::sync::Mutex<Option<Vec<u8>>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
@@ -624,6 +682,7 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
         for _ in 0..workers().min(n.max(1)) {
             s.spawn(|| {
                 let mut rbuf = vec![0u8; SECTION];
+                let mut ebuf: Vec<u8> = Vec::with_capacity(UNPACKED_MAX);
                 loop {
                     let k = next.fetch_add(1, Ordering::Relaxed);
                     if k >= n || failed.load(Ordering::Relaxed) {
@@ -635,10 +694,11 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
                         failed.store(true, Ordering::Relaxed);
                         break;
                     }
+                    encode_runs(&rbuf[..rlen], &mut ebuf);
                     // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
-                    let bound = unsafe { (z.bound)(rlen) };
+                    let bound = unsafe { (z.bound)(ebuf.len()) };
                     let mut cbuf = vec![0u8; bound];
-                    let c = unsafe { (z.compress)(cbuf.as_mut_ptr() as *mut c_void, bound, rbuf.as_ptr() as *const c_void, rlen, level) };
+                    let c = unsafe { (z.compress)(cbuf.as_mut_ptr() as *mut c_void, bound, ebuf.as_ptr() as *const c_void, ebuf.len(), level) };
                     if unsafe { (z.is_error)(c) } != 0 {
                         failed.store(true, Ordering::Relaxed);
                         break;
@@ -676,7 +736,7 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
 
 /// Packed layer `path` back in its raw form, in a new memfd that the
 /// regions then map privately (`load`): the sections unpacked in parallel,
-/// each section's zero pages left out, so they stay holes and read as zero.
+/// only their nonzero pages written, so zero pages stay holes.
 fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64, u64)], z: &Zstd) -> Result<std::fs::File, String> {
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::FileExt;
@@ -695,7 +755,7 @@ fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64, u64)], z: &Zstd) -> 
         for _ in 0..workers().min(sections.len().max(1)) {
             s.spawn(|| {
                 let mut cbuf: Vec<u8> = Vec::new();
-                let mut rbuf = vec![0u8; SECTION];
+                let mut rbuf = vec![0u8; UNPACKED_MAX];
                 loop {
                     let k = next.fetch_add(1, Ordering::Relaxed);
                     if k >= sections.len() || failed.load(Ordering::Relaxed) {
@@ -710,28 +770,15 @@ fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64, u64)], z: &Zstd) -> 
                         break;
                     }
                     // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
-                    let d = unsafe { (z.decompress)(rbuf.as_mut_ptr() as *mut c_void, rlen, cbuf.as_ptr() as *const c_void, cbuf.len()) };
-                    if unsafe { (z.is_error)(d) } != 0 || d != rlen {
+                    let d = unsafe { (z.decompress)(rbuf.as_mut_ptr() as *mut c_void, rbuf.len(), cbuf.as_ptr() as *const c_void, cbuf.len()) };
+                    let runs = (unsafe { (z.is_error)(d) } == 0 && d <= rbuf.len()).then(|| decode_runs(&rbuf[..d], rlen)).flatten();
+                    let Some(runs) = runs else {
                         failed.store(true, Ordering::Relaxed);
                         break;
-                    }
-                    // Runs of pages with a nonzero byte; zero pages stay holes.
-                    let zero = |q: usize| rbuf[q..(q + PAGE).min(rlen)].chunks(8).all(|c| c.iter().all(|&b| b == 0));
-                    let mut q = 0;
-                    while q < rlen {
-                        if zero(q) {
-                            q += PAGE;
-                            continue;
-                        }
-                        let s0 = q;
-                        while q < rlen && !zero(q) {
-                            q += PAGE;
-                        }
-                        let e = q.min(rlen);
-                        if mem.write_all_at(&rbuf[s0..e], (at + s0) as u64).is_err() {
-                            failed.store(true, Ordering::Relaxed);
-                            break;
-                        }
+                    };
+                    if runs.iter().any(|&(s, n, o)| mem.write_all_at(&rbuf[o..o + n], (at + s) as u64).is_err()) {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
                     }
                 }
             });
@@ -817,7 +864,7 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
         for _ in 0..threads {
             s.spawn(|| {
                 let mut cbuf: Vec<u8> = Vec::new();
-                let mut rbuf = vec![0u8; SECTION];
+                let mut rbuf = vec![0u8; UNPACKED_MAX];
                 let mut mine = [0u64; 6];
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
@@ -833,38 +880,39 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
                     let rlen = (*raw_len as usize).saturating_sub(sec * SECTION).min(SECTION);
                     cbuf.resize(clen as usize, 0);
                     let t0 = std::time::Instant::now();
-                    let mut ok = read_full_at(&files[k], &mut cbuf, off) && section_check(&cbuf) == check && parts[k][sec].iter().all(|&(_, at, n)| at % PAGE == 0 && n % PAGE == 0 && at + n <= rlen);
+                    let ok = read_full_at(&files[k], &mut cbuf, off) && section_check(&cbuf) == check && parts[k][sec].iter().all(|&(_, at, n)| at % PAGE == 0 && n % PAGE == 0 && at + n <= rlen);
                     let t1 = std::time::Instant::now();
+                    let mut runs = None;
                     if ok {
                         // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
-                        let d = unsafe { (z.decompress)(rbuf.as_mut_ptr() as *mut c_void, rlen, cbuf.as_ptr() as *const c_void, cbuf.len()) };
-                        ok = d == rlen;
+                        let d = unsafe { (z.decompress)(rbuf.as_mut_ptr() as *mut c_void, rbuf.len(), cbuf.as_ptr() as *const c_void, cbuf.len()) };
+                        runs = (unsafe { (z.is_error)(d) } == 0 && d <= rbuf.len()).then(|| decode_runs(&rbuf[..d], rlen)).flatten();
+                        mine[1] += d as u64;
                     }
-                    if !ok {
+                    let Some(runs) = runs else {
                         failed.store(true, Ordering::Relaxed);
                         break;
-                    }
+                    };
                     let t2 = std::time::Instant::now();
+                    // Each part takes the runs it overlaps: the section's
+                    // nonzero pages there.
                     for &(a, at, n) in &parts[k][sec] {
                         let index = page_index(a);
-                        let mut q = 0;
-                        while q < n {
-                            if zero_page(&rbuf[at + q..at + q + PAGE]) {
-                                q += PAGE;
+                        let first = runs.partition_point(|r| r.0 + r.1 <= at);
+                        for &(rs, rn, ro) in runs[first..].iter().take_while(|r| r.0 < at + n) {
+                            let (x0, x1) = (rs.max(at), (rs + rn).min(at + n));
+                            if x0 >= x1 {
                                 continue;
                             }
-                            let s0 = q;
-                            while q < n && !zero_page(&rbuf[at + q..at + q + PAGE]) {
-                                q += PAGE;
-                            }
-                            // SAFETY: [a + s0, a + q) lies in a run `load` mapped
-                            // read-write for this fill, and only this worker
+                            let src = &rbuf[ro + (x0 - rs)..ro + (x1 - rs)];
+                            // SAFETY: [a + x0 - at, a + x1 - at) lies in a run `load`
+                            // mapped read-write for this fill, and only this worker
                             // writes it (`src` ranges are disjoint).
-                            unsafe { std::ptr::copy_nonoverlapping(rbuf.as_ptr().add(at + s0), (a + s0) as *mut u8, q - s0) };
-                            mine[2] += (q - s0) as u64;
-                            for j in (s0..q).step_by(PAGE) {
-                                let h = page_hash(&rbuf[at + j..at + j + PAGE]);
-                                let w = 2 * (index + j / PAGE);
+                            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (a + (x0 - at)) as *mut u8, x1 - x0) };
+                            mine[2] += (x1 - x0) as u64;
+                            for (j, page) in src.chunks_exact(PAGE).enumerate() {
+                                let h = page_hash(page);
+                                let w = 2 * (index + (x0 - at) / PAGE + j);
                                 hashes[w].store(h.0, Ordering::Relaxed);
                                 hashes[w + 1].store(h.1, Ordering::Relaxed);
                             }
@@ -872,15 +920,13 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
                     }
                     let t3 = std::time::Instant::now();
                     mine[0] += clen;
-                    mine[1] += rlen as u64;
                     mine[3] += (t1 - t0).as_nanos() as u64;
                     mine[4] += (t2 - t1).as_nanos() as u64;
                     mine[5] += (t3 - t2).as_nanos() as u64;
                     if k > 0 {
                         // A delta's data: its whole section's nonzero pages, as a
                         // memfd's blocks count them (`unpack`).
-                        let nonzero = rbuf[..rlen].chunks(PAGE).filter(|p| !zero_page(p)).count();
-                        data.fetch_add(nonzero * PAGE, Ordering::Relaxed);
+                        data.fetch_add(runs.iter().map(|r| r.1).sum::<usize>(), Ordering::Relaxed);
                     }
                 }
                 for (total, m) in stats.iter().zip(mine) {
