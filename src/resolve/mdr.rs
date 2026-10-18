@@ -309,11 +309,14 @@ pub struct Answers<'t> {
     keys: FxMap<(u32, u8, Sym), u64>,
     modules: FxMap<u32, u64>,
     defs: FxMap<crate::def::DefId, u64>,
+    /// Per module, its std alias, glob source, ambiguity and order entries
+    /// (built on the first whole-namespace read).
+    sides: Option<FxMap<u32, Sum>>,
 }
 
 impl<'t> Answers<'t> {
     pub fn new(t: &'t ResolvedTables) -> Answers<'t> {
-        Answers { t, keys: FxMap::default(), modules: FxMap::default(), defs: FxMap::default() }
+        Answers { t, keys: FxMap::default(), modules: FxMap::default(), defs: FxMap::default(), sides: None }
     }
 
     /// The hash of one def's record (`def_record`).
@@ -377,13 +380,39 @@ impl<'t> Answers<'t> {
         out
     }
 
-    /// The hash of module `m`'s three namespaces, for a read of a whole one.
+    /// The hash of module `m`'s three namespaces and its std alias, glob
+    /// source, ambiguity and order entries, for a read of a whole one (a
+    /// fn-body glob lists the bindings and the std aliases).
     pub fn module(&mut self, m: u32) -> u64 {
         if let Some(&h) = self.modules.get(&m) {
             return h;
         }
         let t = self.t;
+        let sides = self.sides.get_or_insert_with(|| {
+            let mut sides: FxMap<u32, Sum> = FxMap::default();
+            for (k, v) in &t.ambig_vis {
+                sides.entry(k.0.0).or_default().add(|h| (0x51u8, k.1, k.2.0, format!("{v:?}")).hash(h));
+            }
+            for (k, src) in &t.glob_src {
+                sides.entry(k.0.0).or_default().add(|h| (0x52u8, k.1, k.2.0, src.0).hash(h));
+            }
+            for (k, (v, path)) in &t.std_aliases {
+                sides.entry(k.0.0).or_default().add(|h| {
+                    (0x53u8, k.1, k.2.0, path).hash(h);
+                    hash_vis(h, v);
+                });
+            }
+            for (k, src) in &t.std_glob_aliases {
+                sides.entry(k.0.0).or_default().add(|h| (0x54u8, k.1, k.2.0, src.0).hash(h));
+            }
+            for (k, set) in &t.order_dep {
+                sides.entry(k.0.0).or_default().add(|h| (0x55u8, k.1, k.2.0, format!("{set:?}")).hash(h));
+            }
+            sides
+        });
+        let side = sides.get(&m).map_or(0, Sum::get);
         let mut s = Sum::default();
+        s.add(|h| (0x5eu8, side).hash(h));
         for (ns, map) in t.maps.get(m as usize).into_iter().flatten().enumerate() {
             for (name, state) in map {
                 let mut h = FxHasher::default();

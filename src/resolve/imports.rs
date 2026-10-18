@@ -1139,6 +1139,7 @@ impl ResolvedTables {
     /// (namespace index, name, vis, defining module, path). A glob of
     /// `module` imports these as it imports the module's bindings.
     pub fn visible_std_aliases(&self, module: ModuleId, from: ModuleId, interner: &Interner) -> Vec<(u8, Sym, VisKind, ModuleId, Vec<Sym>)> {
+        crate::resolve::mdr::read(module);
         self.std_aliases
             .range((module, 0, Sym(0))..=(module, u8::MAX, Sym(u32::MAX)))
             .filter_map(|(&key, (vis, path))| {

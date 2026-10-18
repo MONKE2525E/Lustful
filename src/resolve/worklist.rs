@@ -6191,7 +6191,10 @@ impl Rewrite<'_> {
             .or_else(|| {
                 order[..n_order]
                     .iter()
-                    .filter_map(|&idx| self.tables.std_aliases.get(&(module, idx as u8, first)).map(|(_, p)| p))
+                    .filter_map(|&idx| {
+                        crate::resolve::mdr::read_key(module, idx as u8, first);
+                        self.tables.std_aliases.get(&(module, idx as u8, first)).map(|(_, p)| p)
+                    })
                     .next()
             });
         let Some(alias) = alias else { return false };
@@ -6216,6 +6219,7 @@ impl Rewrite<'_> {
             let seg = names[plen];
             let asked = if plen + 1 == names.len() { ns } else { Namespace::Type };
             let key = (m, ns_index(asked) as u8, seg);
+            crate::resolve::mdr::read_key(m, key.1, seg);
             let Some((vis, path)) = self.tables.std_aliases.get(&key) else { return false };
             if !self.tables.visible(vis, self.tables.std_alias_def_module(key), module, self.interner) {
                 return false;
@@ -6281,7 +6285,12 @@ impl Rewrite<'_> {
             {
                 return None;
             }
-            if last && (0..3).any(|i| self.tables.std_aliases.contains_key(&(m, i, seg))) {
+            if last
+                && (0..3).any(|i| {
+                    crate::resolve::mdr::read_key(m, i, seg);
+                    self.tables.std_aliases.contains_key(&(m, i, seg))
+                })
+            {
                 return None;
             }
             let in_module = names[..plen].iter().map(|s| self.interner.get(*s)).collect::<Vec<_>>().join("::");
@@ -7139,6 +7148,7 @@ impl Rewrite<'_> {
                                     Some(_) => {}
                                     None => {
                                         let key = (src, ns_index(ns) as u8, last);
+                                        crate::resolve::mdr::read_key(src, key.1, last);
                                         if let Some((avis, apath)) = self.tables.std_aliases.get(&key).cloned()
                                             && self.tables.visible(&avis, self.tables.std_alias_def_module(key), module, self.interner)
                                         {
@@ -7679,7 +7689,10 @@ impl Rewrite<'_> {
                     .iter()
                     .rev()
                     .find_map(|f| f.std_imports.get(&(name, idx)))
-                    .or_else(|| self.tables.std_aliases.get(&(module, idx as u8, name)).map(|(_, p)| p))?;
+                    .or_else(|| {
+                        crate::resolve::mdr::read_key(module, idx as u8, name);
+                        self.tables.std_aliases.get(&(module, idx as u8, name)).map(|(_, p)| p)
+                    })?;
                 let strs: Vec<&str> = alias.iter().map(|s| self.interner.get(*s)).collect();
                 (crate::ty::lang::std_path_kind(&strs) == Some(crate::ty::lang::StdPathKind::Variant))
                     .then(|| Pat::Path(alias.iter().map(|s| PathSeg::plain(*s)).collect()))
@@ -7733,7 +7746,8 @@ impl Rewrite<'_> {
         // stdout) is the std glob's own name; two std globs that bring
         // different items are `std_glob_ambiguous`.
         let platform = self.tables.std_platform.map(|(root, _)| root);
-        let from_std = |key| {
+        let from_std = |key: (ModuleId, u8, Sym)| {
+            crate::resolve::mdr::read_key(key.0, key.1, key.2);
             self.tables.glob_src.get(&key).is_some_and(|src| {
                 self.tables.std_modules.iter().any(|&(_, m)| m == *src) || platform.is_some_and(|root| self.tables.root_of(*src) == root)
             })
