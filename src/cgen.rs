@@ -1210,6 +1210,13 @@ struct FnGen<'b, 'p> {
     zc_frame: bool,
     zc_st: Option<u32>,
     zc_in_cleanup: bool,
+    /// Unwind tables: per block, the locals whose drop flag may be set at its terminator
+    /// (`flags_maybe_set`), and the block being emitted.
+    flags_at_term: Vec<Vec<bool>>,
+    cur_bb: usize,
+    /// A call's destination that `call_value` passes as the out-pointer of a large return
+    /// instead of a temporary (`out_target`).
+    call_out: Option<String>,
     /// Where the body's str literal caches go in `out` (the prologue's
     /// end), and the cache of each distinct literal (cgen/kconst.rs).
     kdecl_at: Option<usize>,
@@ -2236,6 +2243,9 @@ impl<'b, 'p> FnGen<'b, 'p> {
             zc_frame: false,
             zc_st: None,
             zc_in_cleanup: false,
+            flags_at_term: Vec::new(),
+            cur_bb: 0,
+            call_out: None,
             kdecl_at: None,
             kstrs: HashMap::new(),
             addr_only: false,
@@ -2500,6 +2510,9 @@ impl FnGen<'_, '_> {
   if (lust_unw_pending && lust_unw_mine()) {}", self.unwind_return());
         }
         self.kdecl_at = Some(self.out.len());
+        if zc {
+            self.flags_at_term = self.flags_maybe_set();
+        }
         self.blocks(&order);
         self.kstr_finish();
         self.out.push_str("}\n");
@@ -2520,6 +2533,7 @@ impl FnGen<'_, '_> {
         let entry = if zc && self.zc_frame && !self.zc_in_cleanup { self.zc_entry_states(order) } else { Vec::new() };
         for (k, &bi) in order.iter().enumerate() {
             self.zc_st = entry.get(bi).copied().flatten();
+            self.cur_bb = bi;
             let _ = writeln!(self.out, "bb{bi}:;");
             let block = self.body.block(Bb(bi as u32));
             for (si, s) in block.stmts.iter().enumerate() {
@@ -3514,7 +3528,37 @@ impl FnGen<'_, '_> {
                     // method's own return type.
                     CallTarget::Builtin(_) | CallTarget::Dyn(_) => false,
                 };
-                if *target == CallTarget::Builtin(Builtin::DefaultGlue) {
+                // Unwind tables: a call into a whole local that its arguments do not read, with no
+                // old value to drop (a type without drop glue, or a flag `flags_maybe_set` proves
+                // clear), writes the local itself, and a large return gets it as the out-pointer:
+                // a panic inside never returns here, and the cleanup sees the clear flag.
+                let direct = zc
+                    && !self.zc_in_cleanup
+                    && dest.proj.is_empty()
+                    && !mentions
+                    && !ret_unit
+                    && matches!(target, CallTarget::Fn(_) | CallTarget::Dyn(_) | CallTarget::Indirect(_))
+                    && (!needs_drop_c(self.p, &dest_cty) || self.flags_at_term.get(self.cur_bb).is_some_and(|f| !f[dest.local as usize]));
+                if direct {
+                    let d = self.place(dest, &loc).0;
+                    self.out.push_str("  {\n");
+                    let body_start = self.out.len();
+                    let mut post = Vec::new();
+                    self.call_out = Some(d.clone());
+                    let v = self.call_value(*target, args, &dest_cty, &loc, &mut post);
+                    self.call_out = None;
+                    // A call owns its moved arguments from the start (as in `emit_assign`).
+                    let flags: String = post.iter().map(|p| format!("    {p}\n")).collect();
+                    self.out.insert_str(body_start, &flags);
+                    if v != d {
+                        let _ = writeln!(self.out, "    {d} = {v};");
+                    }
+                    if needs_drop_c(self.p, &dest_cty) {
+                        let l = dest.local;
+                        let _ = writeln!(self.out, "    d{l} = 1;{}", self.reset_move_flags(l, &[]));
+                    }
+                    self.out.push_str("  }\n");
+                } else if *target == CallTarget::Builtin(Builtin::DefaultGlue) {
                     // The default glue of the destination's type.
                     let v = match &dest_cty {
                         CTy::Unit | CTy::Bool | CTy::Char | CTy::Int(_) | CTy::Float(_) => zero_lit(self.p, &dest_cty),
@@ -3753,6 +3797,18 @@ impl FnGen<'_, '_> {
     /// The C text of one call's result value. Every user fn call goes through
     /// `lust_fns`, so a changed function can be swapped in without relinking
     /// its callers.
+    /// The out-pointer target of a large-return call: the destination the caller set in
+    /// `call_out` (no declaration), else a new temporary of C type `ct` and its declaration.
+    fn out_target(&mut self, ct: &str) -> (String, String) {
+        match self.call_out.take() {
+            Some(d) => (String::new(), d),
+            None => {
+                let t = self.tmp();
+                (format!("{ct} {t}; "), t)
+            }
+        }
+    }
+
     fn call_value(&mut self, target: CallTarget, args: &[Operand], dest_cty: &CTy, loc: &str, post: &mut Vec<String>) -> String {
         // Release C defines only what a unit holds by value or projects from
         // (`type_decls_with`): a builtin may size or open what its operands and result
@@ -3796,10 +3852,9 @@ impl FnGen<'_, '_> {
                     args.push(loc.to_string());
                 }
                 if ret_is_large(self.p, f) {
-                    let t = self.tmp();
-                    let ret = ctype(&cty(&self.p.tys, info.ret));
+                    let (decl, t) = self.out_target(&ctype(&cty(&self.p.tys, info.ret)));
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
-                    let _ = writeln!(self.out, "    {ret} {t}; {}(&{t}{pre});", self.slots.callee(self.p, f));
+                    let _ = writeln!(self.out, "    {decl}{}(&{t}{pre});", self.slots.callee(self.p, f));
                     t
                 } else {
                     format!("{}({})", self.slots.callee(self.p, f), args.join(", "))
@@ -4010,9 +4065,8 @@ impl FnGen<'_, '_> {
                 let rc = ctype(&ret);
                 let pre: String = vals.iter().map(|v| format!(", {v}")).collect();
                 if ret_by_out(self.p, &ret) {
-                    let t = self.tmp();
-                    let _ =
-                        writeln!(self.out, "    {rc} {t}; ((void (*)({rc} *, {}))({rt}.vt[{k}]))(&{t}, {rt}.data{pre});", tys.join(", "));
+                    let (decl, t) = self.out_target(&rc);
+                    let _ = writeln!(self.out, "    {decl}((void (*)({rc} *, {}))({rt}.vt[{k}]))(&{t}, {rt}.data{pre});", tys.join(", "));
                     t
                 } else {
                     format!("(({rc} (*)({}))({rt}.vt[{k}]))({rt}.data{pre})", tys.join(", "))
@@ -4037,10 +4091,9 @@ impl FnGen<'_, '_> {
                     keep
                 });
                 if ret_by_out(self.p, ret) {
-                    let t = self.tmp();
-                    let rt = ctype(ret);
+                    let (decl, t) = self.out_target(&ctype(ret));
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
-                    let _ = writeln!(self.out, "    {rt} {t}; l{callee}(&{t}{pre});");
+                    let _ = writeln!(self.out, "    {decl}l{callee}(&{t}{pre});");
                     t
                 } else {
                     format!("l{callee}({})", args.join(", "))

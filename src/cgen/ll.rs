@@ -1614,7 +1614,7 @@ impl FnGen<'_, '_> {
     /// local (an assign to it or a part, a call result) may set its flag; a move of the whole
     /// local or its drop clears it. A move this does not model counts as still set, so a
     /// clear answer is exact.
-    fn flags_maybe_set(&self) -> Vec<Vec<bool>> {
+    pub(super) fn flags_maybe_set(&self) -> Vec<Vec<bool>> {
         let body = self.body;
         let (nl, nb) = (body.locals.len(), body.blocks.len());
         let mut entry: Vec<Option<Vec<bool>>> = vec![None; nb];
