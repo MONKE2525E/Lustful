@@ -162,8 +162,11 @@ pub fn cflags(debug: bool) -> String {
     // -fomit-frame-pointer: zig cc keeps a frame pointer in every fn
     // (7% of a release tsgo's instructions); nothing walks them, as
     // unwinding reads .eh_frame. Targets whose ABI needs one keep it.
+    // -O2: zig cc gives clang -O2 for -O1, -O2 and -O3 alike.
+    // -g0: zig cc emits DWARF by default, which the release link strips
+    // (`ldflags`); on a fn of 400 KB of C it was 7/8 of the compile.
     let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fexceptions -fno-asynchronous-unwind-tables -fomit-frame-pointer";
-    if debug { format!("{base} -g") } else { base.into() }
+    if debug { format!("{base} -g") } else { format!("{base} -g0") }
 }
 
 /// mimalloc as one C unit that replaces malloc and free (`MI_MALLOC_OVERRIDE`): the
@@ -187,7 +190,7 @@ pub fn memfast_unit() -> String {
 /// The flags of a `.cc` unit (the runtime's throw and catch).
 pub fn cxxflags(debug: bool) -> String {
     let base = "-O2 -w -fexceptions -fomit-frame-pointer";
-    if debug { format!("{base} -g") } else { base.into() }
+    if debug { format!("{base} -g") } else { format!("{base} -g0") }
 }
 
 /// The link-time extras for one spec: libm for the float methods, the
