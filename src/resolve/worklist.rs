@@ -3723,6 +3723,7 @@ fn resolve_one(
         let files: Vec<&str> = works.iter().map(|w| w.key.as_str()).collect();
         crate::resolve::mdr::structure(tables, &files)
     });
+    lap!("resolve: names+structure");
     let mut answers = crate::resolve::mdr::Answers::new(tables);
     let mut final_hits: Vec<Option<FinalChunk>> = Vec::with_capacity(works.len());
     for w in works.iter() {

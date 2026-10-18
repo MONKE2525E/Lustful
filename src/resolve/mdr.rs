@@ -272,31 +272,56 @@ pub fn structure(t: &ResolvedTables, files: &[&str]) -> u64 {
         (m.parent.map(|p| p.0), m.name.0, &m.path, m.no_prelude, m.krate_root.0, m.macro_use, m.span.file).hash(&mut h);
         hash_vis(&mut h, &m.vis);
     }
-    t.module_defs.iter().map(|d| (d.hash.0, d.krate.0)).collect::<Vec<_>>().hash(&mut h);
-    format!("{:?} {:?}", t.std_globs, t.externs).hash(&mut h);
-    let mut cfgs: Vec<String> = t.crate_cfgs.iter().map(|(m, c)| format!("{} {c:?}", m.0)).collect();
-    cfgs.sort_unstable();
-    cfgs.hash(&mut h);
-    let mut magic: Vec<(u32, u32)> = t.crate_magic.iter().map(|(s, m)| (s.0, m.0)).collect();
-    magic.sort_unstable();
-    magic.hash(&mut h);
+    for d in &t.module_defs {
+        (d.hash.0, d.krate.0).hash(&mut h);
+    }
+    for (m, path) in &t.std_globs {
+        (m.0, path).hash(&mut h);
+    }
+    for e in &t.externs {
+        (&e.name, e.def.hash.0, e.def.krate.0, e.is_std_lib, e.owner.0, e.root_module.map(|m| m.0), &e.unsupported).hash(&mut h);
+    }
+    // Hash maps: order-independent sums.
+    let mut sum = Sum::default();
+    for (m, (cfg, name)) in &t.crate_cfgs {
+        sum.add(|x| (0x01u8, m.0, format!("{cfg:?}"), name).hash(x));
+    }
+    for (s, m) in &t.crate_magic {
+        sum.add(|x| (0x02u8, s.0, m.0).hash(x));
+    }
+    for (f, (m, scope)) in &t.macro_scopes {
+        sum.add(|x| {
+            (0x03u8, f.0, m.0).hash(x);
+            for (name, d) in &scope.inherited {
+                (name.0, d.map(|d| d.hash.0)).hash(x);
+            }
+            // Without positions (see `build`).
+            for e in &scope.events {
+                (&e.container, &e.skip_inside).hash(x);
+                for (name, d) in &e.macros {
+                    (name.0, d.map(|d| d.hash.0)).hash(x);
+                }
+            }
+        });
+    }
+    for (i, maps) in t.maps.iter().enumerate() {
+        for (name, st) in &maps[2] {
+            sum.add(|x| {
+                (0x04u8, i, name.0).hash(x);
+                match st {
+                    BindState::Ambiguous => x.write_u8(0),
+                    BindState::One(b) => {
+                        hash_target(x, &b.target);
+                        hash_vis(x, &b.vis);
+                        (b.rank, b.def_module.0).hash(x);
+                    }
+                }
+            });
+        }
+    }
+    sum.get().hash(&mut h);
     (t.std_modules.iter().map(|(s, m)| (s.0, m.0)).collect::<Vec<_>>(), t.std_platform.map(|(m, s)| (m.0, s.0)), t.std_splice_lo).hash(&mut h);
     t.alloc_roots.iter().map(|m| m.0).collect::<Vec<_>>().hash(&mut h);
-    let mut scopes: Vec<String> = t
-        .macro_scopes
-        .iter()
-        .map(|(f, (m, scope))| {
-            let events: Vec<String> = scope.events.iter().map(|e| format!("{:?} {:?} {:?}", e.container, e.skip_inside, e.macros)).collect();
-            format!("{} {} {:?} {events:?}", f.0, m.0, scope.inherited)
-        })
-        .collect();
-    scopes.sort_unstable();
-    scopes.hash(&mut h);
-    for (i, maps) in t.maps.iter().enumerate() {
-        let mut macros: Vec<String> = maps[2].iter().map(|(name, st)| format!("{i} {} {st:?}", name.0)).collect();
-        macros.sort_unstable();
-        macros.hash(&mut h);
-    }
     files.hash(&mut h);
     h.finish()
 }
