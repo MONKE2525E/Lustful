@@ -2004,12 +2004,14 @@ fn ll_callee_ids(f: &FnOut) -> impl Iterator<Item = &str> {
 /// id to its slot. The copies come in fn id order (slot order carries a persistent
 /// session's history, and its units are a one-shot build's).
 pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections::HashMap<&str, usize>) -> Vec<usize> {
-    static LIMITS: std::sync::OnceLock<(usize, usize, usize, usize, usize)> = std::sync::OnceLock::new();
-    let (bytes, depth, hint, tiny, tiny_depth) = *LIMITS.get_or_init(|| {
+    static LIMITS: std::sync::OnceLock<(usize, usize, usize, usize, usize, usize)> = std::sync::OnceLock::new();
+    let (bytes, depth, hint, tiny, tiny_depth, path) = *LIMITS.get_or_init(|| {
         let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         // 25: tsgo through the release driver ran ~40% slower without copies and slower with
         // smaller or deeper ones (rel-llvm REPORT.md, step 7).
-        (n("LUST_LL_INLINE", 25), n("LUST_LL_INLINE_DEPTH", 3), n("LUST_LL_INLINE_HINT", 1), n("LUST_LL_INLINE_TINY", 0), n("LUST_LL_INLINE_TINY_DEPTH", 0))
+        let path = n("LUST_LL_INLINE_PATH", 0);
+        let extra = n("LUST_LL_INLINE_TINY_DEPTH", 0).max(if path > 0 { 6 } else { 0 });
+        (n("LUST_LL_INLINE", 25), n("LUST_LL_INLINE_DEPTH", 3), n("LUST_LL_INLINE_HINT", 1), n("LUST_LL_INLINE_TINY", 0), extra, path)
     });
     if bytes == 0 {
         return Vec::new();
@@ -2031,19 +2033,23 @@ pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections:
     let own: HashSet<usize> = slots.iter().copied().collect();
     let mut picked: Vec<(&str, usize)> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
-    let mut frontier: Vec<usize> = slots.to_vec();
+    // Each frontier fn with the summed cost of the copies on its way from the unit's own fn
+    // (`LUST_LL_INLINE_PATH=<budget>`: past the depth, a callee within the limit is still
+    // copied while that sum stays within the budget, up to six more levels).
+    let mut frontier: Vec<(usize, usize)> = slots.iter().map(|&s| (s, 0)).collect();
     for level in 0..depth + tiny_depth {
         let mut next = Vec::new();
-        for &s in &frontier {
+        for &(s, sum) in &frontier {
             for id in ll_callee_ids(&fns[s]) {
                 let Some(&g) = slot_of.get(id) else { continue };
                 let f = &fns[g];
-                let max = if level < depth { limit(f) } else { tiny };
-                if own.contains(&g) || f.ll.is_empty() || f.ll_cost as usize > max || !seen.insert(g) {
+                let cost = f.ll_cost as usize;
+                let ok = if level < depth { cost <= limit(f) } else { cost <= tiny || (path > 0 && cost <= limit(f) && sum + cost <= path) };
+                if own.contains(&g) || f.ll.is_empty() || !ok || !seen.insert(g) {
                     continue;
                 }
                 picked.push((id, g));
-                next.push(g);
+                next.push((g, sum + cost));
             }
         }
         frontier = next;
