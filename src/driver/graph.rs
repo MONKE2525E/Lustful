@@ -1622,6 +1622,18 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
     }
 }
 
+/// The fingerprint of one const or static item's evaluated value, made
+/// once per item (`ConstItem::value_fp`): `Sig` reads in every walk, the
+/// const fn value check, and the statics fingerprint all fold it, and a
+/// large table's value is costly to walk.
+fn value_fp(p: &Program, value: &crate::ty::consteval::ConstValue, cell: &std::sync::OnceLock<u64>) -> u64 {
+    *cell.get_or_init(|| {
+        let mut h = FxHasher::default();
+        hash_const_value(&mut h, p, value, 0);
+        h.finish()
+    })
+}
+
 /// The fingerprint of one def's resolved signature (section 8.1 `Sig` node):
 /// signature types with defs in stable form, plus the def's visibility
 /// facts (`hash_vis_facts`). Types hash *deeply* (see
@@ -1733,14 +1745,14 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         if let Some(item) = p.const_by_def(def).map(|i| &p.consts[i as usize]) {
             0u8.hash(&mut h);
             hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
-            hash_const_value(&mut h, p, &item.value, 0);
+            value_fp(p, &item.value, &item.value_fp).hash(&mut h);
             // Whether `&C` is promoted (lower `promotable`).
             item.qualif.hash(&mut h);
         } else if let Some(item) = p.static_by_def(def).map(|i| &p.statics[i as usize]) {
             1u8.hash(&mut h);
             item.mutable.hash(&mut h);
             hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
-            hash_const_value(&mut h, p, &item.value, 0);
+            value_fp(p, &item.value, &item.value_fp).hash(&mut h);
             // A `thread_local!` key's form and init fn (W-TLS): key
             // method calls carry both in their IR (lower/tls.rs).
             if let Some(k) = item.tls {
@@ -1769,7 +1781,7 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         1u8.hash(&mut h);
         item.mutable.hash(&mut h);
         hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
-        hash_const_value(&mut h, p, &item.value, 0);
+        value_fp(p, &item.value, &item.value_fp).hash(&mut h);
         if let Some(k) = item.tls {
             k.eager.hash(&mut h);
             hash_def_pub(&mut h, p, p.def_id(k.init));
@@ -1822,41 +1834,33 @@ pub(crate) fn glue_method_slots_fp(p: &Program, slots: &[u32]) -> u64 {
     h.finish()
 }
 
-/// The evaluated value of every const and static, by def, plus one
-/// fingerprint over the body consts in order: what a const fn edit can
-/// move. A full collect after a const fn edit keeps generic reuse when no
-/// value of the last program moved (driver/compile.rs).
+/// One fingerprint over the values of the body consts, in order: what a
+/// const fn edit can move with no reader key. A full collect after a const
+/// fn edit keeps generic reuse when it holds (driver/compile.rs). The
+/// values of const and static items need no such check: every reader
+/// records a `Sig` read of the item (through its binding), whose
+/// fingerprint folds the value, so a moved one rechecks just its readers.
+/// A body const has no def a read could name: its own body reads it by
+/// index.
 #[derive(Clone, Default, PartialEq)]
 pub(crate) struct ConstValuesFp {
-    by_def: FxMap<crate::def::DefId, u64>,
     body: u64,
 }
 
 impl ConstValuesFp {
     pub(crate) fn of(p: &Program) -> ConstValuesFp {
-        let fp = |v: &crate::ty::consteval::ConstValue| {
-            let mut h = FxHasher::default();
-            hash_const_value(&mut h, p, v, 0);
-            h.finish()
-        };
-        let mut by_def: FxMap<crate::def::DefId, u64> = FxMap::default();
-        for (d, c) in p.const_defs.iter().zip(&p.consts) {
-            by_def.insert(*d, fp(&c.value));
-        }
-        for (d, s) in p.static_defs.iter().zip(&p.statics) {
-            by_def.insert(*d, fp(&s.value));
-        }
         let mut h = FxHasher::default();
+        (p.body_consts.len() as u64).hash(&mut h);
         for c in &p.body_consts {
-            fp(&c.value).hash(&mut h);
+            value_fp(p, &c.value, &c.value_fp).hash(&mut h);
         }
-        ConstValuesFp { by_def, body: h.finish() }
+        ConstValuesFp { body: h.finish() }
     }
 
-    /// True when every value of `self` (the last program) that `new` still
-    /// has is the same, and the body consts are.
+    /// True when the body consts of `self` (the last program) keep their
+    /// values in `new`.
     pub(crate) fn kept_in(&self, new: &ConstValuesFp) -> bool {
-        self.body == new.body && self.by_def.iter().all(|(d, v)| new.by_def.get(d).is_none_or(|n| n == v))
+        self.body == new.body
     }
 }
 

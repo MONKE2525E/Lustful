@@ -117,6 +117,9 @@ pub struct ConstItem {
     /// rustc's promotion qualifs of the value (`ty::constqual`): `&C`
     /// is promoted when neither holds.
     pub qualif: crate::ty::constqual::Qualif,
+    /// The value's fingerprint, made once on first use
+    /// (driver/graph.rs `value_fp`).
+    pub value_fp: std::sync::OnceLock<u64>,
 }
 
 /// What one item inside a function body resolved to, by `Ast::stmt_items`
@@ -206,6 +209,8 @@ pub struct StaticItem {
     /// Set for a `thread_local!` static: `ty` is `LocalKey<T>` and
     /// `value` the key's slot word, from 1 (check/tls.rs).
     pub tls: Option<super::tls::TlsKey>,
+    /// As `ConstItem::value_fp`.
+    pub value_fp: std::sync::OnceLock<u64>,
 }
 
 /// Where a fn's `FnDef` sits in the Ast. `Program` names defs by
@@ -6490,7 +6495,7 @@ fn install_const_items(
             let def = DefId { krate: p.krate, hash };
             p.defs.insert(def, DefData::skeleton(DefsKind::Const, Some(parent), name, Vis::Priv, item.span));
             p.const_defs.push(def);
-            p.consts.push(ConstItem { name, ty: item.ty, value, qualif });
+            p.consts.push(ConstItem { name, ty: item.ty, value, qualif, value_fp: Default::default() });
             if let Some(generics) = &tmpls[pi] {
                 p.gx.assoc_const_tmpls.insert(idx, (item.expr, generics.clone()));
             }
@@ -6512,7 +6517,7 @@ fn install_const_items(
             None if item.stmt_idx.is_some() => {
                 if let Some(name) = item.name {
                     let idx = p.body_consts.len() as u32;
-                    p.body_consts.push(ConstItem { name, ty: item.ty, value, qualif });
+                    p.body_consts.push(ConstItem { name, ty: item.ty, value, qualif, value_fp: Default::default() });
                     p.body_items.insert(item.stmt_idx.unwrap(), BodyItem::Const(idx));
                 }
             }
@@ -6525,7 +6530,7 @@ fn install_const_items(
                     let def = DefId { krate: p.krate, hash };
                     p.defs.insert(def, DefData::skeleton(DefsKind::Const, None, name, Vis::Priv, item.span));
                     p.const_defs.push(def);
-                    p.consts.push(ConstItem { name, ty: item.ty, value, qualif });
+                    p.consts.push(ConstItem { name, ty: item.ty, value, qualif, value_fp: Default::default() });
                 }
             }
             Some(mutable) => {
@@ -6577,13 +6582,13 @@ fn install_const_items(
                     },
                     None => None,
                 };
-                statics[item.static_idx as usize] = Some(StaticItem { name, ty: item.ty, mutable, value, tls });
+                statics[item.static_idx as usize] = Some(StaticItem { name, ty: item.ty, mutable, value, tls, value_fp: Default::default() });
             }
         }
     }
     p.statics = statics
         .into_iter()
-        .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit, tls: None }))
+        .map(|s| s.unwrap_or(StaticItem { name: Sym(0), ty: ERROR, mutable: false, value: crate::ty::consteval::ConstValue::Unit, tls: None , value_fp: Default::default() }))
         .collect();
     // Each `thread_local!` key's slot word: 1, 2, .. in static order
     // (runtime/thread.c finds the thread's cell by it).
@@ -6591,6 +6596,7 @@ fn install_const_items(
     for st in p.statics.iter_mut().filter(|s| s.tls.is_some()) {
         slot += 1;
         st.value = crate::ty::consteval::ConstValue::Int(slot);
+        st.value_fp = Default::default();
     }
 }
 
