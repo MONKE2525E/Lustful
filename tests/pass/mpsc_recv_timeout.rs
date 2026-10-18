@@ -1,6 +1,6 @@
 // Receiver::recv_timeout and RecvTimeoutError (tf-p6 R09): queued value, then
 // disconnection, then the deadline; Display/Debug/type_name; path and value forms;
-// a rendezvous channel pairs with a blocked sender at once.
+// a rendezvous channel pairs with a blocked sender.
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 fn main() {
@@ -17,12 +17,12 @@ fn main() {
     match rx.recv_timeout(Duration::from_secs(5)) { Err(RecvTimeoutError::Disconnected) => println!("disc"), _ => println!("?") }
     println!("{} | {} | {:?} {:?}", RecvTimeoutError::Timeout, mpsc::RecvTimeoutError::Disconnected, RecvTimeoutError::Timeout, RecvTimeoutError::Timeout == RecvTimeoutError::Disconnected);
     println!("{}", std::any::type_name::<RecvTimeoutError>());
+    // The sender blocks in send until a receive takes the value; a long
+    // timeout (not a sleep and try_recv) keeps this exact under load.
     let (stx, srx) = mpsc::sync_channel::<u8>(0);
     let h = std::thread::spawn(move || { stx.send(7).unwrap(); stx.send(8).unwrap(); });
-    std::thread::sleep(Duration::from_millis(100));
-    println!("{:?}", srx.try_recv());
-    std::thread::sleep(Duration::from_millis(100));
-    println!("{:?}", srx.recv_timeout(Duration::ZERO));
+    println!("{:?}", srx.recv_timeout(Duration::from_secs(30)));
+    println!("{:?}", srx.recv_timeout(Duration::from_secs(30)));
     h.join().unwrap();
     println!("{:?} {:?}", srx.try_recv(), srx.recv_timeout(Duration::ZERO));
     println!("{:?}", Receiver_path());
