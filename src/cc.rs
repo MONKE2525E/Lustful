@@ -158,7 +158,10 @@ pub fn cflags(debug: bool) -> String {
     // uint8_t and chars in uint32_t, so nothing should depend on it,
     // and after this flag nothing can (it also matches MSVC where the
     // windows-gnu build would otherwise differ on arm64).
-    let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fexceptions -fno-asynchronous-unwind-tables";
+    // -fomit-frame-pointer: zig cc keeps a frame pointer in every fn
+    // (7% of a release tsgo's instructions); nothing walks them, as
+    // unwinding reads .eh_frame. Targets whose ABI needs one keep it.
+    let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fexceptions -fno-asynchronous-unwind-tables -fomit-frame-pointer";
     if debug { format!("{base} -g") } else { base.into() }
 }
 
@@ -172,7 +175,7 @@ pub fn mimalloc_unit() -> Option<String> {
 
 /// The flags of a `.cc` unit (the runtime's throw and catch).
 pub fn cxxflags(debug: bool) -> String {
-    let base = "-O2 -w -fexceptions";
+    let base = "-O2 -w -fexceptions -fomit-frame-pointer";
     if debug { format!("{base} -g") } else { base.into() }
 }
 
