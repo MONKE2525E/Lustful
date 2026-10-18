@@ -471,6 +471,10 @@ pub struct Program {
     /// this program. 0 when no slot is (a fresh collect, or a kept
     /// program a delta moved before its read sets were walked).
     pub(crate) verified: u64,
+    /// The fn bodies of `ast` by file, for `outer_param_names` (built on
+    /// first use, with the address of the Ast it indexes: a new Ast, as a
+    /// patch sets, builds it again).
+    pub(crate) outer_params: std::sync::RwLock<Option<(usize, std::sync::Arc<OuterParams>)>>,
 }
 
 impl Program {
@@ -3492,6 +3496,7 @@ pub fn collect_reuse(
         impl_parents: HashMap::default(),
         reuse_stamp: 0,
         verified: 0,
+        outer_params: Default::default(),
     };
     let (ast, interner, known) = (&*ast, &*interner, &*known);
     p.gx.walk_instances = walk_instances;
@@ -6822,7 +6827,68 @@ pub(crate) fn apply_stmt_overlay(p: &Program, scope: &mut generics::Scope, at: S
     scope.local_types = types;
     scope.local_aliases = aliases;
     scope.local_traits = traits;
-    scope.outer_params = outer_param_names(&p.ast, at);
+    scope.outer_params = outer_param_names_in(p, at);
+}
+
+/// The fn bodies of one Ast, by file, in item order: each body's span and
+/// the generic param names `outer_param_names` takes for it.
+pub(crate) struct OuterParams {
+    by_file: HashMap<crate::diag::FileId, Vec<(Span, Vec<Sym>)>>,
+}
+
+impl OuterParams {
+    fn new(ast: &Ast) -> OuterParams {
+        let mut by_file: HashMap<crate::diag::FileId, Vec<(Span, Vec<Sym>)>> = HashMap::default();
+        let names = |gs: &[&ast::Generics]| -> Vec<Sym> {
+            gs.iter()
+                .flat_map(|g| g.params.iter())
+                .filter_map(|p| match p {
+                    ast::GenericParam::Type { name, .. } | ast::GenericParam::Const { name, .. } => Some(*name),
+                    ast::GenericParam::Lifetime { .. } => None,
+                })
+                .collect()
+        };
+        let mut add = |b: Option<ast::BlockId>, gs: &[&ast::Generics]| {
+            if let Some(b) = b {
+                let s = ast.block(b).span;
+                by_file.entry(s.file).or_default().push((s, names(gs)));
+            }
+        };
+        for item in &ast.items {
+            match &item.kind {
+                ItemKind::Fn(f) => add(f.body, &[&f.generics]),
+                ItemKind::Impl(imp) => imp.fns.iter().for_each(|f| add(f.body, &[&imp.generics, &f.generics])),
+                ItemKind::Trait(t) => t.fns.iter().for_each(|f| add(f.body, &[&t.generics, &f.generics])),
+                _ => {}
+            }
+        }
+        for item in &ast.stmt_items {
+            if let ItemKind::Fn(f) = &item.kind {
+                add(f.body, &[&f.generics]);
+            }
+        }
+        OuterParams { by_file }
+    }
+}
+
+/// `outer_param_names` through the program's index of fn bodies
+/// (`Program::outer_params`): the same names in the same order, from the
+/// bodies of `at`'s file only.
+fn outer_param_names_in(p: &Program, at: Span) -> Vec<Sym> {
+    let key = Arc::as_ptr(&p.ast) as usize;
+    let held = p.outer_params.read().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|(k, _)| *k == key).map(|(_, ix)| ix.clone());
+    let ix = held.unwrap_or_else(|| {
+        let ix = Arc::new(OuterParams::new(&p.ast));
+        *p.outer_params.write().unwrap_or_else(|e| e.into_inner()) = Some((key, ix.clone()));
+        ix
+    });
+    let mut out: Vec<Sym> = Vec::new();
+    for (s, names) in ix.by_file.get(&at.file).map_or(&[][..], |v| &v[..]) {
+        if s.ctxt == at.ctxt && s.lo <= at.lo && at.hi <= s.hi && (s.lo != at.lo || s.hi != at.hi || s.lo != s.hi) {
+            out.extend_from_slice(names);
+        }
+    }
+    out
 }
 
 /// The type and const generic parameter names of every function

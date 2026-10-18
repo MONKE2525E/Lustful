@@ -92,6 +92,7 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
         impl_parents,    // same (impl headers stand)
         reuse_stamp: _,  // the driver sets it (`patch::keep`)
         verified: _,     // the driver clears it (`compile`)
+        outer_params: _, // rebuilt for a new Ast (`outer_param_names_in`)
         const_goals: _,  // same (const fns refuse)
     } = p;
     let fn_defs_data: Vec<_> = fn_defs.iter().map(|&d| defs.get(d)).collect();
