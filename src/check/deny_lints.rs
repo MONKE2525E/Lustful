@@ -72,9 +72,10 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &Checked) -> Option<Diag> {
         }
         out
     };
-    let within = |inner: crate::diag::Span, outs: &[crate::diag::Span]| outs.iter().any(|o| o.file == inner.file && o.lo <= inner.lo && inner.hi <= o.hi);
+    // Whether a lint at `inner` sits in a span that levels one of `names`
+    // (`scoped`, walked only when a lint would fire: most bodies have none).
+    let within = |inner: crate::diag::Span, names: &[&str]| scoped(names).iter().any(|o| o.file == inner.file && o.lo <= inner.lo && inner.hi <= o.hi);
     let md_names = ["undropped_manually_drops"];
-    let md_scopes = scoped(&md_names);
     for i in def.exprs.0..def.exprs.1 {
         let e = &p.ast.exprs[i as usize];
         if let Expr::Call { callee, args } = e
@@ -82,19 +83,18 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &Checked) -> Option<Diag> {
             && (matches!(ck.res(*callee), Res::Builtin(Builtin::MemDrop)) || matches!(ck.res(ast::ExprId(i)), Res::Builtin(Builtin::MemDrop)))
             && let Some(d) = undropped_manually_drops(p, ck, def.exprs, ast::ExprId(i), *arg)
             && !leveled(p, fn_attrs, &md_names)
-            && !within(p.ast.expr_spans[i as usize], &md_scopes)
+            && !within(p.ast.expr_spans[i as usize], &md_names)
         {
             return Some(d);
         }
     }
     let ei_names = ["enum_intrinsics_non_enums"];
     if !leveled(p, fn_attrs, &ei_names) {
-        let ei_scopes = scoped(&ei_names);
         for i in def.exprs.0..def.exprs.1 {
             if let Expr::Call { callee, args } = &p.ast.exprs[i as usize]
                 && let [arg] = args.as_slice()
                 && let Some(d) = discriminant_non_enum(p, ck, *callee, *arg, ast::ExprId(i))
-                && !within(d.span, &ei_scopes)
+                && !within(d.span, &ei_names)
             {
                 return Some(d);
             }
@@ -104,12 +104,11 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &Checked) -> Option<Diag> {
     if leveled(p, fn_attrs, &lock_names) {
         return None;
     }
-    let lock_scopes = scoped(&lock_names);
     for &b in &blocks {
         for s in &p.ast.block(b).stmts {
             if let Stmt::Let { pat, .. } = s
                 && let Some(d) = let_underscore_lock(p, ck, *pat)
-                && !within(d.span, &lock_scopes)
+                && !within(d.span, &lock_names)
             {
                 return Some(d);
             }
@@ -120,7 +119,7 @@ pub fn check_body(p: &Program, fid: LocalDefId, ck: &Checked) -> Option<Diag> {
         if let Expr::Assign { lhs, rhs } = &p.ast.exprs[i as usize]
             && matches!(p.ast.exprs[lhs.0 as usize], Expr::Underscore)
             && is_lock(p, ck, ck.ty(*rhs))
-            && !within(p.ast.expr_spans[i as usize], &lock_scopes)
+            && !within(p.ast.expr_spans[i as usize], &lock_names)
         {
             return Some(lock_diag(p.ast.expr_spans[lhs.0 as usize]));
         }
