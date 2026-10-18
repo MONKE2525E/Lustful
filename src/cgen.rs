@@ -10490,21 +10490,11 @@ pub fn fn_unit_parts(
     let helpers = if llvm {
         let mut h = c.clone();
         slots.iter().chain(ll_inl).for_each(|&s| h.push_str(&fns[s].ll_c));
-        // The plain C of an LLVM unit holds only its fns' C ABI wrappers and trampolines:
-        // it declares only the types their signatures hold (a main entry keeps it all).
+        // The plain C of an LLVM unit holds only its fns' C ABI wrappers and trampolines, and
+        // cc.rs compiles them after the helpers' C, which declares every type they name
+        // (`compile_pair`): nothing comes before the mark (a main entry keeps it all).
         if term_main.is_none() {
-            c = unit_header();
-            c.push_str(ll::PAIR_TYPEDEF);
-            let (mut held, mut named) = (Vec::new(), HashSet::new());
-            for t in slots.iter().flat_map(|&s| &fns[s].ll_sig) {
-                by_value_deps(t, &mut held);
-                collect_types(t, &mut named);
-            }
-            let held: HashSet<CTy> = held.into_iter().collect();
-            named.retain(|t| !held.contains(t));
-            type_decls_with(p, &mut c, &held, &named, Decls::ByValue, &HashSet::new());
-            // cc.rs compiles what follows together with the helpers' C (`compile_pair`).
-            c.push_str(ll::BODY_MARK);
+            c = ll::BODY_MARK.to_string();
         }
         h
     } else {
