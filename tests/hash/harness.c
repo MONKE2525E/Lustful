@@ -4,6 +4,20 @@
    Extra modes: fxvectors (rustc-hash's own published test values),
    edges (directed capacity/hash checks via asserts, prints ok). */
 #define _POSIX_C_SOURCE 199309L
+#include <stdint.h>
+#include <stdlib.h>
+
+/* hash.c calls the runtime's panic and OOM entry points on paths
+   this harness never takes (capacity overflow, allocation
+   failure). Abort stubs stand in for them; the real ones are in
+   src/runtime/panic.c and core.c, which this harness does not link. */
+void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t line, uint32_t col) {
+    (void)msg; (void)len; (void)file; (void)line; (void)col;
+    abort();
+}
+void lust_oom(void) { abort(); }
+void lust_oom_size(uint64_t n) { (void)n; abort(); }
+
 #define LUST_IMPL 1
 #include "../../src/runtime/hash.h"
 #include <stdio.h>
