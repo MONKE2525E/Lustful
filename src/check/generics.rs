@@ -10164,7 +10164,12 @@ fn snapshot_ty_tree(src: &dyn TyIntern, t: Ty) -> Option<OwnedTy> {
             for e in src.tys_of(b.value.inputs).to_vec() {
                 inputs.push(snapshot_ty_tree(src, e)?);
             }
-            OwnedTy::FnPtr(b, inputs, Box::new(snapshot_ty_tree(src, b.value.output)?))
+            let output = Box::new(snapshot_ty_tree(src, b.value.output)?);
+            // The ids of the sig's own inputs and output are the source
+            // store's (a body overlay's are new at each check); the owned
+            // trees hold them, and `build_owned_ty` reads only those.
+            let b = Binder { count: b.count, value: FnSig { inputs: EMPTY_TYS, output: ERROR, ..b.value } };
+            OwnedTy::FnPtr(b, inputs, output)
         }
         TyKind::Dyn(b, r) => {
             let bounds = src.dyn_bounds(b).clone();
