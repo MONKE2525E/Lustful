@@ -3626,10 +3626,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Unwind tables need a C compiler with -fexceptions and a C++ driver, never tcc: a
     // release driver build uses them, one-shot or from a persistent session such as a
     // front image (LUST_UNWIND_TABLES=0 turns them off); --emit-c in a one-shot process
-    // only with LUST_UNWIND_TABLES=1 (difftest EH=1).
+    // only with LUST_UNWIND_TABLES=1 (difftest EH=1, which builds that C itself). A tcc
+    // build ignores the variable: it would link that C without the C++ unit, and
+    // catch_unwind would return Ok after a panic (rel-opt).
     let tables_env = std::env::var("LUST_UNWIND_TABLES").ok();
     program.unwind_tables = program.unwind
-        && if req.cc { tables_env.as_deref() != Some("0") } else { !caches.persistent && tables_env.as_deref() == Some("1") };
+        && if req.cc {
+            tables_env.as_deref() != Some("0")
+        } else {
+            !caches.persistent && req.emit_c.is_some() && tables_env.as_deref() == Some("1")
+        };
     // Route the spliced source std fns: resolve each registry row's
     // mangled name to the local fn the splice defined. A missing fn is
     // a broken std build (the loader found it standalone), so it is an
