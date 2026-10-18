@@ -296,6 +296,8 @@ out=$(run_lust build hello.rs -o h -g --timings)
 case "$out" in *"cache hit"*) ok "cache: repeated -g build hits";; *) bad "cache: repeated -g build hits" "no hit line";; esac
 out=$( (cd "$d" && LUST_NO_DAEMON=1 LUST_CACHE_COMPILER_ID=other-compiler "$lust" check hello.rs --timings) 2>&1 )
 case "$out" in *"cache hit"*) bad "cache: compiler id change misses" "reported a hit";; *) ok "cache: compiler id change misses";; esac
+out=$( (cd "$d" && LUST_NO_DAEMON=1 LUST_RELEASE_C=1 "$lust" build hello.rs -o h -g --timings) 2>&1 )
+case "$out" in *"cache hit"*) bad "cache: a LUST_ setting misses" "reported a hit";; *) ok "cache: a LUST_ setting misses";; esac
 out=$( (cd "$d" && LUST_NO_DAEMON=1 LUST_NO_CACHE=1 "$lust" check hello.rs --timings) 2>&1 )
 case "$out" in *"cache hit"*) bad "cache: LUST_NO_CACHE never hits" "reported a hit";; *) ok "cache: LUST_NO_CACHE never hits";; esac
 

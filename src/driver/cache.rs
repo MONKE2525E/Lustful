@@ -137,7 +137,31 @@ fn compiler_id() -> (u64, u64) {
     hash128(&[env!("LUST_BUILD_HASH").as_bytes(), &tcc.0.to_le_bytes(), &tcc.1.to_le_bytes(), extra.as_bytes()], 7)
 }
 
-/// The whole-request key for `req` over `src` bytes: compiler id, target, path, flags, source.
+/// The `LUST_*` settings among `vars` that can change a build's answer, sorted, one
+/// `name=value` line each: all but those that only steer the process (daemon, cache
+/// location, threads, logs). A setting not listed here is keyed, so a new one costs a miss,
+/// never a wrong hit (rel-opt: a `LUST_UNWIND_TABLES=1 LUST_RELEASE_C=1` build's binary
+/// was replayed to a plain build of the same file).
+fn env_key(vars: impl Iterator<Item = (String, String)>) -> String {
+    const STEERING: &[&str] = &[
+        "LUST_NO_DAEMON",
+        "LUST_DAEMON_SOCKET",
+        "LUST_DAEMON_IDLE",
+        "LUST_CACHE_DIR",
+        "LUST_CACHE_MAX_BYTES",
+        "LUST_CACHE_COMPILER_ID",
+        "LUST_THREADS",
+        "LUST_STATS",
+        "LUST_VISITS_LOG",
+        "LUST_TCC_HOME",
+    ];
+    let mut set: Vec<(String, String)> = vars.filter(|(k, _)| k.starts_with("LUST_") && !STEERING.contains(&k.as_str())).collect();
+    set.sort();
+    set.iter().map(|(k, v)| format!("{k}={v}\n")).collect()
+}
+
+/// The whole-request key for `req` over `src` bytes: compiler id, target, path, flags,
+/// the `LUST_*` settings (`env_key`), source.
 /// The session key text (`SessionKey::describe`, which names every field) is in
 /// the key, so two crate selections of one file never replay each other's
 /// stored answer. `--timings` is not in the key: stored responses keep no timing
@@ -163,6 +187,7 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
     let graph = crate::protocol::graph_key(&req.session);
     // The root path as typed: `file!`, `dbg!`, and panic locations show it.
     let shown = req.client.shown.as_deref().map_or(&[][..], |p| p.as_os_str().as_encoded_bytes());
+    let env = env_key(std::env::vars());
     let (a, b) = hash128(
         &[
             &id.0.to_le_bytes(),
@@ -176,6 +201,7 @@ fn request_key(id: (u64, u64), req: &Request, src: &[u8]) -> String {
             session.as_bytes(),
             &graph.to_le_bytes(),
             &build_script.to_le_bytes(),
+            env.as_bytes(),
             src,
         ],
         13,
@@ -533,6 +559,17 @@ mod tests {
 
     /// Each unit-object key input must change the key on its own, and a
     /// stored unit object copies back out byte for byte.
+    /// Every `LUST_*` setting but the process-steering ones goes into the request key,
+    /// whatever its order in the environment.
+    #[test]
+    fn request_keys_hold_the_lust_settings() {
+        let vars = |v: &[(&str, &str)]| v.iter().map(|(k, x)| (k.to_string(), x.to_string())).collect::<Vec<_>>().into_iter();
+        let key = env_key(vars(&[("LUST_RELEASE_C", "1"), ("PATH", "/bin"), ("LUST_NO_DAEMON", "1"), ("LUST_UNWIND_TABLES", "1"), ("LUST_THREADS", "4")]));
+        assert_eq!(key, "LUST_RELEASE_C=1\nLUST_UNWIND_TABLES=1\n");
+        assert_eq!(key, env_key(vars(&[("LUST_UNWIND_TABLES", "1"), ("LUST_RELEASE_C", "1")])));
+        assert_eq!(env_key(vars(&[("LUST_CACHE_DIR", "/c"), ("HOME", "/h")])), "");
+    }
+
     #[test]
     fn unit_objects_round_trip_and_key_on_every_input() {
         let dir = std::env::temp_dir().join(format!("lust-unit-cache-test-{}", std::process::id()));
