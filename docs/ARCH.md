@@ -4026,7 +4026,9 @@ item headers without positions.
 | `Expansion(call)` | MacroDef, input tokens, cfg, files/env read | output token trees |
 | `Items(file)` | Tokens, Expansions | parsed item headers |
 | `Sig(def)` | Items, Sigs it names | resolved signature: types with def hashes, generics, predicates, repr, vis |
-| `LayoutOf(adt)` | Sig of adt and field adts (generic form) | size/align function shape: field order, offsets as functions of params; concrete layouts derive at mono |
+| `LayoutOf(adt)` | Sig of adt and the adts it holds by value (generic form) | size/align function shape: field order, offsets as functions of params; concrete layouts derive at mono. A type behind a pointer or in a collection counts by identity |
+| `Structure(adt)` | Sig of adt and of every adt its fields name | the same content over all of them, behind pointers too: what auto traits and derive glue answers read |
+| `AssocVis(adt, name)` | the resolver's item tables | visibility and module of one inherent item (method and `Type::item` privacy) |
 | `ImplSet(trait, head)` | all impl headers in the bucket, across visible crates | set of impl header hashes, sorted |
 | `Binding(module, ns, name)` | ModTree, the imports and defs that decide this one name | the resolved `Res` (def disk pair, or ambiguous, or absent) for that name only |
 | `MethodSet(head, name, form)` | inherent impls and trait impls that can answer this probe | candidate def list for one (Self head, method name, receiver form), in probe order |

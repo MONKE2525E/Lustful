@@ -49,6 +49,10 @@ pub(crate) mod bit {
     /// No derive trait: a read of the written std and lang trait impls
     /// that name the Adt (traits/index.rs `get`, `ReadKey::LangImpls`).
     pub(crate) const LANG: u16 = 1 << 15;
+    /// No derive trait: a read of the Adt's deep layout
+    /// (`ReadKey::Layout`), by a reader that sees it through a pointer
+    /// (`Program::note_adt_layout`).
+    pub(crate) const LAYOUT: u16 = 1 << 14;
 }
 
 /// The derive bit of lang trait `tr`, or 0 for a trait no derive makes.
@@ -63,8 +67,23 @@ pub(crate) fn masked(d: &Derives, mask: u16) -> u16 {
 }
 
 /// True while a scope is open on this thread.
-fn open() -> bool {
+pub(crate) fn open() -> bool {
     DEPTH.with(Cell::get) != 0
+}
+
+/// Runs `f` with this thread's log closed and set aside: a fingerprint
+/// that computes a structural answer (`ReadKey::Answer`) inside a body's
+/// scope notes nothing into that body.
+pub(crate) fn unlogged<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(u32, Vec<(DefId, u16)>);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(self.0));
+            LOG.with(|l| *l.borrow_mut() = std::mem::take(&mut self.1));
+        }
+    }
+    let _back = Back(DEPTH.with(|d| d.replace(0)), LOG.with(|l| std::mem::take(&mut *l.borrow_mut())));
+    f()
 }
 
 /// Notes a read of the derive traits `mask` of the Adt template `def`.
@@ -140,14 +159,17 @@ pub(crate) fn scoped<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<(DefId, u16)
 }
 
 /// Records one read per noted def into `reads`: `Derives` for a reader of
-/// the whole list, else `DeriveBits` of the traits it asked; and
-/// `LangImpls` for a def noted with `bit::LANG`.
+/// the whole list, else `DeriveBits` of the traits it asked; `LangImpls`
+/// for a def noted with `bit::LANG`, and `Layout` with `bit::LAYOUT`.
 pub(crate) fn record(p: &Program, reads: &mut Reads, noted: &[(DefId, u16)]) {
     for &(def, mask) in noted {
         if mask & bit::LANG != 0 {
             p.record_lang_impls(reads, def);
         }
-        match mask & !bit::LANG {
+        if mask & bit::LAYOUT != 0 {
+            let _ = p.layout_of(reads, def);
+        }
+        match mask & !(bit::LANG | bit::LAYOUT) {
             0 => {}
             bit::ALL => p.record_derives(reads, def),
             m => p.record_derive_bits(reads, def, m),

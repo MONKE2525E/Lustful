@@ -3680,9 +3680,11 @@ impl<'p> Ctx<'p> {
             self.err("L0510", span, format!("field `{name}` is private"), "Use the type's methods instead.");
             return;
         }
-        let Some(tables) = &p.resolved else { return };
+        // The field's type and visibility (`Sig(adt)`), with module tables
+        // or not: struct literals and patterns reach fields through here.
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
+        let Some(tables) = &p.resolved else { return };
         if let Some((def_mod, fields)) = tables.field_vis.get(&def)
             && let Some(vis) = fields.get(&field)
             && !tables.visible(vis, *def_mod, self.module, &p.interner)
@@ -3712,9 +3714,9 @@ impl<'p> Ctx<'p> {
             self.err("L0510", span, format!("field `{index}` is private"), "Use the type's methods instead.");
             return;
         }
-        let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
+        let Some(tables) = &p.resolved else { return };
         if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
             && let Some(vis) = fields.get(index as usize)
             && !tables.visible(vis, *def_mod, self.module, &p.interner)
@@ -3743,9 +3745,9 @@ impl<'p> Ctx<'p> {
             self.err("L0510", span, format!("tuple struct constructor `{name}` is private"), "Use the type's methods instead.");
             return;
         }
-        let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
         let _ = p.sig_of(&mut self.out.reads, def);
+        let Some(tables) = &p.resolved else { return };
         if let Some((def_mod, fields)) = tables.tuple_field_vis.get(&def)
             && fields.iter().any(|vis| !tables.visible(vis, *def_mod, self.module, &p.interner))
         {
@@ -3821,7 +3823,7 @@ impl<'p> Ctx<'p> {
         let p = self.p;
         let Some(tables) = &p.resolved else { return false };
         let def = p.def_of_adt(a);
-        let _ = p.sig_of(&mut self.out.reads, def);
+        p.record_assoc_vis(&mut self.out.reads, def, name);
         tables.assoc_vis.get(&def).and_then(|items| items.get(&name)).is_some_and(|(vis, def_mod)| !tables.visible(vis, *def_mod, self.module, &p.interner))
     }
 
@@ -3833,7 +3835,7 @@ impl<'p> Ctx<'p> {
         let p = self.p;
         let Some(tables) = &p.resolved else { return };
         let def = p.def_of_adt(a);
-        let _ = p.sig_of(&mut self.out.reads, def);
+        p.record_assoc_vis(&mut self.out.reads, def, name);
         if let Some(items) = tables.assoc_vis.get(&def)
             && let Some((vis, def_mod)) = items.get(&name)
             && !tables.visible(vis, *def_mod, self.module, &p.interner)
@@ -5400,8 +5402,11 @@ impl<'p> Ctx<'p> {
     fn auto_inner(&mut self, trait_def: DefId, t: Ty, seen: &mut crate::check::collect::AutoSeen) -> Option<bool> {
         let t = self.deep(t);
         // The answer reads the fields of every Adt in `t` (their
-        // layouts' fingerprints cover nested field types).
-        self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
+        // layouts' fingerprints cover nested field types), but not what
+        // a raw pointer, or for `Send` and `Sync` an `Rc`, points at.
+        let lang = &self.p.gx.lang;
+        let behind = if trait_def == lang.send || trait_def == lang.sync { crate::driver::graph::Behind::SendSync } else { crate::driver::graph::Behind::Other };
+        self.p.record_structure_reads(&mut self.out.reads, &self.tys, t, behind, crate::driver::graph::answer::AUTO);
         self.note_opaques(t);
         // A walk from the top answers the same each time for a type the env
         // cannot reach (`auto_memo`); one inside a cycle may lean on `seen`.
@@ -9347,6 +9352,11 @@ impl<'p> Ctx<'p> {
                 let mut cow_step = false;
                 for step in 0..=4 {
                     if let Some(a) = self.tys.local_adt(inner) {
+                        // The lookup reads the Adt's field list, found or
+                        // not: a field added, removed, or retyped moves its
+                        // `Sig`. A body that reaches the Adt through a
+                        // reference has no other read of it.
+                        let _ = p.sig_of(&mut self.out.reads, p.def_of_adt(a));
                         let adt = p.adt(a);
                         if !adt.is_enum
                             && let Some(i) = adt.variants[0].fields.iter().position(|f| f.name == *name)
@@ -10225,6 +10235,10 @@ impl<'p> Ctx<'p> {
                 // `Deref` impls (`m.0` on a `ManuallyDrop<Newtype>`).
                 // A Cow base stays a reject (its view is check/cow.rs's).
                 for _ in 0..4 {
+                    // As for named fields: the lookup reads the field list.
+                    if let Some(a) = self.tys.local_adt(inner) {
+                        let _ = p.sig_of(&mut self.out.reads, p.def_of_adt(a));
+                    }
                     let has = match self.kind(inner) {
                         TyKind::Tuple(ts) => (*index as usize) < self.tys.tys_of(ts).len(),
                         _ if *index == 0 && send_error_elem(&self.tys, inner).is_some() => true,
@@ -13807,9 +13821,21 @@ impl<'p> Ctx<'p> {
     /// the written impls the glue calls (`glue_methods`), so a warm
     /// body rechecks when one of those changes (section 8.2; the
     /// predicates themselves record nothing).
-    fn record_glue_reads(&mut self, _trait_def: DefId, t: Ty) {
+    fn record_glue_reads(&mut self, trait_def: DefId, t: Ty) {
         let t = self.deep(t);
-        self.p.record_layout_reads(&mut self.out.reads, &self.tys, t);
+        // `Clone` of a reference or a shared pointer reads nothing of
+        // its target (`glue_clone`).
+        use crate::driver::graph::{Behind, answer};
+        let lang = &self.p.gx.lang;
+        let behind = if trait_def == lang.clone { Behind::Clone } else { Behind::Other };
+        let kind = match trait_def {
+            d if d == lang.clone => answer::CLONE,
+            d if d == lang.partial_eq => answer::PARTIAL_EQ,
+            d if d == lang.eq => answer::EQ,
+            d if d == lang.partial_ord => answer::PARTIAL_ORD,
+            _ => answer::DEFAULT,
+        };
+        self.p.record_structure_reads(&mut self.out.reads, &self.tys, t, behind, kind);
     }
 
     /// The trait ref an assoc call on `base` asks of `trait_def`: the
@@ -25031,6 +25057,12 @@ impl<'p> Ctx<'p> {
         let site_tys = out.generic_site_args.iter().flat_map(|(_, _, args)| args.iter().filter_map(|g| g.as_ty()));
         let tys = out.expr_ty.iter().chain(&out.pat_ty).copied().chain(out.locals.iter().map(|l| l.ty)).chain(site_tys);
         p.record_type_lang_reads(&mut out.reads, &self.tys, tys);
+        // The deep layout of each type the body holds by value: signatures
+        // fold types shallow (`Program::record_type_layout_reads`). A
+        // generic call's type args are not held here: the instance reads
+        // its own, and what the call returns or takes is an expression type.
+        let tys = out.expr_ty.iter().chain(&out.pat_ty).copied().chain(out.locals.iter().map(|l| l.ty));
+        p.record_type_layout_reads(&mut out.reads, &self.tys, tys);
     }
 
     fn has_error_kind(&self, t: Ty) -> bool {

@@ -934,7 +934,8 @@ impl GenReuse {
                     }
                     ReadKey::Checked(_) => add(ReaderKey::Checked),
                     ReadKey::ImplSet(k) => add(ReaderKey::Trait(k.trait_)),
-                    ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::LangImpls(_) => {}
+                    ReadKey::AssocVis(a, name) => add(ReaderKey::Method(*a, *name)),
+                    ReadKey::Layout(_) | ReadKey::Structure(_) | ReadKey::Answer(..) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::LangImpls(_) => {}
                 }
             }
             n

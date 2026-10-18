@@ -213,6 +213,27 @@ pub enum ReadKey {
     /// index hands out (traits/index.rs `get`). The fingerprint is the
     /// impls' content (`lang_impls_fingerprint`).
     LangImpls(DefId),
+    /// The deep structure of one Adt template, through pointers and
+    /// collections: what auto traits (`Send`, `Sync`, `Unpin`) and derive
+    /// glue answers (`Clone`, `PartialEq`, ...) read, recorded by those
+    /// structural walks (`Program::record_structure_reads`). `Layout` is
+    /// the by-value part. The fingerprint is the full deep content
+    /// (`structure_fingerprint`).
+    Structure(DefId),
+    /// One structural answer about a user Adt with no generic params
+    /// (`answer::AUTO`: its `Send`, `Sync`, and `Unpin`; or one derive glue
+    /// answer, `answer::CLONE`...), which an auto trait or glue walk over a
+    /// type that holds the Adt reads in place of its `Structure`. The
+    /// fingerprint is the answer (`answer_fingerprint`), so an edit deep
+    /// inside the Adt that keeps the answer dirties no reader.
+    Answer(DefId, u8),
+    /// The visibility of the inherent associated item `name` of one Adt
+    /// (`ResolvedTables::assoc_vis`: written visibility and module), which
+    /// a method call or a `Type::item` path checks (`Ctx::check_assoc_vis`).
+    /// The Adt's `Sig` leaves these entries out, so a method added to a
+    /// type does not dirty the callers of its other methods. The
+    /// fingerprint is the entry; no entry is a failed read.
+    AssocVis(DefId, Sym),
 }
 
 /// One recorded read: the fingerprint the node had when it was read, and
@@ -576,43 +597,78 @@ fn ty_fingerprint(p: &Program, t: Ty) -> Fingerprint {
 /// and Projection defs are not Adt layouts and do not appear here: their
 /// content is covered by their own `Sig` nodes when a body reads them.
 pub(crate) fn collect_adt_defs(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<DefId>) {
-    fn args(p: &Program, tys: &impl TyIntern, a: ArgsId, out: &mut Vec<DefId>) {
+    collect_adt_defs_where(p, tys, t, out, &|_| false)
+}
+
+/// Which answer a `Layout` read stands behind (`Program::record_layout_reads_for`):
+/// the pointers that answer stops at, whatever they point at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Behind {
+    /// `Clone`: a reference, raw pointer, fn pointer, `Rc`, `Arc`, or
+    /// `Weak` clones (or not, for `&mut`) without its target.
+    Clone,
+    /// `Send` and `Sync`: a raw pointer, `Rc`, or `rc::Weak` has neither.
+    SendSync,
+    /// `Unpin` and the rest: only a raw pointer is fixed.
+    Other,
+}
+
+/// True when the answer `behind` names is fixed at type `t`.
+fn stops_at(tys: &impl TyIntern, t: Ty, behind: Behind) -> bool {
+    match tys.kind(t) {
+        TyKind::RawPtr(..) => true,
+        TyKind::Ref(..) | TyKind::FnPtr(_) | TyKind::FnDef(..) => behind == Behind::Clone,
+        TyKind::Adt(..) => match tys.builtin_of(t) {
+            Some(BuiltinTy::Rc | BuiltinTy::Weak) => behind != Behind::Other,
+            Some(BuiltinTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak)) => behind == Behind::Clone,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `collect_adt_defs` that leaves out what lies behind a type `stop` takes.
+fn collect_adt_defs_where(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<DefId>, stop: &dyn Fn(Ty) -> bool) {
+    if stop(t) {
+        return;
+    }
+    let args = |a: ArgsId, out: &mut Vec<DefId>| {
         for a in tys.args(a) {
             if let GenericArg::Ty(t) = a {
-                collect_adt_defs(p, tys, *t, out);
+                collect_adt_defs_where(p, tys, *t, out, stop);
             }
         }
-    }
+    };
     match tys.kind(t) {
         TyKind::Adt(def, a) => {
             out.push(def);
-            args(p, tys, a, out);
+            args(a, out);
         }
         TyKind::Ref(_, _, inner) | TyKind::RawPtr(_, inner) | TyKind::Slice(inner) | TyKind::Array(inner, _) => {
-            collect_adt_defs(p, tys, inner, out)
+            collect_adt_defs_where(p, tys, inner, out, stop)
         }
         TyKind::Tuple(ts) => {
             for e in tys.tys_of(ts) {
-                collect_adt_defs(p, tys, *e, out);
+                collect_adt_defs_where(p, tys, *e, out, stop);
             }
         }
         TyKind::FnPtr(sig) => {
             let sig = tys.sig(sig);
             for e in tys.tys_of(sig.value.inputs) {
-                collect_adt_defs(p, tys, *e, out);
+                collect_adt_defs_where(p, tys, *e, out, stop);
             }
-            collect_adt_defs(p, tys, sig.value.output, out);
+            collect_adt_defs_where(p, tys, sig.value.output, out, stop);
         }
-        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => args(p, tys, a, out),
+        TyKind::FnDef(_, a) | TyKind::Closure(_, a) | TyKind::Opaque(_, a) | TyKind::Projection(_, a) => args(a, out),
         TyKind::Dyn(bounds, _) => {
             let b = tys.dyn_bounds(bounds);
             let mut refs: Vec<&TraitRef> = b.principal.as_ref().map(|pr| &pr.value).into_iter().collect();
             refs.extend(b.supertraits.iter().map(|st| &st.value));
             for tr in refs {
-                args(p, tys, tr.args, out);
+                args(tr.args, out);
                 for (_, arg) in tys.bindings(tr.bindings) {
                     if let GenericArg::Ty(t) = arg {
-                        collect_adt_defs(p, tys, *t, out);
+                        collect_adt_defs_where(p, tys, *t, out, stop);
                     }
                 }
             }
@@ -621,11 +677,14 @@ pub(crate) fn collect_adt_defs(p: &Program, tys: &impl TyIntern, t: Ty, out: &mu
     }
 }
 
-/// Which deep walk a memo entry belongs to: Adt layouts
-/// (`hash_adt_layout`) or Adt regions (`hash_adt_regions`).
+/// Which deep walk a memo entry belongs to: Adt layouts by value
+/// (`hash_adt_layout` over the Adts a value holds inline), Adt structure
+/// (the same content over every Adt the fields name), or Adt regions
+/// (`hash_adt_regions`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Deep {
     Layout,
+    Structure,
     Regions,
 }
 
@@ -652,7 +711,10 @@ pub(crate) struct DeepMemo(FxMap<(Deep, DefId), u64>, bool);
 #[derive(Default)]
 pub struct FpMemo {
     layout: Vec<std::sync::OnceLock<u64>>,
+    structure: Vec<std::sync::OnceLock<u64>>,
     regions: Vec<std::sync::OnceLock<u64>>,
+    /// `Answer` fingerprints, `ANSWER_KINDS` per Adt.
+    answers: Vec<std::sync::OnceLock<u64>>,
     walk: std::sync::Mutex<()>,
     /// While mono runs on a program whose memo was off: the
     /// `deep_stamp` the current values were made under.
@@ -663,7 +725,9 @@ impl FpMemo {
     /// Turns the memo on, empty, for a program with `adts` Adts.
     pub fn on(&mut self, adts: usize) {
         self.layout = (0..adts).map(|_| Default::default()).collect();
+        self.structure = (0..adts).map(|_| Default::default()).collect();
         self.regions = (0..adts).map(|_| Default::default()).collect();
+        self.answers = (0..adts * ANSWER_KINDS).map(|_| Default::default()).collect();
     }
 
     /// Turns the memo off and drops its values.
@@ -713,6 +777,7 @@ impl FpMemo {
         let a = p.adt_by_def(def)?;
         match kind {
             Deep::Layout => self.layout.get(a.0 as usize),
+            Deep::Structure => self.structure.get(a.0 as usize),
             Deep::Regions => self.regions.get(a.0 as usize),
         }
     }
@@ -776,16 +841,60 @@ fn hash_ty_refs(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, r: &m
     }
 }
 
+/// True for a std type that holds its type args behind a pointer, or not
+/// at all: owning heap pointers and collections, `RefCell` and lock
+/// guards, thread and channel handles, a `thread_local!` key.
+fn points_at_args(tys: &impl TyIntern, t: Ty) -> bool {
+    use crate::ty::sync::SyncTy as S;
+    matches!(
+        tys.builtin_of(t),
+        Some(BuiltinTy::Vec | BuiltinTy::Boxed | BuiltinTy::Rc | BuiltinTy::Weak | BuiltinTy::Hash(_))
+            | Some(BuiltinTy::RefGuard | BuiltinTy::RefMutGuard | BuiltinTy::LocalKey | BuiltinTy::Fmt(_))
+            | Some(BuiltinTy::Sync(
+                S::Arc | S::ArcWeak | S::MutexGuard | S::RwLockReadGuard | S::RwLockWriteGuard | S::JoinHandle | S::ScopedJoinHandle | S::Sender | S::SyncSender | S::Receiver
+            ))
+    )
+}
+
+/// The Adt defs that the types `types` hold by value
+/// (`Program::record_type_layout_reads`), with repeats; the hidden types
+/// of opaques among them go to `hidden`.
+fn by_value_adts(p: &Program, tys: &impl TyIntern, types: impl IntoIterator<Item = Ty>, defs: &mut Vec<DefId>, hidden: &mut Vec<Ty>) {
+    let mut seen: FxMap<Ty, ()> = FxMap::default();
+    let mut stack: Vec<Ty> = types.into_iter().collect();
+    let ty_args = |a: ArgsId, stack: &mut Vec<Ty>| stack.extend(tys.args(a).iter().filter_map(|g| g.as_ty()));
+    while let Some(t) = stack.pop() {
+        if seen.insert(t, ()).is_some() {
+            continue;
+        }
+        match tys.kind(t) {
+            TyKind::Adt(def, args) => {
+                defs.push(def);
+                if !points_at_args(tys, t) {
+                    ty_args(args, &mut stack);
+                }
+            }
+            TyKind::Tuple(ts) => stack.extend(tys.tys_of(ts).iter().copied()),
+            TyKind::Array(e, _) => stack.push(e),
+            TyKind::Closure(_, a) => ty_args(a, &mut stack),
+            TyKind::Opaque(def, _) => {
+                if let Some(&h) = p.gx.opaque_hidden.get(&crate::check::generics::opaque_def(def)) {
+                    hidden.push(h);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Hashes one type deeply: the shallow structure (`hash_ty`) plus the
-/// deep layout fingerprint of every Adt it names (`adt_deep`), which
-/// covers that Adt's layout and, transitively, every Adt its fields
-/// name. A signature that mentions a type only by name must still
-/// change when that type's fields, derives, or discriminants change,
-/// because bodies checked against the signature read those facts
-/// through the compat tables (field types, copy-ness, glue) without a
-/// separate recorded read for each one.
+/// deep structure fingerprint of every Adt it names (`adt_deep`), which
+/// covers that Adt's content and, transitively, every Adt its fields
+/// name. The type of a const, static, or alias folds in this way: its
+/// readers take the value or the type whole. Fn and Adt signatures fold
+/// shallow (`sig_fingerprint`).
 pub(crate) fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty, memo: &mut DeepMemo) {
-    hash_ty_refs(h, p, tys, t, &mut |h, def| adt_deep(p, Deep::Layout, def, memo).hash(h));
+    hash_ty_refs(h, p, tys, t, &mut |h, def| adt_deep(p, Deep::Structure, def, memo).hash(h));
 }
 
 /// Folds the written `Drop` and auto trait (`Send`, `Sync`, `Unpin`)
@@ -823,6 +932,9 @@ fn hash_structural_impls(h: &mut FxHasher, p: &Program, def: DefId) {
 /// value is a pure function of the reachable content, the same in
 /// every run and walk order, and the walk visits each Adt once.
 fn adt_deep(p: &Program, kind: Deep, def: DefId, memo: &mut DeepMemo) -> u64 {
+    if kind == Deep::Regions && region_inert(p, def) {
+        return regions_leaf(p, def);
+    }
     if let Some(v) = memo.get(p, kind, def) {
         return v;
     }
@@ -835,11 +947,33 @@ fn adt_deep(p: &Program, kind: Deep, def: DefId, memo: &mut DeepMemo) -> u64 {
     memo.get(p, kind, def).unwrap_or_default()
 }
 
+/// True for an Adt with no lifetime or type params: its region facts
+/// (variance, outlives) are fixed whatever its fields hold (only
+/// `'static` can appear in them), so the deep regions walk takes it as a
+/// leaf by identity (`regions_leaf`); its fields' types are in its own
+/// `Sig` already.
+fn region_inert(p: &Program, def: DefId) -> bool {
+    let Some(a) = p.adt_by_def(def) else { return false };
+    p.gx.adt_lifetimes.get(&def).is_none_or(|l| l.is_empty())
+        && p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.iter().all(|q| matches!(q.kind, ParamKind::Const(_))))
+}
+
+/// The deep regions fingerprint of a `region_inert` Adt: its identity,
+/// and the `Drop` and auto trait impls its readers' borrow ends follow.
+fn regions_leaf(p: &Program, def: DefId) -> u64 {
+    let mut h = FxHasher::default();
+    "adt-regions-leaf-v2".hash(&mut h);
+    hash_def_pub(&mut h, p, def);
+    hash_structural_impls(&mut h, p, def);
+    h.finish()
+}
+
 /// Folds one Adt's own content for walk `kind` into `h`; `r` folds each
 /// Adt it names.
 fn hash_adt_own(h: &mut FxHasher, p: &Program, kind: Deep, def: DefId, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
     match kind {
-        Deep::Layout => hash_adt_layout(h, p, def, r),
+        Deep::Layout => hash_adt_layout(h, p, def, true, r),
+        Deep::Structure => hash_adt_layout(h, p, def, false, r),
         Deep::Regions => hash_adt_regions(h, p, def, r),
     }
 }
@@ -862,7 +996,7 @@ impl Scc<'_> {
         self.stack.push(v);
         let mut succ: Vec<DefId> = Vec::new();
         hash_adt_own(&mut FxHasher::default(), p, kind, v, &mut |_, d| {
-            if !succ.contains(&d) {
+            if !succ.contains(&d) && !(kind == Deep::Regions && region_inert(p, d)) {
                 succ.push(d);
             }
         });
@@ -887,7 +1021,12 @@ impl Scc<'_> {
         let mut members = self.stack.split_off(at);
         members.sort_unstable_by_key(|d| (def_crate_hash(p, *d), d.hash.0));
         let mut h = FxHasher::default();
-        (if kind == Deep::Layout { "adt-deep-layout-v1" } else { "adt-deep-regions-v1" }).hash(&mut h);
+        (match kind {
+            Deep::Layout => "adt-deep-layout-v2",
+            Deep::Structure => "adt-deep-structure-v1",
+            Deep::Regions => "adt-deep-regions-v1",
+        })
+        .hash(&mut h);
         (members.len() as u64).hash(&mut h);
         for &m in &members {
             hash_adt_own(&mut h, p, kind, m, &mut |h, d| match members.contains(&d) {
@@ -895,6 +1034,7 @@ impl Scc<'_> {
                     "scc-member".hash(h);
                     hash_def_pub(h, p, d);
                 }
+                false if kind == Deep::Regions && region_inert(p, d) => regions_leaf(p, d).hash(h),
                 false => memo.get(p, kind, d).unwrap_or_default().hash(h),
             });
         }
@@ -916,8 +1056,22 @@ impl Scc<'_> {
 /// `adt_deep`). Builtin Adts (String, Vec, Option)
 /// and unknown defs fold their def hash only: their layout is fixed by
 /// the compiler, never by a user edit.
-fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
+fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, by_value: bool, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
     "adt-layout-v2".hash(h);
+    // By value, `r` folds only the Adts a field holds inline; the others
+    // fold by identity, inside the field's type.
+    let field_ty = |h: &mut FxHasher, t: Ty, r: &mut dyn FnMut(&mut FxHasher, DefId)| {
+        if by_value {
+            hash_ty(h, p, &p.tys, t);
+            let (mut defs, mut hidden) = (Vec::new(), Vec::new());
+            by_value_adts(p, &p.tys, [t], &mut defs, &mut hidden);
+            for d in defs {
+                r(h, d);
+            }
+        } else {
+            hash_ty_refs(h, p, &p.tys, t, r);
+        }
+    };
     hash_def_pub(h, p, def);
     let Some(a) = p.adt_by_def(def) else { return };
     let adt = p.adt(a);
@@ -955,7 +1109,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(
                 }
             }
             for &(_, t) in &rec.assoc_tys {
-                hash_ty_refs(h, p, &p.tys, t, r);
+                field_ty(h, t, r);
             }
         }
     }
@@ -985,7 +1139,7 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(
             } else {
                 (i as u64).hash(h);
             }
-            hash_ty_refs(h, p, &p.tys, fd.ty, r);
+            field_ty(h, fd.ty, r);
         }
     }
 }
@@ -1174,13 +1328,87 @@ fn lang_impl_shape(p: &Program, rec: &crate::traits::index::ImplRecord) -> u64 {
 
 /// The `LayoutOf(adt)` node's fingerprint (section 8.1), separate from
 /// `Sig`: it covers only what layout and value semantics read (see
-/// `hash_adt_layout`), so an edit that changes a type's methods or a
-/// field's visibility does not dirty layout readers, and a field edit
-/// dirties them even when no signature that names the type changed text.
+/// `hash_adt_layout`), over the Adts a value holds inline (a type behind
+/// a pointer or in a collection folds by identity, `Deep::Layout`). So an
+/// edit that changes a type's methods or a field's visibility does not
+/// dirty layout readers, and a field edit dirties them even when no
+/// signature that names the type changed text.
 pub(crate) fn layout_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let mut h = FxHasher::default();
-    "layout-v2".hash(&mut h);
+    "layout-v3".hash(&mut h);
     adt_deep(p, Deep::Layout, def, &mut DeepMemo::default()).hash(&mut h);
+    Fingerprint(h.finish())
+}
+
+/// The kinds of `ReadKey::Answer`: the structural question asked of the Adt.
+pub(crate) mod answer {
+    /// `Send`, `Sync`, and `Unpin` together: a walk through `&T` asks
+    /// `Sync` of a `Send` question.
+    pub(crate) const AUTO: u8 = 0;
+    pub(crate) const CLONE: u8 = 1;
+    pub(crate) const PARTIAL_EQ: u8 = 2;
+    pub(crate) const EQ: u8 = 3;
+    pub(crate) const PARTIAL_ORD: u8 = 4;
+    pub(crate) const DEFAULT: u8 = 5;
+}
+
+/// True for an Adt template with no generic params at all: its structural
+/// answers are closed booleans (`ReadKey::Answer`).
+fn closed_adt(p: &Program, def: DefId) -> bool {
+    let Some(a) = p.adt_by_def(def) else { return false };
+    p.gx.adt_lifetimes.get(&def).is_none_or(|l| l.is_empty()) && p.gx.adt_generics.get(a.0 as usize).is_none_or(|g| g.params.is_empty())
+}
+
+/// The `Answer(adt, kind)` node's fingerprint: the answer for the closed
+/// type of the Adt (memoized while the program memo is on), or its
+/// `Structure` fingerprint for an Adt with generic params. Computed with
+/// the derive log closed: it notes nothing into a body that records it.
+fn answer_fingerprint(p: &Program, def: DefId, kind: u8) -> Fingerprint {
+    let slot = p.adt_by_def(def).and_then(|a| p.fp_memo.answers.get(a.0 as usize * ANSWER_KINDS + kind as usize));
+    if let Some(v) = slot.and_then(|s| s.get()) {
+        return Fingerprint(*v);
+    }
+    let mut h = FxHasher::default();
+    ("answer-v1", kind).hash(&mut h);
+    if closed_adt(p, def) {
+        use crate::check::collect as c;
+        crate::check::derive_delta::unlogged(|| {
+            let mut tys = crate::ty::Tys::new(&p.tys);
+            let t = tys.mk_adt(def, &[]);
+            let lang = &p.gx.lang;
+            match kind {
+                answer::AUTO => {
+                    for tr in [lang.send, lang.sync, lang.unpin] {
+                        c::auto_structural(p, &mut tys, &[], tr, t, &mut c::AutoSeen::default()).hash(&mut h);
+                    }
+                }
+                answer::CLONE => c::has_clone(p, &tys, t).hash(&mut h),
+                answer::PARTIAL_EQ => c::has_eq(p, &tys, t).hash(&mut h),
+                answer::EQ => c::has_total_eq(p, &tys, t).hash(&mut h),
+                answer::PARTIAL_ORD => c::has_ord(p, &tys, t).hash(&mut h),
+                _ => c::has_default(p, &tys, t).hash(&mut h),
+            }
+        });
+    } else {
+        structure_fingerprint(p, def).0.hash(&mut h);
+    }
+    let v = h.finish();
+    if let Some(s) = slot {
+        let _ = s.set(v);
+    }
+    Fingerprint(v)
+}
+
+/// `ReadKey::Answer` kinds per Adt in the program memo.
+const ANSWER_KINDS: usize = 6;
+
+/// The `Structure(adt)` node's fingerprint: the Adt's content and,
+/// transitively, that of every Adt its fields name, behind pointers and
+/// in collections too (`Deep::Structure`).
+pub(crate) fn structure_fingerprint(p: &Program, def: DefId) -> Fingerprint {
+    let mut h = FxHasher::default();
+    "structure-v1".hash(&mut h);
+    adt_deep(p, Deep::Structure, def, &mut DeepMemo::default()).hash(&mut h);
     Fingerprint(h.finish())
 }
 
@@ -1339,6 +1567,18 @@ fn binding_fingerprint(p: &Program, res: BindingRes) -> Fingerprint {
         }
         BindingRes::Ambiguous => 1u8.hash(&mut h),
         BindingRes::Absent => 2u8.hash(&mut h),
+    }
+    Fingerprint(h.finish())
+}
+
+/// The fingerprint of an `AssocVis` node: the item's visibility and the
+/// path of the module it is written in.
+fn assoc_vis_fingerprint(p: &Program, entry: Option<&(VisKind, ModuleId)>) -> Fingerprint {
+    let mut h = FxHasher::default();
+    "assoc-vis-v1".hash(&mut h);
+    if let (Some((vis, m)), Some(t)) = (entry, &p.resolved) {
+        hash_vis(&mut h, p, vis);
+        hash_module_path(&mut h, p, t, *m);
     }
     Fingerprint(h.finish())
 }
@@ -1577,17 +1817,8 @@ fn hash_vis_facts(h: &mut FxHasher, p: &Program, def: DefId) {
             hash_vis(h, p, vis);
         }
     }
-    if let Some(items) = t.assoc_vis.get(&def) {
-        let mut acc = 0u64;
-        for (name, (vis, m)) in items {
-            let mut e = FxHasher::default();
-            p.name(*name).hash(&mut e);
-            hash_vis(&mut e, p, vis);
-            hash_module_path(&mut e, p, t, *m);
-            acc = acc.wrapping_add(e.finish());
-        }
-        (items.len() as u64, acc).hash(h);
-    }
+    // Inherent item visibility is not here: its readers record one
+    // `AssocVis` read per item.
 }
 
 /// Folds one evaluated const value into `h`. `StaticRef` (`StaticPlace`) indices are
@@ -1691,10 +1922,14 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     if let Some(local) = p.local_def(def.hash).filter(|l| p.def_id(*l) == def) {
         let f = p.fn_info(local);
         0u8.hash(&mut h);
+        // Types fold shallow here, by identity: what a caller reads of a
+        // type's content it records itself (`Sig` reads of the Adts it
+        // opens, a `Layout` read of each type it holds by value,
+        // `record_type_layout_reads`), so an edit deep inside a type
+        // dirties those bodies, not every caller of every fn that names
+        // it. The same holds for a method's Self type.
         match f.owner {
-            // A method's signature reads its Self type's layout (field
-            // access through `self`, by-value copies, drop glue).
-            Some(a) => layout_fingerprint(p, p.def_of_adt(a)).0.hash(&mut h),
+            Some(a) => hash_def_pub(&mut h, p, p.def_of_adt(a)),
             None => 0u64.hash(&mut h),
         }
         match f.self_kind {
@@ -1706,7 +1941,7 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         }
         (f.params.len() as u64).hash(&mut h);
         for t in &f.params {
-            hash_ty_deep(&mut h, p, &p.tys, *t, &mut seen);
+            hash_ty(&mut h, p, &p.tys, *t);
         }
         // Qualifiers are part of the caller-visible signature (an
         // `unsafe fn` flip changes what callers may do). Parameter
@@ -1729,11 +1964,12 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         p.gx.static_dyn_fns.contains(&local).hash(&mut h);
         // `#[track_caller]` adds a C parameter callers pass (check/caller.rs).
         crate::check::caller::is_track_caller(p, local).hash(&mut h);
-        hash_ty_deep(&mut h, p, &p.tys, f.ret, &mut seen);
+        hash_ty(&mut h, p, &p.tys, f.ret);
         // A generic fn's `impl Trait` return: callers' revealed checks
-        // read its hidden type (check/opaque.rs).
+        // read its hidden type (check/opaque.rs); one that holds the
+        // value reads its layout (`record_type_layout_reads`).
         if let Some(&hidden) = p.gx.opaque_hidden.get(&crate::check::generics::opaque_def(def)) {
-            hash_ty_deep(&mut h, p, &p.tys, hidden, &mut seen);
+            hash_ty(&mut h, p, &p.tys, hidden);
         }
         // The bounds of its `impl Trait` return: all callers see of it
         // (`impl Sh + Clone` to `impl Sh + Send` drops `.clone()`).
@@ -1771,7 +2007,10 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         }
     } else if p.adt_by_def(def).is_some() {
         1u8.hash(&mut h);
-        layout_fingerprint(p, def).0.hash(&mut h);
+        // Its own content, the Adts its fields name by identity (as for
+        // a fn above): a body that opens a field's type records that
+        // type's `Sig` itself, and one that holds a value its `Layout`.
+        hash_adt_layout(&mut h, p, def, false, &mut |h, d| hash_def_pub(h, p, d));
         // Lifetime params and field regions (W-BORROW): `&'a T` and
         // `&'static T` fields erase alike.
         adt_deep(p, Deep::Regions, def, &mut seen).hash(&mut h);
@@ -1786,9 +2025,13 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
             // Whether `&C` is promoted (lower `promotable`).
             item.qualif.hash(&mut h);
         } else if let Some(item) = p.static_by_def(def).map(|i| &p.statics[i as usize]) {
+            // A static's type folds by identity: its readers hold a place,
+            // and its value is emitted in the glue unit, whose rebuild
+            // reads the deep type (`statics_fingerprint`). A const's value
+            // is inlined into its readers, so its type folds deep.
             1u8.hash(&mut h);
             item.mutable.hash(&mut h);
-            hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
+            hash_ty(&mut h, p, &p.tys, item.ty);
             value_fp(p, &item.value, &item.value_fp).hash(&mut h);
             // A `thread_local!` key's form and init fn (W-TLS): key
             // method calls carry both in their IR (lower/tls.rs).
@@ -1797,14 +2040,15 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
                 hash_def_pub(&mut h, p, p.def_id(k.init));
             }
         } else if let Some(ty) = p.aliases.get(&data.name) {
+            // The target by identity, as a signature type.
             1u8.hash(&mut h);
-            hash_ty_deep(&mut h, p, &p.tys, *ty, &mut seen);
+            hash_ty(&mut h, p, &p.tys, *ty);
         } else if let Some(la) = p.gx.generic_aliases.get(&data.name) {
             // A lifetime alias (W-BORROW) resolves at each use: its tokens
             // carry the regions, its erased body the type.
             2u8.hash(&mut h);
             la.body_hash.hash(&mut h);
-            hash_ty_deep(&mut h, p, &p.tys, la.erased, &mut seen);
+            hash_ty(&mut h, p, &p.tys, la.erased);
         } else {
             p.name(data.name).hash(&mut h);
         }
@@ -1817,7 +2061,7 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         2u8.hash(&mut h);
         1u8.hash(&mut h);
         item.mutable.hash(&mut h);
-        hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut seen);
+        hash_ty(&mut h, p, &p.tys, item.ty);
         value_fp(p, &item.value, &item.value_fp).hash(&mut h);
         if let Some(k) = item.tls {
             k.eager.hash(&mut h);
@@ -1833,11 +2077,13 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
         hash_region_sig(&mut h, p, Some(rs));
     }
     // Param defaults (W-CHECK-G): `S<u8>` means `S<u8, D>`, so a default
-    // edit changes what every path that omits the arg names.
+    // edit changes what every path that omits the arg names. The default
+    // folds by identity, as signature types do: a reader of the type it
+    // names records its own reads.
     if let Some(ds) = p.gx.param_defaults.get(&def) {
         for d in ds {
             match d {
-                Some(GenericArg::Ty(t)) => hash_ty_deep(&mut h, p, &p.tys, *t, &mut seen),
+                Some(GenericArg::Ty(t)) => hash_ty(&mut h, p, &p.tys, *t),
                 Some(GenericArg::Const(c)) => p.tys.const_kind(*c).hash(&mut h),
                 _ => 0u8.hash(&mut h),
             }
@@ -1847,9 +2093,9 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
 }
 
 /// The fingerprint of the program's statics as the glue unit emits
-/// them: each static's `Sig` fingerprint (deep type plus evaluated
-/// value; its visibility rides along, so a visibility edit costs one
-/// glue rebuild) in definition order. The driver stores the fingerprint of
+/// them: each static's `Sig` fingerprint (evaluated value; its
+/// visibility rides along, so a visibility edit costs one glue rebuild)
+/// and its type's deep content, in definition order. The driver stores the fingerprint of
 /// the statics last built into a glue unit and rebuilds that unit
 /// when a later build's statics differ. This must be a built-state
 /// comparison, not an edit trigger: a `check` request consumes the
@@ -1877,6 +2123,11 @@ pub(crate) fn statics_fingerprint(p: &Program) -> u64 {
     (p.static_defs.len() as u64).hash(&mut h);
     for &def in &p.static_defs {
         sig_fingerprint(p, def).0.hash(&mut h);
+        // The glue unit emits the value in the type's C layout: the type's
+        // deep content joins here (the `Sig` folds it by identity).
+        if let Some(item) = p.static_by_def(def).map(|i| &p.statics[i as usize]) {
+            hash_ty_deep(&mut h, p, &p.tys, item.ty, &mut DeepMemo::default());
+        }
     }
     h.finish()
 }
@@ -2104,6 +2355,59 @@ impl<'a> Program {
         }
     }
 
+    /// Records a `Layout` read of each user Adt template that one body's
+    /// expression, pattern, and local types hold by value:
+    /// inline, in a tuple, array, or enum payload, in a closure's captures,
+    /// an opaque's hidden type, or the args of a generic type that holds
+    /// them (`points_at_args`). Drop glue, copies, sizes, and tags of a value follow
+    /// its deep layout, which fn and Adt signatures fold only shallow
+    /// (`sig_fingerprint`). A reference, raw pointer, `Box`, `Vec`, `Rc`,
+    /// `Arc`, or hashed collection points at its target, so a type held
+    /// only behind one costs no read here; the readers that look through
+    /// one record their own (auto traits, release C field offsets).
+    pub fn record_type_layout_reads(&self, reads: &mut Reads, tys: &impl TyIntern, types: impl IntoIterator<Item = Ty>) {
+        if reads.off {
+            return;
+        }
+        let mut defs: Vec<DefId> = Vec::new();
+        let mut hidden: Vec<Ty> = Vec::new();
+        by_value_adts(self, tys, types, &mut defs, &mut hidden);
+        // Hidden types live in the program's interner, as do theirs.
+        let mut opened: FxMap<Ty, ()> = FxMap::default();
+        while !hidden.is_empty() {
+            let next: Vec<Ty> = std::mem::take(&mut hidden).into_iter().filter(|&t| opened.insert(t, ()).is_none()).collect();
+            by_value_adts(self, &self.tys, next, &mut defs, &mut hidden);
+        }
+        defs.sort_unstable_by_key(|d| (d.krate.0, d.hash.0));
+        defs.dedup();
+        for def in defs {
+            if self.user_adt(def) {
+                let _ = self.layout_of(reads, def);
+            }
+        }
+    }
+
+    /// Notes (check/derive_delta.rs, `bit::LAYOUT`) a `Layout` read of Adt
+    /// `a` (its template, for an instance) and of each user Adt its
+    /// instance args name: release C bakes its field offsets into a body
+    /// that may hold it only behind a pointer.
+    pub(crate) fn note_adt_layout(&self, a: AdtId) {
+        if !crate::check::derive_delta::open() {
+            return;
+        }
+        let Some(def) = self.derive_def(a) else { return };
+        let mut defs = vec![def];
+        if let Some(Some((_, args))) = self.gx.adt_instance_of.get(a.0 as usize) {
+            for g in self.tys.args(*args) {
+                if let GenericArg::Ty(t) = *g {
+                    collect_adt_defs(self, &self.tys, t, &mut defs);
+                }
+            }
+        }
+        defs.retain(|&d| self.user_adt(d));
+        crate::check::derive_delta::note_defs(&defs, crate::check::derive_delta::bit::LAYOUT);
+    }
+
     /// True for an Adt template of user source: not spliced std source,
     /// not a shipped crate, not a builtin def. Only these key
     /// `LangImpls` reads (`ImplIndex::name_adts`): no user impl of a std
@@ -2185,7 +2489,8 @@ impl<'a> Program {
     /// The layout fingerprint of one Adt def (`layout_fingerprint`),
     /// recorded as a `Layout` read. It is separate from the Adt's `Sig`
     /// fingerprint: a method or visibility edit on the type does not
-    /// move it, and a field, repr, derive, or discriminant edit does.
+    /// move it, and a field, repr, or discriminant edit of the type or of
+    /// one it holds by value does.
     pub fn layout_of(&self, reads: &mut Reads, adt: DefId) -> Option<Fingerprint> {
         let known = self.adt_by_def(adt).is_some() || self.defs.get(adt).is_some();
         if !known {
@@ -2215,6 +2520,41 @@ impl<'a> Program {
         for def in defs {
             let _ = self.layout_of(reads, def);
         }
+    }
+
+    /// Records the reads of a structural answer (an auto trait, a derive
+    /// glue walk, `kind` of `answer`) about one type: for every Adt inside
+    /// it that the walk looks at (not behind the pointers whose answer is
+    /// fixed, `Behind`: `Rc<Checker>: Clone` reads nothing of `Checker`),
+    /// the `Answer` of a user Adt with no generic params, else its
+    /// `Structure`.
+    pub(crate) fn record_structure_reads(&self, reads: &mut Reads, tys: &impl TyIntern, t: Ty, behind: Behind, kind: u8) {
+        if reads.off {
+            return;
+        }
+        let mut defs = Vec::new();
+        collect_adt_defs_where(self, tys, t, &mut defs, &|x| stops_at(tys, x, behind));
+        defs.sort_unstable_by_key(|d| (d.krate.0, d.hash.0));
+        defs.dedup();
+        for def in defs {
+            if self.user_adt(def) && closed_adt(self, def) {
+                reads.record_with(ReadKey::Answer(def, kind), false, || answer_fingerprint(self, def, kind));
+            } else {
+                let known = self.adt_by_def(def).is_some() || self.defs.get(def).is_some();
+                reads.record_with(ReadKey::Structure(def), !known, || structure_fingerprint(self, def));
+            }
+        }
+    }
+
+    /// The `assoc_vis` entry of inherent item `name` of Adt `def`.
+    fn assoc_vis_entry(&self, def: DefId, name: Sym) -> Option<&(VisKind, ModuleId)> {
+        self.resolved.as_ref()?.assoc_vis.get(&def)?.get(&name)
+    }
+
+    /// Records the `AssocVis` read of inherent item `name` of Adt `def`.
+    pub(crate) fn record_assoc_vis(&self, reads: &mut Reads, def: DefId, name: Sym) {
+        let entry = self.assoc_vis_entry(def, name);
+        reads.record_with(ReadKey::AssocVis(def, name), entry.is_none(), || assoc_vis_fingerprint(self, entry));
     }
 
     /// Whether a user trait is defined in or imported into `module`
@@ -2293,6 +2633,15 @@ impl<'a> Program {
             ReadKey::LangImpls(def) => {
                 Read { fingerprint: lang_impls_fingerprint(self, *def), failed: self.gx.index.impls_naming(*def).next().is_none() }
             }
+            ReadKey::Structure(def) => {
+                let known = self.adt_by_def(*def).is_some() || self.defs.get(*def).is_some();
+                Read { fingerprint: structure_fingerprint(self, *def), failed: !known }
+            }
+            ReadKey::AssocVis(def, name) => {
+                let entry = self.assoc_vis_entry(*def, *name);
+                Read { fingerprint: assoc_vis_fingerprint(self, entry), failed: entry.is_none() }
+            }
+            ReadKey::Answer(def, kind) => Read { fingerprint: answer_fingerprint(self, *def, *kind), failed: self.adt_by_def(*def).is_none() },
         }
     }
 
@@ -2516,7 +2865,9 @@ impl Program {
     fn derive_key_moves_uncached(&self, m: &mut DeriveMoves, key: &ReadKey) -> bool {
         let reach = m.reach;
         match key {
-            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) => self.adt_by_def(*d).is_none_or(|a| reach.row(self, a.0 as usize)) || self.hasher_reaches(m, *d),
+            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) | ReadKey::Structure(d) | ReadKey::Answer(d, _) => {
+                self.adt_by_def(*d).is_none_or(|a| reach.row(self, a.0 as usize)) || self.hasher_reaches(m, *d)
+            }
             // Impl shapes fold types shallow: no derive list.
             ReadKey::LangImpls(_) => false,
             ReadKey::Sig(def) => self.sig_moves(m, *def),
@@ -2543,7 +2894,7 @@ impl Program {
                     self.gx.index.by_def(d).is_none_or(|(_, rec)| reach.record(&self.tys, rec) || rec.items.iter().any(|&it| self.sig_moves(m, it)))
                 })
             }
-            ReadKey::Checked(_) | ReadKey::TraitInScope(..) => false,
+            ReadKey::Checked(_) | ReadKey::TraitInScope(..) | ReadKey::AssocVis(..) => false,
         }
     }
 
@@ -2595,9 +2946,9 @@ impl Program {
                 _ => Some(false),
             },
             ReadKey::MethodSet(k) => Some(matches!(k.head, Head::Adt(d) if row(d)) || m.names.contains_key(&k.name)),
-            ReadKey::Checked(_) | ReadKey::TraitInScope(..) => Some(false),
+            ReadKey::Checked(_) | ReadKey::TraitInScope(..) | ReadKey::AssocVis(..) => Some(false),
             // As `sig_moves` answers for an Adt def (no fn has that def).
-            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) => match self.adt_by_def(*d) {
+            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) | ReadKey::Structure(d) | ReadKey::Answer(d, _) => match self.adt_by_def(*d) {
                 None => Some(true),
                 Some(_) => m.sig.get(d).copied(),
             },
@@ -3264,11 +3615,12 @@ fn main() {}
         assert!(dirty_in(&interner, &known, fixed, &failing) >= 1, "added def dirties the failed lookup");
     }
 
-    /// Type edits dirty through deep signature fingerprints: a body
-    /// that only receives a struct from a callee and reads a nested
-    /// field rechecks when the nested type changes, and stays clean
-    /// when an unrelated type changes. This is what lets the dirty
-    /// walk run in full mode (type edits), not only on signature text.
+    /// Type edits dirty through a body's own reads: a body that only
+    /// receives a struct from a callee and reads a nested field rechecks
+    /// when the nested type changes (the `Layout` read of the struct it
+    /// holds; `make`'s `Sig` folds `Outer` by name only), and stays clean
+    /// when an unrelated type changes. This is what lets the dirty walk
+    /// run in full mode (type edits), not only on signature text.
     #[test]
     fn dirty_walk_covers_type_edits_through_deep_sigs() {
         let interner = std::sync::Arc::new(Interner::default());
@@ -3283,7 +3635,7 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         let reads = main_reads(&interner, &known, src);
         assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
         let nested = src.replace("struct Inner { x: i64 }", "struct Inner { x: bool }");
-        assert!(dirty_in(&interner, &known, &nested, &reads) >= 1, "nested field type edit dirties through make's Sig");
+        assert!(dirty_in(&interner, &known, &nested, &reads) >= 1, "nested field type edit dirties through Layout(Outer)");
         // Derive lists left the layout (P3.3): a body dirties on a derive
         // edit only through its own Derives / DeriveBits reads.
         let derive = src.replace("struct Inner { x: i64 }", "#[derive(Clone)]\nstruct Inner { x: i64 }");
@@ -3292,18 +3644,75 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         assert_eq!(dirty_in(&interner, &known, &unrelated, &reads), 0, "unrelated type edit stays clean");
     }
 
+    /// A field read through a reference records the struct's `Sig`, with
+    /// or without module tables: the body holds no value of the struct,
+    /// and the signature that gave it the reference names the struct by
+    /// identity only. A field type edit dirties the body.
+    #[test]
+    fn field_reads_through_references_record_the_struct() {
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let src = "\
+struct Foo { x: i64, y: i64 }
+fn get(o: &Foo) -> i64 { o.x }
+fn main() {}
+";
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        let (ck, errs) = check_fn(&program, program.fn_names[&interner.intern("get")]);
+        assert!(errs.is_empty(), "{errs:?}");
+        let retyped = src.replace("x: i64, y", "x: u8, y");
+        assert!(dirty_in(&interner, &known, &retyped, &ck.reads) >= 1, "the read field's type edit dirties the body");
+        let other = src.replace("y: i64", "y: u8");
+        assert!(dirty_in(&interner, &known, &other, &ck.reads) >= 1, "so does an edit of another field (the field list is one Sig)");
+    }
+
+    /// An auto trait question about a type with no generic params reads
+    /// the answer (`ReadKey::Answer`), not the type's whole structure: a
+    /// field edit inside the type that keeps it `Send` keeps the body that
+    /// asks clean; a field that makes it not `Send` dirties the body.
+    #[test]
+    fn auto_trait_questions_read_the_answer() {
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let src = "\
+struct Inner { x: i64 }
+struct Outer { a: Inner }
+fn need_send<T: Send>(_: &T) {}
+fn ask(o: &Outer) { need_send(o); }
+fn main() {}
+";
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        let (ck, errs) = check_fn(&program, program.fn_names[&interner.intern("ask")]);
+        assert!(errs.is_empty(), "{errs:?}");
+        let reads = ck.reads;
+        assert!(reads.keys().any(|k| matches!(k, ReadKey::Answer(_, answer::AUTO))), "the Send question reads Answer(Outer)");
+        assert!(!reads.keys().any(|k| matches!(k, ReadKey::Structure(_))), "and no Structure");
+        let kept = src.replace("struct Inner { x: i64 }", "struct Inner { x: i64, y: u8 }");
+        assert_eq!(dirty_in(&interner, &known, &kept, &reads), 0, "a field that keeps Send keeps the body clean");
+        let lost = src.replace("struct Inner { x: i64 }", "struct Inner { x: *const i64 }");
+        assert!(dirty_in(&interner, &known, &lost, &reads) >= 1, "a raw pointer field makes Outer not Send");
+    }
+
     /// The layout fingerprint is its own node: it moves on field edits,
     /// not on a method or derive edit of the same type, and
     /// `layout_of` records it so the walk replays it.
     /// Deep fingerprints (`adt_deep`) over a type graph with a shared
     /// sub-type and a cycle: the same values with the program memo on or
-    /// off, in any order, and for any item order in the source; an edit
-    /// moves every type that reaches it and no other.
+    /// off, in any order, and for any item order in the source. A
+    /// structure edit moves every type that reaches it and no other; a
+    /// layout edit only the types that hold it by value (not behind the
+    /// `Box`es of the cycle).
     #[test]
     fn deep_fingerprints_are_memo_and_order_free() {
         const SRC: &str = "struct A { b: Box<B>, c: C }\nstruct B { a: Option<Box<A>>, x: u8 }\nstruct C { x: u32 }\n\
                            struct D { a: A, c: C, e: (C, [C; 2]) }\nfn main() {}\n";
-        fn fps(src: &str, memo: bool, rev: bool) -> Vec<(Fingerprint, Fingerprint)> {
+        fn fps(src: &str, memo: bool, rev: bool) -> Vec<(Fingerprint, Fingerprint, Fingerprint)> {
             let mut out = Vec::new();
             with_program(src, |interner, p| {
                 if memo {
@@ -3315,7 +3724,7 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
                 }
                 for n in names {
                     let def = p.def_of_adt(p.type_names[&interner.intern(n)]);
-                    out.push((layout_fingerprint(p, def), sig_fingerprint(p, def)));
+                    out.push((layout_fingerprint(p, def), sig_fingerprint(p, def), structure_fingerprint(p, def)));
                 }
                 if rev {
                     out.reverse();
@@ -3328,11 +3737,15 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         assert_eq!(fps(SRC, true, true), base, "walk order does not matter");
         let moved = SRC.replace("struct C { x: u32 }\n", "").replace("fn main", "struct C { x: u32 }\nfn main");
         assert_eq!(fps(&moved, true, false), base, "item order does not matter");
-        let layouts = |v: &[(Fingerprint, Fingerprint)]| v.iter().map(|x| x.0).collect::<Vec<_>>();
-        let (b, c) = (layouts(&base), layouts(&fps(&SRC.replace("x: u32", "x: u64"), true, false)));
-        assert!(b.iter().zip(&c).all(|(x, y)| x != y), "C's edit moves A, B (through A), C, and D");
-        let c = layouts(&fps(&SRC.replace("x: u8", "x: u16"), true, false));
-        assert_eq!((b[0] != c[0], b[1] != c[1], b[2] != c[2], b[3] != c[3]), (true, true, false, true), "B's edit moves its cycle and D");
+        let moved = |a: &[(Fingerprint, Fingerprint, Fingerprint)], b: &[(Fingerprint, Fingerprint, Fingerprint)], f: fn(&(Fingerprint, Fingerprint, Fingerprint)) -> Fingerprint| {
+            a.iter().zip(b).map(|(x, y)| f(x) != f(y)).collect::<Vec<_>>()
+        };
+        let c_edit = fps(&SRC.replace("x: u32", "x: u64"), true, false);
+        let b_edit = fps(&SRC.replace("x: u8", "x: u16"), true, false);
+        assert_eq!(moved(&base, &c_edit, |x| x.2), [true, true, true, true], "C's edit moves the structure of A, B (through A), C, and D");
+        assert_eq!(moved(&base, &b_edit, |x| x.2), [true, true, false, true], "B's edit moves the structure of its cycle and D");
+        assert_eq!(moved(&base, &c_edit, |x| x.0), [true, false, true, true], "C's edit moves the layout of A, C, and D: B holds A in a Box");
+        assert_eq!(moved(&base, &b_edit, |x| x.0), [false, true, false, false], "B's edit moves only B's layout: A holds B in a Box");
     }
 
     /// The memo that follows mono (`FpMemo::sync`): a table the deep
@@ -3395,11 +3808,12 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
         });
     }
 
-    /// `Sig` covers member visibility (ARCH 8.1): the field and method
-    /// privacy checks record a `Sig(adt)` read, and a visibility-only
-    /// edit moves that fingerprint (so the stored read is dirty) while
-    /// the layout stands. The tables are built by hand here; the daemon
-    /// cases in scripts/fuzz/smoke.py run the same edge end to end.
+    /// Member visibility (ARCH 8.1): the field privacy check records a
+    /// `Sig(adt)` read and the method privacy check an `AssocVis` read of
+    /// the one method; a visibility-only edit moves that fingerprint (so
+    /// the stored read is dirty) while the layout stands, and a method's
+    /// edit leaves `Sig(adt)` alone. The tables are built by hand here; the
+    /// daemon cases in scripts/fuzz/smoke.py run the same edge end to end.
     #[test]
     fn sig_covers_member_visibility() {
         let src = "struct Foo { x: i64 }\nimpl Foo { fn get(&self) -> i64 { self.x } }\n\
@@ -3411,8 +3825,9 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
                 assert!(errs.is_empty(), "{errs:?}");
                 ck.reads.clone()
             };
-            // No module tables: one module, no privacy check, no read.
-            assert!(!main_reads(p).contains(&ReadKey::Sig(def)));
+            // No module tables: no privacy check, but the field read still
+            // records Sig(Foo) (its type).
+            assert!(main_reads(p).contains(&ReadKey::Sig(def)), "a field read records Sig(Foo) without module tables too");
             let mut tables = ResolvedTables::new(interner.intern("test"));
             tables.field_vis.insert(def, (ROOT_MODULE, [(interner.intern("x"), VisKind::Pub)].into_iter().collect()));
             tables.assoc_vis.insert(def, [(interner.intern("get"), (VisKind::Pub, ROOT_MODULE))].into_iter().collect());
@@ -3429,9 +3844,13 @@ fn main() { let v = make(); println!(\"{}\", v.f.x); }
             let t = std::sync::Arc::get_mut(p.resolved.as_mut().unwrap()).unwrap();
             t.field_vis.get_mut(&def).unwrap().1.insert(interner.intern("x"), VisKind::Pub);
             assert_eq!(sig_fingerprint(p, def), sig, "the edit back restores Sig");
+            let get = ReadKey::AssocVis(def, interner.intern("get"));
+            let vis = stored.get(&get).map(|r| r.fingerprint);
+            assert!(vis.is_some(), "the method privacy check reads AssocVis(Foo::get)");
             let t = std::sync::Arc::get_mut(p.resolved.as_mut().unwrap()).unwrap();
             t.assoc_vis.get_mut(&def).unwrap().insert(interner.intern("get"), (VisKind::Crate, ROOT_MODULE));
-            assert_ne!(sig_fingerprint(p, def), sig, "a method visibility edit moves Sig");
+            assert_eq!(sig_fingerprint(p, def), sig, "a method visibility edit leaves Sig(Foo)");
+            assert_ne!(Some(p.read_fingerprint(&get).fingerprint), vis, "and moves AssocVis(Foo::get)");
             assert!(p.reads_dirty(&stored) > 0, "the method caller is dirty");
         });
     }

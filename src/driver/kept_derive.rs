@@ -126,6 +126,9 @@ pub(super) fn apply_derives(
                     K::Derives(_) => "Derives",
                     K::DeriveBits(..) => "DeriveBits",
                     K::LangImpls(_) => "LangImpls",
+                    K::AssocVis(..) => "AssocVis",
+                    K::Structure(_) => "Structure",
+                    K::Answer(..) => "Answer",
                 };
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 match kinds.iter_mut().find(|x| x.0 == name) {

@@ -812,10 +812,28 @@ impl OffsetPlace {
 /// The layout of `t` when its fields can be read by offset (a struct, enum or tuple
 /// with a known C layout, not packed).
 fn offset_layout(p: &Program, t: &CTy) -> Option<Layout> {
+    note_offset_layout(p, t);
     match t {
         CTy::Adt(a) if p.adt(*a).repr.pack.is_none() => c_layout(p, t),
         CTy::Tuple(_) => c_layout(p, t),
         _ => None,
+    }
+}
+
+/// Notes a `Layout` read of the Adts whose layout an offset read of `t`
+/// bakes in (`Program::note_adt_layout`): `t` and what it holds by value.
+/// The body may hold `t` only behind the pointer it reads through, which
+/// its type reads do not cover (`Program::record_type_layout_reads`).
+fn note_offset_layout(p: &Program, t: &CTy) {
+    match t {
+        CTy::Adt(a) => p.note_adt_layout(*a),
+        CTy::Tuple(es) => es.iter().for_each(|e| note_offset_layout(p, e)),
+        CTy::Array(e, _) | CTy::Option(e) => note_offset_layout(p, e),
+        CTy::Result(a, b) => {
+            note_offset_layout(p, a);
+            note_offset_layout(p, b);
+        }
+        _ => {}
     }
 }
 
@@ -2766,6 +2784,7 @@ impl FnGen<'_, '_> {
         let (inner, off) = match (pr, t) {
             (Proj::Deref, CTy::Ref(inner) | CTy::Boxed(inner) | CTy::Ptr(inner)) if offset_layout(self.p, inner).is_some() => ((**inner).clone(), 0),
             (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) => {
+                note_offset_layout(self.p, inner);
                 let l = c_layout(self.p, inner).filter(|l| l.align > 0)?;
                 ((**inner).clone(), 16u64.div_ceil(l.align) * l.align)
             }

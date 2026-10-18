@@ -1175,6 +1175,59 @@ def case_trait_default_nested():
     d.kill()
 
 
+def case_deep_type_edits():
+    # 24. Fn and Adt signatures fold the types they name by identity: an
+    # edit inside a type that a central struct holds dirties the bodies
+    # that open it (field reads), hold it by value (`Layout` reads), or
+    # ask an auto trait or drop glue of it, not every caller of the
+    # struct's methods. Thirty `&Hub` callers of `Hub::get` stay clean
+    # when `Leaf` gains a field; a new field with drop glue, and one that
+    # makes `Hub` not `Sync`, answer as cold.
+    work = tempfile.mkdtemp(prefix="lust-driver-deep-types-")
+    d = Daemon(work)
+    src = os.path.join(work, "x.rs")
+    out = os.path.join(work, "x")
+    leaf = "#[derive(Default)]\nstruct Leaf {\n    x: i64,\n}\n"
+    head = ("#[derive(Default)]\nstruct Noisy;\nimpl Drop for Noisy {\n    fn drop(&mut self) { println!(\"drop\"); }\n}\n"
+            "struct Hub {\n    leaf: Leaf,\n    n: i64,\n}\n"
+            "impl Hub {\n    fn new() -> Hub { Hub { leaf: Leaf { x: 1, ..Default::default() }, n: 2 } }\n"
+            "    fn get(&self) -> i64 { self.leaf.x + self.n }\n}\n"
+            "fn need_sync<T: Sync>(_: &T) {}\n")
+    callers = "".join(f"fn q{i}(h: &Hub) -> i64 {{ h.get() + {i} }}\n" for i in range(30))
+    main = "fn main() {\n    let h = Hub::new();\n    need_sync(&h);\n    println!(\"{}\", " + " + ".join(f"q{i}(&h)" for i in range(30)) + ");\n}\n"
+    base = leaf + head + callers + main
+    steps = [
+        ("base", base, None),
+        ("a field added to Leaf", base.replace("    x: i64,\n}", "    x: i64,\n    y: u8,\n}", 1), "few"),
+        ("a field with drop glue in Leaf", base.replace("    x: i64,\n}", "    x: i64,\n    z: Noisy,\n}", 1), "few"),
+        ("a field that is not Sync in Leaf", base.replace("    x: i64,\n}", "    x: i64,\n    c: std::cell::Cell<i64>,\n}", 1), None),
+        ("back", base, "few"),
+    ]
+
+    def cold(text):
+        cw = tempfile.mkdtemp(prefix="lust-driver-deep-types-cold-")
+        csrc = os.path.join(cw, "x.rs")
+        open(csrc, "w").write(text)
+        env = dict(os.environ, LUST_NO_DAEMON="1", LUST_CACHE_DIR=os.path.join(cw, "c"))
+        c = lust_run([LUST, "check", csrc], cwd=cw, env=env, capture_output=True)
+        b = lust_run([LUST, "build", csrc, "-o", os.path.join(cw, "x")], cwd=cw, env=env, capture_output=True)
+        r = run_prog(os.path.join(cw, "x")) if b.returncode == 0 else None
+        shutil.rmtree(cw, ignore_errors=True)
+        return (c.returncode, r.stdout if r else None)
+
+    d.start()
+    for name, text, expect in steps:
+        open(src, "w").write(text)
+        c = d.run(["check", src], expect=None)
+        st = parse_stats(c.stderr)
+        b = d.run(["build", src, "-o", out], expect=None)
+        r = run_prog(out) if b.returncode == 0 else None
+        check(f"deep type edits, {name}: warm equals cold", (c.returncode, r.stdout if r else None) == cold(text), c.stderr[-200:])
+        if expect == "few":
+            check(f"deep type edits, {name}: the &Hub callers stay clean", st.get("rechecked", 99) <= 8, str(st))
+    d.kill()
+
+
 def main():
     if not os.path.exists(LUST):
         sys.exit(f"{LUST} not built; run cargo build --release first")
@@ -1185,7 +1238,7 @@ def main():
              case_moved_and_revived_slots, case_instance_calls_moved_slot,
              case_nested_identity_and_shadowing, case_stable_instance_ids,
              case_user_trait_impl_edits, case_inherent_impl_edits, case_dep_std_edits,
-             case_trait_default_nested)
+             case_trait_default_nested, case_deep_type_edits)
     # One case that raises (a failed assert, a timeout, an OS error)
     # fails that case only: the rest still run, and the summary line
     # below is always the last line, as the gate's need_ok requires.
