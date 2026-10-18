@@ -1184,17 +1184,6 @@ impl ResolveCache {
         }
     }
 
-    /// The rewrite epoch under which one file's final chunk is cached.
-    fn final_epoch(&self, key: &str, text_hash: u64, file_id: FileId) -> Option<u64> {
-        self.peek(key, text_hash, file_id).and_then(|e| e.final_chunk.as_ref()).map(|c| c.epoch)
-    }
-
-    /// One file's cached final chunk, cloned out; the cache keeps
-    /// its copy for the next request.
-    fn final_chunk(&self, key: &str, text_hash: u64, file_id: FileId) -> Option<FinalChunk> {
-        self.peek(key, text_hash, file_id).and_then(|e| e.final_chunk.clone())
-    }
-
     fn put_final(&mut self, key: &str, text_hash: u64, file_id: FileId, chunk: FinalChunk) {
         if !self.one_shot {
             self.entry(key, text_hash, file_id).final_chunk = Some(chunk);
