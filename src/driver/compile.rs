@@ -4148,7 +4148,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             None => ROOT_FILE.0,
         })
         .collect();
-    let outs = par_map(&bodies, |(i, b)| cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot));
+    // Release C (driver/release_c.rs): content-addressed names, set as cgen's naming
+    // context around every step that prints C.
+    let release = super::release_c::on(caches.persistent);
+    let rnames = release.then(|| super::release_c::names(&program, &front.fn_slot, front.slot_of.len().max(caches.out.len()), &inst_adt_ids(&program)));
+    let rn = rnames.as_ref();
+    let outs = par_map(&bodies, |(i, b)| cgen::names::with(rn, || cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot)));
     if let Some(e) = outs.iter().find_map(|o| o.error.clone()) {
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
@@ -4263,9 +4268,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     caches.glue_slots_fp = glue_slots_fp;
     let (shared_changed, regenerated) = if caches.glue_stale || glue_slots_changed || caches.objects != Some(req.debug) {
         caches.glue_stale = false;
-        caches.glue.refresh(&program, &front.fn_slot, caches.out.iter().flat_map(|o| o.glue.iter()))
+        cgen::names::with(rn, || caches.glue.refresh(&program, &front.fn_slot, caches.out.iter().flat_map(|o| o.glue.iter())))
     } else {
-        caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter()))
+        cgen::names::with(rn, || caches.glue.add(&program, &front.fn_slot, bodies.iter().flat_map(|(i, _)| caches.out[slot(*i)].glue.iter())))
     };
     if regenerated {
         caches.objects = None;
@@ -4399,6 +4404,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     if fresh_base || caches.glue.shared.is_none() {
         caches.glue.compute_shared(&caches.out, &groups, 3);
     }
+    // Release C: every glue key is shared (fn units hold its prototype, `glue_shards`
+    // its definition: a set that follows the grouping would move with it), and the fn
+    // units are `release_c::groups`.
+    let rgroups = rnames.as_ref().map(|names| {
+        caches.glue.shared = Some(caches.glue.protos.keys().cloned().collect());
+        let mut file = vec![String::new(); caches.out.len()];
+        let mut line = vec![0u32; caches.out.len()];
+        for i in 0..front.fn_slot.len().min(program.fns.len()) {
+            let s = slot(i);
+            if let (Some(f), Some(l)) = (file.get_mut(s), line.get_mut(s)) {
+                *f = fn_files.get(i).and_then(|&f| file_paths.get(f as usize)).cloned().unwrap_or_default();
+                *l = line_base_of(front, i);
+            }
+        }
+        super::release_c::groups(&caches.out, names, &file, &line)
+    });
     let gen_unit = |u: usize, overlay: bool| match u {
         0 => cgen::main_unit(main_slot, &registered, cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])),
         1 => cgen::glue_unit(&program, &caches.glue),
@@ -4407,18 +4428,60 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         LOC_UNIT => cgen::loc_unit(&files, &slot_lines),
         g => {
             let register = if overlay { format!("lust_overlay_u{g}") } else { format!("lust_register_u{g}") };
-            cgen::fn_unit(&program, &caches.out, groups[g - FIRST_FN_UNIT].clone(), &caches.glue, &register, Some(main_slot))
+            cgen::fn_unit(&program, &caches.out, &groups[g - FIRST_FN_UNIT].clone().collect::<Vec<_>>(), &caches.glue, &register, Some(main_slot))
         }
     };
-    let units: Vec<(PathBuf, String)> =
-        par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay)));
+    // Release C glue shards come after the fn units (`link_fn_units` counts both).
+    let rshards: Vec<String> = match &rgroups {
+        Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, super::release_c::unit_bytes())),
+        None => Vec::new(),
+    };
+    let units: Vec<(PathBuf, String)> = match &rgroups {
+        None => par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay))),
+        Some(rg) => {
+            let mut jobs: Vec<usize> = vec![0, 1, 2, 3, LOC_UNIT];
+            jobs.extend((0..rg.len()).map(|g| g + FIRST_FN_UNIT));
+            let mut units = par_map(&jobs, |&u| {
+                let c = cgen::names::with(rn, || match u {
+                    0 => cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])),
+                    1 => cgen::names::statics_unit(&program, &caches.glue),
+                    2 => cgen::runtime_unit(),
+                    3 => super::release_c::table_unit(&rg.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()),
+                    LOC_UNIT => {
+                        let live = (0..caches.out.len()).filter(|&s| !caches.out[s].code.is_empty()).map(|s| s as u32);
+                        cgen::loc_unit(&files, &slot_lines) + &cgen::names::slot_table(live)
+                    }
+                    g => {
+                        let (reg, slots) = &rg[g - FIRST_FN_UNIT];
+                        cgen::fn_unit(&program, &caches.out, slots, &caches.glue, reg, Some(main_slot))
+                    }
+                });
+                (base_obj(u), c)
+            });
+            let first = FIRST_FN_UNIT + rg.len();
+            units.extend(rshards.iter().enumerate().map(|(j, c)| (base_obj(first + j), c.clone())));
+            units
+        }
+    };
+    // The units the link takes after 1..4: release C has its own fn units and glue shards.
+    let link_fn_units: Vec<usize> = match &rgroups {
+        Some(rg) => (0..rg.len() + rshards.len()).map(|g| g + FIRST_FN_UNIT).collect(),
+        None => fn_units.clone(),
+    };
     if let Some(p) = &req.emit_c {
         // Emitted C must be self-contained: write every base unit, not only the units
         // rebuilt for this (possibly warm, incremental) build.
-        for u in [0, 1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()) {
-            // The standalone main unit registers no overlays; `lust_base_init` covers all units.
-            let c = if u == 0 { cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])) } else { gen_unit(u, false) };
-            let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
+        if rgroups.is_some() {
+            for (o, c) in &units {
+                let u = o.file_stem().and_then(|s| s.to_str()).and_then(|s| s.strip_prefix('u')).unwrap_or("x");
+                let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
+            }
+        } else {
+            for u in [0, 1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()) {
+                // The standalone main unit registers no overlays; `lust_base_init` covers all units.
+                let c = if u == 0 { cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])) } else { gen_unit(u, false) };
+                let _ = std::fs::write(format!("{}.u{u}.c", p.display()), c);
+            }
         }
         // A foreign emit-c build has no link step here: the emitted C
         // is the product, unless the cc release driver below links it.
@@ -4561,7 +4624,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     drop(miss_units);
     caches.objects = Some(req.debug);
     t.lap("tcc compile");
-    let all_base: Vec<PathBuf> = [1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()).map(base_obj).collect();
+    let all_base: Vec<PathBuf> = [1, 2, 3, LOC_UNIT].into_iter().chain(link_fn_units.iter().copied()).map(base_obj).collect();
     let linked = if !caches.persistent {
         let mut objs = vec![base_obj(0)];
         objs.extend(all_base);

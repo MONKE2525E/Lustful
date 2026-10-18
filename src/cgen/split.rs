@@ -263,7 +263,7 @@ impl FnGen<'_, '_> {
             TyKind::FnPtr(_) => {
                 let ct = cty(&self.body.tys, p);
                 collect_types(&ct, &mut self.sig_types);
-                let name = format!("lust_splitp_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
+                let name = format!("lust_splitp_{}_{}", super::names::fn_tag(self.slots.of(self.body.fn_id)), self.adapters);
                 self.adapters += 1;
                 let _ = writeln!(self.prelude, "static uint8_t {name}(void *env, uint32_t c) {{\n  return (*({}*)env)(c);\n}}", ctype(&ct));
                 format!("((lust_pat){{ .kind = LUST_PAT_PRED, .pred = {name}, .env = (void*){ptr} }})")
@@ -283,7 +283,7 @@ impl FnGen<'_, '_> {
     /// predicate closure's body (its env is the stored closure), or,
     /// without `env`, a plain fn item that takes the char alone.
     fn split_adapter(&mut self, f: LocalDefId, env: bool) -> String {
-        let name = format!("lust_splitp_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
+        let name = format!("lust_splitp_{}_{}", super::names::fn_tag(self.slots.of(self.body.fn_id)), self.adapters);
         self.adapters += 1;
         let mut body = String::new();
         let (r, _) = if env {

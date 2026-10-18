@@ -2418,6 +2418,26 @@ assignment is part of code identity:
   restarts, in any crate load order or instance discovery
   order. A restart test in 9.3 proves it.
 
+Release C (`LUST_RELEASE_C=1`, one-shot builds; cgen/names.rs,
+driver/release_c.rs). A release build has no session to keep
+slots in, so its C must not name slots at all: then a
+content-keyed object cache (key = unit C text, C compiler,
+flags, target) reuses every unit a commit did not touch,
+across commits, machines and CI runs. Fn bodies are extern
+`f_<hash of DiskDefId>` called directly through prototypes,
+Adts are `A<def hash>` or `A<instance key hash>`, vtables and
+per-fn helpers count from 0 in their fn, and a panic location
+reads its slot from the location unit (`lust_so_<id>`). Units
+follow each fn's own identity: its source file (an instance:
+its generic fn's), fns in source order, content-defined cuts
+(`LUST_RELEASE_UNIT_KB`, default 128). Glue lives in
+content-defined shards (fn units keep prototypes), statics in
+one data unit, and a fn unit defines only the types it holds by
+value: a type it only points at is forward-declared. The daemon
+and dev builds keep the numbered scheme (overlays need the
+table). Measured on the 12 ts-rust v0.6->v0.7 merges: see
+rel-cache's REPORT.md.
+
 Locations and span remapping. Panic locations,
 `track_caller` locations, and cached diagnostics are
 position-dependent. A token hash that ignores whitespace

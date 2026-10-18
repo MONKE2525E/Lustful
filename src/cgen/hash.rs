@@ -111,7 +111,7 @@ fn build_expr(p: &Program, slots: &Slots, s_cty: &CTy, s: &str, need: &mut dyn F
             None => "0".into(),
         },
         CTy::Adt(a) => match p.gx.build_hashers.get(a) {
-            Some(&(f, _)) => format!("(({}lust_fns[{}])({s}))", fn_ptr_cast(p, f), slots.of(f)),
+            Some(&(f, _)) => format!("({}({s}))", slots.callee(p, f)),
             None => "0".into(),
         },
         _ => "0".into(),
@@ -127,7 +127,7 @@ fn build_into(p: &Program, slots: &Slots, s_cty: &CTy, s: &str, var: &str, need:
         && let Some(&(f, _)) = p.gx.build_hashers.get(a)
         && super::ret_is_large(p, f)
     {
-        return format!("{ht} {var}; (({}lust_fns[{}])(&{var}, {s}));", fn_ptr_cast(p, f), slots.of(f));
+        return format!("{ht} {var}; ({}(&{var}, {s}));", slots.callee(p, f));
     }
     format!("{ht} {var} = {};", build_expr(p, slots, s_cty, s, need))
 }
@@ -158,7 +158,7 @@ fn hasher_call(p: &Program, slots: &Slots, hc: &CTy, m: usize, h: &str, arg: &st
         CTy::Adt(a) => {
             if let Some(&f) = p.gx.hasher_methods.get(&(*a, m as u8)) {
                 let call =
-                    format!("(({}lust_fns[{}])({h}{}{arg}))", fn_ptr_cast(p, f), slots.of(f), if arg.is_empty() { "" } else { ", " });
+                    format!("({}({h}{}{arg}))", slots.callee(p, f), if arg.is_empty() { "" } else { ", " });
                 return if name == "finish" { call } else { format!("{call};") };
             }
             match name {
@@ -301,7 +301,7 @@ pub(super) fn hash_value_body(p: &Program, slots: &Slots, key: &CTy, need: &mut 
         }
         // A written impl: its `hash::<H>` instance (`gx.hash_impls`).
         CTy::Adt(a) if let Some(&(_, f)) = p.gx.hash_impls.get(a).and_then(|v| v.iter().find(|(h, _)| cty(&p.tys, *h) == *hc)) => {
-            let _ = writeln!(body, "  ({}lust_fns[{}])(p, h);", fn_ptr_cast(p, f), slots.of(f));
+            let _ = writeln!(body, "  {}(p, h);", slots.callee(p, f));
         }
         CTy::Adt(a) => {
             let adt = p.adt(*a);
@@ -451,7 +451,7 @@ pub(super) fn glue(p: &Program, slots: &Slots, g: &Glue, t: &CTy, need: &mut dyn
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
                 let key = key_of(map, &format!("({e}*)elem"));
                 let borrowed = borrow_expr(p, slots, &k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
-                let call = format!("({}lust_fns[{}])(*(lust_dyn*)ctx, *{borrowed})", fn_ptr_cast(p, dk.eq), slots.of(dk.eq));
+                let call = format!("{}(*(lust_dyn*)ctx, *{borrowed})", slots.callee(p, dk.eq));
                 (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("  return {call};\n"))
             } else {
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
@@ -491,7 +491,7 @@ fn dyn_hash_body(p: &Program, slots: &Slots, map: &CTy, dk: &crate::check::gener
     } else {
         String::new()
     };
-    let call = format!("({}lust_fns[{}])(*k, &h);", fn_ptr_cast(p, f), slots.of(f));
+    let call = format!("{}(*k, &h);", slots.callee(p, f));
     format!("  {build}\n  {call}\n  uint64_t r = {finish};{drop}\n  return r;\n")
 }
 
@@ -506,7 +506,7 @@ fn borrow_expr(p: &Program, slots: &Slots, k: &CTy, q: &CTy, kp: &str) -> String
     if let CTy::Adt(a) = k
         && let Some((_, &f)) = p.gx.borrow_impls.iter().find(|((b, t), _)| b == a && cty(&p.tys, *t) == *q)
     {
-        let call = format!("({}lust_fns[{}])({kp})", fn_ptr_cast(p, f), slots.of(f));
+        let call = format!("{}({kp})", slots.callee(p, f));
         // `&str`, `&[T]` and `&dyn Tr` come back as fat values: point at a temporary.
         return match q {
             CTy::Str => format!("((lust_str[]){{ {call} }})"),

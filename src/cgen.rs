@@ -9,7 +9,7 @@ use crate::ty::lang::{self, SigTy};
 use crate::ty::layout::{self, EnumTag, Layout, Niche, ReprKind, niche_tag_value};
 use crate::ty::iter::IterKind;
 use crate::ty::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 mod clonefrom;
@@ -19,6 +19,7 @@ mod hash;
 mod split;
 mod bytes;
 mod unwind;
+pub mod names;
 mod own;
 mod slices;
 mod kconst;
@@ -582,7 +583,7 @@ pub fn ctype(t: &CTy) -> String {
         CTy::Ref(inner) => format!("{}*", ctype(inner)),
         CTy::Ptr(inner) => format!("{}*", ctype(inner)),
         CTy::FatPtr(inner) => ctype(inner),
-        CTy::Adt(a) => format!("A{}", a.0),
+        CTy::Adt(a) => names::adt(*a),
         CTy::Option(_) => format!("O_{}", mangle(t)),
         CTy::Result(..) => format!("R_{}", mangle(t)),
         CTy::ExitCode => "uint8_t".into(),
@@ -667,7 +668,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Fmt(k) => tok(s, &format!("Fmt{}", *k as u8), &[]),
         // The kind fixes how many type arguments follow.
         CTy::Hash(k, args) => tok(s, &format!("H{}", *k as u8), &args.iter().collect::<Vec<_>>()),
-        CTy::Adt(a) => tok(s, &format!("A{}", a.0), &[]),
+        CTy::Adt(a) => tok(s, &names::adt(*a), &[]),
         CTy::Vec(e) => tok(s, "V", &[e]),
         CTy::Boxed(e) => tok(s, "Bx", &[e]),
         CTy::Rc(e) => tok(s, "Rc", &[e]),
@@ -696,7 +697,7 @@ fn mangle_into(t: &CTy, s: &mut String) {
         CTy::Array(e, n) => tok(s, &format!("Y{n}"), &[e]),
         CTy::Tuple(es) => tok(s, &format!("T{}", es.len()), &es.iter().collect::<Vec<_>>()),
         CTy::FnPtr(ps, r) => tok(s, &format!("fp{}", ps.len()), &ps.iter().chain([&**r]).collect::<Vec<_>>()),
-        CTy::Unsized(a, e) => tok(s, &format!("N{}", a.0), &[e]),
+        CTy::Unsized(a, e) => tok(s, &names::unsized_adt(*a), &[e]),
     }
 }
 
@@ -792,6 +793,12 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 }
 
 /// Named types that `t` holds by value, so their C definitions must come first.
+/// True when `t` behind a pointer needs only a forward declaration: a struct-typed C type
+/// (a fn pointer typedef has no forward form).
+fn pointee_is_struct(t: &CTy) -> bool {
+    matches!(t, CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::ArrayIter(..) | CTy::OptIter(..))
+}
+
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
         CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) | CTy::ArrayIter(..) | CTy::OptIter(..) => {
@@ -973,6 +980,12 @@ pub struct FnOut {
     /// names built from a slot), its own included. Sorted, deduplicated.
     /// The daemon's slot-moved re-emit and dead-callee checks read it.
     pub used: Vec<u32>,
+    /// Release C (`names`): the extern declarations `code` needs (callee and
+    /// trampoline prototypes, location slots). Empty for numbered names.
+    pub externs: BTreeSet<String>,
+    /// Release C: types the code only points at (a `&T` local it never derefs):
+    /// declared, not defined (`type_decls_with`). Empty for numbered names.
+    pub named: HashSet<CTy>,
 }
 
 /// The LocalDefId to slot table cgen prints from, with a record of every
@@ -981,11 +994,12 @@ pub struct FnOut {
 pub(crate) struct Slots<'s> {
     map: &'s [u32],
     used: std::cell::RefCell<Vec<u32>>,
+    externs: std::cell::RefCell<BTreeSet<String>>,
 }
 
 impl<'s> Slots<'s> {
     fn new(map: &'s [u32]) -> Self {
-        Slots { map, used: Default::default() }
+        Slots { map, used: Default::default(), externs: Default::default() }
     }
 
     /// The slot of fn `f`, recorded as used.
@@ -995,11 +1009,29 @@ impl<'s> Slots<'s> {
         s
     }
 
-    fn into_used(self) -> Vec<u32> {
+    /// The callee text for a call of written fn `f` (`names::callee`).
+    fn callee(&self, p: &Program, f: LocalDefId) -> String {
+        let s = self.of(f);
+        names::callee(p, f, s, &mut self.externs.borrow_mut())
+    }
+
+    /// A fn pointer value for fn `f` (`names::fn_value`).
+    fn fn_value(&self, p: &Program, f: LocalDefId) -> String {
+        let s = self.of(f);
+        names::fn_value(p, f, s, &mut self.externs.borrow_mut())
+    }
+
+    /// A panic location in fn `f` (`names::loc`).
+    fn loc(&self, f: LocalDefId, rel: u64, col: u64) -> String {
+        let s = self.of(f);
+        names::loc(s, rel, col, &mut self.externs.borrow_mut())
+    }
+
+    fn into_used(self) -> (Vec<u32>, BTreeSet<String>) {
         let mut v = self.used.into_inner();
         v.sort_unstable();
         v.dedup();
-        v
+        (v, self.externs.into_inner())
     }
 }
 
@@ -1079,6 +1111,9 @@ struct FnGen<'b, 'p> {
     /// end), and the cache of each distinct literal (cgen/kconst.rs).
     kdecl_at: Option<usize>,
     kstrs: HashMap<Vec<u8>, usize>,
+    /// Release C: the place being emitted is only borrowed (`Rvalue::Ref`), so its
+    /// type needs no definition (`place`).
+    addr_only: bool,
 }
 
 /// A layout with no field or niche detail, for runtime struct types whose
@@ -1749,8 +1784,14 @@ fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
     if ret_is_large(p, f) { format!("(void (*)({params}))") } else { format!("({ret} (*)({params}))") }
 }
 
-/// The C signature of function `f`, defined under the C name `f<slot>`.
+/// The C signature of function `f`, defined under the C name of its body in `slot`
+/// (`names::body`: `f<slot>`, or `f_<id>` in release C).
 fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
+    fn_sig_named(p, f, &names::body(slot))
+}
+
+/// The C signature of function `f` under the C name `name`.
+fn fn_sig_named(p: &Program, f: LocalDefId, name: &str) -> String {
     let info = p.fn_info(f);
     let ret = ctype(&cty(&p.tys, info.ret));
     let mut params: Vec<String> = Vec::new();
@@ -1771,7 +1812,7 @@ fn fn_sig(p: &Program, f: LocalDefId, slot: u32) -> String {
         params.push("lust_loc ltc".to_string());
     }
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-    if ret_is_large(p, f) { format!("void f{slot}({params})") } else { format!("{ret} f{slot}({params})") }
+    if ret_is_large(p, f) { format!("void {name}({params})") } else { format!("{ret} {name}({params})") }
 }
 
 /// The slot trampoline for function `f` (ARCH 4.5): a tiny forwarder
@@ -1784,6 +1825,12 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
     let info = p.fn_info(f);
     let ret = ctype(&cty(&p.tys, info.ret));
     let cast = fn_ptr_cast(p, f);
+    // Release C: an extern trampoline that calls its body (defined just above it) by name.
+    let (linkage, target, tr) = if names::release() {
+        ("", names::body(slot), names::tramp(slot))
+    } else {
+        ("static ", format!("lust_fns[{slot}]"), format!("tramp{slot}"))
+    };
     // The body fn of a closure that captures nothing (W-CHECK-G): a fn
     // pointer to it takes only the call args, so the trampoline supplies
     // the zero-sized env (by reference for `Fn` and `FnMut`).
@@ -1806,13 +1853,13 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
                 params.extend(decls);
                 let rest = if all.is_empty() { String::new() } else { format!(", {}", all.join(", ")) };
                 return format!(
-                    "static void tramp{slot}({}) {{ lust_Unit env; ({cast}lust_fns[{slot}])(out{rest}); }}\n",
+                    "{linkage}void {tr}({}) {{ lust_Unit env; ({cast}{target})(out{rest}); }}\n",
                     params.join(", ")
                 );
             }
             let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
             return format!(
-                "static {ret} tramp{slot}({params}) {{ lust_Unit env; return ({cast}lust_fns[{slot}])({}); }}\n",
+                "{linkage}{ret} {tr}({params}) {{ lust_Unit env; return ({cast}{target})({}); }}\n",
                 all.join(", ")
             );
         }
@@ -1830,10 +1877,10 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
         params.extend(decls);
         let mut all = vec!["out".to_string()];
         all.extend(names);
-        format!("static void tramp{slot}({}) {{ ({cast}lust_fns[{slot}])({}); }}\n", params.join(", "), all.join(", "))
+        format!("{linkage}void {tr}({}) {{ ({cast}{target})({}); }}\n", params.join(", "), all.join(", "))
     } else {
         let params = if decls.is_empty() { "void".to_string() } else { decls.join(", ") };
-        format!("static {ret} tramp{slot}({params}) {{ return ({cast}lust_fns[{slot}])({}); }}\n", names.join(", "))
+        format!("{linkage}{ret} {tr}({params}) {{ return ({cast}{target})({}); }}\n", names.join(", "))
     }
 }
 
@@ -1897,14 +1944,23 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         }
     }
     let mut types = std::mem::take(&mut g.sig_types);
+    let mut named = HashSet::new();
+    let release = names::release();
     for t in &g.local_cty {
-        collect_types(t, &mut types);
+        match t {
+            // Release C: a plain pointer local names its pointee; a deref of it records
+            // the pointee as used (`place`), and so does any emitter that sizes it.
+            CTy::Ref(e) | CTy::Ptr(e) if release && pointee_is_struct(e) => collect_types(e, &mut named),
+            _ => collect_types(t, &mut types),
+        }
     }
     for (_, t) in &g.glue {
         collect_types(t, &mut types);
     }
     let (code, glue) = (g.out, g.glue);
-    FnOut { code, glue, types, error: None, used: slots.into_used() }
+    let (used, externs) = slots.into_used();
+    named.retain(|t| !types.contains(t));
+    FnOut { code, glue, types, error: None, used, externs, named }
 }
 
 impl<'b, 'p> FnGen<'b, 'p> {
@@ -1944,6 +2000,7 @@ impl<'b, 'p> FnGen<'b, 'p> {
             unw_call: false,
             kdecl_at: None,
             kstrs: HashMap::new(),
+            addr_only: false,
         }
     }
 }
@@ -2039,8 +2096,7 @@ impl FnGen<'_, '_> {
         }
         let (l, c) = self.map.line_display_col(span);
         let rel = l.saturating_sub(self.base_line).min(0xFFFFF) as u64;
-        let slot = self.slots.of(self.body.fn_id) as u64;
-        format!("{}u", (slot << 40) | (rel << 20) | c.min(0xFFFFF) as u64)
+        self.slots.loc(self.body.fn_id, rel, c.min(0xFFFFF) as u64)
     }
     fn tmp(&mut self) -> String {
         self.tmp += 1;
@@ -2054,7 +2110,9 @@ impl FnGen<'_, '_> {
         let p = self.p;
         let fid = self.body.fn_id;
         let slot = self.slots.of(fid);
-        let _ = writeln!(self.out, "/* {} */\nstatic {} {{", p.display_path(p.fn_info(fid).name), fn_sig(p, fid, slot));
+        // Release C bodies are extern: other units call them directly (`names`).
+        let linkage = if names::release() { "" } else { "static " };
+        let _ = writeln!(self.out, "/* {} */\n{linkage}{} {{", p.display_path(p.fn_info(fid).name), fn_sig(p, fid, slot));
         // Locals grouped by C type. No initializers: the borrow checker proves every read is
         // after a write. Drop flags start at 0, except for parameters, which own their values.
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
@@ -2545,6 +2603,17 @@ impl FnGen<'_, '_> {
         let mut t = self.local_cty[pl.local as usize].clone();
         let mut variant: Option<u32> = None;
         for pr in &pl.proj {
+            // Release C defines only what a unit holds by value (`type_decls`): a field
+            // or element read needs its container defined (behind a pointer too), an
+            // index the element type, a deref of an `Rc` or a guard the block it reads.
+            // A bare reborrow (`&*p`) takes only an address.
+            if names::release() {
+                match (pr, &t) {
+                    (Proj::Deref, CTy::Ref(_) | CTy::Boxed(_) | CTy::Ptr(_)) | (Proj::Downcast(_), _) => {}
+                    (Proj::Index(_), CTy::Vec(el) | CTy::Slice(el) | CTy::BoxSlice(el)) => collect_types(el, &mut self.sig_types),
+                    _ => collect_types(&t, &mut self.sig_types),
+                }
+            }
             match (pr, t.clone()) {
                 (Proj::Deref, CTy::Ref(inner)) => {
                     if *inner == CTy::Str {
@@ -2668,6 +2737,10 @@ impl FnGen<'_, '_> {
                 }
                 (pr, t) => panic!("bad projection in codegen: {pr:?} on {t:?}"),
             }
+        }
+        // A place read by value or by discriminant needs its type defined.
+        if names::release() && !self.addr_only {
+            collect_types(&t, &mut self.sig_types);
         }
         (e, t)
     }
@@ -3047,10 +3120,10 @@ impl FnGen<'_, '_> {
                     let t = self.tmp();
                     let ret = ctype(&cty(&self.p.tys, info.ret));
                     let pre = if args.is_empty() { String::new() } else { format!(", {}", args.join(", ")) };
-                    let _ = writeln!(self.out, "    {ret} {t}; ({}lust_fns[{}])(&{t}{pre});", fn_ptr_cast(self.p, f), self.slots.of(f));
+                    let _ = writeln!(self.out, "    {ret} {t}; {}(&{t}{pre});", self.slots.callee(self.p, f));
                     t
                 } else {
-                    format!("({}lust_fns[{}])({})", fn_ptr_cast(self.p, f), self.slots.of(f), args.join(", "))
+                    format!("{}({})", self.slots.callee(self.p, f), args.join(", "))
                 }
             }
             // `mpsc::channel()`: the element type comes from the pair.
@@ -3311,7 +3384,10 @@ impl FnGen<'_, '_> {
                     let (_, t) = self.place(pl, loc);
                     return format!("(({} *){a})", ctype(&t));
                 }
+                // Release C: taking an address needs no definition of the place's type.
+                self.addr_only = true;
                 let (e, t) = self.kplace(pl, loc);
+                self.addr_only = false;
                 // A slice place (a deref of a fat value, or a bare-slice
                 // temporary from a range index) is already the fat value;
                 // a place holding a slice reference takes an address as usual.
@@ -3548,7 +3624,7 @@ impl FnGen<'_, '_> {
                     zero_lit(self.p, &CTy::Adt(*a))
                 } else {
                     let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
-                    format!("((A{}){{ {} }})", a.0, fields.join(", "))
+                    format!("(({}){{ {} }})", names::adt(*a), fields.join(", "))
                 }
             }
             Rvalue::VecLit(elem, ops) => {
@@ -3727,7 +3803,7 @@ impl FnGen<'_, '_> {
                     CTy::FnPtr(..) => {
                         self.note_callee(*f);
                         collect_types(&t, &mut self.sig_types);
-                        format!("(({})lust_tramps[{}])", ctype(&t), self.slots.of(*f))
+                        format!("(({}){})", ctype(&t), self.slots.fn_value(self.p, *f))
                     }
                     // A bare fn item value is a zero-sized type.
                     CTy::Unit => "((lust_Unit){})".into(),
@@ -3845,7 +3921,8 @@ impl FnGen<'_, '_> {
         let vt = p.gx.vtables[vid as usize].clone();
         let supers: Vec<String> = vt.supers.iter().map(|&s| self.vtable_sym(s)).collect();
         let fslot = self.slots.of(self.body.fn_id);
-        let name = format!("vt{fslot}_{vid}");
+        // Release C counts this fn's vtables: `vid` is a program-wide counter.
+        let name = if names::release() { format!("vt{}_{}", names::fn_tag(fslot), self.vtables.len()) } else { format!("vt{fslot}_{vid}") };
         let ct = cty(&p.tys, vt.self_ty);
         let drop = if needs_drop_c(p, &ct) {
             self.want(Glue::Drop, &ct);
@@ -3945,7 +4022,7 @@ impl FnGen<'_, '_> {
                 for t in &params {
                     collect_types(t, &mut self.sig_types);
                 }
-                let call = format!("({}lust_fns[{}])", fn_ptr_cast(p, f), self.slots.of(f));
+                let call = self.slots.callee(p, f);
                 (params, cty(&p.tys, info.ret), call)
             }
         };
@@ -4025,8 +4102,8 @@ impl FnGen<'_, '_> {
         }
         let name = format!("{vt_name}_m{j}");
         let ret = ctype(&cty(&p.tys, info.ret));
-        let cast = fn_ptr_cast(p, f);
-        let slot = self.slots.of(f);
+        // `(CAST lust_fns[slot])`, or `(CAST f_<id>)` in release C (`names::callee`).
+        let target = self.slots.callee(p, f);
         let recv = ctype(&cty(&p.tys, info.params[0]));
         let recv_dropped = param_dropped(p, &cty(&p.tys, info.params[0]));
         let mut decls: Vec<String> = Vec::new();
@@ -4069,12 +4146,12 @@ impl FnGen<'_, '_> {
                 let rest = if call.is_empty() { String::new() } else { format!(", {call}") };
                 let _ = writeln!(
                     self.prelude,
-                    "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out{rest}); {drop}{free} }}"
+                    "static void {name}({ret} *out, void *self{decls}) {{ {target}(out{rest}); {drop}{free} }}"
                 );
             } else {
                 let _ = writeln!(
                     self.prelude,
-                    "static {ret} {name}(void *self{decls}) {{ {ret} r = ({cast}lust_fns[{slot}])({call}); {drop}{free} return r; }}"
+                    "static {ret} {name}(void *self{decls}) {{ {ret} r = {target}({call}); {drop}{free} return r; }}"
                 );
             }
             return name;
@@ -4089,12 +4166,12 @@ impl FnGen<'_, '_> {
             let rest = if names.is_empty() { String::new() } else { format!(", {names}") };
             let _ = writeln!(
                 self.prelude,
-                "static void {name}({ret} *out, void *self{decls}) {{ ({cast}lust_fns[{slot}])(out{rest}); }}"
+                "static void {name}({ret} *out, void *self{decls}) {{ {target}(out{rest}); }}"
             );
         } else {
             let _ = writeln!(
                 self.prelude,
-                "static {ret} {name}(void *self{decls}) {{ return ({cast}lust_fns[{slot}])({names}); }}"
+                "static {ret} {name}(void *self{decls}) {{ return {target}({names}); }}"
             );
         }
         name
@@ -4302,7 +4379,7 @@ impl FnGen<'_, '_> {
             collect_types(&cty(&self.p.tys, t), &mut self.sig_types);
         }
         let v = self.tmp();
-        let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, f), self.slots.of(f));
+        let call = self.slots.callee(self.p, f);
         // A dropped parameter (a zero-sized env taken by value, or a
         // zero-sized argument) is not in the C signature, so it is
         // not passed here either (see `param_dropped`).
@@ -4383,7 +4460,7 @@ impl FnGen<'_, '_> {
     /// reverse order of creation, as Rust's temporaries do).
     fn sort_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<(sync::Callee, u8, CTy)>) -> String {
         use Builtin as B;
-        let name = format!("lust_less_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
+        let name = format!("lust_less_{}_{}", names::fn_tag(self.slots.of(self.body.fn_id)), self.adapters);
         self.adapters += 1;
         let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
         let (a, bb) = (format!("(({pt})a)"), format!("(({pt})b)"));
@@ -4434,7 +4511,7 @@ impl FnGen<'_, '_> {
         if let Some(n) = self.shims.get(&key) {
             return n.clone();
         }
-        let name = format!("lust_ctor_{}_{}", self.slots.of(self.body.fn_id), self.shims.len());
+        let name = format!("lust_ctor_{}_{}", names::fn_tag(self.slots.of(self.body.fn_id)), self.shims.len());
         self.shims.insert(key, name.clone());
         let mut decls: Vec<String> = Vec::new();
         let mut vals: Vec<String> = Vec::new();
@@ -4455,7 +4532,7 @@ impl FnGen<'_, '_> {
                     zero_lit(self.p, ret)
                 } else {
                     let fields: Vec<String> = vals.iter().enumerate().map(|(i, v)| format!(".f{i} = {v}")).collect();
-                    format!("((A{}){{ {} }})", a.0, fields.join(", "))
+                    format!("(({}){{ {} }})", names::adt(*a), fields.join(", "))
                 }
             }
             _ => self.make_variant(ret, variant, &vals),
@@ -4496,7 +4573,7 @@ impl FnGen<'_, '_> {
         if let Some(n) = self.shims.get(&key) {
             return n.clone();
         }
-        let name = format!("lust_prim_{}_{}", self.slots.of(self.body.fn_id), self.shims.len());
+        let name = format!("lust_prim_{}_{}", names::fn_tag(self.slots.of(self.body.fn_id)), self.shims.len());
         self.shims.insert(key, name.clone());
         let TyKind::FnPtr(sig) = tys.kind(fp_ty) else { unreachable!("ItemShim to a non fn pointer type") };
         let sig = tys.sig(sig).value;
@@ -4577,7 +4654,7 @@ impl FnGen<'_, '_> {
     /// `f(p)` as an Ordering, or `f(p).cmp(b)` with ctx `{&f, b}`.
     fn search_adapter(&mut self, b: Builtin, elem: &CTy, clo: Option<(sync::Callee, u8, CTy)>) -> String {
         use Builtin as B;
-        let name = format!("lust_bcmp_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
+        let name = format!("lust_bcmp_{}_{}", names::fn_tag(self.slots.of(self.body.fn_id)), self.adapters);
         self.adapters += 1;
         let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
         let p = format!("(({pt})p)");
@@ -5128,7 +5205,7 @@ impl FnGen<'_, '_> {
                 let p = self.p;
                 let a = p.tys.local_adt_of(crate::check::generics::location_def()).expect("Location is a std Adt");
                 let ct = ctype(&CTy::Adt(a));
-                let fslot = self.slots.of(self.body.fn_id);
+                let fslot = names::fn_tag(self.slots.of(self.body.fn_id));
                 let (t, l, n) = (self.tmp(), self.tmp(), self.tmp());
                 let node = format!("lc{fslot}_{n}");
                 let _ = writeln!(self.prelude, "static struct {node} {{ lust_loc k; struct {node} *next; {ct} v; }} *{node}_head;");
@@ -8000,6 +8077,8 @@ pub struct GlueSet {
     /// The fn slots each key's definition prints (a written method it
     /// calls, see `glue_callee`), as `FnOut::used`.
     used: HashMap<(Glue, CTy), Vec<u32>>,
+    /// Release C: the extern declarations each key's definition needs (`FnOut::externs`).
+    externs: HashMap<(Glue, CTy), BTreeSet<String>>,
 }
 
 impl GlueSet {
@@ -8061,7 +8140,9 @@ impl GlueSet {
             let mut types = Vec::new();
             let rec = Slots::new(slots);
             glue_def(p, &rec, &g.0, &g.1, &mut proto, &mut def, &mut more, &mut types);
-            self.used.insert(g.clone(), rec.into_used());
+            let (used, externs) = rec.into_used();
+            self.used.insert(g.clone(), used);
+            self.externs.insert(g.clone(), externs);
             let changed = is_new
                 || self.def_map.get(&g) != Some(&def)
                 || self.protos.get(&g) != Some(&proto)
@@ -8147,7 +8228,7 @@ impl GlueSet {
     }
 }
 
-fn unit_header() -> String {
+pub(crate) fn unit_header() -> String {
     let mut c = String::with_capacity(64 * 1024);
     c.push_str(runtime_decls());
     c.push('\n');
@@ -8554,15 +8635,29 @@ pub fn loc_unit(files: &SlotFiles, slot_lines: &[u32]) -> String {
 /// panic=unwind a `main` that ends by a panic exits 101.
 pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -> String {
     let unwind = init.as_ref().is_some_and(|i| i.unwind);
+    let runner_slot = init.as_ref().and_then(|i| i.hook_runner);
     let (init, runner) = match init {
         Some(UnwindInit { unwind, ids: [a, b, c, d], hook_runner }) => (
             format!("\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);", unwind as u8),
-            hook_runner.map_or(String::new(), |s| format!("\n  lust_hook_set_runner(lust_fns[{s}]);")),
+            hook_runner.map_or(String::new(), |s| {
+                // Release C names the runner directly (only its address is taken here).
+                if names::release() { format!("\n  lust_hook_set_runner((lust_fnptr){});", names::body(s)) } else { format!("\n  lust_hook_set_runner(lust_fns[{s}]);") }
+            }),
         ),
         None => (String::new(), String::new()),
     };
     let mut c = unit_header();
     c.push_str("void lust_loc_init(void);\nvoid lust_kstatics_init(void);\n");
+    // Release C calls main's body (and passes the hook runner) by name.
+    let main_call = if names::release() {
+        let _ = writeln!(c, "void {}(void);", names::body(main_slot));
+        if let Some(s) = runner_slot.filter(|&s| s != main_slot) {
+            let _ = writeln!(c, "void {}(void);", names::body(s));
+        }
+        format!("{}()", names::body(main_slot))
+    } else {
+        format!("((void (*)(void))lust_fns[{main_slot}])()")
+    };
     for u in overlays {
         let _ = writeln!(c, "void lust_overlay_u{u}(void);");
     }
@@ -8580,7 +8675,7 @@ pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -
     }
     let _ = writeln!(
         c,
-        "  if (lust_main_entry_p) {{ int rc = lust_main_entry_p(); {} lust_tls_exit(); lust_flush(); return rc; }}\n  ((void (*)(void))lust_fns[{main_slot}])();\n  {}lust_tls_exit();\n  lust_flush();\n  return {};\n}}",
+        "  if (lust_main_entry_p) {{ int rc = lust_main_entry_p(); {} lust_tls_exit(); lust_flush(); return rc; }}\n  {main_call};\n  {}lust_tls_exit();\n  lust_flush();\n  return {};\n}}",
         if unwind { "if (lust_unw_main_exit()) rc = 101;" } else { "" },
         if unwind { "int rc = lust_unw_main_exit();\n  " } else { "" },
         if unwind { "rc" } else { "0" }
@@ -8775,9 +8870,16 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             // trampoline (forwarding through `lust_fns`), whose address is.
             let f = LocalDefId(*f);
             let slot = *slots.get(f.0 as usize).expect("internal: a fn pointer in static data has no fn slot");
-            let name = format!("stramp{slot}");
+            let name = format!("stramp{}", names::fn_tag(slot));
             if !pre.contains(&format!(" {name}(")) {
-                pre.push_str(&trampoline(p, f, slot).replacen(&format!(" tramp{slot}("), &format!(" {name}("), 1));
+                let tr = trampoline(p, f, slot).replacen(&format!(" {}(", names::tramp(slot)), &format!(" {name}("), 1);
+                if names::release() {
+                    // Release C: the copy calls the body by name, so it needs the
+                    // body's prototype, and it stays local to this unit.
+                    let _ = writeln!(pre, "{};", fn_sig(p, f, slot));
+                    pre.push_str("static ");
+                }
+                pre.push_str(&tr);
             }
             format!("(({})&{name})", ctype(t))
         }
@@ -8859,7 +8961,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                     .enumerate()
                     .map(|(i, x)| format!(".f{i} = {}", const_init(p, x, &cty(&p.tys, adt.variants[0].fields[i].ty), pre, cx, slots, sub(pos, i).as_deref())))
                     .collect();
-                format!("((A{}){{ {} }})", a.0, parts.join(", "))
+                format!("(({}){{ {} }})", names::adt(*a), parts.join(", "))
             }
         }
         (CV::Variant(variant, vals), CTy::Adt(a)) => {
@@ -9115,23 +9217,25 @@ fn used_statics<'a>(p: &Program, texts: impl Iterator<Item = &'a str>) -> HashSe
     (0..p.statics.len()).filter(|&i| syms.contains(static_sym(p, i as u32).as_str())).collect()
 }
 
-/// The unit for the slots in `range` (`fns` is indexed by slot; empty slots have no code). Its
+/// The unit for `slots` (`fns` is indexed by slot; empty slots have no code). Its
 /// functions are static; the function `register` stores them in `lust_fns`.
 /// `main_slot` is the slot of `p.main` (not its `LocalDefId`: slots are
 /// stable across edits, local ids are not).
-pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &GlueSet, register: &str, main_slot: Option<u32>) -> String {
+pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, register: &str, main_slot: Option<u32>) -> String {
     let mut c = unit_header();
     let mut types = HashSet::new();
+    let mut named = HashSet::new();
     let mut seen: HashSet<&(Glue, CTy)> = HashSet::new();
-    for f in &fns[range.clone()] {
+    for f in slots.iter().map(|&s| &fns[s]) {
         types.extend(f.types.iter().cloned());
+        named.extend(f.named.iter().cloned());
         seen.extend(f.glue.iter());
     }
     // The termination entry below names main's return type directly.
     // Declare it in this unit even when main's cached `FnOut` predates
     // the return-type edit (a warm unit must not name an undeclared
     // `Result` struct).
-    let main_in_unit = main_slot.filter(|&s| range.contains(&(s as usize)) && fns.get(s as usize).is_some_and(|f| !f.code.is_empty()));
+    let main_in_unit = main_slot.filter(|&s| slots.contains(&(s as usize)) && fns.get(s as usize).is_some_and(|f| !f.code.is_empty()));
     let term_main = main_in_unit.and_then(|s| p.main.map(|m| (m, s))).filter(|&(m, _)| {
         let ret = p.fn_info(m).ret;
         p.tys.is_exit_code(ret) || p.tys.result_args(ret).is_some()
@@ -9165,16 +9269,27 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
     // every unit was pure repetition in a program with many statics.
     let used = used_statics(
         p,
-        fns[range.clone()]
+        slots
             .iter()
-            .map(|f| f.code.as_str())
+            .map(|&s| fns[s].code.as_str())
             .chain(seen.iter().filter(|k| hybrid && !g.is_shared(k)).map(|k| g.def_map[*k].as_str())),
     );
     for &i in &used {
         collect_types(&cty(&p.tys, p.statics[i].ty), &mut types);
     }
-    type_decls(p, &mut c, &types);
+    named.retain(|t| !types.contains(t));
+    type_decls_with(p, &mut c, &types, &named, names::release());
     c.push_str(&static_decls_for(p, &used));
+    // Release C (`names`): the prototypes and location slots that the code (and its
+    // static glue) names outside itself, in one sorted list.
+    let mut externs: BTreeSet<&str> = BTreeSet::new();
+    for &s in slots {
+        externs.extend(fns[s].externs.iter().map(String::as_str));
+    }
+    for k in seen.iter().filter(|k| hybrid && !g.is_shared(k)) {
+        externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
+    }
+    externs.into_iter().for_each(|e| c.push_str(e));
     let mut keys: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
     for k in &keys {
@@ -9189,7 +9304,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
             c.push_str(&g.def_map[*k]);
         }
     }
-    for f in &fns[range.clone()] {
+    for f in slots.iter().map(|&s| &fns[s]) {
         c.push_str(&f.code);
     }
     // Termination entry for a `main` returning `ExitCode` or
@@ -9204,11 +9319,13 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
         let rc = cty(&p.tys, ret);
         let rt = ctype(&rc);
         let cast = fn_ptr_cast(p, m);
+        // Main's body is in this unit: release C calls it by name.
+        let target = if names::release() { names::body(idx) } else { format!("lust_fns[{idx}]") };
         let _ = writeln!(c, "static int lust_main_entry_impl(void) {{");
         if ret_is_large(p, m) {
-            let _ = writeln!(c, "  {rt} r; ({cast}lust_fns[{idx}])(&r);");
+            let _ = writeln!(c, "  {rt} r; ({cast}{target})(&r);");
         } else {
-            let _ = writeln!(c, "  {rt} r = ({cast}lust_fns[{idx}])();");
+            let _ = writeln!(c, "  {rt} r = ({cast}{target})();");
         }
         if p.unwind {
             let _ = writeln!(c, "  if (lust_unw_pending && lust_unw_mine()) return 0;");
@@ -9236,7 +9353,8 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], range: std::ops::Range<usize>, g: &Gl
         let _ = writeln!(c, "  return rc;\n}}");
     }
     let _ = writeln!(c, "void {register}(void) {{");
-    for i in range.filter(|&i| !fns[i].code.is_empty()) {
+    // Release C calls bodies by name: no table to fill.
+    for &i in slots.iter().filter(|&&i| !fns[i].code.is_empty() && !names::release()) {
         let _ = writeln!(c, "  lust_fns[{i}] = (lust_fnptr)f{i};");
         let _ = writeln!(c, "  lust_tramps[{i}] = (lust_fnptr)tramp{i};");
     }
@@ -9413,12 +9531,94 @@ fn emit_enum_decl(p: &Program, out: &mut String, opener: &str, t: &CTy, variants
 }
 
 /// Declares the given types, plus every type they contain (by value or inside a Vec).
+/// The C types the definition of `t` holds by value: they must be defined before it.
+fn def_deps(p: &Program, t: &CTy) -> Vec<CTy> {
+    let mut deps = Vec::new();
+    match t {
+        CTy::Adt(a) => p.adt(*a).variants.iter().flat_map(|v| &v.fields).for_each(|f| by_value_deps(&cty(&p.tys, f.ty), &mut deps)),
+        CTy::Option(e) => by_value_deps(e, &mut deps),
+        CTy::Result(a, b) => {
+            by_value_deps(a, &mut deps);
+            by_value_deps(b, &mut deps);
+        }
+        CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
+        CTy::Array(e, _) => by_value_deps(e, &mut deps),
+        CTy::ArrayIter(e, n) => by_value_deps(&CTy::Array(e.clone(), *n), &mut deps),
+        CTy::OptIter(_, e) => by_value_deps(&CTy::Option(e.clone()), &mut deps),
+        // A slice holds `e*` only: every struct type has a forward
+        // typedef above, so only a fn pointer typedef must come
+        // first. Counting `e` itself made a false cycle for a
+        // recursive `enum A { P(Arc<[A]>) }`, and the DFS start
+        // order (ADT ids, which follow the file name) then decided
+        // which side was incomplete.
+        CTy::Slice(e) => by_value_deps(&CTy::Ref(e.clone()), &mut deps),
+        CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
+        CTy::Sync(k, e) if k.is_cell_struct() => by_value_deps(e, &mut deps),
+        // A fn pointer typedef is a declarator: its parameter and
+        // return structs may be incomplete there (C11 6.7.6.3), and
+        // each has a forward typedef above. Only another fn pointer
+        // typedef must come first. Counting the structs made a false
+        // cycle for `struct ByFn<T> { g: Option<fn(ByFn<(T, T)>)> }`
+        // that left the Option incomplete inside the struct.
+        CTy::FnPtr(ps, r) => {
+            ps.iter().for_each(|e| by_value_deps(e, &mut deps));
+            by_value_deps(r, &mut deps);
+            deps.retain(|d| matches!(d, CTy::FnPtr(..)));
+        }
+        // A table holds its builder by value, an Entry its key; an
+        // iterator holds neither (see `hash::struct_fields`). The
+        // elements live behind the table pointer. Counting the key
+        // and the `(K, V)` tuple made a false cycle for a recursive
+        // `enum Any { Obj(HashMap<String, Any>) }` that left `Any`
+        // incomplete inside the tuple.
+        CTy::Hash(k, args) if hash::is_table(*k) => {
+            if let Some(s) = args.last() {
+                by_value_deps(s, &mut deps);
+            }
+        }
+        CTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry | crate::ty::hash::HashTy::VacantEntry, args) => {
+            if let Some(k) = args.first() {
+                by_value_deps(k, &mut deps);
+            }
+        }
+        _ => {}
+    }
+    deps
+}
+
 fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
-    // Close over field types.
+    type_decls_with(p, out, roots, &HashSet::new(), false)
+}
+
+/// `type_decls`, plus forward declarations of `named` (release C: types the code only
+/// points at). With `by_value` (release C fn units), define only what the roots hold by
+/// value; a type reached only through a pointer gets its forward typedef, so a unit does
+/// not change when a struct it only points at does. Glue and static data reach through
+/// pointers (a drop through an `Rc` reads its count block), so their units keep the
+/// whole closure.
+fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &HashSet<CTy>, by_value: bool) {
+    let defined: Option<HashSet<CTy>> = by_value.then(|| {
+        let mut defined = HashSet::new();
+        let mut stack: Vec<CTy> = roots.iter().cloned().collect();
+        while let Some(t) = stack.pop() {
+            if defined.insert(t.clone()) {
+                stack.extend(def_deps(p, &t));
+                // Table code and initializers size the elements (`sizeof`).
+                if let CTy::Hash(..) = t {
+                    stack.push(hash::elem_cty(&t));
+                }
+            }
+        }
+        defined
+    });
+    // Close over field types (release C: one step out of each defined type).
     let mut wanted: HashSet<CTy> = HashSet::new();
-    let mut stack: Vec<CTy> = roots.iter().cloned().collect();
+    let mut stack: Vec<CTy> = defined.as_ref().map_or_else(|| roots.iter().cloned().collect(), |d| d.iter().chain(named).cloned().collect());
     while let Some(t) = stack.pop() {
         if !wanted.insert(t.clone()) {
+            continue;
+        }
+        if defined.as_ref().is_some_and(|d| !d.contains(&t)) {
             continue;
         }
         let mut inner = HashSet::new();
@@ -9456,7 +9656,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
     list.sort_by_cached_key(mangle);
     for t in &list {
         if let CTy::Adt(a) = t {
-            let _ = writeln!(out, "typedef struct A{0} A{0};", a.0);
+            let _ = writeln!(out, "typedef struct {0} {0};", names::adt(*a));
         }
         // Every struct-typed C type too: a closure env holds references
         // (`&(captures..)`, `&Result<..>`) that can sit in a type emitted
@@ -9487,56 +9687,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
         if !emitted.insert(t.clone()) {
             return;
         }
-        let mut deps = Vec::new();
-        match t {
-            CTy::Adt(a) => p.adt(*a).variants.iter().flat_map(|v| &v.fields).for_each(|f| by_value_deps(&cty(&p.tys, f.ty), &mut deps)),
-            CTy::Option(e) => by_value_deps(e, &mut deps),
-            CTy::Result(a, b) => {
-                by_value_deps(a, &mut deps);
-                by_value_deps(b, &mut deps);
-            }
-            CTy::Tuple(es) => es.iter().for_each(|e| by_value_deps(e, &mut deps)),
-            CTy::Array(e, _) => by_value_deps(e, &mut deps),
-            CTy::ArrayIter(e, n) => by_value_deps(&CTy::Array(e.clone(), *n), &mut deps),
-            CTy::OptIter(_, e) => by_value_deps(&CTy::Option(e.clone()), &mut deps),
-            // A slice holds `e*` only: every struct type has a forward
-            // typedef above, so only a fn pointer typedef must come
-            // first. Counting `e` itself made a false cycle for a
-            // recursive `enum A { P(Arc<[A]>) }`, and the DFS start
-            // order (ADT ids, which follow the file name) then decided
-            // which side was incomplete.
-            CTy::Slice(e) => by_value_deps(&CTy::Ref(e.clone()), &mut deps),
-            CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
-            CTy::Sync(k, e) if k.is_cell_struct() => by_value_deps(e, &mut deps),
-            // A fn pointer typedef is a declarator: its parameter and
-            // return structs may be incomplete there (C11 6.7.6.3), and
-            // each has a forward typedef above. Only another fn pointer
-            // typedef must come first. Counting the structs made a false
-            // cycle for `struct ByFn<T> { g: Option<fn(ByFn<(T, T)>)> }`
-            // that left the Option incomplete inside the struct.
-            CTy::FnPtr(ps, r) => {
-                ps.iter().for_each(|e| by_value_deps(e, &mut deps));
-                by_value_deps(r, &mut deps);
-                deps.retain(|d| matches!(d, CTy::FnPtr(..)));
-            }
-            // A table holds its builder by value, an Entry its key; an
-            // iterator holds neither (see `hash::struct_fields`). The
-            // elements live behind the table pointer. Counting the key
-            // and the `(K, V)` tuple made a false cycle for a recursive
-            // `enum Any { Obj(HashMap<String, Any>) }` that left `Any`
-            // incomplete inside the tuple.
-            CTy::Hash(k, args) if hash::is_table(*k) => {
-                if let Some(s) = args.last() {
-                    by_value_deps(s, &mut deps);
-                }
-            }
-            CTy::Hash(crate::ty::hash::HashTy::Entry | crate::ty::hash::HashTy::OccupiedEntry | crate::ty::hash::HashTy::VacantEntry, args) => {
-                if let Some(k) = args.first() {
-                    by_value_deps(k, &mut deps);
-                }
-            }
-            _ => {}
-        }
+        let deps = def_deps(p, t);
         for d in &deps {
             emit(p, d, emitted, out);
         }
@@ -9675,7 +9826,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
             }
             CTy::Adt(a) => {
                 let adt = p.adt(*a);
-                let an = a.0;
+                let an = names::adt(*a);
                 let _ = writeln!(out, "/* {} */", p.display_path(adt.name));
                 let packed = adt.repr.pack;
                 if let Some(n) = packed {
@@ -9687,13 +9838,13 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                         Some(l) => {
                             let variants: Vec<Vec<CTy>> =
                                 adt.variants.iter().map(|v| v.fields.iter().map(|f| cty(&p.tys, f.ty)).collect()).collect();
-                            emit_enum_decl(p, out, &format!("struct A{an}"), t, &variants, &l);
+                            emit_enum_decl(p, out, &format!("struct {an}"), t, &variants, &l);
                         }
                         None => {
                             let fields = |v: &Variant| -> String {
                                 v.fields.iter().enumerate().map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty)))).collect()
                             };
-                            let _ = write!(out, "struct A{an} {{ uint32_t tag; ");
+                            let _ = write!(out, "struct {an} {{ uint32_t tag; ");
                             if adt.variants.iter().any(|v| !v.fields.is_empty()) {
                                 out.push_str("union { ");
                                 for (vi, v) in adt.variants.iter().enumerate() {
@@ -9711,9 +9862,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                         Some(l) => {
                             let v = &adt.variants[0];
                             if v.fields.is_empty() && l.align > 1 {
-                                let _ = writeln!(out, "struct A{an} {{ _Alignas({}) lust_Unit _z; }};", l.align);
+                                let _ = writeln!(out, "struct {an} {{ _Alignas({}) lust_Unit _z; }};", l.align);
                             } else if v.fields.is_empty() {
-                                let _ = writeln!(out, "struct A{an} {{ }};");
+                                let _ = writeln!(out, "struct {an} {{ }};");
                             } else {
                                 let fields: Vec<(String, Layout, u64)> = v
                                     .fields
@@ -9724,9 +9875,9 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                                         (format!("{} f{i}", ctype(&ft)), field_layout(p, &ft), l.field_offsets[i])
                                     })
                                     .collect();
-                                let _ = writeln!(out, "struct A{an} {{ {}}};", layout_members(&fields, Some(l.size), l.align));
+                                let _ = writeln!(out, "struct {} {{ {}}};", an.clone(), layout_members(&fields, Some(l.size), l.align));
                             }
-                            layout_assert(out, &format!("A{an}"), &l);
+                            layout_assert(out, &an.clone(), &l);
                         }
                         None => {
                             let f: String = adt.variants[0]
@@ -9736,7 +9887,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
                                 .map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty))))
                                 .collect();
                             let f = if f.is_empty() { "uint8_t unused; ".to_string() } else { f };
-                            let _ = writeln!(out, "struct A{an} {{ {f}}};");
+                            let _ = writeln!(out, "struct {an} {{ {f}}};");
                         }
                     }
                 }
@@ -9748,7 +9899,7 @@ fn type_decls(p: &Program, out: &mut String, roots: &HashSet<CTy>) {
         }
     }
     let mut emitted = HashSet::new();
-    for t in &list {
+    for t in list.iter().filter(|t| defined.as_ref().is_none_or(|d| d.contains(*t))) {
         emit(p, t, &mut emitted, out);
     }
     out.push('\n');
@@ -9776,7 +9927,7 @@ fn glue_callee(p: &Program, slots: &Slots, f: LocalDefId, types: &mut Vec<CTy>) 
     let info = p.fn_info(f);
     types.push(cty(&p.tys, info.ret));
     types.extend(info.params.iter().map(|&t| cty(&p.tys, t)));
-    format!("({}lust_fns[{}])", fn_ptr_cast(p, f), slots.of(f))
+    slots.callee(p, f)
 }
 
 /// Generates the prototype and definition of glue `g` for `t`. Pushes the glue keys the
@@ -10921,7 +11072,7 @@ mod tests {
             runtime_unit(),
             table_unit(n, &[5]),
             loc_unit(&SlotFiles { paths: &["test.rs"], of_slot: &[] }, &vec![1; n]),
-            fn_unit(&program, &outs, 0..n, &glue, "lust_register_u5", Some(slots[main.0 as usize])),
+            fn_unit(&program, &outs, &(0..n).collect::<Vec<_>>(), &glue, "lust_register_u5", Some(slots[main.0 as usize])),
         ];
         let dir = std::env::temp_dir().join(format!("lust-cgen-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

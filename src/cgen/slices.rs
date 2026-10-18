@@ -375,7 +375,7 @@ impl FnGen<'_, '_> {
     /// The `cmp(ctx, p)` adapter of `partition_point`: `pred(p)` as
     /// `Less` (-1) or `Greater` (1); ctx is the closure.
     fn partition_adapter(&mut self, elem: &CTy, f: &(sync::Callee, u8, CTy)) -> String {
-        let name = format!("lust_bcmp_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
+        let name = format!("lust_bcmp_{}_{}", super::names::fn_tag(self.slots.of(self.body.fn_id)), self.adapters);
         self.adapters += 1;
         let pt = ctype(&CTy::Ref(Box::new(elem.clone())));
         let mut body = String::new();

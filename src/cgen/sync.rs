@@ -1312,7 +1312,7 @@ impl FnGen<'_, '_> {
                 let pts: Vec<CTy> = self.p.fn_info(*f).params.iter().map(|&t| cty(&self.p.tys, t)).collect();
                 self.spill_by_ptr(out, &pts, &mut args);
                 let v = self.tmp();
-                let call = format!("({}lust_fns[{}])", fn_ptr_cast(self.p, *f), self.slots.of(*f));
+                let call = self.slots.callee(self.p, *f);
                 if ret_is_large(self.p, *f) {
                     let pre: String = args.iter().map(|a| format!(", {a}")).collect();
                     let _ = writeln!(out, "  {} {v}; {call}(&{v}{pre});", ctype(&rt));
@@ -1428,7 +1428,7 @@ impl FnGen<'_, '_> {
         let pk = format!("struct {{ lust_JoinHdr h; {} ret; {} env; }}", ctype(&ret), ctype(&env_ty));
         let n = self.adapters;
         self.adapters += 1;
-        let slot = self.slots.of(self.body.fn_id);
+        let slot = super::names::fn_tag(self.slots.of(self.body.fn_id));
         let (run, drop) = (format!("lust_thr_{slot}_{n}"), format!("lust_thrdrop_{slot}_{n}"));
         let mut body = String::new();
         let v = self.callee_call_c(&mut body, &callee, "k->env", &[]);

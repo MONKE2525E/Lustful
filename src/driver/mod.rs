@@ -20,6 +20,7 @@ mod patch;
 pub(crate) mod sig_nodes;
 mod span_shift;
 mod session;
+mod release_c;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
 pub use compile::{release_bases, sweep_bases};

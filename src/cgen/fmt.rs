@@ -717,7 +717,7 @@ impl FnGen<'_, '_> {
                 }
             }
         }
-        let name = format!("lust_fa_{}_{}", self.slots.of(self.body.fn_id), self.adapters);
+        let name = format!("lust_fa_{}_{}", super::names::fn_tag(self.slots.of(self.body.fn_id)), self.adapters);
         self.adapters += 1;
         let outer = std::mem::take(&mut self.out);
         let _ = writeln!(self.out, "    const {} *env = (const {0} *)envp;", ctype(&env_ct));
@@ -931,7 +931,7 @@ impl FnGen<'_, '_> {
         let os = p.adt(repr_a).variants.iter().position(|v| p.interner.get(v.name) == "Os").expect("io::Error's Repr has an Os variant");
         let t = CTy::Result(Box::new(CTy::Unit), Box::new(CTy::Adt(err_a)));
         let repr = self.make_variant(&repr_cty, os, &[code.to_string()]);
-        let err = self.make_variant(&t, 1, &[format!("((A{}){{ .f0 = {repr} }})", err_a.0)]);
+        let err = self.make_variant(&t, 1, &[format!("(({}){{ .f0 = {repr} }})", super::names::adt(err_a))]);
         let ok = self.make_variant(&t, 0, &["((lust_Unit){})".to_string()]);
         format!("(({code}) ? {err} : {ok})")
     }
