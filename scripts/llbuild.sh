@@ -18,7 +18,24 @@ one() { # one <unit .c file>: its object path on stdout
   key=$key-$(echo "$CC $OPT ${FL:-}" | sha256sum | cut -c1-8)
   o=${LLOBJ:-$work}/$key.o
   if [ ! -f "$o" ]; then
-    if [ -f "$ll" ]; then
+    if [ -f "$ll" ] && head -c 64 "$c" | grep -q "^/\* lust: LLVM unit body \*/"; then
+      # The C half is only its body (cgen::ll::BODY_MARK): one C file, the helpers' C then the
+      # body, and the IR keeps the body's fns external through llvm.used (src/cc.rs compile_pair).
+      python3 -I - "$c" "$ll" "$hc" "$work/$key.$$" <<'EOF' || return 1
+import re, sys
+c, ll, hc, out = sys.argv[1:]
+body = open(c).read().split("/* lust: LLVM unit body */\n", 1)[1]
+ir = open(ll).read()
+names = re.findall(r"^(?!static\b|inline\b)[A-Za-z_][^;{}\n]*?\b([A-Za-z_]\w*)\([^;{}]*\)\s*\{", body, re.M)
+used = "".join(f"declare void @{n}()\n" for n in names if f"@{n}(" not in ir)
+if names:
+    used += '@llvm.used = appending global [%d x ptr] [%s], section "llvm.metadata"\n' % (len(names), ", ".join(f"ptr @{n}" for n in names))
+open(out + ".ll", "w").write(ir + "\n" + used)
+open(out + ".hc.c", "w").write(open(hc).read() + "\n" + body)
+EOF
+      $CC $OPT ${FL:-$F} -emit-llvm -Xclang -disable-llvm-passes -Xclang -no-enable-noundef-analysis -x c -c "$work/$key.$$.hc.c" -o "$work/$key.$$.h.bc"
+      $CC $OPT -w -fexceptions -c "$work/$key.$$.ll" -Xclang -mlink-builtin-bitcode -Xclang "$work/$key.$$.h.bc" -o "$o.$$.tmp"
+    elif [ -f "$ll" ]; then
       $CC $OPT ${FL:-$F} -emit-llvm -Xclang -disable-llvm-passes -Xclang -no-enable-noundef-analysis -c "$c" -o "$work/$key.$$.c.bc"
       $CC $OPT ${FL:-$F} -emit-llvm -Xclang -disable-llvm-passes -Xclang -no-enable-noundef-analysis -x c -c "$hc" -o "$work/$key.$$.h.bc"
       $CC $OPT -w -fexceptions -c "$ll" -Xclang -mlink-bitcode-file -Xclang "$work/$key.$$.c.bc" \
