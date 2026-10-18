@@ -15,11 +15,18 @@
 # fns read through a pointer grows (directly, as an enum payload, behind Option, as an array,
 # as a generic arg), statics and thread_local keys are added, and tests/daemon/dt01's six
 # versions. A step that fails to build must fail on both sides with the same status.
+# Two sequences cover the LLVM units' inputs that zig's compile cache cannot see (b41791434):
+# an edit that changes a unit's helpers' C but not its IR (zig keyed the object on the IR and
+# served the last one at that path: the old string printed), and a merge that removes items,
+# built with a profile (PGO unit names, per-unit profiles). The PGO one trains at its first
+# step (an instrumented one-shot build, run once) and needs zig plus a clang and llvm-profdata
+# of zig's LLVM major (LUST_PGO_CC, LUST_PROFDATA, or clang-<N> and llvm-profdata-<N> on PATH);
+# without them it is skipped and says so.
 #
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: front_check.py [--jobs N] [--keep DIR] [--only NAME]
 # Exit 0 = all same, 1 = a difference or a build failure on one side, 2 = setup error.
-import argparse, hashlib, os, shutil, subprocess, sys, tempfile, time
+import argparse, hashlib, os, re, shutil, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -206,6 +213,109 @@ fn main() {{
 '''
 
 
+def helper_edit(label, step):
+    """Only `main`'s string and constant change: the LLVM unit's IR stays, its helpers' C moves."""
+    return f'''struct Acc {{
+    total: u64,
+    hits: u32,
+}}
+
+impl Acc {{
+    #[inline(never)]
+    fn add(&mut self, x: u64) {{
+        self.total += x;
+        self.hits += 1;
+    }}
+
+    #[inline(never)]
+    fn report(&self) -> String {{
+        format!("total={{}} hits={{}}", self.total, self.hits)
+    }}
+}}
+
+#[inline(never)]
+fn run(n: u64) -> Acc {{
+    let mut a = Acc {{ total: 0, hits: 0 }};
+    for i in 0..n {{
+        if i % 3 == 0 {{
+            a.add(i * 7);
+        }}
+    }}
+    a
+}}
+
+fn main() {{
+    let a = run(10);
+    println!("{{}} [{label}] {{}}", a.report(), {step});
+}}
+'''
+
+
+def shapes(with_tag):
+    """Methods in several impl blocks of one type, called across fns; a merge removes one."""
+    tag_impl = '''impl Shape {
+    #[inline(never)]
+    fn tag(&self) -> &'static str {
+        if self.w > self.h { "wide" } else { "tall" }
+    }
+}
+
+''' if with_tag else ""
+    tag_use = '''    println!("{}", v[0].tag());
+''' if with_tag else ""
+    return f'''struct Shape {{
+    w: u32,
+    h: u32,
+}}
+
+impl Shape {{
+    #[inline(never)]
+    fn area(&self) -> u32 {{
+        self.w * self.h
+    }}
+}}
+
+{tag_impl}impl Shape {{
+    #[inline(never)]
+    fn perim(&self) -> u32 {{
+        2 * (self.w + self.h)
+    }}
+}}
+
+impl Shape {{
+    fn scaled(&self, k: u32) -> Shape {{
+        Shape {{ w: self.w * k, h: self.h * k }}
+    }}
+}}
+
+#[inline(never)]
+fn total(v: &[Shape]) -> u64 {{
+    let mut t = 0u64;
+    for s in v {{
+        t += s.area() as u64 + s.perim() as u64;
+    }}
+    t
+}}
+
+#[inline(never)]
+fn describe(s: &Shape) -> String {{
+    format!("{{}}x{{}} p={{}} a={{}}", s.w, s.h, s.perim(), s.area())
+}}
+
+fn main() {{
+    let mut v = Vec::new();
+    for i in 1..200u32 {{
+        v.push(Shape {{ w: i % 7 + 1, h: i % 5 + 2 }}.scaled(2));
+    }}
+    let mut sum = 0u64;
+    for _ in 0..50 {{
+        sum += total(&v);
+    }}
+    println!("{{}} {{}}", sum, describe(&v[2]));
+{tag_use}}}
+'''
+
+
 def corpus():
     """(name, [sources]) of every sequence."""
     seqs = [
@@ -242,6 +352,8 @@ def corpus():
                     "    A.with(|a| a.set(a.get() + 5));\n    AA.with(|a| a.set(a.get() * 3));\n    println!(\"{} {}\", A.with(|a| a.get()), AA.with(|a| a.get()));"),
         ]),
     ]
+    seqs.append(("llvm-helper-only-edit", [helper_edit("v1", 1), helper_edit("v2-label", 1), helper_edit("v2-label", 3)]))
+    seqs.append(("remove-impl-pgo", [shapes(True), shapes(False), shapes(True)], {"pgo": True}))
     dt = os.path.join(ROOT, "tests/daemon/dt01_deep_type_edits")
     seqs.append(("dt01", [open(os.path.join(dt, f"v{k}.rs")).read() for k in range(1, 7)]))
     return seqs
@@ -290,20 +402,39 @@ def build(cmd, env, cwd):
     return (r.returncode, r.stderr.decode(errors="replace")[-400:].replace("\n", " "))
 
 
-def check_seq(name, srcs, backend, args, work):
-    """One sequence on one backend: (name, backend, problems, steps)."""
+def check_seq(name, srcs, backend, args, work, opts):
+    """One sequence on one backend: (name, backend, problems, steps); steps is 0 when skipped."""
     d = os.path.join(work, f"{name}-{backend}")
     os.makedirs(d, exist_ok=True)
-    drop = ("LUST_DAEMON_SOCKET", "LUST_CACHE_DIR", "LUST_NO_CACHE", "LUST_THREADS", "LUST_FRONT_STATE", "LUST_RELEASE_BACKEND")
+    drop = ("LUST_DAEMON_SOCKET", "LUST_CACHE_DIR", "LUST_NO_CACHE", "LUST_THREADS", "LUST_FRONT_STATE", "LUST_RELEASE_BACKEND",
+            "LUST_PGO_USE", "LUST_PGO_GEN", "LUST_PGO_CC", "LUST_PROFDATA")
     base = {k: v for k, v in os.environ.items() if k not in drop}
     base.update(LUST_RELEASE_C="1", LUST_NO_DAEMON="1")
     if backend == "llvm":
         base["LUST_RELEASE_BACKEND"] = "llvm"
         if args.llvm_cc:
             base["LUST_CC"] = args.llvm_cc
+    rel = ["--release", "--target", args.host]
+    if opts.get("pgo"):
+        if not args.pgo:
+            return name, backend, [], 0
+        # The profile both sides use: an instrumented one-shot build of the first step, run once.
+        with open(os.path.join(d, "main.rs"), "w") as f:
+            f.write(srcs[0])
+        raw = os.path.join(d, "raw")
+        gen = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4", LUST_PGO_GEN="1", LUST_PGO_CC=args.pgo["cc"])
+        rg, eg = build([LUST, "build", "main.rs", *rel, "-o", "gen.bin"], gen, d)
+        if rg != 0:
+            return name, backend, [f"{name} {backend}: the instrumented build failed ({rg}): {eg[:300]}"], len(srcs)
+        subprocess.run([os.path.join(d, "gen.bin")], cwd=d, env=dict(os.environ, LLVM_PROFILE_FILE=os.path.join(raw, "%p.profraw")),
+                       capture_output=True, timeout=RUN_TIMEOUT)
+        prof = os.path.join(d, "train.profdata")
+        m = subprocess.run([args.pgo["profdata"], "merge", "-o", prof, raw], capture_output=True, text=True)
+        if m.returncode != 0:
+            return name, backend, [f"{name} {backend}: llvm-profdata merge failed: {m.stderr[:300]}"], len(srcs)
+        base.update(LUST_PGO_USE=prof, LUST_PROFDATA=args.pgo["profdata"])
     img = dict(base, LUST_FRONT_STATE=os.path.join(d, "front"), LUST_FRONT_SAVE="background", LUST_CACHE_DIR=os.path.join(d, "cache"), LUST_THREADS="1")
     one = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4")
-    rel = ["--release", "--target", args.host]
     problems = []
     for step, src in enumerate(srcs):
         with open(os.path.join(d, "main.rs"), "w") as f:
@@ -343,6 +474,29 @@ def is_clang(cmd):
         return False
 
 
+def pgo_tools():
+    """{cc, profdata} for the PGO sequences: zig's LLVM major in both, and a profile runtime that
+    links; None when any is missing."""
+    if not shutil.which("zig"):
+        return None
+    v = subprocess.run(["zig", "cc", "--version"], capture_output=True, text=True).stdout
+    m = re.search(r"clang version (\d+)", v)
+    if not m:
+        return None
+    major = m.group(1)
+    cc = os.environ.get("LUST_PGO_CC") or shutil.which(f"clang-{major}")
+    pd = os.environ.get("LUST_PROFDATA") or shutil.which(f"llvm-profdata-{major}")
+    if not cc or not pd:
+        return None
+    with tempfile.TemporaryDirectory() as t:
+        src = os.path.join(t, "p.c")
+        with open(src, "w") as f:
+            f.write("int main(void) { return 0; }\n")
+        if subprocess.run([cc, "-fprofile-generate", src, "-o", os.path.join(t, "p")], capture_output=True).returncode != 0:
+            return None
+    return {"cc": cc, "profdata": pd, "major": major}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=min(14, os.cpu_count() or 4))
@@ -361,13 +515,16 @@ def main():
             print("error: the LLVM backend needs clang (or zig) on PATH")
             return 2
         args.llvm_cc = "clang"
-    seqs = [s for s in corpus() if not args.only or args.only in s[0]]
+    args.pgo = None if args.llvm_cc else pgo_tools()
+    seqs = [s if len(s) == 3 else (*s, {}) for s in corpus() if not args.only or args.only in s[0]]
+    if any(o.get("pgo") for _, _, o in seqs) and not args.pgo:
+        print("front-check: PGO sequences skipped: they need zig, and clang and llvm-profdata of zig's LLVM major with a profile runtime")
     work = tempfile.mkdtemp(prefix="front-check.", dir=os.environ.get("TMPDIR"))
-    jobs = [(n, srcs, b) for n, srcs in seqs for b in ("c", "llvm")]
+    jobs = [(n, srcs, b, o) for n, srcs, o in seqs for b in ("c", "llvm")]
     t0 = time.time()
     bad = steps = 0
     with ThreadPoolExecutor(max(1, args.jobs)) as pool:
-        for name, backend, problems, n in pool.map(lambda j: check_seq(j[0], j[1], j[2], args, work), jobs):
+        for name, backend, problems, n in pool.map(lambda j: check_seq(j[0], j[1], j[2], args, work, j[3]), jobs):
             steps += n
             for p in problems:
                 bad += 1
