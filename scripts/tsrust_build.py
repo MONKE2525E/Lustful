@@ -27,7 +27,12 @@ Steps, on a scratch copy of the fork (never a fork change):
            again: a test whose Cargo runs differ is "flaky", not a bug.
 
 Usage: tsrust_build.py --fork DIR --lust PATH --work DIR [--only a,b] [--max-rounds N]
-                       [--timeout SECS] [-j N] [--max-bugs N] [--reuse] [--clean]
+                       [--timeout SECS] [-j N] [--max-bugs N] [--reuse] [--clean] [--profile NAME]
+--profile NAME (release, goport, ...): lust builds each test bin with the release driver
+(`--profile NAME --target <host>`; LUST_RELEASE_C and LUST_RELEASE_BACKEND pass through from
+the environment) and the Cargo side is `cargo build --profile NAME`, so both sides have the
+same overflow checks and debug assertions (a debug Cargo oracle sees debug_assert panics a
+release build does not have). The prune step's rustc check stays a dev build.
 --reuse keeps <work>/fork from an earlier run (fast reruns after a lust fix); --clean removes the
 big dirs at the end and keeps the pruned sources as fork-src.tgz (tsrust-full.sh --boat --build
 adds it).
@@ -309,9 +314,11 @@ def dev_features(lib, copy):
     return prune.dev_features_for({"tsrust_dir": str(copy), "src_dir": rel}, env={})[0]
 
 
-def cargo_errors(lib, copy, env):
-    """rustc errors of `cargo build --bin lust_tests_<crate>`: (file, line, code, message)."""
+def cargo_errors(lib, copy, env, profile=None):
+    """rustc errors of `cargo build --bin lust_tests_<crate>` (dev, or the Cargo profile
+    `profile`): (file, line, code, message)."""
     cmd = ["cargo", "build", "--offline", "--bin", f"lust_tests_{lib['crate']}", "-p", lib["pkg"], "--message-format", "json"]
+    cmd += ["--profile", profile] if profile else []
     cmd += ["--no-default-features", "--features", ",".join(dev_features(lib, copy))]
     r = subprocess.run(cmd, cwd=copy, env=env, capture_output=True, text=True, timeout=7200)
     out = []
@@ -348,11 +355,24 @@ def bin_target(lib):
             "manifest": lib["manifest"]}
 
 
+# Extra `lust build` flags of the --profile mode (main sets them): the release driver.
+RELEASE_ARGS = []
+
+
+def host_triple():
+    return next(ln.split()[1] for ln in subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout.splitlines() if ln.startswith("host:"))
+
+
+def cargo_out_dir(profile):
+    """The dir under the cargo target dir that holds a profile's bins."""
+    return {None: "debug", "dev": "debug", "test": "debug", "bench": "release"}.get(profile, profile)
+
+
 def lust_build(lust, lib, work, env, out_bin, timeout):
     """(ok, short error text, located errors). Located errors are (file, line, code, message)
     in the fork copy, outside the generated driver. A timeout is a hang, never a pass."""
     t = bin_target(lib)
-    cmd = tsrust_full.lust_cmd(lust, "build", t, work)
+    cmd = tsrust_full.lust_cmd(lust, "build", t, work) + RELEASE_ARGS
     cmd[cmd.index("-o") + 1] = str(out_bin)
     try:
         r = subprocess.run(cmd, cwd=work, env=env, capture_output=True, text=True, timeout=timeout)
@@ -553,7 +573,10 @@ def main():
     ap.add_argument("--clean", action="store_true", help="at the end, remove the fork copy, target dirs, caches and bins (keep build.json)")
     ap.add_argument("--reuse", action="store_true", help="keep <work>/fork from an earlier run (its pruning and tests.json)")
     ap.add_argument("-j", type=int, default=1, help="test runs at once (the fork's tests share files: 1 is safe)")
+    ap.add_argument("--profile", help="build both sides with this Cargo profile (lust: the release driver)")
     a = ap.parse_args()
+    if a.profile:
+        RELEASE_ARGS[:] = ["--profile", a.profile, "--target", host_triple()]
     prune.build_items_tool()
     work = a.work.resolve()
     copy = work / "fork"
@@ -620,8 +643,8 @@ def main():
         if not ok:
             save()
             continue
-        cargo_exe = work / "cargo-target/debug" / f"lust_tests_{lib['crate']}"
-        rc, errs, stderr = cargo_errors(lib, copy, env)  # the arms may have changed
+        cargo_exe = work / "cargo-target" / cargo_out_dir(a.profile) / f"lust_tests_{lib['crate']}"
+        rc, errs, stderr = cargo_errors(lib, copy, env, a.profile)  # the arms may have changed
         if rc != 0:
             st["build"] = f"cargo build failed after the lust build: {errs[:1]} {stderr[-300:]}"
             save()
