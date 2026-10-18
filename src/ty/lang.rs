@@ -1317,6 +1317,11 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
     // the fd or -errno.
     IntrinsicDef { name: "sys_x_name_to_handle_at", c_symbol: "lust_sys_x_name_to_handle_at", params: &[S::I32, S::Bytes, S::I32, S::VecU8Mut], ret: S::I32, allowed: &[C::NameToHandleAt], implemented: true },
     IntrinsicDef { name: "sys_x_open_by_handle_at", c_symbol: "lust_sys_x_open_by_handle_at", params: &[S::I32, S::I32, S::Bytes, S::I32], ret: S::I32, allowed: &[C::NameToHandleAt], implemented: true },
+    // kqueue/kevent for the nix adapter's sys::event (Darwin, sysx.c):
+    // kqueue returns the fd or -errno; kevent takes 48-byte records
+    // (sysx.h) and returns the event count or -errno.
+    IntrinsicDef { name: "sys_x_kqueue", c_symbol: "lust_sys_x_kqueue", params: &[], ret: S::I32, allowed: &[C::Nix], implemented: true },
+    IntrinsicDef { name: "sys_x_kevent", c_symbol: "lust_sys_x_kevent", params: &[S::I32, S::Bytes, S::VecU8Mut, S::I32, S::I64, S::I64], ret: S::I32, allowed: &[C::Nix], implemented: true },
     // The signal registry behind the signal-hook adapter.
     IntrinsicDef { name: "sys_sig_register", c_symbol: "lust_sys_sig_register", params: &[S::I32, S::I32, S::Ptr, S::U64], ret: S::I32, allowed: &[C::SignalHook], implemented: true },
     IntrinsicDef { name: "sys_sig_register_pipe", c_symbol: "lust_sys_sig_register_pipe", params: &[S::I32, S::I32], ret: S::I32, allowed: &[C::SignalHook], implemented: true },

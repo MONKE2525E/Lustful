@@ -124,6 +124,16 @@ int32_t lust_sys_x_name_to_handle_at(int32_t dirfd, const uint8_t *p, uint64_t l
 /* open_by_handle_at(2) over a handle (type, bytes): the fd
    or -errno. */
 int32_t lust_sys_x_open_by_handle_at(int32_t mount_fd, int32_t handle_type, const uint8_t *p, uint64_t len, int32_t flags);
+/* kqueue(2) (the nix adapter's sys::event, Darwin): the fd or
+   -errno. -ENOSYS off Darwin. */
+int32_t lust_sys_x_kqueue(void);
+/* kevent(2) over 48-byte records (ident u64, filter i64, flags
+   u64, fflags u64, data i64, udata i64, all little-endian):
+   `changes` is the changelist bytes, `events` a Vec whose length
+   is the eventlist capacity in bytes and whose first records are
+   overwritten with the returned events. has_timeout 0 waits
+   without a limit. Returns the event count or -errno. */
+int32_t lust_sys_x_kevent(int32_t fd, const uint8_t *changes, uint64_t clen, lust_Vec *events, int32_t has_timeout, int64_t sec, int64_t nsec);
 
 #ifdef LUST_IMPL
 #include "sysx.c"

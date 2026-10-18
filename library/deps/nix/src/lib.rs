@@ -2,8 +2,10 @@
 // prctl THP forms ts-rust's thp_guard.rs uses, the fanotify
 // group and mark forms fswatch/unix.rs uses (feature
 // `fanotify`, tf-adapters F2), the `NixPath` trait of the mark
-// call, the signal set of tsgo's start (sys::signal), plus the
-// Errno type they return. Everything else in
+// call, the signal set of tsgo's start (sys::signal), the
+// kqueue forms fswatch/unix_bsd.rs uses on Darwin (feature
+// `event`, sys::event over sysx, with sys::time's TimeSpec),
+// plus the Errno type they return. Everything else in
 // nix is absent and rejects in lust (README).
 
 pub mod errno;

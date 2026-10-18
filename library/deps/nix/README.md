@@ -1,8 +1,9 @@
 # Adapter: nix 0.31.3
 
 Lust adapter crate (docs/ARCH.md section 3.6) for the two prctl
-forms ts-rust's thp_guard.rs uses and the fanotify forms
-fswatch/unix.rs uses. Gate: `scripts/test-adapters.sh nix`.
+forms ts-rust's thp_guard.rs uses, the fanotify forms
+fswatch/unix.rs uses, and the kqueue forms fswatch/unix_bsd.rs
+uses on Darwin. Gate: `scripts/test-adapters.sh nix`.
 
 ## Implemented, same results as upstream
 
@@ -32,10 +33,30 @@ fswatch/unix.rs uses. Gate: `scripts/test-adapters.sh nix`.
   Display from nix's `desc` table, `from_raw` (unknown codes
   are `UnknownErrno`, as upstream), and the `io::Error`
   conversions.
+- `sys::event` (feature `event`, Darwin): `Kqueue::new` and
+  `Kqueue::kevent` over kqueue(2)/kevent(2) (the sysx shim),
+  `KEvent` (new and the six accessors), the `EventFilter`
+  enum, and the `EvFlags`/`FilterFlag` flag types, with
+  Darwin values as upstream passes libc's. Upstream's module
+  is BSD-only; here it exists on macOS only.
+- `sys::time::TimeSpec`: `new`, `from_duration`, `tv_sec`,
+  `tv_nsec`, the `UTIME_NOW`/`UTIME_OMIT` consts (the
+  target's values), `AsRef`/`AsMut` of the adapter's
+  `Timespec` record, and the `Duration` conversions.
+- `errno::Errno` on macOS is the same enum form with
+  Darwin's errno numbers and variant set (from sys/errno.h;
+  `desc` texts still nix's).
 
 ## Rejected (lust error, never a different answer)
 
 - Everything else in nix, including fanotify `read_events`,
-  `FanotifyEvent`, `write_response`, and the Errno forms that
+  `FanotifyEvent`, `write_response`, the Errno forms that
   read or write the C errno (`last`, `set`, `clear`,
-  `result`). Layout queries on adapter types reject.
+  `result`), `kevent64`, the `poll` feature's forms (the
+  feature name is listed because upstream's `event` pulls it
+  in; its items reject), and the rest of `sys::time`.
+  `sys::signal`, `sys::prctl`, and `sys::fanotify` are
+  absent off Linux (their numbers here are Linux values).
+  Layout queries on adapter types reject. Flag and `KEvent`
+  Debug forms are tuple/record forms, not upstream's
+  bitflags/libc forms.

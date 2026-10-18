@@ -764,3 +764,77 @@ int32_t lust_sys_x_open_by_handle_at(int32_t mount_fd, int32_t handle_type, cons
     return -ENOSYS;
 }
 #endif
+
+/* kqueue/kevent for the nix adapter's sys::event (Darwin only; the
+   adapter's event module exists only there, as upstream's). Records
+   cross as 48-byte little-endian fields (sysx.h), translated to and
+   from struct kevent here so its layout stays the C compiler's. */
+#ifdef __APPLE__
+#include <sys/event.h>
+#include <sys/time.h>
+
+static uint64_t lust_sysx_rec_u64(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int k = 0; k < 8; k++) v |= (uint64_t)p[k] << (8 * k);
+    return v;
+}
+
+static void lust_sysx_rec_put(uint8_t *p, const struct kevent *ev) {
+    uint64_t f[6] = {(uint64_t)ev->ident, (uint64_t)(int64_t)ev->filter, ev->flags, ev->fflags,
+                     (uint64_t)(int64_t)ev->data, (uint64_t)(int64_t)(uintptr_t)ev->udata};
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 8; k++) p[i * 8 + k] = (uint8_t)(f[i] >> (8 * k));
+}
+
+int32_t lust_sys_x_kqueue(void) {
+    int fd = kqueue();
+    return fd < 0 ? -errno : fd;
+}
+
+int32_t lust_sys_x_kevent(int32_t fd, const uint8_t *changes, uint64_t clen, lust_Vec *events, int32_t has_timeout, int64_t sec, int64_t nsec) {
+    if (clen % 48 != 0 || events->len % 48 != 0) return -EINVAL;
+    uint64_t nch = clen / 48, nev = events->len / 48;
+    struct kevent stack_ch[8], stack_ev[8];
+    struct kevent *ch = stack_ch, *ev = stack_ev;
+    if (nch > 8) {
+        ch = (struct kevent *)malloc((size_t)nch * sizeof *ch);
+        if (!ch) return -ENOMEM;
+    }
+    if (nev > 8) {
+        ev = (struct kevent *)malloc((size_t)nev * sizeof *ev);
+        if (!ev) {
+            if (ch != stack_ch) free(ch);
+            return -ENOMEM;
+        }
+    }
+    for (uint64_t i = 0; i < nch; i++) {
+        const uint8_t *r = changes + i * 48;
+        memset(&ch[i], 0, sizeof ch[i]);
+        ch[i].ident = (uintptr_t)lust_sysx_rec_u64(r);
+        ch[i].filter = (int16_t)(int64_t)lust_sysx_rec_u64(r + 8);
+        ch[i].flags = (uint16_t)lust_sysx_rec_u64(r + 16);
+        ch[i].fflags = (uint32_t)lust_sysx_rec_u64(r + 24);
+        ch[i].data = (intptr_t)(int64_t)lust_sysx_rec_u64(r + 32);
+        ch[i].udata = (void *)(uintptr_t)lust_sysx_rec_u64(r + 40);
+    }
+    struct timespec ts;
+    ts.tv_sec = (time_t)sec;
+    ts.tv_nsec = (long)nsec;
+    int n = kevent(fd, ch, (int)nch, ev, (int)nev, has_timeout ? &ts : NULL);
+    int e = errno;
+    if (n > 0) {
+        uint8_t *out = (uint8_t *)events->ptr;
+        for (int i = 0; i < n; i++) lust_sysx_rec_put(out + (uint64_t)i * 48, &ev[i]);
+    }
+    if (ch != stack_ch) free(ch);
+    if (ev != stack_ev) free(ev);
+    return n < 0 ? -e : n;
+}
+#else
+int32_t lust_sys_x_kqueue(void) { return -ENOSYS; }
+
+int32_t lust_sys_x_kevent(int32_t fd, const uint8_t *changes, uint64_t clen, lust_Vec *events, int32_t has_timeout, int64_t sec, int64_t nsec) {
+    (void)fd; (void)changes; (void)clen; (void)events; (void)has_timeout; (void)sec; (void)nsec;
+    return -ENOSYS;
+}
+#endif
