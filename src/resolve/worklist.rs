@@ -538,8 +538,6 @@ impl NestedFnScan {
 /// step treats a segment as a list of whole items of that file.
 struct FileWork {
     path: PathBuf,
-    /// The file text, on its first segment only.
-    text: String,
     file_id: FileId,
     ast: Ast,
     /// The module this file's top-level items belong to.
@@ -903,7 +901,7 @@ struct CachedFile {
     /// checking and expansion already applied to `raw`), with the
     /// hash of every other input that expansion read
     /// (`expansion_input_hash`) and the outside reads it recorded.
-    expanded: Option<(u64, lexer::Lexed, Vec<crate::expand::Dep>, u64)>,
+    expanded: Option<(u64, std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>,
     /// The parsed Ast with the hash of the expanded token stream
     /// it was parsed from. Expansion answers depend on the whole
     /// crate's macro environment, so own text alone cannot key a
@@ -1138,20 +1136,20 @@ impl ResolveCache {
     }
 
     /// The cached expansion of one file whose other inputs hash to
-    /// `input_hash` (`expansion_input_hash`), cloned out, with the
-    /// stream's own `hash_lexed`.
-    fn expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64) -> Option<(lexer::Lexed, Vec<crate::expand::Dep>, u64)> {
+    /// `input_hash` (`expansion_input_hash`), shared, with the stream's
+    /// own `hash_lexed`.
+    fn expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64) -> Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)> {
         match self.peek(key, text_hash, file_id).and_then(|e| e.expanded.as_ref()) {
-            Some((h, l, deps, exp_hash)) if *h == input_hash => Some((clone_lexed(l), deps.clone(), *exp_hash)),
+            Some((h, l, deps, exp_hash)) if *h == input_hash => Some((l.clone(), deps.clone(), *exp_hash)),
             _ => None,
         }
     }
 
     /// Stores one file's expansion; returns the stream's `hash_lexed`.
-    fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64, lexed: &lexer::Lexed, deps: &[crate::expand::Dep]) -> u64 {
+    fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64, lexed: &std::sync::Arc<lexer::Lexed>, deps: &[crate::expand::Dep]) -> u64 {
         let exp_hash = hash_lexed(lexed);
         self.expansions += 1;
-        self.entry(key, text_hash, file_id).expanded = Some((input_hash, clone_lexed(lexed), deps.to_vec(), exp_hash));
+        self.entry(key, text_hash, file_id).expanded = Some((input_hash, lexed.clone(), deps.to_vec(), exp_hash));
         exp_hash
     }
 
@@ -1170,7 +1168,7 @@ impl ResolveCache {
     /// tokens from it (driver/patch.rs `kept_body`).
     pub fn expansion_of(&self, file_id: FileId, text: &str) -> Option<&lexer::Lexed> {
         let text_hash = hash_str(text);
-        self.files.values().find(|e| e.file_id == file_id && e.text_hash == text_hash).and_then(|e| e.expanded.as_ref()).map(|e| &e.1)
+        self.files.values().find(|e| e.file_id == file_id && e.text_hash == text_hash).and_then(|e| e.expanded.as_ref()).map(|e| &*e.1)
     }
 
     /// The cached parsed Ast for one expanded token stream, cloned out.
@@ -2678,7 +2676,7 @@ impl MacroEnv {
     fn build(
         job: &CrateJob,
         discs: &[FileDisc],
-        expanded: &[Option<lexer::Lexed>],
+        expanded: &[Option<std::sync::Arc<lexer::Lexed>>],
         dep_exports: &[(String, Vec<OwnedMacroSource>)],
         tables: &ResolvedTables,
         interner: &Interner,
@@ -3329,7 +3327,7 @@ fn resolve_one(
     // Expansion rounds (6.1): expand every file with the macro
     // environment the outlines now prove, then look for module edges
     // the expansions generated; repeat until a round adds no file.
-    let mut expanded: Vec<Option<lexer::Lexed>> = Vec::new();
+    let mut expanded: Vec<Option<std::sync::Arc<lexer::Lexed>>> = Vec::new();
     // The `hash_lexed` of each expanded stream, when the expansion
     // cache knows it (a hit, or a store this round).
     let mut exp_known: Vec<Option<u64>> = Vec::new();
@@ -3373,14 +3371,14 @@ fn resolve_one(
                 })
             })
             .collect();
-        let exp_hits: Vec<std::sync::Mutex<Option<(lexer::Lexed, Vec<crate::expand::Dep>, u64)>>> = exp_keys
+        let exp_hits: Vec<std::sync::Mutex<Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>>> = exp_keys
             .iter()
             .enumerate()
             .map(|(di, k)| std::sync::Mutex::new(k.as_ref().and_then(|(key, th, ih)| cache.expanded(key, *th, discs[di].file_id, *ih))))
             .collect();
         exp_known.clear();
         exp_known.extend(exp_hits.iter().map(|h| h.lock().unwrap().as_ref().map(|x| x.2)));
-        let results = par_map(&indices, |&di| -> Result<(Option<lexer::Lexed>, Vec<crate::expand::Dep>), Diag> {
+        let results = par_map(&indices, |&di| -> Result<(Option<std::sync::Arc<lexer::Lexed>>, Vec<crate::expand::Dep>), Diag> {
             if let Some((l, deps, _)) = exp_hits[di].lock().unwrap().take() {
                 return Ok((Some(l), deps));
             }
@@ -3408,7 +3406,7 @@ fn resolve_one(
             // The crate's seeds, then this file's glob seeds, borrowed: a copy
             // of every seed per file cost more than the expansion of most files.
             let extra = menv.glob_seeds.get(di).map_or(&[][..], Vec::as_slice);
-            crate::expand::expand_lexed_seeded_extra(spliced, &ects, &menv.seeds, extra).map(|(l, deps)| (Some(l), deps))
+            crate::expand::expand_lexed_seeded_extra(spliced, &ects, &menv.seeds, extra).map(|(l, deps)| (Some(std::sync::Arc::new(l)), deps))
         });
         file_deps.resize_with(discs.len(), Vec::new);
         for (di, r) in results.into_iter().enumerate() {
@@ -3505,29 +3503,40 @@ fn resolve_one(
     let exp_hashes = if keep {
         par_map(&order, |&di| match (exp_known.get(di).copied().flatten(), expanded[di].as_ref(), discs[di].lexed.as_ref()) {
             (Some(h), Some(_), _) => h,
-            (_, Some(l), _) | (_, None, Some(l)) => hash_lexed(l),
+            (_, Some(l), _) => hash_lexed(l),
+            (_, None, Some(l)) => hash_lexed(l),
             (_, None, None) => hash_lexed(&lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }),
         })
     } else {
         vec![0; order.len()]
     };
-    // The stream each file parses from. Nothing reads the streams after
-    // this phase, so a parse task moves its own out instead of copying it.
-    let streams: Vec<std::sync::Mutex<Option<lexer::Lexed>>> =
-        expanded.into_iter().zip(discs.iter_mut()).map(|(e, d)| std::sync::Mutex::new(e.or_else(|| d.lexed.take()))).collect();
+    // The stream each file parses from, shared with the expansion cache:
+    // a parse reads it and copies nothing.
+    let streams: Vec<std::sync::Mutex<Option<std::sync::Arc<lexer::Lexed>>>> =
+        expanded.into_iter().zip(discs.iter_mut()).map(|(e, d)| std::sync::Mutex::new(e.or_else(|| d.lexed.take().map(std::sync::Arc::new)))).collect();
     // Each file's works: one, or one per item segment (see below).
     let mut works: Vec<Vec<FileWork>> = Vec::with_capacity(order.len());
     let mut todo: Vec<usize> = Vec::new();
-    for (pos, &di) in order.iter().enumerate() {
+    // Each file's cache key (the canonical path memo is the cache's own,
+    // so serial), then its text hash, outside flag and cached parse in
+    // parallel: cloning every unchanged file's Ast in one loop cost a
+    // warm tsgo merge about 0.25 s (perf, merge 11).
+    let keys: Vec<String> = order.iter().map(|&di| job.file_key(&cache.canon(&discs[di].path), discs[di].module)).collect();
+    let positions: Vec<usize> = (0..order.len()).collect();
+    let probes: Vec<(u64, bool, Option<Ast>)> = {
+        let cache: &ResolveCache = cache;
+        par_map(&positions, |&pos| {
+            let disc = &discs[order[pos]];
+            let (text_hash, outside) = (hash_str(&disc.text), reads_outside(&disc.text));
+            let hit = if outside { None } else { cache.parsed(&keys[pos], text_hash, disc.file_id, exp_hashes[pos]) };
+            (text_hash, outside, hit)
+        })
+    };
+    for ((pos, &di), (key, (text_hash, outside, hit))) in order.iter().enumerate().zip(keys.into_iter().zip(probes)) {
         let disc = &discs[di];
-        let key = job.file_key(&cache.canon(&disc.path), disc.module);
-        let text_hash = hash_str(&disc.text);
-        let outside = reads_outside(&disc.text);
-        let hit = if outside { None } else { cache.parsed(&key, text_hash, disc.file_id, exp_hashes[pos]) };
         match hit {
             Some(ast) => works.push(vec![FileWork {
                 path: disc.path.clone(),
-                text: disc.text.clone(),
                 file_id: disc.file_id,
                 ast,
                 module: disc.module,
@@ -3546,7 +3555,7 @@ fn resolve_one(
     let parsed = par_map(&todo, |&pos| -> Result<(Vec<FileWork>, Option<Ast>), Diag> {
         let di = order[pos];
         let disc = &discs[di];
-        let lexed = streams[di].lock().unwrap().take().unwrap_or(lexer::Lexed { tokens: Vec::new(), strings: Vec::new() });
+        let lexed = streams[di].lock().unwrap().take().unwrap_or_else(|| std::sync::Arc::new(lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }));
         // A one-shot resolve parses a big file in item segments in
         // parallel, and each segment is its own work through strip,
         // register, rewrite, and flatten. The per-file caches of a
@@ -3585,7 +3594,6 @@ fn resolve_one(
             .enumerate()
             .map(|(k, ast)| FileWork {
                 path: disc.path.clone(),
-                text: if k == 0 { disc.text.clone() } else { String::new() },
                 file_id: disc.file_id,
                 ast,
                 module: disc.module,
@@ -3714,7 +3722,9 @@ fn resolve_one(
     });
     lap!("resolve: names+structure");
     let mut answers = crate::resolve::mdr::Answers::new(tables);
-    let mut final_hits: Vec<Option<FinalChunk>> = Vec::with_capacity(works.len());
+    // The hit decisions share one answer memo, so they run in order; the
+    // chunks they take are copied out in parallel.
+    let mut hit_refs: Vec<Option<&FinalChunk>> = Vec::with_capacity(works.len());
     for w in works.iter() {
         let hit = cache.peek(&w.key, w.text_hash, w.file_id).and_then(|e| e.final_chunk.as_ref()).filter(|c| {
             c.exp_hash == w.exp_hash
@@ -3723,8 +3733,11 @@ fn resolve_one(
                     None => !cache.one_shot && c.epoch == epoch,
                 }
         });
-        final_hits.push(hit.map(|c| c.clone_for_hit(crate::resolve::mdr::on())));
+        hit_refs.push(hit);
     }
+    let observe = crate::resolve::mdr::on();
+    let final_hits: Vec<Option<FinalChunk>> = par_map(&hit_refs, |c| c.map(|c| c.clone_for_hit(observe)));
+    drop(hit_refs);
     lap!("resolve: epoch");
     // Rewrite paths to flat names, checking visibility. The tables
     // are frozen at this point and each work's Ast is its own (a file,
@@ -4200,7 +4213,7 @@ fn extern_macro_use_events(lexed: &lexer::Lexed, interner: &Interner) -> Vec<(u3
 fn textual_env(
     job: &CrateJob,
     discs: &[FileDisc],
-    expanded: &[Option<lexer::Lexed>],
+    expanded: &[Option<std::sync::Arc<lexer::Lexed>>],
     srcs: &[MacroSrc],
     dep_owned: &FxMap<String, Vec<usize>>,
     owned_names: &[Sym],
