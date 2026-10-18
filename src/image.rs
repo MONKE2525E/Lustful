@@ -1037,6 +1037,7 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     if LOADED.get().is_some() {
         return Err("image already loaded".into());
     }
+    let t0 = std::time::Instant::now();
     let chain = read_chain(dir)?;
     if !chain.iter().all(Header::compatible) {
         return Err("image from another lust build".into());
@@ -1048,7 +1049,9 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     if window_taken(arena) {
         return Err("image window in use".into());
     }
+    let t1 = std::time::Instant::now();
     let (runs, src) = spans(&chain);
+    let t2 = std::time::Instant::now();
     let mut mapped: Vec<(usize, usize)> = Vec::new();
     let unmap_all = |mapped: &[(usize, usize)]| {
         for &(a, l) in mapped {
@@ -1086,6 +1089,7 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
             // SAFETY: the run just mapped.
             unsafe { madvise(p, e - a, MADV_NOHUGEPAGE) };
         }
+        let t3 = std::time::Instant::now();
         let pages: usize = runs.iter().map(|&(a, e)| (e - a) / PAGE).sum();
         let Some((words, _)) = raw(16 * pages) else {
             unmap_all(&mapped);
@@ -1095,7 +1099,20 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
         // SAFETY: 16 zeroed bytes per page, page aligned, never unmapped.
         let words = unsafe { std::slice::from_raw_parts(words as *const AtomicU64, 2 * pages) };
         match fill(dir, &chain, &src, &runs, words, z) {
-            Ok((d, note)) => (deltas, fill_note) = (d, note),
+            Ok((d, note)) => {
+                let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+                let t4 = std::time::Instant::now();
+                let regions: usize = chain.iter().map(|h| h.regions.len()).sum();
+                fill_note = format!(
+                    "{note}; load: headers {:.0} ms, spans {:.0} ms ({regions} regions, {} runs), map {:.0} ms, fill {:.0} ms",
+                    ms(t0, t1),
+                    ms(t1, t2),
+                    runs.len(),
+                    ms(t2, t3),
+                    ms(t3, t4)
+                );
+                deltas = d;
+            }
             Err(e) => {
                 unmap_all(&mapped);
                 return Err(e);
@@ -1771,6 +1788,9 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
     let log = dir.join(SAVE_LOG);
     let _ = std::fs::remove_file(&log);
     let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
+    // The fork copies the page table of every resident page; its time
+    // goes in the parent's line.
+    let t = std::time::Instant::now();
     // SAFETY: no other thread runs (`quiesce`), so the child's copy of
     // the heap and of every lock in it is consistent.
     let pid = unsafe { fork() };
@@ -1804,7 +1824,7 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
         return write_image(dir, roots);
     }
     std::mem::forget(roots);
-    Ok(format!("lust: front state saving in the background: pid {pid}, result in {}", log.display()))
+    Ok(format!("lust: front state saving in the background: pid {pid} (fork {:.0} ms), result in {}", t.elapsed().as_secs_f64() * 1e3, log.display()))
 }
 
 /// Writes the image of `roots` and returns a one-line summary. After a
