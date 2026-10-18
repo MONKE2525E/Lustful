@@ -180,6 +180,31 @@ static uint64_t lh_eq_spread(uint64_t w, uint8_t tag) {
     uint64_t x = w ^ (tag * 0x0101010101010101ull);
     return (x - 0x0101010101010101ull) & ~x & 0x8080808080808080ull;
 }
+#if defined(__SSE2__) && !defined(__TINYC__) && LUST_HASH_GROUP_WIDTH == 16
+#include <emmintrin.h>
+/* hashbrown's x86_64 group: one 16-byte load and byte compares. Its masks are
+   exact, where the SWAR tag test below may also flag the byte above a match
+   (a candidate that eq rejects): the same lookups, inserts and order. */
+static uint32_t lh_movemask_eq(__m128i g, uint8_t b) {
+    return (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(g, _mm_set1_epi8((char)b)));
+}
+/* mode: 0 match_tag, 1 match_empty, 2 match_empty_or_deleted, 3 match_full */
+static uint32_t lh_group_bits(const lust_hash_table *t, uint64_t pos, int mode, uint8_t tag) {
+    __m128i g = _mm_loadu_si128((const __m128i *)(t->ctrl + pos));
+    if (mode == 0) return lh_movemask_eq(g, tag);
+    if (mode == 1) return lh_movemask_eq(g, LUST_HASH_EMPTY);
+    uint32_t hi = (uint32_t)_mm_movemask_epi8(g);
+    return mode == 2 ? hi : hi ^ 0xFFFFu;
+}
+/* All three masks a probe needs, from one load. */
+static void lh_group_masks(const lust_hash_table *t, uint64_t pos, uint8_t tag, uint32_t *tag_bits,
+                           uint32_t *empty_bits, uint32_t *eod_bits) {
+    __m128i g = _mm_loadu_si128((const __m128i *)(t->ctrl + pos));
+    *tag_bits = lh_movemask_eq(g, tag);
+    *empty_bits = lh_movemask_eq(g, LUST_HASH_EMPTY);
+    *eod_bits = (uint32_t)_mm_movemask_epi8(g);
+}
+#else
 /* mode: 0 match_tag, 1 match_empty, 2 match_empty_or_deleted, 3 match_full */
 static uint32_t lh_group_bits(const lust_hash_table *t, uint64_t pos, int mode, uint8_t tag) {
     uint32_t bits = 0;
@@ -208,11 +233,16 @@ static void lh_group_masks(const lust_hash_table *t, uint64_t pos, uint8_t tag, 
     *empty_bits = eb;
     *eod_bits = db;
 }
+#endif
 static int lh_lowest_bit(uint32_t bits, uint64_t *out) {
     if (!bits) return 0;
+#ifndef __TINYC__
+    *out = (uint64_t)__builtin_ctz(bits);
+#else
     uint64_t i = 0;
     while (!(bits & 1u)) { bits >>= 1; i++; }
     *out = i;
+#endif
     return 1;
 }
 

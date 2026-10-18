@@ -57,9 +57,20 @@ static uintptr_t *lust_kaddr;
 static uint64_t lust_kaddr_cap;
 static int32_t lust_klock;
 
+/* The table's hash of a key: 8 bytes per step (startup registers megabytes of static
+   pointees), mixed so the low bits (the table index) see every byte. */
 static uint64_t lust_khash(const uint8_t *b, uint64_t n, uint64_t h) {
-    for (uint64_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
-    return h;
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0x9e3779b97f4a7c15ull;
+        h ^= h >> 32;
+    }
+    for (; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    h ^= h >> 29;
+    h *= 0xbf58476d1ce4e5b9ull;
+    return h ^ (h >> 32);
 }
 
 static uint64_t lust_kaddr_slot(uintptr_t a) { return (uint64_t)((a >> 3) * 0x9e3779b97f4a7c15ull); }
@@ -158,12 +169,15 @@ static void lust_kwalk(const uint8_t *v, uint8_t *cls, const uint64_t *d, uint64
 static uint8_t lust_kkey(const void *p, uint64_t n, const uint64_t *desc, uint8_t *key) {
     uint8_t *cls = key + n;
     memcpy(key, p, n);
-    if (desc) {
-        memset(cls, 0, n);
-        lust_kwalk((const uint8_t *)p, cls, desc + 1, desc[0], 0);
-    } else {
+    if (!desc) {
+        /* Every byte init and no pointer (most static pointees): a C string when its one
+           zero byte is the last; no chunk rule applies. */
         memset(cls, 1, n);
+        int cstr = memchr(key, 0, n) == (const void *)(key + n - 1);
+        return !cstr && (n == 4 || n == 8 || n == 16 || n == 32);
     }
+    memset(cls, 0, n);
+    lust_kwalk((const uint8_t *)p, cls, desc + 1, desc[0], 0);
     int reloc = 0, uninit = 0;
     uint64_t zeros = 0;
     for (uint64_t i = 0; i < n; i++) {
