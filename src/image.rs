@@ -26,8 +26,8 @@
 //      Zero pages (freed blocks among them) are holes in every layer. Each
 //      layer has a header (format, compiler build, address anchors, the
 //      `Roots` pointer, the next arena base, its parent layer), a region
-//      table, then pages. With `LUST_FRONT_ZSTD=1` (and the system's
-//      libzstd) a layer is written packed (`pack`): its raw form in 8 MB
+//      table, then pages. When the system's libzstd loads (and unless
+//      `LUST_FRONT_ZSTD=0`) a layer is written packed (`pack`): its raw form in 8 MB
 //      zstd sections, which the next run reads in one pass and unpacks in
 //      parallel into a memfd (`unpack`): on a CI disk, page faults on a
 //      raw tsgo chain (13.2 GB) cost a fresh merge 12.8 s, and the chain
@@ -91,8 +91,9 @@ const COMPACT_DUE: &str = "compact-due";
 /// Image format. Bump on any change to the header or to what `Roots` holds.
 const MAGIC: &[u8; 8] = b"LUSTFIM3";
 /// A packed layer (`pack`): the raw (`MAGIC`) layer in zstd sections.
-const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ1";
-/// `LUST_FRONT_ZSTD=1`: saves write packed layers (when libzstd loads).
+const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ2";
+/// Saves write packed layers when libzstd loads; `LUST_FRONT_ZSTD=0` keeps
+/// them raw.
 const PACK_ENV: &str = "LUST_FRONT_ZSTD";
 /// Raw bytes per packed section; sections pack and unpack in parallel.
 const SECTION: usize = 8 << 20;
@@ -418,8 +419,9 @@ struct Header {
     /// (address, length, file offset), all page-aligned. A packed layer's
     /// offsets are in its raw form.
     regions: Vec<(u64, u64, u64)>,
-    /// A packed layer's raw length and sections (file offset, packed length).
-    packed: Option<(u64, Vec<(u64, u64)>)>,
+    /// A packed layer's raw length and sections (file offset, packed
+    /// length, `section_check`).
+    packed: Option<(u64, Vec<(u64, u64, u64)>)>,
 }
 
 impl Header {
@@ -472,14 +474,14 @@ fn read_header(path: &Path) -> Result<Header, String> {
         }
         // The first HEADER bytes are read; the rest of the head follows.
         let mut all = head.clone();
-        all.resize(32 + head_len as usize + n as usize * 16, 0);
+        all.resize(32 + head_len as usize + n as usize * 24, 0);
         f.read_exact(&mut all[HEADER..]).map_err(|_| "short packed image".to_string())?;
         let file_len = f.metadata().map_err(|e| format!("image: {e}"))?.len();
         let inner = &all[32..32 + head_len as usize];
         let mut h = parse_header(&inner[..HEADER], &inner[HEADER..], raw_len)?;
         let table = &all[32 + head_len as usize..];
-        let sections: Vec<(u64, u64)> = table.chunks_exact(16).map(|c| (word(c, 0), word(c, 8))).collect();
-        if sections.len() != raw_len.div_ceil(SECTION as u64) as usize || sections.iter().any(|&(o, l)| o.checked_add(l).is_none_or(|e| e > file_len)) {
+        let sections: Vec<(u64, u64, u64)> = table.chunks_exact(24).map(|c| (word(c, 0), word(c, 8), word(c, 16))).collect();
+        if sections.len() != raw_len.div_ceil(SECTION as u64) as usize || sections.iter().any(|&(o, l, _)| o.checked_add(l).is_none_or(|e| e > file_len)) {
             return Err("packed image section table".into());
         }
         h.packed = Some((raw_len, sections));
@@ -558,6 +560,31 @@ fn zstd() -> Option<&'static Zstd> {
     .as_ref()
 }
 
+/// The libzstd a save packs with: None when `LUST_FRONT_ZSTD=0` or when
+/// libzstd does not load (then `raw_why` says which).
+fn packer() -> Option<&'static Zstd> {
+    zstd().filter(|_| std::env::var_os(PACK_ENV).is_none_or(|v| v != "0"))
+}
+
+/// Why saves stay raw, for the save line (None when they pack).
+fn raw_why() -> Option<&'static str> {
+    match (std::env::var_os(PACK_ENV).is_some_and(|v| v == "0"), zstd().is_some()) {
+        (true, _) => Some("raw (LUST_FRONT_ZSTD=0)"),
+        (false, false) => Some("raw (no libzstd)"),
+        (false, true) => None,
+    }
+}
+
+/// A packed section's check: a hash of its packed bytes, so a damaged
+/// layer fails to load (a cold build) instead of mapping wrong pages.
+fn section_check(b: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = crate::intern::FxHasher::default();
+    h.write(b);
+    h.write_usize(b.len());
+    h.finish()
+}
+
 /// The threads that pack or unpack a layer's sections.
 fn workers() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16)
@@ -571,9 +598,9 @@ fn read_full_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> bool {
 /// Writes raw layer `raw` (`len` bytes; `head` is its header and region
 /// table) to `out` packed: a short header (`MAGIC_PACKED`, the raw length,
 /// the section count, `head`'s length), `head` itself (so the chain reads
-/// without unpacking), the section table, then the raw form cut into
-/// `SECTION`-byte sections, each one zstd frame, packed in parallel.
-/// Returns the packed length.
+/// without unpacking), the section table (file offset, packed length,
+/// `section_check`), then the raw form cut into `SECTION`-byte sections,
+/// each one zstd frame, packed in parallel. Returns the packed length.
 fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: &Zstd) -> Result<u64, String> {
     use std::io::Write;
     let n = (len as usize).div_ceil(SECTION);
@@ -614,11 +641,12 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
         return Err("image pack failed".into());
     }
     let parts: Vec<Vec<u8>> = parts.into_iter().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or_default()).collect();
-    let mut at = (32 + head.len() + n * 16) as u64;
-    let mut table = Vec::with_capacity(n * 16);
+    let mut at = (32 + head.len() + n * 24) as u64;
+    let mut table = Vec::with_capacity(n * 24);
     for p in &parts {
-        table.extend_from_slice(&at.to_le_bytes());
-        table.extend_from_slice(&(p.len() as u64).to_le_bytes());
+        for v in [at, p.len() as u64, section_check(p)] {
+            table.extend_from_slice(&v.to_le_bytes());
+        }
         at += p.len() as u64;
     }
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
@@ -637,7 +665,7 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
 /// Packed layer `path` back in its raw form, in a new memfd that the
 /// regions then map privately (`load`): the sections unpacked in parallel,
 /// each section's zero pages left out, so they stay holes and read as zero.
-fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64)], z: &Zstd) -> Result<std::fs::File, String> {
+fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64, u64)], z: &Zstd) -> Result<std::fs::File, String> {
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::FileExt;
     let src = std::fs::File::open(path).map_err(|e| format!("image: {e}"))?;
@@ -661,11 +689,11 @@ fn unpack(path: &Path, raw_len: u64, sections: &[(u64, u64)], z: &Zstd) -> Resul
                     if k >= sections.len() || failed.load(Ordering::Relaxed) {
                         break;
                     }
-                    let (off, clen) = sections[k];
+                    let (off, clen, check) = sections[k];
                     let at = k * SECTION;
                     let rlen = (raw_len as usize - at).min(SECTION);
                     cbuf.resize(clen as usize, 0);
-                    if !read_full_at(&src, &mut cbuf, off) {
+                    if !read_full_at(&src, &mut cbuf, off) || section_check(&cbuf) != check {
                         failed.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -801,7 +829,8 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     // The deltas' data on disk (their holes cost nothing): past half the
     // base's live bytes, the next save writes a new base.
     let deltas: u64 = files[1..].iter().map(|f| f.metadata().map_or(0, |m| std::os::unix::fs::MetadataExt::blocks(&m) * 512)).sum();
-    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live, files });
+    let packed = chain.iter().filter(|h| h.packed.is_some()).count();
+    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live, files, packed });
     // SAFETY: the root was a leaked `Box<Roots>` of a process running this
     // same binary at the same addresses (checked: build id, anchors), and
     // every page it reaches is mapped back above.
@@ -825,6 +854,8 @@ struct Loaded {
     /// Each layer's raw form (the file, or a packed layer's memfd), which
     /// a base write copies untouched pages from.
     files: Vec<std::fs::File>,
+    /// How many layers were packed.
+    packed: usize,
 }
 
 static LOADED: std::sync::OnceLock<Loaded> = std::sync::OnceLock::new();
@@ -835,6 +866,16 @@ static GEN: AtomicUsize = AtomicUsize::new(0);
 /// How many images led to this process's session (0: a cold one).
 pub fn generation() -> usize {
     GEN.load(Ordering::Relaxed)
+}
+
+/// The form of the restored layers, for the build line: `packed`, or why
+/// they (and this run's saves) are raw.
+pub fn layers_note() -> String {
+    match LOADED.get().map(|l| (l.packed, l.layers)) {
+        Some((p, n)) if p == n => "packed".into(),
+        Some((p, _)) if p > 0 => format!("packed and raw; saves {}", raw_why().map_or("pack", |_| "stay raw")),
+        _ => raw_why().map_or_else(|| "raw; saves pack".to_string(), str::to_string),
+    }
 }
 
 /// The restored runs of this process (none in a cold one).
@@ -1304,13 +1345,15 @@ fn base_due(l: &Loaded) -> bool {
 
 /// True when this save should rebuild the image cold instead of writing a base from this
 /// heap: a base is due and the image's restored span passes `LUST_FRONT_COMPACT_RATIO` (default
-/// 1.5, 0 for never) times its live bytes. Restored
+/// 3 when saves pack, else 1.5; 0 for never) times its live bytes. Restored
 /// memory is never reused and a page that holds a live block is kept whole, so a base from
 /// this heap keeps every such page (tsgo's 12-merge replay: 8.7, 12.7, 17.0 GB bases for 4.7,
 /// 5.2, 5.7 GB live).
 fn compaction_due(dir: &Path) -> bool {
     let Some(l) = LOADED.get() else { return false };
-    let ratio = std::env::var("LUST_FRONT_COMPACT_RATIO").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5);
+    // Packed, a scattered base costs a few seconds to save and restore, so
+    // compaction (a cold rebuild) waits for a larger span.
+    let ratio = std::env::var("LUST_FRONT_COMPACT_RATIO").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(if packer().is_some() { 3.0 } else { 1.5 });
     let span: usize = l.runs.iter().map(|&(a, e)| e - a).sum();
     COMPACT_OK.load(Ordering::Relaxed)
         && ratio > 0.0
@@ -1483,9 +1526,9 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     let base_fds: Vec<c_int> = base_from.as_ref().map_or(Vec::new(), |(_, f)| f.iter().map(|f| f.as_raw_fd()).collect());
     let path = layer_path(dir, layer);
     let tmp = dir.join(format!("front.tmp{}", std::process::id()));
-    // Packed (`LUST_FRONT_ZSTD=1`): the raw layer goes to a memfd first, then
+    // Packed (`packer`): the raw layer goes to a memfd first, then
     // `pack` writes it to the temp file.
-    let packer = zstd().filter(|_| std::env::var_os(PACK_ENV).is_some_and(|v| v == "1"));
+    let packer = packer();
     let mut file = match packer {
         Some(_) => {
             use std::os::fd::FromRawFd;
@@ -1699,7 +1742,7 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         t.elapsed().as_secs_f64() * 1e3,
         live >> 20,
         OLD_FREED.load(Ordering::Relaxed) >> 20,
-        packed_len.map_or(String::new(), |n| format!(", packed to {} MB", n >> 20))
+        packed_len.map_or_else(|| format!(", {}", raw_why().unwrap_or("raw")), |n| format!(", packed to {} MB", n >> 20))
     ))
 }
 
@@ -1724,7 +1767,7 @@ mod tests {
         let data: Vec<u8> = (0..len).map(|i| if (i / PAGE) % 3 == 1 { 0 } else { (i * 31 % 251) as u8 }).collect();
         std::fs::write(dir.join("raw"), &data).unwrap();
         let raw = std::fs::File::open(dir.join("raw")).unwrap();
-        let head = vec![7u8; HEADER];
+        let head = header(9, 0).bytes();
         let mut out = std::fs::File::create(dir.join("packed")).unwrap();
         let n = pack(&raw, len as u64, &head, &mut out, z).unwrap();
         drop(out);
@@ -1732,9 +1775,10 @@ mod tests {
         assert_eq!(packed.len() as u64, n);
         assert_eq!(&packed[..8], MAGIC_PACKED);
         let word = |i: usize| u64::from_le_bytes(packed[i..i + 8].try_into().unwrap());
-        assert_eq!((word(8), word(24)), (len as u64, HEADER as u64));
-        let at = 32 + HEADER;
-        let sections: Vec<(u64, u64)> = (0..word(16) as usize).map(|k| (word(at + 16 * k), word(at + 16 * k + 8))).collect();
+        assert_eq!((word(8), word(24)), (len as u64, head.len() as u64));
+        let at = 32 + head.len();
+        let sections: Vec<(u64, u64, u64)> =
+            (0..word(16) as usize).map(|k| (word(at + 24 * k), word(at + 24 * k + 8), word(at + 24 * k + 16))).collect();
         assert_eq!(sections.len(), len.div_ceil(SECTION));
         let mem = unpack(&dir.join("packed"), len as u64, &sections, z).unwrap();
         let mut back = vec![0u8; len];
@@ -1742,6 +1786,17 @@ mod tests {
         assert!(back == data, "unpacked bytes differ");
         let allocated = std::os::unix::fs::MetadataExt::blocks(&mem.metadata().unwrap()) * 512;
         assert!(allocated < len as u64 * 3 / 4, "zero pages were written: {allocated} of {len} bytes allocated");
+        // A damaged byte in a section fails the check: the load goes cold.
+        let mut bad = packed.clone();
+        let mid = (sections[1].0 + sections[1].1 / 2) as usize;
+        bad[mid] ^= 0x40;
+        std::fs::write(dir.join("bad"), &bad).unwrap();
+        assert!(unpack(&dir.join("bad"), len as u64, &sections, z).is_err(), "a damaged section unpacked");
+        // The whole layer reads as a chain layer; a truncated one does not.
+        let h = read_header(&dir.join("packed")).unwrap();
+        assert_eq!((h.id, h.packed.as_ref().map(|p| p.1.len())), (9, Some(sections.len())));
+        std::fs::write(dir.join("short"), &packed[..packed.len() - 100]).unwrap();
+        assert!(read_header(&dir.join("short")).is_err(), "a truncated layer read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

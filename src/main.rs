@@ -154,7 +154,7 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     for (k, req) in reqs.iter().enumerate() {
         let found = sessions.iter().position(|s| s.key == req.session);
         let how = match (&loaded, found) {
-            (Ok(()), Some(_)) => format!("restored generation {}", image::generation()),
+            (Ok(()), Some(_)) => format!("restored generation {} ({})", image::generation(), image::layers_note()),
             (Ok(()), None) => "cold (the image has no session for this crate selection)".to_string(),
             (Err(why), _) => format!("cold ({why})"),
         };
