@@ -685,6 +685,7 @@ impl<'p> Ctx<'p> {
     /// `core::time::Duration` Adt when spliced, else the builtin.
     fn duration_ty(&mut self) -> Ty {
         let p = self.p;
+        crate::check::spec::read_all(crate::check::spec::tab::ADTS);
         let src = (0..p.adts.len() as u32)
             .map(AdtId)
             .find(|&a| p.is_std_adt(a) && p.display_path(p.adt(a).name) == "core::time::Duration");
@@ -698,6 +699,7 @@ impl<'p> Ctx<'p> {
     /// crate is in the session (its mention triggers load it).
     fn io_error_ty(&mut self) -> Ty {
         let p = self.p;
+        crate::check::spec::read_all(crate::check::spec::tab::ADTS);
         (0..p.adts.len() as u32)
             .map(AdtId)
             .find(|&a| p.shipped_crate_at(p.adt(a).span) == Some(crate::ty::lang::ShippedCrate::Std) && p.display_path(p.adt(a).name) == "std::io::Error")
@@ -775,6 +777,7 @@ impl<'p> Ctx<'p> {
             // `std::time::Duration` names it, so `sleep` takes it.
             SyncOp::ThreadSleep => {
                 let p = self.p;
+                crate::check::spec::read_all(crate::check::spec::tab::ADTS);
                 let src = (0..p.adts.len() as u32)
                     .map(AdtId)
                     .find(|&a| p.is_std_adt(a) && p.display_path(p.adt(a).name) == "core::time::Duration");

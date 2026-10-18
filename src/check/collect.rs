@@ -393,7 +393,7 @@ pub struct Program {
     /// `impl W<u16>`); the probe unifies the receiver against
     /// each candidate, and the overlap check in `finish_collect`
     /// rejects patterns that can both apply.
-    pub methods: HashMap<(AdtId, Sym), Vec<LocalDefId>>,
+    pub methods: crate::check::spec::Logged<(AdtId, Sym), Vec<LocalDefId>, { crate::check::spec::tab::METHODS }>,
     pub main: Option<LocalDefId>,
     /// The crate this program was collected as: session-local id and stable hash.
     pub krate: CrateId,
@@ -403,7 +403,7 @@ pub struct Program {
     /// `defs` and in the type store, where `TyKind::Adt(DefId, ArgsId)` reads it.
     pub fn_defs: Vec<DefId>,
     /// The `LocalDefId` of a function by its stable hash (section 1.7).
-    pub def_by_hash: HashMap<DefPathHash, LocalDefId>,
+    pub def_by_hash: crate::check::spec::Logged<DefPathHash, LocalDefId, { crate::check::spec::tab::DEF_BY_HASH }>,
     /// Source std fns routed into this compile by the std loader (S5):
     /// full Rust path segments to the local fn that carries the body.
     /// Empty unless the driver spliced std source in. Filled by the
@@ -3472,12 +3472,12 @@ pub fn collect_reuse(
         drop_adts: Default::default(),
         aliases: HashMap::default(),
         fn_names: HashMap::default(),
-        methods: HashMap::default(),
+        methods: Default::default(),
         main: None,
         krate: crate_ids.local,
         stable_crate: crate_ids.stable,
         fn_defs: Vec::new(),
-        def_by_hash: HashMap::default(),
+        def_by_hash: Default::default(),
         std_fns: Vec::new(),
         shipped_ranges: ast.shipped.clone(),
         resolved,

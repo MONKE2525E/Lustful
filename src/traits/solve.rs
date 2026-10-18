@@ -555,6 +555,9 @@ impl Solver {
     /// commits its probe bindings; every other answer binds
     /// nothing.
     pub fn select<C: SolveCx>(&mut self, cx: &mut C, index: &ImplIndex, env: &[Predicate], obl: TraitRef) -> Selection {
+        // A window check of mono discovery stops after its step budget
+        // (check/spec.rs).
+        crate::check::spec::step(1);
         let obl = deep_trait_ref(cx, obl);
         if self.stack.len() >= MAX_DEPTH || self.stack.contains(&obl) {
             return Selection::Overflow;

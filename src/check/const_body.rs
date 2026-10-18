@@ -447,7 +447,7 @@ pub(crate) fn written_anon_consts(p: &Program, t: ast::TyId) -> Vec<(ast::ExprId
     if w.out.iter().any(|(_, want)| want.is_none()) {
         let wants = p.gx.anon_wants.lock().unwrap_or_else(|e| e.into_inner());
         for (e, want) in &mut w.out {
-            *want = want.or_else(|| wants.get(&e.0).copied().flatten());
+            *want = want.or_else(|| crate::check::spec::anon_want(e.0, || wants.get(&e.0).copied().flatten()));
         }
     }
     w.out

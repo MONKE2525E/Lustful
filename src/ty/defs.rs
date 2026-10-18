@@ -10,6 +10,7 @@
 // signature reads that would walk raw predicate lists for supertraits go through
 // `param_env` instead (ARCH 2.1).
 use super::*;
+use crate::check::spec;
 use crate::def::DefId;
 use crate::diag::Span;
 use crate::intern::{FxMap, Sym};
@@ -140,6 +141,7 @@ impl Defs {
     /// duplicate definitions are user errors reported by collect (L0106), and the
     /// surviving record only feeds later error messages.
     pub fn insert(&mut self, def: DefId, data: DefData) {
+        spec::wrote(spec::tab::DEFS, &def);
         match self.by_def.get(&def) {
             Some(&i) => self.data[i as usize].1 = data,
             None => {
@@ -151,12 +153,14 @@ impl Defs {
 
     /// The number of def records.
     pub fn len(&self) -> usize {
+        spec::read_all(spec::tab::DEFS);
         self.data.len()
     }
 
     /// Drops the records added after the first `n` (check/const_body.rs
     /// removes the defs of its transient fns). Adt records stay below `n`.
     pub fn truncate(&mut self, n: usize) {
+        spec::wrote_all(spec::tab::DEFS);
         for (def, _) in self.data.drain(n.min(self.data.len())..) {
             self.by_def.remove(&def);
         }
@@ -164,23 +168,27 @@ impl Defs {
 
     /// Records one user Adt def and its session-local index, in both directions.
     pub fn insert_adt(&mut self, def: DefId, local: AdtId, data: DefData) {
+        spec::wrote(spec::tab::DEF_ADT_LOCALS, &def);
         self.adt_locals.insert(def, local);
         let i = local.0 as usize;
         if i >= self.adt_defs.len() {
             self.adt_defs.resize(i + 1, DefId::PLACEHOLDER);
         }
+        spec::wrote(spec::tab::DEF_ADT_DEFS, &i);
         self.adt_defs[i] = def;
         self.insert(def, data);
     }
 
     /// The record of a def, if this crate defines it.
     pub fn get(&self, def: DefId) -> Option<&DefData> {
+        spec::read(spec::tab::DEFS, &def);
         self.by_def.get(&def).map(|&i| &self.data[i as usize].1)
     }
 
     /// The record of a def for an update in place (collect's
     /// signature normalization keeps `sig` in step with `FnInfo`).
     pub fn get_mut(&mut self, def: DefId) -> Option<&mut DefData> {
+        spec::wrote(spec::tab::DEFS, &def);
         self.by_def.get(&def).map(|&i| &mut self.data[i as usize].1)
     }
     /// The kind of a def, if known.
@@ -206,15 +214,18 @@ impl Defs {
         if i >= self.adt_defs.len() {
             self.adt_defs.resize(i + 1, DefId::PLACEHOLDER);
         }
+        spec::wrote(spec::tab::DEF_ADT_DEFS, &i);
         self.adt_defs[i] = def;
     }
 
     /// The session-local index of a user Adt def, for the compat `AdtDef` table.
     pub fn local_adt(&self, def: DefId) -> Option<AdtId> {
+        spec::read(spec::tab::DEF_ADT_LOCALS, &def);
         self.adt_locals.get(&def).copied()
     }
     /// The def of a user Adt by its session-local index.
     pub fn def_of_adt(&self, local: AdtId) -> Option<DefId> {
+        spec::read(spec::tab::DEF_ADT_DEFS, &(local.0 as usize));
         self.adt_defs.get(local.0 as usize).copied().filter(|d| *d != DefId::PLACEHOLDER)
     }
 

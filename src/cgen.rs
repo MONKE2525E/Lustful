@@ -11297,7 +11297,7 @@ fn glue_def_value(
             let _ = writeln!(protos, "int8_t {pre}_{m}({ct} *a, {ct} *b);");
             // A written `partial_cmp` (see `glue_methods`): its
             // `Option<Ordering>` becomes the glue's code.
-            let written = if partial { &p.gx.pcmp_methods } else { &p.gx.glue_methods };
+            let written = if partial { p.gx.pcmp_methods.as_map() } else { p.gx.glue_methods.as_map() };
             if let CTy::Adt(adt_id) | CTy::Unsized(adt_id, _) = t
                 && let Some(&f) = written.get(&(*adt_id, p.gx.lang.partial_ord))
                 && let Some(ord) = p.tys.local_adt_of(crate::check::generics::ordering_def())

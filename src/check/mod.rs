@@ -41,6 +41,7 @@ pub mod split;
 pub mod project;
 pub mod prog_shift;
 pub mod sized;
+pub mod spec;
 pub mod slice;
 pub mod stdtypes;
 pub mod std_inherent;

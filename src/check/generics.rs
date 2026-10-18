@@ -1525,8 +1525,20 @@ pub(crate) fn note_anon_const(ast: &Ast, sink: Option<&AnonWants>, e: ast::ExprI
     if ast.anon_const(e).is_none() && !matches!(ast.expr(e), ast::Expr::Block(_)) {
         return;
     }
+    // A window check keeps its notes (check/spec.rs); `Ahead::take`
+    // replays them in its body's turn.
+    if crate::check::spec::note_anon(e.0, want) {
+        return;
+    }
+    put_anon_want(sink, e.0, want);
+}
+
+/// One `anon_wants` note: the expression is known; a type, when given,
+/// replaces the entry's.
+fn put_anon_want(sink: &AnonWants, e: u32, want: Option<ConstScalar>) {
+    crate::check::spec::wrote(crate::check::spec::tab::ANON_WANTS, &e);
     let mut m = sink.lock().unwrap_or_else(|p| p.into_inner());
-    let slot = m.entry(e.0).or_insert(None);
+    let slot = m.entry(e).or_insert(None);
     if want.is_some() {
         *slot = want;
     }
@@ -5595,19 +5607,19 @@ pub struct GenTables {
     pub fn_templates: Vec<Option<FnTemplate>>,
     pub fn_scopes: Vec<FnScope>,
     pub fn_class: Vec<FnClass>,
-    pub instances: FxMap<LocalDefId, InstanceInfo>,
+    pub instances: crate::check::spec::Logged<LocalDefId, InstanceInfo, { crate::check::spec::tab::INSTANCES }>,
     /// Every registered closure by its def (ARCH 2.9).
-    pub closures: FxMap<DefId, ClosureEntry>,
+    pub closures: crate::check::spec::Logged<DefId, ClosureEntry, { crate::check::spec::tab::CLOSURES }>,
     /// Closure body fns back to their closure def.
-    pub closure_fns: FxMap<LocalDefId, DefId>,
+    pub closure_fns: crate::check::spec::Logged<LocalDefId, DefId, { crate::check::spec::tab::CLOSURE_FNS }>,
     /// Each template's closures as its template check analyzed them:
     /// (template, closure expr) to kind and capture shapes. Concrete
     /// instances reuse these, so captures follow the generic body.
-    pub template_closures: FxMap<(LocalDefId, ast::ExprId), (crate::check::closure::ClosureKind, Vec<CaptureShape>)>,
+    pub template_closures: crate::check::spec::Logged<(LocalDefId, ast::ExprId), (crate::check::closure::ClosureKind, Vec<CaptureShape>), { crate::check::spec::tab::TEMPLATE_CLOSURES }>,
     /// The Fn trait each closure call in a template goes through
     /// (from its template check), by (template, call expr).
-    pub template_calls: FxMap<(LocalDefId, ast::ExprId), crate::check::closure::ClosureKind>,
-    pub instance_by_key: FxMap<(DefId, ArgsId), LocalDefId>,
+    pub template_calls: crate::check::spec::Logged<(LocalDefId, ast::ExprId), crate::check::closure::ClosureKind, { crate::check::spec::tab::TEMPLATE_CALLS }>,
+    pub instance_by_key: crate::check::spec::Logged<(DefId, ArgsId), LocalDefId, { crate::check::spec::tab::INSTANCE_BY_KEY }>,
     /// Inherent method templates by (Adt template def, name), in
     /// registration order; disjoint Self patterns may share a name.
     pub inherent_methods: FxMap<(DefId, Sym), Vec<LocalDefId>>,
@@ -5640,35 +5652,35 @@ pub struct GenTables {
     pub traits_by_method: FxMap<Sym, Vec<DefId>>,
     /// The `Drop::drop` instance to call for one concrete Adt,
     /// for cgen's drop glue (iface: W-CGEN reads this).
-    pub drop_methods: FxMap<AdtId, LocalDefId>,
+    pub drop_methods: crate::check::spec::Logged<AdtId, LocalDefId, { crate::check::spec::tab::DROP_METHODS }>,
     /// The written `Clone::clone`, `Default::default`,
     /// `PartialEq::eq`, and `PartialOrd::partial_cmp` methods of
     /// non-generic impls on non-generic local Adts, by (Adt, trait):
     /// derived glue calls them for a field of that type, as rustc's
     /// derived bodies call the field type's impl (iface: W-CGEN
     /// reads this, like `drop_methods`).
-    pub glue_methods: FxMap<(AdtId, DefId), LocalDefId>,
+    pub glue_methods: crate::check::spec::Logged<(AdtId, DefId), LocalDefId, { crate::check::spec::tab::GLUE_METHODS }>,
     /// The written `Clone::clone_from` methods of impls on local
     /// Adts, by Adt: cgen's `clonefrom` glue calls them, as a derived
     /// or default `clone_from` calls each field's (iface: W-CGEN
     /// reads this, like `glue_methods`).
-    pub clone_from_methods: FxMap<AdtId, LocalDefId>,
+    pub clone_from_methods: crate::check::spec::Logged<AdtId, LocalDefId, { crate::check::spec::tab::CLONE_FROM_METHODS }>,
     /// The written `PartialOrd::partial_cmp` methods cgen's `PCmp`
     /// glue may call: like `glue_methods`, but an `Ord` impl may also
     /// exist (the `Cmp` glue then means `Ord::cmp` and cannot serve
     /// both), and only an `lt` override disqualifies (sort compares
     /// with `lt`, whose default is `partial_cmp == Some(Less)`).
     /// Keyed by (Adt, `PartialOrd` trait) (iface: W-CGEN reads this).
-    pub pcmp_methods: FxMap<(AdtId, DefId), LocalDefId>,
+    pub pcmp_methods: crate::check::spec::Logged<(AdtId, DefId), LocalDefId, { crate::check::spec::tab::PCMP_METHODS }>,
     /// The written `impl Default for &'static A` methods (a non-generic
     /// impl, `A` a non-generic local Adt): the derive glue's default of
     /// a `&'static A` field calls it (ts-rust's `&'static ExportMember`).
     /// Keyed by `A` (iface: W-CGEN reads this).
-    pub ref_default_methods: FxMap<AdtId, LocalDefId>,
+    pub ref_default_methods: crate::check::spec::Logged<AdtId, LocalDefId, { crate::check::spec::tab::REF_DEFAULT_METHODS }>,
     /// The user `fmt` method instance for one concrete Adt and fmt
     /// trait (`FmtKind as u8`: Display or Debug), for cgen's Debug and
     /// Display glue (W-STD-B; iface: W-CGEN reads this).
-    pub fmt_methods: FxMap<(AdtId, u8), LocalDefId>,
+    pub fmt_methods: crate::check::spec::Logged<(AdtId, u8), LocalDefId, { crate::check::spec::tab::FMT_METHODS }>,
     /// Field types of `#[derive(Debug)]` Adts that name a local Adt the
     /// structural rules could not answer at collect (a written `impl
     /// Debug` is not in the index yet): proven in `finish_collect`.
@@ -5678,36 +5690,36 @@ pub struct GenTables {
     /// take core's defaults in cgen), and the `BuildHasher::build_hasher`
     /// instance with the impl's `Hasher` type (W-STD-B; iface: W-CGEN
     /// reads these for the hash glue).
-    pub hasher_methods: FxMap<(AdtId, u8), LocalDefId>,
-    pub build_hashers: FxMap<AdtId, (LocalDefId, Ty)>,
+    pub hasher_methods: crate::check::spec::Logged<(AdtId, u8), LocalDefId, { crate::check::spec::tab::HASHER_METHODS }>,
+    pub build_hashers: crate::check::spec::Logged<AdtId, (LocalDefId, Ty), { crate::check::spec::tab::BUILD_HASHERS }>,
     /// The `Iterator` method instances of one concrete Adt whose impl
     /// is generic (`next`, `size_hint`, `next_back`, and the `Item`
     /// type): the `ByNext` expansion calls them, as it calls the
     /// plain fns of a non-generic impl (check/iter.rs `by_next_fns`;
     /// iface: lower/iter.rs reads this through it).
-    pub iter_methods: FxMap<AdtId, (LocalDefId, Option<LocalDefId>, Option<LocalDefId>, Option<Ty>, bool)>,
+    pub iter_methods: crate::check::spec::Logged<AdtId, (LocalDefId, Option<LocalDefId>, Option<LocalDefId>, Option<Ty>, bool), { crate::check::spec::tab::ITER_METHODS }>,
     /// The written `Hash::hash` template of a non-generic impl on a
     /// non-generic local Adt (no `hash_slice` of its own), and its
     /// instances by hasher type: the hash glue calls one for a value of
     /// that Adt, as core's and derived impls call the field's impl
     /// (W-STD-B; iface: W-CGEN reads `hash_impls`).
-    pub written_hash: FxMap<AdtId, LocalDefId>,
-    pub hash_impls: FxMap<AdtId, Vec<(Ty, LocalDefId)>>,
+    pub written_hash: crate::check::spec::Logged<AdtId, LocalDefId, { crate::check::spec::tab::WRITTEN_HASH }>,
+    pub hash_impls: crate::check::spec::Logged<AdtId, Vec<(Ty, LocalDefId)>, { crate::check::spec::tab::HASH_IMPLS }>,
     /// Map lookups by a dyn key (`impl Borrow<dyn K + 'a> for Key`, with
     /// written `Hash` and `PartialEq` impls for `dyn K + '_`; ts-rust's
     /// module caches): per key Adt, the hash glue's calls (cgen/hash.rs).
-    pub dyn_keys: FxMap<AdtId, DynKey>,
+    pub dyn_keys: crate::check::spec::Logged<AdtId, DynKey, { crate::check::spec::tab::DYN_KEYS }>,
     /// The written generic `Hash` impls of concrete Adt instances
     /// (`impl<T: Hash> Hash for VecDeque<T>`): the impl's `hash` fn
     /// and the impl args at the instance. `ensure_written_hash` makes
     /// their `hash::<H>` instances into `hash_impls`, as for
     /// `written_hash`.
-    pub generic_hash: FxMap<AdtId, (LocalDefId, Vec<GenericArg>)>,
+    pub generic_hash: crate::check::spec::Logged<AdtId, (LocalDefId, Vec<GenericArg>), { crate::check::spec::tab::GENERIC_HASH }>,
     /// The written `Borrow::borrow` of a non-generic `impl Borrow<Q>`
     /// on a non-generic local Adt, by (Adt, Q): a map or set lookup by
     /// `&Q` calls it on each candidate key (W-STD-B; iface: W-CGEN
     /// reads this).
-    pub borrow_impls: FxMap<(AdtId, Ty), LocalDefId>,
+    pub borrow_impls: crate::check::spec::Logged<(AdtId, Ty), LocalDefId, { crate::check::spec::tab::BORROW_IMPLS }>,
     /// True when the program uses any generic or trait form. The
     /// driver then assigns instance slots and forces a full work
     /// set (iface: W-DRIVER reads this).
@@ -5726,11 +5738,11 @@ pub struct GenTables {
     /// The template checks, by checked fn: each template body is
     /// checked as itself (`template_check`), and its trait picks
     /// are recorded there.
-    pub template_checks: FxMap<LocalDefId, LocalDefId>,
+    pub template_checks: crate::check::spec::Logged<LocalDefId, LocalDefId, { crate::check::spec::tab::TEMPLATE_CHECKS }>,
     /// Trait picks of template bodies by call expression (ARCH 4.1
     /// `CallTrait`, see `check/picks.rs`): every check of a body other
     /// than its template check reuses them instead of probing again.
-    pub trait_picks: FxMap<crate::ast::ExprId, crate::check::picks::TraitPick>,
+    pub trait_picks: crate::check::spec::Logged<crate::ast::ExprId, crate::check::picks::TraitPick, { crate::check::spec::tab::TRAIT_PICKS }>,
     /// The signature stub of each trait method (`add_trait_method_stubs`),
     /// by method def: the callee of calls a template's env proves.
     pub trait_method_stubs: FxMap<DefId, LocalDefId>,
@@ -5749,7 +5761,7 @@ pub struct GenTables {
     /// trait ref), both in the global store (iface: W-CGEN reads
     /// these to emit vtable statics).
     pub vtables: Vec<crate::check::object::VtableData>,
-    pub vtable_by_key: FxMap<(Ty, TraitRef), u32>,
+    pub vtable_by_key: crate::check::spec::Logged<(Ty, TraitRef), u32, { crate::check::spec::tab::VTABLE_BY_KEY }>,
     /// Methods of `impl dyn Trait` blocks, by (the dyn type with an
     /// erased region, name).
     pub dyn_inherent: FxMap<(Ty, Sym), LocalDefId>,
@@ -5795,7 +5807,7 @@ pub struct GenTables {
     /// `item_types_key`) that held one before collect normalized it. Well-
     /// formedness ran on these; a derive delta refuses when one names its
     /// reach (it neither normalizes nor checks them again).
-    pub written_projections: FxMap<DefId, Vec<Ty>>,
+    pub written_projections: crate::check::spec::Logged<DefId, Vec<Ty>, { crate::check::spec::tab::WRITTEN_PROJECTIONS }>,
     /// The `Ast::items` index of each struct, enum, type alias, and trait
     /// by flat name (the first one when a name repeats). Param defaults
     /// and generic aliases read their written generics through it.
@@ -5810,7 +5822,7 @@ pub struct GenTables {
     /// The return type callers check against, for a plain fn whose
     /// `FnInfo::ret` was revealed to its hidden type for codegen
     /// (`check::opaque::reveal_plain`): the opaque type itself.
-    pub opaque_ret_of: FxMap<LocalDefId, Ty>,
+    pub opaque_ret_of: crate::check::spec::Logged<LocalDefId, Ty, { crate::check::spec::tab::OPAQUE_RET_OF }>,
     /// The hidden type of each `impl Trait` return, over its defining
     /// fn's params (check/opaque.rs): from `reveal_plain` and the
     /// template check. A revealed check substitutes a use's args.
@@ -5842,12 +5854,12 @@ impl Default for GenTables {
             fn_templates: Vec::new(),
             fn_scopes: Vec::new(),
             fn_class: Vec::new(),
-            instances: FxMap::default(),
-            closures: FxMap::default(),
-            closure_fns: FxMap::default(),
-            template_closures: FxMap::default(),
-            template_calls: FxMap::default(),
-            instance_by_key: FxMap::default(),
+            instances: Default::default(),
+            closures: Default::default(),
+            closure_fns: Default::default(),
+            template_closures: Default::default(),
+            template_calls: Default::default(),
+            instance_by_key: Default::default(),
             inherent_methods: FxMap::default(),
             inherent_tmpls: std::sync::OnceLock::new(),
             prim_inherent_methods: FxMap::default(),
@@ -5856,33 +5868,33 @@ impl Default for GenTables {
             inherent_const_self: FxMap::default(),
             assoc_const_tmpls: FxMap::default(),
             traits_by_method: FxMap::default(),
-            drop_methods: FxMap::default(),
-            glue_methods: FxMap::default(),
-            clone_from_methods: FxMap::default(),
-            pcmp_methods: FxMap::default(),
-            ref_default_methods: FxMap::default(),
-            fmt_methods: FxMap::default(),
+            drop_methods: Default::default(),
+            glue_methods: Default::default(),
+            clone_from_methods: Default::default(),
+            pcmp_methods: Default::default(),
+            ref_default_methods: Default::default(),
+            fmt_methods: Default::default(),
             deferred_debug_fields: Vec::new(),
-            hasher_methods: FxMap::default(),
-            build_hashers: FxMap::default(),
-            iter_methods: FxMap::default(),
-            written_hash: FxMap::default(),
-            hash_impls: FxMap::default(),
-            dyn_keys: FxMap::default(),
-            generic_hash: FxMap::default(),
-            borrow_impls: FxMap::default(),
+            hasher_methods: Default::default(),
+            build_hashers: Default::default(),
+            iter_methods: Default::default(),
+            written_hash: Default::default(),
+            hash_impls: Default::default(),
+            dyn_keys: Default::default(),
+            generic_hash: Default::default(),
+            borrow_impls: Default::default(),
             has_generics: false,
             user_generics: false,
             cow_fns: Vec::new(),
             mono_counts: (0, 0),
-            template_checks: FxMap::default(),
-            trait_picks: FxMap::default(),
+            template_checks: Default::default(),
+            trait_picks: Default::default(),
             trait_method_stubs: FxMap::default(),
             walk_instances: true,
             reuse: Default::default(),
             dyn_infos: FxMap::default(),
             vtables: Vec::new(),
-            vtable_by_key: FxMap::default(),
+            vtable_by_key: Default::default(),
             dyn_inherent: FxMap::default(),
             dyn_impl_sites: Vec::new(),
             static_dyn_impls: Vec::new(),
@@ -5894,11 +5906,11 @@ impl Default for GenTables {
             adt_created: Vec::new(),
             turn_marks: Vec::new(),
             derive_marks: [0; 3],
-            written_projections: FxMap::default(),
+            written_projections: Default::default(),
             item_index: FxMap::default(),
             param_defaults: FxMap::default(),
             opaques: FxMap::default(),
-            opaque_ret_of: FxMap::default(),
+            opaque_ret_of: Default::default(),
             opaque_hidden: FxMap::default(),
             anon_wants: Default::default(),
         }
@@ -12374,6 +12386,9 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     // compile skips them, and runs them only for a clean body whose
     // requests name a stub (`lint_tail`, below).
     let lints = reuse.on || !reuse.one_shot;
+    // Window checks run only where a check records no reads: a read's
+    // fingerprint can come from the deep memo, which logs no table read.
+    let mut ahead = Ahead::new(!p.record_reads && !reuse.on);
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -12387,8 +12402,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         }
         let mut next_queue: Vec<LocalDefId> = Vec::new();
         let mut recheck: Vec<LocalDefId> = Vec::new();
-        for fid in std::mem::take(&mut queue) {
+        let round = std::mem::take(&mut queue);
+        ahead.start(round.len());
+        for (k, &fid) in round.iter().enumerate() {
             crate::driver::graph::FpMemo::sync(p);
+            ahead.fill(p, &round, k, lints);
+            let adts_before = p.adts.len();
             if rounds == 1 && p.gx.fn_class.get(fid.0 as usize) == Some(&FnClass::Plain) {
                 p.gx.turn_marks.push((fid, p.gx.adt_created.len() as u32));
             }
@@ -12403,15 +12422,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 stored
             } else {
                 reuse.discovery_checked += 1;
-                let (mut checked, mut discarded) = crate::check::check_fn_with(p, fid, lints);
-                if !lints
-                    && discarded.is_empty()
-                    && checked.inst_requests.iter().any(|(t, _)| p.gx.fn_class.get(t.0 as usize) == Some(&FnClass::Stub))
-                    && let Some(d) = crate::check::lint_tail(p, fid, &mut checked)
-                {
-                    discarded.push(d);
-                }
-                let (adt_tys, reqs, closures_owned, vts) = discovery_out(p, &checked, &discarded);
+                let checked = match ahead.take(p, k, fid, lints) {
+                    Some(found) => found,
+                    None => discover_one(p, fid, lints),
+                };
+                let clean = checked.clean;
+                let (adt_tys, reqs, closures_owned, vts) = checked.out;
                 // A body whose types still name a generic definer's
                 // template closures (its instance is made from this very
                 // body's requests) checks again next round; its requests
@@ -12438,12 +12454,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                         (adt_tys, reqs, closures_owned, vts)
                     }
                 } else {
-                    if discarded.is_empty() && !pending {
+                    if clean && !pending {
                         reuse.store_discovered(p, fid, &checked.reads, &adt_tys, &reqs, &closures_owned, &vts);
                     } else {
                         // A pending check of `lust check` (no instances) stays
                         // pending: its reads let a derive delta skip it.
-                        let keep = !p.gx.walk_instances && discarded.is_empty() && !checked.closure_kind_pending;
+                        let keep = !p.gx.walk_instances && clean && !checked.closure_kind_pending;
                         reuse.note_unstored(p, fid, &adt_tys, &reqs, &closures_owned, &vts, keep.then_some(&checked.reads));
                     }
                     (adt_tys, reqs, closures_owned, vts)
@@ -12542,7 +12558,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 ensure_written_hash(p, &mut next_queue);
                 hash_done = hash_stamp(p);
             }
+            // A scan of every Adt row (check/sync.rs) reads the row count.
+            if p.adts.len() != adts_before {
+                crate::check::spec::wrote_all(crate::check::spec::tab::ADTS);
+            }
         }
+        ahead.end();
         // Deferred vtables whose closures this round registered; when no
         // work is left, the rest as they are (a closure that never came).
         let flush = next_queue.is_empty() && recheck.is_empty();
@@ -12560,6 +12581,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         queue = next_queue;
     }
     p.gx.reuse = reuse;
+    ahead.report();
     crate::check::opaque::finish_opaque_rets(p);
     p.gx.mono_done = true;
     // W-SHIM: instances whose behavior lust cannot make exact. A
@@ -12616,6 +12638,250 @@ fn names_unregistered_closure(p: &Program, t: &OwnedTy) -> bool {
         OwnedTy::Adt(_, a) | OwnedTy::FnDef(_, a) | OwnedTy::Opaque(_, a) | OwnedTy::Projection(_, a) => args(a),
         OwnedTy::FnPtr(_, inputs, output) => inputs.iter().any(|e| names_unregistered_closure(p, e)) || names_unregistered_closure(p, output),
         OwnedTy::Dyn(principal, _, _) => principal.as_ref().is_some_and(|(_, a, bs)| args(a) || bs.iter().any(|(_, g)| args(std::slice::from_ref(g)))),
+    }
+}
+
+/// One fresh discovery check of a body (`discover_one`), owned: its
+/// discovery output and what the walk reads of the check besides.
+struct Found {
+    out: crate::driver::gen_reuse::Discovered,
+    closure_map_pending: bool,
+    closure_kind_pending: bool,
+    /// The check (with the lints a one-shot compile asks for) found no
+    /// error.
+    clean: bool,
+    reads: crate::driver::graph::Reads,
+}
+
+impl Found {
+    /// Field by field: the outputs as `build_owned_ty` reads them (a fn
+    /// pointer's own input and output ids are body-local numbering, which
+    /// it replaces; `stable`), the read sets by their `Debug` text.
+    fn same(&self, o: &Found) -> bool {
+        let tys = |v: &[OwnedTy]| v.iter().map(stable).collect::<Vec<_>>();
+        let closures = |v: &[OwnedClosure]| {
+            v.iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.env = stable(&c.env);
+                    c.output = stable(&c.output);
+                    c.inputs = tys(&c.inputs);
+                    c.bound_inputs = tys(&c.bound_inputs);
+                    c.input_regions = c.input_regions.iter().map(|t| t.as_ref().map(stable)).collect();
+                    c.output_region = c.output_region.as_ref().map(stable);
+                    c.bound_output = c.bound_output.as_ref().map(stable);
+                    c
+                })
+                .collect::<Vec<_>>()
+        };
+        let reqs = |v: &[(LocalDefId, Vec<OwnedArg>)]| v.iter().map(|(t, a)| (*t, a.iter().map(stable_arg).collect::<Vec<_>>())).collect::<Vec<_>>();
+        let vts = |v: &[(OwnedTy, OwnedTy)]| v.iter().map(|(a, b)| (stable(a), stable(b))).collect::<Vec<_>>();
+        let ((a0, a1, a2, a3), (b0, b1, b2, b3)) = (&self.out, &o.out);
+        tys(a0) == tys(b0)
+            && reqs(a1) == reqs(b1)
+            && closures(a2) == closures(b2)
+            && vts(a3) == vts(b3)
+            && self.closure_map_pending == o.closure_map_pending
+            && self.closure_kind_pending == o.closure_kind_pending
+            && self.clean == o.clean
+            && format!("{:?}", self.reads) == format!("{:?}", o.reads)
+    }
+}
+
+/// `t` with each fn pointer's own input and output ids cleared: a
+/// snapshot keeps them in its `FnSig`, but they are body-local numbering,
+/// and `build_owned_ty` rebuilds both from the snapshot's parts.
+fn stable(t: &OwnedTy) -> OwnedTy {
+    let b = |e: &OwnedTy| Box::new(stable(e));
+    let args = |a: &[OwnedArg]| a.iter().map(stable_arg).collect();
+    match t {
+        OwnedTy::Leaf(k) => OwnedTy::Leaf(*k),
+        OwnedTy::Ref(r, m, e) => OwnedTy::Ref(*r, *m, b(e)),
+        OwnedTy::RawPtr(m, e) => OwnedTy::RawPtr(*m, b(e)),
+        OwnedTy::Slice(e) => OwnedTy::Slice(b(e)),
+        OwnedTy::Array(e, n) => OwnedTy::Array(b(e), *n),
+        OwnedTy::Tuple(ts) => OwnedTy::Tuple(ts.iter().map(stable).collect()),
+        OwnedTy::Adt(d, a) => OwnedTy::Adt(*d, args(a)),
+        OwnedTy::FnDef(d, a) => OwnedTy::FnDef(*d, args(a)),
+        OwnedTy::Closure(d, a) => OwnedTy::Closure(*d, args(a)),
+        OwnedTy::Opaque(d, a) => OwnedTy::Opaque(*d, args(a)),
+        OwnedTy::Projection(d, a) => OwnedTy::Projection(*d, args(a)),
+        OwnedTy::FnPtr(sig, ins, out) => {
+            let sig = Binder { count: sig.count, value: FnSig { inputs: EMPTY_TYS, output: UNIT, ..sig.value } };
+            OwnedTy::FnPtr(sig, ins.iter().map(stable).collect(), b(out))
+        }
+        OwnedTy::Dyn(pr, auto, r) => {
+            let pr = pr.as_ref().map(|(d, a, bs)| (*d, args(a), bs.iter().map(|(bd, g)| (*bd, stable_arg(g))).collect()));
+            OwnedTy::Dyn(pr, *auto, *r)
+        }
+    }
+}
+
+fn stable_arg(a: &OwnedArg) -> OwnedArg {
+    match a {
+        OwnedArg::Ty(t) => OwnedArg::Ty(stable(t)),
+        other => other.clone(),
+    }
+}
+
+/// Checks body `fid` for discovery against the program as it is now.
+fn discover_one(p: &Program, fid: LocalDefId, lints: bool) -> Found {
+    let (mut checked, mut discarded) = crate::check::check_fn_with(p, fid, lints);
+    if !lints
+        && discarded.is_empty()
+        && checked.inst_requests.iter().any(|(t, _)| p.gx.fn_class.get(t.0 as usize) == Some(&FnClass::Stub))
+        && let Some(d) = crate::check::lint_tail(p, fid, &mut checked)
+    {
+        discarded.push(d);
+    }
+    let out = discovery_out(p, &checked, &discarded);
+    let (closure_map_pending, closure_kind_pending) = (checked.closure_map_pending, checked.closure_kind_pending);
+    Found { out, closure_map_pending, closure_kind_pending, clean: discarded.is_empty(), reads: checked.reads }
+}
+
+/// A window check's result: the check, what it read of the logged
+/// tables, its `anon_wants` notes, and the steps it took.
+type Ahead1 = (Found, crate::check::spec::Log, Vec<(u32, Option<ConstScalar>)>, u64);
+
+/// Discovery checks of a round run ahead in windows (check/spec.rs): at
+/// the turn of body `k`, `fill` checks the next bodies of the round in
+/// parallel against the program as it is then, and each one's turn takes
+/// its result (`take`) only when nothing it read changed since; else the
+/// body checks in its turn as before.
+struct Ahead {
+    on: bool,
+    found: Vec<Option<Ahead1>>,
+    /// The end of the open window.
+    filled: usize,
+    /// Bodies the next window checks.
+    width: usize,
+    /// `LUST_CHECK_PARDISC=<log>`: every result taken is checked again in
+    /// order, and a difference is logged.
+    compare: Option<std::ffi::OsString>,
+    /// Windows, results taken, results stale, checks that stopped early.
+    counts: [usize; 4],
+    window_ms: f64,
+    max_steps: u64,
+    /// Stale results by the table of the read that made them stale.
+    stale_by: [usize; 64],
+}
+
+/// Steps (trait selections and new body types) a window check may take
+/// before it stops; the body then checks in its turn.
+const AHEAD_FUEL: u64 = 2_000_000;
+
+impl Ahead {
+    fn new(on: bool) -> Ahead {
+        let on = on && crate::pool::threads() > 1 && std::env::var_os("LUST_NO_PARDISC").is_none();
+        if on {
+            crate::check::spec::quiet_hook();
+        }
+        Ahead {
+            on,
+            found: Vec::new(),
+            filled: 0,
+            width: 64,
+            compare: std::env::var_os("LUST_CHECK_PARDISC"),
+            counts: [0; 4],
+            window_ms: 0.0,
+            max_steps: 0,
+            stale_by: [0; 64],
+        }
+    }
+
+    /// A round of `n` bodies starts.
+    fn start(&mut self, n: usize) {
+        self.found.clear();
+        self.found.resize_with(n, || None);
+        self.filled = 0;
+    }
+
+    /// The round's last turn ended.
+    fn end(&mut self) {
+        crate::check::spec::close_window();
+        self.found.clear();
+    }
+
+    /// Before body `k`'s check: when the open window ends at `k`, checks
+    /// the next window.
+    fn fill(&mut self, p: &Program, round: &[LocalDefId], k: usize, lints: bool) {
+        if !self.on || k < self.filled || round.len() - k < 2 {
+            return;
+        }
+        crate::check::spec::close_window();
+        let end = (k + self.width).min(round.len());
+        let t0 = std::time::Instant::now();
+        let results = crate::pool::par_map(&round[k..end], |&f| crate::check::spec::speculate(AHEAD_FUEL, || discover_one(p, f, lints)));
+        self.window_ms += t0.elapsed().as_secs_f64() * 1e3;
+        self.counts[0] += 1;
+        for (i, r) in results.into_iter().enumerate() {
+            match r {
+                Some(r) => self.found[k + i] = Some(r),
+                None => self.counts[3] += 1,
+            }
+        }
+        self.filled = end;
+        crate::check::spec::open_window();
+    }
+
+    /// Body `k`'s window result, when nothing it read was written since
+    /// its window opened. Its `anon_wants` notes go in now, in turn order.
+    fn take(&mut self, p: &Program, k: usize, fid: LocalDefId, lints: bool) -> Option<Found> {
+        let (found, log, anon, steps) = self.found.get_mut(k)?.take()?;
+        if let Some(t) = crate::check::spec::with_writes(|w| log.stale_by(w)) {
+            self.counts[2] += 1;
+            self.stale_by[t as usize] += 1;
+            return None;
+        }
+        self.counts[1] += 1;
+        self.max_steps = self.max_steps.max(steps);
+        for (e, want) in anon {
+            put_anon_want(&p.gx.anon_wants, e, want);
+        }
+        if let Some(path) = &self.compare {
+            let fresh = discover_one(p, fid, lints);
+            if !fresh.same(&found) {
+                let (a, b) = (&found.out, &fresh.out);
+                let line = format!(
+                    "pardisc: {} {} differs: adt_tys {} reqs {} closures {} vtables {} map_pending {} kind_pending {} clean {} reads {}\n",
+                    std::env::args().skip(2).find(|a| a.ends_with(".rs")).unwrap_or_default(),
+                    p.interner.get(p.fn_info(fid).name),
+                    a.0 != b.0,
+                    a.1 != b.1,
+                    a.2 != b.2,
+                    a.3 != b.3,
+                    found.closure_map_pending != fresh.closure_map_pending,
+                    found.closure_kind_pending != fresh.closure_kind_pending,
+                    found.clean != fresh.clean,
+                    format!("{:?}", found.reads) != format!("{:?}", fresh.reads),
+                );
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        }
+        Some(found)
+    }
+
+    /// `LUST_PARDISC_STATS`: one line of counts, to stderr (`1`) or
+    /// appended to the file the value names.
+    fn report(&self) {
+        let Some(to) = std::env::var_os("LUST_PARDISC_STATS").filter(|_| self.on) else { return };
+        let [w, taken, stale, out] = self.counts;
+        let by: Vec<String> = self.stale_by.iter().enumerate().filter(|(_, n)| **n > 0).map(|(t, n)| format!("{t}:{n}")).collect();
+        let line = format!(
+            "pardisc-stats: windows {w} taken {taken} stale {stale} stopped {out} window-ms {:.1} max-steps {} stale-by-table {}\n",
+            self.window_ms,
+            self.max_steps,
+            by.join(",")
+        );
+        if to == "1" {
+            eprint!("{line}");
+        } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(to) {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
     }
 }
 
@@ -13554,10 +13820,10 @@ fn compute_glue_methods(p: &mut Program) {
             cf_out.insert(a, cf);
         }
     }
-    p.gx.glue_methods = out;
-    p.gx.clone_from_methods = cf_out;
-    p.gx.pcmp_methods = pcmp_out;
-    p.gx.ref_default_methods = ref_default_out;
+    p.gx.glue_methods = out.into();
+    p.gx.clone_from_methods = cf_out.into();
+    p.gx.pcmp_methods = pcmp_out.into();
+    p.gx.ref_default_methods = ref_default_out.into();
 }
 
 /// Fills `written_hash` and `borrow_impls` (W-STD-B): the written
@@ -13606,9 +13872,9 @@ fn compute_written_hash(p: &mut Program) {
             }
         }
     }
-    p.gx.written_hash = hash;
-    p.gx.dyn_keys = dyn_keys(p, &borrow);
-    p.gx.borrow_impls = borrow;
+    p.gx.written_hash = hash.into();
+    p.gx.dyn_keys = dyn_keys(p, &borrow).into();
+    p.gx.borrow_impls = borrow.into();
 }
 
 /// The dyn lookups of `borrow` (key Adt, dyn type) whose dyn type has a

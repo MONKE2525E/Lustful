@@ -24,6 +24,7 @@ pub use defs::{DefData, Defs, SigData};
 
 use crate::def::{CrateId, DefId, StableCrateHash};
 use crate::diag::Span;
+use crate::check::spec;
 use crate::intern::{FxMap, Sym};
 use std::hash::Hash;
 
@@ -1302,11 +1303,14 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
 struct Arena<T, I> {
     items: Vec<T>,
     map: FxMap<T, I>,
+    /// The global store's arenas log misses and new entries for window
+    /// checks (check/spec.rs); a body overlay's log nothing (`tab::NONE`).
+    tab: u8,
 }
 
 impl<T, I> Default for Arena<T, I> {
     fn default() -> Arena<T, I> {
-        Arena { items: Vec::new(), map: FxMap::default() }
+        Arena { items: Vec::new(), map: FxMap::default(), tab: spec::tab::NONE }
     }
 }
 
@@ -1315,11 +1319,18 @@ impl<T: Clone + Eq + Hash, I: Idx> Arena<T, I> {
         self.items.len() as u32
     }
     fn get_id(&self, v: &T) -> Option<I> {
-        self.map.get(v).copied()
+        let id = self.map.get(v).copied();
+        if id.is_none() && self.tab != spec::tab::NONE {
+            spec::read(self.tab, v);
+        }
+        id
     }
     fn intern(&mut self, v: T, base: u32) -> I {
         if let Some(&id) = self.map.get(&v) {
             return id;
+        }
+        if self.tab != spec::tab::NONE {
+            spec::wrote(self.tab, &v);
         }
         let id = I::from_u32(base + self.items.len() as u32);
         self.map.insert(v.clone(), id);
@@ -1330,11 +1341,18 @@ impl<T: Clone + Eq + Hash, I: Idx> Arena<T, I> {
 
 impl<X: Clone + Eq + Hash, I: Idx> Arena<Box<[X]>, I> {
     fn get_slice(&self, s: &[X]) -> Option<I> {
-        self.map.get(s).copied()
+        let id = self.map.get(s).copied();
+        if id.is_none() && self.tab != spec::tab::NONE {
+            spec::read(self.tab, s);
+        }
+        id
     }
     fn intern_slice(&mut self, s: &[X], base: u32) -> I {
         if let Some(&id) = self.map.get(s) {
             return id;
+        }
+        if self.tab != spec::tab::NONE {
+            spec::wrote(self.tab, s);
         }
         let boxed: Box<[X]> = s.into();
         let id = I::from_u32(base + self.items.len() as u32);
@@ -1357,19 +1375,19 @@ pub struct GlobalTys {
     bindings_a: Arena<Box<[(DefId, GenericArg)]>, BindingsId>,
     builtins: BuiltinDefs,
     /// One-argument Adt applications by (def, elem): the `mk_vec`/`mk_option` cache.
-    adt1: FxMap<(DefId, Ty), Ty>,
-    adt_locals: FxMap<DefId, AdtId>,
+    adt1: spec::Logged<(DefId, Ty), Ty, { spec::tab::TY_ADT1 }>,
+    adt_locals: spec::Logged<DefId, AdtId, { spec::tab::TY_ADT_LOCALS }>,
     adt_defs: Vec<DefId>,
     /// Materialized generic instances: (template def, concrete args)
     /// to the instance's session-local index. Filled by mono during
     /// collection; body overlays read it through the global store.
-    adt_instances: FxMap<(DefId, ArgsId), AdtId>,
+    adt_instances: spec::Logged<(DefId, ArgsId), AdtId, { spec::tab::TY_ADT_INSTANCES }>,
     /// Instances that differ only in lifetimes (`M<Rc<dyn Tr>>` next to
     /// `M<Rc<dyn Tr + 'static>>`) share one C type: the first registered
     /// instance under the region-free args (`region_free`), and each later
     /// one to it (`c_adt`).
-    adt_c_keys: FxMap<(DefId, ArgsId), AdtId>,
-    adt_c_canon: FxMap<AdtId, AdtId>,
+    adt_c_keys: spec::Logged<(DefId, ArgsId), AdtId, { spec::tab::TY_ADT_C_KEYS }>,
+    adt_c_canon: spec::Logged<AdtId, AdtId, { spec::tab::TY_ADT_C_CANON }>,
     /// The full applied type of each session-local Adt, in index
     /// order where registered: `Adt(def, args)` with the instance's
     /// args, not always `EMPTY_ARGS`.
@@ -1378,9 +1396,9 @@ pub struct GlobalTys {
     /// (`str`, `[T]`, or, non-generic only, another such struct), by
     /// def, to that field's type. `std::path::Path`, `std::ffi::OsStr`,
     /// and indexmap's generic `map::Slice<K, V>` are these.
-    unsized_adts: FxMap<DefId, Ty>,
+    unsized_adts: spec::Logged<DefId, Ty, { spec::tab::TY_UNSIZED }>,
     /// The field of each mono instance of a generic unsized newtype.
-    unsized_insts: FxMap<(DefId, ArgsId), Ty>,
+    unsized_insts: spec::Logged<(DefId, ArgsId), Ty, { spec::tab::TY_UNSIZED_INSTS }>,
 }
 
 impl GlobalTys {
@@ -1416,16 +1434,23 @@ impl GlobalTys {
             bounds: Arena::default(),
             bindings_a: Arena::default(),
             builtins,
-            adt1: FxMap::default(),
-            adt_locals: FxMap::default(),
+            adt1: Default::default(),
+            adt_locals: Default::default(),
             adt_defs: Vec::new(),
-            adt_instances: FxMap::default(),
-            adt_c_keys: FxMap::default(),
-            adt_c_canon: FxMap::default(),
+            adt_instances: Default::default(),
+            adt_c_keys: Default::default(),
+            adt_c_canon: Default::default(),
             adt_full_tys: Vec::new(),
-            unsized_adts: FxMap::default(),
-            unsized_insts: FxMap::default(),
+            unsized_adts: Default::default(),
+            unsized_insts: Default::default(),
         };
+        g.kinds.tab = spec::tab::KINDS;
+        g.args_a.tab = spec::tab::ARGS;
+        g.tys_a.tab = spec::tab::TYS_LIST;
+        g.consts.tab = spec::tab::CONSTS;
+        g.sigs.tab = spec::tab::SIGS;
+        g.bounds.tab = spec::tab::BOUNDS;
+        g.bindings_a.tab = spec::tab::BINDINGS;
         // The intern calls must stay out of the assertions: `debug_assert_eq!`
         // drops its arguments in release builds, which would skip the interning.
         let empty_args = g.intern_args(&[]);
@@ -1459,11 +1484,13 @@ impl GlobalTys {
         if i >= self.adt_defs.len() {
             self.adt_defs.resize(i + 1, DefId::PLACEHOLDER);
         }
+        spec::wrote(spec::tab::TY_ADT_DEFS, &i);
         self.adt_defs[i] = def;
         if i >= self.adt_full_tys.len() {
             self.adt_full_tys.resize(i + 1, None);
         }
         let t = self.intern(TyKind::Adt(def, EMPTY_ARGS));
+        spec::wrote(spec::tab::TY_ADT_FULL, &i);
         self.adt_full_tys[i] = Some(t);
     }
     /// `t` with every kept region (`'static`, the only one left after
@@ -1545,6 +1572,7 @@ impl GlobalTys {
         if i >= self.adt_full_tys.len() {
             self.adt_full_tys.resize(i + 1, None);
         }
+        spec::wrote(spec::tab::TY_ADT_FULL, &i);
         self.adt_full_tys[i] = Some(t);
         t
     }
@@ -1562,6 +1590,7 @@ impl GlobalTys {
     }
     /// The full applied type of a session-local Adt, if registered.
     pub fn full_adt_ty(&self, local: AdtId) -> Option<Ty> {
+        spec::read(spec::tab::TY_ADT_FULL, &(local.0 as usize));
         self.adt_full_tys.get(local.0 as usize).copied().flatten()
     }
 }
@@ -1659,6 +1688,7 @@ impl TyIntern for GlobalTys {
         self.unsized_insts.get(&(def, args)).copied()
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
+        spec::read(spec::tab::TY_ADT_DEFS, &(local.0 as usize));
         self.adt_defs.get(local.0 as usize).copied().filter(|d| *d != DefId::PLACEHOLDER)
     }
     fn local_adt_instance(&self, def: DefId, args: ArgsId) -> Option<AdtId> {
@@ -1741,6 +1771,7 @@ impl TyIntern for Tys<'_> {
         if let Some(t) = self.kinds.get_id(&k) {
             return t;
         }
+        spec::step(1);
         let f = compute_flags(&*self, k);
         let t = self.kinds.intern(k, self.global.kinds.len());
         debug_assert_eq!(self.flags.len(), (t.0 - self.global.kinds.len()) as usize);
