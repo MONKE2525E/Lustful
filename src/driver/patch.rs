@@ -2546,7 +2546,8 @@ pub(super) fn reuse_kept(
         // No Adt or derive list changes from here: deep Adt fingerprints
         // hold across the compare (707 keys of a large reach took 330 ms).
         p.fp_memo.on(p.adts.len());
-        let unproven = crate::check::const_body::check_dirty(&mut p, &mut errs, &mut moved, super::item_oracle::on());
+        let edited: Vec<LocalDefId> = headers.iter().map(|h| LocalDefId(h.fn_index as u32)).collect();
+        let unproven = crate::check::const_body::check_dirty(&mut p, &mut errs, &mut moved, super::item_oracle::on(), &edited);
         p.fp_memo.off();
         if unproven > 0 {
             super::item_oracle::fail("keyed clean const body has dirty reads", "item", &unproven.to_string());

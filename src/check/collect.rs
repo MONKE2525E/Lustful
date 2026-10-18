@@ -369,6 +369,10 @@ pub struct Program {
     /// (check/const_body.rs), by its location: a kept program checks
     /// again only the bodies whose reads moved (`check_dirty`).
     pub const_body_reads: Vec<(FnLoc, crate::driver::graph::Reads)>,
+    /// The AST counts at the last walk over every initializer site
+    /// (`const_body::Shape`): `check_dirty` may skip the walk while they
+    /// hold and no edited header has a signature anon const.
+    pub const_sites_shape: super::const_body::Shape,
     pub type_names: HashMap<Sym, AdtId>,
     /// Adts with a written `Drop` impl, by written name. Const items
     /// evaluate before the impl index and `gx.drop_methods` exist;
@@ -3452,6 +3456,7 @@ pub fn collect_reuse(
         scope_of_stmt: HashMap::default(),
         fn_siblings: HashMap::default(),
         const_body_reads: Vec::new(),
+        const_sites_shape: Default::default(),
         type_names: HashMap::default(),
         drop_adts: Default::default(),
         aliases: HashMap::default(),

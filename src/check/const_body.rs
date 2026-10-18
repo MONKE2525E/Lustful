@@ -62,12 +62,37 @@ enum SiteTy {
 pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
     p.const_body_reads.clear();
     check_sites(p, errs, &|_| true);
+    p.const_sites_shape = Shape::of(&p.ast);
+}
+
+/// The AST counts that bound the initializer sites (`sites`): anonymous
+/// consts, items, and body items. A kept program's AST with the counts of
+/// the last walk over every site holds the same sites, except in the
+/// signatures of edited headers (`check_dirty`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Shape {
+    anon_consts: usize,
+    items: usize,
+    stmt_items: usize,
+}
+
+impl Shape {
+    fn of(ast: &ast::Ast) -> Shape {
+        Shape { anon_consts: ast.anon_consts.len(), items: ast.items.len(), stmt_items: ast.stmt_items.len() }
+    }
 }
 
 /// `check_all` for a kept program after a header or derive delta: only
 /// the bodies whose stored reads moved check again, and the ones with no
 /// stored reads (an anonymous const of an edited signature); all of them
-/// when the program records no reads.
+/// when the program records no reads. `edited` are the fns whose headers
+/// the delta redid.
+///
+/// Every site of a kept program checked clean and stored its reads (a
+/// failed one sends the request to the full path), so a site with no
+/// reads is new. With no dirty set, the walk over the sites is skipped
+/// when none can be new: the AST counts equal the last walk's (`Shape`)
+/// and no edited header's item has a signature anon const.
 ///
 /// `moved` says which read keys the deltas can move (`kept_delta::Touched`,
 /// `Program::derive_key_moves`). A program that holds its verified-at mark
@@ -77,7 +102,13 @@ pub fn check_all(p: &mut Program, errs: &mut Vec<Diag>) {
 /// `check_all` and this fn write them. Any other program compares every
 /// read. With `prove` (the item oracle) every keyed clean set also takes
 /// the full compare; the return is the count it finds dirty.
-pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>, moved: &mut dyn FnMut(&Program, &ReadKey) -> bool, prove: bool) -> usize {
+pub fn check_dirty(
+    p: &mut Program,
+    errs: &mut Vec<Diag>,
+    moved: &mut dyn FnMut(&Program, &ReadKey) -> bool,
+    prove: bool,
+    edited: &[LocalDefId],
+) -> usize {
     if !p.record_reads {
         check_all(p, errs);
         return 0;
@@ -121,8 +152,21 @@ pub fn check_dirty(p: &mut Program, errs: &mut Vec<Diag>, moved: &mut dyn FnMut(
             p.const_body_reads.push((l, r));
         }
     }
-    check_sites(p, errs, &|l| locs.contains(&l) || !known.contains(&l));
-    super::derive_delta::log(&|| format!("const bodies: {} rechecked, all {:.1} ms\n", locs.len(), t0.elapsed().as_secs_f64() * 1e3));
+    let edited_item = |f: &LocalDefId| match p.fns.get(f.0 as usize).map(|i| i.loc) {
+        Some(FnLoc::Item(i) | FnLoc::Impl(i, _) | FnLoc::Trait(i, _)) => p.ast.items.get(i as usize),
+        _ => None,
+    };
+    let none_new = locs.is_empty()
+        && p.const_sites_shape == Shape::of(&p.ast)
+        && edited.iter().all(|f| edited_item(f).is_some_and(|item| SigWalk::roots(&p.ast, &p.interner, item).is_empty()));
+    if !none_new {
+        check_sites(p, errs, &|l| locs.contains(&l) || !known.contains(&l));
+        p.const_sites_shape = Shape::of(&p.ast);
+    }
+    super::derive_delta::log(&|| {
+        let walk = if none_new { " (no site walk)" } else { "" };
+        format!("const bodies: {} rechecked{walk}, all {:.1} ms\n", locs.len(), t0.elapsed().as_secs_f64() * 1e3)
+    });
     unproven
 }
 

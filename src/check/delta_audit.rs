@@ -68,6 +68,7 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
         scope_of_stmt: _,            // same
         fn_siblings: _,              // same
         const_body_reads: _,         // const_body::check_dirty (reuse_kept)
+        const_sites_shape: _,        // same
         type_names: _,               // same
         drop_adts: _,                // same
         aliases: _,                  // same
