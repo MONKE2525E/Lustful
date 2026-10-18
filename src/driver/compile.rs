@@ -4054,6 +4054,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 *h = true;
             }
         }
+        // A body's C names only slots held when it was made, and every build remakes
+        // the bodies whose C names a slot no fn holds. So unless a slot held at the
+        // last build is lost (or slots were renumbered), no body calls a dead slot, and
+        // the walk skips reading every body's used slots (each a block of its own).
+        let lost = caches.held_slots.is_empty()
+            || front.slots_renumbered
+            || caches.held_slots.len() > held.len()
+            || caches.held_slots.iter().zip(&held).any(|(&was, &is)| was && !is);
         // Each concrete fn's verdict; an instance or closure body fn whose
         // stored reads decide waits for one parallel walk over all of them
         // (`reads_dirty_par`).
@@ -4061,7 +4069,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         let mut by_reads: Vec<usize> = Vec::new();
         for i in (0..program.fns.len()).filter(|&i| concrete(i)) {
             let s = front.fn_slot[i] as usize;
-            let calls_dead = build && caches.out[s].used.iter().any(|&u| !held.get(u as usize).copied().unwrap_or(false));
+            let calls_dead = build && lost && caches.out[s].used.iter().any(|&u| !held.get(u as usize).copied().unwrap_or(false));
             let mut recheck = regenerate_all || !caches.ok[s] || (build && !caches.has_out[s]) || calls_dead;
             if !recheck && i < fn_count {
                 recheck = body_changed[i];
@@ -4108,6 +4116,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         work = (0..program.fns.len()).filter(|&i| recheck_of[i]).collect();
+        if build {
+            caches.held_slots = held;
+        }
         // A recheck leaves the slot's C stale until codegen replaces
         // it; a check request, or a build that stops on errors, never
         // gets there.

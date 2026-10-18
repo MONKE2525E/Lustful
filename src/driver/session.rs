@@ -311,6 +311,9 @@ pub(crate) struct Caches {
     /// `release_c::codegen_key` of the last build: a build under another key makes
     /// every slot's C again (release C and classic C share the slot cache).
     pub(crate) codegen_key: u64,
+    /// The slots some fn held at the last build (`held` of the generic reuse walk):
+    /// a build that lost none of them has no body whose C names a dead slot.
+    pub(crate) held_slots: Vec<bool>,
     /// `graph::glue_method_slots_fp` as of the last glue build: the
     /// slots that glue calling written `fmt` and `drop` methods names.
     pub(crate) glue_slots_fp: u64,
@@ -482,6 +485,7 @@ impl Session {
                 statics_fp: 0,
                 loc_fp: 0,
                 codegen_key: 0,
+                held_slots: Vec::new(),
                 glue_slots_fp: 0,
                 glue_stale: false,
                 wiped_slots: Vec::new(),
