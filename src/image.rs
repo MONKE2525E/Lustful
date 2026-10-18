@@ -70,7 +70,9 @@ const LOCK_FILE: &str = "lock";
 /// A background save's result line, in the state directory.
 const SAVE_LOG: &str = "save.log";
 /// `LUST_FRONT_COMPACT=1`: this process rebuilds the image cold and writes it as a new base
-/// (`compact_exec`, `main::image_run`).
+/// (`main::image_run`): a run a background save started (`compact_exec`), or a command of its
+/// own, such as a CI job after the release job. `LUST_FRONT_COMPACT=defer`: a save never starts
+/// a compaction; it leaves `COMPACT_DUE` when one is due.
 const COMPACT_ENV: &str = "LUST_FRONT_COMPACT";
 /// The state lock's descriptor, which a compacting process inherits (`compact_exec`).
 const LOCK_FD_ENV: &str = "LUST_FRONT_LOCK_FD";
@@ -78,6 +80,9 @@ const LOCK_FD_ENV: &str = "LUST_FRONT_LOCK_FD";
 const WAIT_PID_ENV: &str = "LUST_FRONT_WAIT_PID";
 /// Left by a compaction that did not finish: later saves write a plain base (`compaction_due`).
 const NO_COMPACT: &str = "nocompact";
+/// Left by a save that wrote a plain base while a compaction was due (`compaction_due`), so a job
+/// of its own can run one (`LUST_FRONT_COMPACT=1`); the next cold base removes it.
+const COMPACT_DUE: &str = "compact-due";
 /// Image format. Bump on any change to the header or to what `Roots` holds.
 const MAGIC: &[u8; 8] = b"LUSTFIM3";
 /// Arena bases come from this window, one generation after another:
@@ -976,7 +981,7 @@ fn modified_runs(runs: &[(usize, usize)]) -> Result<Vec<(usize, usize)>, String>
 
 /// Set once this process holds the state directory's lock.
 static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The lock's descriptor (`lock`, `adopt_lock`).
+/// The lock's descriptor (`lock`, `compact_lock`).
 static LOCK_FD: AtomicI32 = AtomicI32::new(-1);
 /// Set by a run whose saves may compact the image (`allow_compaction`).
 static COMPACT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1000,16 +1005,21 @@ pub fn lock(dir: &Path) {
     }
 }
 
-/// True in a process that rebuilds the image cold (`compact_exec`).
+/// True in a process that rebuilds the image cold (`COMPACT_ENV`).
 pub fn compact_mode() -> bool {
     std::env::var_os(COMPACT_ENV).is_some_and(|v| v == "1")
 }
 
-/// The state lock in a compacting process: the save child's descriptor, inherited across the
-/// exec (`compact_exec`), close-on-exec again so the compilers this run starts do not hold it.
-/// False when there is none: the process then must not touch the state.
-pub fn adopt_lock() -> bool {
-    let Some(fd) = std::env::var(LOCK_FD_ENV).ok().and_then(|v| v.parse::<c_int>().ok()) else { return false };
+/// The state lock in a compacting process. A run a background save started inherits the save
+/// child's descriptor across the exec (`compact_exec`), close-on-exec again so the compilers
+/// this run starts do not hold it. A command of its own takes the lock as a build does, after
+/// any save that holds it. False when there is no lock: the process then must not touch the
+/// state.
+pub fn compact_lock(dir: &Path) -> bool {
+    let Some(fd) = std::env::var(LOCK_FD_ENV).ok().and_then(|v| v.parse::<c_int>().ok()) else {
+        lock(dir);
+        return LOCKED.load(Ordering::Relaxed);
+    };
     // SAFETY: fcntl on a descriptor of this process.
     if unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } < 0 {
         return false;
@@ -1146,8 +1156,9 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
         // texts are freed here, so they are not live blocks of the image.
         crate::driver::drop_parked_cc();
         // A base from this heap would keep its scattered pages: rebuild the image cold instead
-        // (`compaction_due`). On success the exec does not return.
-        if compaction_due(dir) {
+        // (`compaction_due`), unless a job of its own does that. On success the exec does not
+        // return.
+        if compaction_due(dir) && std::env::var_os(COMPACT_ENV).is_none_or(|v| v != "defer") {
             let why = compact_exec(build_pid);
             refuse_compaction(dir, &why);
         }
@@ -1203,6 +1214,11 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
     if loaded.is_none() {
         // A cold base (a cold build, or a compaction): compaction may run again.
         let _ = std::fs::remove_file(dir.join(NO_COMPACT));
+        let _ = std::fs::remove_file(dir.join(COMPACT_DUE));
+    } else if let Some(l) = loaded.filter(|_| delta.is_none() && compaction_due(dir)) {
+        // A plain base of a scattered heap (`LUST_FRONT_COMPACT=defer`, or a foreground save).
+        let span: usize = l.runs.iter().map(|&(a, e)| e - a).sum();
+        let _ = std::fs::write(dir.join(COMPACT_DUE), format!("{} MB of restored span for {} MB live\n", span >> 20, l.live >> 20));
     }
     let (layer, parent) = match delta {
         Some(l) => (l.layers, l.top_id),

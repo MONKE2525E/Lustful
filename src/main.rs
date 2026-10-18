@@ -113,18 +113,18 @@ const BIG_FILE: u64 = 256 << 10;
 /// daemon; any other panic resumes).
 fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Response> {
     let t = std::time::Instant::now();
-    // Compact mode (src/image.rs `compact_exec`): a background save found the image too
-    // scattered and started this run of the same command to rebuild it cold. It holds the
-    // save child's lock, loads nothing, makes no artifact (every cc step is parked and
-    // dropped), and writes the new image as a base.
+    // Compact mode (`LUST_FRONT_COMPACT=1`, src/image.rs): a background save found the image
+    // too scattered and started this run of the same command (`compact_exec`), or a job of its
+    // own runs it. It rebuilds the image cold: it loads nothing, makes no artifact (every cc
+    // step is parked and dropped), and writes the new image as a base.
     let compact = image::compact_mode();
     if compact && !reqs.iter().all(|r| r.cc) {
         image::refuse_compaction(dir, "a compaction of a run that is not all release driver builds");
         return Vec::new();
     }
     if compact {
-        if !image::adopt_lock() {
-            image::refuse_compaction(dir, "no state lock to adopt");
+        if !image::compact_lock(dir) {
+            image::refuse_compaction(dir, "no state lock");
             return Vec::new();
         }
     } else {
@@ -214,7 +214,10 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
                 format!("lust: front state not compacted: {e}\n")
             }
         };
-        let _ = std::fs::write(dir.join("save.log"), line);
+        let _ = std::fs::write(dir.join("save.log"), &line);
+        if let Some(last) = resps.last_mut() {
+            last.stderr.push_str(&line);
+        }
         return resps;
     }
     let saved = if background { image::save_background(dir, roots) } else { image::save(dir, roots) };
