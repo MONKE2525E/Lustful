@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""rel-xplat scorekeeper: tsgo 216-run digest goldens.
+
+make <fork> <cargo-tsgo> <goldens.json>: run the Cargo tsc on every
+fixture command (tsrust_parity.projects/commands/run_one) and record
+a digest per run. check <fork> <lust-tsgo> <goldens.json>: run the
+lust tsc the same way, timed by the caller, and compare digests.
+Both bins need the lib files next to them (noembed)."""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tsrust_parity as par
+
+def digests(fork, bin_path, work):
+    # tsc prints its lib dir (the bin's dir) in some outputs; mask it
+    # so goldens made on one machine compare on another. Callers still
+    # run both bins from the same relative layout, which keeps the
+    # written-file digests (tree) honest.
+    bindir = str(bin_path.parent).encode()
+    out = {}
+    for case, src in par.projects(fork):
+        for cmd in par.commands(bin_path, case):
+            tag = f"{case} :: {' '.join(cmd[1:])}"
+            (rc, so, se), tree = par.run_one(cmd, src, work, 600)
+            res = (rc, so.replace(bindir, b"@BIN@"), se.replace(bindir, b"@BIN@"))
+            h = hashlib.sha256(repr((res, tree)).encode()).hexdigest()[:16]
+            out[tag] = h
+    return out
+
+mode, fork, bin_path, gold = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
+work = Path(sys.argv[5]) if len(sys.argv) > 5 else Path("/tmp/gold-work")
+got = digests(fork, bin_path, work)
+if mode == "make":
+    gold.write_text(json.dumps(got, indent=0, sort_keys=True))
+    print(f"goldens: {len(got)} runs recorded")
+else:
+    want = json.loads(gold.read_text())
+    bad = [t for t in sorted(set(want) | set(got)) if want.get(t) != got.get(t)]
+    for t in bad:
+        print(f"DIFF {t}")
+    print(f"verify: {len(want) - len(bad)}/{len(want)} same, ran {len(got)}")
+    if not got:
+        print("verify: NO RUNS (bin name must end in tsgo for the parity command table)")
+    sys.exit(1 if bad else 0)
