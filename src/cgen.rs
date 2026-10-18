@@ -2148,7 +2148,7 @@ impl FnGen<'_, '_> {
         if cl_text.contains('(') {
             members = unwind::frame_members(&cl_text, self.local_cty.len(), &self.move_paths, &self.local_drop, &self.body.promoted);
             self.zc_frame = true;
-            let decls = self.frame_struct(slot, &members);
+            let decls = self.frame_struct(&names::fn_tag(slot), &members);
             self.out.push_str(&decls);
         }
         // Release C bodies are extern: other units call them directly (`names`).
@@ -2248,7 +2248,8 @@ impl FnGen<'_, '_> {
             let _ = writeln!(self.out, "  uint8_t {};", flags.join(", "));
         }
         if self.zc_frame {
-            let _ = writeln!(self.out, "  struct fr{slot} L __attribute__((cleanup(cl{slot})));\n  L.st = 0;");
+            let tag = names::fn_tag(slot);
+            let _ = writeln!(self.out, "  struct fr{tag} L __attribute__((cleanup(cl{tag})));\n  L.st = 0;");
             for s in &frame_init {
                 let _ = writeln!(self.out, "  {s}");
             }
@@ -2277,7 +2278,7 @@ impl FnGen<'_, '_> {
             let _ = writeln!(self.out, "#undef l{i}");
         }
         if self.zc_frame {
-            unwind::cleanup_fn(&mut self.out, slot, &members, &cl_order, &cl_text);
+            unwind::cleanup_fn(&mut self.out, &names::fn_tag(slot), &members, &cl_order, &cl_text);
             self.zc_frame = false;
         }
         self.out.push('\n');
@@ -3310,8 +3311,8 @@ impl FnGen<'_, '_> {
                 i += 1;
             }
         }
-        let slot = self.slots.of(self.body.fn_id);
-        let name = format!("pk{slot}_{}", self.tmp());
+        // Named by the fn's tag (its stable id in release C), not its slot, which moves.
+        let name = format!("pk{}_{}", names::fn_tag(self.slots.of(self.body.fn_id)), self.tmp());
         let params: Vec<String> =
             std::iter::once("lust_loc qloc".to_string()).chain(used.iter().map(|n| format!("{} *q{n}", ctype(&self.local_cty[*n])))).collect();
         let defs: String = used.iter().map(|n| format!("#define l{n} (*q{n})\n")).collect();

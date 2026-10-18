@@ -68,13 +68,13 @@ impl FnGen<'_, '_> {
 }
 
 impl FnGen<'_, '_> {
-    /// `catch_unwind(f)` with unwind tables: the call of `f` goes in a thunk (`cut<slot>_<n>`,
+    /// `catch_unwind(f)` with unwind tables: the call of `f` goes in a thunk (`cu<tag>_<n>`,
     /// in the unit before this fn) that `lust_unw_try` runs under a catch point. The env and
     /// the result sit in one context struct, so a panic leaves this frame's locals alone.
     fn catch_unwind_tables(&mut self, callee: &sync::Callee, env: &str, env_ty: &CTy, ret: &CTy, res: &CTy, once: bool) -> String {
-        let slot = self.slots.of(self.body.fn_id);
+        let tag = names::fn_tag(self.slots.of(self.body.fn_id));
         let k = self.tmp();
-        let name = format!("cu{slot}_{k}");
+        let name = format!("cu{tag}_{k}");
         let mut call = String::new();
         let v = self.callee_call_c(&mut call, callee, "(c_->ev)", &[]);
         let _ = writeln!(
@@ -148,11 +148,11 @@ pub(super) fn frame_members(cl_text: &str, n: usize, move_paths: &[Vec<Vec<Step>
 }
 
 impl FnGen<'_, '_> {
-    /// Unwind tables: the frame struct type of the fn in `slot` (the ladder entry `st`,
-    /// then each member local, its drop flag and move flags) and its cleanup fn's
-    /// prototype, both before the fn.
-    pub(super) fn frame_struct(&self, slot: u32, members: &[Vec<String>]) -> String {
-        let mut s = format!("struct fr{slot} {{\n  int32_t st;\n");
+    /// Unwind tables: the frame struct type of the fn `tag` names (`names::fn_tag`: its
+    /// slot, or its stable id in release C) with the ladder entry `st`, then each member
+    /// local, its drop flag and move flags; and its cleanup fn's prototype, both before the fn.
+    pub(super) fn frame_struct(&self, tag: &str, members: &[Vec<String>]) -> String {
+        let mut s = format!("struct fr{tag} {{\n  int32_t st;\n");
         for (l, names) in members.iter().enumerate() {
             for nm in names {
                 if nm.starts_with('l') {
@@ -165,22 +165,22 @@ impl FnGen<'_, '_> {
                 }
             }
         }
-        let _ = writeln!(s, "}};\nstatic void cl{slot}(struct fr{slot} *Lc);");
+        let _ = writeln!(s, "}};\nstatic void cl{tag}(struct fr{tag} *Lc);");
         s
     }
 }
 
-/// Unwind tables: the cleanup fn of the fn in `slot`, after it. The unwinder calls it (the
+/// Unwind tables: the cleanup fn of the fn `tag` names, after it. The unwinder calls it (the
 /// cleanup variable `L`) at each scope exit: a normal return stored `st = 0`; an unwind
 /// left the ladder entry of the call or statement that panicked, so it runs the cleanup
 /// blocks from there and returns, and the unwinder goes on. `cl_text` is the cleanup
 /// blocks' C, emitted with the members' names.
-pub(super) fn cleanup_fn(out: &mut String, slot: u32, members: &[Vec<String>], cl_order: &[usize], cl_text: &str) {
+pub(super) fn cleanup_fn(out: &mut String, tag: &str, members: &[Vec<String>], cl_order: &[usize], cl_text: &str) {
     let names: Vec<&String> = members.iter().flatten().collect();
     for nm in &names {
         let _ = writeln!(out, "#undef {nm}");
     }
-    let _ = writeln!(out, "static void cl{slot}(struct fr{slot} *Lc) {{");
+    let _ = writeln!(out, "static void cl{tag}(struct fr{tag} *Lc) {{");
     for nm in &names {
         let _ = writeln!(out, "#define {nm} (Lc->{nm})");
     }
