@@ -224,11 +224,28 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
 /// in `glue_shards`).
 pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     let mut c = unit_header();
+    // Defined: what the data holds by value, and the promoted values it points at (each
+    // has its own definition here). Another static, a fn or glue it points at needs only
+    // a forward typedef, so the unit does not change when a type behind a pointer does.
+    let mut held = Vec::new();
     let mut types = HashSet::new();
+    let mut pointed = HashSet::new();
+    let mut fns = Vec::new();
     for (_, st) in p.statics.iter().enumerate().filter(|&(i, _)| p.static_live(i)) {
         let t = cty(&p.tys, st.ty);
-        collect_types(&t, &mut types);
+        by_value_deps(&t, &mut held);
+        collect_types(&t, &mut pointed);
         collect_promoted(p, &st.value, &t, &mut types);
+        const_fns(&st.value, &mut fns);
+    }
+    types.extend(held);
+    // The data's fn pointers point at this unit's own copies of their trampolines
+    // (`const_init`), which take and return the fns' values by value.
+    for f in fns {
+        let info = p.fn_info(LocalDefId(f));
+        for &t in info.params.iter().chain([&info.ret]) {
+            collect_types(&cty(&p.tys, t), &mut types);
+        }
     }
     let data = static_defs(p, &g.slots);
     // Only the glue the data names (a vtable's drop entry, say): the unit must not
@@ -238,15 +255,27 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     for (k, proto) in &g.protos {
         let name = proto.split('(').next().and_then(|h| h.rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).next()).unwrap_or("");
         if named.contains(name) {
-            collect_types(&k.1, &mut types);
+            collect_types(&k.1, &mut pointed);
             protos.push(proto);
         }
     }
     protos.sort();
-    type_decls(p, &mut c, &types);
+    pointed.retain(|t| !types.contains(t));
+    type_decls_with(p, &mut c, &types, &pointed, Decls::ByValue, &HashSet::new());
     protos.into_iter().for_each(|x| c.push_str(x));
     c.push_str(&data);
     c
+}
+
+/// The fns whose pointers the constant `v` holds.
+fn const_fns(v: &crate::ty::consteval::ConstValue, out: &mut Vec<u32>) {
+    use crate::ty::consteval::ConstValue as CV;
+    match v {
+        CV::FnPtr(f) => out.push(*f),
+        CV::Aggregate(vs) | CV::Variant(_, vs) => vs.iter().for_each(|x| const_fns(x, out)),
+        CV::Repeat(x, _) | CV::Ref(x) => const_fns(x, out),
+        _ => {}
+    }
 }
 
 /// Whether a release C unit (or glue shard) ends after the fn (glue key) `id` of `size`

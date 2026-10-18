@@ -10050,7 +10050,11 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
             let at = CTy::Array(e.clone(), b.len() as u64);
             collect_types(&at, out);
         }
-        (CV::Ref(inner), CTy::Ref(inner_ct)) => collect_promoted(p, inner, inner_ct, out),
+        // A promoted value has its own definition: its type is defined too.
+        (CV::Ref(inner), CTy::Ref(inner_ct)) => {
+            collect_types(inner_ct, out);
+            collect_promoted(p, inner, inner_ct, out)
+        }
         (CV::Aggregate(vals), CTy::Tuple(es)) => {
             for (x, e) in vals.iter().zip(es) {
                 collect_promoted(p, x, e, out);
