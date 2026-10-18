@@ -2268,11 +2268,32 @@ pub fn ll_unit(fns: &[FnOut], slots: &[usize], inl: &[usize], triple: &str) -> S
     static INTERNAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let linkage = if *INTERNAL.get_or_init(|| std::env::var("LUST_LL_COPY").is_ok_and(|v| v == "internal")) { "internal" } else { "available_externally" };
     for &s in inl {
-        out.push_str(&fns[s].ll.replacen("\ndefine ", &format!("\ndefine {linkage} "), 1));
+        copy_text(&mut out, &fns[s].ll, linkage);
     }
     out
 }
 
+/// Appends fn IR `ll` as an inline copy: `linkage` on its define line, which also leaves out
+/// its `dereferenceable(<bytes>)` attributes. Those follow the sizes of the types its params
+/// and result point at, which change with any field of them; with them every unit that holds
+/// the copy would recompile. Inlining drops them, and a copy is only ever inlined.
+fn copy_text(out: &mut String, ll: &str, linkage: &str) {
+    let Some(at) = ll.find("\ndefine ") else {
+        out.push_str(ll);
+        return;
+    };
+    let end = ll[at + 1..].find('\n').map_or(ll.len(), |k| at + 1 + k);
+    out.push_str(&ll[..at]);
+    let _ = write!(out, "\ndefine {linkage} ");
+    let mut rest = &ll[at + 8..end];
+    while let Some(i) = rest.find(" dereferenceable") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        rest = rest.find(')').map_or("", |k| &rest[k + 1..]);
+    }
+    out.push_str(rest);
+    out.push_str(&ll[end..]);
+}
 
 #[cfg(test)]
 mod tests {
@@ -2300,6 +2321,16 @@ mod tests {
         );
         assert_eq!(out, want);
         assert!(ad.adapt("void g(void) { f_00000000000000aa(1); }\n", |_| false).is_none(), "a call is not a prototype");
+    }
+
+    /// An inline copy is `available_externally` and has no dereferenceable bytes.
+    #[test]
+    fn a_copy_leaves_out_its_dereferenceable_bytes() {
+        let ll = "\n; cost 2\n; deref\ndefine nonnull align 8 dereferenceable(1328) ptr @fl_00000000000000ab(ptr nonnull align 8 dereferenceable_or_null(16) noundef %p1) uwtable {\n  %v1 = getelementptr inbounds i8, ptr %p1, i64 8\n  ret ptr %v1\n}\n";
+        let mut out = String::new();
+        super::copy_text(&mut out, ll, "available_externally");
+        let want = ll.replace("define nonnull align 8 dereferenceable(1328) ptr", "define available_externally nonnull align 8 ptr").replace(" dereferenceable_or_null(16)", "");
+        assert_eq!(out, want);
     }
 
     /// A unit keeps an LLVM fn's wrapper only when some text names it, and its trampoline only
