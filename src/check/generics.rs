@@ -11381,7 +11381,7 @@ pub(crate) fn instance_sig(p: &mut Program, template: LocalDefId, args: &[Generi
 /// make it now. Err when its owner or its `impl Trait` return moves: the
 /// method tables and the opaque type callers keep would then differ (the
 /// template's own check proved its hidden type stands).
-pub(crate) fn refresh_instance(p: &mut Program, inst: LocalDefId) -> Result<(), &'static str> {
+pub(crate) fn refresh_instance(p: &mut Program, inst: LocalDefId) -> Result<InstanceUndo, &'static str> {
     let Some(info) = p.gx.instances.get(&inst) else { return Err("instance") };
     let Some(template) = info.template_local else { return Err("instance") };
     let args: Vec<GenericArg> = p.tys.args(info.args).to_vec();
@@ -11391,13 +11391,34 @@ pub(crate) fn refresh_instance(p: &mut Program, inst: LocalDefId) -> Result<(), 
     if s.owner != p.fns[i].owner || s.opaque_ret != p.gx.opaque_ret_of.get(&inst).copied() {
         return Err("instance owner");
     }
-    if let Some(d) = p.defs.get_mut(def_id) {
-        d.sig = crate::ty::defs::SigData::Fn { params: s.params.clone(), ret: s.ret };
+    let sig = p.defs.get_mut(def_id).map(|d| std::mem::replace(&mut d.sig, crate::ty::defs::SigData::Fn { params: s.params.clone(), ret: s.ret }));
+    let f = &mut p.fns[i];
+    let old = (std::mem::replace(&mut f.params, s.params), std::mem::replace(&mut f.ret, s.ret), std::mem::replace(&mut f.ret_borrows_from, s.ret_borrows_from));
+    let scope = std::mem::replace(&mut p.gx.fn_scopes[i], FnScope { env: Vec::new(), scope: s.scope });
+    Ok(InstanceUndo { inst, params: old.0, ret: old.1, ret_borrows_from: old.2, scope, sig })
+}
+
+/// What `refresh_instance` wrote over, for `undo_instance`.
+pub(crate) struct InstanceUndo {
+    inst: LocalDefId,
+    params: Vec<Ty>,
+    ret: Ty,
+    ret_borrows_from: Option<usize>,
+    scope: FnScope,
+    sig: Option<crate::ty::defs::SigData>,
+}
+
+/// Puts back what `refresh_instance` wrote (a refused header delta keeps
+/// the program, driver/kept_delta.rs `fail`).
+pub(crate) fn undo_instance(p: &mut Program, u: InstanceUndo) {
+    let i = u.inst.0 as usize;
+    let def_id = p.def_id(u.inst);
+    if let (Some(d), Some(sig)) = (p.defs.get_mut(def_id), u.sig) {
+        d.sig = sig;
     }
     let f = &mut p.fns[i];
-    (f.params, f.ret, f.ret_borrows_from) = (s.params, s.ret, s.ret_borrows_from);
-    p.gx.fn_scopes[i] = FnScope { env: Vec::new(), scope: s.scope };
-    Ok(())
+    (f.params, f.ret, f.ret_borrows_from) = (u.params, u.ret, u.ret_borrows_from);
+    p.gx.fn_scopes[i] = u.scope;
 }
 
 /// Creates (or finds) the concrete instance of one template.

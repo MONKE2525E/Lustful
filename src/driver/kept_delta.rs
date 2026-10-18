@@ -164,7 +164,7 @@ fn apply(
     super::laps::mark("collect/delta redo");
     // Until the replay stores its outputs, every write has an undo: the
     // old records and template checks go back and `p` stands.
-    let mut undos = Some(Undos { sigs: undos, templates: Vec::new() });
+    let mut undos = Some(Undos { sigs: undos, templates: Vec::new(), instances: Vec::new() });
     for (&i, &(rpit, old_ret)) in fns.iter().zip(&old_rets) {
         let f = LocalDefId(i as u32);
         if p.gx.fn_class[i] == FnClass::Template {
@@ -178,7 +178,7 @@ fn apply(
     }
     // An edited template's instances in a check's program take its new
     // signature, as collect's `fn_instance` would make them; their bodies
-    // replay below (`replay_discovery`). These writes have no undo.
+    // replay below (`replay_discovery`).
     for (k, &i) in fns.iter().enumerate() {
         let f = LocalDefId(i as u32);
         if !instanced.contains_key(&f) {
@@ -187,11 +187,11 @@ fn apply(
         if params_of(p, i) != old_params[k] {
             return Err(fail(p, caches, &mut undos, "sig params"));
         }
-        undos = None;
         let insts: Vec<LocalDefId> = p.gx.instances.iter().filter(|(_, info)| info.template_local == Some(f)).map(|(&g, _)| g).collect();
         for g in insts {
-            if let Err(why) = generics::refresh_instance(p, g) {
-                return Err(fail(p, caches, &mut undos, why));
+            match generics::refresh_instance(p, g) {
+                Ok(u) => undos.as_mut().map_or((), |x| x.instances.push(u)),
+                Err(why) => return Err(fail(p, caches, &mut undos, why)),
             }
         }
     }
@@ -230,6 +230,8 @@ fn apply(
 struct Undos {
     sigs: Vec<crate::check::delta_audit::SigUndo>,
     templates: Vec<TemplateUndo>,
+    /// Instances of edited templates given the new signature, last.
+    instances: Vec<generics::InstanceUndo>,
 }
 
 /// The delta's error for `why`: with every write undone (newest first)
@@ -237,6 +239,7 @@ struct Undos {
 /// is half edited.
 fn fail(p: &mut Program, caches: &mut Caches, undos: &mut Option<Undos>, why: &'static str) -> (&'static str, bool) {
     let Some(u) = undos.take() else { return (why, false) };
+    u.instances.into_iter().rev().for_each(|x| generics::undo_instance(p, x));
     u.templates.into_iter().rev().for_each(|t| undo_template(p, caches, t));
     u.sigs.into_iter().rev().for_each(|s| crate::check::delta_audit::undo(p, s));
     (why, true)
