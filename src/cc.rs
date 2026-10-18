@@ -270,6 +270,29 @@ pub fn unit_key(c_text: &str, pre: Option<&[u8]>, spec: &CcSpec, debug: bool, pr
     format!("{a:016x}{b:016x}")
 }
 
+/// `unit_key` of an LLVM unit (`compile_pair`): its C half, its IR and its helpers' C as
+/// parts, with `extra` (the IR compile's flags, the runtime IR's digest), not copied into one
+/// text first (~1 MB a unit, every unit every build). Its C has no `#include`.
+fn ll_unit_key(c: &str, ll: &str, hc: &str, extra: &str, spec: &CcSpec, debug: bool, profile: Option<&str>) -> String {
+    let flags = cflags(debug);
+    let (a, b) = crate::driver::cache::hash128(
+        &[
+            b"cc-v2 llvm-v5",
+            spec.triple.as_bytes(),
+            compiler_id(&spec.cmd).as_bytes(),
+            flags.as_bytes(),
+            &[debug as u8],
+            profile.unwrap_or("").as_bytes(),
+            extra.as_bytes(),
+            c.as_bytes(),
+            ll.as_bytes(),
+            hc.as_bytes(),
+        ],
+        37,
+    );
+    format!("{a:016x}{b:016x}")
+}
+
 /// A command that runs the C compiler (or links through it). gcc 7+, clang 16+ and zig cc
 /// take `__DATE__` and `__TIME__` from `SOURCE_DATE_EPOCH`, fixed here unless the caller
 /// set it: mimalloc's unit prints them, so its object, and its key (the preprocessed text,
@@ -663,11 +686,9 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
         let (unit, c) = (&units[i].name, text(i));
         let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
         keyed.then(|| match ll_of.get(unit.as_str()) {
-            // v4: a lust before b41791434 could store, through zig's cache, an LLVM object built
-            // from an older helpers' C under the current key; no build reads those.
             Some(ll) => {
                 let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
-                unit_key(&format!("{c}\n/* llvm-v4 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), None, spec, debug, part.as_deref(), false)
+                ll_unit_key(c, ll, hc, &format!("{} {nopre} rtinl {rt_digest}", llflags(debug)), spec, debug, part.as_deref())
             }
             None => unit_key(c, pre_of(i), spec, debug, part.as_deref(), is_cxx(&names[i])),
         })
@@ -990,6 +1011,19 @@ mod tests {
         assert!(calls("int old_fn(void);\nint h(void) { return old_fn(); }\n", "old_fn"));
         assert!(calls("int new_fn(void);\nint h(void) { return new_fn(); }\n", "new_fn"), "the object of the old C");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An LLVM unit's key moves with each of its texts, and with where one ends and the next
+    /// begins (the parts are hashed with their lengths).
+    #[test]
+    fn an_llvm_unit_key_moves_with_each_text() {
+        let spec = super::CcSpec { triple: "x86_64-unknown-linux-musl".into(), cxx: vec!["c++".into()], cmd: vec!["cc".into()], statik: false, exe_suffix: "" };
+        let key = |c: &str, ll: &str, hc: &str, extra: &str| super::ll_unit_key(c, ll, hc, extra, &spec, false, None);
+        let base = key("c", "ll", "hc", "x");
+        for other in [key("c2", "ll", "hc", "x"), key("c", "ll2", "hc", "x"), key("c", "ll", "hc2", "x"), key("c", "ll", "hc", "y"), key("cl", "l", "hc", "x")] {
+            assert_ne!(base, other);
+        }
+        assert_eq!(base, key("c", "ll", "hc", "x"));
     }
 
     #[test]
