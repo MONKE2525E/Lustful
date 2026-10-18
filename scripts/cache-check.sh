@@ -7,7 +7,8 @@
 # warm-check.sh covers cold vs threads vs daemon on one source; this covers the cache and
 # the daemon's reused C across edits (fx-unitcache). Last, 6 sequences of 4 steps through
 # the release driver (with a front image), whose binaries must be byte-identical with and
-# without the cache and whose no-change rebuild must compile nothing. With zig on PATH,
+# without the cache and whose no-change rebuild must compile nothing, and 6 more with one fn
+# per release unit (no image). With zig on PATH,
 # the same through zig cc (musl, release C, then the epoch case with LLVM units): zig's
 # own compile cache must not change a binary.
 # Run after scripts/build.sh. Exit 0 = all same, 1 = a difference, 2 = setup error. The
@@ -24,6 +25,12 @@ drc=$?
 # byte-identical, and a no-change rebuild must compile no unit.
 python3 "$root/scripts/cache_check.py" --seqs "${RELEASE_SEQS:-6}" --steps 4 --seed "${SEED:-1}" --jobs "$jobs" --release --front
 rrc=$?
+# The same with one fn per unit: most of a unit's types are then held only by other
+# definitions and declared as byte blocks (cgen `nested_block`), so a code path that reads
+# an Adt's fields without recording it fails to compile here.
+LUST_RELEASE_UNIT_KB=0 python3 "$root/scripts/cache_check.py" --seqs "${RELEASE_SEQS:-6}" --steps 4 --seed "$((${SEED:-1} + 7))" --jobs "$jobs" --release
+brc=$?
+rrc=$((rrc > brc ? rrc : brc))
 # zig keys a compile on its source and args only: the same unit text with another input
 # (a profile, linked bitcode, SOURCE_DATE_EPOCH) must still give its own object.
 zrc=0
