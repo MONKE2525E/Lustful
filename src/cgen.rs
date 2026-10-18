@@ -10860,9 +10860,13 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         }
         defined
     };
+    // One pointer step from the roots themselves (a glue key and its recorded types): the
+    // Box, `&`, Vec and Rc fields of a root point at what its glue reads in place. A struct
+    // the roots hold by value is read by its own glue, through a prototype; stepping from
+    // every such struct too defined the pointees of the whole by-value closure, and a glue
+    // shard or a unit with inline glue recompiled for most edits of a central struct.
     let one_step = |roots: Vec<CTy>| {
-        let first = by_value(roots);
-        let step: Vec<CTy> = first.iter().flat_map(|t| field_types(p, t)).chain(first.iter().cloned()).collect();
+        let step: Vec<CTy> = roots.iter().flat_map(|t| field_types(p, t)).chain(roots.iter().cloned()).collect();
         by_value(step)
     };
     let defined: Option<HashSet<CTy>> = match decls {
