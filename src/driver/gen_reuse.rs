@@ -61,10 +61,10 @@ struct TemplateEntry {
     calls: Vec<(u32, ClosureKind)>,
 }
 
-/// One clean check of a template with closures: its reads alone. Collect
-/// never reuses it (the check also registers the closure bodies); the
-/// derive delta compares it to know whether the kept program's check of
-/// the template still holds (driver/kept_derive.rs).
+/// One clean check of a template with closures: its reads, and what a
+/// replay needs (`out`). The derive delta compares the reads to know
+/// whether the kept program's check of the template still holds
+/// (driver/kept_derive.rs); collect replays `out` (`closure_template`).
 struct ClosureTemplateEntry {
     src: u64,
     env: u64,
@@ -72,6 +72,18 @@ struct ClosureTemplateEntry {
     stamp: u64,
     reads: Reads,
     n_exprs: u32,
+    out: Option<ClosureTemplateOut>,
+}
+
+/// The output of one clean check of a template with closures: its picks
+/// and closure call kinds and its closures' capture shapes, by expression
+/// offset from the body's first expression (as `TemplateEntry`), and its
+/// closures' records, from which a replay makes their body fns again.
+struct ClosureTemplateOut {
+    picks: Vec<(u32, TraitPick)>,
+    calls: Vec<(u32, ClosureKind)>,
+    shapes: Vec<(u32, ClosureKind, Vec<CaptureShape>)>,
+    closures: Vec<OwnedClosure>,
 }
 
 /// One clean discovery check: the Adt types the body names, its
@@ -706,8 +718,64 @@ impl GenReuse {
             return;
         };
         let (lo, hi) = p.fn_def(t).exprs;
-        let entry = ClosureTemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads), n_exprs: hi - lo };
+        let entry = ClosureTemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads), n_exprs: hi - lo, out: None };
         self.closure_templates.insert(def, entry);
+    }
+
+    /// Adds to the entry `store_closure_template` just made for template
+    /// `t` what a replay of its clean check needs: picks, closure call
+    /// kinds, capture shapes, and the closures' records.
+    pub(crate) fn store_closure_template_out(
+        &mut self,
+        p: &Program,
+        t: LocalDefId,
+        picks: &[(ExprId, TraitPick)],
+        calls: &[(ExprId, ClosureKind)],
+        shapes: &crate::check::generics::ClosureShapes,
+        closures: &[OwnedClosure],
+    ) {
+        let (lo, hi) = p.fn_def(t).exprs;
+        let inside = |e: ExprId| e.0 >= lo && e.0 < hi;
+        let Some(e) = self.closure_templates.get_mut(&p.def_id(t)) else { return };
+        if !picks.iter().all(|(x, _)| inside(*x)) || !calls.iter().all(|(x, _)| inside(*x)) || !shapes.iter().all(|(x, _, _)| inside(*x)) {
+            return;
+        }
+        e.out = Some(ClosureTemplateOut {
+            picks: picks.iter().map(|&(x, pick)| (x.0 - lo, pick)).collect(),
+            calls: calls.iter().map(|&(x, k)| (x.0 - lo, k)).collect(),
+            shapes: shapes.iter().map(|(x, k, s)| (x.0 - lo, *k, s.clone())).collect(),
+            closures: closures.to_vec(),
+        });
+    }
+
+    /// The stored output of template `t`, which has closures, rebased onto
+    /// its current body, if its stored check still holds: as `template`,
+    /// plus no `Checked` read (a collect checks such a body again).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn closure_template(
+        &mut self,
+        p: &Program,
+        t: LocalDefId,
+    ) -> Option<(Vec<(ExprId, TraitPick)>, Vec<(ExprId, ClosureKind)>, crate::check::generics::ClosureShapes, Vec<OwnedClosure>)> {
+        if !self.on {
+            return None;
+        }
+        let src = self.src_of(p, t)?;
+        let (lo, hi) = p.fn_def(t).exprs;
+        let e = self.closure_templates.get_mut(&p.def_id(t))?;
+        let out = e.out.as_ref()?;
+        if e.src != src || e.n_exprs != hi - lo || e.reads.keys().any(|k| matches!(k, ReadKey::Checked(_))) {
+            return None;
+        }
+        if !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
+            return None;
+        }
+        e.env = self.env;
+        self.templates_reused += 1;
+        let picks = out.picks.iter().map(|&(off, pick)| (ExprId(lo + off), pick)).collect();
+        let calls = out.calls.iter().map(|&(off, k)| (ExprId(lo + off), k)).collect();
+        let shapes = out.shapes.iter().map(|(off, k, s)| (ExprId(lo + off), *k, s.clone())).collect();
+        Some((picks, calls, shapes, out.closures.clone()))
     }
 
     /// Whether the stored check of template `t`, which has closures, still

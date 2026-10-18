@@ -10637,8 +10637,9 @@ pub fn check_lang_templates(p: &mut Program) -> Vec<Diag> {
 pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::driver::gen_reuse::GenReuse) -> Vec<Diag> {
     // A template whose stored check still holds (driver session
     // reuse) contributes its picks and closure call kinds without
-    // a recheck. A body with closure expressions always rechecks:
-    // its check also registers closure body fns.
+    // a recheck; one with closure expressions also makes its closure
+    // body fns again from the stored records (below). An opaque
+    // definer always rechecks: its check sets the hidden types.
     crate::driver::graph::FpMemo::sync(p);
     let defines_opaque = p.gx.opaques.contains_key(&opaque_def(p.def_id(t)));
     if !defines_opaque && let Some((picks, calls)) = reuse.template(p, t) {
@@ -10647,13 +10648,26 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
         record_template_closures(p, t, Vec::new(), calls);
         return Vec::new();
     }
+    let has_closures = fn_has_closures(p, t);
+    // A body with closures whose stored check holds replays it as well:
+    // its closures' records make their body fns again, as the check does.
+    if !defines_opaque
+        && has_closures
+        && let Some((picks, calls, shapes, owned)) = reuse.closure_template(p, t)
+    {
+        reuse.note_template_out(p, t, &picks, &calls, &shapes);
+        record_template_closures(p, t, shapes, calls);
+        register_closures(p, t, owned, FnClass::TemplateClosure);
+        p.gx.trait_picks.extend(picks);
+        return Vec::new();
+    }
     // Closures first: their body fns must exist before the body
     // lowers (its closure calls name them), and the capture
     // analysis is recorded for the instances. Only bodies with
     // closure expressions pay this extra check.
     let mut closure_fns: Vec<LocalDefId> = Vec::new();
     let mut template_shapes: ClosureShapes = Vec::new();
-    let has_closures = fn_has_closures(p, t);
+    let mut closure_records: Vec<OwnedClosure> = Vec::new();
     // The closure pass reads derive lists too (capture modes): its notes
     // join the reads the derive delta compares for this template.
     let ((), closure_noted) = crate::check::derive_delta::scoped(p.record_reads && has_closures, || {
@@ -10665,6 +10679,7 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
             template_shapes.clone_from(&shapes);
             record_template_closures(p, t, shapes, Vec::new());
             if let Some(owned) = owned {
+                closure_records.clone_from(&owned);
                 closure_fns = register_closures(p, t, owned, FnClass::TemplateClosure);
             }
         }
@@ -10674,7 +10689,13 @@ pub(crate) fn check_template(p: &mut Program, t: LocalDefId, reuse: &mut crate::
         crate::check::derive_delta::record(p, &mut body.reads, &closure_noted);
         reuse.store_closure_template(p, t, body.errs.is_empty().then_some(&body.reads));
     }
-    finish_template(p, t, reuse, body, &closure_fns, &template_shapes)
+    // What a replay of this clean check needs (`GenReuse::closure_template`).
+    let replay = (has_closures && !defines_opaque && body.errs.is_empty()).then(|| (body.picks.clone(), body.calls.clone()));
+    let errs = finish_template(p, t, reuse, body, &closure_fns, &template_shapes);
+    if let Some((picks, calls)) = replay {
+        reuse.store_closure_template_out(p, t, &picks, &calls, &template_shapes, &closure_records);
+    }
+    errs
 }
 
 /// The part of a template check that only reads the program: the body
