@@ -44,10 +44,11 @@ def collect(path):
 
 
 def problems(ok, fails, what):
-    """Failure strings for one run: every failure line, plus a run with no check."""
+    """Failure strings for one run: every failure line, plus a run with no check while the patch
+    oracle runs (it checks every path; the resolve oracle alone sees no single-file chunk path)."""
     if not on():
         return []
     out = [f"{what}: {l[:300]}" for l in fails]
-    if ok == 0:
+    if ok == 0 and os.environ.get("LUST_CHECK_ITEMPATCH", "") not in ("", "0"):
         out.append(f"{what}: the oracles logged 0 checks (a blind spot)")
     return out
