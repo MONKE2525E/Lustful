@@ -818,6 +818,20 @@ impl ResolvedTables {
     /// explicit sources name different targets (a user error the caller
     /// reports after the fixpoint).
     pub fn insert(&mut self, module: ModuleId, ns: Namespace, name: Sym, bind: Bind) -> InsertOut {
+        let out = self.insert_inner(module, ns, name, bind);
+        // Any change through here ends a glob source's ownership of
+        // the binding (`glob_src`): its later copy refresh must not
+        // take an ambiguity another glob's insert made (a variant
+        // glob beside a type glob, in the type namespace) for a
+        // stale copy of its own and reset it to One. `insert_glob`
+        // re-records ownership for its own copies right after.
+        if out == InsertOut::Changed && self.glob_src.remove(&(module, ns_index(ns) as u8, name)).is_some() {
+            self.touch(module, name);
+        }
+        out
+    }
+
+    fn insert_inner(&mut self, module: ModuleId, ns: Namespace, name: Sym, bind: Bind) -> InsertOut {
         // A glob std alias of the name loses to a local item or explicit
         // import, and is ambiguous with a glob binding of a crate item.
         let key = (module, ns_index(ns) as u8, name);
@@ -2736,9 +2750,15 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         None => (imp.vis.clone(), imp.module),
                     };
                     for v in tables.variants[&adt].clone() {
-                        let bind = Bind { target: Target::Variant(adt, v), vis: vis.clone(), rank: 1, def_module };
-                        if tables.insert(imp.module, Namespace::Value, v, bind) == InsertOut::Changed {
-                            changed = true;
+                        // Variants bind in both namespaces (rustc): a
+                        // glob of another module that brings a type
+                        // of the variant's name makes a path head
+                        // ambiguous, not silently the type's.
+                        for ns in [Namespace::Value, Namespace::Type] {
+                            let bind = Bind { target: Target::Variant(adt, v), vis: vis.clone(), rank: 1, def_module };
+                            if tables.insert(imp.module, ns, v, bind) == InsertOut::Changed {
+                                changed = true;
+                            }
                         }
                     }
                     TryOut::Done(changed)
@@ -2785,7 +2805,9 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 let name = interner.intern(v);
                                 let mut full = path.clone();
                                 full.push(name);
-                                changed |= tables.insert_glob_std_alias(imp.module, Namespace::Value, name, imp.vis.clone(), imp.module, full);
+                                // Both namespaces, like a user enum's variants.
+                                changed |= tables.insert_glob_std_alias(imp.module, Namespace::Value, name, imp.vis.clone(), imp.module, full.clone());
+                                changed |= tables.insert_glob_std_alias(imp.module, Namespace::Type, name, imp.vis.clone(), imp.module, full);
                             }
                             // `use std::panic::*;`: the items of the std
                             // source overlay module (AssertUnwindSafe) or of
@@ -2830,19 +2852,27 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                 if !tables.check_reexport(imp, Target::Variant(adt, path[rest]), interner.get(path[rest]), interner, diags) {
                     return TryOut::Done(false);
                 }
-                let dup = explicit_exists(tables, imp, Namespace::Value, *name);
-                let out = tables.insert(
-                    imp.module,
-                    Namespace::Value,
-                    import_bind_name(*name, Target::Variant(adt, path[rest]), interner),
-                    Bind { target: Target::Variant(adt, path[rest]), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
-                );
+                // Both namespaces, as a glob of the enum binds them.
+                let bind_name = import_bind_name(*name, Target::Variant(adt, path[rest]), interner);
+                let mut dup = false;
+                let mut changed = false;
+                for ns in [Namespace::Value, Namespace::Type] {
+                    dup |= explicit_exists(tables, imp, ns, *name);
+                    let out = tables.insert(
+                        imp.module,
+                        ns,
+                        bind_name,
+                        Bind { target: Target::Variant(adt, path[rest]), vis: imp.vis.clone(), rank: 2, def_module: imp.module },
+                    );
+                    changed |= out == InsertOut::Changed;
+                    if !dup {
+                        report_dup(out, imp, *name, interner, diags);
+                    }
+                }
                 if dup {
                     diags.push(dup_diag(imp, *name, interner));
-                } else {
-                    report_dup(out, imp, *name, interner, diags);
                 }
-                return TryOut::Done(out == InsertOut::Changed);
+                return TryOut::Done(changed);
             }
             let (mod_path, last) = path.split_at(path.len() - 1);
             let last = last[0];

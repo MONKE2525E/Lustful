@@ -6994,7 +6994,10 @@ impl Rewrite<'_> {
                     {
                         let target = Target::Variant(adt, path[rest]);
                         let bn = crate::resolve::imports::import_bind_name(name, target, self.interner);
-                        if insert_local(scopes, bn, Namespace::Value, LocalBind::Target(target), 2) && self.interner.get(name) != "_" {
+                        // Both namespaces, as at module level.
+                        let dup = insert_local(scopes, bn, Namespace::Value, LocalBind::Target(target), 2)
+                            | insert_local(scopes, bn, Namespace::Type, LocalBind::Target(target), 2);
+                        if dup && self.interner.get(name) != "_" {
                             self.push_local_dup(span, name);
                         }
                         continue;
@@ -7175,7 +7178,9 @@ impl Rewrite<'_> {
                         match res {
                             PathRes::Done(Target::Def(adt)) if self.tables.variants.contains_key(&adt) => {
                                 for v in self.tables.variants[&adt].clone() {
+                                    // Both namespaces, as at module level.
                                     insert_local(scopes, v, Namespace::Value, LocalBind::Target(Target::Variant(adt, v)), 1);
+                                    insert_local(scopes, v, Namespace::Type, LocalBind::Target(Target::Variant(adt, v)), 1);
                                 }
                             }
                             PathRes::Done(Target::Module(src)) => self.glob_from_module(ast, src, module, scopes, span),
@@ -7195,6 +7200,7 @@ impl Rewrite<'_> {
                     {
                         for v in self.tables.variants[&adt].clone() {
                             insert_local(scopes, v, Namespace::Value, LocalBind::Target(Target::Variant(adt, v)), 1);
+                            insert_local(scopes, v, Namespace::Type, LocalBind::Target(Target::Variant(adt, v)), 1);
                         }
                         continue;
                     }
