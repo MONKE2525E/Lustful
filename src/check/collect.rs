@@ -6973,9 +6973,17 @@ fn fold_body_const_values(p: &mut Program) {
     let fns: Vec<(Option<ast::BlockId>, crate::def::DefPathHash)> = p.fns.iter().zip(&p.fn_defs).map(|(f, d)| (f.def(&p.ast).body, d.hash)).collect();
     let items: Vec<usize> = consts.iter().map(|&(j, _)| j as usize).collect();
     let parent = stmt_item_parents(&p.ast, &fns, &items);
-    for (j, ci) in consts {
-        let (Some(owner), Some(c)) = (parent[j as usize], p.body_consts.get(ci as usize)) else { continue };
-        let fp = crate::driver::graph::value_fp(p, &c.value, &c.value_fp);
+    let owned: Vec<(usize, u32)> = consts.iter().filter_map(|&(j, ci)| Some((parent[j as usize]?, ci))).filter(|&(_, ci)| (ci as usize) < p.body_consts.len()).collect();
+    // The value fingerprints are independent (each made once, `value_fp`):
+    // in parallel, then folded in order.
+    let fps = {
+        let p = &*p;
+        crate::pool::par_map(&owned, |&(_, ci)| {
+            let c = &p.body_consts[ci as usize];
+            crate::driver::graph::value_fp(p, &c.value, &c.value_fp)
+        })
+    };
+    for (&(owner, _), fp) in owned.iter().zip(fps) {
         if let Some(src) = p.gx.reuse.ast_src.get_mut(owner) {
             let mut h = crate::intern::FxHasher::default();
             std::hash::Hash::hash(&(*src, fp), &mut h);
