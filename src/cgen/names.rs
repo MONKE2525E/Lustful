@@ -166,9 +166,11 @@ pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
     if !cur.is_empty() {
         shards.push(cur);
     }
-    shards
-        .into_iter()
-        .map(|keys| {
+    // Each shard is its own unit: built in parallel (in order), each worker
+    // under this thread's naming context.
+    let names = CUR.with(|c| c.borrow().clone());
+    crate::pool::par_map(&shards, |keys| {
+        with(names.as_ref(), || {
             let mut c = unit_header();
             if p.unwind_tables {
                 c.push_str(noreturn_decls());
@@ -176,7 +178,7 @@ pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
             let mut types = HashSet::new();
             let mut protos: BTreeSet<&str> = BTreeSet::new();
             let mut externs: BTreeSet<&str> = BTreeSet::new();
-            for k in &keys {
+            for k in keys {
                 g.def_types(k, &mut types);
                 protos.insert(&g.protos[*k]);
                 for d in g.deps.get(*k).into_iter().flatten() {
@@ -188,12 +190,12 @@ pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
             type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep);
             externs.into_iter().for_each(|e| c.push_str(e));
             protos.into_iter().for_each(|x| c.push_str(x));
-            for k in &keys {
+            for k in keys {
                 c.push_str(&g.def_map[*k]);
             }
             c
         })
-        .collect()
+    })
 }
 
 /// Release C statics: the data of every static, with the types it names (the glue lives
