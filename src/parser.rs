@@ -2130,7 +2130,7 @@ impl<'a> Parser<'a> {
                 ItemKind::Trait(def)
             }
             Tok::Mod if !has_qual => ItemKind::Mod(self.mod_def()?),
-            Tok::Static if !has_qual => ItemKind::Static(self.static_def()?),
+            Tok::Static if !has_qual => ItemKind::Static(self.static_def(false)?),
             Tok::Type if !has_qual => ItemKind::Type(self.type_alias_def()?),
             // `extern { .. }` and `extern crate ..;`: the qualifier loop ate `extern`.
             Tok::LBrace if qual.abi.is_some() && self.cfg_syntax => ItemKind::Mod(self.extern_block_cfg(start)?),
@@ -2283,7 +2283,7 @@ impl<'a> Parser<'a> {
                     let _def = def?;
                 }
                 Tok::Static => {
-                    let _def = self.static_def()?;
+                    let _def = self.static_def(true)?;
                 }
                 Tok::Type => {
                     self.bump();
@@ -2346,6 +2346,11 @@ impl<'a> Parser<'a> {
         self.expect(Tok::Colon, "`:`")?;
         let ty = self.ty()?;
         let (value, init_fn) = self.const_value(name.unwrap_or(Sym(0)), name_span)?;
+        // A cfg-disabled node is only grammar-checked: rustc strips it
+        // before the missing-body validation, so it stands there.
+        if value.is_none() && !self.cfg_syntax {
+            return Err(syntax(name_span, "free constant item without body"));
+        }
         self.expect(Tok::Semi, "`;`")?;
         Ok(ConstDef { name, name_span, ty, value, span: start.to(self.prev_span()), init_fn })
     }
@@ -2412,14 +2417,18 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    /// A `static` item: `static [mut] NAME: Ty = value;`.
-    fn static_def(&mut self) -> PResult<StaticDef> {
+    /// A `static` item: `static [mut] NAME: Ty = value;`. A foreign
+    /// static (the cfg syntax check's extern blocks) has no value.
+    fn static_def(&mut self, foreign: bool) -> PResult<StaticDef> {
         let start = self.expect(Tok::Static, "`static`")?;
         let mutable = self.eat(Tok::Mut);
         let (name, name_span) = self.ident()?;
         self.expect(Tok::Colon, "`:`")?;
         let ty = self.ty()?;
         let (value, init_fn) = self.const_value(name, name_span)?;
+        if value.is_none() && !foreign && !self.cfg_syntax {
+            return Err(syntax(name_span, "free static item without body"));
+        }
         self.expect(Tok::Semi, "`;`")?;
         Ok(StaticDef { name, name_span, mutable, ty, value, span: start.to(self.prev_span()), init_fn })
     }
