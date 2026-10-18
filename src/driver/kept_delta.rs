@@ -686,13 +686,12 @@ fn replay_bodies(
         }
         // A template whose check no longer holds checks again, as collect
         // does, in a check only: a build's instances of it would keep
-        // their old checks, as a check's would (`patch::instanced_templates`).
-        if !again.is_empty() && (walk_instances || {
-            let instanced = super::patch::instanced_templates(p);
-            again.iter().any(|t| instanced.contains_key(t))
-        }) {
+        // their old checks. A check's instances of it (with generic
+        // associated consts) check again in `replay_discovery`.
+        if !again.is_empty() && walk_instances {
             return Err("sig template");
         }
+        let rechecked = again.clone();
         let mut times: Vec<(f64, LocalDefId)> = Vec::new();
         for t in again {
             let (lo, hi) = p.fn_def(t).exprs;
@@ -712,7 +711,7 @@ fn replay_bodies(
             format!("replay templates: {} again; {}\n", times.len(), list.join(", "))
         });
         super::laps::mark("collect/delta replay templates");
-        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers))
+        replay_discovery(p, caches, fn_count, walk_instances, start, bases, &mut touched, &|_| false, Some(&readers), &rechecked)
     })();
     if followed {
         p.fp_memo.follow_end();
@@ -749,6 +748,7 @@ pub(super) fn replay_discovery(
     touched: &mut dyn FnMut(&Program, &ReadKey) -> bool,
     stands: &dyn Fn(LocalDefId) -> bool,
     readers: Option<&crate::intern::FxMap<crate::def::DefId, ()>>,
+    rechecked: &[LocalDefId],
 ) -> Result<(), &'static str> {
     let (record_reads, unwind) = (p.record_reads, p.unwind);
     (p.record_reads, p.unwind) = (true, false);
@@ -810,6 +810,56 @@ pub(super) fn replay_discovery(
             };
             work.push((g, base, newer));
         }
+        // A check of a program with generic associated consts made
+        // instances (`patch::walks_requests`), which collect walks again
+        // from the new bodies: an instance of a template this delta checked
+        // again (`rechecked`, through closure parents) replays the new
+        // check, and must give no error and its stored output, requests
+        // included (`OutCopy::same`), so collect would make the same
+        // instances. An instance of a template that holds replays the same
+        // resolutions: the delta reaches it only through them (an edited
+        // trait impl method through the trait's impl buckets, whose reader
+        // templates check again).
+        let mut instances: crate::intern::FxMap<LocalDefId, ()> = crate::intern::FxMap::default();
+        if stop.is_none() && !walk_instances && !rechecked.is_empty() && super::patch::walks_requests(p) {
+            let owners: crate::intern::FxMap<LocalDefId, ()> = rechecked.iter().map(|&t| (t, ())).collect();
+            // Up from an instance to its template, from a closure body fn to
+            // the fn it is checked in, until a rechecked template (or none).
+            let owned_by_rechecked = |p: &Program, g: LocalDefId| {
+                let mut f = Some(g);
+                for _ in 0..64 {
+                    let Some(h) = f else { return false };
+                    if owners.contains_key(&h) {
+                        return true;
+                    }
+                    f = match p.gx.instances.get(&h) {
+                        Some(info) => info.template_local,
+                        None => p.gx.closure_fns.get(&h).and_then(|d| p.gx.closures.get(d)).map(|e| e.parent),
+                    };
+                }
+                true
+            };
+            for g in (fn_count as u32..p.fns.len() as u32).map(LocalDefId) {
+                // A closure body fn checks with the body it is in.
+                if p.gx.fn_class.get(g.0 as usize) != Some(&FnClass::Instance) || p.check_skips(g) {
+                    continue;
+                }
+                if !owned_by_rechecked(p, g) {
+                    continue;
+                }
+                if reuse.newer(p, g, p.reuse_stamp, start) {
+                    stop = Some("sig mode");
+                    break;
+                }
+                let Some(base) = reuse.out_copy(p.def_id(g)) else {
+                    crate::check::derive_delta::log(&|| format!("discovery instance {}: no output kept\n", p.display_name(p.fn_def(g).name)));
+                    stop = Some("discovery");
+                    break;
+                };
+                instances.insert(g, ());
+                work.push((g, base, false));
+            }
+        }
         // The checks read the program only: they run in parallel, as the
         // compile tail's body checks do.
         let walk_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -855,6 +905,13 @@ pub(super) fn replay_discovery(
             // An output that differs only in types whose instances were all
             // made before the body's turn makes what collect makes (a caller
             // with an error, or one that names a new type); bodies in fn order.
+            // An instance's error, or a closure kind still pending, is
+            // collect's to answer (a pending closure map stands as for a
+            // plain body: collect's last check of it was pending too).
+            if instances.contains_key(&g) && reads.is_none() {
+                crate::check::derive_delta::log(&|| format!("discovery instance {}: error or pending kind\n", p.display_name(p.fn_def(g).name)));
+                return Err("discovery");
+            }
             let same = base.same(p, &out, walk_instances);
             let made = !same
                 && !super::patch::walks_requests(p)

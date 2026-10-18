@@ -152,16 +152,19 @@ pub(super) fn apply_derives(
     // Without user generics collect runs no template check or discovery
     // (the lang enum methods' generics alone need neither in a check).
     if p.gx.user_generics {
-        if let Err(why) = replay_templates(p, front, caches, &reach, keyed, start) {
+        let rechecked = match replay_templates(p, front, caches, &reach, keyed, start) {
+            Ok(r) => r,
+            Err(why) => {
             // A parallel template check failed before the replays wrote
             // (`recheck_par`): the delta undoes as a refusal above does.
-            if why == TEMPLATE_DIAG || why == TEMPLATE_INSTANCES {
-                caches.gen_reuse.forget_answers();
-                undo.restore(p);
-                return Err((why, true));
+                if why == TEMPLATE_DIAG {
+                    caches.gen_reuse.forget_answers();
+                    undo.restore(p);
+                    return Err((why, true));
+                }
+                return Err((why, false));
             }
-            return Err((why, false));
-        }
+        };
         crate::driver::laps::mark("kept/derive templates");
         // A body's discovery reads are a subset of its check's, taken on
         // the same program: a body whose stored check reads are all clean
@@ -218,7 +221,7 @@ pub(super) fn apply_derives(
         let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
         let stands = |g: LocalDefId| clean.get(g.0 as usize).copied().unwrap_or(false);
-        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None)
+        super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None, &rechecked)
             .map_err(|why| (why, false))?;
         crate::driver::laps::mark("kept/derive discovery");
     }
@@ -283,10 +286,6 @@ fn reach_names(p: &Program, reach: &crate::check::derive_delta::Reach, fn_count:
 /// (`recheck_par`); `p` is then as the derive delta left it.
 const TEMPLATE_DIAG: &str = "derive template diag";
 
-/// The refusal of a template to check again that has instances in a
-/// check's program, before any write (`replay_templates`).
-const TEMPLATE_INSTANCES: &str = "derive template instances";
-
 /// `kept_delta::recheck_template` for templates `ts`, which have no
 /// closures and define no opaque type: their body checks only read the
 /// program, so they run in parallel (`generics::template_body`), and the
@@ -328,7 +327,8 @@ fn recheck_par(p: &mut Program, ts: &[LocalDefId], caches: &mut Caches) -> Resul
     out
 }
 
-/// Mono's template checks after a derive delta: a template (trait default
+/// Mono's template checks after a derive delta (the templates that
+/// checked again, for `kept_delta::replay_discovery`): a template (trait default
 /// bodies included) whose stored check no longer holds checks again as
 /// collect's template check does,
 /// and must pass with the same hidden type (`kept_delta::recheck_template`).
@@ -348,7 +348,7 @@ fn replay_templates(
     reach: &crate::check::derive_delta::Reach,
     keyed: bool,
     start: u64,
-) -> Result<(), &'static str> {
+) -> Result<Vec<LocalDefId>, &'static str> {
     let fn_count = front.fn_loc.len();
     // Only a template with no stored reads needs the names (made once).
     let mut names: Option<crate::intern::FxMap<crate::intern::Sym, ()>> = None;
@@ -418,15 +418,6 @@ fn replay_templates(
             again.push(t);
         }
         crate::driver::laps::mark("kept/derive templates walk");
-        // A check's instances replay their templates' checks
-        // (`patch::instanced_templates`): one with instances refuses, before
-        // any template check writes.
-        if !again.is_empty() {
-            let instanced = super::patch::instanced_templates(p);
-            if again.iter().any(|t| instanced.contains_key(t)) {
-                return Err(TEMPLATE_INSTANCES);
-            }
-        }
         // Templates with no closures and no opaque type of their own check
         // in parallel (`recheck_par`); the others, and a check the other
         // mode stored, one at a time in fn order.
@@ -438,11 +429,11 @@ fn replay_templates(
         });
         recheck_par(p, &par, caches)?;
         crate::driver::laps::mark("kept/derive templates par");
-        for t in again {
+        for &t in &again {
             let body = p.fn_def(t).exprs;
             super::kept_delta::recheck_template(p, t, &[body], caches)?;
         }
-        Ok(())
+        Ok(par.into_iter().chain(again).collect())
     })();
     (p.record_reads, p.unwind) = (record_reads, unwind);
     out
