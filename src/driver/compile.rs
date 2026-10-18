@@ -3513,14 +3513,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
     // Every body of a generic program rechecks when the trait system
-    // moved too (collect dropped the cache then), and in a build when
-    // derive lists moved since the last build: codegen reads them with
-    // no recorded read (gen_reuse.rs `build_derives_moved`).
-    let derives_moved = req.cmd == Cmd::Build && caches.gen_reuse.build_derives_moved();
-    if derives_moved {
+    // moved too (collect dropped the cache then). Derive lists moved since
+    // the last build regenerate the glue only: each slot's codegen records
+    // the derive lists it reads into the slot's read set (below), so the
+    // walk rechecks just those slots (gen_reuse.rs `build_derives_moved`).
+    if req.cmd == Cmd::Build && caches.gen_reuse.build_derives_moved() {
         caches.glue_stale = true;
     }
-    let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed && !derives_moved;
+    let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed;
     // A std or lang trait impl edit moves no trait-system key: bodies read
     // those impls (`ReadKey::LangImpls`). Derived and drop glue read them
     // with no read, so the next build regenerates the glue (once:
@@ -3529,7 +3529,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue_stale = true;
     }
     if gen_ok_here && !gen_ok {
-        visits.generic = if caches.gen_reuse.trait_changed { "trait_key" } else { "derives" };
+        visits.generic = "trait_key";
     }
     // A program with no generics rechecks every body on a new trait
     // system too. Its plain bodies ask the impls of lang and std traits
@@ -4253,7 +4253,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let release = super::release_c::on(caches.persistent);
     let rnames = release.then(|| super::release_c::names(&program, &front.fn_slot, front.slot_of.len().max(caches.out.len()), &inst_adt_ids(&program)));
     let rn = rnames.as_ref();
-    let outs = par_map(&bodies, |(i, b)| cgen::names::with(rn, || cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot)));
+    // Codegen reads derive lists (Copy layouts, comparison forms, default
+    // variants): its notes join the slot's read set below, as the check's
+    // do (check/derive_delta.rs), so a derive edit regenerates just the
+    // slots that read the list.
+    let (outs, cg_noted): (Vec<_>, Vec<_>) = par_map(&bodies, |(i, b)| {
+        check::derive_delta::scoped(program.record_reads, || {
+            cgen::names::with(rn, || cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot))
+        })
+    })
+    .into_iter()
+    .unzip();
     if let Some(e) = outs.iter().find_map(|o| o.error.clone()) {
         return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() };
     }
@@ -4278,6 +4288,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         .filter(|&(_, &u)| wanted.get(u as usize).copied().unwrap_or(false))
         .map(|(l, &u)| (u, program.disk_id(LocalDefId(l as u32))))
         .collect();
+    let mut cg_reads = false;
+    for ((i, _), noted) in bodies.iter().zip(&cg_noted) {
+        if !noted.is_empty()
+            && let Some(Some(r)) = caches.slot_reads.get_mut(slot(*i))
+        {
+            check::derive_delta::record(&program, r, noted);
+            cg_reads = true;
+        }
+    }
+    if cg_reads {
+        caches.read_index.sync(&mut caches.slot_reads);
+    }
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);
         // The IR fingerprint a slot-moved re-emit checks its rebuilt

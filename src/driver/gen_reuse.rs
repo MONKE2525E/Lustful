@@ -15,8 +15,9 @@
 //   a slot renumber (`compile.rs`, "generic reuse"). Derive lists are
 //   not in the key (PLAN R12): every answer that reads one records a
 //   `Derives` read (check/derive_delta.rs), so a derive edit rechecks
-//   only the bodies that asked. A build still falls back on a derive
-//   edit (`build_derives_moved`). Impls of user traits are not in the key:
+//   only the bodies that asked; codegen's reads join each slot's read
+//   set, and a build regenerates the glue on a derive edit
+//   (`build_derives_moved`). Impls of user traits are not in the key:
 //   selection records an `ImplSet` read of the bucket it searched
 //   (driver/graph.rs), so an added, removed, or edited user trait impl
 //   rechecks only the bodies that read its bucket. Other inherent impls
@@ -438,11 +439,10 @@ impl GenReuse {
     }
 
     /// For a build: true when derive lists moved since the last build
-    /// made C, and records this build's key. Codegen reads derive lists
-    /// with no recorded read (derived glue, Copy layouts, comparison
-    /// forms), so such a build regenerates every body and the glue, as a
-    /// trait-system change does. The first build of a session has no C
-    /// to keep.
+    /// made C, and records this build's key. Derived glue reads derive
+    /// lists with no recorded read, so such a build regenerates the glue;
+    /// each slot's codegen records its own reads (compile.rs). The first
+    /// build of a session has no C to keep.
     pub fn build_derives_moved(&mut self) -> bool {
         let moved = self.build_derive_key.is_some() && self.build_derive_key != self.derive_key;
         self.build_derive_key = self.derive_key;
