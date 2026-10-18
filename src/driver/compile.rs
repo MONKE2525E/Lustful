@@ -4704,11 +4704,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let slot_of: std::collections::HashMap<&str, usize> = rn
                 .map(|n| n.fns.iter().enumerate().filter_map(|(s, id)| id.as_deref().map(|id| (id, s))).collect())
                 .unwrap_or_default();
-            let inl: Vec<Vec<usize>> = par_map(&(0..rg.len()).collect::<Vec<_>>(), |&g| cgen::ll::ll_inline_set(&caches.out, &rg[g].1, &slot_of));
             // One layout phase (cgen `in_layout_phase`): the program is frozen, so each
             // worker keeps its `c_layout` answers across the units it assembles.
             let asm_tag = cgen::layout_phase();
-            let assemble = |u: usize, c_refs: Option<&cgen::ll::CRefs>| {
+            let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>| {
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
                     1 => (cgen::names::statics_unit(&program, &caches.glue), String::new()),
@@ -4730,7 +4729,28 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // text names them (`cgen::ll::CRefs`): the C units and glue shards, and every fn's
             // helpers' C. `main`'s is always kept (the termination entry calls it).
             let (c_jobs, fn_jobs) = jobs.split_at(5);
-            let mut made = par_map(c_jobs, |&u| assemble(u, None));
+            // The C units (the statics unit is the slow one) and the inline sets, together.
+            let first: Vec<usize> = c_jobs.iter().copied().chain(0..rg.len()).collect();
+            let mut made = Vec::with_capacity(jobs.len());
+            let mut inl: Vec<Vec<usize>> = Vec::with_capacity(rg.len());
+            for (k, r) in par_map(&(0..first.len()).collect::<Vec<_>>(), |&k| {
+                if k < c_jobs.len() {
+                    Ok(assemble(first[k], &[], None))
+                } else {
+                    Err(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of))
+                }
+            })
+            .into_iter()
+            .enumerate()
+            {
+                match r {
+                    Ok(m) => made.push(m),
+                    Err(set) => {
+                        debug_assert!(k >= c_jobs.len());
+                        inl.push(set)
+                    }
+                }
+            }
             let c_refs = cgen::names::with(rn, || cgen::ll::on(&program)).then(|| {
                 // The C units and glue shards are made this build; each fn's C was read when
                 // its FnOut was made (`FnOut::ll_c_refs`; a C body's `code` is read here).
@@ -4755,7 +4775,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 r
             });
-            made.extend(par_map(fn_jobs, |&u| assemble(u, c_refs.as_ref())));
+            made.extend(par_map(fn_jobs, |&u| assemble(u, &inl, c_refs.as_ref())));
             let mut units: Vec<(PathBuf, String)> = Vec::with_capacity(made.len());
             // The LLVM backend (cgen/ll.rs): a fn unit whose fns have LLVM IR gets two
             // companions after the glue shards, its IR `u<N>.ll` and its helpers' C `u<N>.hc`,
