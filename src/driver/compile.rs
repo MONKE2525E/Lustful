@@ -2792,7 +2792,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     } else {
         let lines =
             if old_len == 0 { LineIndex::new(&src) } else { map.lines(ROOT_FILE).splice(&src, region_start, region_end_old, region_end) };
-        map.set_file(ROOT_FILE, &path, lines);
+        map.set_file(ROOT_FILE, &path, lines, &src);
     }
     let mut ranges: Vec<(usize, usize)> = kept_front.iter().map(|c| (c.start, c.start + c.text.len())).collect();
     let headers = if region_start == 0 && region_end == src.len() { fresh_headers.as_deref() } else { None };

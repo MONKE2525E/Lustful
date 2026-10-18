@@ -538,6 +538,17 @@ struct SourceFile {
     path: String,
     lines: LineIndex,
     text: Option<String>,
+    /// `text_hash` of the bytes the entry was built from, kept text or not.
+    hash: u64,
+}
+
+/// The FxHash of a file's bytes, as the source map records it
+/// (`SourceMap::text_hash`).
+pub fn text_hash(src: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::intern::FxHasher::default();
+    src.hash(&mut h);
+    h.finish()
 }
 
 /// The session's source map: every file's path and line index, plus the expansion table
@@ -556,13 +567,18 @@ impl SourceMap {
     /// same file for the rest of the session.
     pub fn add_file(&mut self, path: &str, src: &str) -> FileId {
         let id = FileId(self.files.len() as u32);
-        self.files.push(std::sync::Arc::new(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: None }));
+        self.files.push(std::sync::Arc::new(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: None, hash: text_hash(src) }));
         id
     }
     /// Adds a file and keeps its text in the map (multi-file crates).
     pub fn add_file_with_text(&mut self, path: &str, src: &str) -> FileId {
         let id = FileId(self.files.len() as u32);
-        self.files.push(std::sync::Arc::new(SourceFile { path: path.to_string(), lines: LineIndex::new(src), text: Some(src.to_string()) }));
+        self.files.push(std::sync::Arc::new(SourceFile {
+            path: path.to_string(),
+            lines: LineIndex::new(src),
+            text: Some(src.to_string()),
+            hash: text_hash(src),
+        }));
         id
     }
     /// The number of files in the map.
@@ -575,20 +591,27 @@ impl SourceMap {
     }
     /// Replaces a file's path and line index. The driver uses this for the session's one
     /// file on each request: the path comes from the request, and the index is spliced
-    /// from the last request's index, so it arrives ready-made.
-    pub fn set_file(&mut self, file: FileId, path: &str, lines: LineIndex) {
-        self.files[file.0 as usize] = std::sync::Arc::new(SourceFile { path: path.to_string(), lines, text: None });
+    /// from the last request's index, so it arrives ready-made. `src` is the text the
+    /// index describes (only its hash is kept).
+    pub fn set_file(&mut self, file: FileId, path: &str, lines: LineIndex, src: &str) {
+        self.files[file.0 as usize] = std::sync::Arc::new(SourceFile { path: path.to_string(), lines, text: None, hash: text_hash(src) });
     }
     /// Replaces the kept text of one multi-file crate file and its line
     /// index (the daemon's body patch edits one file in place). Only this
     /// file's entry is rebuilt; maps cloned earlier keep the old text.
     pub fn replace_text(&mut self, file: FileId, text: String, lines: LineIndex) {
         let path = self.files[file.0 as usize].path.clone();
-        self.files[file.0 as usize] = std::sync::Arc::new(SourceFile { path, lines, text: Some(text) });
+        let hash = text_hash(&text);
+        self.files[file.0 as usize] = std::sync::Arc::new(SourceFile { path, lines, text: Some(text), hash });
     }
     /// True when no file has been added yet (a fresh session).
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
+    }
+    /// The hash of the bytes `file`'s entry was built from (`text_hash`), also for the
+    /// one-file path, whose map keeps no text. The daemon's guard compares these.
+    pub fn text_hash(&self, file: FileId) -> u64 {
+        self.files[file.0 as usize].hash
     }
     /// The path diagnostics print for `file`.
     pub fn path(&self, file: FileId) -> &str {

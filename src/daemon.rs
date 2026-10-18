@@ -466,7 +466,6 @@ enum GuardOutcome {
 /// guard mismatch, fx-defcheck round 3). Cheap: the texts are
 /// already in the map.
 fn session_text_hashes(session: &Session) -> crate::intern::FxMap<PathBuf, u64> {
-    use std::hash::{Hash, Hasher};
     let map = &session.front.map;
     let mut out = crate::intern::FxMap::default();
     for k in 0..map.file_count() {
@@ -475,9 +474,10 @@ fn session_text_hashes(session: &Session) -> crate::intern::FxMap<PathBuf, u64> 
         if p.is_empty() {
             continue;
         }
-        let mut h = crate::intern::FxHasher::default();
-        map.text(f).unwrap_or("").hash(&mut h);
-        out.insert(PathBuf::from(p), h.finish());
+        // The map's hash of the bytes read, not of its kept text: a one-file
+        // crate keeps none, and hashing "" for it made the proof blind there
+        // (sd23_std_impl_hash: a truncated root answered L0130 against L0612).
+        out.insert(PathBuf::from(p), map.text_hash(f));
     }
     out
 }
@@ -1391,6 +1391,33 @@ mod tests {
         texts.insert(root.clone(), 0);
         let done = guard_once(&req, warm, inputs, texts, start, base.join("f1"));
         assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == root), "other bytes read as stale");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The content proof on a one-file crate with no doctored snapshot
+    /// (sd23_std_impl_hash, rel-cache's gate 15:2x: warm L0612, fresh
+    /// L0130 no `main`). The map keeps no text there, so the snapshot
+    /// must hash the bytes read. The root is emptied, as a copy caught
+    /// between its truncate and its write leaves it, and `start` lies
+    /// ahead of every ctime, as a lagging filesystem clock makes it.
+    #[test]
+    fn guard_stale_when_one_file_root_read_other_bytes() {
+        let base = std::env::temp_dir().join(format!("lust-guard-onefile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("main.rs");
+        std::fs::write(&root, "struct S;\nfn main() {\n    let x: u8 = S;\n}\n").unwrap();
+        let req = check_req(&root);
+        let mut sessions: HashMap<SessionKey, Entry> = HashMap::new();
+        let entry = entry_for(&mut sessions, &base.join("s"), &req.session, None, &mut 0);
+        let warm = driver::compile(&req, &mut entry.session);
+        assert_eq!(warm.code, 1, "a type error: {}", warm.stderr);
+        let inputs = session_inputs(&entry.session, &req);
+        let texts = session_text_hashes(&entry.session);
+        std::fs::write(&root, "").unwrap();
+        let start = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let done = guard_once(&req, warm, inputs, texts, start, base.join("f1"));
+        assert!(matches!(&done.outcome, GuardOutcome::Stale(p) if *p == root), "an emptied root reads as stale");
         let _ = std::fs::remove_dir_all(&base);
     }
 
