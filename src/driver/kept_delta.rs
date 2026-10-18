@@ -125,7 +125,7 @@ fn apply(
     super::laps::mark("collect/delta refusals");
     let opaque_idents = opaque_body_idents(p);
     super::laps::mark("collect/delta opaque idents");
-    let (namers, template_namers) = rpit_namers(p, &opaque_idents, &fns, walk_instances, &instanced).map_err(|e| (e, true))?;
+    let (namers, template_namers) = rpit_namers(p, &opaque_idents, &fns, walk_instances).map_err(|e| (e, true))?;
     super::laps::mark("collect/delta rpit namers");
     // The node answers of the last collect describe the old signatures.
     caches.gen_reuse.forget_answers();
@@ -212,14 +212,14 @@ fn apply(
     }
     // A template that does: its check runs again (the hidden type must
     // stand), as for a template that calls an edited fn.
-    for t in template_namers {
+    for &t in &template_namers {
         let (lo, hi) = p.fn_def(t).exprs;
         if let Err(why) = recheck_undoable(p, t, &[(lo, hi)], caches, &mut undos) {
             return Err(fail(p, caches, &mut undos, why));
         }
     }
     super::laps::mark("collect/delta reveal");
-    let out = replay_bodies(p, front, caches, &fns, walk_instances, start, bases, &mut undos).map_err(|why| fail(p, caches, &mut undos, why));
+    let out = replay_bodies(p, front, caches, &fns, &template_namers, walk_instances, start, bases, &mut undos).map_err(|why| fail(p, caches, &mut undos, why));
     super::laps::mark("collect/delta replay");
     out
 }
@@ -607,7 +607,6 @@ fn rpit_namers(
     opaque_idents: &[(crate::def::DefId, Vec<crate::intern::Sym>)],
     fns: &[usize],
     walk_instances: bool,
-    instanced: &FxMap<LocalDefId, ()>,
 ) -> Result<(Vec<LocalDefId>, Vec<LocalDefId>), &'static str> {
     let names: Vec<crate::intern::Sym> = fns.iter().map(|&i| p.fn_def(LocalDefId(i as u32)).name).collect();
     let (mut plain, mut tmpl) = (Vec::new(), Vec::new());
@@ -621,7 +620,7 @@ fn rpit_namers(
         }
         match p.gx.fn_class.get(g.0 as usize) {
             Some(FnClass::Plain) if p.gx.opaque_ret_of.contains_key(&g) => plain.push(g),
-            Some(FnClass::Template) if !walk_instances && !instanced.contains_key(&g) && !p.is_lang_method(g) => tmpl.push(g),
+            Some(FnClass::Template) if !walk_instances && !p.is_lang_method(g) => tmpl.push(g),
             c => {
                 crate::check::derive_delta::log(&|| {
                     let lang = p.is_lang_method(g);
@@ -656,6 +655,7 @@ fn replay_bodies(
     front: &Front,
     caches: &mut Caches,
     fns: &[usize],
+    namers: &[LocalDefId],
     walk_instances: bool,
     start: u64,
     bases: &Bases,
@@ -720,9 +720,12 @@ fn replay_bodies(
         if !again.is_empty() && walk_instances {
             return Err("sig template");
         }
-        // The edited templates' instances replay too (`refresh_instance`).
+        // The edited templates' instances replay too (`refresh_instance`),
+        // and the instances of the templates that reveal an opaque type
+        // naming one (`rpit_namers`, checked again in `apply`).
         let mut rechecked = again.clone();
         rechecked.extend(fns.iter().map(|&i| LocalDefId(i as u32)).filter(|f| p.gx.fn_class[f.0 as usize] == FnClass::Template));
+        rechecked.extend_from_slice(namers);
         let mut times: Vec<(f64, LocalDefId)> = Vec::new();
         for t in again {
             let (lo, hi) = p.fn_def(t).exprs;
@@ -879,17 +882,18 @@ pub(super) fn replay_discovery(
                 if !owned_by_rechecked(p, g) {
                     continue;
                 }
-                if reuse.newer(p, g, p.reuse_stamp, start) {
-                    stop = Some("sig mode");
-                    break;
-                }
-                let Some(base) = reuse.out_copy(p.def_id(g)) else {
-                    crate::check::derive_delta::log(&|| format!("discovery instance {}: no output kept\n", p.display_name(p.fn_def(g).name)));
-                    stop = Some("discovery");
+                // Another collect replaced the entry (a refused request's):
+                // the output the program has is the one kept for it, as for
+                // a plain body (`GenReuse::hold`).
+                let newer = reuse.newer(p, g, p.reuse_stamp, start);
+                let base = if newer { reuse.held_copy(p, g, p.reuse_stamp) } else { reuse.out_copy(p.def_id(g)) };
+                let Some(base) = base else {
+                    crate::check::derive_delta::log(&|| format!("discovery instance {}: no output kept (newer {newer})\n", p.display_name(p.fn_def(g).name)));
+                    stop = Some(if newer { "sig mode" } else { "discovery" });
                     break;
                 };
                 instances.insert(g, ());
-                work.push((g, base, false));
+                work.push((g, base, newer));
             }
         }
         // The checks read the program only: they run in parallel, as the
@@ -985,7 +989,6 @@ pub(super) fn replay_discovery(
 /// patch base); std and lang fns are left out.
 pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
     let opaque_idents = opaque_body_idents(p);
-    let instanced = super::patch::instanced_templates(p);
     let mut out: Vec<(&'static str, usize)> = Vec::new();
     for i in 0..p.fns.len() {
         let f = LocalDefId(i as u32);
@@ -997,7 +1000,7 @@ pub(crate) fn census(p: &Program) -> Vec<(&'static str, usize)> {
         {
             continue;
         }
-        let why = refusal(p, f, false).and_then(|()| rpit_namers(p, &opaque_idents, &[i], false, &instanced).map(drop)).err().unwrap_or("ok");
+        let why = refusal(p, f, false).and_then(|()| rpit_namers(p, &opaque_idents, &[i], false).map(drop)).err().unwrap_or("ok");
         match out.iter_mut().find(|e| e.0 == why) {
             Some(e) => e.1 += 1,
             None => out.push((why, 1)),
