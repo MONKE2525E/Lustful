@@ -12280,6 +12280,13 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     // take one more round before the definer's instance is made and
     // checked; `lust check` makes no instances, so it checks again once.
     let mut rechecked: FxMap<LocalDefId, u32> = FxMap::default();
+    // Vtable requests of replayed discovery outputs that name a closure no
+    // body has registered yet, with the requester's depth: a body that
+    // boxes a generic definer's `impl Fn` return names the closure of the
+    // definer's instance, which a request of the same body makes in a
+    // later round (a fresh check waits for it, `closure_map_pending`).
+    // Each is built once its closures exist (`replay_vtable`).
+    let mut deferred_vts: Vec<(OwnedTy, OwnedTy, usize)> = Vec::new();
     let recheck_limit = if p.gx.walk_instances { 8 } else { 1 };
     // The body lints after a clean check add only errors. A discovery
     // check's errors matter only for its instance requests (a failed
@@ -12311,6 +12318,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
             // this loop is about to extend. A body whose stored
             // discovery still holds (driver session reuse) replays it.
             let replayed = reuse.discovered(p, fid);
+            let from_store = replayed.is_some();
             let (adt_tys_owned, requests_owned, closures_owned, vtables_owned) = if let Some(stored) = replayed {
                 stored
             } else {
@@ -12363,19 +12371,11 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
             // Vtables for this body's unsizing coercions, with the
             // method instances they point at (ARCH 2.8, 4.2).
             for (src, dyn_ty) in &vtables_owned {
-                let src = build_owned_ty(p, src);
-                let src = normalize_global(p, src);
-                let dyn_ty = build_owned_ty(p, dyn_ty);
-                let Some(principal) = crate::check::object::vtable_key(p, &p.tys, dyn_ty) else { continue };
-                if !live_writers.contains(&src) {
-                    live_writers.push(src);
+                if from_store && names_unregistered_closure(p, src) {
+                    deferred_vts.push((src.clone(), dyn_ty.clone(), depth));
+                    continue;
                 }
-                let mut made: Vec<LocalDefId> = Vec::new();
-                crate::mono::vtable::ensure_vtable(p, src, principal, &mut made);
-                for inst in made {
-                    depths.insert(inst, depth + 1);
-                    next_queue.push(inst);
-                }
+                replay_vtable(p, src, dyn_ty, depth, &mut live_writers, &mut depths, &mut next_queue);
             }
             for (template, owned_args) in requests_owned {
                 // `lust check` stops at the template checks (ARCH 4.1):
@@ -12450,6 +12450,16 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
             }
             ensure_written_hash(p, &mut next_queue);
         }
+        // Deferred vtables whose closures this round registered; when no
+        // work is left, the rest as they are (a closure that never came).
+        let flush = next_queue.is_empty() && recheck.is_empty();
+        for (src, dyn_ty, depth) in std::mem::take(&mut deferred_vts) {
+            if !flush && names_unregistered_closure(p, &src) {
+                deferred_vts.push((src, dyn_ty, depth));
+            } else {
+                replay_vtable(p, &src, &dyn_ty, depth, &mut live_writers, &mut depths, &mut next_queue);
+            }
+        }
         next_queue.extend(recheck);
         // Std bodies an ensured vtable or glue method named are no
         // discovery roots in `lust check` either (`check_skips`).
@@ -12473,6 +12483,47 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         errs.extend(crate::check::platform::io_copy_instance(p, f));
     }
     errs
+}
+
+/// Builds the vtable of one discovery output's unsizing coercion
+/// (`materialize`) and queues the method instances it makes.
+fn replay_vtable(
+    p: &mut Program,
+    src: &OwnedTy,
+    dyn_ty: &OwnedTy,
+    depth: usize,
+    live_writers: &mut Vec<Ty>,
+    depths: &mut FxMap<LocalDefId, usize>,
+    next_queue: &mut Vec<LocalDefId>,
+) {
+    let src = build_owned_ty(p, src);
+    let src = normalize_global(p, src);
+    let dyn_ty = build_owned_ty(p, dyn_ty);
+    let Some(principal) = crate::check::object::vtable_key(p, &p.tys, dyn_ty) else { return };
+    if !live_writers.contains(&src) {
+        live_writers.push(src);
+    }
+    let mut made: Vec<LocalDefId> = Vec::new();
+    crate::mono::vtable::ensure_vtable(p, src, principal, &mut made);
+    for inst in made {
+        depths.insert(inst, depth + 1);
+        next_queue.push(inst);
+    }
+}
+
+/// True when type `t` names a closure that no body registered yet
+/// (`Program::gx.closures`).
+fn names_unregistered_closure(p: &Program, t: &OwnedTy) -> bool {
+    let args = |a: &[OwnedArg]| a.iter().any(|g| matches!(g, OwnedArg::Ty(t) if names_unregistered_closure(p, t)));
+    match t {
+        OwnedTy::Leaf(_) => false,
+        OwnedTy::Ref(_, _, e) | OwnedTy::RawPtr(_, e) | OwnedTy::Slice(e) | OwnedTy::Array(e, _) => names_unregistered_closure(p, e),
+        OwnedTy::Tuple(es) => es.iter().any(|e| names_unregistered_closure(p, e)),
+        OwnedTy::Closure(d, a) => !p.gx.closures.contains_key(d) || args(a),
+        OwnedTy::Adt(_, a) | OwnedTy::FnDef(_, a) | OwnedTy::Opaque(_, a) | OwnedTy::Projection(_, a) => args(a),
+        OwnedTy::FnPtr(_, inputs, output) => inputs.iter().any(|e| names_unregistered_closure(p, e)) || names_unregistered_closure(p, output),
+        OwnedTy::Dyn(principal, _, _) => principal.as_ref().is_some_and(|(_, a, bs)| args(a) || bs.iter().any(|(_, g)| args(std::slice::from_ref(g)))),
+    }
 }
 
 /// The output of one fresh discovery check of a body (see
