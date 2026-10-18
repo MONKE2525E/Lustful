@@ -3814,7 +3814,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if !caches.has_out[s] {
                 continue;
             }
-            let Some(Some(cached)) = caches.slot_ir.get(s) else { continue };
+            let Some(Some(cached)) = caches.slot_ir.get(s) else {
+                // No cached IR (the program had generics when this C was
+                // made): after a renumber the C may name moved slots, so
+                // it is checked again.
+                if front.slots_renumbered {
+                    reemit_failed.push(i);
+                }
+                continue;
+            };
             let moved = cached.slot_at_gen != s as u32
                 || cached.used_at_gen.iter().any(|(disk, at_gen)| front.slot_of.get(disk) != Some(at_gen));
             if !moved {
@@ -4198,28 +4206,35 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // the dead C (and any symbol only it named) leaves the link.
     dirty_slots.extend(std::mem::take(&mut caches.wiped_slots).into_iter().map(|s| s as usize));
     let mut file_hashes: FxMap<FileId, u64> = FxMap::default();
+    // Cached IR serves only the slot-moved re-emit, which runs only in a
+    // program with no generics: a generic program caches none (on tsgo it
+    // was 1.5 GB of a daemon session, made serially per generated body).
+    let keep_ir = !program.gx.has_generics;
     // The stable id of each fn whose slot the new C prints (`FnOut::used`),
     // by slot: the pairs below are the next renumber's re-emit trigger.
-    let mut wanted = vec![false; front.slot_of.len()];
-    outs.iter().flat_map(|o| &o.used).for_each(|&u| wanted[u as usize] = true);
+    let mut wanted = vec![false; if keep_ir { front.slot_of.len() } else { 0 }];
+    outs.iter().filter(|_| keep_ir).flat_map(|o| &o.used).for_each(|&u| wanted[u as usize] = true);
     let disk_at: FxMap<u32, DiskDefId> = (front.fn_slot.iter().enumerate())
-        .filter(|&(_, &u)| wanted[u as usize])
+        .filter(|&(_, &u)| wanted.get(u as usize).copied().unwrap_or(false))
         .map(|(l, &u)| (u, program.disk_id(LocalDefId(l as u32))))
         .collect();
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);
         // The IR fingerprint a slot-moved re-emit checks its rebuilt
         // body against (see `ir_cache::CachedBody`).
-        let base_line = line_base_of(front, *i);
-        let fp = super::ir_cache::ir_fingerprint(&program, body, &map, base_line);
-        let used_pairs: Vec<(DiskDefId, u32)> = out.used.iter().filter_map(|&u| Some((*disk_at.get(&u)?, u))).collect();
+        let cached = keep_ir.then(|| {
+            let base_line = line_base_of(front, *i);
+            let fp = super::ir_cache::ir_fingerprint(&program, body, &map, base_line);
+            let used_pairs: Vec<(DiskDefId, u32)> = out.used.iter().filter_map(|&u| Some((*disk_at.get(&u)?, u))).collect();
+            let file = program.fn_def(LocalDefId(*i as u32)).name_span.file;
+            let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
+            super::ir_cache::cache_body(&program, body, fh, s as u32, used_pairs, fp)
+        });
         caches.out[s] = out;
         caches.has_out[s] = true;
         dirty_slots.push(s);
-        let file = program.fn_def(LocalDefId(*i as u32)).name_span.file;
-        let fh = *file_hashes.entry(file).or_insert_with(|| file_text_hash(&map, file));
         if let Some(slot_ir) = caches.slot_ir.get_mut(s) {
-            *slot_ir = Some(super::ir_cache::cache_body(&program, body, fh, s as u32, used_pairs, fp));
+            *slot_ir = cached;
         }
     }
     // Group slots into function units by C bytes (see
