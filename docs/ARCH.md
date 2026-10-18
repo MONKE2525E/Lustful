@@ -4352,6 +4352,7 @@ dir no runner can execute is not a gate.
 |---|---|---|
 | `scripts/difftest.sh` | `tests/pass`, `tests/fail`, `tests/reject` with each compiler's defaults (panics unwind); `PANIC=abort` runs them with `-C panic=abort` on both sides | rustc with its defaults (or `-C panic=abort`) |
 | `PANIC=unwind scripts/difftest.sh` | `tests/unwind/` plus panic cases in `tests/pass` | rustc with `-C panic=unwind`, overflow checks on. Needed because abort mode cannot test recovered panics, poison, or unwind drops. |
+| `RELEASE=1 scripts/difftest.sh` (with or without `PANIC=unwind`) | `tests/release/` plus every `tests/pass` case | rustc and lust both with `-C overflow-checks=off -C debug-assertions=off`, a release profile's semantics: wrapping arithmetic, masked shifts, no debug assertions. |
 | `scripts/test-crates.sh` | `tests/crates/*`: multi-file Cargo fixtures, each built by Cargo and by lust, stdout and exit compared. Sets target and features per fixture. | Cargo |
 | `scripts/test-macros.sh` | `tests/macros/`: token compare, executable hygiene cases, both-reject cases | `rustc -Zunpretty=expanded` tokens; rustc run output |
 | `scripts/test-traits.sh` | `tests/traits/`: selection, coherence, and inference cases, accept and reject | rustc accept/reject per case, with the rustc error class recorded in the fixture |

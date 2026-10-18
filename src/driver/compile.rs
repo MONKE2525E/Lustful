@@ -2400,15 +2400,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             ..Default::default()
         };
     }
-    // Lust builds always check integer overflow. A dev profile that turns the
-    // checks off would wrap where lust panics, so it is a clear error.
-    if !req.session.profile.overflow_checks && !matches!(req.cmd, crate::protocol::Cmd::Check) {
-        return Response {
-            stderr: "error: the dev profile sets `overflow-checks = false`: lust dev builds always check overflow\n".into(),
-            code: 2,
-            ..Default::default()
-        };
-    }
     let path = req.file.to_string_lossy().to_string();
     let mut src = match std::fs::read_to_string(&req.file) {
         Ok(s) => s,
@@ -3487,6 +3478,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // (collect's own checks did too: `GenReuse::one_shot`).
     program.record_reads = caches.persistent;
     program.unwind = !session_key.profile.panic_abort;
+    program.overflow_checks = session_key.profile.overflow_checks;
     // Route the spliced source std fns: resolve each registry row's
     // mangled name to the local fn the splice defined. A missing fn is
     // a broken std build (the loader found it standalone), so it is an

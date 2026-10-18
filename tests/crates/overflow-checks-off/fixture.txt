@@ -1,4 +1,1 @@
-# A dev profile without overflow checks wraps; lust builds always check, so
-# lust rejects the build with a clear error (valid Rust lust rejects on purpose).
-expect=overflow-checks = false
-cargo=pass
+# A dev profile without overflow checks: lust's build wraps as Cargo's does (255u8 + 1 prints 0).

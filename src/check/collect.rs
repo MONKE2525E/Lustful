@@ -425,6 +425,11 @@ pub struct Program {
     /// statements and codegen propagates panics (docs/ARCH.md 7.2).
     /// Set by the driver after collection from the session's profile.
     pub unwind: bool,
+    /// Integer overflow panics (`-C overflow-checks`, or the Cargo profile's
+    /// `overflow-checks`): `+ - *`, negation, shifts, `abs` and `pow` check as
+    /// in a debug build. Off, they wrap and shift amounts are masked, as in a
+    /// release build. Set by the driver after collection from the session's profile.
+    pub overflow_checks: bool,
     /// Region signatures for the borrow checker (W-BORROW, ARCH 5): the
     /// signatures with their lifetimes kept, beside the erased ones above.
     pub regions: crate::borrowck::RegionTables,
@@ -3463,6 +3468,7 @@ pub fn collect_reuse(
         gx: GenTables::default(),
         record_reads: true,
         unwind: false,
+        overflow_checks: true,
         regions: Default::default(),
         fp_memo: Default::default(),
         const_goals: Vec::new(),

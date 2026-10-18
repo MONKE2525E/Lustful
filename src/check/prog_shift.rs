@@ -63,6 +63,7 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         gx,
         record_reads: _,
         unwind: _,
+        overflow_checks: _,
         regions: _,
         fp_memo: _,
         impl_parents,

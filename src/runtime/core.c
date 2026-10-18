@@ -1406,6 +1406,18 @@ lust_i128 lust_pow_i128(lust_i128 a, uint32_t e, lust_loc loc) LUST_BODY({
     while (e) { if (e & 1) r = lust_mul_i128(r, a, loc); e >>= 1; if (e) a = lust_mul_i128(a, a, loc); }
     return r;
 })
+/* `abs` and `pow` with overflow checks off (release builds): they wrap. */
+lust_i128 lust_wrapping_abs_i128(lust_i128 a) LUST_BODY({ lust_i128 z = {0, 0}; return (int64_t)a.hi < 0 ? lust_i128_sub(z, a) : a; })
+lust_u128 lust_wrapping_pow_u128(lust_u128 a, uint32_t e) LUST_BODY({
+    lust_u128 r = {1, 0};
+    while (e) { if (e & 1) r = lust_u128_mul(r, a); e >>= 1; if (e) a = lust_u128_mul(a, a); }
+    return r;
+})
+lust_i128 lust_wrapping_pow_i128(lust_i128 a, uint32_t e) LUST_BODY({
+    lust_i128 r = {1, 0};
+    while (e) { if (e & 1) r = lust_i128_mul(r, a); e >>= 1; if (e) a = lust_i128_mul(a, a); }
+    return r;
+})
 
 /* Decimal format: split by 10^19, the largest power of ten in a word. */
 void lust_fmt_u128(lust_String *out, lust_u128 v) LUST_BODY({

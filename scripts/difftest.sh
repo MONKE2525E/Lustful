@@ -28,6 +28,11 @@
 #     unwind mode only (a form unwinding does not cover yet, such as
 #     thread::spawn) is UNSUPPORTED, and LUST_STRICT=1 makes it fail.
 #     The filter `unwind-` runs only the tests/unwind cases (their names get that prefix).
+#   RELEASE=1 (rustc and lust both -C overflow-checks=off -C debug-assertions=off, a Cargo
+#     release profile's semantics; panics unwind unless PANIC=abort): tests/release/*.rs plus
+#     every tests/pass case (and tests/unwind when panics unwind), compared as in
+#     PANIC=unwind mode. A tests/release case that lust rejects fails. The filter `release-`
+#     runs only the tests/release cases.
 # Usage: scripts/difftest.sh [filter]
 #   SANITIZE=1 also builds the generated C with gcc -fsanitize=address,undefined and runs it.
 #              Its stdout and exit status must match the plain lust build's.
@@ -158,14 +163,30 @@ sanitize_case() {
 # std's own library/ path and line (src/stdloc.rs), so the whole text compares exactly.
 lust_stderr() { mask_stderr "$2" | sed "s|$1|@CASE@|g"; }
 
-if [ "${PANIC:-abort}" = unwind ]; then
-  lust_flags=(-C panic=unwind)
-  require_dir tests/unwind
+if [ "${PANIC:-abort}" = unwind ] || [ "${RELEASE:-0}" = 1 ]; then
+  # RELEASE=1 alone unwinds, as a release profile and plain rustc do.
+  panic=${PANIC:-unwind}
+  lust_flags=(-C panic=$panic)
   require_dir tests/pass
-  rustc_flags=(--edition 2024 -C panic=unwind -C overflow-checks=on -A warnings)
-  # tests/unwind cases, then every tests/pass case: unwind mode must not
+  rustc_flags=(--edition 2024 -C panic=$panic -A warnings)
+  unwind_cases=""
+  mode="PANIC=$panic"
+  if [ "$panic" = unwind ]; then
+    require_dir tests/unwind
+    unwind_cases=$(ls "$root"/tests/unwind/*.rs)
+  fi
+  if [ "${RELEASE:-0}" = 1 ]; then
+    # A release profile: no overflow checks, no debug assertions, on both sides.
+    lust_flags+=(-C overflow-checks=off -C debug-assertions=off)
+    rustc_flags+=(-C overflow-checks=off -C debug-assertions=off)
+    require_dir tests/release
+    unwind_cases="$unwind_cases $(ls "$root"/tests/release/*.rs)"
+    mode="$mode RELEASE=1"
+  else
+    rustc_flags+=(-C overflow-checks=on)
+  fi
+  # tests/unwind (and tests/release) cases, then every tests/pass case: the mode must not
   # change a program that does not panic, and must unwind the ones that do.
-  unwind_cases=$(ls "$root"/tests/unwind/*.rs)
   pass_cases=$(ls "$root"/tests/pass/*.rs)
   # Rust prints a full backtrace for a panic while panicking; lust prints
   # only its header, so both sides drop the frame lines.
@@ -175,15 +196,15 @@ if [ "${PANIC:-abort}" = unwind ]; then
     local name=$1 f=$2 rs ls msg
     rustc_oracle run "$f" "${rustc_flags[@]}"
     if [ "$(cat rustc.cc)" -ne 0 ]; then
-      report bad "$name" "rustc (panic=unwind) rejected it: $(head -3 rustc.err)"; return
+      report bad "$name" "rustc ($mode) rejected it: $(head -3 rustc.err)"; return
     fi
     rs=$(cat rustc.rs)
     if ! run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" 2>"$name.lust.err"; then
-      if [[ "$f" == */unwind/* ]] || [ "${LUST_STRICT:-0}" = 1 ]; then
+      if [[ "$f" == */unwind/* || "$f" == */release/* ]] || [ "${LUST_STRICT:-0}" = 1 ]; then
         report bad "$name" "lust rejected it: $(head -3 "$name.lust.err")"; return
       fi
       echo unsupported >st
-      echo "UNSUPPORTED $name (unwind): $(grep -m1 -E 'L[0-9]{4}|error' "$name.lust.err")"
+      echo "UNSUPPORTED $name ($mode): $(grep -m1 -E 'L[0-9]{4}|error' "$name.lust.err")"
       return
     fi
     run_to "./$name.lust" >"$name.lust.out" 2>"$name.lust.stderr"; ls=$?
@@ -209,7 +230,7 @@ if [ "${PANIC:-abort}" = unwind ]; then
     exit 1
   fi
   shard_line
-  echo "difftest (PANIC=unwind): $pass passed, $fail failed, $unsupported unsupported"
+  echo "difftest ($mode): $pass passed, $fail failed, $unsupported unsupported"
   [ $fail -eq 0 ]
   exit $?
 fi

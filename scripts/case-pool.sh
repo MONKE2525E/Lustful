@@ -46,7 +46,7 @@ rustc_version=$(rustc -vV 2>&1)
 #   sib_hash[dir]: the dir's own .rs cases. Only in the key of a case that names other files
 #                  (`mod x;`, `#[path`, `include!`), because it may read a sibling case.
 declare -A dep_hash sib_hash
-for d in "$root"/tests/{pass,fail,reject,unwind}; do
+for d in "$root"/tests/{pass,fail,reject,unwind,release}; do
   [ -d "$d" ] || continue
   dep_hash[$d]=$(cd "$d" && find . -type f ! -regex '\./[^/]*\.rs' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum)
   sib_hash[$d]=$(cd "$d" && find . -maxdepth 1 -type f -name '*.rs' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum)
@@ -143,6 +143,7 @@ run_all() {
   for f in "$@"; do
     name=$(basename "$f" .rs)
     [[ "$f" == */unwind/* ]] && name="unwind-$name"
+    [[ "$f" == */release/* ]] && name="release-$name"
     [[ -n "$filter" && "$name" != *"$filter"* ]] && continue
     m=$((m + 1))
     (( (m - 1) % shard_n == shard_k )) || continue

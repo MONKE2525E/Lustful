@@ -3387,6 +3387,13 @@ impl FnGen<'_, '_> {
                 let (a, at) = self.operand(a, loc, post);
                 match (op, &at) {
                     (UnOp::Neg, CTy::Float(_)) => format!("(-{a})"),
+                    (UnOp::Neg, CTy::Int(i)) if !self.p.overflow_checks => {
+                        if is128(*i) {
+                            format!("lust_{}_sub((({}){{0, 0}}), {a})", int_fn(*i), int_c(*i))
+                        } else {
+                            format!("(({})(0ull - (uint64_t)({a})))", int_c(*i))
+                        }
+                    }
                     (UnOp::Neg, CTy::Int(i)) => format!("lust_neg_{}({a}, {loc})", int_fn(*i)),
                     (UnOp::Not, CTy::Bool) => format!("(!{a})"),
                     (UnOp::Not, CTy::Int(i)) if is128(*i) => format!("lust_{}_not({a})", int_fn(*i)),
@@ -4104,7 +4111,18 @@ impl FnGen<'_, '_> {
             if op.is_cmp() {
                 return format!("(lust_{f}_cmp({a}, {b}) {} 0)", op.symbol());
             }
+            let checks = self.p.overflow_checks;
             return match op {
+                // Overflow checks off: + - * wrap and shift amounts are masked,
+                // as rustc's release builds do (`Program::overflow_checks`).
+                Add | Sub | Mul if !checks => {
+                    let how = match op {
+                        Add => "add",
+                        Sub => "sub",
+                        _ => "mul",
+                    };
+                    format!("lust_{f}_{how}({a}, {b})")
+                }
                 Add => format!("lust_add_{f}({a}, {b}, {loc})"),
                 Sub => format!("lust_sub_{f}({a}, {b}, {loc})"),
                 Mul => format!("lust_mul_{f}({a}, {b}, {loc})"),
@@ -4120,7 +4138,7 @@ impl FnGen<'_, '_> {
                         _ => format!("(uint64_t)({b})"),
                     };
                     let dir = if op == Shl { "left" } else { "right" };
-                    let sh = format!("lust_shift_amount({amount}, 128, \"{dir}\", {loc})");
+                    let sh = if checks { format!("lust_shift_amount({amount}, 128, \"{dir}\", {loc})") } else { format!("((uint32_t)({amount} & 127u))") };
                     let how = if op == Shl { "shl" } else { "shr" };
                     format!("lust_{f}_{how}({a}, {sh})")
                 }
@@ -4141,7 +4159,11 @@ impl FnGen<'_, '_> {
             CTy::Bool => format!("((uint8_t)({a} {} {b}))", op.symbol()),
             CTy::Int(i) => {
                 let (c, f) = (int_c(*i), int_fn(*i));
+                let checks = self.p.overflow_checks;
                 match op {
+                    // Overflow checks off: wrapping math in uint64_t (no C signed
+                    // overflow), truncated to the type by the cast.
+                    Add | Sub | Mul if !checks => format!("(({c})((uint64_t)({a}) {} (uint64_t)({b})))", op.symbol()),
                     Add => format!("lust_add_{f}({a}, {b}, {loc})"),
                     Sub => format!("lust_sub_{f}({a}, {b}, {loc})"),
                     Mul => format!("lust_mul_{f}({a}, {b}, {loc})"),
@@ -4155,7 +4177,11 @@ impl FnGen<'_, '_> {
                             _ => format!("(uint64_t)({b})"),
                         };
                         let dir = if op == Shl { "left" } else { "right" };
-                        let sh = format!("lust_shift_amount({amount}, {}, \"{dir}\", {loc})", i.bits());
+                        let sh = if checks {
+                            format!("lust_shift_amount({amount}, {}, \"{dir}\", {loc})", i.bits())
+                        } else {
+                            format!("((uint32_t)({amount} & {}u))", i.bits() - 1)
+                        };
                         if op == Shl { format!("(({c})((uint64_t)({a}) << {sh}))") } else { format!("(({c})({a} >> {sh}))") }
                     }
                     _ => unreachable!(),
@@ -5653,6 +5679,24 @@ impl FnGen<'_, '_> {
             }
             B::CharIsAsciiControl => format!("(*{0} < 32u || *{0} == 127u)", vals[0]),
             B::CharIsDigitRadix => format!("(lust_digit({}, {}, {}) != 0xFFFFFFFFu)", vals[0], vals[1], std_loc(1, 407, 9)),
+            // `abs` and `pow` inherit the caller's overflow checks
+            // (`#[rustc_inherit_overflow_checks]`): off, they wrap.
+            B::Abs if !self.p.overflow_checks => {
+                let it = int_of(&tys[0]);
+                if is128(it) {
+                    format!("lust_wrapping_abs_i128({})", vals[0])
+                } else {
+                    format!("(({0}) < 0 ? ({1})(0ull - (uint64_t)({0})) : ({0}))", vals[0], int_c(it))
+                }
+            }
+            B::Pow if !self.p.overflow_checks => {
+                let it = int_of(&tys[0]);
+                if is128(it) {
+                    format!("lust_wrapping_pow_{}({}, {})", int_fn(it), vals[0], vals[1])
+                } else {
+                    format!("(({})lust_wrapping_pow((uint64_t)({}), {}, {}))", int_c(it), vals[0], vals[1], it.bits())
+                }
+            }
             B::Abs => format!("lust_abs_{}({}, {})", int_fn(int_of(&tys[0])), vals[0], num_loc(int_of(&tys[0]), false)),
             B::Pow => format!("lust_pow_{}({}, {}, {})", int_fn(int_of(&tys[0])), vals[0], vals[1], num_loc(int_of(&tys[0]), true)),
             B::Min | B::Max => {
@@ -7522,7 +7566,10 @@ impl FnGen<'_, '_> {
                     "    uint64_t {add} = {y} == 0 ? 0 : ({x} % {y} == 0 ? 0 : {y} - {x} % {y}); {ct} {t} = ({ct})(({x} + {add}) & {mask});"
                 );
                 if b == B::NextMultipleOf {
-                    let _ = writeln!(self.out, "    if ({add} > ({mask}) - {x}) lust_panic_cstr(\"attempt to add with overflow\", {nloc});");
+                    // core's `self + (rhs - r)` inherits the overflow checks: off, it wraps.
+                    if self.p.overflow_checks {
+                        let _ = writeln!(self.out, "    if ({add} > ({mask}) - {x}) lust_panic_cstr(\"attempt to add with overflow\", {nloc});");
+                    }
                     t
                 } else {
                     self.int_option_c(&t, &format!("{y} != 0 && {add} <= ({mask}) - {x}"), it)
@@ -7572,11 +7619,12 @@ impl FnGen<'_, '_> {
                     "    uint64_t {x} = {masked_a}; uint64_t {m} = {x} <= 1 ? 0 : (({mask}) >> lust_leading_zeros64({x} - 1, {bits}));"
                 );
                 if b == B::NextPowerOfTwo {
-                    let nloc = num_loc(it, false);
-                    let _ = writeln!(
-                        self.out,
-                        "    if ({m} == ({mask})) lust_panic_cstr(\"attempt to add with overflow\", {nloc}); {ct} {t} = ({ct})({m} + 1);"
-                    );
+                    // The `+ 1` inherits the overflow checks: off, it wraps to 0.
+                    if self.p.overflow_checks {
+                        let nloc = num_loc(it, false);
+                        let _ = writeln!(self.out, "    if ({m} == ({mask})) lust_panic_cstr(\"attempt to add with overflow\", {nloc});");
+                    }
+                    let _ = writeln!(self.out, "    {ct} {t} = ({ct})({m} + 1);");
                     t
                 } else {
                     let _ = writeln!(self.out, "    {ct} {t} = ({ct})(({m} + 1) & ({mask}));");
@@ -7772,10 +7820,12 @@ impl FnGen<'_, '_> {
                     "    {ct} {r} = {{0, 0}}; if ({y}.lo != 0 || {y}.hi != 0) lust_u128_divmod({x}, {y}, &{r}); {ct} {add} = ({r}.lo == 0 && {r}.hi == 0) ? (({ct}){{0, 0}}) : lust_u128_sub({y}, {r}); {ct} {t} = lust_u128_add({x}, {add});"
                 );
                 if b == B::NextMultipleOf {
-                    let _ = writeln!(
-                        self.out,
-                        "    if (lust_u128_cmp({t}, {x}) < 0) lust_panic_cstr(\"attempt to add with overflow\", {nloc});"
-                    );
+                    if self.p.overflow_checks {
+                        let _ = writeln!(
+                            self.out,
+                            "    if (lust_u128_cmp({t}, {x}) < 0) lust_panic_cstr(\"attempt to add with overflow\", {nloc});"
+                        );
+                    }
                     t
                 } else {
                     self.int_option_c(&t, &format!("({y}.lo != 0 || {y}.hi != 0) && lust_u128_cmp({t}, {x}) >= 0"), it)

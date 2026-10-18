@@ -338,12 +338,10 @@ pub enum Invocation {
     /// `lust build --release --target <triple>...`: the lust release driver.
     /// One cold request per target (each `cc: true`, its own session and
     /// output path); `lust-core` runs them in order and never hands them
-    /// to the daemon. `overflow_note` says the named profile turns
-    /// overflow checks off, which lust codegen cannot do yet: the driver
-    /// prints that once instead of changing semantics silently.
+    /// to the daemon. Err: the named profile cannot be read (undefined, or
+    /// an `inherits` cycle), the error to print.
     ReleaseCc {
-        reqs: Vec<Request>,
-        overflow_note: bool,
+        reqs: Result<Vec<Request>, String>,
     },
     /// `lust build --release` / `--profile <name>`: hand the file to Cargo or rustc.
     /// Handled in the client process; never sent to the daemon.
@@ -360,7 +358,7 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Clone, Default)]
@@ -621,8 +619,18 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     // the release driver's list and build one session each.
     let mut targets: Vec<String> = Vec::new();
     let mut net = CargoNet { offline: std::env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true"), locked: false };
-    // `-C panic=unwind|abort`, as rustc takes it. None keeps the default.
+    // `-C panic=unwind|abort`, `-C overflow-checks=on|off` and `-C debug-assertions=on|off`,
+    // as rustc takes them. None keeps the default.
     let mut panic_abort: Option<bool> = None;
+    let (mut overflow_checks, mut debug_assertions): (Option<bool>, Option<bool>) = (None, None);
+    // A rustc boolean option value.
+    fn rustc_bool(v: &str) -> Option<bool> {
+        match v {
+            "y" | "yes" | "on" | "true" => Some(true),
+            "n" | "no" | "off" | "false" => Some(false),
+            _ => None,
+        }
+    }
     // Splits one `--features` value (comma- or space-separated, as Cargo takes).
     fn push_features(into: &mut Vec<String>, value: &str) -> Option<()> {
         let names: Vec<&str> = value.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
@@ -661,6 +669,8 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             "-C" => match it.next()?.as_str() {
                 "panic=unwind" => panic_abort = Some(false),
                 "panic=abort" => panic_abort = Some(true),
+                c if c.starts_with("overflow-checks=") => overflow_checks = Some(rustc_bool(&c["overflow-checks=".len()..])?),
+                c if c.starts_with("debug-assertions=") => debug_assertions = Some(rustc_bool(&c["debug-assertions=".len()..])?),
                 _ => return None,
             },
             "--target" => targets.push(it.next()?.clone()),
@@ -681,7 +691,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     // Crate-selection flags are lust dev flags today: reject them there rather
     // than build a different crate selection than the user named.
     if rustc {
-        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || !targets.is_empty() || panic_abort.is_some() {
+        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || !targets.is_empty() || panic_abort.is_some() || overflow_checks.is_some() || debug_assertions.is_some() {
             return None;
         }
         return Some(Invocation::RustcCheck { file: abs(&file) });
@@ -699,14 +709,17 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         }
         let profile_name = profile.as_deref().unwrap_or("release");
         let manifest = crate_flags.manifest_path.clone().or_else(|| find_manifest(&file).map(|m| m.path));
-        let named = named_profile(manifest.as_deref(), profile_name);
+        let named = match cargo_profile(manifest.as_deref(), profile_name) {
+            Ok(p) => p.flags,
+            Err(e) => return Some(Invocation::ReleaseCc { reqs: Err(e) }),
+        };
         let multi = targets.len() > 1;
         let mut reqs = Vec::new();
         for triple in &targets {
             let mut flags = crate_flags.clone();
             flags.target_triple = Some(triple.clone());
             let mut session = session_key_for(&file, flags, net);
-            session.profile = ProfileFlags { overflow_checks: true, ..named };
+            session.profile = named;
             if let Some(abort) = panic_abort {
                 session.profile.panic_abort = abort;
             }
@@ -736,10 +749,10 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
                 client: Client::current(&typed),
             });
         }
-        return Some(Invocation::ReleaseCc { reqs, overflow_note: !named.overflow_checks });
+        return Some(Invocation::ReleaseCc { reqs: Ok(reqs) });
     }
     if release || profile.is_some() {
-        if cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() || panic_abort.is_some() {
+        if cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() || panic_abort.is_some() || overflow_checks.is_some() || debug_assertions.is_some() {
             return None;
         }
         if release && profile.is_none() {
@@ -761,6 +774,12 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let mut session = session_key_for(&file, crate_flags, net);
     if let Some(abort) = panic_abort {
         session.profile.panic_abort = abort;
+    }
+    if let Some(on) = overflow_checks {
+        session.profile.overflow_checks = on;
+    }
+    if let Some(on) = debug_assertions {
+        session.profile.debug_assertions = on;
     }
     let req = Request {
         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
@@ -1129,31 +1148,17 @@ fn toml_lookup(text: &str, path: &str) -> Option<String> {
     None
 }
 
-/// The dev profile Cargo applies to the package at `manifest`, read from
-/// the sources Cargo merges, highest first: `CARGO_PROFILE_DEV_<KEY>`
-/// env vars, the `.cargo/config.toml` (or legacy `.cargo/config`) chain
-/// from the manifest dir up (nearer wins; lust runs Cargo there), then
-/// `$CARGO_HOME/config.toml`, then the workspace root manifest (Cargo
-/// reads profiles from the root only: the manifest itself when it has
-/// `[workspace]`, else the nearest manifest above it that has one).
-/// A dev profile that leaves a key unset keeps Cargo's dev default.
+/// The dev profile Cargo applies to the package at `manifest` (`cargo_profile`), with
+/// Cargo's dev defaults when it cannot be read.
 fn dev_profile(manifest: &Path) -> ProfileFlags {
-    let texts = profile_sources(manifest);
-    let get = |key: &str| {
-        let env = format!("CARGO_PROFILE_DEV_{}", key.to_uppercase().replace('-', "_"));
-        std::env::var(env).ok().or_else(|| texts.iter().find_map(|t| toml_lookup(t, &format!("profile.dev.{key}"))))
-    };
-    let dev = ProfileFlags::DEV_UNWIND;
-    ProfileFlags {
-        panic_abort: get("panic").map_or(dev.panic_abort, |v| v == "abort"),
-        overflow_checks: get("overflow-checks").map_or(dev.overflow_checks, |v| v == "true"),
-        debug_assertions: get("debug-assertions").map_or(dev.debug_assertions, |v| v == "true"),
-    }
+    cargo_profile(Some(manifest), "dev").map_or(ProfileFlags::DEV_UNWIND, |p| p.flags)
 }
 
-/// The texts Cargo merges for profiles of the package at `manifest`, in
-/// lookup order (nearer config first, workspace root manifest last).
-/// `dev_profile` documents the sources.
+/// The texts Cargo merges for profiles of the package at `manifest`, highest first:
+/// the `.cargo/config.toml` (or legacy `.cargo/config`) chain from the manifest dir up
+/// (nearer wins; lust runs Cargo there), then `$CARGO_HOME/config.toml`, then the
+/// workspace root manifest (Cargo reads profiles from the root only: the manifest itself
+/// when it has `[workspace]`, else the nearest manifest above it that has one).
 fn profile_sources(manifest: &Path) -> Vec<String> {
     let is_root = |t: &str| t.lines().any(|l| toml_strip_comment(l).trim().strip_prefix('[').is_some_and(|h| toml_dotted(h.trim_end_matches(']')) == "workspace"));
     let own = std::fs::read_to_string(manifest).unwrap_or_default();
@@ -1178,39 +1183,53 @@ fn profile_sources(manifest: &Path) -> Vec<String> {
     texts
 }
 
-/// The flags of one named Cargo profile (`--profile goport`), following
-/// `inherits` through the same sources as `dev_profile`. Built-in bases
-/// are Cargo's: dev and test unwind with overflow checks and debug
-/// assertions; release and bench unwind with neither. A custom profile
-/// with no `inherits` starts from dev, as Cargo's does. Overflow comes
-/// back in the flags as written; the release driver keeps checks on and
-/// says so (see `Invocation::ReleaseCc`).
-fn named_profile(manifest: Option<&Path>, name: &str) -> ProfileFlags {
+/// The settings of one Cargo profile that lust's builds use: the flags that change program
+/// output, and `opt-level` ("0" to "3", "s", "z") for the C compiler of a release build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CargoProfile {
+    pub flags: ProfileFlags,
+    pub opt_level: String,
+}
+
+/// The profile `name` (`dev`, `release`, `test`, `bench`, or a custom profile with
+/// `inherits`) that Cargo applies to the package at `manifest` (None: a file with no
+/// manifest), read from `CARGO_PROFILE_<NAME>_<KEY>` env vars, then `profile_sources`. A
+/// key the profile leaves unset comes from the profile it inherits (`test` inherits `dev`,
+/// `bench` inherits `release`), and at the end from Cargo's defaults: dev checks overflow
+/// and debug assertions at opt-level 0, release checks neither at opt-level 3; both
+/// unwind. Per-package overrides are not read.
+pub fn cargo_profile(manifest: Option<&Path>, name: &str) -> Result<CargoProfile, String> {
     let texts = manifest.map(profile_sources).unwrap_or_default();
-    let get = |prof: &str, key: &str| {
-        let env = format!("CARGO_PROFILE_{}_{}", prof.to_uppercase().replace('-', "_"), key.to_uppercase().replace('-', "_"));
-        std::env::var(env).ok().or_else(|| texts.iter().find_map(|t| toml_lookup(t, &format!("profile.{prof}.{key}"))))
+    let get = |profile: &str, key: &str| {
+        let up = |s: &str| s.to_uppercase().replace('-', "_");
+        let env = format!("CARGO_PROFILE_{}_{}", up(profile), up(key));
+        std::env::var(env).ok().or_else(|| texts.iter().find_map(|t| toml_lookup(t, &format!("profile.{profile}.{key}"))))
     };
-    let (mut panic_abort, mut overflow, mut debug_assertions) = (None, None, None);
-    let mut cur = name.to_string();
-    for _ in 0..6 {
-        panic_abort = panic_abort.or_else(|| get(&cur, "panic").map(|v| v == "abort"));
-        overflow = overflow.or_else(|| get(&cur, "overflow-checks").map(|v| v == "true"));
-        debug_assertions = debug_assertions.or_else(|| get(&cur, "debug-assertions").map(|v| v == "true"));
-        if panic_abort.is_some() && overflow.is_some() && debug_assertions.is_some() {
-            break;
+    // The inherits chain from `name` down to `dev` or `release`.
+    let mut chain = vec![name.to_string()];
+    loop {
+        let cur = chain.last().cloned().unwrap_or_default();
+        let parent = match cur.as_str() {
+            "dev" | "release" => break,
+            "test" => "dev".to_string(),
+            "bench" => "release".to_string(),
+            _ => get(&cur, "inherits").ok_or_else(|| format!("profile `{cur}` is not defined or has no `inherits`"))?,
+        };
+        if chain.contains(&parent) {
+            return Err(format!("profile `{name}` inherits in a cycle: {} -> {parent}", chain.join(" -> ")));
         }
-        match get(&cur, "inherits") {
-            Some(parent) if parent != cur => cur = parent,
-            _ => break,
-        }
+        chain.push(parent);
     }
-    let base_release = matches!(cur.as_str(), "release" | "bench");
-    ProfileFlags {
-        panic_abort: panic_abort.unwrap_or(false),
-        overflow_checks: overflow.unwrap_or(!base_release),
-        debug_assertions: debug_assertions.unwrap_or(!base_release),
-    }
+    let release = chain.last().is_some_and(|p| p == "release");
+    let lookup = |key: &str| chain.iter().find_map(|p| get(p, key));
+    Ok(CargoProfile {
+        flags: ProfileFlags {
+            panic_abort: lookup("panic").map_or(false, |v| v == "abort"),
+            overflow_checks: lookup("overflow-checks").map_or(!release, |v| v == "true"),
+            debug_assertions: lookup("debug-assertions").map_or(!release, |v| v == "true"),
+        },
+        opt_level: lookup("opt-level").unwrap_or_else(|| if release { "3" } else { "0" }.into()),
+    })
 }
 
 /// Reads package name, package version, and `[[bin]]` tables from manifest
@@ -1564,14 +1583,13 @@ mod tests {
             "/tmp/x/dist",
         ]));
         match inv {
-            Some(Invocation::ReleaseCc { reqs, overflow_note }) => {
+            Some(Invocation::ReleaseCc { reqs: Ok(reqs) }) => {
                 assert_eq!(reqs.len(), 2);
                 assert!(reqs.iter().all(|r| r.cc && matches!(r.cmd, Cmd::Build)));
                 assert_eq!(reqs[0].session.target_triple, "x86_64-unknown-linux-musl");
                 assert_eq!(reqs[0].session.features, ["noembed"]);
                 assert_eq!(reqs[1].out, PathBuf::from("/tmp/x/dist/aarch64-unknown-linux-musl/main"));
-                assert!(overflow_note, "the release base turns overflow checks off");
-                assert!(reqs[0].session.profile.overflow_checks, "checks stay on in the build itself");
+                assert!(!reqs[0].session.profile.overflow_checks, "the release base turns overflow checks off");
                 assert!(!reqs[0].session.profile.debug_assertions, "release profile");
             }
             _ => panic!("not a release-cc invocation"),
@@ -1707,5 +1725,44 @@ mod tests {
         std::fs::write(dir.join("m/.cargo/config.toml"), "[profile.dev]\npanic = \"unwind\"\n").unwrap();
         assert!(!dev_profile(&member).panic_abort, "config beats the manifest");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Release defaults, a custom profile's inherits chain, env over config over manifest,
+    /// and the errors for an undefined profile and an inherits cycle.
+    #[test]
+    fn cargo_profile_reads_any_profile() {
+        let dir = std::env::temp_dir().join(format!("lust-cargoprofile-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let m = dir.join("Cargo.toml");
+        std::fs::write(&m, "[package]\nname = \"p\"\n\n[profile.goport]\ninherits = \"release\"\nlto = \"fat\"\n\n[profile.chk]\ninherits = \"goport\"\noverflow-checks = true\n\n[profile.a]\ninherits = \"b\"\n[profile.b]\ninherits = \"a\"\n").unwrap();
+        let rel = cargo_profile(Some(&m), "release").unwrap();
+        assert_eq!(rel.flags, ProfileFlags { panic_abort: false, overflow_checks: false, debug_assertions: false });
+        assert_eq!(rel.opt_level, "3");
+        assert_eq!(cargo_profile(Some(&m), "goport").unwrap(), rel, "goport inherits release");
+        let chk = cargo_profile(Some(&m), "chk").unwrap();
+        assert!(chk.flags.overflow_checks && !chk.flags.debug_assertions, "a child key beats the inherited one");
+        let dev = cargo_profile(Some(&m), "dev").unwrap();
+        assert_eq!((dev.flags, dev.opt_level.as_str()), (ProfileFlags::DEV_UNWIND, "0"));
+        assert_eq!(cargo_profile(Some(&m), "test").unwrap(), dev, "test inherits dev");
+        assert!(cargo_profile(Some(&m), "nope").unwrap_err().contains("not defined"));
+        assert!(cargo_profile(Some(&m), "a").unwrap_err().contains("cycle"));
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::write(dir.join(".cargo/config.toml"), "[profile.release]\nopt-level = 2\npanic = \"abort\"\n").unwrap();
+        let g = cargo_profile(Some(&m), "goport").unwrap();
+        assert!(g.flags.panic_abort && g.opt_level == "2", "config of the inherited profile applies");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-C overflow-checks` and `-C debug-assertions` set the session profile; a bad value
+    /// or a release build with them is a usage error.
+    #[test]
+    fn rustc_profile_flags() {
+        let p = compile_req(&["build", "x.rs", "-C", "overflow-checks=off", "-C", "debug-assertions=no"]).session.profile;
+        assert!(!p.overflow_checks && !p.debug_assertions);
+        let p = compile_req(&["build", "x.rs", "-C", "overflow-checks=on"]).session.profile;
+        assert!(p.overflow_checks && p.debug_assertions);
+        assert!(parse_args(&args(&["build", "x.rs", "-C", "overflow-checks=maybe"])).is_none());
+        assert!(parse_args(&args(&["build", "x.rs", "--release", "-C", "overflow-checks=off"])).is_none());
     }
 }

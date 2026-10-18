@@ -127,10 +127,11 @@ fn main() {
         }
         // The release driver: one cold compile per target, in this process,
         // in order. A failed target stops the run with its code.
-        Some(Invocation::ReleaseCc { reqs, overflow_note }) => {
-            if overflow_note {
-                eprintln!("lust: note: the profile turns overflow checks off; lust builds keep them on for now");
-            }
+        Some(Invocation::ReleaseCc { reqs }) => {
+            let reqs = reqs.unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2)
+            });
             let mut code = 0;
             for req in &reqs {
                 let triple = if req.session.target_triple.is_empty() { protocol::host_triple() } else { &req.session.target_triple };
