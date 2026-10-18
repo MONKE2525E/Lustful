@@ -222,6 +222,9 @@ pub(crate) struct Front {
     pub(crate) std_plan: Option<crate::stdload::StdPlan>,
     /// The patch oracle's state (`item_oracle.rs`; unused when it is off).
     pub(crate) oracle: std::sync::Mutex<super::item_oracle::State>,
+    /// The last full resolve's module dependency record (`LUST_B3_OBSERVE=1`,
+    /// resolve/mdr.rs), which the next full resolve compares with.
+    pub(crate) mdr: Option<crate::resolve::mdr::Mdr>,
 }
 
 pub(crate) struct Chunk {
@@ -467,6 +470,7 @@ impl Session {
                 last_check: None,
                 std_plan: None,
                 oracle: Default::default(),
+                mdr: None,
             },
             caches: Caches {
                 ok: Vec::new(),

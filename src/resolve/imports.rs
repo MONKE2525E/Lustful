@@ -1076,6 +1076,7 @@ impl ResolvedTables {
     /// One name's binding, without prelude or flat-name fallback. This is
     /// the raw table read; `Program::binding` layers the fallbacks.
     pub fn lookup(&self, module: ModuleId, ns: Namespace, name: Sym) -> Option<&BindState> {
+        crate::resolve::mdr::read_key(module, ns_index(ns) as u8, name);
         self.maps.get(module.0 as usize).and_then(|m| m[ns_index(ns)].get(&name))
     }
 
@@ -1712,6 +1713,7 @@ impl ResolvedTables {
         let (m, false) = self.std_module_at(i, *seg, interner)? else { return None };
         let mut items = Vec::new();
         for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+            crate::resolve::mdr::read(m);
             for &name in self.maps[m.0 as usize][ns_index(ns)].keys() {
                 let full = [interner.get(path[0]), interner.get(*seg), interner.get(name)];
                 if crate::resolve::stdpaths::std_has(&full).is_some() {
@@ -1743,6 +1745,7 @@ impl ResolvedTables {
         let mut full: Vec<&str> = path.iter().map(|s| interner.get(*s)).collect();
         let mut items = Vec::new();
         for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+            crate::resolve::mdr::read(m);
             for &name in self.maps[m.0 as usize][ns_index(ns)].keys() {
                 full.push(interner.get(name));
                 if crate::resolve::stdpaths::std_has(&full).is_some() {

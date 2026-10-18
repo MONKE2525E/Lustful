@@ -125,6 +125,8 @@ pub struct ResolvedCrate {
     /// (cached per file in `ResolveCache`). It is equal to a scan of
     /// the merged `ast`; the driver uses it instead of rescanning.
     pub scans: crate::driver::ast_hash::AstScans,
+    /// The module dependency record, under `LUST_B3_OBSERVE=1` (resolve/mdr.rs).
+    pub mdr: Option<crate::resolve::mdr::Mdr>,
 }
 
 /// A failed resolution: the source map and combined text for rendering,
@@ -946,6 +948,8 @@ struct FinalChunk {
     /// every top-level fn (collect's order).
     scan_bodies: Vec<(u64, Vec<Sym>)>,
     nested_bodies: Vec<(u64, Vec<Sym>)>,
+    /// What the rewrite read, when an observed resolve made it (resolve/mdr.rs).
+    reads: Option<crate::resolve::mdr::FileReads>,
 }
 
 /// True when a file's expansion can read data outside its own text
@@ -1380,6 +1384,8 @@ struct CrateOut {
     /// Nested fn body scans of this crate; the workspace wrapper
     /// appends them after every crate's top-level bodies.
     nested_bodies: Vec<(u64, Vec<crate::intern::Sym>)>,
+    /// This crate's share of the module dependency record (resolve/mdr.rs).
+    mdr: Option<crate::resolve::mdr::CratePart>,
 }
 
 /// One crate's failed resolution inside a session.
@@ -1749,6 +1755,7 @@ pub fn resolve_crate_with(
         _ => std_asks = std_asks.or(asks),
     };
     let mut chunks: Vec<Ast> = Vec::new();
+    let mut mdr_parts: Vec<crate::resolve::mdr::CratePart> = Vec::new();
     let mut fn_lines: Vec<u32> = Vec::new();
     let mut body_hashes: Vec<u64> = Vec::new();
     let mut nested_lines: Vec<u32> = Vec::new();
@@ -1811,6 +1818,7 @@ pub fn resolve_crate_with(
                     structure_hash = h.finish();
                 }
                 tables.fn_module.extend(out.fn_module);
+                mdr_parts.extend(out.mdr);
                 expand_deps.extend(out.expand_deps);
                 scan_items.extend(out.scans.items);
                 scan_bodies.extend(out.scans.bodies);
@@ -1839,7 +1847,8 @@ pub fn resolve_crate_with(
     let ast = Ast::concat(chunks);
     scan_bodies.extend(nested_scan_bodies);
     let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, std_asks, platform_asks, expand_deps, timings, scans })
+    let mdr = crate::resolve::mdr::on().then(|| crate::resolve::mdr::build(&tables, &map, mdr_parts));
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, std_asks, platform_asks, expand_deps, timings, scans, mdr })
 }
 
 /// Creates (or reuses) the job for one source dependency, recursively.
@@ -3660,6 +3669,7 @@ fn resolve_one(
             tables.std_globs.push((imp.module, path.clone()));
         }
     }
+    let mdr_imports = crate::resolve::mdr::on().then(|| crate::resolve::mdr::imports_part(tables, &imports, interner));
     if !inner_diags.is_empty() {
         return Err(OneError { diags: inner_diags, seen, std_asks });
     }
@@ -3693,6 +3703,8 @@ fn resolve_one(
     // compiler's pool; diagnostics merge back in work order. Each work
     // sits behind its own lock, taken once, so one task can own it
     // mutably. A work whose final chunk is cached is skipped.
+    let rewritten = final_hits.iter().filter(|h| h.is_none()).count();
+    let mut rw_reads: Vec<Option<crate::resolve::mdr::FileReads>> = vec![None; works.len()];
     let rw_diags: Vec<Diag> = {
         let tables: &ResolvedTables = tables;
         let local_names = tables.local_named_set();
@@ -3702,6 +3714,8 @@ fn resolve_one(
             .filter(|(fi, _)| final_hits[*fi].is_none())
             .map(|(fi, w)| (fi, std::sync::Mutex::new(w)))
             .collect();
+        // An observed resolve records what each file's rewrite reads.
+        crate::resolve::mdr::recording(crate::resolve::mdr::on());
         let per_work = par_map(&cells, |(fi, cell)| {
             let mut w = cell.lock().unwrap();
             let module = w.module;
@@ -3715,10 +3729,17 @@ fn resolve_one(
                 std_splice_lo: input.std_splice_lo,
                 gen_floor: 0,
             };
+            crate::resolve::mdr::begin();
             rw.file_items(&mut w.ast, *fi, module, &[]);
-            rw.diags
+            (*fi, rw.diags, crate::resolve::mdr::end())
         });
-        per_work.into_iter().flatten().collect()
+        crate::resolve::mdr::recording(false);
+        let mut diags = Vec::new();
+        for (fi, d, reads) in per_work {
+            diags.extend(d);
+            rw_reads[fi] = reads;
+        }
+        diags
     };
     if !rw_diags.is_empty() {
         return Err(OneError { diags: rw_diags, seen, std_asks });
@@ -3752,6 +3773,7 @@ fn resolve_one(
         /// later segments of a file.
         structure: Option<u64>,
         scan: Option<crate::driver::ast_hash::AstScans>,
+        reads: Option<crate::resolve::mdr::FileReads>,
     }
     // Module/import structure per file, hashed before flattening drops
     // it: the file path, then its `mod`, `use`, and `extern crate`
@@ -3791,6 +3813,7 @@ fn resolve_one(
                     items: c.scan_items,
                     bodies: c.scan_bodies.into_iter().chain(c.nested_bodies).collect(),
                 }),
+                reads: c.reads,
             });
             continue;
         }
@@ -3848,6 +3871,7 @@ fn resolve_one(
             nested_module_paths: n_paths,
             structure,
             scan: None,
+            reads: rw_reads[fi].take(),
         });
     }
     lap!("resolve: flatten");
@@ -3886,9 +3910,16 @@ fn resolve_one(
                 scan_items: scan.items.clone(),
                 scan_bodies: scan.bodies[..top].to_vec(),
                 nested_bodies: scan.bodies[top..].to_vec(),
+                reads: pd.reads.clone(),
             },
         );
     }
+    let mdr = mdr_imports.map(|(uses, edges)| crate::resolve::mdr::CratePart {
+        uses,
+        edges,
+        files: pendings.iter().map(|pd| crate::resolve::mdr::FileRec { key: pd.key.clone(), text: pd.text_hash, reads: pd.reads.clone() }).collect(),
+        rewritten,
+    });
     // Assemble the crate outputs in file order. Module paths are
     // per-crate (every crate root has the empty path), so the map
     // holds only this job's crate: in a workspace session the other
@@ -3971,6 +4002,7 @@ fn resolve_one(
         timings,
         scans,
         nested_bodies,
+        mdr,
     })
 }
 
@@ -5334,6 +5366,13 @@ struct Rewrite<'a> {
 }
 
 impl Rewrite<'_> {
+    /// The namespaces some module defines `name` in (`local_names`), noted
+    /// as a read of the crate-wide set (resolve/mdr.rs).
+    fn local_name(&self, name: Sym) -> Option<u8> {
+        crate::resolve::mdr::read_name(name);
+        self.local_names.get(&name).copied()
+    }
+
     /// Rewrites one file's top-level items (recursing into inline mods).
     fn file_items(&mut self, ast: &mut Ast, fi: usize, module: ModuleId, prefix: &[Sym]) {
         let mut items = std::mem::take(&mut ast.items);
@@ -5882,6 +5921,7 @@ impl Rewrite<'_> {
     /// module-tables path and the frame-binding path).
     fn glob_from_module(&mut self, ast: &mut Ast, src: ModuleId, module: ModuleId, scopes: &mut [Frame], span: Span) {
         let mut entries = Vec::new();
+        crate::resolve::mdr::read(src);
         for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
             for (name, state) in &self.tables.maps[src.0 as usize][ns_index(ns)] {
                 match state {
@@ -6352,7 +6392,7 @@ impl Rewrite<'_> {
             // imports: rewrite it to the full std path (W-THREADS).
             if res == PathRes::Absent
                 && let Some(&first) = names.first()
-                && !self.local_names.contains_key(&first)
+                && self.local_name(first).is_none()
                 && let Some(path) = self.tables.std_sync_glob_path(module, self.interner.get(first), self.interner)
             {
                 let mut out: Vec<PathSeg> = path.iter().map(|s| PathSeg::plain(*s)).collect();
@@ -6370,7 +6410,7 @@ impl Rewrite<'_> {
             if res == PathRes::Absent
                 && let Some(&first) = names.first()
                 && crate::ty::lang::needs_std_use(self.interner.get(first))
-                && !self.local_names.contains_key(&first)
+                && self.local_name(first).is_none()
                 && !self.tables.std_glob_imports(module, self.interner.get(first), self.interner)
             {
                 let n = self.interner.get(first).to_string();
@@ -6393,7 +6433,7 @@ impl Rewrite<'_> {
                 self.diags.push(d);
                 return;
             }
-            if res == PathRes::Absent && names.first().is_some_and(|n| self.local_names.contains_key(n)) {
+            if res == PathRes::Absent && names.first().is_some_and(|&n| self.local_name(n).is_some()) {
                 // A bare path in a type position may name a const
                 // item: a const generic argument the parser read as
                 // a type (`Arr<N>`). Rust allows only a
@@ -6416,7 +6456,7 @@ impl Rewrite<'_> {
                 // next to a `static T` (value namespace) stays a param
                 // (collect resolves params; W-STD-C).
                 let asked = if names.len() > 1 { Namespace::Type } else { ns };
-                let in_ns = names.first().and_then(|n| self.local_names.get(n)).is_some_and(|m| m & (1 << ns_index(asked)) != 0);
+                let in_ns = names.first().and_then(|&n| self.local_name(n)).is_some_and(|m| m & (1 << ns_index(asked)) != 0);
                 if !in_ns {
                     self.apply(segs, res, span, module, ns, scopes);
                     return;

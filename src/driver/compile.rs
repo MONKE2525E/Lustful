@@ -2313,9 +2313,17 @@ fn resolved_setup(
         }
     };
     let worklist::ResolvedCrate {
-        ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, scans, ..
+        ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, scans, mdr, ..
     } =
         resolved;
+    // B3 step 2 (`LUST_B3_OBSERVE=1`): what a warm resolve would have had to
+    // redo since the last full resolve (resolve/mdr.rs).
+    if let Some(m) = mdr {
+        if let Some(prev) = &front.mdr {
+            eprintln!("{}", crate::resolve::mdr::observe(prev, &m).line());
+        }
+        front.mdr = Some(m);
+    }
     t.lap_parts(resolve_timings, "resolve: other");
     let fn_count = fn_lines.len();
     // Dropping the previous merged Ast walks every node string and
