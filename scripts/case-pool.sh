@@ -148,6 +148,14 @@ rustc_oracle() {
 # unsupported, and seen.
 run_all() {
   local fn=$1; shift
+  # tidy: once a case's status is ok or unsupported (and no solo rerun is due), its build
+  # files go and only its log and status stay (a full release difftest kept ~5 MB a case, 12 GB
+  # of the shared /tmp). A failing case keeps everything.
+  tidy() {
+    case "$(cat st 2>/dev/null)" in
+      ok | unsupported) [ -f .lust-timeout ] || find . -mindepth 1 -maxdepth 1 ! -name log ! -name log.retry ! -name st -exec rm -rf {} + ;;
+    esac
+  }
   local f name i=0 m=0 running=0 st
   local names=() files=()
   rm -rf "$work/c"
@@ -164,6 +172,7 @@ run_all() {
       cd "$work/c/$i" || exit 1
       export LUST_DAEMON_SOCKET=$PWD/no-daemon.sock LUST_CACHE_DIR=$PWD/cache
       "$fn" "$name" "$f"
+      tidy
     ) >"$work/c/$i/log" 2>&1 &
     names+=("$name"); files+=("$f"); i=$((i + 1)); running=$((running + 1))
   done
@@ -177,6 +186,7 @@ run_all() {
       export LUST_DAEMON_SOCKET=$PWD/no-daemon.sock LUST_CACHE_DIR=$PWD/cache
       case_timeout=$retry_timeout
       "$fn" "${names[$i]}" "${files[$i]}"
+      tidy
     ) >"$work/c/$i/log.retry" 2>&1
     if [ -f "$work/c/$i/.lust-timeout" ]; then
       echo "FAIL ${names[$i]}: HANG lust timed out alone at ${retry_timeout}s (first at ${case_timeout}s under load)" >"$work/c/$i/log"
