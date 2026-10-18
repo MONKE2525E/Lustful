@@ -1243,11 +1243,13 @@ fn scalar_lit(bits: u128, size: u64, signed: bool) -> String {
 /// a struct DAG whose fields share sub-types would otherwise cost one walk
 /// per path.
 ///
-/// Every Adt laid out on the way is a `Layout` read of the body being made
-/// (`Program::note_adt_layout`): a body may hold the type only behind a
-/// pointer, which its type reads do not cover
+/// In release C, every Adt laid out on the way is a `Layout` read of the
+/// body being made (`Program::note_adt_layout`): a body may hold the type
+/// only behind a pointer, which its type reads do not cover
 /// (`Program::record_type_layout_reads`), while its C reads a field at an
-/// offset or its LLVM IR gives the pointee's size (`dereferenceable`).
+/// offset or its LLVM IR gives the pointee's size (`dereferenceable`). Dev
+/// C names fields and types, so its body text holds no such layout and
+/// takes no read (a warm dev build checks fewer bodies again).
 fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
     let tag = LAYOUT_PHASE.with(std::cell::Cell::get);
     if tag != 0
@@ -1445,7 +1447,9 @@ fn c_layout_walk(p: &Program, t: &CTy) -> Option<Layout> {
                 if !seen.on.insert(*a) {
                     return None;
                 }
-                p.note_adt_layout(*a);
+                if names::release() {
+                    p.note_adt_layout(*a);
+                }
                 let adt = p.adt(*a);
                 let r = if adt.is_enum {
                     let mut variants = Vec::with_capacity(adt.variants.len());
