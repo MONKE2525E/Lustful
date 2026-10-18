@@ -213,6 +213,16 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(2)
             });
+            // With a front image, every target's session comes from it
+            // (in the re-executed image process).
+            if let Some(dir) = image::state_dir() {
+                if image::arena_on() {
+                    let resps = image_run(&reqs, &dir);
+                    resps.iter().for_each(|r| eprint!("{}", r.stderr));
+                    std::process::exit(resps.iter().map(|r| r.code).find(|&c| c != 0).unwrap_or(0));
+                }
+                eprintln!("lust: front state off: {}", image::reexec(&dir));
+            }
             let mut code = 0;
             for req in &reqs {
                 let triple = if req.session.target_triple.is_empty() { protocol::host_triple() } else { &req.session.target_triple };

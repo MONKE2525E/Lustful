@@ -4468,7 +4468,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, super::release_c::unit_bytes())),
         None => Vec::new(),
     };
-    let units: Vec<(PathBuf, String)> = match &rgroups {
+    let mut units: Vec<(PathBuf, String)> = match &rgroups {
         None => par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay))),
         Some(rg) => {
             let mut jobs: Vec<usize> = vec![0, 1, 2, 3, LOC_UNIT];
@@ -4528,31 +4528,35 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     t.lap("assemble C units (par)");
     // The release driver (src/cc.rs): the same self-contained unit set
     // goes to the external C compiler for the session target, and the
-    // tcc path below never runs. Cold one-shot sessions only (the
-    // driver builds them); a warm session would hold overlays this
-    // full-unit rebuild does not model.
+    // tcc path below never runs. A cold session builds every unit; a
+    // persistent one (a front image, src/image.rs) keeps its groups
+    // frozen, so a clean unit's C is the same as last time and its object
+    // comes from the cache. Overlays do not exist here: every build emits
+    // the base form of each unit.
     if req.cc {
-        if caches.persistent {
-            return Response { stderr: "error: a release (cc) build needs a cold session\n".into(), code: 3, ..Default::default() };
-        }
         let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
+        // Base-form units this build already made (all of them on a fresh
+        // base) are taken, not made again. Release C made all of its units above.
+        let mut made: FxMap<usize, String> = FxMap::default();
+        if rgroups.is_none() {
+            for (&(u, overlay), (_, c)) in todo.iter().zip(std::mem::take(&mut units)) {
+                if !overlay && u != 0 {
+                    made.insert(u, c);
+                }
+            }
+        }
         let built = crate::cc::spec_for(triple).and_then(|spec| {
             // Release C (`LUST_RELEASE_C=1`) already holds the content-addressed units.
             let mut all: Vec<(String, String)> = if rgroups.is_some() {
                 units.iter().map(|(o, c)| (o.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned()), c.clone())).collect()
             } else {
-                [0, 1, 2, 3, LOC_UNIT]
-                    .into_iter()
-                    .chain(fn_units.iter().copied())
-                    .map(|u| {
-                        let c = if u == 0 {
-                            cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize]))
-                        } else {
-                            gen_unit(u, false)
-                        };
-                        (format!("u{u}"), c)
-                    })
-                    .collect()
+                let order: Vec<usize> = [0, 1, 2, 3, LOC_UNIT].into_iter().chain(fn_units.iter().copied()).collect();
+                let fresh = par_map(&order, |&u| match u {
+                    0 => Some(cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize]))),
+                    u if made.contains_key(&u) => None,
+                    u => Some(gen_unit(u, false)),
+                });
+                order.iter().zip(fresh).map(|(&u, c)| (format!("u{u}"), c.or_else(|| made.remove(&u)).unwrap_or_default())).collect()
             };
             // Unwind tables: the C++ half of a panic (throw and catch), for the C++ driver.
             if program.unwind_tables {
@@ -4567,6 +4571,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         t.lap("cc compile + link");
         match built {
             Ok(summary) => {
+                // The emitted set is this session's base: the next build
+                // keeps these groups and emits only what changed.
+                caches.objects = Some(req.debug);
+                caches.overlays.clear();
+                caches.base_units = groups.len();
                 if req.timings {
                     let _ = writeln!(resp.stderr, "lust build {path}: ok (cc {triple}: {summary})");
                     t.render(&mut resp.stderr);
