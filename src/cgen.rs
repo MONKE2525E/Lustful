@@ -1062,9 +1062,6 @@ pub struct FnOut {
     pub ll: String,
     pub ll_decls: BTreeSet<String>,
     pub ll_c: String,
-    /// The LLVM backend: the C types of the fn's parameters and result, which its C ABI
-    /// wrapper and trampoline (all of `code`) name by value.
-    pub ll_sig: Vec<CTy>,
     /// The LLVM backend: the fn's size for cross-unit inlining (`ll::LlFn::cost`).
     pub ll_cost: u32,
     /// The fn's `#[inline]` attribute, which release C inline definitions follow.
@@ -2179,15 +2176,9 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     let (code, glue) = (g.out, g.glue);
     let (used, externs) = slots.into_used();
     named.retain(|t| !types.contains(t));
-    let ll_sig = if llfn.is_some() {
-        let info = p.fn_info(body.fn_id);
-        info.params.iter().chain(std::iter::once(&info.ret)).map(|&t| cty(&p.tys, t)).collect()
-    } else {
-        Vec::new()
-    };
     let (ll, ll_decls, ll_c, ll_cost) = llfn.map(|f| (f.def, f.decls, f.helpers, f.cost)).unwrap_or_default();
     let inline = if release { inline_attr(p, body.fn_id) } else { InlineAttr::None };
-    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_sig, ll_cost, inline }
+    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, inline }
 }
 
 /// `f`'s `#[inline]` attribute (an instance has its template's). A closure body counts as
