@@ -203,7 +203,7 @@ pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
 pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     let mut c = unit_header();
     let mut types = HashSet::new();
-    for st in &p.statics {
+    for (_, st) in p.statics.iter().enumerate().filter(|&(i, _)| p.static_live(i)) {
         let t = cty(&p.tys, st.ty);
         collect_types(&t, &mut types);
         collect_promoted(p, &st.value, &t, &mut types);

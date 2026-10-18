@@ -9066,7 +9066,7 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
         c.push_str(noreturn_decls());
     }
     let mut types = HashSet::new();
-    for st in &p.statics {
+    for (_, st) in p.statics.iter().enumerate().filter(|&(i, _)| p.static_live(i)) {
         let t = cty(&p.tys, st.ty);
         collect_types(&t, &mut types);
         collect_promoted(p, &st.value, &t, &mut types);
@@ -9515,7 +9515,7 @@ fn static_defs(p: &Program, slots: &[u32]) -> String {
     let mut pre = static_decls(p);
     let mut out = String::new();
     let mut cx = kconst::StaticCx::default();
-    for (i, st) in p.statics.iter().enumerate() {
+    for (i, st) in p.statics.iter().enumerate().filter(|&(i, _)| p.static_live(i)) {
         let ct = cty(&p.tys, st.ty);
         let init = const_init(p, &st.value, &ct, &mut pre, &mut cx, slots, Some(&static_pos(p, i as u32)));
         let _ = writeln!(out, "{} {} = {init};", ctype(&ct), static_sym(p, i as u32));
@@ -9547,7 +9547,7 @@ fn static_decls(p: &Program) -> String {
 fn static_decls_for(p: &Program, keep: &HashSet<usize>) -> String {
     let mut out = String::new();
     for (i, st) in p.statics.iter().enumerate() {
-        if keep.contains(&i) {
+        if keep.contains(&i) && p.static_live(i) {
             let _ = writeln!(out, "extern {} {};", ctype(&cty(&p.tys, st.ty)), static_sym(p, i as u32));
         }
     }
@@ -9574,7 +9574,7 @@ fn used_statics<'a>(p: &Program, texts: impl Iterator<Item = &'a str>) -> HashSe
             }
         }
     }
-    (0..p.statics.len()).filter(|&i| syms.contains(static_sym(p, i as u32).as_str())).collect()
+    (0..p.statics.len()).filter(|&i| p.static_live(i) && syms.contains(static_sym(p, i as u32).as_str())).collect()
 }
 
 /// Release C inline definitions (`inline_callees`): the largest fn or glue code a unit

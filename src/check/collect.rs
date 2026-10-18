@@ -586,6 +586,12 @@ impl Program {
     pub fn static_by_def(&self, def: DefId) -> Option<u32> {
         self.static_defs.iter().position(|&d| d == def).map(|i| i as u32)
     }
+
+    /// False for a hole of the statics table: the place of a static that
+    /// went (`stable_ranks`), an inert placeholder row with no C.
+    pub fn static_live(&self, i: usize) -> bool {
+        self.static_defs.get(i).is_some_and(|d| d.hash.0 != 0)
+    }
     /// The shipped crate a span's source belongs to, if any. Only spans
     /// in spliced shipped source, or in a file of a shipped adapter
     /// crate (ARCH 3.6), answer; every user span gets None.
@@ -3339,9 +3345,12 @@ impl InstOrder {
     }
 }
 
-/// The rank of each hash among `hashes`, by position in `order`
-/// after appending unseen hashes in hash order. The ranks are
-/// dense over `hashes`. `hashes` must hold each def once.
+/// The rank of each hash among `hashes`: its place in `order` after
+/// appending unseen hashes in hash order. Places are never reused: a def
+/// that goes leaves a hole (an inert placeholder row of the Adt or static
+/// table) and moves no other def's index, so the caches that name defs by
+/// index stay valid. The driver restarts an order whose holes pile up
+/// (compile.rs `def_order_sparse`). `hashes` must hold each def once.
 pub(crate) fn stable_ranks(order: &mut Vec<crate::def::DefPathHash>, hashes: &[crate::def::DefPathHash]) -> Vec<u32> {
     let pos: std::collections::HashMap<crate::def::DefPathHash, usize> = order.iter().enumerate().map(|(i, h)| (*h, i)).collect();
     let mut unseen: Vec<crate::def::DefPathHash> = hashes.iter().copied().filter(|h| !pos.contains_key(h)).collect();
@@ -3355,23 +3364,14 @@ pub(crate) fn stable_ranks(order: &mut Vec<crate::def::DefPathHash>, hashes: &[c
 /// (the driver predicts this compile's indices before collect runs
 /// to decide whether cached output still applies).
 pub(crate) fn stable_ranks_preview(order: &[crate::def::DefPathHash], hashes: &[crate::def::DefPathHash]) -> Vec<u32> {
-    let mut extended: Vec<crate::def::DefPathHash> = order.to_vec();
-    let mut pos: std::collections::HashMap<crate::def::DefPathHash, usize> = extended.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+    let mut pos: std::collections::HashMap<crate::def::DefPathHash, usize> = order.iter().enumerate().map(|(i, h)| (*h, i)).collect();
     let mut unseen: Vec<crate::def::DefPathHash> = hashes.iter().copied().filter(|h| !pos.contains_key(h)).collect();
     unseen.sort_by_key(|h| h.0);
     unseen.dedup();
-    for h in unseen {
-        pos.insert(h, extended.len());
-        extended.push(h);
+    for (k, h) in unseen.into_iter().enumerate() {
+        pos.insert(h, order.len() + k);
     }
-    let mut by_pos: Vec<(usize, crate::def::DefPathHash)> = hashes.iter().map(|h| (pos[h], *h)).collect();
-    by_pos.sort_by_key(|(p, _)| *p);
-    by_pos.dedup_by_key(|(_, h)| *h);
-    let mut rank: std::collections::HashMap<crate::def::DefPathHash, u32> = std::collections::HashMap::default();
-    for (r, (_, h)) in by_pos.into_iter().enumerate() {
-        rank.insert(h, r as u32);
-    }
-    hashes.iter().map(|h| rank[h]).collect()
+    hashes.iter().map(|h| pos[h] as u32).collect()
 }
 
 /// Builds the program tables. `crate_ids` names the crate for stable def
@@ -3690,7 +3690,10 @@ pub fn collect_reuse(
     let mut adt_id_of_item: Vec<Option<AdtId>> = vec![None; ast.items.len()];
     {
         let blank_name = interner.intern("");
-        for _ in 0..adt_srcs.len() {
+        // A row per place up to the last one used: the places of Adts that
+        // went are inert placeholder rows (`stable_ranks`).
+        let rows = adt_ranks.iter().map(|&r| r as usize + 1).max().unwrap_or(0);
+        for _ in 0..rows {
             p.adts.push(AdtDef {
                 name: blank_name,
                 is_enum: false,
@@ -6558,7 +6561,7 @@ fn install_const_items(
                     let def = DefId { krate: p.krate, hash };
                     p.defs.insert(def, DefData::skeleton(DefsKind::Static, None, name, Vis::Priv, item.span));
                     if p.static_defs.len() <= item.static_idx as usize {
-                        p.static_defs.resize(item.static_idx as usize + 1, def);
+                        p.static_defs.resize(item.static_idx as usize + 1, DefId { krate: p.krate, hash: crate::def::DefPathHash(0) });
                     }
                     p.static_defs[item.static_idx as usize] = def;
                     p.static_names.insert(name, item.static_idx);

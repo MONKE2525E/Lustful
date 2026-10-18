@@ -148,7 +148,8 @@ impl Digest {
             }
         }
         let consts = p.const_defs.iter().zip(p.consts.iter().map(|c| ("const", c.name)));
-        let statics = p.static_defs.iter().zip(p.statics.iter().map(|s| ("static", s.name)));
+        // A hole of the statics table (`Program::static_live`) is no def.
+        let statics = p.static_defs.iter().zip(p.statics.iter().map(|s| ("static", s.name))).filter(|(d, _)| d.hash.0 != 0);
         for (&def, (kind, name)) in consts.chain(statics) {
             d.names.entry(def).or_insert_with(|| format!("{kind} {}", p.interner.get(name)));
             d.defs.insert(def, DefFacts { sig: sig(def), layout: None, class: None });

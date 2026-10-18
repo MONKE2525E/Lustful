@@ -1278,9 +1278,11 @@ fn fn_bodies(ast: &Ast, fn_loc: &[(usize, Option<usize>)], keys: &[FnKey]) -> Ve
     fn_loc.iter().zip(keys).map(|(&(item, sub), k)| (fn_def_at(ast, item, sub).body, k.disk.hash)).collect()
 }
 
-/// True when every def in `prev` is present in `new` at the same index.
+/// True when every def of `prev` that `new` still has keeps its index. A
+/// removed def leaves a hole (`collect::stable_ranks`): the bodies that
+/// named it read it (a failed lookup now), and nothing else moves.
 fn ids_kept(prev: &FxMap<crate::def::DefPathHash, u32>, new: &FxMap<crate::def::DefPathHash, u32>) -> bool {
-    prev.iter().all(|(h, id)| new.get(h) == Some(id))
+    prev.iter().all(|(h, id)| new.get(h).is_none_or(|n| n == id))
 }
 
 /// True when a disk-loaded `order` names none of this parse's defs:
@@ -1298,6 +1300,13 @@ fn def_order_stale(
     let current_any = !adt_ids.is_empty() || !static_ids.is_empty();
     let overlap = order.adts.iter().any(|h| adt_ids.contains_key(h)) || order.statics.iter().any(|h| static_ids.contains_key(h));
     loaded_any && current_any && !overlap
+}
+
+/// True when the places of `ids` (Adt or static indices of one parse)
+/// hold more than twice as many holes as defs, plus some slack.
+fn def_order_sparse(ids: &FxMap<crate::def::DefPathHash, u32>) -> bool {
+    let rows = ids.values().map(|&i| i as usize + 1).max().unwrap_or(0);
+    rows > 3 * ids.len() + 64
 }
 
 /// True when the non-fn item hash sequence differs between two item
@@ -1376,10 +1385,11 @@ fn slot_update(
         let fns = fn_bodies(&front.ast, &front.fn_loc, keys.as_deref().unwrap_or(&[]));
         // Cached output stays reusable in full mode when every Adt and
         // static of the last parse keeps its session-local index in
-        // this parse (pure additions append at the end of the session
-        // order; body items rank by identity like any other). (Instance
-        // Adt ids of a generic program are session places; a build
-        // regenerates C when they move.)
+        // this parse: an added def takes a new place at the end of the
+        // session order, a removed one leaves a hole, and body items rank
+        // by identity like any other. (Instance Adt ids of a generic
+        // program are session places; a build regenerates C when they
+        // move.)
         let (mut adt_ids, mut static_ids) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order, &fns);
         // A def order loaded from disk is trusted only when it names at
         // least one def of this parse (`def_order_stale`).
@@ -1390,6 +1400,14 @@ fn slot_update(
                 front.def_order_stored = 0;
                 (adt_ids, static_ids) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order, &fns);
             }
+        }
+        // Removed defs leave holes (`collect::stable_ranks`); once they
+        // pile up, the order restarts dense: every index moves once, and
+        // the caches reset (`ids_kept` below).
+        if def_order_sparse(&adt_ids) || def_order_sparse(&static_ids) {
+            front.def_order = collect::DefOrder::default();
+            front.def_order_stored = 0;
+            (adt_ids, static_ids) = predicted_def_ids(&front.ast, &front.interner, crate_ids.stable, &front.def_order, &fns);
         }
         let ids_stable = had_env && ids_kept(&front.prev_adt_ids, &adt_ids) && ids_kept(&front.prev_static_ids, &static_ids);
         front.prev_adt_ids = adt_ids;
@@ -5226,6 +5244,13 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
         assert_eq!(a1[2], a2[2], "Zed keeps its index");
         assert_eq!(s1[1], s2[1], "SM keeps its index");
         assert_eq!(s1[2], s2[2], "SZ keeps its index");
+
+        // A removed def leaves a hole: every other def keeps its index.
+        let (a3, s3) = collect_src("struct Alpha { x: i64 }\nstruct Zed { x: i64 }\nstatic SA: i64 = 3;\nstatic SZ: i64 = 1;\nfn main() {}\n", &mut order);
+        assert_eq!(a3[0], a2[0], "Alpha keeps its index after Mid goes");
+        assert_eq!(a3[2], a2[2], "Zed keeps its index after Mid goes");
+        assert_eq!(s3[0], s2[0], "SA keeps its index after SM goes");
+        assert_eq!(s3[2], s2[2], "SZ keeps its index after SM goes");
     }
 
     /// Instance Adt ids are session places (`collect::InstOrder`): a new
