@@ -793,12 +793,6 @@ fn collect_types(t: &CTy, out: &mut HashSet<CTy>) {
 }
 
 /// Named types that `t` holds by value, so their C definitions must come first.
-/// True when `t` behind a pointer needs only a forward declaration: a struct-typed C type
-/// (a fn pointer typedef has no forward form).
-fn pointee_is_struct(t: &CTy) -> bool {
-    matches!(t, CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::ArrayIter(..) | CTy::OptIter(..))
-}
-
 fn by_value_deps(t: &CTy, out: &mut Vec<CTy>) {
     match t {
         CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::Slice(_) | CTy::FnPtr(..) | CTy::RefCell(_) | CTy::ArrayIter(..) | CTy::OptIter(..) => {
@@ -1947,17 +1941,21 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     let mut named = HashSet::new();
     let release = names::release();
     for t in &g.local_cty {
-        match t {
-            // Release C: a plain pointer local names its pointee, and an `Rc` or `Arc`
-            // local its count block; a deref records what it opens (`place`), and so
-            // does a builtin (`call_value`).
-            CTy::Ref(e) | CTy::Ptr(e) if release && pointee_is_struct(e) => collect_types(e, &mut named),
-            CTy::Rc(_) | CTy::Weak(_) | CTy::Sync(crate::ty::sync::SyncTy::Arc | crate::ty::sync::SyncTy::ArcWeak, _) if release => collect_types(t, &mut named),
-            _ => collect_types(t, &mut types),
+        if release {
+            // Release C: a local needs defined only what it holds by value; what it
+            // points at (through `&`, `Box`, `Rc`, `Vec`, ...) it only names. A deref
+            // records what it opens (`place`), and so does a builtin (`call_value`).
+            let mut held = Vec::new();
+            by_value_deps(t, &mut held);
+            types.extend(held);
+            collect_types(t, &mut named);
+        } else {
+            collect_types(t, &mut types);
         }
     }
+    // Release C units call glue through prototypes, which only name their types.
     for (_, t) in &g.glue {
-        collect_types(t, &mut types);
+        collect_types(t, if release { &mut named } else { &mut types });
     }
     let (code, glue) = (g.out, g.glue);
     let (used, externs) = slots.into_used();
