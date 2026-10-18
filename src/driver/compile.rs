@@ -732,10 +732,31 @@ fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::R
     par_map(sets, |r| r.map(|r| r.iter().filter(|(k, stored)| shards[shard_of(k)].get(*k) != Some(*stored)).count()))
 }
 
+static NEXT_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// A fresh program generation (`Program::verified`, `Reads::verified`).
 fn next_verified() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    NEXT_VERIFIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The process-wide counters a session's stored marks order against
+/// (`next_verified`, the generic reuse stamp). A front image
+/// (src/image.rs) carries them, so a restored session's marks never
+/// collide with new ones.
+pub struct Stamps {
+    verified: u64,
+    reuse: u64,
+}
+
+impl Stamps {
+    pub fn now() -> Stamps {
+        Stamps { verified: NEXT_VERIFIED.load(std::sync::atomic::Ordering::Relaxed), reuse: super::gen_reuse::stamp_now() }
+    }
+    /// Moves both counters up to these values (never down).
+    pub fn restore(&self) {
+        NEXT_VERIFIED.fetch_max(self.verified, std::sync::atomic::Ordering::Relaxed);
+        super::gen_reuse::stamp_restore(self.reuse);
+    }
 }
 
 /// The keyed dirty walk after a header delta (Sol review 2 item 1), by
@@ -2211,7 +2232,7 @@ fn resolved_setup(
     if (old_ast.exprs.len() > 20_000 || old_kept.iter().any(Option::is_some)) && caches.persistent {
         // Nested token trees in the Ast drop recursively; use the
         // compiler stack size like every other compiler thread.
-        let _ = crate::pool::thread("lust-drop").spawn(move || drop((old_ast, old_kept)));
+        crate::pool::drop_detached("lust-drop", (old_ast, old_kept));
     }
     front.map = map.clone();
     front.src.clone_from(&root_text);

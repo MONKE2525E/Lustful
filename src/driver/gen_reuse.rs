@@ -953,6 +953,12 @@ pub(crate) fn stamp_now() -> u64 {
 
 static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Moves the stamp counter up to `v` (a front image's value, src/image.rs),
+/// so stamps stored in a restored session stay older than new ones.
+pub(crate) fn stamp_restore(v: u64) {
+    STAMP.fetch_max(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The two keys `GenReuse::gate` compares across collects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TraitKey {

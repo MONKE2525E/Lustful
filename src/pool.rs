@@ -74,6 +74,34 @@ pub fn thread(name: &str) -> std::thread::Builder {
     std::thread::Builder::new().name(name.into()).stack_size(STACK_SIZE)
 }
 
+/// Detached threads still running (`drop_detached`).
+static DETACHED: AtomicUsize = AtomicUsize::new(0);
+
+/// Drops `value` on a detached thread named `name` (large trees free off
+/// the request's path), or here when no thread starts. A front image save
+/// waits for these (`wait_detached`): they free heap blocks.
+pub fn drop_detached<T: Send + 'static>(name: &str, value: T) {
+    DETACHED.fetch_add(1, Ordering::AcqRel);
+    let done = || DETACHED.fetch_sub(1, Ordering::AcqRel);
+    if thread(name)
+        .spawn(move || {
+            drop(value);
+            done();
+        })
+        .is_err()
+    {
+        // The closure (and `value`) dropped with the failed spawn.
+        done();
+    }
+}
+
+/// Waits until every `drop_detached` thread has finished.
+pub fn wait_detached() {
+    while DETACHED.load(Ordering::Acquire) != 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 struct State {
     /// The job of the current phase. Its real lifetime is the `run` call
     /// that set it: `run` returns only after every worker that took it is

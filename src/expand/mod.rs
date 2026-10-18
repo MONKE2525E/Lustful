@@ -928,8 +928,8 @@ impl ExpansionCache {
                 }
             }
             self.bytes = left;
-            // When no thread starts, the closure (and `gone`) drops here.
-            let _ = std::thread::Builder::new().name("lust-expcache-free".into()).spawn(move || drop(gone));
+            // When no thread starts, `gone` drops here.
+            crate::pool::drop_detached("lust-expcache-free", gone);
         }
     }
 }

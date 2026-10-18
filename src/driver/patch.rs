@@ -540,6 +540,14 @@ pub(crate) struct KeptProgram {
 }
 
 impl PatchBase {
+    /// Joins the `local_names` side thread now (a front image save: no
+    /// thread may outlive the process that wrote the image).
+    pub(crate) fn settle(&mut self) {
+        if let Some(job) = self.local_names_job.take() {
+            self.local_names = job.join().ok();
+        }
+    }
+
     /// The cfg environment and crate name a body of `module`'s crate
     /// expands under alone, if it may (`PatchBase::expand`).
     fn expand_env(&self, module: crate::ty::defs::ModuleId) -> Option<&(crate::resolve::cfg::CfgEnv, String)> {

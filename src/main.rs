@@ -22,6 +22,7 @@ mod diag;
 mod driver;
 mod expand;
 mod explain;
+mod image;
 mod intern;
 mod ir;
 mod lexer;
@@ -46,7 +47,7 @@ mod ty;
 use protocol::Invocation;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: image::Alloc = image::Alloc;
 
 /// Deletes a one-shot session's object directory. A serial walk costs 3 to 6 ms on a cold
 /// build (one unlink per object and C file), so many files are unlinked in parallel on the
@@ -102,7 +103,87 @@ fn raise_stack_limit() {
 /// (470 KB) is even, and fmt40 (54 KB) and a trivial program lose.
 const BIG_FILE: u64 = 256 << 10;
 
+/// Builds `reqs` in order with a front image (`LUST_FRONT_STATE`,
+/// src/image.rs). The image holds one session per crate selection, as a
+/// daemon keeps them: a request takes its own session from the image, or
+/// a new persistent one. A release-driver run (cc requests) stops at the
+/// first failed target. Then the save. Returns the answers; a compile
+/// panic discards the image (an oracle failure answers code 3, as in a
+/// daemon; any other panic resumes).
+fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Response> {
+    let t = std::time::Instant::now();
+    let (mut sessions, loaded) = match image::load(dir) {
+        Ok(roots) => {
+            let image::Roots { mut sessions, tables, stamps } = *roots;
+            diag::put_global_tables(tables);
+            stamps.restore();
+            sessions.iter_mut().for_each(|s| s.after_restore());
+            (sessions, Ok(()))
+        }
+        Err(why) => (Vec::new(), Err(why)),
+    };
+    let load_ms = t.elapsed().as_secs_f64() * 1e3;
+    // `--timings` or LUST_FRONT_STATE_VERBOSE=1 report each load and the
+    // save; a failed save is always reported.
+    let verbose = reqs.iter().any(|r| r.timings) || std::env::var_os("LUST_FRONT_STATE_VERBOSE").is_some_and(|v| v != "0");
+    let mut resps = Vec::new();
+    for req in reqs {
+        let found = sessions.iter().position(|s| s.key == req.session);
+        let how = match (&loaded, found) {
+            (Ok(()), Some(_)) => format!("restored generation {}", image::generation()),
+            (Ok(()), None) => "cold (the image has no session for this crate selection)".to_string(),
+            (Err(why), _) => format!("cold ({why})"),
+        };
+        let i = found.unwrap_or_else(|| {
+            let (a, _) = driver::cache::hash128(&[req.session.describe().as_bytes()], 0);
+            sessions.push(Box::new(driver::Session::new(dir.join(format!("obj-{a:016x}")), true, req.session.clone())));
+            sessions.len() - 1
+        });
+        if req.cc {
+            let triple = if req.session.target_triple.is_empty() { protocol::host_triple() } else { &req.session.target_triple };
+            eprintln!("lust: release build for {triple} -> {}", req.out.display());
+        }
+        let session = &mut sessions[i];
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, session))) {
+            Ok(mut resp) => {
+                if verbose {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(resp.stderr, "lust: front state {how} in {load_ms:.0} ms");
+                }
+                let stop = req.cc && resp.code != 0;
+                resps.push(resp);
+                if stop {
+                    break;
+                }
+            }
+            Err(payload) => {
+                // The next build must not start from a session this one broke.
+                image::discard(dir);
+                if let Some(line) = driver::oracle_failure(&*payload) {
+                    resps.push(driver::Response { stderr: format!("error: internal: {line}\n"), code: 3, ..Default::default() });
+                    return resps;
+                }
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+    sessions.iter_mut().for_each(|s| s.settle());
+    let roots = Box::new(image::Roots { sessions, tables: diag::take_global_tables(), stamps: driver::Stamps::now() });
+    let line = match image::save(dir, roots) {
+        Ok(line) if verbose => line + "\n",
+        Ok(_) => String::new(),
+        Err(e) => format!("lust: front state not saved: {e}\n"),
+    };
+    if let Some(last) = resps.last_mut() {
+        last.stderr.push_str(&line);
+    }
+    resps
+}
+
 fn main() {
+    // A re-executed image process (src/image.rs) runs with randomization
+    // off and an arena variable: its children get neither.
+    image::process_start();
     // Cargo runs lust-core as its RUSTC_WRAPPER during the feature probe.
     if let Some(code) = resolve::probe::wrapper_main() {
         std::process::exit(code);
@@ -156,6 +237,16 @@ fn main() {
             // in-memory state). `--emit-c` writes side files, so it always compiles. A `run`
             // request is also never cached: its response can be the program's own output and
             // exit code (an in-memory run writes no executable), not a build result.
+            // A front image build (src/image.rs): re-execute into an image
+            // process, or run as one.
+            if let Some(dir) = image::state_dir() {
+                if image::arena_on() {
+                    let resp = image_run(std::slice::from_ref(&req), &dir).pop().expect("one answer per request");
+                    protocol::finish(resp, run, &req.out, &args);
+                }
+                let why = image::reexec(&dir);
+                eprintln!("lust: front state off: {why}");
+            }
             let start = std::time::Instant::now();
             let cache = if req.emit_c.is_none() && req.run_args.is_none() && !req.cc { driver::cache::Cache::open(&req.file) } else { None };
             let src = cache.as_ref().and_then(|_| std::fs::read(&req.file).ok());

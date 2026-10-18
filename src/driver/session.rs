@@ -512,6 +512,22 @@ impl Session {
         &self.caches.obj_dir
     }
 
+    /// Before a front image save (src/image.rs): joins the session's side
+    /// threads, so the image holds no handle of a thread that ends with
+    /// this process.
+    pub fn settle(&mut self) {
+        if let Some(p) = self.front.patch.as_mut() {
+            p.settle();
+        }
+    }
+
+    /// After a front image load: process-owned handles are this process's
+    /// to open again (the disk cache, opened on the next compile).
+    pub fn after_restore(&mut self) {
+        self.disk_cache = None;
+        self.cache_tried = false;
+    }
+
     /// The persistent base library directory, once a base was built.
     pub fn base_dir(&self) -> Option<&Path> {
         self.caches.base_dir.as_deref()

@@ -23,7 +23,7 @@ mod session;
 mod release_c;
 
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
-pub use compile::{release_bases, sweep_bases};
+pub use compile::{Stamps, release_bases, sweep_bases};
 pub(crate) use item_oracle::failure as oracle_failure;
 
 /// Compiles one request in `session` (`compile::compile`). Under the

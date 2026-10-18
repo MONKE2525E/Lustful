@@ -322,6 +322,31 @@ pub fn mark_no_capture(ctxt: CtxtId) {
     table[idx] = true;
 }
 
+/// The three process-wide expansion tables, moved out whole for a front
+/// image (src/image.rs): spans in a saved session name their contexts.
+pub struct GlobalTables {
+    expansions: Vec<Expansion>,
+    hygiene: Vec<Option<HygieneMark>>,
+    no_capture: Vec<bool>,
+}
+
+/// Takes the process-wide tables (they read empty after).
+pub fn take_global_tables() -> GlobalTables {
+    GlobalTables {
+        expansions: std::mem::take(&mut *GLOBAL_EXPANSIONS.lock().unwrap()),
+        hygiene: std::mem::take(&mut *HYGIENE_MARKS.lock().unwrap()),
+        no_capture: std::mem::take(&mut *NO_CAPTURE_MARKS.lock().unwrap()),
+    }
+}
+
+/// Puts tables from `take_global_tables` back, in a new process before
+/// anything registers an expansion.
+pub fn put_global_tables(t: GlobalTables) {
+    *GLOBAL_EXPANSIONS.lock().unwrap() = t.expansions;
+    *HYGIENE_MARKS.lock().unwrap() = t.hygiene;
+    *NO_CAPTURE_MARKS.lock().unwrap() = t.no_capture;
+}
+
 /// True when `ctxt` was recorded by `mark_no_capture`.
 pub fn is_no_capture(ctxt: CtxtId) -> bool {
     if ctxt == CtxtId::ROOT {
