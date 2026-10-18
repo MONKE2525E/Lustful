@@ -137,8 +137,9 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
     v
 }
 
-/// The compiler identity for keys: the command plus its `--version` first
-/// line. Computed once per process.
+/// The compiler identity for keys: the command, its `--version` first line,
+/// and the size and modification time of the binary it resolves to (an
+/// in-place toolchain update moves the key). Computed once per process.
 fn compiler_id(cmd: &[String]) -> String {
     static ID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Vec<String>, String>>> = std::sync::OnceLock::new();
     // One spec per process in practice (one lust-core per target); a map
@@ -153,21 +154,49 @@ fn compiler_id(cmd: &[String]) -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string())
         .unwrap_or_default();
-    let id = format!("{} | {ver}", cmd.join(" "));
+    let bin = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).map(|d| d.join(&cmd[0])).find(|p| p.is_file()))
+        .unwrap_or_else(|| PathBuf::from(&cmd[0]));
+    let stamp = std::fs::metadata(std::fs::canonicalize(&bin).unwrap_or(bin))
+        .map(|m| format!("{} {:?}", m.len(), m.modified().ok()))
+        .unwrap_or_default();
+    let id = format!("{} | {ver} | {stamp}", cmd.join(" "));
     map.lock().unwrap_or_else(|e| e.into_inner()).insert(cmd.to_vec(), id.clone());
     id
 }
 
-/// The disk cache key of one unit's object under this backend (the
-/// rel-cache seam): the C text, the compiler, the flags, the target.
-pub fn unit_key(c_text: &str, spec: &CcSpec, debug: bool) -> String {
+/// The disk cache key of one unit's object under this backend: the C text,
+/// the compiler, the flags, the target, and `profile`, the digest of the PGO
+/// data this unit's object depends on (see `Pgo::unit_digest`). A unit that
+/// includes system headers (the runtime unit) keys on its preprocessed text
+/// instead, so a header or sysroot change moves its key; the other units
+/// include nothing.
+pub fn unit_key(c_text: &str, spec: &CcSpec, debug: bool, profile: Option<&str>) -> String {
     let id = compiler_id(&spec.cmd);
     let flags = cflags(debug);
+    let pre = c_text.contains("#include <").then(|| preprocessed(c_text, spec, &flags)).flatten();
+    let text = pre.as_deref().unwrap_or(c_text.as_bytes());
     let (a, b) = crate::driver::cache::hash128(
-        &[b"cc-v1", spec.triple.as_bytes(), id.as_bytes(), flags.as_bytes(), &[debug as u8], c_text.as_bytes()],
+        &[b"cc-v2", spec.triple.as_bytes(), id.as_bytes(), flags.as_bytes(), &[debug as u8], profile.unwrap_or("").as_bytes(), text],
         37,
     );
     format!("{a:016x}{b:016x}")
+}
+
+/// `c_text` after the preprocessor of `spec` with `flags`, or None when it
+/// cannot run (the key then holds the raw text, and a failed compile reports
+/// the real error).
+fn preprocessed(c_text: &str, spec: &CcSpec, flags: &str) -> Option<Vec<u8>> {
+    use std::io::Write as _;
+    let mut cmd = Command::new(&spec.cmd[0]);
+    cmd.args(&spec.cmd[1..]).args(flags.split_whitespace()).args(["-E", "-P", "-x", "c", "-", "-o", "-"]);
+    let mut child = cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let text = c_text.to_string();
+    let writer = std::thread::spawn(move || stdin.write_all(text.as_bytes()));
+    let out = child.wait_with_output().ok()?;
+    writer.join().ok()?.ok()?;
+    out.status.success().then_some(out.stdout)
 }
 
 /// Compiles every unit and links `out`. `units` are (name, C text) pairs in
@@ -188,7 +217,7 @@ pub fn build(
     let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len()));
     let objs: Vec<PathBuf> = units.iter().map(|(name, _)| work.join(format!("{name}.o"))).collect();
-    let keys: Vec<Option<String>> = units.iter().map(|(_, c)| cache.map(|_| unit_key(c, spec, debug))).collect();
+    let keys: Vec<Option<String>> = units.iter().map(|(_, c)| cache.map(|_| unit_key(c, spec, debug, None))).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(String::new());
     let hits = std::sync::atomic::AtomicUsize::new(0);
@@ -266,10 +295,11 @@ mod tests {
             statik: false,
             exe_suffix: "",
         };
-        let base = super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false);
-        assert_ne!(base, super::unit_key("int g(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false), "C text");
-        assert_ne!(base, super::unit_key("int f(void);", &spec("x86_64-unknown-linux-musl", "zig cc"), false), "target");
-        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), true), "debug");
-        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "clang"), false), "compiler");
+        let base = super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false, None);
+        assert_ne!(base, super::unit_key("int g(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false, None), "C text");
+        assert_ne!(base, super::unit_key("int f(void);", &spec("x86_64-unknown-linux-musl", "zig cc"), false, None), "target");
+        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), true, None), "debug");
+        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "clang"), false, None), "compiler");
+        assert_ne!(base, super::unit_key("int f(void);", &spec("aarch64-unknown-linux-musl", "zig cc"), false, Some("p1")), "profile");
     }
 }
