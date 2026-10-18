@@ -948,8 +948,32 @@ struct FinalChunk {
     /// every top-level fn (collect's order).
     scan_bodies: Vec<(u64, Vec<Sym>)>,
     nested_bodies: Vec<(u64, Vec<Sym>)>,
-    /// What the rewrite read, when an observed resolve made it (resolve/mdr.rs).
-    reads: Option<crate::resolve::mdr::FileReads>,
+    /// What the rewrite read, with each answer then (resolve/mdr.rs): the
+    /// chunk stands while those answers do (B3 step 3).
+    deps: Option<crate::resolve::mdr::ChunkDeps>,
+}
+
+impl FinalChunk {
+    /// A copy for a cache hit; the recorded reads only when `deps` (the
+    /// observation reads them), as a hit stores nothing back.
+    fn clone_for_hit(&self, deps: bool) -> FinalChunk {
+        FinalChunk {
+            epoch: self.epoch,
+            exp_hash: self.exp_hash,
+            ast: self.ast.clone(),
+            fn_lines: self.fn_lines.clone(),
+            body_hashes: self.body_hashes.clone(),
+            nested_lines: self.nested_lines.clone(),
+            nested_hashes: self.nested_hashes.clone(),
+            fn_module_paths: self.fn_module_paths.clone(),
+            nested_module_paths: self.nested_module_paths.clone(),
+            structure: self.structure,
+            scan_items: self.scan_items.clone(),
+            scan_bodies: self.scan_bodies.clone(),
+            nested_bodies: self.nested_bodies.clone(),
+            deps: if deps { self.deps.clone() } else { None },
+        }
+    }
 }
 
 /// True when a file's expansion can read data outside its own text
@@ -3687,14 +3711,29 @@ fn resolve_one(
     // chunk was stored under this exact epoch (and expanded
     // stream) rewrites to that chunk, so its rewrite walk is
     // skipped and the chunk is taken over at flatten time.
-    let epoch = tables.rewrite_epoch();
+    // B3 step 3: a cached chunk stands while the module and file structure is
+    // fixed and every answer its rewrite read is the same (resolve/mdr.rs
+    // `still_valid`). `LUST_B3_READS=0` keys chunks on the session-wide
+    // rewrite epoch instead, as before. A one-shot resolve keeps no chunks,
+    // so it needs neither.
+    let local_names = tables.local_named_set();
+    let by_reads = !cache.one_shot && std::env::var_os("LUST_B3_READS").is_none_or(|v| v != "0");
+    let epoch = if cache.one_shot || by_reads { 0 } else { tables.rewrite_epoch() };
+    let structure = by_reads.then(|| {
+        let files: Vec<&str> = works.iter().map(|w| w.key.as_str()).collect();
+        crate::resolve::mdr::structure(tables, &files)
+    });
+    let mut answers = crate::resolve::mdr::Answers::new(tables);
     let mut final_hits: Vec<Option<FinalChunk>> = Vec::with_capacity(works.len());
     for w in works.iter() {
-        let hit = match cache.final_epoch(&w.key, w.text_hash, w.file_id) {
-            Some(e) if e == epoch => cache.final_chunk(&w.key, w.text_hash, w.file_id).filter(|c| c.exp_hash == w.exp_hash),
-            _ => None,
-        };
-        final_hits.push(hit);
+        let hit = cache.peek(&w.key, w.text_hash, w.file_id).and_then(|e| e.final_chunk.as_ref()).filter(|c| {
+            c.exp_hash == w.exp_hash
+                && match structure {
+                    Some(s) => c.deps.as_ref().is_some_and(|d| crate::resolve::mdr::still_valid(d, &mut answers, &local_names, s)),
+                    None => !cache.one_shot && c.epoch == epoch,
+                }
+        });
+        final_hits.push(hit.map(|c| c.clone_for_hit(crate::resolve::mdr::on())));
     }
     lap!("resolve: epoch");
     // Rewrite paths to flat names, checking visibility. The tables
@@ -3707,7 +3746,6 @@ fn resolve_one(
     let mut rw_reads: Vec<Option<crate::resolve::mdr::FileReads>> = vec![None; works.len()];
     let rw_diags: Vec<Diag> = {
         let tables: &ResolvedTables = tables;
-        let local_names = tables.local_named_set();
         let cells: Vec<(usize, std::sync::Mutex<&mut FileWork>)> = works
             .iter_mut()
             .enumerate()
@@ -3715,7 +3753,7 @@ fn resolve_one(
             .map(|(fi, w)| (fi, std::sync::Mutex::new(w)))
             .collect();
         // An observed resolve records what each file's rewrite reads.
-        crate::resolve::mdr::recording(crate::resolve::mdr::on());
+        crate::resolve::mdr::recording(by_reads || crate::resolve::mdr::on());
         let per_work = par_map(&cells, |(fi, cell)| {
             let mut w = cell.lock().unwrap();
             let module = w.module;
@@ -3744,6 +3782,18 @@ fn resolve_one(
     if !rw_diags.is_empty() {
         return Err(OneError { diags: rw_diags, seen, std_asks });
     }
+    // Each fresh chunk's answers, for its reuse by reads next time.
+    let mut rw_deps: Vec<Option<crate::resolve::mdr::ChunkDeps>> = rw_reads
+        .into_iter()
+        .map(|r| {
+            let r = r?;
+            Some(match structure {
+                Some(s) => crate::resolve::mdr::deps_of(r, &mut answers, &local_names, s),
+                None => crate::resolve::mdr::ChunkDeps { reads: r, ..Default::default() },
+            })
+        })
+        .collect();
+    drop(answers);
     lap!("resolve: rewrite");
     // ---- Flatten: inline module bodies splice into top-level items;
     // mod, use, and extern crate items drop. Each fn's module is
@@ -3773,7 +3823,7 @@ fn resolve_one(
         /// later segments of a file.
         structure: Option<u64>,
         scan: Option<crate::driver::ast_hash::AstScans>,
-        reads: Option<crate::resolve::mdr::FileReads>,
+        deps: Option<crate::resolve::mdr::ChunkDeps>,
     }
     // Module/import structure per file, hashed before flattening drops
     // it: the file path, then its `mod`, `use`, and `extern crate`
@@ -3813,7 +3863,7 @@ fn resolve_one(
                     items: c.scan_items,
                     bodies: c.scan_bodies.into_iter().chain(c.nested_bodies).collect(),
                 }),
-                reads: c.reads,
+                deps: c.deps,
             });
             continue;
         }
@@ -3871,7 +3921,7 @@ fn resolve_one(
             nested_module_paths: n_paths,
             structure,
             scan: None,
-            reads: rw_reads[fi].take(),
+            deps: rw_deps[fi].take(),
         });
     }
     lap!("resolve: flatten");
@@ -3910,14 +3960,17 @@ fn resolve_one(
                 scan_items: scan.items.clone(),
                 scan_bodies: scan.bodies[..top].to_vec(),
                 nested_bodies: scan.bodies[top..].to_vec(),
-                reads: pd.reads.clone(),
+                deps: pd.deps.clone(),
             },
         );
     }
     let mdr = mdr_imports.map(|(uses, edges)| crate::resolve::mdr::CratePart {
         uses,
         edges,
-        files: pendings.iter().map(|pd| crate::resolve::mdr::FileRec { key: pd.key.clone(), text: pd.text_hash, reads: pd.reads.clone() }).collect(),
+        files: pendings
+            .iter()
+            .map(|pd| crate::resolve::mdr::FileRec { key: pd.key.clone(), text: pd.text_hash, reads: pd.deps.as_ref().map(|d| d.reads.clone()) })
+            .collect(),
         rewritten,
     });
     // Assemble the crate outputs in file order. Module paths are

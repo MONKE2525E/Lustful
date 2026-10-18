@@ -2,12 +2,18 @@
 // in B3-REVIEW-SOL.md). Per module: hashes of what a full resolve read (the
 // module's own items with their sub-items, its imports, its place in the module
 // tree) and wrote (its namespaces with the def records of what they bind), and
-// the modules its imports read. Per file: its text hash, the modules whose
-// namespaces its path rewrite read, and the names it asked the crate-wide set
-// of local names about. A full resolve builds one under `LUST_B3_OBSERVE=1`
+// the modules its imports read. Per file: its text hash and what its path
+// rewrite read (each lookup by module, namespace and name; whole namespaces a
+// fn-body glob listed; questions to the crate-wide set of local names). Per
+// lookup key: the answer's hash. A full resolve builds one under `LUST_B3_OBSERVE=1`
 // (`ResolvedCrate::mdr`); the driver keeps the last one and prints what a warm
-// resolve would have had to redo (`observe`). Observation only: no resolve
-// skips work on it yet.
+// resolve would have had to redo (`observe`).
+//
+// Step 3 uses the per-file part: every persistent resolve records what each
+// file's rewrite read, with each answer's hash (`ChunkDeps`), next to the
+// file's cached final chunk. A later resolve takes that chunk again while the
+// fixed structure (`structure`) and every recorded answer stand
+// (`still_valid`), even when the session-wide rewrite epoch moved.
 use crate::diag::SourceMap;
 use crate::intern::{FxHasher, FxMap, Interner, Sym};
 use crate::resolve::imports::{BindState, Import, ImportKind, ResolvedTables, Target, VisKind};
@@ -210,6 +216,216 @@ impl Sum {
     }
 }
 
+/// A side table entry of key `k`, in module output sums.
+fn side_keyed(out: &mut Vec<Sum>, k: &(ModuleId, u8, Sym), f: &dyn Fn(&mut FxHasher)) {
+    if let Some(s) = out.get_mut(k.0.0 as usize) {
+        s.add(f);
+    }
+}
+
+/// Hashes the def record a binding carries along: visibility, variants,
+/// associated item and field visibility.
+fn def_record(t: &ResolvedTables, h: &mut FxHasher, d: &crate::def::DefId) {
+    if let Some(info) = t.def_info.get(d) {
+        (info.kind as u8, info.flat.0, info.module.0).hash(h);
+        hash_vis(h, &info.vis);
+    }
+    t.variants.get(d).hash(h);
+    if let Some(m) = t.assoc_vis.get(d) {
+        let mut s = Sum::default();
+        for (name, (v, pm)) in m {
+            s.add(|h| {
+                name.hash(h);
+                hash_vis(h, v);
+                pm.0.hash(h);
+            });
+        }
+        s.get().hash(h);
+    }
+    if let Some((m, fields)) = t.field_vis.get(d) {
+        let mut s = Sum::default();
+        for (name, v) in fields {
+            s.add(|h| {
+                name.hash(h);
+                hash_vis(h, v);
+            });
+        }
+        (m.0, s.get()).hash(h);
+    }
+    if let Some((m, vs)) = t.tuple_field_vis.get(d) {
+        m.0.hash(h);
+        for v in vs {
+            hash_vis(h, v);
+        }
+    }
+}
+
+/// What final chunk reuse by reads (B3 step 3) takes as fixed: every module
+/// (positional ids, parents, visibility, flags), the module defs, the std
+/// globs, extern crates and cfgs, `$crate` roots, std modules, platform and
+/// splice start, the macro environment (positions left out, as in `build`),
+/// and the crate's files in order. A change in any of them means no reuse by
+/// reads at all.
+pub fn structure(t: &ResolvedTables, files: &[&str]) -> u64 {
+    let mut h = FxHasher::default();
+    for m in &t.modules {
+        (m.parent.map(|p| p.0), m.name.0, &m.path, m.no_prelude, m.krate_root.0, m.macro_use, m.span.file).hash(&mut h);
+        hash_vis(&mut h, &m.vis);
+    }
+    t.module_defs.iter().map(|d| (d.hash.0, d.krate.0)).collect::<Vec<_>>().hash(&mut h);
+    format!("{:?} {:?}", t.std_globs, t.externs).hash(&mut h);
+    let mut cfgs: Vec<String> = t.crate_cfgs.iter().map(|(m, c)| format!("{} {c:?}", m.0)).collect();
+    cfgs.sort_unstable();
+    cfgs.hash(&mut h);
+    let mut magic: Vec<(u32, u32)> = t.crate_magic.iter().map(|(s, m)| (s.0, m.0)).collect();
+    magic.sort_unstable();
+    magic.hash(&mut h);
+    (t.std_modules.iter().map(|(s, m)| (s.0, m.0)).collect::<Vec<_>>(), t.std_platform.map(|(m, s)| (m.0, s.0)), t.std_splice_lo).hash(&mut h);
+    t.alloc_roots.iter().map(|m| m.0).collect::<Vec<_>>().hash(&mut h);
+    let mut scopes: Vec<String> = t
+        .macro_scopes
+        .iter()
+        .map(|(f, (m, scope))| {
+            let events: Vec<String> = scope.events.iter().map(|e| format!("{:?} {:?} {:?}", e.container, e.skip_inside, e.macros)).collect();
+            format!("{} {} {:?} {events:?}", f.0, m.0, scope.inherited)
+        })
+        .collect();
+    scopes.sort_unstable();
+    scopes.hash(&mut h);
+    for (i, maps) in t.maps.iter().enumerate() {
+        let mut macros: Vec<String> = maps[2].iter().map(|(name, st)| format!("{i} {} {st:?}", name.0)).collect();
+        macros.sort_unstable();
+        macros.hash(&mut h);
+    }
+    files.hash(&mut h);
+    h.finish()
+}
+
+/// One resolve's answers, each computed once (`deps_of`, `still_valid`,
+/// `build`): a glob-imported type is bound in hundreds of modules, so its
+/// def record hashes once too.
+pub struct Answers<'t> {
+    t: &'t ResolvedTables,
+    keys: FxMap<(u32, u8, Sym), u64>,
+    modules: FxMap<u32, u64>,
+    defs: FxMap<crate::def::DefId, u64>,
+}
+
+impl<'t> Answers<'t> {
+    pub fn new(t: &'t ResolvedTables) -> Answers<'t> {
+        Answers { t, keys: FxMap::default(), modules: FxMap::default(), defs: FxMap::default() }
+    }
+
+    /// The hash of one def's record (`def_record`).
+    fn def(&mut self, d: crate::def::DefId) -> u64 {
+        let t = self.t;
+        *self.defs.entry(d).or_insert_with(|| {
+            let mut h = FxHasher::default();
+            def_record(t, &mut h, &d);
+            h.finish()
+        })
+    }
+
+    /// Hashes one binding (or its absence) with its target's def record.
+    fn state(&mut self, h: &mut FxHasher, state: Option<&BindState>) {
+        match state {
+            None => h.write_u8(2),
+            Some(BindState::Ambiguous) => h.write_u8(0),
+            Some(BindState::One(b)) => {
+                h.write_u8(1);
+                hash_target(h, &b.target);
+                hash_vis(h, &b.vis);
+                (b.rank, b.def_module.0).hash(h);
+                if let Target::Def(d) | Target::Variant(d, _) = &b.target {
+                    self.def(*d).hash(h);
+                }
+            }
+        }
+    }
+
+    /// The hash of one (module, namespace, name) answer: the binding (or its
+    /// absence) with the def record of its target, and the key's ambiguity,
+    /// glob source, std alias and order entries. A rewrite that looked the
+    /// key up reads no more of it.
+    pub fn key(&mut self, k: (u32, u8, Sym)) -> u64 {
+        if let Some(&h) = self.keys.get(&k) {
+            return h;
+        }
+        let t = self.t;
+        let (m, ns, name) = k;
+        let mut h = FxHasher::default();
+        self.state(&mut h, t.maps.get(m as usize).and_then(|maps| maps.get(ns as usize)).and_then(|n| n.get(&name)));
+        let sk = (ModuleId(m), ns, name);
+        if let Some(v) = t.ambig_vis.get(&sk) {
+            (0x51u8, format!("{v:?}")).hash(&mut h);
+        }
+        if let Some(src) = t.glob_src.get(&sk) {
+            (0x52u8, src.0).hash(&mut h);
+        }
+        if let Some((v, path)) = t.std_aliases.get(&sk) {
+            (0x53u8, path).hash(&mut h);
+            hash_vis(&mut h, v);
+        }
+        if let Some(src) = t.std_glob_aliases.get(&sk) {
+            (0x54u8, src.0).hash(&mut h);
+        }
+        if let Some(set) = t.order_dep.get(&sk) {
+            (0x55u8, format!("{set:?}")).hash(&mut h);
+        }
+        let out = h.finish();
+        self.keys.insert(k, out);
+        out
+    }
+
+    /// The hash of module `m`'s three namespaces, for a read of a whole one.
+    pub fn module(&mut self, m: u32) -> u64 {
+        if let Some(&h) = self.modules.get(&m) {
+            return h;
+        }
+        let t = self.t;
+        let mut s = Sum::default();
+        for (ns, map) in t.maps.get(m as usize).into_iter().flatten().enumerate() {
+            for (name, state) in map {
+                let mut h = FxHasher::default();
+                (ns, name.0).hash(&mut h);
+                self.state(&mut h, Some(state));
+                s.add(|x| h.finish().hash(x));
+            }
+        }
+        let out = s.get();
+        self.modules.insert(m, out);
+        out
+    }
+}
+
+/// What a cached final chunk's rewrite read, with each answer's hash then
+/// (B3 step 3): the chunk stands while `still_valid` holds.
+#[derive(Clone, Default)]
+pub struct ChunkDeps {
+    pub structure: u64,
+    pub reads: FileReads,
+    /// Parallel to `reads.keys`, `reads.modules` and `reads.names`.
+    pub key_answers: Vec<u64>,
+    pub module_answers: Vec<u64>,
+    pub name_answers: Vec<u8>,
+}
+
+/// The dependencies of one file's fresh rewrite.
+pub fn deps_of(reads: FileReads, a: &mut Answers, local_names: &FxMap<Sym, u8>, structure: u64) -> ChunkDeps {
+    let key_answers = reads.keys.iter().map(|&k| a.key(k)).collect();
+    let module_answers = reads.modules.iter().map(|&m| a.module(m)).collect();
+    let name_answers = reads.names.iter().map(|s| local_names.get(s).copied().unwrap_or(0)).collect();
+    ChunkDeps { structure, reads, key_answers, module_answers, name_answers }
+}
+
+/// True when every answer `d` recorded is the same under the current tables.
+pub fn still_valid(d: &ChunkDeps, a: &mut Answers, local_names: &FxMap<Sym, u8>, structure: u64) -> bool {
+    d.structure == structure
+        && d.reads.keys.iter().zip(&d.key_answers).all(|(&k, &h)| a.key(k) == h)
+        && d.reads.modules.iter().zip(&d.module_answers).all(|(&m, &h)| a.module(m) == h)
+        && d.reads.names.iter().zip(&d.name_answers).all(|(s, &v)| local_names.get(s).copied().unwrap_or(0) == v)
+}
+
 /// Per-module import hashes and the modules each module's imports read,
 /// from one crate's import list (after `run_imports`).
 pub fn imports_part(tables: &ResolvedTables, imports: &[Import], interner: &Interner) -> (Vec<(u32, u64)>, Vec<(u32, u32)>) {
@@ -262,47 +478,11 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
     let mut items: Vec<Sum> = (0..n).map(|_| Sum::default()).collect();
     let mut out: Vec<Sum> = (0..n).map(|_| Sum::default()).collect();
     let mut tree: Vec<Sum> = (0..n).map(|_| Sum::default()).collect();
-    // The def records a binding carries along: visibility, variants,
-    // associated item and field visibility.
-    let def_record = |h: &mut FxHasher, d: &crate::def::DefId| {
-        if let Some(info) = t.def_info.get(d) {
-            (info.kind as u8, info.flat.0, info.module.0).hash(h);
-            hash_vis(h, &info.vis);
-        }
-        t.variants.get(d).hash(h);
-        if let Some(m) = t.assoc_vis.get(d) {
-            let mut s = Sum::default();
-            for (name, (v, pm)) in m {
-                s.add(|h| {
-                    name.hash(h);
-                    hash_vis(h, v);
-                    pm.0.hash(h);
-                });
-            }
-            s.get().hash(h);
-        }
-        if let Some((m, fields)) = t.field_vis.get(d) {
-            let mut s = Sum::default();
-            for (name, v) in fields {
-                s.add(|h| {
-                    name.hash(h);
-                    hash_vis(h, v);
-                });
-            }
-            (m.0, s.get()).hash(h);
-        }
-        if let Some((m, vs)) = t.tuple_field_vis.get(d) {
-            m.0.hash(h);
-            for v in vs {
-                hash_vis(h, v);
-            }
-        }
-    };
     for (d, info) in &t.def_info {
         let Some(s) = items.get_mut(info.module.0 as usize) else { continue };
         s.add(|h| {
             (d.hash.0, d.krate.0).hash(h);
-            def_record(h, d);
+            def_record(t, h, d);
         });
     }
     // Associated item visibility belongs to the module of the impl that gives it.
@@ -334,23 +514,9 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
             *rank += 1;
         }
     }
-    let mut answers: FxMap<(u32, u8, Sym), FxHasher> = FxMap::default();
     for (i, maps) in t.maps.iter().enumerate() {
         for (ns, m) in maps.iter().enumerate() {
             for (name, state) in m {
-                let a = answers.entry((i as u32, ns as u8, *name)).or_default();
-                match state {
-                    BindState::Ambiguous => a.write_u8(0),
-                    BindState::One(b) => {
-                        a.write_u8(1);
-                        hash_target(a, &b.target);
-                        hash_vis(a, &b.vis);
-                        (b.rank, b.def_module.0).hash(a);
-                        if let Target::Def(d) | Target::Variant(d, _) = &b.target {
-                            def_record(a, d);
-                        }
-                    }
-                }
                 out[i].add(|h| {
                     (ns, name.0).hash(h);
                     match state {
@@ -361,7 +527,7 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
                             hash_vis(h, &b.vis);
                             (b.rank, b.def_module.0).hash(h);
                             if let Target::Def(d) | Target::Variant(d, _) = &b.target {
-                                def_record(h, d);
+                                def_record(t, h, d);
                             }
                         }
                     }
@@ -374,11 +540,7 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
             s.add(f);
         }
     };
-    // The side tables of one key count in its answer and its module's output.
-    let mut keyed = |out: &mut Vec<Sum>, k: &(ModuleId, u8, Sym), f: &dyn Fn(&mut FxHasher)| {
-        side(out, k.0, f);
-        f(answers.entry((k.0.0, k.1, k.2)).or_default());
-    };
+    let keyed = side_keyed;
     for (k, v) in &t.ambig_vis {
         keyed(&mut out, k, &|h| (0x51u8, k.1, k.2.0, format!("{v:?}")).hash(h));
     }
@@ -395,7 +557,7 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
         keyed(&mut out, k, &|h| (0x54u8, k.1, k.2.0, src.0).hash(h));
     }
     for (k, set) in &t.order_dep {
-        keyed(&mut out, &(k.0, k.1 as u8, k.2), &|h| (0x55u8, k.1, k.2.0, format!("{set:?}")).hash(h));
+        keyed(&mut out, k, &|h| (0x55u8, k.1, k.2.0, format!("{set:?}")).hash(h));
     }
     for (m, path) in &t.std_globs {
         side(&mut out, *m, &|h| (0x56u8, path).hash(h));
@@ -439,7 +601,19 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
             macros.add(|h| (i, name.0, format!("{state:?}")).hash(h));
         }
     }
-    let answers = answers.into_iter().map(|(k, h)| (k, h.finish())).collect();
+    // Every key with a binding or a side entry, and its answer.
+    let mut keys: Vec<(u32, u8, Sym)> = Vec::new();
+    for (i, maps) in t.maps.iter().enumerate() {
+        for (ns, m) in maps.iter().enumerate() {
+            keys.extend(m.keys().map(|&name| (i as u32, ns as u8, name)));
+        }
+    }
+    let side_keys = t.ambig_vis.keys().chain(t.glob_src.keys()).chain(t.std_aliases.keys()).chain(t.std_glob_aliases.keys()).chain(t.order_dep.keys());
+    keys.extend(side_keys.map(|k| (k.0.0, k.1, k.2)));
+    keys.sort_unstable();
+    keys.dedup();
+    let mut a = Answers::new(t);
+    let answers = keys.into_iter().map(|k| (k, a.key(k))).collect();
     Mdr { modules, files, global: global.finish(), macros: macros.get(), local_names: t.local_named_set(), answers, rewritten }
 }
 
@@ -471,6 +645,8 @@ pub struct Observation {
     pub reusable_keys: usize,
     /// Answers (module, namespace, name) that came, went or changed.
     pub answers_changed: usize,
+    /// Lookups the files' records hold, over all files (their size).
+    pub keys: usize,
     /// Why a fixed-structure warm resolve would refuse: the module or file set,
     /// the macro environment, or the crate-wide inputs changed.
     pub fallback: Vec<&'static str>,
@@ -548,6 +724,7 @@ pub fn observe(prev: &Mdr, cur: &Mdr) -> Observation {
         .chain(prev.answers.keys().filter(|k| !cur.answers.contains_key(k)).map(|k| (*k, ())))
         .collect();
     o.answers_changed = changed_keys.len();
+    o.keys = cur.files.iter().filter_map(|f| f.reads.as_ref()).map(|r| r.keys.len()).sum();
     for f in &cur.files {
         if !old_files.get(f.key.as_str()).is_some_and(|p| p.text == f.text) {
             o.files_changed += 1;
@@ -575,13 +752,14 @@ impl Observation {
     /// One summary line (`b3-observe: ...`).
     pub fn line(&self) -> String {
         format!(
-            "b3-observe: files={} changed={} rewritten={} reusable={} reusable_keys={} answers_changed={} modules={} dirty={} region={} actual={} missed={}{} local_names_changed={} fallback={}",
+            "b3-observe: files={} changed={} rewritten={} reusable={} reusable_keys={} answers_changed={} keys={} modules={} dirty={} region={} actual={} missed={}{} local_names_changed={} fallback={}",
             self.files,
             self.files_changed,
             self.rewritten,
             self.reusable,
             self.reusable_keys,
             self.answers_changed,
+            self.keys,
             self.modules,
             self.dirty,
             self.region,
