@@ -794,13 +794,23 @@ fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::R
         k.hash(&mut h);
         (h.finish() >> 32) as usize % n
     };
+    // Each thread sorts the keys of its share of the sets into shards, so a
+    // key is hashed once here, not once per thread.
+    let parts: Vec<&[Option<&crate::driver::graph::Reads>]> = sets.chunks(sets.len().div_ceil(n).max(1)).collect();
+    let buckets: Vec<Vec<Vec<&ReadKey>>> = par_map(&parts, |part| {
+        let mut b: Vec<Vec<&ReadKey>> = vec![Vec::new(); n];
+        for r in part.iter().flatten() {
+            for (k, _) in r.iter() {
+                b[shard_of(k)].push(k);
+            }
+        }
+        b
+    });
     let ids: Vec<usize> = (0..n).collect();
     let shards: Vec<FxMap<ReadKey, Read>> = par_map(&ids, |&t| {
         let mut now = FxMap::default();
-        for r in sets.iter().flatten() {
-            for (k, _) in r.iter().filter(|(k, _)| shard_of(k) == t) {
-                now.entry(*k).or_insert_with(|| p.read_fingerprint(k));
-            }
+        for &k in buckets.iter().flat_map(|b| &b[t]) {
+            now.entry(*k).or_insert_with(|| p.read_fingerprint(k));
         }
         now
     });
@@ -4083,6 +4093,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // (`reads_dirty_par`).
         let mut recheck_of = vec![false; program.fns.len()];
         let mut by_reads: Vec<usize> = Vec::new();
+        // The source fingerprint of each instance and closure body fn
+        // (`src_of`: a few map lookups each, over every instance of the
+        // program), in parallel; the verdicts below stay in fn order.
+        let srcs: Vec<Option<u64>> = if regenerate_all {
+            Vec::new()
+        } else {
+            let chunks: Vec<std::ops::Range<usize>> = (fn_count..program.fns.len()).step_by(4096).map(|a| a..(a + 4096).min(program.fns.len())).collect();
+            par_map(&chunks, |r| r.clone().map(|i| if concrete(i) { reuse.src_of(&program, LocalDefId(i as u32)) } else { None }).collect::<Vec<_>>())
+                .into_iter()
+                .flatten()
+                .collect()
+        };
         for i in (0..program.fns.len()).filter(|&i| concrete(i)) {
             let s = front.fn_slot[i] as usize;
             let calls_dead = build && lost && caches.out[s].used.iter().any(|&u| !held.get(u as usize).copied().unwrap_or(false));
@@ -4103,7 +4125,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                     clean
                 };
-                recheck = reuse.src_of(&program, LocalDefId(i as u32)) != Some(front.slot_hash[s]);
+                recheck = srcs[i - fn_count] != Some(front.slot_hash[s]);
                 if !recheck && front.slot_env[s] != env {
                     match (&caches.slot_reads[s], &derive_dirty) {
                         (None, _) => recheck = true,
