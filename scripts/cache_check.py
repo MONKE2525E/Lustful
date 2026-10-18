@@ -23,7 +23,9 @@
 # release binary is a function of the source, the toolchain and the flags, whatever the
 # cache held (rel-cache round 4: the location unit's slot numbers came from the cache's
 # slot manifest). Each sequence ends with a no-change rebuild that must take every unit
-# from the object cache.
+# from the object cache. --front also keeps a front image (LUST_FRONT_STATE, as
+# scripts/release-x64.sh FRONT=1 does) across the cached builds: a front image build had
+# turned release C off, so every merge recompiled nearly every unit.
 #
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: cache_check.py --seqs 40 --steps 4 [--seed 1] [--jobs N] [--threads 1,4,24]
@@ -291,7 +293,7 @@ def check_seq(idx, srcs, threads, args, work):
             outs["rustc"] = run_bin("./rustc.bin", d)
         rel = ["--release", "--target", args.host, "--timings"] if args.release else []
         renv = dict(tenv, LUST_RELEASE_C="1") if args.release else tenv
-        cenv = dict(renv, LUST_NO_DAEMON="1")
+        cenv = dict(renv, LUST_NO_DAEMON="1", **({"LUST_FRONT_STATE": os.path.join(d, "front")} if args.front else {}))
         ref = build([LUST, "build", "main.rs", *rel, "-o", "ref.bin"], dict(renv, LUST_NO_CACHE="1", LUST_NO_DAEMON="1"), d)
         cached = build([LUST, "build", "main.rs", *rel, "-o", "cached.bin"], cenv, d)
         sides = [("ref", ref), ("cached", cached)]
@@ -353,6 +355,7 @@ def main():
     ap.add_argument("--rustc", action="store_true")
     ap.add_argument("--daemon", action="store_true")
     ap.add_argument("--release", action="store_true", help="release driver builds; binaries must be byte-identical")
+    ap.add_argument("--front", action="store_true", help="with --release: the cached builds keep a front image")
     ap.add_argument("--keep", help="copy the steps of each failing sequence here")
     args = ap.parse_args()
     if not os.access(LUST, os.X_OK):

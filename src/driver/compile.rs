@@ -3575,12 +3575,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     program.unwind = !session_key.profile.panic_abort;
     program.overflow_checks = session_key.profile.overflow_checks;
     // Unwind tables need a C compiler with -fexceptions and a C++ driver, never tcc: a
-    // release driver build uses them (LUST_UNWIND_TABLES=0 turns them off); --emit-c
-    // in a one-shot process only with LUST_UNWIND_TABLES=1 (difftest EH=1).
+    // release driver build uses them, one-shot or from a persistent session such as a
+    // front image (LUST_UNWIND_TABLES=0 turns them off); --emit-c in a one-shot process
+    // only with LUST_UNWIND_TABLES=1 (difftest EH=1).
     let tables_env = std::env::var("LUST_UNWIND_TABLES").ok();
     program.unwind_tables = program.unwind
-        && !caches.persistent
-        && if req.cc { tables_env.as_deref() != Some("0") } else { tables_env.as_deref() == Some("1") };
+        && if req.cc { tables_env.as_deref() != Some("0") } else { !caches.persistent && tables_env.as_deref() == Some("1") };
     // Route the spliced source std fns: resolve each registry row's
     // mangled name to the local fn the splice defined. A missing fn is
     // a broken std build (the loader found it standalone), so it is an
@@ -3913,6 +3913,21 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     let reemitted = reemit.len();
 
+    // A build under another codegen key (release C on or off, the release backend's
+    // switches, debug info, unwind tables) makes every slot's C again, as a one-shot build
+    // does: its slot cache holds C of the other form (a front image saved by a tcc build,
+    // then a release driver build). A check makes no C and keeps the key.
+    let release = super::release_c::on(caches.persistent, req.cc);
+    if req.cmd == Cmd::Build {
+        let key = super::release_c::codegen_key(release, req.debug, program.unwind_tables);
+        if caches.codegen_key != key {
+            caches.codegen_key = key;
+            caches.has_out.iter_mut().for_each(|h| *h = false);
+            caches.out.iter_mut().for_each(|o| *o = FnOut::default());
+            caches.glue = GlueSet::default();
+            caches.objects = None;
+        }
+    }
     // Front end for the functions that need it. A build also needs IR for functions with no C yet.
     let mut work = changed.clone();
     work.extend(reemit_failed.iter().copied());
@@ -4255,7 +4270,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         .collect();
     // Release C (driver/release_c.rs): content-addressed names, set as cgen's naming
     // context around every step that prints C.
-    let release = super::release_c::on(caches.persistent);
     let rnames = release.then(|| super::release_c::names(&program, &front.fn_slot, front.slot_of.len().max(caches.out.len()), &inst_adt_ids(&program)));
     let rn = rnames.as_ref();
     // Codegen reads derive lists (Copy layouts, comparison forms, default

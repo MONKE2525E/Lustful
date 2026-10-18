@@ -2389,8 +2389,9 @@ impl<'a> Program {
 
     /// Notes (check/derive_delta.rs, `bit::LAYOUT`) a `Layout` read of Adt
     /// `a` (its template, for an instance) and of each user Adt its
-    /// instance args name: release C bakes its field offsets into a body
-    /// that may hold it only behind a pointer.
+    /// instance args name: codegen asked its layout (cgen `c_layout`), as
+    /// release C does for a field read at an offset and the LLVM backend for
+    /// a pointee's size, in a body that may hold it only behind a pointer.
     pub(crate) fn note_adt_layout(&self, a: AdtId) {
         if !crate::check::derive_delta::open() {
             return;

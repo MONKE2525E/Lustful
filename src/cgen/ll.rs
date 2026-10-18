@@ -1854,7 +1854,8 @@ fn ll_callee_ids(f: &FnOut) -> impl Iterator<Item = &str> {
 /// level otherwise stays a call). The unit gets an
 /// `available_externally` copy of each (`ll_unit`) and its helpers (`fn_unit_parts`), so the
 /// optimizer can inline it, as LTO would; its own unit still emits it. `slot_of` maps a fn
-/// id to its slot.
+/// id to its slot. The copies come in fn id order (slot order carries a persistent
+/// session's history, and its units are a one-shot build's).
 pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections::HashMap<&str, usize>) -> Vec<usize> {
     static LIMITS: std::sync::OnceLock<(usize, usize, usize, usize, usize)> = std::sync::OnceLock::new();
     let (bytes, depth, hint, tiny, tiny_depth) = *LIMITS.get_or_init(|| {
@@ -1879,7 +1880,7 @@ pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections:
         }
     };
     let own: HashSet<usize> = slots.iter().copied().collect();
-    let mut picked: Vec<usize> = Vec::new();
+    let mut picked: Vec<(&str, usize)> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
     let mut frontier: Vec<usize> = slots.to_vec();
     for level in 0..depth + tiny_depth {
@@ -1892,14 +1893,14 @@ pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections:
                 if own.contains(&g) || f.ll.is_empty() || f.ll_cost as usize > max || !seen.insert(g) {
                     continue;
                 }
-                picked.push(g);
+                picked.push((id, g));
                 next.push(g);
             }
         }
         frontier = next;
     }
     picked.sort_unstable();
-    picked
+    picked.into_iter().map(|(_, g)| g).collect()
 }
 
 /// The `.ll` text of one release fn unit: the declarations its fns name (each once) and

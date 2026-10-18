@@ -1,8 +1,12 @@
-// Release C (`LUST_RELEASE_C=1`, one-shot `lust build` only): C whose units depend only
-// on their own fns, so a content-keyed object cache (key = a unit's C text plus the C
-// compiler, its flags and the target) reuses every unit a commit did not touch, across
-// commits, machines and CI runs. Dev builds and the daemon keep numbered names and byte
-// groups (their overlays need the fn table).
+// Release C (`LUST_RELEASE_C=1`, `lust build`): C whose units depend only on their own
+// fns, so a content-keyed object cache (key = a unit's C text plus the C compiler, its
+// flags and the target) reuses every unit a commit did not touch, across commits,
+// machines and CI runs. A one-shot build writes it, and so does a persistent session (a
+// front image, src/image.rs) for the release driver: its units are a one-shot build's,
+// byte for byte, as every name and unit follows from identities and content (the
+// location unit numbers fns by id, `names::loc_unit`, and the glue shards hold what the
+// live fns reach, `names::glue_shards`). Dev builds through tcc in a persistent session (the
+// daemon) keep numbered names and byte groups (their overlays need the fn table).
 //   names      cgen/names.rs: content-addressed fn, Adt and vtable names, direct calls,
 //              panic locations through the location unit's slot table
 //   partition  `groups`: a fn's unit follows from its own identity: its source file
@@ -14,9 +18,21 @@ use crate::cgen::{self, FnOut};
 use crate::check::collect::{LocalDefId, Program};
 use std::sync::Arc;
 
-/// True when this one-shot build writes release C.
-pub fn on(persistent: bool) -> bool {
-    !persistent && std::env::var_os("LUST_RELEASE_C").is_some_and(|v| !v.is_empty() && v != "0")
+/// True when a build writes release C: `LUST_RELEASE_C` set, for a one-shot build or
+/// a release driver build (`cc`) of a persistent session.
+pub fn on(persistent: bool, cc: bool) -> bool {
+    (!persistent || cc) && std::env::var_os("LUST_RELEASE_C").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// What decides a slot's C besides its program: release C or not, debug info, unwind
+/// tables, and the switches of the release backends. A persistent session makes every
+/// slot's C again when it moves.
+pub fn codegen_key(release: bool, debug: bool, unwind_tables: bool) -> u64 {
+    let mut vars: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("LUST_RELEASE_") || k.starts_with("LUST_LL_")).collect();
+    vars.sort();
+    let mut x = crate::intern::FxHasher::default();
+    std::hash::Hash::hash(&(release, debug, unwind_tables, vars), &mut x);
+    std::hash::Hasher::finish(&x)
 }
 
 fn hash64(s: &str) -> u64 {

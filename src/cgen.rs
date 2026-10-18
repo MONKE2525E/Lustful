@@ -813,28 +813,10 @@ impl OffsetPlace {
 /// The layout of `t` when its fields can be read by offset (a struct, enum or tuple
 /// with a known C layout, not packed).
 fn offset_layout(p: &Program, t: &CTy) -> Option<Layout> {
-    note_offset_layout(p, t);
     match t {
         CTy::Adt(a) if p.adt(*a).repr.pack.is_none() => c_layout(p, t),
         CTy::Tuple(_) => c_layout(p, t),
         _ => None,
-    }
-}
-
-/// Notes a `Layout` read of the Adts whose layout an offset read of `t`
-/// bakes in (`Program::note_adt_layout`): `t` and what it holds by value.
-/// The body may hold `t` only behind the pointer it reads through, which
-/// its type reads do not cover (`Program::record_type_layout_reads`).
-fn note_offset_layout(p: &Program, t: &CTy) {
-    match t {
-        CTy::Adt(a) => p.note_adt_layout(*a),
-        CTy::Tuple(es) => es.iter().for_each(|e| note_offset_layout(p, e)),
-        CTy::Array(e, _) | CTy::Option(e) => note_offset_layout(p, e),
-        CTy::Result(a, b) => {
-            note_offset_layout(p, a);
-            note_offset_layout(p, b);
-        }
-        _ => {}
     }
 }
 
@@ -1260,6 +1242,12 @@ fn scalar_lit(bits: u128, size: u64, signed: bool) -> String {
 /// never null. Each Adt's layout is computed once per call (`Seen::done`):
 /// a struct DAG whose fields share sub-types would otherwise cost one walk
 /// per path.
+///
+/// Every Adt laid out on the way is a `Layout` read of the body being made
+/// (`Program::note_adt_layout`): a body may hold the type only behind a
+/// pointer, which its type reads do not cover
+/// (`Program::record_type_layout_reads`), while its C reads a field at an
+/// offset or its LLVM IR gives the pointee's size (`dereferenceable`).
 fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
     /// The Adts on the walk (a by-value cycle has no layout) and the
     /// finished ones.
@@ -1394,6 +1382,7 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
                 if !seen.on.insert(*a) {
                     return None;
                 }
+                p.note_adt_layout(*a);
                 let adt = p.adt(*a);
                 let r = if adt.is_enum {
                     let mut variants = Vec::with_capacity(adt.variants.len());
@@ -2851,7 +2840,6 @@ impl FnGen<'_, '_> {
         let (inner, off) = match (pr, t) {
             (Proj::Deref, CTy::Ref(inner) | CTy::Boxed(inner) | CTy::Ptr(inner)) if offset_layout(self.p, inner).is_some() => ((**inner).clone(), 0),
             (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) => {
-                note_offset_layout(self.p, inner);
                 let l = c_layout(self.p, inner).filter(|l| l.align > 0)?;
                 ((**inner).clone(), 16u64.div_ceil(l.align) * l.align)
             }
@@ -9792,6 +9780,17 @@ fn collect_promoted(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, 
     }
 }
 
+/// The live statics in emission order: by index, or in release C by symbol (a
+/// persistent session's static indices carry its history, and its units are a
+/// one-shot build's, byte for byte).
+fn statics_in_order(p: &Program) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..p.statics.len()).filter(|&i| p.static_live(i)).collect();
+    if names::release() {
+        order.sort_by_cached_key(|&i| static_sym(p, i as u32));
+    }
+    order
+}
+
 /// Definitions of the program's statics as C globals (ARCH 2.13 static data).
 /// The extern declarations come first: statics emit in stable def order,
 /// so one static's initializer can name a later static (`static S: &[u8] = &A;`
@@ -9800,9 +9799,20 @@ fn static_defs(p: &Program, slots: &[u32]) -> String {
     let mut pre = static_decls(p);
     let mut out = String::new();
     let mut cx = kconst::StaticCx::default();
-    for (i, st) in p.statics.iter().enumerate().filter(|&(i, _)| p.static_live(i)) {
+    // Release C numbers the `thread_local!` keys' slot words 1, 2, .. by symbol:
+    // collect numbers them in static order, which a persistent session keeps in
+    // history order. Only this unit holds the words (bodies pass a key's address).
+    let order = statics_in_order(p);
+    let tls_word: HashMap<usize, crate::ty::consteval::ConstValue> = if names::release() {
+        order.iter().filter(|&&i| p.statics[i].tls.is_some()).enumerate().map(|(n, &i)| (i, crate::ty::consteval::ConstValue::Int(n as i128 + 1))).collect()
+    } else {
+        HashMap::new()
+    };
+    for i in order {
+        let st = &p.statics[i];
         let ct = cty(&p.tys, st.ty);
-        let init = const_init(p, &st.value, &ct, &mut pre, &mut cx, slots, Some(&static_pos(p, i as u32)));
+        let value = tls_word.get(&i).unwrap_or(&st.value);
+        let init = const_init(p, value, &ct, &mut pre, &mut cx, slots, Some(&static_pos(p, i as u32)));
         let _ = writeln!(out, "{} {} = {init};", ctype(&ct), static_sym(p, i as u32));
     }
     // Tentative definitions of the path-named promoted values first: one
@@ -9831,10 +9841,8 @@ fn static_decls(p: &Program) -> String {
 /// Extern declarations of the statics at `keep` indices, for function units.
 fn static_decls_for(p: &Program, keep: &HashSet<usize>) -> String {
     let mut out = String::new();
-    for (i, st) in p.statics.iter().enumerate() {
-        if keep.contains(&i) && p.static_live(i) {
-            let _ = writeln!(out, "extern {} {};", ctype(&cty(&p.tys, st.ty)), static_sym(p, i as u32));
-        }
+    for i in statics_in_order(p).into_iter().filter(|i| keep.contains(i)) {
+        let _ = writeln!(out, "extern {} {};", ctype(&cty(&p.tys, p.statics[i].ty)), static_sym(p, i as u32));
     }
     out
 }
@@ -10046,6 +10054,9 @@ pub fn fn_unit_parts(
         }
         inl.extend(more);
     }
+    // The inline definitions in fn id order: slot order carries a persistent
+    // session's history, and its units are a one-shot build's.
+    inl.sort_by_cached_key(|&s| names::fn_tag_opt(s as u32));
     // The termination entry below names main's return type directly.
     // Declare it in this unit even when main's cached `FnOut` predates
     // the return-type edit (a warm unit must not name an undeclared
