@@ -30,6 +30,12 @@
 # builds and runs each: stdout, exit status and normalized stderr must equal both lust runs,
 # and fewer than `--rustc-run-min` judged states (rustc run timeouts are unjudged) fails.
 #
+# Restart mode (FUZZ_RESTART=1): no daemon. Every warm request is its own one-shot process
+# with a front image (LUST_FRONT_STATE, src/image.rs), so each starts from the session the
+# request before it saved: the daemon's incremental paths across a process exit. A daemon
+# restart deletes the image (the next warm request is cold). The run fails on a failed save,
+# and when no warm request restored at all.
+#
 # Usage:
 #   fuzz.py run --edits 2000 --seed 7 --crate small|small2|small3|realish|multi|multi2|multi3|patchseq [--modules 40] [--strict]
 #   fuzz.py replay --prev A.rs --cur B.rs
@@ -407,9 +413,30 @@ class Harness:
         self.log = open(self.logpath, "w")
         self.daemon = None
         self.rss_peak, self.rss_bad = 0.0, ""
+        # Restart mode: warm requests are one-shots on a front image.
+        self.state = os.path.join(self.work, "front-state")
+        self.restored, self.warm_reqs, self.not_saved = 0, 0, []
+        if RESTART:
+            self.env = dict(self.env, LUST_NO_DAEMON="1", LUST_FRONT_STATE=self.state, LUST_FRONT_STATE_VERBOSE="1")
+            self.env.pop("LUST_DAEMON_SOCKET", None)
         self.start_daemon()
 
+    def restart_result(self):
+        """Restart mode: prints the restore count; 1 on a failed save or
+        when no warm request restored (the mode tested nothing)."""
+        if not RESTART:
+            return 0
+        print(f"restart: {self.restored} of {self.warm_reqs} warm requests restored a front image", flush=True)
+        for line in self.not_saved[:5]:
+            print(f"FAIL {line}", flush=True)
+        return 1 if self.not_saved or (self.warm_reqs > 1 and self.restored == 0) else 0
+
     def start_daemon(self):
+        if RESTART:
+            # A fresh warm session: the next warm request is cold.
+            shutil.rmtree(self.state, ignore_errors=True)
+            self._rss_n, self._rss_warm = 0, 0.0
+            return
         if os.path.exists(self.sock):
             os.unlink(self.sock)
         # Own session, so kill_daemon can take down the whole group: an
@@ -431,6 +458,8 @@ class Harness:
             time.sleep(0.005)
 
     def kill_daemon(self):
+        if RESTART:
+            return
         # start_new_session made the daemon its group's leader, so the group id is its pid.
         # os.getpgid fails once poll() has reaped a dead daemon, and a fork child it left
         # (an in-memory run) would keep the socket lock and block the next daemon.
@@ -459,6 +488,14 @@ class Harness:
                              text=True, start_new_session=True)
         try:
             out, err = p.communicate(timeout=self.timeout if timeout is None else timeout)
+            if RESTART and use_daemon:
+                # The image lines are the harness's, not the answer's.
+                self.warm_reqs += 1
+                lines = err.splitlines(keepends=True)
+                image = [l for l in lines if l.startswith("lust: front state")]
+                self.restored += any(l.startswith("lust: front state restored") for l in image)
+                self.not_saved += [l.strip() for l in image if l.startswith("lust: front state not saved")]
+                err = "".join(l for l in lines if not l.startswith("lust: front state"))
             return (p.returncode, out, err)
         except subprocess.TimeoutExpired:
             try:
@@ -476,7 +513,7 @@ class Harness:
             f.write(text)
 
     def daemon_alive(self):
-        return self.daemon.poll() is None
+        return RESTART or self.daemon.poll() is None
 
     # Daemon RSS bound (fx-oraclemem): once a daemon has served RSS_WARM edits, its RSS may
     # grow to at most RSS_GROW times that value plus RSS_SLACK_MB. A per-request leak fails
@@ -493,6 +530,8 @@ class Harness:
 
     def rss_mb(self):
         """The daemon's resident set in MB (0 when it is gone)."""
+        if RESTART:
+            return 0.0
         try:
             with open(f"/proc/{self.daemon.pid}/status") as f:
                 kb = next(int(l.split()[1]) for l in f if l.startswith("VmRSS:"))
@@ -587,6 +626,9 @@ class Harness:
             print(f"kept work dir {self.work} (daemon log: {self.logpath})")
         else:
             shutil.rmtree(self.work, ignore_errors=True)
+
+
+RESTART = os.environ.get("FUZZ_RESTART", "") not in ("", "0")
 
 
 def compare(h, cmd, strict):
@@ -1417,6 +1459,7 @@ def cmd_run(a):
         guard = h.guard_count()
         failures = sig_result(h, ext, failures)
         failures += h.rss_result()
+        failures += h.restart_result()
         failures += rs.judge(a.out)
         failures += rr.judge(a.out)
         print(f"RESULT seed={a.seed} crate={a.crate} modules={a.modules} edits={a.edits} "
@@ -1908,6 +1951,7 @@ def cmd_run_multi(a, rename=False, feat3=False):
         guard = h.guard_count()
         failures = sig_result(h, ext, failures)
         failures += h.rss_result()
+        failures += h.restart_result()
         print(f"RESULT seed={a.seed} crate={a.crate} edits={a.edits} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(ops))
@@ -2416,6 +2460,7 @@ def cmd_run_patchseq(a):
         guard = h.guard_count()
         failures = sig_result(h, ext, failures)
         failures += h.rss_result()
+        failures += h.restart_result()
         print(f"RESULT seed={a.seed} crate=patchseq edits={steps} failures={failures} "
               f"guard_fired={guard} wall={time.time() - t0:.0f}s")
         print("ops:", dict(Counter(k.split(":")[-1] for k in ops.elements())))

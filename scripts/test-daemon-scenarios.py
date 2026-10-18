@@ -6,8 +6,15 @@
 # docs/ARCH.md 8.1-8.3 (const/static values from const fns, consts in
 # patterns, derived impls under type edits, layout answers in bodies).
 #
+# Restart mode (DAEMON_SCENARIO_RESTART=1): no daemon; every warm request
+# is its own one-shot process with a front image (LUST_FRONT_STATE, a state
+# dir per scenario, src/image.rs), so each version's check and run start
+# from the session the request before them saved: the daemon's incremental
+# paths across a process exit. Same comparisons as daemon mode.
+#
 # Usage: python3 scripts/test-daemon-scenarios.py [scenario ...]
-# Env: LUST_BIN (default target/release/lust), DAEMON_SCENARIO_JOBS.
+# Env: LUST_BIN (default target/release/lust), DAEMON_SCENARIO_JOBS,
+# DAEMON_SCENARIO_RESTART.
 # Exit 0 = pass, 1 = a mismatch, 2 = setup error.
 import os, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ProcessPoolExecutor
@@ -16,12 +23,39 @@ import oracle_log  # scripts/oracle_log.py
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUST = os.environ.get("LUST_BIN", os.path.join(ROOT, "target/release/lust"))
 SCEN = os.path.join(ROOT, "tests/daemon")
+RESTART = os.environ.get("DAEMON_SCENARIO_RESTART", "") not in ("", "0")
 
 
 def run(cmd, cwd, env, timeout=60):
     # errors="replace": a wrong program may print bytes that are not UTF-8.
     r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=timeout)
     return r.returncode, r.stdout, r.stderr
+
+
+def cold_of(env):
+    """The env of a cold request: no daemon, and no front image."""
+    cold = dict(env, LUST_NO_DAEMON="1")
+    cold.pop("LUST_FRONT_STATE", None)
+    cold.pop("LUST_FRONT_STATE_VERBOSE", None)
+    return cold
+
+
+def warm_problems(tag, err, first):
+    """Restart mode: every warm request but the first must start from the
+    image the one before it saved (`restored`), unless the crate selection
+    changed (one image holds one session; a daemon keeps one per
+    selection); a failed save is a failure too. An oracle failure answers
+    as an internal error there, as in a daemon."""
+    if not RESTART:
+        return []
+    lines = [l.strip() for l in err.splitlines() if l.startswith("lust: front state")]
+    out = [f"{tag}: {l[:300]}" for l in lines if l.startswith("lust: front state not saved")]
+    load = next((l for l in lines if l.startswith("lust: front state restored") or l.startswith("lust: front state cold")), None)
+    if load is None:
+        out.append(f"{tag}: no front state line in the warm request")
+    elif not first and "restored" not in load and "another crate selection" not in load:
+        out.append(f"{tag}: warm request did not restore: {load[:300]}")
+    return out
 
 
 def first_code(stderr):
@@ -82,13 +116,15 @@ def cargo_scenario(srcdir, name, work, env, daemon):
         cmd = vcmd or cmd
         root, flags = cmd[0], ["--manifest-path", "Cargo.toml"] + cmd[1:]
         wenv = dict(env, **venv)
-        cenv = dict(wenv, LUST_NO_DAEMON="1")
+        cenv = cold_of(wenv)
         tag = f"{name} {v}"
         wkc, _, wkerr = run([LUST, "check", root, *flags], work, wenv)
+        problems.extend(warm_problems(tag, wkerr, v == versions[0]))
         ckc, _, ckerr = run([LUST, "check", root, *flags], work, cenv)
         if (wkc == 0) != (ckc == 0) or first_code(wkerr) != first_code(ckerr):
             problems.append(f"{tag}: warm check != cold check: warm rc={wkc} {wkerr[:200]!r}, cold rc={ckc} {ckerr[:200]!r}")
         wrc, wout, werr = run([LUST, "run", root, *flags, "-o", os.path.join(work, "w.bin")], work, wenv)
+        problems.extend(warm_problems(tag, werr, False))
         crc, cout, cerr = run([LUST, "run", root, *flags, "-o", os.path.join(work, "c.bin")], work, cenv)
         if (wrc, wout, first_code(werr)) != (crc, cout, first_code(cerr)):
             problems.append(f"{tag}: warm != cold: warm=({wrc},{wout!r},{werr[:200]!r}) cold=({crc},{cout!r},{cerr[:200]!r})")
@@ -172,13 +208,21 @@ def scenario(srcdir):
     env.pop("LUST_NO_DAEMON", None)
     oracle_path = oracle_log.setup(env, work)
     log = open(os.path.join(work, "daemon.log"), "w")
-    daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=dict(env, **daemon_env(srcdir)), stderr=log,
-                              start_new_session=True)
+    if RESTART:
+        # Warm requests: one-shot processes on the scenario's front image.
+        # The daemon-only env applies to them; cold ones stay plain.
+        daemon = None
+        env = dict(env, **daemon_env(srcdir), LUST_FRONT_STATE=os.path.join(work, "front-state"), LUST_FRONT_STATE_VERBOSE="1")
+        env.pop("LUST_DAEMON_SOCKET", None)
+        env["LUST_NO_DAEMON"] = "1"
+    else:
+        daemon = subprocess.Popen([LUST, "daemon"], cwd=work, env=dict(env, **daemon_env(srcdir)), stderr=log,
+                                  start_new_session=True)
     main = os.path.join(work, "main.rs")
     problems, notes = [], []
     try:
         t0 = time.time()
-        while not os.path.exists(sock):
+        while daemon is not None and not os.path.exists(sock):
             if time.time() - t0 > 10 or daemon.poll() is not None:
                 return name, [f"{name}: daemon start failed"], notes
             time.sleep(0.005)
@@ -229,7 +273,7 @@ def scenario(srcdir):
             ops = open(ops_path).read().split() if os.path.isfile(ops_path) else ["check", "run"]
             if "check" in ops:
                 wkc, _, wkerr = run([LUST, "check", main], work, wenv)
-            cold_env = dict(wenv, LUST_NO_DAEMON="1")
+            cold_env = cold_of(wenv)
             ckc, _, ckerr = run([LUST, "check", main], work, cold_env)
             if "check" not in ops:
                 wkc, wkerr = ckc, ckerr
@@ -248,6 +292,10 @@ def scenario(srcdir):
             if rustc_ok:
                 rrc, rout, _ = run([os.path.join(work, "r.bin")], work, wenv)
             tag = f"{name} {v}"
+            if "check" in ops:
+                problems.extend(warm_problems(tag + " check", wkerr, v == versions[0]))
+            if "run" in ops:
+                problems.extend(warm_problems(tag + " run", werr, v == versions[0] and "check" not in ops))
             if (wrc == 0) != (crc == 0) or (wrc == 0 and wout != cout) or first_code(werr) != first_code(cerr):
                 problems.append(
                     f"{tag}: warm != cold: warm=({wrc},{wout!r},{werr[:160]!r}) "
@@ -283,11 +331,12 @@ def scenario(srcdir):
     finally:
         # Every scenario, cargo mode too (the returned tuple holds this same list).
         log.flush()
-        problems.extend(guard_problems(os.path.join(work, "daemon.log"), name))
-        try:
-            os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
-        except Exception:
-            daemon.terminate()
+        if daemon is not None:
+            problems.extend(guard_problems(os.path.join(work, "daemon.log"), name))
+            try:
+                os.killpg(os.getpgid(daemon.pid), signal.SIGTERM)
+            except Exception:
+                daemon.terminate()
         log.close()
         # Under LUST_CHECK_ITEMPATCH=1 a scenario the oracle never checked
         # fails (the returned tuple holds this same list).
@@ -355,7 +404,7 @@ def main():
     jobs = int(os.environ.get("DAEMON_SCENARIO_JOBS", "8"))
     with ProcessPoolExecutor(max_workers=jobs) as pool:
         results = list(pool.map(scenario, dirs))
-    if not names:
+    if not names and not RESTART:
         results.append(rebuilt_binary())
         dirs.append(None)
     results.sort()
@@ -369,7 +418,7 @@ def main():
                 print(f"FAIL {p}")
         else:
             print(f"ok   {name}" + (f" ({len(ns)} unsupported version(s))" if ns else ""))
-    print(f"daemon scenarios: {len(dirs) - bad}/{len(dirs)} ok"
+    print(f"daemon scenarios{' (restart)' if RESTART else ''}: {len(dirs) - bad}/{len(dirs)} ok"
           + (f", {notes} unsupported version(s)" if notes else ""))
     return 1 if bad else 0
 
