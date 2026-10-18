@@ -1163,7 +1163,7 @@ fn region_free_get(tys: &impl TyIntern, t: Ty) -> Option<Ty> {
 }
 
 /// `GlobalTys::region_free_args` without interning.
-fn region_free_args_get(tys: &impl TyIntern, args: ArgsId) -> Option<ArgsId> {
+pub(crate) fn region_free_args_get(tys: &impl TyIntern, args: ArgsId) -> Option<ArgsId> {
     let old = tys.args(args);
     let new: Option<Vec<GenericArg>> = old
         .iter()

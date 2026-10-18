@@ -316,6 +316,64 @@ fn main() {{
 '''
 
 
+def lifetime_variants(swap):
+    """Two instances of `M` that differ only in lifetimes share one C type,
+    named by the variant registered first (`register_adt_instance`): one
+    body names the `'a` variants as local types, another calls a method
+    on the `'static` ones (which makes them as its instance's owner). A
+    build that makes a request's instance before an earlier body's turn
+    (c847cb8b6, reverted) registers them in another order than an image
+    build: the C name moved (tsgo replay states 9-11). `swap` puts the
+    two bodies the other way round."""
+    first = """#[inline(never)]
+fn first<'a>(r: Rc<dyn Tr + 'a>, s: &'a str) -> u32 {
+    let m: M<Rc<dyn Tr + 'a>> = M { t: r, n: 5 };
+    let w: M<&'a str> = M { t: s, n: 1 };
+    m.n + m.t.v() + w.n + w.t.len() as u32
+}
+"""
+    second = """#[inline(never)]
+fn second(r: Rc<dyn Tr>, s: &'static str) -> u32 {
+    let m = M { t: r, n: 7 };
+    let w = M { t: s, n: 2 };
+    m.get() + w.get()
+}
+"""
+    a, b = (second, first) if swap else (first, second)
+    return """use std::rc::Rc;
+
+trait Tr {
+    fn v(&self) -> u32;
+}
+
+struct K(u32);
+
+impl Tr for K {
+    fn v(&self) -> u32 {
+        self.0
+    }
+}
+
+struct M<T> {
+    t: T,
+    n: u32,
+}
+
+impl<T> M<T> {
+    #[inline(never)]
+    fn get(&self) -> u32 {
+        self.n
+    }
+}
+
+""" + a + "\n" + b + """
+fn main() {
+    let k: Rc<dyn Tr> = Rc::new(K(3));
+    println!("{} {}", first(k.clone(), "abc"), second(k, "de"));
+}
+"""
+
+
 def corpus():
     """(name, [sources]) of every sequence."""
     seqs = [
@@ -352,6 +410,7 @@ def corpus():
                     "    A.with(|a| a.set(a.get() + 5));\n    AA.with(|a| a.set(a.get() * 3));\n    println!(\"{} {}\", A.with(|a| a.get()), AA.with(|a| a.get()));"),
         ]),
     ]
+    seqs.append(("lifetime-variant-order", [lifetime_variants(False), lifetime_variants(True), lifetime_variants(False)]))
     seqs.append(("llvm-helper-only-edit", [helper_edit("v1", 1), helper_edit("v2-label", 1), helper_edit("v2-label", 3)]))
     seqs.append(("remove-impl-pgo", [shapes(True), shapes(False), shapes(True)], {"pgo": True}))
     dt = os.path.join(ROOT, "tests/daemon/dt01_deep_type_edits")

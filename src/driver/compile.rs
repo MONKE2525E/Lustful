@@ -524,11 +524,17 @@ fn wipe_slot(caches: &mut Caches, s: usize) {
 /// id (`A<id>`), so cached C of a generic program is reusable only while
 /// every id it was made under names the same instance. Ids are session
 /// places (`collect::InstOrder`), so a new instance keeps the others' ids.
+/// The key is of the instance's region-free args: instances that differ
+/// only in lifetimes share one C type (`GlobalTys::register_adt_instance`),
+/// whose Adt is the variant registered first, which an image build and a
+/// one-shot build may make in another order; its name must not depend on
+/// which one that was.
 fn inst_adt_ids(p: &collect::Program) -> Vec<(u32, u64)> {
     let mut out = Vec::new();
     for (a, inst) in p.gx.adt_instance_of.iter().enumerate() {
         if let Some((def, args)) = inst {
-            out.push((a as u32, p.instance_key_hash(&crate::driver::graph::InstanceKey { def: *def, args: *args }).0));
+            let args = crate::ty::region_free_args_get(&p.tys, *args).unwrap_or(*args);
+            out.push((a as u32, p.instance_key_hash(&crate::driver::graph::InstanceKey { def: *def, args }).0));
         }
     }
     out
