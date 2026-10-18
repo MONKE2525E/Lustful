@@ -182,6 +182,10 @@ pub struct LineIndex {
     /// Empty for an ASCII file with no tab. Panic locations count columns
     /// as rustc does, in display width (`display_col`).
     wide: Vec<(u32, i32)>,
+    /// Prefix sums of `wide`'s widths: `wide_sum[i]` is the sum of the
+    /// first `i` entries, so a column's extra width is one subtraction
+    /// (a generated line can hold thousands of wide chars).
+    wide_sum: Vec<i32>,
 }
 
 /// Appends the `LineIndex::wide` entries of `text`, which starts at byte `base`.
@@ -207,7 +211,17 @@ impl LineIndex {
         starts.extend(src.match_indices('\n').map(|(i, _)| i as u32 + 1));
         let mut wide = Vec::new();
         wide_chars(src, 0, &mut wide);
-        LineIndex { starts, wide }
+        LineIndex::with_wide(starts, wide)
+    }
+    fn with_wide(starts: Vec<u32>, wide: Vec<(u32, i32)>) -> LineIndex {
+        let mut wide_sum = Vec::with_capacity(wide.len() + 1);
+        wide_sum.push(0);
+        let mut acc = 0i32;
+        for &(_, d) in &wide {
+            acc += d;
+            wide_sum.push(acc);
+        }
+        LineIndex { starts, wide, wide_sum }
     }
     /// The index after an edit replaced `old[a..old_b]` with `new[a..new_b]`: line starts before
     /// the edit are kept, starts inside it are recomputed, and starts after it are shifted.
@@ -224,7 +238,7 @@ impl LineIndex {
         wide_chars(&new[a..new_b], a, &mut wide);
         let after = self.wide.partition_point(|&(o, _)| (o as usize) < old_b);
         wide.extend(self.wide[after..].iter().map(|&(o, d)| ((o as i64 + delta) as u32, d)));
-        LineIndex { starts, wide }
+        LineIndex::with_wide(starts, wide)
     }
 
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
@@ -238,7 +252,7 @@ impl LineIndex {
         let start = self.starts[line as usize - 1];
         let lo = self.wide.partition_point(|&(o, _)| o < start);
         let hi = self.wide.partition_point(|&(o, _)| o < offset);
-        let extra: i32 = self.wide[lo..hi].iter().map(|&(_, d)| d).sum();
+        let extra: i32 = self.wide_sum[hi] - self.wide_sum[lo];
         (line, (col as i32 + extra).max(1) as u32)
     }
 }
