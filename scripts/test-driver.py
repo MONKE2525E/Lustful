@@ -60,8 +60,8 @@
 #      shadows a name an unchanged nested fn calls rechecks it.
 #  19. stable instance Adt ids: a new instance first in discovery and a
 #      new struct regenerate only the edited fn; a restart builds no unit.
-#  20. user trait impl edits leave the full generic path (ImplSet reads);
-#      a lang trait impl edit still takes it.
+#  20. user trait impl edits leave the full generic path (ImplSet reads),
+#      and so does a lang trait impl edit (LangImpls reads).
 #  21. plain inherent impl edits leave it too (MethodSet reads); an
 #      inherent impl with an associated const still takes it.
 #  22. std modules in a dependency: edits in a source dependency add
@@ -952,8 +952,9 @@ def case_user_trait_impl_edits():
     # records an `ImplSet` read of the bucket it searched. An added unused
     # impl rechecks no template and discovers almost nothing again; a used
     # one, a removed one, and an impl that starts to override a default
-    # method answer as cold. A lang trait impl edit still takes the full
-    # generic path (every template check runs again).
+    # method answer as cold. A lang trait impl edit leaves the full path
+    # too: the bodies whose types name the impl's Adt record `LangImpls`
+    # reads, and an impl for an unused type rechecks almost nothing.
     work = tempfile.mkdtemp(prefix="lust-driver-user-impls-")
     d = Daemon(work)
     src = os.path.join(work, "x.rs")
@@ -973,7 +974,7 @@ def case_user_trait_impl_edits():
         ("default method overridden", (base + impl_b).replace("fn go(&self) -> i64 { 2 }\n}", "fn go(&self) -> i64 { 2 }\n    fn dflt(&self) -> i64 { 7 }\n}").replace("    //MAIN\n", "    println!(\"{}\", generic(&B));\n"), None),
         ("used impl removed", base.replace("impl Tr for A {\n    fn go(&self) -> i64 { 1 }\n}\n", ""), None),
         ("back", base, None),
-        ("lang trait impl", base + "impl Clone for B {\n    fn clone(&self) -> B { B }\n}\n", "full"),
+        ("lang trait impl", base + "impl Clone for B {\n    fn clone(&self) -> B { B }\n}\n", "few"),
     ]
 
     def cold(text):

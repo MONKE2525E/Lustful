@@ -5037,7 +5037,7 @@ pub fn collect_reuse(
     let mut top_hashes: HashMap<ast::BlockId, crate::def::DefPathHash> = HashMap::default();
     // The trait of each trait impl, by item index, for the trait-system
     // key (`gen_reuse::trait_key`).
-    let mut impl_traits: HashMap<usize, DefId> = HashMap::default();
+    let mut impl_traits: HashMap<usize, (DefId, bool)> = HashMap::default();
     for (item_idx, item) in ast.items.iter().enumerate() {
         match &item.kind {
             ItemKind::Fn(def) => {
@@ -5180,7 +5180,7 @@ pub fn collect_reuse(
                         let cx = p.gx.resolve_cx_in(&p.type_names, &p.aliases, std);
                         match generics::resolve_trait_ref(ast, interner, known, &cx, &mut p.tys, &impl_scope, self_pat, tref, imp.span) {
                             Ok(tr) => {
-                                impl_traits.insert(item_idx, tr.def);
+                                impl_traits.insert(item_idx, (tr.def, p.lang_keyed_impl(&tr)));
                                 Some(tr)
                             }
                             Err(d) => {

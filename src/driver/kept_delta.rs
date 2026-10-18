@@ -483,7 +483,9 @@ impl Touched {
             ReadKey::Binding(b) => matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d)),
             ReadKey::Checked(_) => true,
             ReadKey::ImplSet(s) => traits.contains(&s.trait_),
-            ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => false,
+            // A header delta refuses impl methods of std and lang traits
+            // (`generics::delta_impl_trait`), so no `LangImpls` read moves.
+            ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::LangImpls(_) => false,
         }
     }
 }

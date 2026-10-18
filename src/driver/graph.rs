@@ -203,6 +203,16 @@ pub enum ReadKey {
     /// derivable trait's selection) records their bits
     /// (check/derive_delta.rs `bit`). The fingerprint is those flags.
     DeriveBits(DefId, u16),
+    /// The written impls of std and lang traits (traits outside `ImplSet`
+    /// reads) whose trait refs name one user Adt template
+    /// (`ImplIndex::impls_naming`). Format glue, `?`, `for` loops,
+    /// operators, conversions, `Deref`, and drop glue look these impls up
+    /// with no `ImplSet` read, always for a type the body names; so a body
+    /// records this read for each Adt its types name
+    /// (`record_type_lang_reads`), and for each Adt of such an impl the
+    /// index hands out (traits/index.rs `get`). The fingerprint is the
+    /// impls' content (`lang_impls_fingerprint`).
+    LangImpls(DefId),
 }
 
 /// One recorded read: the fingerprint the node had when it was read, and
@@ -565,7 +575,7 @@ fn ty_fingerprint(p: &Program, t: Ty) -> Fingerprint {
 /// the caller dedups through its cycle stack). FnDef, Closure, Opaque,
 /// and Projection defs are not Adt layouts and do not appear here: their
 /// content is covered by their own `Sig` nodes when a body reads them.
-fn collect_adt_defs(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<DefId>) {
+pub(crate) fn collect_adt_defs(p: &Program, tys: &impl TyIntern, t: Ty, out: &mut Vec<DefId>) {
     fn args(p: &Program, tys: &impl TyIntern, a: ArgsId, out: &mut Vec<DefId>) {
         for a in tys.args(a) {
             if let GenericArg::Ty(t) = a {
@@ -778,6 +788,32 @@ pub(crate) fn hash_ty_deep(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t
     hash_ty_refs(h, p, tys, t, &mut |h, def| adt_deep(p, Deep::Layout, def, memo).hash(h));
 }
 
+/// Folds the written `Drop` and auto trait (`Send`, `Sync`, `Unpin`)
+/// impls of Adt `def` into `h`: their headers and bounds, in a stable
+/// order. Whether a type needs drop and which auto traits it has follow
+/// its fields, so these impls reach every type that holds this one, as
+/// its fields do. The other written impls of std and lang traits are
+/// `LangImpls` reads of the bodies whose types name the Adt.
+fn hash_structural_impls(h: &mut FxHasher, p: &Program, def: DefId) {
+    let lang = &p.gx.lang;
+    let mut impls: Vec<u64> = p
+        .gx
+        .index
+        .impls_naming(def)
+        .map(|id| p.gx.index.peek(id))
+        .filter(|rec| rec.trait_def == lang.drop || lang.is_auto(rec.trait_def))
+        .map(|rec| {
+            let mut h = FxHasher::default();
+            hash_trait_ref(&mut h, p, &p.tys, &rec.trait_ref);
+            hash_generics(&mut h, p, &rec.generics);
+            h.finish()
+        })
+        .collect();
+    impls.sort_unstable();
+    "structural-impls-v1".hash(h);
+    impls.hash(h);
+}
+
 /// The deep fingerprint of one Adt in one walk: its own content
 /// (`hash_adt_layout` or `hash_adt_regions`), where each Adt it names
 /// folds in as that Adt's deep fingerprint. Adts that name each other
@@ -923,6 +959,9 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(
             }
         }
     }
+    // Its written `Drop` and auto trait impls: drop glue and auto traits
+    // of every type that holds this one read them.
+    hash_structural_impls(h, p, def);
     // A generic Adt's parameters and bounds: a bound edit changes what
     // every use of the type must prove (generic reuse, W-PERF).
     if let Some(g) = p.gx.adt_generics.get(a.0 as usize) {
@@ -980,6 +1019,122 @@ fn derive_bits_fingerprint(p: &Program, def: DefId, mask: u16) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// The `LangImpls(def)` node's fingerprint: the shape (`lang_impl_shape`)
+/// of each written std or lang trait impl whose trait ref names the Adt
+/// template `def`, in a stable order, or a fixed value when there is none.
+fn lang_impls_fingerprint(p: &Program, def: DefId) -> Fingerprint {
+    let mut impls: Vec<(u64, u64, u64)> = p
+        .gx
+        .index
+        .impls_naming(def)
+        .map(|id| p.gx.index.peek(id))
+        .map(|rec| (def_crate_hash(p, rec.trait_def), rec.trait_def.hash.0, lang_impl_shape(p, rec)))
+        .collect();
+    impls.sort_unstable();
+    let mut h = FxHasher::default();
+    "lang-impls-v2".hash(&mut h);
+    impls.hash(&mut h);
+    Fingerprint(h.finish())
+}
+
+/// One written std or lang trait impl as `LangImpls` reads see it, with no
+/// deep walk: the trait ref, generics and bounds, associated type and
+/// const bindings, the regioned header, and each item's name and
+/// signature. Types fold shallow (`hash_ty`: defs in stable form, regions
+/// included); a body that reads deeper into a named type records a `Sig`
+/// or `Layout` read of its own. Items fold by name, so an impl added
+/// before this one (which moves its items' def hashes) leaves it alone.
+fn lang_impl_shape(p: &Program, rec: &crate::traits::index::ImplRecord) -> u64 {
+    let tys = &p.tys;
+    let mut h = FxHasher::default();
+    "lang-impl-shape-v1".hash(&mut h);
+    hash_trait_ref(&mut h, p, tys, &rec.trait_ref);
+    hash_generics(&mut h, p, &rec.generics);
+    (rec.assoc_tys.len() as u64).hash(&mut h);
+    for (d, t) in &rec.assoc_tys {
+        hash_def_pub(&mut h, p, *d);
+        hash_ty(&mut h, p, tys, *t);
+    }
+    (rec.assoc_consts.len() as u64).hash(&mut h);
+    for (d, c) in &rec.assoc_consts {
+        hash_def_pub(&mut h, p, *d);
+        hash_const(&mut h, tys, *c);
+    }
+    if let Some(ir) = p.regions.impl_regions.get(&rec.def) {
+        1u8.hash(&mut h);
+        for &t in ir.header.iter().chain(ir.assoc.iter().map(|(_, t)| t)) {
+            hash_ty(&mut h, p, tys, t);
+        }
+        ir.facts.hash(&mut h);
+        (ir.preds.len() as u64).hash(&mut h);
+        for pred in &ir.preds {
+            hash_predicate(&mut h, p, tys, pred);
+        }
+    }
+    if let Some(head) = p.regions.impl_heads.get(&rec.def) {
+        2u8.hash(&mut h);
+        hash_ty(&mut h, p, tys, head.self_ty);
+        for &r in &head.trait_lifetimes {
+            hash_region(&mut h, r);
+        }
+        for w in &head.where_lts {
+            w.param.hash(&mut h);
+            hash_def_pub(&mut h, p, w.trait_def);
+            for &r in &w.lifetimes {
+                hash_region(&mut h, r);
+            }
+        }
+    }
+    (rec.items.len() as u64).hash(&mut h);
+    for &d in &rec.items {
+        let Some(l) = p.local_def(d.hash).filter(|l| p.def_id(*l) == d) else {
+            hash_def_pub(&mut h, p, d);
+            continue;
+        };
+        let f = p.fn_info(l);
+        p.name(f.name).hash(&mut h);
+        match f.self_kind {
+            None => 0u8.hash(&mut h),
+            Some(SelfKind::Value) => 1u8.hash(&mut h),
+            Some(SelfKind::Ref) => 2u8.hash(&mut h),
+            Some(SelfKind::RefMut) => 3u8.hash(&mut h),
+            Some(SelfKind::Typed) => 4u8.hash(&mut h),
+        }
+        (f.params.len() as u64).hash(&mut h);
+        for &t in &f.params {
+            hash_ty(&mut h, p, tys, t);
+        }
+        hash_ty(&mut h, p, tys, f.ret);
+        let def = f.def(&p.ast);
+        (def.qual.is_const, def.qual.is_async, def.qual.is_unsafe, def.variadic).hash(&mut h);
+        crate::check::caller::is_track_caller(p, l).hash(&mut h);
+        match p.gx.fn_templates.get(l.0 as usize) {
+            Some(Some(t)) => hash_generics(&mut h, p, &t.generics),
+            _ => u64::MAX.hash(&mut h),
+        }
+        match p.regions.fns.get(&l) {
+            Some(rs) => {
+                1u8.hash(&mut h);
+                rs.n_univ.hash(&mut h);
+                for &t in rs.params.iter().chain(std::iter::once(&rs.ret)).chain(&rs.header) {
+                    hash_ty(&mut h, p, tys, t);
+                }
+                for &(a, b) in &rs.facts {
+                    hash_region(&mut h, a);
+                    hash_region(&mut h, b);
+                }
+                rs.early.hash(&mut h);
+                (rs.bounds.len() as u64).hash(&mut h);
+                for pred in &rs.bounds {
+                    hash_predicate(&mut h, p, tys, pred);
+                }
+            }
+            None => 0u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
 /// The `LayoutOf(adt)` node's fingerprint (section 8.1), separate from
 /// `Sig`: it covers only what layout and value semantics read (see
 /// `hash_adt_layout`), so an edit that changes a type's methods or a
@@ -1007,6 +1162,8 @@ fn hash_regions_deep(h: &mut FxHasher, p: &Program, t: Ty, memo: &mut DeepMemo) 
 fn hash_adt_regions(h: &mut FxHasher, p: &Program, def: DefId, r: &mut dyn FnMut(&mut FxHasher, DefId)) {
     "adt-regions-v2".hash(h);
     hash_def_pub(h, p, def);
+    // A `Drop` impl moves borrow ends and drop order.
+    hash_structural_impls(h, p, def);
     (p.gx.adt_lifetimes.get(&def).map_or(0, |v| v.len()) as u64).hash(h);
     p.regions.adt_facts.get(&def).hash(h);
     // Its regioned trait bounds (tf-borrow r9): building a value replays them.
@@ -1258,7 +1415,7 @@ fn impl_set_fingerprint(p: &Program, key: &ImplSetKey, set: &ImplSet) -> Fingerp
 /// const bindings, and each item's def and signature. Method bodies are
 /// not in it (each is its own fn, checked on its own).
 fn impl_content(p: &Program, def: DefId) -> u64 {
-    let Some((_, rec)) = p.gx.index.by_def(def) else { return 0 };
+    let Some(rec) = p.gx.index.peek_def(def) else { return 0 };
     let mut h = FxHasher::default();
     "impl-content-v1".hash(&mut h);
     hash_trait_ref(&mut h, p, &p.tys, &rec.trait_ref);
@@ -1907,6 +2064,69 @@ impl<'a> Program {
         reads.record_with(ReadKey::DeriveBits(def, mask), self.adt_by_def(def).is_none(), || derive_bits_fingerprint(self, def, mask));
     }
 
+    /// Records a `LangImpls` read of the Adt template `def`.
+    pub(crate) fn record_lang_impls(&self, reads: &mut Reads, def: DefId) {
+        reads.record_with(ReadKey::LangImpls(def), self.gx.index.impls_naming(def).next().is_none(), || lang_impls_fingerprint(self, def));
+    }
+
+    /// Records a `LangImpls` read of each user Adt template that the
+    /// types `types` name, arguments included (one body's expression,
+    /// pattern, and local types): a lookup of a std or lang trait impl for
+    /// one of them, found or not, is a read of that Adt's impls.
+    pub fn record_type_lang_reads(&self, reads: &mut Reads, tys: &impl TyIntern, types: impl IntoIterator<Item = Ty>) {
+        if reads.off {
+            return;
+        }
+        let mut seen: FxMap<Ty, ()> = FxMap::default();
+        let mut defs: Vec<DefId> = Vec::new();
+        for t in types {
+            if seen.insert(t, ()).is_none() {
+                collect_adt_defs(self, tys, t, &mut defs);
+            }
+        }
+        defs.sort_unstable_by_key(|d| (d.krate.0, d.hash.0));
+        defs.dedup();
+        for def in defs {
+            if self.user_adt(def) {
+                self.record_lang_impls(reads, def);
+            }
+        }
+    }
+
+    /// True for an Adt template of user source: not spliced std source,
+    /// not a shipped crate, not a builtin def. Only these key
+    /// `LangImpls` reads (`ImplIndex::name_adts`): no user impl of a std
+    /// trait can name only std types.
+    pub(crate) fn user_adt(&self, def: DefId) -> bool {
+        self.adt_by_def(def).is_some_and(|a| {
+            let span = self.adts[a.0 as usize].span;
+            !self.std_source_span(span) && self.shipped_crate_at(span).is_none()
+        })
+    }
+
+    /// The user Adt templates (`user_adt`) the trait ref arguments `args`
+    /// name: the Adts a written impl's `LangImpls` reads key on.
+    pub(crate) fn lang_named_adts(&self, args: crate::ty::ArgsId) -> Vec<DefId> {
+        let mut defs = Vec::new();
+        for a in self.tys.args(args) {
+            if let GenericArg::Ty(t) = *a {
+                collect_adt_defs(self, &self.tys, t, &mut defs);
+            }
+        }
+        defs.retain(|&d| self.user_adt(d));
+        defs.sort_unstable_by_key(|d| (d.krate.0, d.hash.0));
+        defs.dedup();
+        defs
+    }
+
+    /// True for a written impl with trait ref `tr` that `LangImpls` reads
+    /// cover in place of the trait-system key (gen_reuse.rs `trait_key`):
+    /// a std or lang trait (not local, no `ImplSet` reads) and a user Adt
+    /// in the trait ref.
+    pub(crate) fn lang_keyed_impl(&self, tr: &TraitRef) -> bool {
+        !self.impls_read_covered(tr.def) && !self.gx.index.trait_record(tr.def).is_some_and(|r| r.local) && !self.lang_named_adts(tr.args).is_empty()
+    }
+
     /// True for a trait whose impls fill `ImplSet` buckets, and so stay out
     /// of the trait-system key (`gen_reuse::trait_key`): a user trait (a
     /// trait item of this crate) with no associated const. A `<T as K>::C`
@@ -2058,6 +2278,9 @@ impl<'a> Program {
             ReadKey::Derives(def) => Read { fingerprint: derives_fingerprint(self, *def), failed: self.adt_by_def(*def).is_none() },
             ReadKey::DeriveBits(def, mask) => {
                 Read { fingerprint: derive_bits_fingerprint(self, *def, *mask), failed: self.adt_by_def(*def).is_none() }
+            }
+            ReadKey::LangImpls(def) => {
+                Read { fingerprint: lang_impls_fingerprint(self, *def), failed: self.gx.index.impls_naming(*def).next().is_none() }
             }
         }
     }
@@ -2283,6 +2506,8 @@ impl Program {
         let reach = m.reach;
         match key {
             ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) => self.adt_by_def(*d).is_none_or(|a| reach.row(self, a.0 as usize)) || self.hasher_reaches(m, *d),
+            // Impl shapes fold types shallow: no derive list.
+            ReadKey::LangImpls(_) => false,
             ReadKey::Sig(def) => self.sig_moves(m, *def),
             ReadKey::Binding(k) => match self.binding_res(k.module, k.ns, k.name) {
                 BindingRes::Def(def) => self.sig_moves(m, def),
@@ -2366,6 +2591,7 @@ impl Program {
                 Some(_) => m.sig.get(d).copied(),
             },
             ReadKey::ImplSet(_) => None,
+            ReadKey::LangImpls(_) => Some(false),
         }
     }
 

@@ -3515,6 +3515,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         caches.glue_stale = true;
     }
     let gen_ok = gen_ok_here && !caches.gen_reuse.trait_changed && !derives_moved;
+    // A std or lang trait impl edit moves no trait-system key: bodies read
+    // those impls (`ReadKey::LangImpls`). Derived and drop glue read them
+    // with no read, so the next build regenerates the glue (once:
+    // `glue_stale` holds until a build does).
+    if std::mem::take(&mut caches.gen_reuse.lang_changed) {
+        caches.glue_stale = true;
+    }
     if gen_ok_here && !gen_ok {
         visits.generic = if caches.gen_reuse.trait_changed { "trait_key" } else { "derives" };
     }

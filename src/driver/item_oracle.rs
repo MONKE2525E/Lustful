@@ -96,6 +96,8 @@ fn err_keys(ds: &[Diag]) -> Vec<ErrKey> {
 pub(crate) struct Digest {
     defs: FxMap<DefId, DefFacts>,
     impl_sets: FxMap<(DefId, Head), Fingerprint>,
+    /// Each user Adt's written std and lang trait impls (`LangImpls`).
+    lang_impls: FxMap<DefId, Fingerprint>,
     hidden: FxMap<DefId, u64>,
     /// Each Adt instance's type (deep hash), in creation order: a kept
     /// program must hold the instances a cold collect makes.
@@ -126,6 +128,9 @@ impl Digest {
             }
             d.names.insert(def, format!("type {}", p.interner.get(p.adts[a].name)));
             d.defs.insert(def, DefFacts { sig: sig(def), layout: Some(layout(def)), class: None });
+            if p.user_adt(def) {
+                d.lang_impls.insert(def, p.read_fingerprint(&ReadKey::LangImpls(def)).fingerprint);
+            }
         }
         for rec in p.gx.index.trait_records() {
             d.names.insert(rec.def, format!("trait {}", p.interner.get(rec.name)));
@@ -185,6 +190,12 @@ impl Digest {
                 .filter(|k| !cold.impl_sets.contains_key(k))
                 .map(|k| format!("impl set of {} for {:?} only in warm", name(&k.0), k.1)),
         );
+        for (d, c) in &cold.lang_impls {
+            if self.lang_impls.get(d) != Some(c) {
+                out.push(format!("std and lang trait impls of {}", name(d)));
+            }
+        }
+        out.extend(self.lang_impls.keys().filter(|d| !cold.lang_impls.contains_key(d)).map(|d| format!("std and lang trait impls of {} only in warm", name(d))));
         if self.instances != cold.instances {
             let at = self.instances.iter().zip(&cold.instances).position(|(a, b)| a != b);
             let same_set = self.instances.iter().all(|h| cold.instances.contains(h)) && cold.instances.iter().all(|h| self.instances.contains(h));

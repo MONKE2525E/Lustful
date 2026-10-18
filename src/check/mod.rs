@@ -25013,6 +25013,14 @@ impl<'p> Ctx<'p> {
                 }
             }
         }
+        // The written std and lang trait impls this body's types can
+        // select: format glue, `?`, `for` loops, operators, conversions,
+        // and drop glue look them up with no `ImplSet` read
+        // (`ReadKey::LangImpls`).
+        let (p, out) = (self.p, &mut self.out);
+        let site_tys = out.generic_site_args.iter().flat_map(|(_, _, args)| args.iter().filter_map(|g| g.as_ty()));
+        let tys = out.expr_ty.iter().chain(&out.pat_ty).copied().chain(out.locals.iter().map(|l| l.ty)).chain(site_tys);
+        p.record_type_lang_reads(&mut out.reads, &self.tys, tys);
     }
 
     fn has_error_kind(&self, t: Ty) -> bool {

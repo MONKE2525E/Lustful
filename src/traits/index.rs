@@ -256,6 +256,14 @@ pub struct ImplIndex {
     /// their ids and slots, but no bucket, trait list, def lookup, or
     /// `all_impls` walk sees them, as if collect had never made them.
     dead: Vec<bool>,
+    /// The written impls of traits outside `ImplSet` reads (std and lang
+    /// traits) by the Adt templates their trait refs name (Self pattern
+    /// and trait arguments; `name_adts`), and each such impl's Adts, by
+    /// impl id. A body records a `LangImpls` read of an Adt its types
+    /// name, and of each Adt of such an impl that `get` hands out
+    /// (driver/graph.rs `ReadKey::LangImpls`).
+    by_adt: FxMap<DefId, Vec<ImplId>>,
+    names: Vec<Vec<DefId>>,
 }
 
 impl ImplIndex {
@@ -349,6 +357,29 @@ impl ImplIndex {
         id
     }
 
+    /// Records that the written impl `id` of a trait outside `ImplSet`
+    /// reads names the Adt templates `adts` in its trait ref (collect,
+    /// right after `insert_impl`).
+    pub fn name_adts(&mut self, id: ImplId, adts: &[DefId]) {
+        let i = id.0 as usize;
+        if self.names.len() <= i {
+            self.names.resize_with(i + 1, Vec::new);
+        }
+        for &a in adts {
+            let list = self.by_adt.entry(a).or_default();
+            if !list.contains(&id) {
+                list.push(id);
+                self.names[i].push(a);
+            }
+        }
+    }
+
+    /// The live impls whose trait ref names the Adt template `adt`
+    /// (`name_adts`), in insert order.
+    pub fn impls_naming(&self, adt: DefId) -> impl Iterator<Item = ImplId> + '_ {
+        self.by_adt.get(&adt).into_iter().flatten().copied().filter(|id| !self.dead[id.0 as usize])
+    }
+
     /// The derived record of trait `trait_def` for the Adt template
     /// `adt`, alive or dead (None: collect never made one).
     pub fn derived_record(&self, adt: DefId, trait_def: DefId) -> Option<ImplId> {
@@ -400,11 +431,16 @@ impl ImplIndex {
     }
 
     /// One impl record by id. Handing out a derived record notes a read
-    /// of its trait in its Adt's derive list (check/derive_delta.rs).
+    /// of its trait in its Adt's derive list (check/derive_delta.rs); a
+    /// written impl of a std or lang trait notes a `LangImpls` read of
+    /// each Adt it names (`name_adts`).
     pub fn get(&self, id: ImplId) -> &ImplRecord {
         let rec = &self.impls[id.0 as usize];
         if let (Synthetic::Derive(_, bit), SelfHead::Adt(def)) = (rec.synthetic, rec.head) {
             crate::check::derive_delta::note_def(def, bit);
+        }
+        if let Some(adts) = self.names.get(id.0 as usize) {
+            crate::check::derive_delta::note_defs(adts, crate::check::derive_delta::bit::LANG);
         }
         rec
     }
@@ -416,6 +452,12 @@ impl ImplIndex {
     /// A record the scan goes on to use comes from `get`.
     pub fn peek(&self, id: ImplId) -> &ImplRecord {
         &self.impls[id.0 as usize]
+    }
+
+    /// One impl record by its def, with no note (see `peek`): for
+    /// fingerprints, which a body records while its scope is open.
+    pub fn peek_def(&self, def: DefId) -> Option<&ImplRecord> {
+        self.by_def.get(&def).map(|&id| &self.impls[id.0 as usize])
     }
 
     /// One impl record by its def.

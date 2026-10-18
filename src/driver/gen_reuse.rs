@@ -267,6 +267,11 @@ pub struct GenReuse {
     /// one of them moved (`values_moved`), before any entry is used.
     pub values_check: Option<crate::driver::graph::ConstValuesFp>,
     pub values_moved: bool,
+    /// The key of the std and lang trait impls the trait-system key
+    /// leaves to `LangImpls` reads (`TraitKey::lang`), and whether this
+    /// collect moved it: the driver then regenerates the glue.
+    lang_key: Option<u64>,
+    pub lang_changed: bool,
     /// True once this collect reached `gate`.
     gated: bool,
     /// The defs whose stored entry read each node a header delta can move
@@ -410,6 +415,8 @@ impl GenReuse {
         }
         self.trait_key = Some(key.system);
         self.derive_key = Some(key.derives);
+        self.lang_changed = self.lang_key != Some(key.lang);
+        self.lang_key = Some(key.lang);
         self.gated = true;
     }
 
@@ -421,6 +428,9 @@ impl GenReuse {
     pub fn forget_failed_gate(&mut self) {
         if self.gated && self.trait_changed {
             self.trait_key = None;
+        }
+        if self.gated && self.lang_changed {
+            self.lang_key = None;
         }
         if let Some((t, c)) = self.prev_outs.take() {
             (self.tpl_out, self.closure_out) = (t, c);
@@ -825,7 +835,7 @@ impl GenReuse {
                     }
                     ReadKey::Checked(_) => add(ReaderKey::Checked),
                     ReadKey::ImplSet(k) => add(ReaderKey::Trait(k.trait_)),
-                    ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) => {}
+                    ReadKey::Layout(_) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::LangImpls(_) => {}
                 }
             }
             n
@@ -971,6 +981,9 @@ pub struct TraitKey {
     pub system: u64,
     /// The derive list of each Adt that has one.
     pub derives: u64,
+    /// The written std and lang trait impls that name a user Adt, which
+    /// `system` leaves out (`trait_key`).
+    pub lang: u64,
 }
 
 /// The trait-system key (see the module docs): trait items (default
@@ -986,7 +999,15 @@ pub struct TraitKey {
 /// signature. For the same reason an inherent impl with associated items
 /// and no `dyn` Self joins without its methods (the header delta,
 /// driver/kept_delta.rs, keeps the key through their head edits).
-pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> TraitKey {
+///
+/// A positive written impl of a std or lang trait whose trait ref names a
+/// user Adt (`impl_traits` flags it, `Program::lang_keyed_impl`) is left
+/// out too: every body whose types name that Adt records a `LangImpls`
+/// read of its impls (driver/graph.rs), the index notes the same read
+/// when it hands the impl out, and its `Drop` and auto trait facts fold
+/// into the Adt's deep layout. Those impls make the `lang` key, which
+/// only refreshes glue (compile.rs).
+pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool)>) -> TraitKey {
     use crate::ast::{ItemKind, TyExpr};
     let user_trait = |d: &DefId| p.impls_read_covered(*d);
     let plain_inherent = |imp: &crate::ast::ImplDef| {
@@ -996,9 +1017,15 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> TraitKey {
     "trait-system-v3".hash(&mut h);
     let mut dh = FxHasher::default();
     "derives-v1".hash(&mut dh);
+    let mut lh = FxHasher::default();
+    "lang-impls-v1".hash(&mut lh);
     for (i, item) in p.ast.items.iter().enumerate() {
         let derives = match &item.kind {
-            ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(user_trait) => continue,
+            ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(|(d, _)| user_trait(d)) => continue,
+            ItemKind::Impl(imp) if !imp.is_negative && impl_traits.get(&i).is_some_and(|&(_, keyed)| keyed) => {
+                crate::driver::ast_hash::item_hash(&p.ast, item).hash(&mut lh);
+                continue;
+            }
             ItemKind::Impl(imp) if plain_inherent(imp) => continue,
             ItemKind::Impl(imp) if imp.trait_ref.is_none() && !matches!(p.ast.ty(imp.self_ty), TyExpr::Dyn { .. }) => {
                 let bare = crate::ast::Item { kind: ItemKind::Impl(crate::ast::ImplDef { fns: Vec::new(), ..imp.clone() }), ..item.clone() };
@@ -1024,7 +1051,7 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, DefId>) -> TraitKey {
             p.interner.get(*d).hash(&mut dh);
         }
     }
-    TraitKey { system: h.finish(), derives: dh.finish() }
+    TraitKey { system: h.finish(), derives: dh.finish(), lang: lh.finish() }
 }
 
 /// A check's read set plus a `Sig` read of the checked fn itself: a body

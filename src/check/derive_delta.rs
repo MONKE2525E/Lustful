@@ -46,6 +46,9 @@ pub(crate) mod bit {
     pub(crate) const ORD: u16 = 1 << 7;
     pub(crate) const DEFAULT: u16 = 1 << 8;
     pub(crate) const ALL: u16 = (1 << 9) - 1;
+    /// No derive trait: a read of the written std and lang trait impls
+    /// that name the Adt (traits/index.rs `get`, `ReadKey::LangImpls`).
+    pub(crate) const LANG: u16 = 1 << 15;
 }
 
 /// The derive bit of lang trait `tr`, or 0 for a trait no derive makes.
@@ -75,6 +78,15 @@ pub(crate) fn note_def(def: DefId, mask: u16) {
             l.push((def, mask));
         }
     });
+}
+
+/// `note_def` for each of `defs` with one mask (the index's `LangImpls`
+/// notes), with one scope test for all.
+pub(crate) fn note_defs(defs: &[DefId], mask: u16) {
+    if defs.is_empty() || !open() {
+        return;
+    }
+    LOG.with(|l| l.borrow_mut().extend(defs.iter().map(|&d| (d, mask))));
 }
 
 /// Notes a read of the derive traits `mask` of Adt `a` (its template's,
@@ -128,13 +140,17 @@ pub(crate) fn scoped<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<(DefId, u16)
 }
 
 /// Records one read per noted def into `reads`: `Derives` for a reader of
-/// the whole list, else `DeriveBits` of the traits it asked.
+/// the whole list, else `DeriveBits` of the traits it asked; and
+/// `LangImpls` for a def noted with `bit::LANG`.
 pub(crate) fn record(p: &Program, reads: &mut Reads, noted: &[(DefId, u16)]) {
     for &(def, mask) in noted {
-        if mask == bit::ALL {
-            p.record_derives(reads, def);
-        } else {
-            p.record_derive_bits(reads, def, mask);
+        if mask & bit::LANG != 0 {
+            p.record_lang_impls(reads, def);
+        }
+        match mask & !bit::LANG {
+            0 => {}
+            bit::ALL => p.record_derives(reads, def),
+            m => p.record_derive_bits(reads, def, m),
         }
     }
 }

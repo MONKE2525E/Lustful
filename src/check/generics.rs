@@ -7652,6 +7652,10 @@ pub fn finish_trait_impl(
         return;
     };
     let items: Vec<DefId> = method_ids.iter().map(|&id| p.def_id(id)).collect();
+    // A std or lang trait impl: the user Adts its trait ref names key the
+    // `LangImpls` reads of the bodies that can select it
+    // (`ImplIndex::name_adts`).
+    let named: Vec<DefId> = if p.impls_read_covered(tr.def) { Vec::new() } else { p.lang_named_adts(tr.args) };
     let impl_id = p.gx.index.insert_impl(ImplRecord {
         def: impl_def,
         trait_def: tr.def,
@@ -7666,6 +7670,7 @@ pub fn finish_trait_impl(
         head,
         blanket,
     });
+    p.gx.index.name_adts(impl_id, &named);
     // The orphan rule (section 2.3). Std source impls are std's own;
     // std source module types are foreign to user impls (W-STD-C).
     if !p.std_source_span(imp.span) {
