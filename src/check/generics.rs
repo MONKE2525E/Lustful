@@ -8613,28 +8613,21 @@ fn validate_method_sig(
                 })
                 .collect();
             let goal = TraitRef { def: b.value.def, args: p.tys.intern_args(&goal_args), bindings: b.value.bindings };
-            // A bound over concrete types only that holds outright
-            // (`where u8: Copy`) needs no implication from the
-            // trait. The pure solver has no records for the derive
-            // family's scalar impls, so those answer by structure.
+            // A bound over concrete types only (`where i64: Default`)
+            // holds or fails for every caller alike, so it needs no
+            // implication from the trait. `check_wf_item` proves it
+            // later, when the solver has the std scalar impls (here,
+            // in collect, the derive family's scalar impls are not
+            // there yet), and rejects one that does not hold
+            // (`where String: Copy`, L0612).
             let concrete = goal_args.iter().all(|g| match g {
                 GenericArg::Ty(t) => !p.tys.flags(*t).contains_param() && !p.tys.flags(*t).contains_infer(),
                 _ => true,
             });
-            let outright = concrete
-                && goal_args.first().and_then(|g| g.as_ty()).is_some_and(|t| {
-                    let lang = &p.gx.lang;
-                    if goal.def == lang.copy {
-                        crate::check::collect::is_copy(p, &p.tys, t)
-                    } else if goal.def == lang.clone {
-                        crate::check::collect::has_clone(p, &p.tys, t)
-                    } else if goal.def == lang.debug {
-                        crate::check::collect::has_debug(p, &p.tys, t)
-                    } else {
-                        false
-                    }
-                });
-            if !outright && !prove_goal(p, &env, goal) && !prove_goal(p, &[], goal) {
+            if concrete {
+                continue;
+            }
+            if !prove_goal(p, &env, goal) && !prove_goal(p, &[], goal) {
                 let gname = p.gx.index.trait_record(goal.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
                 errs.push(Diag::new(
                     "L0110",
@@ -14214,6 +14207,28 @@ fn wf_fn_item(p: &mut Program, i: usize) -> Option<WfItem> {
     Some((at(tys, span), at(values, span), generics, span))
 }
 
+/// `dst: From<src>` or `src: Into<dst>` between scalar types (`where
+/// i64: From<u8>`). Core writes these with macros, and the pure solver
+/// has no records for them; `Ctx::numeric_from_ok` is core's exact table.
+fn scalar_conversion_holds(p: &Program, tr: TraitRef) -> bool {
+    let args = p.tys.args(tr.args);
+    let (Some(a), Some(b)) = (args.first().and_then(|g| g.as_ty()), args.get(1).and_then(|g| g.as_ty())) else {
+        return false;
+    };
+    let (ak, bk) = (p.tys.kind(a), p.tys.kind(b));
+    let scalar = |k: &TyKind| matches!(k, TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_));
+    if !scalar(&ak) || !scalar(&bk) {
+        return false;
+    }
+    if tr.def == p.gx.lang.from {
+        crate::check::Ctx::numeric_from_ok(bk, ak)
+    } else if tr.def == p.gx.lang.into {
+        crate::check::Ctx::numeric_from_ok(ak, bk)
+    } else {
+        false
+    }
+}
+
 /// `check_written_wf` for one fn only: a signature delta runs it for
 /// the fn it edited (`delta_audit::redo_sig`).
 pub(crate) fn check_fn_wf(p: &mut Program, f: LocalDefId, errs: &mut Vec<Diag>) {
@@ -14288,7 +14303,7 @@ fn check_wf_item(p: &mut Program, adt_idx: &FxMap<DefId, usize>, (tys, values, g
             .iter()
             .filter_map(|g| g.as_ty())
             .any(|t| (0..n_params).any(|i| ty_uses_param(&p.tys, t, i) || ty_uses_const_param(&p.tys, t, i)));
-        if !mentions_param && !prove_goal(p, &[], b.value) {
+        if !mentions_param && !prove_goal(p, &[], b.value) && !scalar_conversion_holds(p, b.value) {
             let gname = p.gx.index.trait_record(b.value.def).map_or_else(|| "?".to_string(), |r| p.display_path(r.name));
             errs.push(Diag::new(
                 "L0612",
