@@ -1249,6 +1249,64 @@ fn scalar_lit(bits: u128, size: u64, signed: bool) -> String {
 /// (`Program::record_type_layout_reads`), while its C reads a field at an
 /// offset or its LLVM IR gives the pointee's size (`dereferenceable`).
 fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
+    let tag = LAYOUT_PHASE.with(std::cell::Cell::get);
+    if tag != 0
+        && let Some(hit) = LAYOUTS.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 != tag {
+                *c = (tag, crate::intern::FxMap::default());
+            }
+            c.1.get(t).cloned()
+        })
+    {
+        return hit;
+    }
+    let l = c_layout_walk(p, t);
+    if tag != 0 {
+        LAYOUTS.with(|c| c.borrow_mut().1.insert(t.clone(), l.clone()));
+    }
+    l
+}
+
+thread_local! {
+    /// The codegen phase this thread works in (`in_layout_phase`), or 0.
+    static LAYOUT_PHASE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This thread's `c_layout` answers in that phase, by C type.
+    static LAYOUTS: std::cell::RefCell<(u64, crate::intern::FxMap<CTy, Option<Layout>>)> = std::cell::RefCell::new((0, crate::intern::FxMap::default()));
+}
+
+/// A new codegen phase (`in_layout_phase`): one program, frozen while it
+/// runs.
+pub fn layout_phase() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs `f` in codegen phase `tag`: `c_layout` keeps its answers on this
+/// thread for the rest of the phase. A layout is a function of the
+/// program and the C type, and the program does not change in a phase
+/// (the driver's codegen of every body); outside one, nothing is kept.
+pub fn in_layout_phase<R>(tag: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LAYOUT_PHASE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(LAYOUT_PHASE.with(|c| c.replace(tag)));
+    f()
+}
+
+/// This thread's layout of `t` in its codegen phase, when one was found.
+fn phase_layout(t: &CTy) -> Option<Layout> {
+    if LAYOUT_PHASE.with(std::cell::Cell::get) == 0 {
+        return None;
+    }
+    LAYOUTS.with(|c| c.borrow().1.get(t).cloned().flatten())
+}
+
+/// `c_layout` without the phase cache.
+fn c_layout_walk(p: &Program, t: &CTy) -> Option<Layout> {
     /// The Adts on the walk (a by-value cycle has no layout) and the
     /// finished ones.
     #[derive(Default)]
@@ -1378,6 +1436,11 @@ fn c_layout(p: &Program, t: &CTy) -> Option<Layout> {
             CTy::Adt(a) => {
                 if let Some(l) = seen.done.get(a) {
                     return Some(l.clone());
+                }
+                // An Adt's layout, once found, holds in any walk of this
+                // phase (`c_layout`); a cycle's None depends on the walk.
+                if let Some(l) = phase_layout(t) {
+                    return Some(l);
                 }
                 if !seen.on.insert(*a) {
                     return None;

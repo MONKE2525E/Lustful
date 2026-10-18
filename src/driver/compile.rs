@@ -4276,9 +4276,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // variants): its notes join the slot's read set below, as the check's
     // do (check/derive_delta.rs), so a derive edit regenerates just the
     // slots that read the list.
+    // One codegen phase: `c_layout` keeps its answers per thread.
+    let layout_tag = cgen::layout_phase();
     let (outs, cg_noted): (Vec<_>, Vec<_>) = par_map(&bodies, |(i, b)| {
         check::derive_delta::scoped(program.record_reads, || {
-            cgen::names::with(rn, || cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot))
+            cgen::in_layout_phase(layout_tag, || {
+                cgen::names::with(rn, || cgen::gen_fn(&program, b, &map, line_base_of(front, *i), &front.fn_slot))
+            })
         })
     })
     .into_iter()
