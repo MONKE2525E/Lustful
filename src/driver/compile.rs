@@ -177,6 +177,71 @@ impl Timer {
     }
 }
 
+/// The release driver's cc step, parked by `compile` for an image run (`main::image_run`
+/// turns `defer_cc` on for its last release build when the image saves in the background).
+/// The run forks the image save first and then runs this step, so the image is written while
+/// clang runs: after a merge, a new base took 11-21 s inside a CI job, after the artifact.
+pub struct DeferredCc {
+    job: Box<dyn FnOnce() -> Result<String, String>>,
+    t: Timer,
+    /// The build's summary line up to the cc summary.
+    head: String,
+    timings: bool,
+}
+
+enum Parked {
+    Job(DeferredCc),
+    /// The step ran: its exit code and the lines the build prints after it.
+    Done(i32, String),
+}
+
+thread_local! {
+    static DEFER_CC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PARKED: std::cell::RefCell<Option<Parked>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Turns on or off the parking of the next release build's cc step (`DeferredCc`).
+pub fn defer_cc(on: bool) {
+    DEFER_CC.with(|d| d.set(on));
+}
+
+/// Runs a parked cc step now: an image save that cannot fork writes after it.
+pub fn finish_parked_cc() {
+    PARKED.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(Parked::Job(job)) = p.take() {
+            let DeferredCc { job, mut t, head, timings } = job;
+            *p = Some(match job() {
+                Ok(summary) => {
+                    t.lap("cc compile + link");
+                    let mut out = String::new();
+                    if timings {
+                        let _ = writeln!(out, "{head}{summary})");
+                        t.render(&mut out);
+                    }
+                    Parked::Done(0, out)
+                }
+                Err(e) => Parked::Done(3, format!("error: {e}\n")),
+            });
+        }
+    });
+}
+
+/// Drops a parked cc step: the image save's forked child, so the step's unit texts are
+/// not live blocks of the image it writes.
+pub fn drop_parked_cc() {
+    PARKED.with(|p| drop(p.borrow_mut().take()));
+}
+
+/// The parked cc step's exit code and output, running it first if it has not run.
+pub fn parked_cc_result() -> Option<(i32, String)> {
+    finish_parked_cc();
+    PARKED.with(|p| match p.borrow_mut().take() {
+        Some(Parked::Done(code, out)) => Some((code, out)),
+        _ => None,
+    })
+}
+
 /// True when `LUST_STATS` is set to a value other than "" or "0". Stats go
 /// to stderr as one `lust-stats:` line per compile; the scale gate
 /// (scripts/scale-gate.py) parses them. Off by default: user output does
@@ -4723,7 +4788,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
             }
         }
-        let built = crate::cc::spec_for(triple).and_then(|spec| {
+        let prepared = crate::cc::spec_for(triple).and_then(|spec| {
             // Release C (`LUST_RELEASE_C=1`) already holds the content-addressed units.
             let mut all: Vec<(String, String)> = if rgroups.is_some() {
                 // An LLVM companion keeps its `.ll` name (cc.rs pairs it with its C unit).
@@ -4763,9 +4828,28 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if let Some(parent) = req.out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }
-            let cache = crate::driver::cache::Cache::open(&req.file);
-            crate::cc::build(&all, &spec, &req.out, req.debug, cache.as_ref(), &dir.join("cc"))
+            Ok((all, spec, crate::driver::cache::Cache::open(&req.file)))
         });
+        let (all, spec, cache) = match prepared {
+            Ok(x) => x,
+            Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
+        };
+        let (out, debug, cc_dir) = (req.out.clone(), req.debug, dir.join("cc"));
+        let job = move || crate::cc::build(&all, &spec, &out, debug, cache.as_ref(), &cc_dir);
+        if DEFER_CC.with(std::cell::Cell::get) && !leak_at_exit {
+            // Parked for the caller (`DeferredCc`): the session is final before it, as after
+            // a build that links.
+            caches.objects = Some(req.debug);
+            caches.overlays.clear();
+            caches.base_units = groups.len();
+            drop((bodies, units));
+            program.verified = verified;
+            super::patch::keep(front, program);
+            let head = format!("lust build {path}: ok (cc {triple}: ");
+            PARKED.with(|p| *p.borrow_mut() = Some(Parked::Job(DeferredCc { job: Box::new(job), t, head, timings: req.timings })));
+            return resp;
+        }
+        let built = job();
         t.lap("cc compile + link");
         match built {
             Ok(summary) => {

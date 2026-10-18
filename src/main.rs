@@ -129,7 +129,8 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     // save; a failed save is always reported.
     let verbose = reqs.iter().any(|r| r.timings) || std::env::var_os("LUST_FRONT_STATE_VERBOSE").is_some_and(|v| v != "0");
     let mut resps = Vec::new();
-    for req in reqs {
+    let background = std::env::var_os(image::SAVE_ENV).is_some_and(|v| v == "background");
+    for (k, req) in reqs.iter().enumerate() {
         let found = sessions.iter().position(|s| s.key == req.session);
         let how = match (&loaded, found) {
             (Ok(()), Some(_)) => format!("restored generation {}", image::generation()),
@@ -146,7 +147,12 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
             eprintln!("lust: release build for {triple} -> {}", req.out.display());
         }
         let session = &mut sessions[i];
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, session))) {
+        // The last release build parks its cc step (`driver::defer_cc`), so the background
+        // save below forks first and writes the image while clang runs.
+        driver::defer_cc(background && req.cc && k + 1 == reqs.len());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver::compile(req, session)));
+        driver::defer_cc(false);
+        match result {
             Ok(mut resp) => {
                 if verbose {
                     use std::fmt::Write as _;
@@ -171,7 +177,6 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     }
     sessions.iter_mut().for_each(|s| s.settle());
     let roots = Box::new(image::Roots { sessions, tables: diag::take_global_tables(), stamps: driver::Stamps::now() });
-    let background = std::env::var_os(image::SAVE_ENV).is_some_and(|v| v == "background");
     let saved = if background { image::save_background(dir, roots) } else { image::save(dir, roots) };
     let line = match saved {
         Ok(line) if verbose => line + "\n",
@@ -180,6 +185,15 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     };
     if let Some(last) = resps.last_mut() {
         last.stderr.push_str(&line);
+    }
+    // The parked cc step: it runs now, while the forked child writes the image.
+    if let Some((code, out)) = driver::parked_cc_result()
+        && let Some(last) = resps.last_mut()
+    {
+        last.stderr.push_str(&out);
+        if code != 0 {
+            last.code = code;
+        }
     }
     resps
 }

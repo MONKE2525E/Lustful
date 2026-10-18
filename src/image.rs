@@ -32,7 +32,9 @@
 //      process-wide tables the session's spans index into
 //      (`diag::GlobalTables`) and the stamp counters ride in `Roots`.
 //      With `LUST_FRONT_SAVE=background` a forked child writes them while
-//      the build answers and exits (`save_background`). Every image
+//      the build answers and exits (`save_background`); a release build
+//      forks it before its cc step (`driver::defer_cc`), so the image is
+//      written while clang runs. Every image
 //      process holds the state directory's lock (`lock`) from before its
 //      load to its exit, a background save's child to the save's end: a
 //      build waits for the save before it, and a release waits for its
@@ -1004,7 +1006,9 @@ fn quiesce() {
 
 /// `save` in a forked child (`LUST_FRONT_SAVE=background`), so the build
 /// answers and exits at once and a release publishes its artifact without
-/// waiting (a base save takes 10-18 s on tsgo). The child is this
+/// waiting (a base save takes 10-18 s on tsgo). A release build's cc step
+/// runs after the fork, in the parent (`driver::defer_cc`), so the save
+/// overlaps clang; the child drops it first. The child is this
 /// process's memory at the fork with this thread alone; it detaches (its
 /// own session, standard streams on /dev/null, so no pipe of the caller
 /// waits for it), holds the state lock until it exits (`lock`), and
@@ -1032,6 +1036,9 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
                 dup2(null.as_raw_fd(), fd);
             });
         }
+        // The parent runs a parked cc step after the fork (`driver::defer_cc`): its unit
+        // texts are freed here, so they are not live blocks of the image.
+        crate::driver::drop_parked_cc();
         let line = write_image(dir, roots).unwrap_or_else(|e| format!("lust: front state not saved: {e}"));
         let _ = std::fs::write(&log, line + "\n");
         // SAFETY: ends the child now; the parent's exit handlers and
@@ -1039,6 +1046,8 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
         unsafe { _exit(0) }
     }
     if pid < 0 {
+        // No child: a parked cc step runs first, so its unit texts are freed before the save.
+        crate::driver::finish_parked_cc();
         return write_image(dir, roots);
     }
     std::mem::forget(roots);
