@@ -1718,6 +1718,15 @@ impl<'a> Parser<'a> {
                 self.cfg_attr_grammar(start, body_start, body_end)?;
                 continue;
             }
+            // Rust 2024 unsafe attributes (`#[unsafe(no_mangle)]`): lust has
+            // no unsafe code, so none of them is supported yet.
+            if path.is_empty() && body.first().map(|t| t.tok) == Some(Tok::Unsafe) && body.get(1).map(|t| t.tok) == Some(Tok::LParen) {
+                let inner = match body.get(2).map(|t| t.tok) {
+                    Some(Tok::Ident(s)) => self.interner.get(s).to_string(),
+                    _ => "..".to_string(),
+                };
+                return Err(not_yet(C_ATTR, start, &format!("the `#[unsafe({inner})]` attribute")));
+            }
             let Some(first) = path.first().map(|s| s.name) else {
                 return Err(syntax(start, "expected an attribute name"));
             };
@@ -3688,6 +3697,8 @@ impl<'a> Parser<'a> {
         match self.toks.get(j).map(|t| t.tok) {
             Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Impl | Tok::Mod | Tok::Trait | Tok::Static | Tok::Type | Tok::Extern) => true,
             Some(Tok::Const) => self.toks.get(j + 1).map(|t| t.tok) != Some(Tok::LBrace),
+            // `union` is a contextual keyword: an item only when a name follows.
+            Some(Tok::Ident(s)) => self.interner.get(s) == "union" && matches!(self.toks.get(j + 1).map(|t| t.tok), Some(Tok::Ident(_))),
             _ => false,
         }
     }

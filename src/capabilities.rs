@@ -1621,7 +1621,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("explicit lifetime turbofish args", "L0731"),
     ("format macros (format_args! and kin) outside expression position", "L0401"),
     ("attributes lust does not know by name (named in the message)", "L0402"),
-    ("known attributes lust does not handle yet, such as `target_feature`, `crate_name` and `no_implicit_prelude` (named in the message)", "L0522"),
+    ("known attributes lust does not handle yet, such as `target_feature`, `crate_name`, `no_implicit_prelude`, and unsafe ones like `#[unsafe(no_mangle)]` (named in the message)", "L0522"),
     ("`deny` and `forbid` of a lint lust does not check (named in the message)", "L0531"),
     ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, and Default (named in the message)", "L0403"),
     ("`unsafe` blocks and functions", "L0404"),
@@ -1661,7 +1661,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("extern blocks", "L0810"),
     ("extern functions", "L0810"),
     ("C string literals", "L0641"),
-    ("unions", "L0602"),
+    ("unions, also inside function bodies", "L0602"),
     ("extern function types", "L0602"),
     ("inferred types (`_`) in signatures", "L0602"),
 ];

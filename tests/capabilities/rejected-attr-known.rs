@@ -1,4 +1,4 @@
-// capability: rejected: known attributes lust does not handle yet, such as `target_feature`, `crate_name` and `no_implicit_prelude` (named in the message)
+// capability: rejected: known attributes lust does not handle yet, such as `target_feature`, `crate_name`, `no_implicit_prelude`, and unsafe ones like `#[unsafe(no_mangle)]` (named in the message)
 // expect: L0522
 
 #[target_feature(enable = "avx2")]

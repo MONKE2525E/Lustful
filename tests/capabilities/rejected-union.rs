@@ -1,4 +1,4 @@
-// capability: rejected: unions
+// capability: rejected: unions, also inside function bodies
 // expect: L0602
 
 union U {
