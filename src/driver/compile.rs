@@ -4690,6 +4690,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             if program.unwind_tables {
                 all.push(("eh.cc".to_string(), include_str!("../runtime/unwind.cc").to_string()));
             }
+            // musl: mimalloc replaces musl's malloc (LUST_RELEASE_ALLOC=system keeps it).
+            if triple.ends_with("-musl")
+                && std::env::var("LUST_RELEASE_ALLOC").as_deref() != Ok("system")
+                && let Some(mi) = crate::cc::mimalloc_unit()
+            {
+                all.push(("mimalloc".to_string(), mi));
+            }
             if let Some(parent) = req.out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }

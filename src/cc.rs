@@ -162,6 +162,14 @@ pub fn cflags(debug: bool) -> String {
     if debug { format!("{base} -g") } else { base.into() }
 }
 
+/// mimalloc as one C unit that replaces malloc and free (`MI_MALLOC_OVERRIDE`): the
+/// allocator of musl release builds, whose own malloc ran tsgo 3.2x slower. Allocation
+/// strategy is not observable. None when the build had no mimalloc source (build.rs).
+pub fn mimalloc_unit() -> Option<String> {
+    let src = include_str!(concat!(env!("OUT_DIR"), "/mimalloc.c"));
+    (!src.is_empty()).then(|| format!("#define MI_MALLOC_OVERRIDE 1\n{src}"))
+}
+
 /// The flags of a `.cc` unit (the runtime's throw and catch).
 pub fn cxxflags(debug: bool) -> String {
     let base = "-O2 -w -fexceptions";

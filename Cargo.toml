@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
+# Direct, for its C source: build.rs amalgamates it for musl release builds (src/cc.rs).
+libmimalloc-sys = { version = "0.1.49", default-features = false }
 
 [profile.release]
 opt-level = 3

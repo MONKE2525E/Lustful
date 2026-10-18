@@ -5,6 +5,38 @@
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+/// Appends `file` to `out` with each `#include` of a file next to it or in `dirs` replaced
+/// by that file's text. Each file goes in once (`seen`): mimalloc's
+/// headers have include guards, so later copies would be empty. False when a file cannot be
+/// read.
+fn inline_includes(file: &Path, dirs: &[PathBuf], seen: &mut Vec<PathBuf>, out: &mut String) -> bool {
+    let Ok(text) = std::fs::read_to_string(file) else { return false };
+    seen.push(file.to_path_buf());
+    for line in text.lines() {
+        // `#include "x"`, or `#include <x>` of a header in `dirs` (mimalloc.h names its own
+        // mimalloc-stats.h that way); system headers stay.
+        let t = line.trim_start();
+        let name = t.strip_prefix("#include \"").and_then(|r| r.split('"').next()).or_else(|| t.strip_prefix("#include <").and_then(|r| r.split('>').next()));
+        let found = name.and_then(|n| {
+            let here = file.parent().map(|d| d.join(n));
+            here.into_iter().chain(dirs.iter().map(|d| d.join(n))).find(|p| p.is_file())
+        });
+        match found {
+            Some(p) if !seen.contains(&p) => {
+                if !inline_includes(&p, dirs, seen, out) {
+                    return false;
+                }
+            }
+            Some(_) => {}
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    true
+}
+
 /// Hashes every file under `dir` (names and bytes, sorted) into `h`.
 fn hash_tree(h: &mut std::collections::hash_map::DefaultHasher, dir: &Path) {
     let mut files: Vec<PathBuf> = Vec::new();
@@ -48,6 +80,16 @@ fn main() {
     println!("cargo:rustc-env=LUST_TCC_BIN={}", tcc.join("bin/tcc").display());
     println!("cargo:rerun-if-env-changed=LUST_TCC_HOME");
     println!("cargo:rerun-if-changed=build.rs");
+    // mimalloc, the allocator of musl release builds (src/cc.rs `mimalloc_unit`): its
+    // static.c with every local include inlined, one C text, from the libmimalloc-sys this
+    // crate builds with. Empty when its include dir is unknown (no unit then).
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let amalg = std::env::var("DEP_MIMALLOC_INCLUDE_DIR").ok().and_then(|inc| {
+        let base = Path::new(&inc).parent()?.to_path_buf();
+        let mut text = String::new();
+        inline_includes(&base.join("src/static.c"), &[base.join("src"), base.join("include")], &mut Vec::new(), &mut text).then_some(text)
+    });
+    std::fs::write(out_dir.join("mimalloc.c"), amalg.unwrap_or_default()).unwrap();
     // Build hash: compiler sources, the shipped library sources (built into
     // the binary by src/stdload.rs, S5), the manifest, and the tcc tree.
     let mut h = std::collections::hash_map::DefaultHasher::new();

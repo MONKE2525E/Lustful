@@ -30,6 +30,10 @@
 #     The filter `unwind-` runs only the tests/unwind cases (their names get that prefix).
 #   EH=1 (with PANIC=unwind or RELEASE=1): lust's C with unwind tables (LUST_UNWIND_TABLES=1),
 #     built by clang -fexceptions (eh_build), in place of the tcc build.
+#   CC_DRIVER=1 (with RELEASE=1): the lust release driver builds each case (cc_build:
+#     lust build --release --target $CC_TARGET, default x86_64-unknown-linux-musl, with the
+#     compiler LUST_CC names), the shipped release path: unwind tables, the musl allocator,
+#     release C and its inline definitions with LUST_RELEASE_C=1.
 #   RELEASE=1 (rustc and lust both -C overflow-checks=off -C debug-assertions=off, a Cargo
 #     release profile's semantics; panics unwind unless PANIC=abort): tests/release/*.rs plus
 #     every tests/pass case (and tests/unwind when panics unwind), compared as in
@@ -182,6 +186,11 @@ eh_build() {
   clang++ -o "$name.lust" "${objs[@]}" -lm -lpthread
 }
 
+# cc_build <fixture> <name>: CC_DRIVER=1, the release driver build of one case (see the header).
+cc_build() {
+  run_lust "$lust" build "$1" --release --target "${CC_TARGET:-x86_64-unknown-linux-musl}" -C "panic=$panic" -o "$2.lust"
+}
+
 # lust_stderr <case file> <lust stderr>: lust's stderr as difftest compares it to rustc's
 # (mask_stderr, the case path as @CASE@). A panic inside lust's shipped std source reports
 # std's own library/ path and line (src/stdloc.rs), so the whole text compares exactly.
@@ -223,7 +232,9 @@ if [ "${PANIC:-abort}" = unwind ] || [ "${RELEASE:-0}" = 1 ]; then
       report bad "$name" "rustc ($mode) rejected it: $(head -3 rustc.err)"; return
     fi
     rs=$(cat rustc.rs)
-    if [ "${EH:-0}" = 1 ]; then
+    if [ "${CC_DRIVER:-0}" = 1 ]; then
+      cc_build "$f" "$name" 2>"$name.lust.err"
+    elif [ "${EH:-0}" = 1 ]; then
       eh_build "$f" "$name" 2>"$name.lust.err"
     else
       run_lust "$lust" build "${lust_flags[@]}" "$f" -o "$name.lust" 2>"$name.lust.err"
