@@ -88,15 +88,22 @@ pub(super) fn apply_derives(
     // Deep Adt fingerprints are kept across the moved keys (the derive
     // lists are final here; the memo goes before any other write).
     p.fp_memo.on(p.adts.len());
+    // The moved fn names and signature answers, made once for every key
+    // test of this delta (and the const body check after it, patch.rs).
+    let tables = {
+        let mut named = crate::driver::graph::DeriveMoves::new(&reach);
+        p.moved_fn_names(&mut named);
+        named.tables().ok_or(("derive names", false))?
+    };
+    caches.derive_tables = Some(tables.clone());
     let (is_dirty, has_checked) = {
         let prog: &Program = p;
         // `named` gives the tables of the parallel classifier; `moves` the
         // walk for the keys it leaves.
-        let mut named = crate::driver::graph::DeriveMoves::new(&reach);
-        prog.moved_fn_names(&mut named);
+        let named = crate::driver::graph::DeriveMoves::with_tables(&reach, tables.clone());
         let quick = named.quick();
         let quick = |k: &crate::driver::graph::ReadKey| quick.as_ref().and_then(|q| prog.derive_key_moves_quick(q, k));
-        let mut moves = crate::driver::graph::DeriveMoves::new(&reach);
+        let mut moves = crate::driver::graph::DeriveMoves::with_tables(&reach, tables.clone());
         crate::driver::laps::mark("kept/derive names");
         let def_slot = |d: crate::def::DefId| prog.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
         let answers = &mut caches.gen_reuse.memo;
@@ -156,7 +163,7 @@ pub(super) fn apply_derives(
     // Without user generics collect runs no template check or discovery
     // (the lang enum methods' generics alone need neither in a check).
     if p.gx.user_generics {
-        let rechecked = match replay_templates(p, front, caches, &reach, keyed, start) {
+        let rechecked = match replay_templates(p, front, caches, &reach, &tables, keyed, start) {
             Ok(r) => r,
             Err(why) => {
             // A parallel template check failed before the replays wrote
@@ -222,7 +229,7 @@ pub(super) fn apply_derives(
             format!("derive clean: not clean: {}\n", parts.join("; "))
         });
         crate::driver::laps::mark("kept/derive clean");
-        let mut moves = crate::driver::graph::DeriveMoves::memoized(&reach);
+        let mut moves = crate::driver::graph::DeriveMoves::with_tables(&reach, tables.clone());
         let mut touched = |p: &Program, k: &crate::driver::graph::ReadKey| !keyed || p.derive_key_moves(&mut moves, k);
         let stands = |g: LocalDefId| clean.get(g.0 as usize).copied().unwrap_or(false);
         super::kept_delta::replay_discovery(p, caches, front.fn_loc.len(), walk_instances, start, &Vec::new(), &mut touched, &stands, None, &rechecked, true)
@@ -350,13 +357,14 @@ fn replay_templates(
     front: &Front,
     caches: &mut Caches,
     reach: &crate::check::derive_delta::Reach,
+    tables: &crate::driver::graph::DeriveTables,
     keyed: bool,
     start: u64,
 ) -> Result<Vec<LocalDefId>, &'static str> {
     let fn_count = front.fn_loc.len();
     // Only a template with no stored reads needs the names (made once).
     let mut names: Option<crate::intern::FxMap<crate::intern::Sym, ()>> = None;
-    let mut moves = crate::driver::graph::DeriveMoves::memoized(reach);
+    let mut moves = crate::driver::graph::DeriveMoves::with_tables(reach, tables.clone());
     let idents = &front.chunks[0].scan.body_idents;
     // The moved keys the stored checks read, fingerprinted once and in
     // parallel into the request's answers (`GenReuse::memo`), which
@@ -366,11 +374,10 @@ fn replay_templates(
         let prog: &Program = p;
         let reuse = &caches.gen_reuse;
         let mut seen: crate::intern::FxMap<crate::driver::graph::ReadKey, ()> = crate::intern::FxMap::default();
-        let keys: Vec<crate::driver::graph::ReadKey> = reuse
-            .template_read_keys()
-            .filter(|k| !reuse.memo.contains_key(*k) && seen.insert(**k, ()).is_none() && prog.derive_key_moves(&mut moves, k))
-            .copied()
-            .collect();
+        let asked: Vec<crate::driver::graph::ReadKey> =
+            reuse.template_read_keys().filter(|k| !reuse.memo.contains_key(*k) && seen.insert(**k, ()).is_none()).copied().collect();
+        let moved = prog.derive_keys_moved(&mut moves, &asked);
+        let keys: Vec<crate::driver::graph::ReadKey> = asked.into_iter().zip(moved).filter(|(_, m)| *m).map(|(k, _)| k).collect();
         let fresh = crate::driver::compile::par_map(&keys, |k| prog.read_fingerprint(k));
         caches.gen_reuse.memo.extend(keys.into_iter().zip(fresh));
         p.fp_memo.off();

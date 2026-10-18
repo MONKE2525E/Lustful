@@ -283,6 +283,9 @@ pub(crate) struct Caches {
     /// Set by a header delta refused because the one edited signature's
     /// own checks fail (`kept_delta::apply`): the errors collect would answer.
     pub(crate) delta_sig_errs: Option<Vec<crate::diag::Diag>>,
+    /// The derive delta's moved fn names and signature answers for this
+    /// request (`kept_derive::apply_derives`), for its const body check.
+    pub(crate) derive_tables: Option<crate::driver::graph::DeriveTables>,
     /// The cached IR body per slot, in the translatable form of
     /// `ir_cache::CachedBody`. Set when the slot's body is lowered;
     /// read when a slot renumber makes its C stale and the C must be
@@ -470,6 +473,7 @@ impl Session {
                 header_moves: None,
                 delta_template_errs: None,
                 delta_sig_errs: None,
+                derive_tables: None,
                 slot_ir: Vec::new(),
                 glue: GlueSet::default(),
                 statics_fp: 0,

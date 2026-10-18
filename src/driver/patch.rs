@@ -2599,7 +2599,19 @@ pub(super) fn reuse_kept(
     if !headers.is_empty() || !derives.is_empty() {
         let mut errs = Vec::new();
         let mut touched = caches.header_moves.as_mut();
-        let mut dmoves = derive_reach.as_ref().map(crate::driver::graph::DeriveMoves::new);
+        // The derive delta's answers for every key the stored sets read, in
+        // parallel from its tables (`derive_keys_moved`).
+        let tables = caches.derive_tables.take();
+        let mut dmoves = derive_reach.as_ref().map(|r| match tables {
+            Some(t) => crate::driver::graph::DeriveMoves::with_tables(r, t),
+            None => crate::driver::graph::DeriveMoves::memoized(r),
+        });
+        if let Some(m) = dmoves.as_mut() {
+            let mut seen: crate::intern::FxMap<crate::driver::graph::ReadKey, ()> = crate::intern::FxMap::default();
+            let keys: Vec<crate::driver::graph::ReadKey> =
+                p.const_body_reads.iter().flat_map(|(_, r)| r.iter().map(|(k, _)| *k)).filter(|k| seen.insert(*k, ()).is_none()).collect();
+            p.derive_keys_moved(m, &keys);
+        }
         let mut moved = |q: &crate::check::collect::Program, k: &crate::driver::graph::ReadKey| {
             touched.as_mut().is_some_and(|t| t.hit(q, k)) || dmoves.as_mut().is_some_and(|m| q.derive_key_moves(m, k))
         };

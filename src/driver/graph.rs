@@ -2836,6 +2836,26 @@ impl<'a> DeriveMoves<'a> {
     pub(crate) fn memoized(reach: &'a crate::check::derive_delta::Reach) -> DeriveMoves<'a> {
         DeriveMoves { keys: Some(FxMap::default()), ..DeriveMoves::new(reach) }
     }
+
+    /// The signature answers and moved fn names this walk made
+    /// (`moved_fn_names`), for a later walk over the same reach in the
+    /// same request (`with_tables`). None before `moved_fn_names`.
+    pub(crate) fn tables(&self) -> Option<DeriveTables> {
+        Some(DeriveTables { sig: self.sig.clone(), names: self.names.clone()? })
+    }
+
+    /// A memoized walk over `reach` that starts from `tables`: the same
+    /// answers as a fresh one, with no signature walked twice.
+    pub(crate) fn with_tables(reach: &'a crate::check::derive_delta::Reach, tables: DeriveTables) -> DeriveMoves<'a> {
+        DeriveMoves { reach, sig: tables.sig, keys: Some(FxMap::default()), names: Some(tables.names), hashers: None }
+    }
+}
+
+/// `DeriveMoves::tables`: what `moved_fn_names` makes for one reach.
+#[derive(Clone, Default)]
+pub(crate) struct DeriveTables {
+    sig: FxMap<DefId, bool>,
+    names: FxMap<Sym, ()>,
 }
 
 impl Program {
@@ -2859,6 +2879,21 @@ impl Program {
             k.insert(*key, b);
         }
         b
+    }
+
+    /// `derive_key_moves` for each of `keys` (distinct): the tables'
+    /// answers (`derive_key_moves_quick`) in parallel, the walk's for the
+    /// keys they leave, all into `m`'s memo when it keeps one.
+    pub(crate) fn derive_keys_moved(&self, m: &mut DeriveMoves, keys: &[ReadKey]) -> Vec<bool> {
+        let quick: Vec<Option<bool>> = match m.quick() {
+            Some(q) => crate::driver::compile::par_map(keys, |k| self.derive_key_moves_quick(&q, k)),
+            None => vec![None; keys.len()],
+        };
+        let out: Vec<bool> = keys.iter().zip(quick).map(|(k, q)| q.unwrap_or_else(|| self.derive_key_moves(m, k))).collect();
+        if let Some(memo) = &mut m.keys {
+            memo.extend(keys.iter().copied().zip(out.iter().copied()));
+        }
+        out
     }
 
     /// `derive_key_moves` without the per-key memo.
