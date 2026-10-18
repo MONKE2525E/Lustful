@@ -4378,6 +4378,25 @@ impl<'p> Lower<'p> {
                     };
                     let ok = bin(self, BinOp::Le, copy_s, Operand::Const(Const::Int(max, IntTy::U128)));
                     (ok, konst(true), None)
+                } else if si.bits() <= 64 {
+                    // In i64 or u64, which hold every source value: the target's bounds
+                    // clamp to that range (a bound outside it always holds).
+                    let wt = if si.signed() { IntTy::I64 } else { IntTy::U64 };
+                    let w = self.temp(int(wt));
+                    self.assign(Place::local(w), Rvalue::Cast(copy_s, int(wt)), span);
+                    let wc = Operand::Copy(Place::local(w));
+                    let (lo, hi): (i128, i128) = if si.signed() { (i64::MIN.into(), i64::MAX.into()) } else { (0, u64::MAX.into()) };
+                    let (min, max): (i128, i128) = if di.signed() {
+                        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+                    } else {
+                        (0, if bits >= 128 { i128::MAX } else { (1i128 << bits) - 1 })
+                    };
+                    let (min, max) = (min.max(lo), max.min(hi));
+                    let ge = bin(self, BinOp::Ge, wc.clone(), Operand::Const(Const::Int(min as u128, wt)));
+                    let le = bin(self, BinOp::Le, wc.clone(), Operand::Const(Const::Int(max as u128, wt)));
+                    let ok = bin(self, BinOp::BitAnd, Operand::Copy(Place::local(ge)), Operand::Copy(Place::local(le)));
+                    let pos = bin(self, BinOp::Gt, wc, Operand::Const(Const::Int(max as u128, wt)));
+                    (ok, Operand::Copy(Place::local(pos)), None)
                 } else {
                     let i128t = int(IntTy::I128);
                     let w = self.temp(i128t);

@@ -67,8 +67,9 @@ static int lust_tls_ready;
 #ifndef __TINYC__
 /* The calling thread's block, as pthread_getspecific gives it: the fast
    path reads it with one native thread-local load (tcc has no native
-   TLS, so its builds keep the pthread lookup). */
-static __thread lust_tls_block *lust_tls_cur;
+   TLS, so its builds keep the pthread lookup). External: the release
+   units' inline lust_tls_cell (runtime/inl.h) reads it too. */
+__thread lust_tls_block *lust_tls_cur;
 #endif
 
 static int lust_tls_is_ready(void) {
