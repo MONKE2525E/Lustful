@@ -14,7 +14,9 @@
 //
 // Location: `.lust-cache/` next to the source file. `LUST_CACHE_DIR` overrides it.
 // `LUST_NO_CACHE=1` turns it off. Size cap: `LUST_CACHE_MAX_BYTES` (default 512 MiB).
-// The oldest entries are deleted first when the cap is passed (by store time).
+// The least recently stored or used entries are deleted first when the cap is passed, but
+// never the unit objects the running build stored or took: the next build of the same
+// source needs them all (a tsgo release C build holds about 1 GB of objects).
 //
 // Trust rule: the cache is trusted like ccache's local cache. A stored build result is copied
 // out and can run. Never commit `.lust-cache/` and never use a cache from an untrusted source
@@ -187,6 +189,25 @@ pub struct Cache {
     id: (u64, u64),
 }
 
+/// Per cache dir, the unit object files the running build stored or took: `evict` keeps
+/// them. Per process, as a build can store through two `Cache`s (the session's and the
+/// whole-request one); per dir, so a build that starts on one dir (`begin_build`) leaves
+/// other dirs' builds alone (a daemon's sessions, parallel tests).
+type Used = std::collections::HashMap<PathBuf, std::collections::HashSet<String>>;
+static USED: std::sync::Mutex<Option<Used>> = std::sync::Mutex::new(None);
+
+/// Starts a build of `src_file`: the unit objects earlier builds of this process (a
+/// daemon) used in its cache dir may be evicted again.
+pub fn begin_build(src_file: &Path) {
+    forget_used(&cache_dir(src_file));
+}
+
+fn forget_used(dir: &Path) {
+    if let Some(u) = USED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        u.remove(dir);
+    }
+}
+
 /// True when the source mentions a macro whose result depends on data
 /// outside the source bytes (`env!`, `option_env!`, the `include!`
 /// family): such a request never enters this cache, since its key
@@ -221,17 +242,33 @@ impl Cache {
 
     /// Copies the cached unit object under `key` (see `unit_key`) to `dest`.
     /// False on a miss (no entry, or the copy failed): the caller compiles
-    /// the unit with tcc.
+    /// the unit with tcc. A hit makes the entry the most recently used.
     pub fn unit_object(&self, key: &str, dest: &Path) -> bool {
-        std::fs::copy(self.dir.join(format!("unit-{key}.o")), dest).is_ok()
+        let name = format!("unit-{key}.o");
+        let path = self.dir.join(&name);
+        if std::fs::copy(&path, dest).is_err() {
+            return false;
+        }
+        let _ = std::fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        self.note_used(name);
+        true
     }
 
-    /// Stores a freshly compiled unit object under `key`. Runs the same
-    /// size-cap eviction as whole-request stores.
+    /// Stores a freshly compiled unit object under `key`. The build evicts once
+    /// after its last store (`evict_objects`).
     pub fn store_unit_object(&self, key: &str, obj: &Path) {
         let name = format!("unit-{key}.o");
         self.copy_in(obj, &self.dir.join(&name));
-        self.evict(&name);
+        self.note_used(name);
+    }
+
+    fn note_used(&self, name: String) {
+        USED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(self.dir.clone()).or_default().insert(name);
+    }
+
+    /// The size-cap eviction of a build that stored unit objects, run once after them.
+    pub fn evict_objects(&self) {
+        self.evict("");
     }
 
     /// The manifest file for one session selection. The session text
@@ -334,14 +371,20 @@ impl Cache {
         self.evict(&format!("req-{key}"));
     }
 
-    /// Deletes oldest entries (by store time) until the cache fits the size cap.
-    /// The entry file named `keep` is never deleted by the call that wrote it.
+    /// Deletes the least recently stored or used entries until the cache fits the size
+    /// cap. The entry file named `keep` and the unit objects the running build stored or
+    /// took are never deleted.
     /// Whole-request entries (`req-*`, plus their `.exe`) and unit objects
     /// (`unit-*.o`, one file each) are evictable; slot manifests are small
     /// and pinned (deleting one only costs a renumber, but the cap is about
     /// object bulk, not manifests).
     fn evict(&self, keep: &str) {
         let cap = std::env::var("LUST_CACHE_MAX_BYTES").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(DEFAULT_MAX_BYTES);
+        self.evict_to(cap, keep);
+    }
+
+    /// `evict` with the cap given.
+    fn evict_to(&self, cap: u64, keep: &str) {
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
         // (mtime, path, len) for every entry file; a `req-<key>` file is one entry.
         let mut entries: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
@@ -367,11 +410,13 @@ impl Cache {
             return;
         }
         entries.sort();
+        let used = USED.lock().unwrap_or_else(|e| e.into_inner());
+        let used = |n: &str| used.as_ref().and_then(|u| u.get(&self.dir)).is_some_and(|u| u.contains(n));
         for (_, path, size) in entries {
             if total <= cap {
                 break;
             }
-            if path.file_name().is_some_and(|n| n.to_string_lossy() == keep) {
+            if path.file_name().is_some_and(|n| n.to_string_lossy() == keep || used(&n.to_string_lossy())) {
                 continue;
             }
             let mut exe = path.as_os_str().to_owned();
@@ -494,6 +539,34 @@ mod tests {
         cache.store_unit_object(&base, &obj);
         assert!(cache.unit_object(&base, &dest), "hit after store");
         assert_eq!(std::fs::read(&dest).unwrap(), b"fake-object");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A build keeps every unit object it stored or took, even past the size cap (a tsgo
+    /// release stores about 1 GB, twice the default cap, and evicted its own objects); the
+    /// next build's eviction deletes the least recently used objects first.
+    #[test]
+    fn eviction_keeps_the_running_builds_objects() {
+        let dir = std::env::temp_dir().join(format!("lust-evict-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = dir.join("made.o");
+        std::fs::write(&obj, b"0123456789").unwrap();
+        let present = |k: &str| dir.join(format!("unit-{k}.o")).exists();
+        forget_used(&dir);
+        let first = Cache { dir: dir.clone(), id: (3, 4) };
+        for k in ["a", "b", "c"] {
+            first.store_unit_object(k, &obj);
+        }
+        first.evict_to(15, "");
+        assert!(["a", "b", "c"].iter().all(|k| present(k)), "the running build's objects stay past the cap");
+        // The next build takes b and stores d: a and c, unused by it, go.
+        forget_used(&dir);
+        let next = Cache { dir: dir.clone(), id: (3, 4) };
+        assert!(next.unit_object("b", &dir.join("dest.o")));
+        next.store_unit_object("d", &obj);
+        next.evict_to(15, "");
+        assert_eq!(["a", "b", "c", "d"].map(present), [false, true, false, true]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

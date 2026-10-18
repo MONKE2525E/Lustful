@@ -580,6 +580,10 @@ pub fn build(
             });
         }
     });
+    // One size-cap eviction after the stores (it keeps this build's objects).
+    if let Some(c) = cache {
+        c.evict_objects();
+    }
     let errors = errors.into_inner().unwrap_or_else(|e| e.into_inner());
     if !errors.is_empty() {
         return Err(format!("the C compiler failed for target {}:\n{errors}", spec.triple));

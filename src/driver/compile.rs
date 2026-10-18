@@ -2424,6 +2424,7 @@ fn resolved_setup(
 
 pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut t = Timer::new();
+    crate::driver::cache::begin_build(&req.file);
     if req.session != session.key {
         return Response {
             stderr: format!(
@@ -4867,6 +4868,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 cache.store_unit_object(k, obj);
             }
         }
+        cache.evict_objects();
     }
     let units_compiled = miss_units.len();
     drop(miss_units);
