@@ -310,9 +310,10 @@ pub fn llflags(debug: bool) -> String {
 /// left after inlining are dropped instead of compiled. `pgo`: the unit's PGO flags
 /// (`pgo::Mode::unit_flags`) for that last step, which then runs inside `src`'s dir on the
 /// IR's bare file name, as the profile names the module's static fns by it. `rt_inl`: the
-/// runtime's inlinable copy (`compile_runtime_ir`), linked as builtin bitcode too.
+/// runtime's inlinable copy (`compile_runtime_ir`), linked as builtin bitcode too. `nopre`:
+/// no PGO pre-inliner (see `build`).
 #[allow(clippy::too_many_arguments)]
-fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &str, hc: &str, obj: &Path, pgo: Option<&[String]>, rt_inl: Option<&Path>) -> Result<(), String> {
+fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &str, hc: &str, obj: &Path, pgo: Option<&[String]>, rt_inl: Option<&Path>, nopre: bool) -> Result<(), String> {
     let bc = src.with_extension("c.bc");
     let ll_path = src.with_extension("ll");
     let hc_path = src.with_extension("hc.c");
@@ -344,6 +345,9 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
     let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
     let mut cmd = cc_command(prog);
     cmd.args(&words[1..]).args(llflags(debug).split_whitespace()).arg("-c");
+    if nopre {
+        cmd.args(["-mllvm", "-disable-preinline"]);
+    }
     match (pgo, ll_path.parent(), ll_path.file_name()) {
         (Some(flags), Some(dir), Some(file)) => cmd.args(flags).current_dir(dir).arg(file),
         _ => cmd.arg(&ll_path),
@@ -467,6 +471,11 @@ pub fn build(
         .then(|| units.iter().position(|(_, c)| c.starts_with("#define LUST_IMPL 1\n")))
         .flatten();
     let rt_inl = work.join("runtime.inl.bc");
+    // PGO with runtime IR: the training build has none (an instrumented runtime cannot be
+    // copied), so LLVM's PGO pre-inliner, which inlines small callees before it hashes each
+    // fn's CFG, would inline runtime fns in the use build only and the hashes would differ
+    // (half the fns lost their profile). Both builds skip the pre-inliner then.
+    let nopre = rt_max > 0 && pgo.is_some();
     let rt_digest = match rt {
         Some(r) => {
             let part = pgo_of(r).map(|m| m.key_part(&pfile(r)));
@@ -499,7 +508,7 @@ pub fn build(
             cache.map(|_| match ll_of.get(unit.as_str()) {
                 Some(ll) => {
                     let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
-                    unit_key(&format!("{c}\n/* llvm-v2 {} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), spec, debug, part.as_deref(), false)
+                    unit_key(&format!("{c}\n/* llvm-v2 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), spec, debug, part.as_deref(), false)
                 }
                 None => unit_key(c, spec, debug, part.as_deref(), is_cxx(&names[i])),
             })
@@ -543,7 +552,7 @@ pub fn build(
                             continue;
                         }
                     };
-                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path())) {
+                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path()), nopre) {
                         Ok(()) => {
                             if let (Some(cache), Some(key)) = (cache, &keys[i]) {
                                 cache.store_unit_object(key, obj);
