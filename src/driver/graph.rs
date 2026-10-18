@@ -1037,6 +1037,43 @@ fn lang_impls_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// The resolved shape of one impl record (`lang_impl_shape`) for the
+/// trait-system key (gen_reuse.rs `trait_key`): the aliases and consts
+/// its written header and bounds name are resolved in it.
+pub(crate) fn resolved_impl_hash(p: &Program, def: DefId) -> u64 {
+    p.gx.index.peek_def(def).map_or(0, |rec| lang_impl_shape(p, rec))
+}
+
+/// Every trait record, resolved, for the trait-system key: generics and
+/// bounds (supertraits, associated type bounds), associated items, the
+/// declared types of associated consts, and methods.
+pub(crate) fn resolved_traits_hash(p: &Program) -> u64 {
+    let mut recs: Vec<&crate::traits::index::TraitRecord> = p.gx.index.trait_records().collect();
+    recs.sort_unstable_by_key(|r| (def_crate_hash(p, r.def), r.def.hash.0));
+    let mut h = FxHasher::default();
+    "resolved-traits-v1".hash(&mut h);
+    (recs.len() as u64).hash(&mut h);
+    for r in recs {
+        hash_def_pub(&mut h, p, r.def);
+        hash_generics(&mut h, p, &r.generics);
+        (r.assoc_items.len() as u64).hash(&mut h);
+        for &(d, n, is_type) in &r.assoc_items {
+            hash_def_pub(&mut h, p, d);
+            (p.name(n), is_type).hash(&mut h);
+            if let Some(&(t, has_default)) = p.gx.trait_assoc_consts.get(&d) {
+                hash_ty(&mut h, p, &p.tys, t);
+                has_default.hash(&mut h);
+            }
+        }
+        (r.methods.len() as u64).hash(&mut h);
+        for &(d, n) in &r.methods {
+            hash_def_pub(&mut h, p, d);
+            p.name(n).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 /// One written std or lang trait impl as `LangImpls` reads see it, with no
 /// deep walk: the trait ref, generics and bounds, associated type and
 /// const bindings, the regioned header, and each item's name and

@@ -8,8 +8,8 @@
 //
 // A stored result depends on three things, and holds while all three do:
 // - the trait system: trait items, impl items of lang and foreign
-//   traits, inherent impls with an associated const or a `dyn` Self,
-//   and type alias and const items (`trait_key`). Collect drops every
+//   traits, and inherent impls with an associated const or a `dyn` Self,
+//   each as written and resolved (`trait_key`). Collect drops every
 //   entry when their fingerprint changes (`GenReuse::gate`), and the
 //   driver also drops them on a const fn body edit, a nested static, or
 //   a slot renumber (`compile.rs`, "generic reuse"). Derive lists are
@@ -987,9 +987,12 @@ pub struct TraitKey {
 }
 
 /// The trait-system key (see the module docs): trait items (default
-/// bodies included), impl items (headers, method heads, associated
-/// items), and type alias and const items (an impl header or a bound
-/// can reach a type through them); and, apart, the derive-list key. An
+/// bodies included) and impl items (headers, method heads, associated
+/// items), as written and resolved (every trait record, and each kept
+/// impl's record: an alias or const a header or a bound names resolves
+/// in them); and, apart, the derive-list key. Type alias and const items
+/// stay out: their readers record `Sig` reads that fold the resolved
+/// target or the value. An
 /// impl of a trait whose impls `ImplSet` reads cover
 /// (`Program::impls_read_covered`; `impl_traits` gives each trait impl's
 /// trait by item index) is left out, and so is an inherent impl with no
@@ -1007,7 +1010,7 @@ pub struct TraitKey {
 /// when it hands the impl out, and its `Drop` and auto trait facts fold
 /// into the Adt's deep layout. Those impls make the `lang` key, which
 /// only refreshes glue (compile.rs).
-pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool)>) -> TraitKey {
+pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool, DefId)>) -> TraitKey {
     use crate::ast::{ItemKind, TyExpr};
     let user_trait = |d: &DefId| p.impls_read_covered(*d);
     let plain_inherent = |imp: &crate::ast::ImplDef| {
@@ -1021,8 +1024,8 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool)>) -> Trai
     "lang-impls-v1".hash(&mut lh);
     for (i, item) in p.ast.items.iter().enumerate() {
         let derives = match &item.kind {
-            ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(|(d, _)| user_trait(d)) => continue,
-            ItemKind::Impl(imp) if !imp.is_negative && impl_traits.get(&i).is_some_and(|&(_, keyed)| keyed) => {
+            ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(|(d, _, _)| user_trait(d)) => continue,
+            ItemKind::Impl(imp) if !imp.is_negative && impl_traits.get(&i).is_some_and(|&(_, keyed, _)| keyed) => {
                 crate::driver::ast_hash::item_hash(&p.ast, item).hash(&mut lh);
                 continue;
             }
@@ -1032,8 +1035,16 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool)>) -> Trai
                 (1u8, crate::driver::ast_hash::item_hash(&p.ast, &bare)).hash(&mut h);
                 continue;
             }
-            ItemKind::Trait(_) | ItemKind::Impl(_) | ItemKind::Type(_) | ItemKind::Const(_) => {
+            // Type aliases and consts stay out: every reader of one records
+            // a `Sig` read that folds its resolved target or value, and the
+            // trait records and the impls kept here fold in resolved
+            // (below), so one that moves a header or a bound moves the key.
+            ItemKind::Type(_) | ItemKind::Const(_) => continue,
+            ItemKind::Trait(_) | ItemKind::Impl(_) => {
                 (0u8, crate::driver::ast_hash::item_hash(&p.ast, item)).hash(&mut h);
+                if let Some(&(_, _, def)) = impl_traits.get(&i) {
+                    crate::driver::graph::resolved_impl_hash(p, def).hash(&mut h);
+                }
                 continue;
             }
             ItemKind::Struct(s) => (s.name, &s.derives),
@@ -1051,6 +1062,7 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool)>) -> Trai
             p.interner.get(*d).hash(&mut dh);
         }
     }
+    crate::driver::graph::resolved_traits_hash(p).hash(&mut h);
     TraitKey { system: h.finish(), derives: dh.finish(), lang: lh.finish() }
 }
 
