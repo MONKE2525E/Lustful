@@ -547,7 +547,8 @@ pub fn build(
     // copied), so LLVM's PGO pre-inliner, which inlines small callees before it hashes each
     // fn's CFG, would inline runtime fns in the use build only and the hashes would differ
     // (half the fns lost their profile). Both builds skip the pre-inliner then.
-    let nopre = rt_max > 0 && pgo.is_some();
+    // (`pgo::no_preinline` puts the flag in every PGO compile already.)
+    let nopre = rt_max > 0 && pgo.is_some() && !pgo::no_preinline();
     let rt_digest = match rt {
         Some(r) => {
             let part = pgo_of(r).map(|m| m.key_part(&pfile(r)));

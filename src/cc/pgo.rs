@@ -84,10 +84,12 @@ impl Mode {
     /// The compile flags of the unit compiled as `file`. With a profile it first writes
     /// that unit's own profile into the work dir (a unit with no records gets none).
     pub fn unit_flags(&self, file: &str) -> Result<Vec<String>, String> {
+        let nopre = no_preinline().then_some(["-mllvm".to_string(), "-disable-preinline".to_string()]).into_iter().flatten();
         match self {
-            Mode::Gen => Ok(vec!["-fprofile-generate".into()]),
+            Mode::Gen => Ok(std::iter::once("-fprofile-generate".to_string()).chain(nopre).collect()),
             Mode::Use(p) => {
                 let mut flags = p.pins.clone();
+                flags.extend(nopre);
                 if let Some(recs) = p.own.get(file).filter(|r| !r.is_empty()) {
                     let stem = file.strip_suffix(".c").unwrap_or(file);
                     let (txt, out) = (p.work.join(format!("{stem}.proftext")), p.work.join(format!("{stem}.profdata")));
@@ -107,11 +109,12 @@ impl Mode {
 
     /// The profile part of the cache key of the unit compiled as `file` (`cc::unit_key`).
     pub fn key_part(&self, file: &str) -> String {
+        let nopre = if no_preinline() { " nopre" } else { "" };
         match self {
-            Mode::Gen => "gen".into(),
+            Mode::Gen => format!("gen{nopre}"),
             Mode::Use(p) => {
                 let own = p.own.get(file).map(|r| r.join("\n\n")).unwrap_or_default();
-                digest(&[p.pins.join(" ").as_bytes(), own.as_bytes()])
+                digest(&[p.pins.join(" ").as_bytes(), nopre.as_bytes(), own.as_bytes()])
             }
         }
     }
@@ -177,6 +180,14 @@ fn run(cmd: &mut Command) -> Result<String, String> {
         return Err(format!("{:?} failed: {}", cmd.get_program(), String::from_utf8_lossy(&o.stderr)));
     }
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// `LUST_PGO_PREINLINE=0`: neither the instrumented nor the use build runs LLVM's PGO
+/// pre-inliner. It inlines small callees before each fn's CFG hash is taken, so a caller's
+/// record stops matching when a callee it inlined changes (a cross-unit copy, a merge that
+/// edits the callee); without it a record follows its own fn only.
+pub fn no_preinline() -> bool {
+    std::env::var("LUST_PGO_PREINLINE").is_ok_and(|v| v == "0")
 }
 
 fn digest(parts: &[&[u8]]) -> String {
