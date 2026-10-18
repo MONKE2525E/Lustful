@@ -2448,10 +2448,13 @@ simple statements in IR and the rest as always_inline C
 helpers cut from cgen's own statement C. A unit is three
 texts (`u<N>.ll`, its helpers' C `u<N>.hc`, its C wrappers
 `u<N>`) that cc.rs compiles as one module and keys as one.
-`LUST_LL_INLINE=<cost>` adds `available_externally` copies of
-small callees from other units. C stays the default. Tests:
-difftest LL=1, and CC_DRIVER=1 with the switch; numbers in
-rel-llvm's REPORT.md.
+`LUST_LL_INLINE=<cost>` (default 25) adds `available_externally`
+copies of small callees from other units. `LUST_LL_RTINL=<n>`
+(off by default) compiles the runtime unit through IR and links
+an `available_externally` copy of its fns of up to n
+instructions into each LLVM unit (cc/rtinl.rs). Tests: difftest LL=1,
+and CC_DRIVER=1 with LUST_RELEASE_C=1; numbers in rel-llvm's
+REPORT.md.
 
 Locations and span remapping. Panic locations,
 `track_caller` locations, and cached diagnostics are

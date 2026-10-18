@@ -7706,9 +7706,15 @@ impl FnGen<'_, '_> {
                 old
             }
             B::MemTake => unreachable!("take lowers to a default fill plus MemReplace"),
-            // An identity the C compiler sees through: lust makes no
-            // promise about optimization, only the value.
-            B::HintBlackBox => vals[0].clone(),
+            // The value through a slot whose address escapes into an empty
+            // asm (runtime.h `lust_black_box`), as rustc's black_box does: an
+            // optimizer keeps what it would otherwise drop (an unused
+            // allocation, a benchmark's work).
+            B::HintBlackBox => {
+                let t = self.tmp();
+                let _ = writeln!(self.out, "    {} {t} = {}; lust_black_box(&{t});", ctype(&tys[0]), vals[0]);
+                t
+            }
             B::CmpMax | B::CmpMin => {
                 // Check limited these to primitive total orders. On
                 // a tie the first argument wins, as `Ord::max` and

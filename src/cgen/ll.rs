@@ -1991,7 +1991,7 @@ fn ll_callee_ids(f: &FnOut) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Cross-unit inlining for the LLVM backend (`LUST_LL_INLINE=<cost>`, 0 or unset: off;
+/// Cross-unit inlining for the LLVM backend (`LUST_LL_INLINE=<cost>`, default 25, 0: off;
 /// `LUST_LL_INLINE_DEPTH`, default 3): the fns outside `slots` that a fn of the unit calls,
 /// directly or through such fns up to the depth, whose cost (`LlFn::cost`: statements and
 /// blocks) is at most that. `LUST_LL_INLINE_HINT=<n>` (default 1) multiplies the limit by n
@@ -2007,7 +2007,9 @@ pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections:
     static LIMITS: std::sync::OnceLock<(usize, usize, usize, usize, usize)> = std::sync::OnceLock::new();
     let (bytes, depth, hint, tiny, tiny_depth) = *LIMITS.get_or_init(|| {
         let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        (n("LUST_LL_INLINE", 0), n("LUST_LL_INLINE_DEPTH", 3), n("LUST_LL_INLINE_HINT", 1), n("LUST_LL_INLINE_TINY", 0), n("LUST_LL_INLINE_TINY_DEPTH", 0))
+        // 25: tsgo through the release driver ran ~40% slower without copies and slower with
+        // smaller or deeper ones (rel-llvm REPORT.md, step 7).
+        (n("LUST_LL_INLINE", 25), n("LUST_LL_INLINE_DEPTH", 3), n("LUST_LL_INLINE_HINT", 1), n("LUST_LL_INLINE_TINY", 0), n("LUST_LL_INLINE_TINY_DEPTH", 0))
     });
     if bytes == 0 {
         return Vec::new();
@@ -2088,8 +2090,13 @@ pub fn ll_unit(fns: &[FnOut], slots: &[usize], inl: &[usize], triple: &str) -> S
     for &s in slots {
         out.push_str(&fns[s].ll);
     }
+    // `LUST_LL_COPY=internal` (measurement): copies are the unit's own internal fns instead,
+    // as release C's static copies are, so a training build counts each unit's copy in its
+    // callers' context (an available_externally copy has no counters of its own).
+    static INTERNAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let linkage = if *INTERNAL.get_or_init(|| std::env::var("LUST_LL_COPY").is_ok_and(|v| v == "internal")) { "internal" } else { "available_externally" };
     for &s in inl {
-        out.push_str(&fns[s].ll.replacen("\ndefine ", "\ndefine available_externally ", 1));
+        out.push_str(&fns[s].ll.replacen("\ndefine ", &format!("\ndefine {linkage} "), 1));
     }
     out
 }

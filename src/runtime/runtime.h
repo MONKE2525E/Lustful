@@ -41,6 +41,15 @@ void *memcpy(void *, const void *, size_t);
 #define LUST_BODY(...) ;
 #endif
 
+/* std::hint::black_box: the value's slot escapes into an empty asm that may read and write
+   memory, so an optimizer can assume nothing about the value or what it points at (rustc's
+   form). tcc does not optimize: nothing to hide. */
+#ifdef __TINYC__
+#define lust_black_box(p) ((void)(p))
+#else
+#define lust_black_box(p) __asm__ __volatile__("" : : "r"(p) : "memory")
+#endif
+
 
 #if defined(_WIN32) && defined(LUST_IMPL)
 /* The Win32 thread layer (rel-win): the runtime names pthread calls

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod pgo;
+mod rtinl;
 
 /// One target's compiler setup: the command words, the flags every unit
 /// gets, and how the link differs from a host link.
@@ -210,6 +211,10 @@ fn ldflags(spec: &CcSpec, debug: bool) -> Vec<String> {
         v.push("-pthread".into());
     }
     v.push("-lm".into());
+    // Extra link flags, for measurement (for example section GC or hot/cold text grouping).
+    if let Ok(extra) = std::env::var("LUST_RELEASE_LDFLAGS") {
+        v.extend(extra.split_whitespace().map(str::to_string));
+    }
     v
 }
 
@@ -288,9 +293,11 @@ fn preprocessed(c_text: &str, words: &[String], flags: &str, cxx: bool) -> Optio
 }
 
 /// The flags of an LLVM unit's own compile (its IR plus its C half's bitcode).
+/// `LUST_LL_OPT` replaces the optimization level (default -O2; for measurement).
 pub fn llflags(debug: bool) -> String {
-    let base = "-O2 -w -fexceptions";
-    if debug { format!("{base} -g") } else { base.into() }
+    let opt = std::env::var("LUST_LL_OPT").unwrap_or_else(|_| "-O2".into());
+    let base = format!("{opt} -w -fexceptions");
+    if debug { format!("{base} -g") } else { base }
 }
 
 /// Compiles one LLVM backend unit into `obj`: the C unit `src` and the helpers' C `hc` to
@@ -299,8 +306,10 @@ pub fn llflags(debug: bool) -> String {
 /// helpers link as builtin bitcode: only what the IR names, internalized, so the copies
 /// left after inlining are dropped instead of compiled. `pgo`: the unit's PGO flags
 /// (`pgo::Mode::unit_flags`) for that last step, which then runs inside `src`'s dir on the
-/// IR's bare file name, as the profile names the module's static fns by it.
-fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &str, hc: &str, obj: &Path, pgo: Option<&[String]>) -> Result<(), String> {
+/// IR's bare file name, as the profile names the module's static fns by it. `rt_inl`: the
+/// runtime's inlinable copy (`compile_runtime_ir`), linked as builtin bitcode too.
+#[allow(clippy::too_many_arguments)]
+fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &str, hc: &str, obj: &Path, pgo: Option<&[String]>, rt_inl: Option<&Path>) -> Result<(), String> {
     let bc = src.with_extension("c.bc");
     let ll_path = src.with_extension("ll");
     let hc_path = src.with_extension("hc.c");
@@ -337,13 +346,43 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
         _ => cmd.arg(&ll_path),
     };
     let abs = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    run(cmd
-        .args(["-Xclang", "-mlink-bitcode-file", "-Xclang"])
-        .arg(abs(&bc))
-        .args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"])
-        .arg(abs(&hbc))
-        .arg("-o")
-        .arg(obj))
+    cmd.args(["-Xclang", "-mlink-bitcode-file", "-Xclang"]).arg(abs(&bc)).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(abs(&hbc));
+    if let Some(rt) = rt_inl {
+        cmd.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(abs(rt));
+    }
+    run(cmd.arg("-o").arg(obj))
+}
+
+/// Compiles the runtime unit `src` through LLVM IR (`rtinl.rs`): the C to IR with the full
+/// pipeline (and the unit's profile: `pgo`, then inside `src`'s dir), `rtinl::split`, its
+/// object `obj` from the IR with every internal symbol exported (no IR passes again), and
+/// `inl`, the bitcode of the copy the LLVM units inline from (fns of at most `max`
+/// instructions).
+fn compile_runtime_ir(spec: &CcSpec, cflags: &[String], src: &Path, obj: &Path, inl: &Path, max: usize, pgo: Option<&[String]>) -> Result<(), String> {
+    let words = &spec.cmd;
+    let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
+    let run = |extra: &[&str], input: &Path, out: &Path, pgo: Option<&[String]>| -> Result<(), String> {
+        let mut cmd = Command::new(&prog);
+        cmd.args(&words[1..]).args(cflags).args(extra);
+        match (pgo, input.parent(), input.file_name()) {
+            (Some(flags), Some(dir), Some(file)) => cmd.args(flags).current_dir(dir).arg(file),
+            _ => cmd.arg(input),
+        };
+        match cmd.arg("-o").arg(out).output() {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(format!("({})\n{}", o.status, String::from_utf8_lossy(&o.stderr))),
+            Err(e) => Err(format!("cannot run {}: {e}\n", words.join(" "))),
+        }
+    };
+    let (ir, obj_ll, inl_ll) = (src.with_extension("rt.ll"), src.with_extension("obj.ll"), src.with_extension("inl.ll"));
+    let ir = std::fs::canonicalize(src.parent().unwrap_or(Path::new("."))).map(|d| d.join(ir.file_name().unwrap_or_default())).unwrap_or(ir);
+    run(&["-S", "-emit-llvm"], src, &ir, pgo)?;
+    let text = std::fs::read_to_string(&ir).map_err(|e| format!("cannot read {}: {e}\n", ir.display()))?;
+    let parts = rtinl::split(&text, max);
+    std::fs::write(&obj_ll, parts.obj).map_err(|e| format!("cannot write {}: {e}\n", obj_ll.display()))?;
+    std::fs::write(&inl_ll, parts.inl).map_err(|e| format!("cannot write {}: {e}\n", inl_ll.display()))?;
+    run(&["-Xclang", "-disable-llvm-passes", "-c"], &obj_ll, obj, None)?;
+    run(&["-emit-llvm", "-Xclang", "-disable-llvm-passes", "-c"], &inl_ll, inl, None)
 }
 
 /// What the PGO split (`pgo::defined_externs`, `pgo::stable_name`) reads for an LLVM unit:
@@ -413,6 +452,42 @@ pub fn build(
     let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(units[i].1.len() + ll_of.get(units[i].0.as_str()).map_or(0, |l| l.len())));
     let objs: Vec<PathBuf> = names.iter().map(|name| work.join(format!("{name}.o"))).collect();
+    let hits = std::sync::atomic::AtomicUsize::new(0);
+    // `LUST_LL_RTINL=<max instructions>` (0 or unset: off): with LLVM units, the runtime unit
+    // compiles through IR first (`compile_runtime_ir`) and every LLVM unit links the
+    // runtime's fns of at most that size as inlinable IR (not in an instrumented build,
+    // whose counters must stay the runtime's). LLVM unit keys hold that copy's digest.
+    // Off by default: a PGO build lost half its fns' profile with it (the training build has
+    // no runtime IR, and the PGO pre-inliner inlines runtime fns before it hashes CFGs).
+    let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let rt = (rt_max > 0 && !ll_of.is_empty() && !matches!(pgo, Some(pgo::Mode::Gen)))
+        .then(|| units.iter().position(|(_, c)| c.starts_with("#define LUST_IMPL 1\n")))
+        .flatten();
+    let rt_inl = work.join("runtime.inl.bc");
+    let rt_digest = match rt {
+        Some(r) => {
+            let part = pgo_of(r).map(|m| m.key_part(&pfile(r)));
+            let key = cache.map(|_| unit_key(&format!("{}\n/* rtinl {rt_max} */", units[r].1), spec, debug, part.as_deref(), false));
+            let cached = matches!((cache, &key), (Some(c), Some(k)) if c.unit_object(k, &objs[r]) && c.unit_object(&format!("{k}-inl"), &rt_inl));
+            if cached {
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let src = work.join(format!("{}.c", names[r]));
+                std::fs::write(&src, &units[r].1).map_err(|e| format!("cannot write {}: {e}", src.display()))?;
+                let pf = pgo_of(r).map(|m| m.unit_flags(&pfile(r))).transpose()?;
+                compile_runtime_ir(spec, &flags, &src, &objs[r], &rt_inl, rt_max, pf.as_deref())
+                    .map_err(|e| format!("the C compiler failed for target {} (runtime IR):\n{e}", spec.triple))?;
+                if let (Some(c), Some(k)) = (cache, &key) {
+                    c.store_unit_object(k, &objs[r]);
+                    c.store_unit_object(&format!("{k}-inl"), &rt_inl);
+                }
+            }
+            let bytes = std::fs::read(&rt_inl).map_err(|e| format!("cannot read {}: {e}", rt_inl.display()))?;
+            let (a, b) = crate::driver::cache::hash128(&[&bytes], 47);
+            format!("{a:016x}{b:016x}")
+        }
+        None => String::new(),
+    };
     let keys: Vec<Option<String>> = units
         .iter()
         .enumerate()
@@ -421,7 +496,7 @@ pub fn build(
             cache.map(|_| match ll_of.get(unit.as_str()) {
                 Some(ll) => {
                     let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
-                    unit_key(&format!("{c}\n/* llvm-v2 */\n{ll}\n/* helpers */\n{hc}"), spec, debug, part.as_deref(), false)
+                    unit_key(&format!("{c}\n/* llvm-v2 {} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), spec, debug, part.as_deref(), false)
                 }
                 None => unit_key(c, spec, debug, part.as_deref(), is_cxx(&names[i])),
             })
@@ -429,7 +504,6 @@ pub fn build(
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(String::new());
-    let hits = std::sync::atomic::AtomicUsize::new(0);
     let limit = crate::pool::threads().max(1).min(units.len().max(1));
     let t_compile = std::time::Instant::now();
     std::thread::scope(|scope| {
@@ -437,6 +511,9 @@ pub fn build(
             scope.spawn(|| loop {
                 let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(&i) = order.get(k) else { return };
+                if Some(i) == rt {
+                    continue;
+                }
                 let (name, c) = (&names[i], &units[i].1);
                 let obj = &objs[i];
                 if let (Some(cache), Some(key)) = (cache, &keys[i])
@@ -460,7 +537,7 @@ pub fn build(
                             continue;
                         }
                     };
-                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref()) {
+                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].0.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path())) {
                         Ok(()) => {
                             if let (Some(cache), Some(key)) = (cache, &keys[i]) {
                                 cache.store_unit_object(key, obj);
