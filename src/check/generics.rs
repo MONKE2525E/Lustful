@@ -12447,8 +12447,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 // anyway). A window result that checked such a type as a
                 // body type would go stale at the first earlier turn that
                 // interned it; the stale ones check again now, in parallel.
-                let adts_early = p.adts.len();
-                for (_, found) in ahead.window(k) {
+                for found in ahead.window(k) {
                     let (adt_tys, reqs, closures, vts) = &found.out;
                     let args = reqs.iter().flat_map(|(_, a)| a).filter_map(|a| match a {
                         OwnedArg::Ty(t) => Some(t),
@@ -12464,36 +12463,6 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                         let lifted = lift_request(p, owned_args);
                         p.tys.intern_args(&lifted);
                     }
-                }
-                // Instances ahead of time: each result's requests make their
-                // instances now, in turn order, as its turn's request step
-                // does (below), which then finds them made. A request that
-                // reports an error (the depth limit) or first checks a lang
-                // template waits for its turn, so diagnostics keep their
-                // order; a result whose closure kinds are pending drops its
-                // requests at its turn, so it makes none here.
-                for (i, found) in ahead.window(k) {
-                    if found.closure_kind_pending {
-                        continue;
-                    }
-                    let depth = depths.get(&round[i]).copied().unwrap_or(0);
-                    for (template, owned_args) in &found.out.1 {
-                        if depth + 1 > crate::mono::MAX_INSTANCE_DEPTH || p.is_lang_method(*template) && !lang_checked.contains(template) {
-                            continue;
-                        }
-                        let lifted = lift_request(p, owned_args);
-                        let args_id = p.tys.intern_args(&lifted);
-                        if let Some(&had) = p.gx.instance_by_key.get(&(p.def_id(*template), args_id)) {
-                            eager_only.retain(|&f| f != had);
-                            continue;
-                        }
-                        let inst = fn_instance(p, *template, &lifted);
-                        depths.insert(inst, depth + 1);
-                        next_queue.push(inst);
-                    }
-                }
-                if p.adts.len() != adts_early {
-                    crate::check::spec::wrote_all(crate::check::spec::tab::ADTS);
                 }
                 ahead.recheck(&round, k, |&f| discover_one(p, f, lints));
             }
@@ -12940,10 +12909,9 @@ impl<R: Send> Ahead<R> {
         }
     }
 
-    /// The results of the window that opened at `k`, with their places
-    /// in the round, in turn order.
-    fn window(&self, k: usize) -> impl Iterator<Item = (usize, &R)> {
-        self.found[k..self.filled].iter().enumerate().filter_map(move |(i, r)| r.as_ref().map(|r| (k + i, &r.0)))
+    /// The results of the window that opened at `k`, in turn order.
+    fn window(&self, k: usize) -> impl Iterator<Item = &R> {
+        self.found[k..self.filled].iter().filter_map(|r| r.as_ref().map(|r| &r.0))
     }
 
     /// After the main thread wrote to logged tables between turns (early
