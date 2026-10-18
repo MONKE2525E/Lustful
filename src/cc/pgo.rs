@@ -19,10 +19,12 @@
 // Record names: an external function is its own name; a static one is
 // `<file>;<name>` with the file as given to the compiler, so units compile from inside
 // the work dir under content-derived names (`stable_name`). A unit owns the records of
-// the definitions it prints (`defined_externs`). The runtime unit's helpers come from
-// macros (`LUST_ABS(int8_t, i8)`), so the runtime unit also owns the `lust_*` records no
-// unit visibly defines; any other record no unit defines is of a fn this build does not
-// have (a profile from an older state) and goes to no unit.
+// the definitions it prints (`defined_externs`), and only those, so its key moves only
+// with its own fns' records. A unit with `#include`s (the runtime, mimalloc) makes some
+// fns with macros (`LUST_ABS(int8_t, i8)`), so its definitions come from its
+// preprocessed text. A record no unit defines is of a fn this build does not have (a
+// profile from an older state, or a `lust_*` fn only inline copies held) and goes to no
+// unit.
 use super::CcSpec;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,9 +45,8 @@ pub struct Pgo {
     /// The flags that pin the summary thresholds to the whole profile's.
     pins: Vec<String>,
     records: usize,
-    /// `lust_*` records no unit visibly defines (the runtime unit's macro-made helpers):
-    /// the runtime unit owns them, or every unit when no unit includes system headers.
-    unowned: usize,
+    /// Records of macro-made fns: only a preprocessed text shows their definition.
+    helpers: usize,
     /// Other records no unit defines (fns this build does not have): in no profile.
     absent: usize,
     work: PathBuf,
@@ -67,7 +68,7 @@ impl Mode {
             return Err(format!("LUST_PROFDATA ({}) is LLVM {pd}, the compiler ({}) LLVM {cc}", profdata(), spec.cmd.join(" ")));
         }
         let bits = std::env::var("LUST_PGO_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
-        Pgo::load(Path::new(&path), bits, work, units).map(|p| Some(Mode::Use(p)))
+        Pgo::load(Path::new(&path), bits, work, &unit_defs(spec, units)).map(|p| Some(Mode::Use(p)))
     }
 
     /// Extra link flags: the profile runtime of an instrumented build.
@@ -112,7 +113,7 @@ impl Mode {
     pub fn describe(&self) -> String {
         match self {
             Mode::Gen => "pgo instrumented".into(),
-            Mode::Use(p) => format!("pgo {} records, {} runtime helpers, {} of fns not in this build", p.records, p.unowned, p.absent),
+            Mode::Use(p) => format!("pgo {} records, {} runtime helpers, {} of fns not in this build", p.records, p.helpers, p.absent),
         }
     }
 }
@@ -179,7 +180,7 @@ fn digest(parts: &[&[u8]]) -> String {
 impl Pgo {
     /// Reads `path` (an indexed profile), quantizes it to `bits`, pins the summary
     /// thresholds of the whole quantized profile, and splits the records by unit.
-    fn load(path: &Path, bits: u32, work: &Path, units: &[(String, &str)]) -> Result<Pgo, String> {
+    fn load(path: &Path, bits: u32, work: &Path, defs: &UnitDefs) -> Result<Pgo, String> {
         let text = run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(path))?;
         let (head, mut records) = parse(&text);
         if bits > 0 {
@@ -195,37 +196,59 @@ impl Pgo {
         std::fs::write(&txt, format!("{head}{}\n\n", body.join("\n\n"))).map_err(|e| format!("cannot write {}: {e}", txt.display()))?;
         run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
         let pins = pins(&run(Command::new(profdata()).args(["show", "--detailed-summary"]).arg(&all))?)?;
-        let (own, unowned, absent) = split(&records, units);
-        Ok(Pgo { head, own, pins, records: records.len(), unowned, absent, work: work.to_path_buf() })
+        let (own, helpers, absent) = split(&records, defs);
+        Ok(Pgo { head, own, pins, records: records.len(), helpers, absent, work: work.to_path_buf() })
     }
 }
 
-/// The records of each unit (by the file name it compiles as), sorted, and how many went
-/// to the runtime unit for want of a visible definition and how many to no unit. A
-/// static fn's record goes to its file, an external one to every unit that prints its
-/// definition, else a `lust_*` one to the runtime unit (the one that includes system
-/// headers; every unit when none does), else to none.
-fn split(records: &HashMap<String, String>, units: &[(String, &str)]) -> (HashMap<String, Vec<String>>, usize, usize) {
+/// The external fns each unit defines, by the file name it compiles as, and the names
+/// only a preprocessed text shows (macro-made).
+struct UnitDefs {
+    units: Vec<(String, Vec<String>)>,
+    macro_made: std::collections::HashSet<String>,
+}
+
+/// The definitions of each unit (`defined_externs`): of its preprocessed text when it has
+/// `#include`s (`cc::preprocessed` with `spec`'s compiler; its text as given when that
+/// fails), so the fns its macros make count as its own.
+fn unit_defs(spec: &CcSpec, units: &[(String, &str)]) -> UnitDefs {
+    let flags = super::cflags(false);
+    let mut macro_made = std::collections::HashSet::new();
+    let units = units
+        .iter()
+        .map(|(file, c)| {
+            let raw: std::collections::HashSet<&str> = defined_externs(c).into_iter().collect();
+            let pre = c.contains("#include <").then(|| super::preprocessed(c, &spec.cmd, &flags, false)).flatten();
+            let names: Vec<String> = match &pre {
+                Some(pre) => defined_externs(&String::from_utf8_lossy(pre)).into_iter().map(str::to_string).collect(),
+                None => raw.iter().map(|n| n.to_string()).collect(),
+            };
+            macro_made.extend(names.iter().filter(|n| !raw.contains(n.as_str())).cloned());
+            (file.clone(), names)
+        })
+        .collect();
+    UnitDefs { units, macro_made }
+}
+
+/// The records of each unit (by the file name it compiles as), sorted, how many are of
+/// macro-made fns, and how many went to no unit. A static fn's record goes to its file,
+/// an external one to every unit that defines it, else to none.
+fn split(records: &HashMap<String, String>, defs: &UnitDefs) -> (HashMap<String, Vec<String>>, usize, usize) {
     let mut owner: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (file, c) in units {
-        for n in defined_externs(c) {
+    for (file, names) in &defs.units {
+        for n in names {
             owner.entry(n).or_default().push(file);
         }
     }
-    let runtime: Vec<&str> = match units.iter().find(|(_, c)| c.contains("#include <")) {
-        Some((file, _)) => vec![file],
-        None => units.iter().map(|(f, _)| f.as_str()).collect(),
-    };
     let mut own: HashMap<String, Vec<String>> = HashMap::new();
-    let (mut unowned, mut absent) = (0, 0);
+    let (mut helpers, mut absent) = (0, 0);
     for (name, r) in records {
         let files: Vec<&str> = match name.split_once(';') {
             Some((file, _)) => vec![file],
             None => match owner.get(name.as_str()) {
-                Some(f) => f.clone(),
-                None if name.starts_with("lust_") => {
-                    unowned += 1;
-                    runtime.clone()
+                Some(f) => {
+                    helpers += defs.macro_made.contains(name) as usize;
+                    f.clone()
                 }
                 None => {
                     absent += 1;
@@ -240,7 +263,7 @@ fn split(records: &HashMap<String, String>, units: &[(String, &str)]) -> (HashMa
     for r in own.values_mut() {
         r.sort_unstable();
     }
-    (own, unowned, absent)
+    (own, helpers, absent)
 }
 
 /// An IR PGO text profile: the header (flag lines) and each record by name.
@@ -443,27 +466,51 @@ mod tests {
         format!("{n}\n# Func Hash:\n7\n# Num Counters:\n1\n# Counter Values:\n{c}")
     }
 
-    /// A loaded profile of `records` (name, count) over `units`.
-    fn split_mode(records: &[(&str, u64)], units: &[(&str, &str)]) -> Mode {
+    /// A loaded profile of `records` (name, count) over units that define `defs` (file,
+    /// fn names; `macro_made` of them only a preprocessed text shows).
+    fn split_mode(records: &[(&str, u64)], defs: &[(&str, &[&str])], macro_made: &[&str]) -> Mode {
         let recs: HashMap<String, String> = records.iter().map(|(n, c)| (n.to_string(), rec(n, *c))).collect();
-        let units: Vec<(String, &str)> = units.iter().map(|(f, c)| (f.to_string(), *c)).collect();
-        let (own, unowned, absent) = split(&recs, &units);
-        Mode::Use(Pgo { head: String::new(), own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), unowned, absent, work: PathBuf::new() })
+        let defs = UnitDefs {
+            units: defs.iter().map(|(f, ns)| (f.to_string(), ns.iter().map(|n| n.to_string()).collect())).collect(),
+            macro_made: macro_made.iter().map(|n| n.to_string()).collect(),
+        };
+        let (own, helpers, absent) = split(&recs, &defs);
+        Mode::Use(Pgo { head: String::new(), own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, work: PathBuf::new() })
     }
 
+    /// A unit's key moves only with the records of the fns it defines (the runtime unit's
+    /// macro-made ones included), never with a record no unit defines: the runtime unit
+    /// keeps its key when another unit's inline copy of a `lust_*` fn comes or goes.
     #[test]
     fn a_unit_key_moves_only_with_its_own_records() {
-        let units = [("u1.c", "int f(void) {\n}\nstatic int s(void) {\n}\n"), ("u2.c", "int g(void) {\n}\n"), ("u3.c", "#include <stdint.h>\nLUST_ABS(int8_t, i8)\n")];
-        let mk = |f: u64, g: u64, s: u64, abs: u64| split_mode(&[("f", f), ("g", g), ("u1.c;s", s), ("lust_abs_i8", abs), ("f_gone", f + g)], &units);
-        let base = mk(1, 2, 3, 4);
-        assert_eq!(base.key_part("u2.c"), mk(9, 2, 9, 9).key_part("u2.c"), "others' records");
-        assert_ne!(base.key_part("u2.c"), mk(1, 5, 3, 4).key_part("u2.c"), "own record");
-        assert_ne!(base.key_part("u1.c"), mk(1, 2, 5, 4).key_part("u1.c"), "own static record");
-        assert_ne!(base.key_part("u3.c"), mk(1, 2, 3, 5).key_part("u3.c"), "the runtime unit owns what no unit prints");
-        assert_eq!(base.key_part("u1.c"), mk(1, 2, 3, 5).key_part("u1.c"));
-        // `f_gone` (no unit defines it) moves no key, the runtime unit's included.
-        let Mode::Use(p) = &base else { unreachable!() };
-        assert_eq!((p.unowned, p.absent), (1, 1));
+        let with_copy: [(&str, &[&str]); 3] = [("u1.c", &["f", "lust_copy"]), ("u2.c", &["g"]), ("u3.c", &["lust_abs_i8"])];
+        let without: [(&str, &[&str]); 3] = [("u1.c", &["f"]), ("u2.c", &["g"]), ("u3.c", &["lust_abs_i8"])];
+        let mk = |defs: &[(&str, &[&str])], f: u64, g: u64, s: u64, abs: u64| {
+            split_mode(&[("f", f), ("g", g), ("u1.c;s", s), ("lust_abs_i8", abs), ("lust_copy", 7), ("f_gone", f + g)], defs, &["lust_abs_i8"])
+        };
+        let base = mk(&with_copy, 1, 2, 3, 4);
+        assert_eq!(base.key_part("u2.c"), mk(&with_copy, 9, 2, 9, 9).key_part("u2.c"), "others' records");
+        assert_ne!(base.key_part("u2.c"), mk(&with_copy, 1, 5, 3, 4).key_part("u2.c"), "own record");
+        assert_ne!(base.key_part("u1.c"), mk(&with_copy, 1, 2, 5, 4).key_part("u1.c"), "own static record");
+        assert_ne!(base.key_part("u3.c"), mk(&with_copy, 1, 2, 3, 5).key_part("u3.c"), "own macro-made record");
+        assert_eq!(base.key_part("u1.c"), mk(&with_copy, 1, 2, 3, 5).key_part("u1.c"));
+        assert_eq!(base.key_part("u3.c"), mk(&without, 1, 2, 3, 4).key_part("u3.c"), "an inline copy elsewhere comes or goes");
+        // `f_gone` and, with no copy left, `lust_copy` (no unit defines them) go to no unit.
+        let Mode::Use(p) = &mk(&without, 1, 2, 3, 4) else { unreachable!() };
+        assert_eq!((p.helpers, p.absent), (1, 2));
+    }
+
+    /// A unit with `#include`s is read through the preprocessor: the fns its macros make
+    /// are its own.
+    #[test]
+    fn macro_made_fns_belong_to_their_unit() {
+        let Ok(spec) = super::super::spec_for(crate::protocol::host_triple()) else { return };
+        let c = "#include <stddef.h>\n#define MK(n) int lust_##n(void) { return 0; }\nMK(a)\nint visible(void) {\n  return 1;\n}\n";
+        let d = unit_defs(&spec, &[("u2.c".to_string(), c)]);
+        let mut names = d.units[0].1.clone();
+        names.sort();
+        assert_eq!(names, vec!["lust_a", "visible"]);
+        assert_eq!(d.macro_made, ["lust_a".to_string()].into_iter().collect());
     }
 
     #[test]
