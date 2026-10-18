@@ -2517,8 +2517,9 @@ impl FnGen<'_, '_> {
     /// their unwind actions, and terminators.
     fn blocks(&mut self, order: &[usize]) {
         let zc = self.p.unwind && self.p.unwind_tables;
+        let entry = if zc && self.zc_frame && !self.zc_in_cleanup { self.zc_entry_states(order) } else { Vec::new() };
         for (k, &bi) in order.iter().enumerate() {
-            self.zc_st = None;
+            self.zc_st = entry.get(bi).copied().flatten();
             let _ = writeln!(self.out, "bb{bi}:;");
             let block = self.body.block(Bb(bi as u32));
             for (si, s) in block.stmts.iter().enumerate() {
@@ -2552,6 +2553,46 @@ impl FnGen<'_, '_> {
             }
             self.term(&block.term, block.term_span, next);
         }
+    }
+
+    /// Unwind tables: the ladder entry `L.st` holds when each of `order`'s blocks starts,
+    /// where every path to the block agrees (`function` stores 0 at entry, and `blocks`
+    /// stores each statement's and call's entry before it runs), so a block stores only
+    /// where the entry changes. None where the paths disagree.
+    fn zc_entry_states(&self, order: &[usize]) -> Vec<Option<u32>> {
+        let n = self.body.blocks.len();
+        let mut normal = vec![false; n];
+        order.iter().for_each(|&b| normal[b] = true);
+        // None: no path seen yet; Some(None): the paths disagree.
+        let mut entry: Vec<Option<Option<u32>>> = vec![None; n];
+        let Some(&first) = order.first() else { return Vec::new() };
+        entry[first] = Some(Some(0));
+        let mut work = vec![first];
+        while let Some(b) = work.pop() {
+            let block = self.body.block(Bb(b as u32));
+            let mut st = entry[b].flatten();
+            for si in 0..=block.stmts.len() {
+                let skip = block.stmts.get(si).is_some_and(|s| matches!(s.kind, StmtKind::StorageDead(_) | StmtKind::FakeRead(_)));
+                if !skip && let Some(Unw::Goto(e)) = self.stmt_action(b, si) {
+                    st = Some(e);
+                }
+            }
+            if let Terminator::Call { unwind: Some(u), .. } = &block.term {
+                st = Some(u.0);
+            }
+            for s in succ(&block.term).into_iter().map(|s| s.0 as usize).filter(|&s| normal[s]) {
+                let new = match entry[s] {
+                    None => Some(st),
+                    Some(old) if old == st => Some(old),
+                    Some(_) => Some(None),
+                };
+                if entry[s] != new {
+                    entry[s] = new;
+                    work.push(s);
+                }
+            }
+        }
+        entry.into_iter().map(Option::flatten).collect()
     }
 
     /// Unwind tables: stores ladder entry `b` in the frame's `L.st` (once per run of
