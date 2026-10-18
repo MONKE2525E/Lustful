@@ -12305,10 +12305,11 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     let recheck_limit = if p.gx.walk_instances { 8 } else { 1 };
     // The body lints after a clean check add only errors. A discovery
     // check's errors matter only for its instance requests (a failed
-    // body's stub picks), which `lust check` walks only with generic
-    // associated consts, and for the reuse store a one-shot compile has
-    // not (`GenReuse::on`). So a one-shot `lust check` skips them.
-    let lints = p.gx.walk_instances || !p.gx.assoc_const_tmpls.is_empty() || reuse.on || !reuse.one_shot;
+    // body's stub picks are dropped, `discovery_out`) and for the reuse
+    // store a one-shot compile has not (`GenReuse::on`). So a one-shot
+    // compile skips them, and runs them only for a clean body whose
+    // requests name a stub (`lint_tail`, below).
+    let lints = reuse.on || !reuse.one_shot;
     while !queue.is_empty() {
         rounds += 1;
         if rounds > 4096 || p.fns.len() > 200_000 {
@@ -12338,7 +12339,14 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 stored
             } else {
                 reuse.discovery_checked += 1;
-                let (checked, discarded) = crate::check::check_fn_with(p, fid, lints);
+                let (mut checked, mut discarded) = crate::check::check_fn_with(p, fid, lints);
+                if !lints
+                    && discarded.is_empty()
+                    && checked.inst_requests.iter().any(|(t, _)| p.gx.fn_class.get(t.0 as usize) == Some(&FnClass::Stub))
+                    && let Some(d) = crate::check::lint_tail(p, fid, &mut checked)
+                {
+                    discarded.push(d);
+                }
                 let (adt_tys, reqs, closures_owned, vts) = discovery_out(p, &checked, &discarded);
                 // A body whose types still name a generic definer's
                 // template closures (its instance is made from this very
