@@ -37,8 +37,7 @@ const FAKE_DIR_ENV: &str = "LUST_PROBE_FAKE_DIR";
 /// cannot be the wrapper: a process that is not lust-core (unit tests), or
 /// no build dir from `cargo metadata`.
 pub fn check_command(manifest: &Path, triple: &str, env: Option<&[(String, String)]>) -> Command {
-    let mut cmd = Command::new("cargo");
-    super::cargo::apply_cargo_env(&mut cmd, env);
+    let mut cmd = super::cargo::cargo_command(env);
     if let Some(dir) = manifest.parent() {
         cmd.current_dir(dir);
     }

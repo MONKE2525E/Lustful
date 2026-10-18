@@ -364,6 +364,23 @@ pub fn apply_cargo_env(cmd: &mut Command, env: Option<&[(String, String)]>) {
     cmd.envs(env.iter().map(|(k, v)| (k, v)));
 }
 
+/// A `cargo` command for a client's Cargo env (`apply_cargo_env`), with
+/// `cargo` found on the PATH that env gives. A command that sets PATH and
+/// names a bare program makes std fork instead of posix_spawn, and a fork
+/// copies the page table of every resident page of this process: several
+/// GB after a front image restore (src/image.rs), hundreds of ms a spawn.
+pub fn cargo_command(env: Option<&[(String, String)]>) -> Command {
+    use std::os::unix::fs::PermissionsExt;
+    let path = match env {
+        Some(env) => env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()),
+        None => std::env::var("PATH").ok(),
+    };
+    let found = path.iter().flat_map(std::env::split_paths).map(|d| d.join("cargo")).find(|c| c.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0));
+    let mut cmd = Command::new(found.unwrap_or_else(|| PathBuf::from("cargo")));
+    apply_cargo_env(&mut cmd, env);
+    cmd
+}
+
 impl GraphRequest {
     /// One env var as Cargo sees it for this request.
     fn var(&self, name: &str) -> Option<String> {
@@ -539,7 +556,7 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
 /// One `cargo metadata` run for `req`, read into a graph (key, watch,
 /// and stamp are filled by `load_graph`).
 fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = cargo_command(req.env.as_deref());
     // Run in the manifest's directory: Cargo discovers `.cargo/config.toml`
     // from the working directory, and the project's config (source
     // replacement, aliases) must apply as it does for the user there.
@@ -564,7 +581,6 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
         cmd.args(["--filter-platform", filter]);
     }
     cmd.args(req.cargo_net.args());
-    apply_cargo_env(&mut cmd, req.env.as_deref());
     let out = cmd.output().map_err(|e| format!("cannot run `cargo metadata`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -766,11 +782,10 @@ pub fn package_cargo_env(pkg: &PackageInfo, target: &TargetInfo) -> Vec<(String,
 /// else `target_directory` for a Cargo without build-dir): the probe of
 /// `resolve::probe` needs its deps dir. None when the call fails.
 pub fn build_dir(manifest: &Path, env: Option<&[(String, String)]>) -> Option<PathBuf> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = cargo_command(env);
     if let Some(dir) = manifest.parent() {
         cmd.current_dir(dir);
     }
-    apply_cargo_env(&mut cmd, env);
     let out = cmd.args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"]).arg(manifest).output().ok()?;
     let root = parse_json(&String::from_utf8_lossy(&out.stdout)).ok()?;
     let dir = root.get("build_directory").or_else(|| root.get("target_directory"))?.as_str()?;
