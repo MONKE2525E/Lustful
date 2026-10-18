@@ -311,11 +311,6 @@ pub struct GenReuse {
     /// True unless this collect's trait-system key equals the last one;
     /// then every entry was dropped, and the driver rechecks every body.
     pub trait_changed: bool,
-    /// For a collect after a const fn edit: the last program's const and
-    /// static values. Collect drops every entry right after `gate` when
-    /// one of them moved (`values_moved`), before any entry is used.
-    pub values_check: Option<crate::driver::graph::ConstValuesFp>,
-    pub values_moved: bool,
     /// The key of the std and lang trait impls the trait-system key
     /// leaves to `LangImpls` reads (`TraitKey::lang`), and whether this
     /// collect moved it: the driver then regenerates the glue.

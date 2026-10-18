@@ -62,10 +62,6 @@ pub(crate) struct Front {
     /// (`Program::static_defs`): while a full resolve leaves them equal,
     /// nested statics kept their indexes and generic reuse holds.
     pub(crate) prev_static_defs: Option<Vec<crate::def::DefId>>,
-    /// The body const values of the last program a request ended with
-    /// (`graph::ConstValuesFp`): a full collect after a const fn edit
-    /// keeps generic reuse when none of them moved.
-    pub(crate) prev_const_values: Option<crate::driver::graph::ConstValuesFp>,
     /// Set by a body patch whose const fn edit only const and static values
     /// can read (`ConstReach::revaluable`): the kept program must evaluate
     /// them again (`collect::const_values_hold`) before it stands.
@@ -423,7 +419,6 @@ impl Session {
                 prev_static_ids: FxMap::default(),
                 ids_forced_full: false,
                 prev_static_defs: None,
-                prev_const_values: None,
                 revalue_consts: false,
                 rpit_edit: false,
                 kept_put_back: false,

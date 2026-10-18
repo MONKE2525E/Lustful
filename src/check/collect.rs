@@ -5608,14 +5608,9 @@ pub fn collect_reuse(
     // the template checks and discovery that `finish_collect` runs.
     let key = crate::driver::gen_reuse::trait_key(&p, &impl_traits);
     p.gx.reuse.gate(key);
-    // After a const fn edit the entries hold only while every const and
-    // static value of the last program does (all are evaluated by now).
-    if let Some(prev) = p.gx.reuse.values_check.take()
-        && !prev.kept_in(&crate::driver::graph::ConstValuesFp::of(&p))
-    {
-        p.gx.reuse.clear();
-        p.gx.reuse.values_moved = true;
-    }
+    // Every value is evaluated by now: each body const's joins its owner
+    // fn's source, before any stored entry is used.
+    fold_body_const_values(&mut p);
     // The spliced source std fns route before mono: its body checks
     // resolve `std::process::exit` and the like as the driver's do. A
     // missing fn is the driver's error (it routes again after collect).
@@ -6915,10 +6910,26 @@ pub(crate) fn nested_static_hashes(
     if statics.is_empty() {
         return out;
     }
-    // Innermost body by span: fn bodies sorted by (file, start, longest
-    // first) form a nesting; a sweep keeps the bodies open at each static.
-    // An instance shares its template's body: the first fn with a body
-    // (the template, in LocalDefId order) is the parent.
+    let parent = stmt_item_parents(ast, fns, &statics);
+    let root = crate::def::item_hash(stable, &["#body"], crate::def::DefKind::Static, "", 0);
+    let mut seen: HashMap<(Option<usize>, Sym), u32> = HashMap::default();
+    for &j in &statics {
+        let ItemKind::Static(st) = &ast.stmt_items[j].kind else { continue };
+        let ordinal = seen.entry((parent[j], st.name)).or_insert(0);
+        let parent_hash = parent[j].map_or(root, |i| fns[i].1);
+        out[j] = Some(crate::def::child_hash(parent_hash, crate::def::DefKind::Static, interner.get(st.name), *ordinal));
+        *ordinal += 1;
+    }
+    out
+}
+
+/// The fn whose body holds each of the body items `items` (by
+/// `Ast::stmt_items` index; None for the others): the innermost by span.
+/// fn bodies sorted by (file, start, longest first) form a nesting; a sweep
+/// keeps the bodies open at each item. An instance shares its template's
+/// body: the first fn with a body (the template, in LocalDefId order) is
+/// the parent. `fns` is every fn in LocalDefId order (body, def hash).
+pub(crate) fn stmt_item_parents(ast: &Ast, fns: &[(Option<ast::BlockId>, crate::def::DefPathHash)], items: &[usize]) -> Vec<Option<usize>> {
     let mut events: Vec<(u32, u32, std::cmp::Reverse<u32>, Option<usize>, usize)> = Vec::new();
     let mut bodies: std::collections::HashSet<ast::BlockId> = Default::default();
     for (i, (body, _)) in fns.iter().enumerate() {
@@ -6929,7 +6940,7 @@ pub(crate) fn nested_static_hashes(
             events.push((s.file.0, s.lo, std::cmp::Reverse(s.hi), Some(i), 0));
         }
     }
-    for &j in &statics {
+    for &j in items {
         let s = ast.stmt_items[j].span;
         events.push((s.file.0, s.lo, std::cmp::Reverse(s.hi), None, j));
     }
@@ -6945,16 +6956,32 @@ pub(crate) fn nested_static_hashes(
             None => parent[j] = open.iter().rev().find(|&&(_, ohi, _)| hi <= ohi).map(|&(_, _, i)| i),
         }
     }
-    let root = crate::def::item_hash(stable, &["#body"], crate::def::DefKind::Static, "", 0);
-    let mut seen: HashMap<(Option<usize>, Sym), u32> = HashMap::default();
-    for &j in &statics {
-        let ItemKind::Static(st) = &ast.stmt_items[j].kind else { continue };
-        let ordinal = seen.entry((parent[j], st.name)).or_insert(0);
-        let parent_hash = parent[j].map_or(root, |i| fns[i].1);
-        out[j] = Some(crate::def::child_hash(parent_hash, crate::def::DefKind::Static, interner.get(st.name), *ordinal));
-        *ordinal += 1;
+    parent
+}
+
+/// Folds the value of each body const into the source fingerprint of the
+/// fn whose body holds it (`GenReuse::ast_src`), right after collect
+/// evaluates it: a body const has no def a read could name, so a const fn
+/// edit that moves its value rechecks its owner, and what replays the
+/// owner's check (its instances and closures), through their sources.
+fn fold_body_const_values(p: &mut Program) {
+    if p.body_consts.is_empty() || p.gx.reuse.ast_src.is_empty() {
+        return;
     }
-    out
+    let mut consts: Vec<(u32, u32)> = p.body_items.iter().filter_map(|(&j, it)| if let BodyItem::Const(ci) = *it { Some((j, ci)) } else { None }).collect();
+    consts.sort_unstable();
+    let fns: Vec<(Option<ast::BlockId>, crate::def::DefPathHash)> = p.fns.iter().zip(&p.fn_defs).map(|(f, d)| (f.def(&p.ast).body, d.hash)).collect();
+    let items: Vec<usize> = consts.iter().map(|&(j, _)| j as usize).collect();
+    let parent = stmt_item_parents(&p.ast, &fns, &items);
+    for (j, ci) in consts {
+        let (Some(owner), Some(c)) = (parent[j as usize], p.body_consts.get(ci as usize)) else { continue };
+        let fp = crate::driver::graph::value_fp(p, &c.value, &c.value_fp);
+        if let Some(src) = p.gx.reuse.ast_src.get_mut(owner) {
+            let mut h = crate::intern::FxHasher::default();
+            std::hash::Hash::hash(&(*src, fp), &mut h);
+            *src = std::hash::Hasher::finish(&h);
+        }
+    }
 }
 
 /// The owner Adt of an impl hoisted out of a fn body (`ImplDef::in_body`),

@@ -3247,10 +3247,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         changed.sort_unstable();
     }
     // The trait-system half of this joins after collect (`gen_ok`).
-    // A const fn edit on a full resolve keeps generic reuse for now: after
-    // collect, if a const or static value of the last program moved, reuse
-    // goes and collect runs again (`ConstValuesFp`, below).
-    let const_fn_checked = const_fn_changed && !matches!(visits.path, "patch" | "item") && front.prev_const_values.is_some();
+    // A const fn edit on a full resolve keeps generic reuse: the values it
+    // can move reach the stored entries through their reads (a const or
+    // static item's `Sig` folds its value) or their sources (a body const
+    // folds into its owner fn's, collect `fold_body_const_values`).
+    let const_fn_checked = const_fn_changed && !matches!(visits.path, "patch" | "item");
     let mut gen_ok_here =
         caches.persistent && gen_env.is_some() && (!const_fn_changed || const_fn_checked) && !statics_may_move && !front.slots_renumbered;
     visits.generic = match () {
@@ -3435,10 +3436,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // gives collect's answer (`Front::delta_errs`; the oracle compares it).
     let delta_errs = front.delta_errs.take();
     let delta_answered = delta_errs.is_some();
-    // A const fn edit keeps generic reuse only while no value moves: collect
-    // checks that before it uses an entry (`GenReuse::values_check`).
-    caches.gen_reuse.values_moved = false;
-    caches.gen_reuse.values_check = if const_fn_checked && gen_ok_here { front.prev_const_values.clone() } else { None };
     let collected = match kept {
         Some(r) => r,
         None if delta_errs.is_some() => Err(delta_errs.unwrap_or_default()),
@@ -3453,21 +3450,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 visits.generic = "statics_moved";
                 collect(front, caches)
             }
-            // A const fn edit moved a value after all: collect dropped the
-            // reuse entries before using any (`GenReuse::values_check`), so
-            // nothing reused holds an old value; the rest goes as with
-            // generic reuse off.
-            Ok(p) if caches.gen_reuse.values_moved => {
-                gen_ok_here = false;
-                visits.generic = "const_values";
-                Ok(p)
-            }
             c => c,
         },
     };
     if let Ok(p) = &collected {
         front.prev_static_defs = Some(p.static_defs.clone());
-        front.prev_const_values = Some(crate::driver::graph::ConstValuesFp::of(p));
     }
     let mut program = match collected {
         Ok(p) => p,

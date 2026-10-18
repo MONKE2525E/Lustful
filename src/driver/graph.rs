@@ -1663,7 +1663,7 @@ fn hash_const_value(h: &mut FxHasher, p: &Program, v: &crate::ty::consteval::Con
 /// once per item (`ConstItem::value_fp`): `Sig` reads in every walk, the
 /// const fn value check, and the statics fingerprint all fold it, and a
 /// large table's value is costly to walk.
-fn value_fp(p: &Program, value: &crate::ty::consteval::ConstValue, cell: &std::sync::OnceLock<u64>) -> u64 {
+pub(crate) fn value_fp(p: &Program, value: &crate::ty::consteval::ConstValue, cell: &std::sync::OnceLock<u64>) -> u64 {
     *cell.get_or_init(|| {
         let mut h = FxHasher::default();
         hash_const_value(&mut h, p, value, 0);
@@ -1869,36 +1869,6 @@ pub(crate) fn glue_method_slots_fp(p: &Program, slots: &[u32]) -> u64 {
     dm.sort_unstable();
     dm.hash(&mut h);
     h.finish()
-}
-
-/// One fingerprint over the values of the body consts, in order: what a
-/// const fn edit can move with no reader key. A full collect after a const
-/// fn edit keeps generic reuse when it holds (driver/compile.rs). The
-/// values of const and static items need no such check: every reader
-/// records a `Sig` read of the item (through its binding), whose
-/// fingerprint folds the value, so a moved one rechecks just its readers.
-/// A body const has no def a read could name: its own body reads it by
-/// index.
-#[derive(Clone, Default, PartialEq)]
-pub(crate) struct ConstValuesFp {
-    body: u64,
-}
-
-impl ConstValuesFp {
-    pub(crate) fn of(p: &Program) -> ConstValuesFp {
-        let mut h = FxHasher::default();
-        (p.body_consts.len() as u64).hash(&mut h);
-        for c in &p.body_consts {
-            value_fp(p, &c.value, &c.value_fp).hash(&mut h);
-        }
-        ConstValuesFp { body: h.finish() }
-    }
-
-    /// True when the body consts of `self` (the last program) keep their
-    /// values in `new`.
-    pub(crate) fn kept_in(&self, new: &ConstValuesFp) -> bool {
-        self.body == new.body
-    }
 }
 
 pub(crate) fn statics_fingerprint(p: &Program) -> u64 {
