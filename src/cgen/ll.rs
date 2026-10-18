@@ -2146,6 +2146,80 @@ impl CRefs {
     }
 }
 
+/// Each LLVM fn's C ABI wrapper (`ll_wrapper`: its `fl_<id>` prototype, then `f_<id>`), by fn
+/// id, read from the fns' C. A C text that calls the fn through `f_<id>` gets the wrapper as a
+/// C99 inline definition in place of its prototype (`adapt`), as release C's inline copies
+/// are (`fn_unit_parts`): clang inlines it, so the call goes straight to `fl_<id>`. The fn's
+/// own unit keeps the external wrapper while some text names it (`CRefs`), for its address
+/// and for calls that stay calls. `LUST_LL_ADAPT=0`: off (measurement).
+pub struct Adapters<'a> {
+    by_id: HashMap<u64, (&'a str, &'a str)>,
+}
+
+impl<'a> Adapters<'a> {
+    /// The wrappers of the LLVM fns in `fns`; None when off.
+    pub fn new(fns: &'a [FnOut]) -> Option<Adapters<'a>> {
+        if std::env::var("LUST_LL_ADAPT").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let mut by_id = HashMap::new();
+        for f in fns.iter().filter(|f| !f.ll.is_empty()) {
+            // `code`: the fn's comment line, the `fl_` prototype, the wrapper, the trampoline.
+            let mut lines = f.code.lines().skip(1);
+            let (Some(proto), Some(def)) = (lines.next(), lines.next()) else { continue };
+            let Some(at) = proto.find(" fl_") else { continue };
+            let Some(id) = proto.get(at + 4..at + 20).and_then(|h| u64::from_str_radix(h, 16).ok()) else { continue };
+            if proto.ends_with(");") && def.ends_with(" }") && def.contains(&format!("f_{id:016x}(")) {
+                by_id.insert(id, (proto, def));
+            }
+        }
+        Some(Adapters { by_id })
+    }
+
+    /// `text` with each line that is the prototype of a wrapper here replaced by the wrapper's
+    /// `fl_<id>` prototype and its inline definition (the first time; a later one by an inline
+    /// declaration), `ll_pair`'s typedef first when the text needs it and has none. A fn `own`
+    /// holds is left alone (the text defines its external wrapper). None: no change.
+    pub fn adapt(&self, text: &str, own: impl Fn(u64) -> bool) -> Option<String> {
+        let b = text.as_bytes();
+        let mut out: Option<String> = None;
+        let mut last = 0;
+        let mut done: HashSet<u64> = HashSet::new();
+        let mut pair: Option<bool> = None;
+        for (at, _) in text.match_indices("f_") {
+            // A prototype names the fn after its return type: ` f_` or `*f_`.
+            if at == 0 || !matches!(b[at - 1], b' ' | b'*') || at < last || b.get(at + 18) != Some(&b'(') {
+                continue;
+            }
+            let Some(id) = text.get(at + 2..at + 18).and_then(|h| u64::from_str_radix(h, 16).ok()) else { continue };
+            let Some(&(proto, def)) = self.by_id.get(&id) else { continue };
+            let start = text[..at].rfind('\n').map_or(0, |k| k + 1);
+            let end = text[at..].find('\n').map_or(text.len(), |k| at + k);
+            let line = &text[start..end];
+            let head = def.split_once(" {").map_or(def, |(h, _)| h);
+            if line.strip_suffix(';') != Some(head) || own(id) {
+                continue;
+            }
+            let o = out.get_or_insert_with(|| String::with_capacity(text.len() + 4096));
+            o.push_str(&text[last..start]);
+            if done.insert(id) {
+                if proto.starts_with("ll_pair ") && !*pair.get_or_insert_with(|| text.contains(PAIR_TYPEDEF)) {
+                    o.push_str(PAIR_TYPEDEF);
+                    pair = Some(true);
+                }
+                let _ = write!(o, "{proto}\ninline {def}");
+            } else {
+                let _ = write!(o, "inline {line}");
+            }
+            last = end;
+        }
+        out.map(|mut o| {
+            o.push_str(&text[last..]);
+            o
+        })
+    }
+}
+
 /// The `.ll` text of one release fn unit: the declarations its fns name (each once) and
 /// their definitions, then an `available_externally` copy of each fn in `inl`
 /// (`ll_inline_set`). Empty when no fn of the unit has LLVM IR.
@@ -2199,9 +2273,34 @@ pub fn ll_unit(fns: &[FnOut], slots: &[usize], inl: &[usize], triple: &str) -> S
     out
 }
 
+
 #[cfg(test)]
 mod tests {
-    use super::CRefs;
+    use super::{Adapters, CRefs, FnOut};
+
+    /// A C text that names an LLVM fn's wrapper by its prototype gets the wrapper inline (once,
+    /// with `ll_pair` when its result needs it); a fn the text defines keeps its prototype.
+    #[test]
+    fn a_wrapper_prototype_becomes_an_inline_wrapper() {
+        let (a, b) = ("00000000000000aa", "00000000000000bb");
+        let fns = [
+            FnOut {
+                ll: "define".into(),
+                code: format!("/* m::a */\nll_pair fl_{a}(uint64_t);\nP f_{a}(uint64_t p1) {{ ll_pair rb = fl_{a}(p1); P r; memcpy(&r, &rb, 16); return r; }}\nP tramp_{a}(uint64_t p1) {{ return f_{a}(p1); }}\n"),
+                ..Default::default()
+            },
+            FnOut { ll: "define".into(), code: format!("/* m::b */\nvoid fl_{b}(void);\nvoid f_{b}(void) {{ fl_{b}(); }}\n"), ..Default::default() },
+        ];
+        let ad = Adapters::new(&fns).unwrap();
+        let text = format!("int x;\nP f_{a}(uint64_t p1);\nvoid f_{b}(void);\nP f_{a}(uint64_t p1);\nvoid g(void) {{ f_{b}(); }}\n");
+        let out = ad.adapt(&text, |id| id == 0xbb).unwrap();
+        let want = format!(
+            "int x;\n{}ll_pair fl_{a}(uint64_t);\ninline P f_{a}(uint64_t p1) {{ ll_pair rb = fl_{a}(p1); P r; memcpy(&r, &rb, 16); return r; }}\nvoid f_{b}(void);\ninline P f_{a}(uint64_t p1);\nvoid g(void) {{ f_{b}(); }}\n",
+            super::PAIR_TYPEDEF
+        );
+        assert_eq!(out, want);
+        assert!(ad.adapt("void g(void) { f_00000000000000aa(1); }\n", |_| false).is_none(), "a call is not a prototype");
+    }
 
     /// A unit keeps an LLVM fn's wrapper only when some text names it, and its trampoline only
     /// when some text names that (the wrapper then too: the trampoline calls it).

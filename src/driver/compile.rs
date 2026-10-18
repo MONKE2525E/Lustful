@@ -4707,10 +4707,26 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // One layout phase (cgen `in_layout_phase`): the program is frozen, so each
             // worker keeps its `c_layout` answers across the units it assembles.
             let asm_tag = cgen::layout_phase();
+            let llvm_on = cgen::names::with(rn, || cgen::ll::on(&program));
+            // The LLVM backend: C that calls an LLVM fn through its C ABI wrapper gets the
+            // wrapper inline (`cgen::ll::Adapters`); an LLVM unit's own wrappers stay external.
+            let adapters = if llvm_on { cgen::ll::Adapters::new(&caches.out) } else { None };
+            let adapt = |text: String, own: &std::collections::HashSet<u64>| match adapters.as_ref().and_then(|a| a.adapt(&text, |id| own.contains(&id))) {
+                Some(t) => t,
+                None => text,
+            };
+            if let Some(a) = &adapters {
+                let new = par_map(&rshards, |t| a.adapt(t, |_| false));
+                for (t, n) in rshards.iter_mut().zip(new) {
+                    if let Some(n) = n {
+                        *t = n;
+                    }
+                }
+            }
             let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>| {
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
-                    1 => (cgen::names::statics_unit(&program, &caches.glue), String::new()),
+                    1 => (adapt(cgen::names::statics_unit(&program, &caches.glue), &Default::default()), String::new()),
                     2 => (cgen::runtime_unit(), String::new()),
                     3 => (super::release_c::table_unit(&rg.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
                     LOC_UNIT => {
@@ -4719,7 +4735,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                     g => {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];
-                        cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs)
+                        let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs);
+                        if adapters.is_none() {
+                            return (c, h);
+                        }
+                        // An LLVM unit's C defines its own fns' wrappers (external).
+                        let own = slots.iter().filter_map(|&s| cgen::names::fn_tag_opt(s as u32)).filter_map(|id| u64::from_str_radix(&id, 16).ok()).collect();
+                        (adapt(c, &own), adapt(h, &own))
                     }
                 }));
                 (base_obj(u), c, helpers)
