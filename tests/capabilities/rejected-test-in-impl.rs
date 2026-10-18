@@ -1,6 +1,5 @@
-// capability: rejected: #[test] functions inside impl blocks (in `lust test`; rustc rejects them too)
+// capability: rejected: #[test] functions inside impl blocks and traits (rustc rejects them too)
 // expect: L0402
-// command: test
 
 struct S;
 

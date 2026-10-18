@@ -1652,7 +1652,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("`dyn` coercions in const and static initializers", "L0702"),
     ("traits, generic type aliases, and type items named like builtin types inside function bodies", "L0820"),
     ("a non-pub member of an impl inside a function body when a block `use` is in scope or the self type does not resolve", "L0820"),
-    ("#[test] functions inside impl blocks (in `lust test`; rustc rejects them too)", "L0402"),
+    ("#[test] functions inside impl blocks and traits (rustc rejects them too)", "L0402"),
     ("raw references (`&raw`)", "L0820"),
     ("tuple struct patterns with field numbers", "L0820"),
     ("variadic parameters (rustc rejects them outside `extern` blocks too)", "L0820"),

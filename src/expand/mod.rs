@@ -1166,6 +1166,10 @@ pub struct Expander<'a> {
     /// True while the list being expanded is an enum body: its first
     /// part is a variant (`A = 1 + 2`), not a block tail.
     enum_body: bool,
+    /// True while the list being expanded is an impl or trait body. A
+    /// `#[test]` fn there stays in every build, so the parser reports it
+    /// (rustc rejects `#[test]` on an associated fn even without --test).
+    assoc_body: bool,
     /// What kind of list is being expanded, for the position rules of a
     /// cfg run (`cfg_run_misplaced`).
     group: Group,
@@ -1335,6 +1339,7 @@ impl<'a> Expander<'a> {
             late_bindings: Vec::new(),
             items_call: false,
             enum_body: false,
+            assoc_body: false,
             group: Group::Brace,
             builtin_imports: Vec::new(),
             module_builtin_alias: FxMap::default(),
@@ -4103,16 +4108,24 @@ impl<'a> Expander<'a> {
                         .rev()
                         .take_while(|t| !t.is_tok(Tok::Semi) && !matches!(t, Tt::Delim(Delim::Brace, _, _)))
                         .any(|t| t.is_tok(Tok::Enum));
+                // An `impl` or `trait` header with no `fn` in it (`fn f() ->
+                // impl Tr {` is a fn body).
+                let assoc_body = d == Delim::Brace && {
+                    let head = || out.iter().rev().take_while(|t| !t.is_tok(Tok::Semi) && !matches!(t, Tt::Delim(Delim::Brace, _, _)));
+                    head().any(|t| t.is_tok(Tok::Impl) || t.is_tok(Tok::Trait)) && !head().any(|t| t.is_tok(Tok::Fn))
+                };
                 let group = group_kind(d, &out, trees.get(i + 1), self.group, self.enum_body);
                 // A tuple stays a tuple when cfg drops all but one element:
                 // `(#[cfg(off)] a, b)` is `(b,)`.
                 let tuple = group == Group::Tuple && has_top(&inner, 0, Tok::Comma);
                 let outer_group = std::mem::replace(&mut self.group, group);
                 let outer_enum = std::mem::replace(&mut self.enum_body, enum_body);
+                let outer_assoc = std::mem::replace(&mut self.assoc_body, assoc_body);
                 let scope_calls = std::mem::replace(&mut self.scope_calls, self.plain_calls.len());
                 let expanded = self.expand_list(inner, depth, false, d == Delim::Brace, nest + 1);
                 self.scope_calls = scope_calls;
                 self.enum_body = outer_enum;
+                self.assoc_body = outer_assoc;
                 self.group = outer_group;
                 let expanded = match expanded {
                     Ok(mut e) if tuple && !e.is_empty() && !has_top(&e, 0, Tok::Comma) => {
@@ -4346,9 +4359,10 @@ impl<'a> Expander<'a> {
                         ));
                     }
                 }
-                // Only a fn item drops: `#[test]` anywhere else is
-                // an error in every build, and the parser reports it.
-                "test" => off = !self.ctx.cfg.test && next_is_fn(trees, after),
+                // Only a free fn drops: `#[test]` anywhere else (also on
+                // an impl or trait fn) is an error in every build, and the
+                // parser reports it.
+                "test" => off = !self.ctx.cfg.test && !self.assoc_body && next_is_fn(trees, after),
                 "macro_export" => {
                     check_macro_export_input(trees, &attr, export_leveled, self.ctx.interner)?;
                     exported = true;
