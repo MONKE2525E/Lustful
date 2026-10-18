@@ -403,8 +403,11 @@ pub fn build(
     let pfile = |i: usize| if is_ll[i] { format!("{}.ll", names[i]) } else { format!("{}.c", names[i]) };
     let files: Vec<(String, &str)> =
         (0..units.len()).filter(|&i| !is_cxx(&names[i])).map(|i| (pfile(i), ll_texts[i].as_deref().unwrap_or(&units[i].1))).collect();
-    let pgo = pgo::Mode::from_env(work, &files)?;
+    let pgo = pgo::Mode::from_env(spec, work, &files)?;
     let pgo_of = |i: usize| pgo.as_ref().filter(|_| !is_cxx(&names[i]));
+    // An instrumented build needs a compiler with a profile runtime (`pgo::gen_spec`).
+    let gen_spec = if matches!(pgo, Some(pgo::Mode::Gen)) { Some(pgo::gen_spec(spec)?) } else { None };
+    let spec = gen_spec.as_ref().unwrap_or(spec);
     // Largest units first, bounded workers: the tcc driver's shape
     // (src/tcc.rs), for the same reason (the tail is short units).
     let mut order: Vec<usize> = (0..units.len()).collect();

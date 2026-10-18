@@ -1,8 +1,10 @@
 // Clang PGO for the release driver, per unit (rel-cache round 3).
 //
 // `LUST_PGO_GEN=1` builds an instrumented binary (`-fprofile-generate`; its runs write
-// raw profiles where `LLVM_PROFILE_FILE` says). `LUST_PGO_USE=<file.profdata>` builds
-// with a merged profile. A profile must not change every object's cache key, so each
+// raw profiles where `LLVM_PROFILE_FILE` says). zig ships no profile runtime, so with a
+// zig compiler that build uses `LUST_PGO_CC`, a clang of zig's LLVM major version, for
+// the host (`gen_spec`; scripts/pgo-llvm.sh installs one). `LUST_PGO_USE=<file.profdata>`
+// builds with a merged profile, which must come from the compiler's LLVM major. A profile must not change every object's cache key, so each
 // unit compiles with a profile of only its own functions' records, and its key holds
 // exactly that (`Mode::key_part`): a refreshed or pinned profile recompiles only the
 // units whose own counts moved. The thresholds LLVM derives from a profile's summary
@@ -21,6 +23,7 @@
 // macros (`LUST_ABS(int8_t, i8)`), so the runtime unit also owns the `lust_*` records no
 // unit visibly defines; any other record no unit defines is of a fn this build does not
 // have (a profile from an older state) and goes to no unit.
+use super::CcSpec;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,11 +54,18 @@ pub struct Pgo {
 impl Mode {
     /// The mode `LUST_PGO_GEN` / `LUST_PGO_USE` ask for, or None. `units` are (file name
     /// the unit compiles as, C text).
-    pub fn from_env(work: &Path, units: &[(String, &str)]) -> Result<Option<Mode>, String> {
+    pub fn from_env(spec: &CcSpec, work: &Path, units: &[(String, &str)]) -> Result<Option<Mode>, String> {
         if std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1") {
             return Ok(Some(Mode::Gen));
         }
         let Some(path) = std::env::var_os("LUST_PGO_USE") else { return Ok(None) };
+        // The profile format and the fns' CFG hashes are those of one LLVM major.
+        let cc = clang_major(&spec.cmd)?;
+        let pd = run(Command::new(profdata()).arg("--version"))?;
+        let pd = major_after(&pd, "LLVM version ")?;
+        if pd != cc {
+            return Err(format!("LUST_PROFDATA ({}) is LLVM {pd}, the compiler ({}) LLVM {cc}", profdata(), spec.cmd.join(" ")));
+        }
         let bits = std::env::var("LUST_PGO_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
         Pgo::load(Path::new(&path), bits, work, units).map(|p| Some(Mode::Use(p)))
     }
@@ -105,6 +115,48 @@ impl Mode {
             Mode::Use(p) => format!("pgo {} records, {} runtime helpers, {} of fns not in this build", p.records, p.unowned, p.absent),
         }
     }
+}
+
+/// The compiler of an instrumented build for `spec`. zig ships no profile runtime, so for
+/// zig `LUST_PGO_CC` names a clang of zig's LLVM major and that build targets the host,
+/// where the training runs (the C is the release target's all the same). Any other
+/// compiler must itself be a clang: the profiles are LLVM IR profiles.
+pub fn gen_spec(spec: &CcSpec) -> Result<CcSpec, String> {
+    let want = clang_major(&spec.cmd)?;
+    if !super::is_zig(&spec.cmd[0]) {
+        return Ok(spec.clone());
+    }
+    let words: Vec<String> = std::env::var("LUST_PGO_CC").unwrap_or_default().split_whitespace().map(str::to_string).collect();
+    if words.is_empty() {
+        return Err(format!(
+            "an instrumented build (LUST_PGO_GEN=1) needs a profile runtime, and zig ships none: set LUST_PGO_CC to a clang of LLVM {want}, zig's version (scripts/pgo-llvm.sh installs one)"
+        ));
+    }
+    let have = clang_major(&words)?;
+    if have != want {
+        return Err(format!("LUST_PGO_CC ({}) is LLVM {have}, zig cc LLVM {want}: its profile would not match", words.join(" ")));
+    }
+    Ok(CcSpec { triple: spec.triple.clone(), cxx: super::cxx_for(&words), cmd: words, statik: false, exe_suffix: spec.exe_suffix })
+}
+
+/// The LLVM major version of a clang command; an error for another compiler (gcc writes
+/// its own profile format).
+fn clang_major(cmd: &[String]) -> Result<u32, String> {
+    let out = run(Command::new(&cmd[0]).args(&cmd[1..]).arg("--version"))?;
+    let first = out.lines().next().unwrap_or("");
+    if !first.contains("clang version ") {
+        return Err(format!("PGO needs clang (LLVM IR profiles); `{}` says: {first}", cmd.join(" ")));
+    }
+    major_after(first, "clang version ")
+}
+
+/// The major version number after `marker` in `text` (`clang version 20.1.2 ...`).
+fn major_after(text: &str, marker: &str) -> Result<u32, String> {
+    text.split(marker)
+        .nth(1)
+        .and_then(|r| r.split(['.', ' ']).next())
+        .and_then(|m| m.trim().parse().ok())
+        .ok_or_else(|| format!("no version after `{}` in: {}", marker.trim(), text.lines().next().unwrap_or("")))
 }
 
 fn profdata() -> String {
@@ -248,15 +300,20 @@ fn quantize(r: &str, bits: u32) -> String {
 fn pins(show: &str) -> Result<Vec<String>, String> {
     let (mut hot, mut cold, mut blocks) = (None, None, 0u64);
     for l in show.lines() {
-        // "<n> blocks with count >= <min> account for <p> percentage of the total counts."
+        // LLVM 18: "<n> blocks with count >= <min> account for <p> percentage of the total counts."
+        // LLVM 20: "<n> blocks (<f>%) with count >= <min> account for <p>% of the total counts."
         let w: Vec<&str> = l.split_whitespace().collect();
-        if w.len() >= 9 && w[1] == "blocks" && w[3] == "count" && w[4] == ">=" {
-            let (n, min) = (w[0].parse::<u64>().unwrap_or(0), w[5].parse::<u64>().unwrap_or(0));
-            match w[8] {
-                "99" => (hot, blocks) = (Some(min), n),
-                "99.9999" => cold = Some(min),
-                _ => {}
-            }
+        let at = |s: &str| w.iter().position(|x| *x == s);
+        let (Some(ge), Some(f)) = (at(">="), at("for")) else { continue };
+        if w.get(1) != Some(&"blocks") {
+            continue;
+        }
+        let n = w[0].parse::<u64>().unwrap_or(0);
+        let min = w.get(ge + 1).and_then(|m| m.parse::<u64>().ok()).unwrap_or(0);
+        match w.get(f + 1).map(|p| p.trim_end_matches('%')) {
+            Some("99") => (hot, blocks) = (Some(min), n),
+            Some("99.9999") => cold = Some(min),
+            _ => {}
         }
     }
     let (Some(hot), Some(cold)) = (hot, cold) else { return Err(format!("no detailed summary in llvm-profdata show output:\n{show}")) };
@@ -410,12 +467,31 @@ mod tests {
     }
 
     #[test]
+    fn llvm_majors_from_version_lines() {
+        let zig = "clang version 20.1.2 (https://github.com/ziglang/zig-bootstrap 7ef74e6)";
+        assert_eq!(major_after(zig, "clang version "), Ok(20));
+        assert_eq!(major_after("Ubuntu clang version 20.1.8 (++20250708)", "clang version "), Ok(20));
+        assert_eq!(major_after("Ubuntu LLVM version 20.1.8\n  Optimized build.", "LLVM version "), Ok(20));
+        assert_eq!(major_after("LLVM (http://llvm.org/):\n  LLVM version 18.1.3\n", "LLVM version "), Ok(18));
+        assert!(major_after("gcc (Ubuntu 13.2.0) 13.2.0", "clang version ").is_err());
+    }
+
+    #[test]
     fn quantize_keeps_small_counts_and_cuts_low_bits() {
         let r = "f\n# Func Hash:\n12345\n# Num Counters:\n2\n# Counter Values:\n5\n1000\n# Num Value Kinds:\n1\n# ValueKind = IPVK_IndirectCallTarget:\n0\n# NumValueSites:\n1\n1\ng:1000";
         let q = quantize(r, 3);
         assert!(q.contains("# Func Hash:\n12345\n"), "the hash stays");
         assert!(q.contains("\n5\n896\n"), "{q}");
         assert!(q.ends_with("g:896"), "{q}");
+    }
+
+    #[test]
+    fn pins_read_llvm_20_summaries() {
+        let show = "Detailed summary:\n21764 blocks (0.63%) with count >= 32768 account for 99% of the total counts.\n129141 blocks (3.71%) with count >= 4 account for 99.9999% of the total counts.\n";
+        let p = pins(show).unwrap();
+        assert!(p.contains(&"-profile-summary-hot-count=32768".to_string()), "{p:?}");
+        assert!(p.contains(&"-profile-summary-cold-count=4".to_string()), "{p:?}");
+        assert!(p.contains(&"-profile-summary-huge-working-set-size-threshold=0".to_string()), "{p:?}");
     }
 
     #[test]
