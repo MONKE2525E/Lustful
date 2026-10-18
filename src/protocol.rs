@@ -289,6 +289,12 @@ pub struct Request {
     /// an error. The daemon wire format does not carry this (decode sets false): `lust
     /// test` compiles in its own process.
     pub harness: bool,
+    /// Build with the external C compiler backend (src/cc.rs) for
+    /// `session.target_triple` instead of tcc, the release driver form.
+    /// The daemon wire format does not carry this (decode sets false):
+    /// release builds always compile cold, in the client-spawned
+    /// `lust-core`, never warm.
+    pub cc: bool,
     pub client: Client,
 }
 
@@ -329,6 +335,16 @@ pub enum Invocation {
         run: bool,
         args: Vec<String>,
     },
+    /// `lust build --release --target <triple>...`: the lust release driver.
+    /// One cold request per target (each `cc: true`, its own session and
+    /// output path); `lust-core` runs them in order and never hands them
+    /// to the daemon. `overflow_note` says the named profile turns
+    /// overflow checks off, which lust codegen cannot do yet: the driver
+    /// prints that once instead of changing semantics silently.
+    ReleaseCc {
+        reqs: Vec<Request>,
+        overflow_note: bool,
+    },
     /// `lust build --release` / `--profile <name>`: hand the file to Cargo or rustc.
     /// Handled in the client process; never sent to the daemon.
     Release {
@@ -344,10 +360,10 @@ pub enum Invocation {
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CrateFlags {
     manifest_path: Option<PathBuf>,
     package: Option<String>,
@@ -601,6 +617,9 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let (mut release, mut profile, mut rustc) = (false, None, false);
     let mut max_errors = 20usize;
     let mut crate_flags = CrateFlags::default();
+    // Every --target named, in order. One builds a session; several are
+    // the release driver's list and build one session each.
+    let mut targets: Vec<String> = Vec::new();
     let mut net = CargoNet { offline: std::env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true"), locked: false };
     // `-C panic=unwind|abort`, as rustc takes it. None keeps the default.
     let mut panic_abort: Option<bool> = None;
@@ -644,8 +663,8 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
                 "panic=abort" => panic_abort = Some(true),
                 _ => return None,
             },
-            "--target" => crate_flags.target_triple = Some(it.next()?.clone()),
-            _ if a.starts_with("--target=") => crate_flags.target_triple = Some(a["--target=".len()..].to_string()),
+            "--target" => targets.push(it.next()?.clone()),
+            _ if a.starts_with("--target=") => targets.push(a["--target=".len()..].to_string()),
             "--" => run_args = it.by_ref().cloned().collect(),
             _ if file.as_os_str().is_empty() => file = a.into(),
             _ => return None,
@@ -662,10 +681,62 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     // Crate-selection flags are lust dev flags today: reject them there rather
     // than build a different crate selection than the user named.
     if rustc {
-        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || panic_abort.is_some() {
+        if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || !targets.is_empty() || panic_abort.is_some() {
             return None;
         }
         return Some(Invocation::RustcCheck { file: abs(&file) });
+    }
+    if (release || profile.is_some()) && !targets.is_empty() {
+        // The lust release driver: one cold cc request per named target.
+        // Crate flags are its inputs, unlike the Cargo release below.
+        if cmd != "build" || !run_args.is_empty() || crate_flags.lib {
+            return None;
+        }
+        let typed = file.clone();
+        let file = abs(&file);
+        if let Some(p) = crate_flags.manifest_path.take() {
+            crate_flags.manifest_path = Some(abs(&p));
+        }
+        let profile_name = profile.as_deref().unwrap_or("release");
+        let manifest = crate_flags.manifest_path.clone().or_else(|| find_manifest(&file).map(|m| m.path));
+        let named = named_profile(manifest.as_deref(), profile_name);
+        let multi = targets.len() > 1;
+        let mut reqs = Vec::new();
+        for triple in &targets {
+            let mut flags = crate_flags.clone();
+            flags.target_triple = Some(triple.clone());
+            let mut session = session_key_for(&file, flags, net);
+            session.profile = ProfileFlags { overflow_checks: true, ..named };
+            if let Some(abort) = panic_abort {
+                session.profile.panic_abort = abort;
+            }
+            let bin = format!("{}{}", session.krate.target_name, if triple.contains("windows") { ".exe" } else { "" });
+            let out = match &out {
+                Some(o) if multi => abs(&o.join(triple).join(&bin)),
+                Some(o) => abs(o),
+                None if multi => abs(&PathBuf::from(triple).join(&bin)),
+                None => abs(&PathBuf::from(bin)),
+            };
+            reqs.push(Request {
+                cmd: Cmd::Build,
+                session,
+                file: file.clone(),
+                out,
+                json,
+                timings,
+                debug,
+                emit_c: emit_c.as_ref().map(|p| {
+                    let p = abs(p);
+                    if multi { PathBuf::from(format!("{}-{}", p.display(), triple)) } else { p }
+                }),
+                max_errors,
+                run_args: None,
+                harness: false,
+                cc: true,
+                client: Client::current(&typed),
+            });
+        }
+        return Some(Invocation::ReleaseCc { reqs, overflow_note: !named.overflow_checks });
     }
     if release || profile.is_some() {
         if cmd != "build" || !run_args.is_empty() || emit_c.is_some() || crate_flags.any() || panic_abort.is_some() {
@@ -676,6 +747,10 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         }
         return Some(Invocation::Release { file: abs(&file), out: out.map(|p| abs(&p)), profile, debug, net });
     }
+    if targets.len() > 1 {
+        return None;
+    }
+    crate_flags.target_triple = targets.into_iter().next();
     let out = out.unwrap_or_else(|| PathBuf::from(file.file_stem().unwrap_or_default()));
     let run = cmd == "run";
     let typed = file.clone();
@@ -698,7 +773,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         emit_c: emit_c.map(|p| abs(&p)),
         max_errors,
         run_args: if run { Some(run_args.clone()) } else { None },
-        harness: false,
+        harness: false, cc: false,
         client: Client::current(&typed),
     };
     Some(Invocation::Compile { req, run, args: run_args })
@@ -901,7 +976,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
         emit_c: if emit.is_empty() { None } else { Some(path(emit)) },
         max_errors: f[4].parse().ok()?,
         run_args: None,
-        harness: false,
+        harness: false, cc: false,
         client: Client { env, shown: if shown.is_empty() { None } else { Some(path(shown)) } },
     })
 }
@@ -1063,6 +1138,23 @@ fn toml_lookup(text: &str, path: &str) -> Option<String> {
 /// `[workspace]`, else the nearest manifest above it that has one).
 /// A dev profile that leaves a key unset keeps Cargo's dev default.
 fn dev_profile(manifest: &Path) -> ProfileFlags {
+    let texts = profile_sources(manifest);
+    let get = |key: &str| {
+        let env = format!("CARGO_PROFILE_DEV_{}", key.to_uppercase().replace('-', "_"));
+        std::env::var(env).ok().or_else(|| texts.iter().find_map(|t| toml_lookup(t, &format!("profile.dev.{key}"))))
+    };
+    let dev = ProfileFlags::DEV_UNWIND;
+    ProfileFlags {
+        panic_abort: get("panic").map_or(dev.panic_abort, |v| v == "abort"),
+        overflow_checks: get("overflow-checks").map_or(dev.overflow_checks, |v| v == "true"),
+        debug_assertions: get("debug-assertions").map_or(dev.debug_assertions, |v| v == "true"),
+    }
+}
+
+/// The texts Cargo merges for profiles of the package at `manifest`, in
+/// lookup order (nearer config first, workspace root manifest last).
+/// `dev_profile` documents the sources.
+fn profile_sources(manifest: &Path) -> Vec<String> {
     let is_root = |t: &str| t.lines().any(|l| toml_strip_comment(l).trim().strip_prefix('[').is_some_and(|h| toml_dotted(h.trim_end_matches(']')) == "workspace"));
     let own = std::fs::read_to_string(manifest).unwrap_or_default();
     let root = if is_root(&own) {
@@ -1083,15 +1175,41 @@ fn dev_profile(manifest: &Path) -> ProfileFlags {
         texts.push(t);
     }
     texts.push(root);
-    let get = |key: &str| {
-        let env = format!("CARGO_PROFILE_DEV_{}", key.to_uppercase().replace('-', "_"));
-        std::env::var(env).ok().or_else(|| texts.iter().find_map(|t| toml_lookup(t, &format!("profile.dev.{key}"))))
+    texts
+}
+
+/// The flags of one named Cargo profile (`--profile goport`), following
+/// `inherits` through the same sources as `dev_profile`. Built-in bases
+/// are Cargo's: dev and test unwind with overflow checks and debug
+/// assertions; release and bench unwind with neither. A custom profile
+/// with no `inherits` starts from dev, as Cargo's does. Overflow comes
+/// back in the flags as written; the release driver keeps checks on and
+/// says so (see `Invocation::ReleaseCc`).
+fn named_profile(manifest: Option<&Path>, name: &str) -> ProfileFlags {
+    let texts = manifest.map(profile_sources).unwrap_or_default();
+    let get = |prof: &str, key: &str| {
+        let env = format!("CARGO_PROFILE_{}_{}", prof.to_uppercase().replace('-', "_"), key.to_uppercase().replace('-', "_"));
+        std::env::var(env).ok().or_else(|| texts.iter().find_map(|t| toml_lookup(t, &format!("profile.{prof}.{key}"))))
     };
-    let dev = ProfileFlags::DEV_UNWIND;
+    let (mut panic_abort, mut overflow, mut debug_assertions) = (None, None, None);
+    let mut cur = name.to_string();
+    for _ in 0..6 {
+        panic_abort = panic_abort.or_else(|| get(&cur, "panic").map(|v| v == "abort"));
+        overflow = overflow.or_else(|| get(&cur, "overflow-checks").map(|v| v == "true"));
+        debug_assertions = debug_assertions.or_else(|| get(&cur, "debug-assertions").map(|v| v == "true"));
+        if panic_abort.is_some() && overflow.is_some() && debug_assertions.is_some() {
+            break;
+        }
+        match get(&cur, "inherits") {
+            Some(parent) if parent != cur => cur = parent,
+            _ => break,
+        }
+    }
+    let base_release = matches!(cur.as_str(), "release" | "bench");
     ProfileFlags {
-        panic_abort: get("panic").map_or(dev.panic_abort, |v| v == "abort"),
-        overflow_checks: get("overflow-checks").map_or(dev.overflow_checks, |v| v == "true"),
-        debug_assertions: get("debug-assertions").map_or(dev.debug_assertions, |v| v == "true"),
+        panic_abort: panic_abort.unwrap_or(false),
+        overflow_checks: overflow.unwrap_or(!base_release),
+        debug_assertions: debug_assertions.unwrap_or(!base_release),
     }
 }
 
@@ -1425,6 +1543,52 @@ mod tests {
         assert!(parse_args(&args(&["check", "/tmp/x/main.rs", "--lib", "--bin", "x"])).is_none());
         assert!(parse_args(&args(&["build", "/tmp/x/main.rs", "--release", "--features", "a"])).is_none());
         assert!(parse_args(&args(&["check", "/tmp/x/main.rs", "--rustc", "--target", "t"])).is_none());
+    }
+
+    /// `--release --target` is the release driver: one cc request per
+    /// target, crate flags as inputs, output per target under `-o`.
+    /// Without a target `--release` stays the Cargo form, and several
+    /// targets without `--release` are a usage error.
+    #[test]
+    fn release_with_targets_is_the_cc_driver() {
+        let inv = parse_args(&args(&[
+            "build",
+            "/tmp/x/main.rs",
+            "--release",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "--target=aarch64-unknown-linux-musl",
+            "--features",
+            "noembed",
+            "-o",
+            "/tmp/x/dist",
+        ]));
+        match inv {
+            Some(Invocation::ReleaseCc { reqs, overflow_note }) => {
+                assert_eq!(reqs.len(), 2);
+                assert!(reqs.iter().all(|r| r.cc && matches!(r.cmd, Cmd::Build)));
+                assert_eq!(reqs[0].session.target_triple, "x86_64-unknown-linux-musl");
+                assert_eq!(reqs[0].session.features, ["noembed"]);
+                assert_eq!(reqs[1].out, PathBuf::from("/tmp/x/dist/aarch64-unknown-linux-musl/main"));
+                assert!(overflow_note, "the release base turns overflow checks off");
+                assert!(reqs[0].session.profile.overflow_checks, "checks stay on in the build itself");
+                assert!(!reqs[0].session.profile.debug_assertions, "release profile");
+            }
+            _ => panic!("not a release-cc invocation"),
+        }
+        assert!(matches!(
+            parse_args(&args(&["build", "/tmp/x/main.rs", "--release"])),
+            Some(Invocation::Release { .. })
+        ));
+        assert!(parse_args(&args(&[
+            "build",
+            "/tmp/x/main.rs",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "--target",
+            "aarch64-unknown-linux-musl",
+        ]))
+        .is_none());
     }
 
     /// The wire carries the full session key: encode, then read back, every

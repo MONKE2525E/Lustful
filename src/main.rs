@@ -12,6 +12,7 @@
 mod ast;
 mod borrowck;
 mod capabilities;
+mod cc;
 mod cgen;
 mod check;
 mod colwidth;
@@ -124,6 +125,30 @@ fn main() {
         Some(Invocation::Release { file, out, profile, debug, net }) => {
             protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net)
         }
+        // The release driver: one cold compile per target, in this process,
+        // in order. A failed target stops the run with its code.
+        Some(Invocation::ReleaseCc { reqs, overflow_note }) => {
+            if overflow_note {
+                eprintln!("lust: note: the profile turns overflow checks off; lust builds keep them on for now");
+            }
+            let mut code = 0;
+            for req in &reqs {
+                let triple = if req.session.target_triple.is_empty() { protocol::host_triple() } else { &req.session.target_triple };
+                eprintln!("lust: release build for {triple} -> {}", req.out.display());
+                let dir = std::env::temp_dir().join(format!("lust-{}-cc", std::process::id()));
+                let mut session = driver::Session::new(dir, false, req.session.clone());
+                session.caches.leak_at_exit = true;
+                let resp = driver::compile(req, &mut session);
+                remove_obj_dir(session.obj_dir());
+                eprint!("{}", resp.stderr);
+                if resp.code != 0 {
+                    code = resp.code;
+                    break;
+                }
+                std::mem::forget(session);
+            }
+            std::process::exit(code);
+        }
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args }) => {
             // Whole-request disk cache (cold runs only; the daemon path keeps its own
@@ -131,7 +156,7 @@ fn main() {
             // request is also never cached: its response can be the program's own output and
             // exit code (an in-memory run writes no executable), not a build result.
             let start = std::time::Instant::now();
-            let cache = if req.emit_c.is_none() && req.run_args.is_none() { driver::cache::Cache::open(&req.file) } else { None };
+            let cache = if req.emit_c.is_none() && req.run_args.is_none() && !req.cc { driver::cache::Cache::open(&req.file) } else { None };
             let src = cache.as_ref().and_then(|_| std::fs::read(&req.file).ok());
             if let (Some(cache), Some(src)) = (&cache, &src)
                 && let Some(resp) = cache.lookup(&req, src, start)

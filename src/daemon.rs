@@ -1094,7 +1094,7 @@ pub fn serve(sock: &Path) -> ! {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false,
+            harness: false, cc: false,
             client: protocol::Client::default(),
             file: file.clone(),
         };
@@ -1254,7 +1254,7 @@ mod tests {
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false,
+            harness: false, cc: false,
             client: protocol::Client::default(),
             file: file.to_path_buf(),
         }

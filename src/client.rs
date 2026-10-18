@@ -6,6 +6,7 @@
 //   lust check <file.rs> [--json] [--timings]     lust check <file.rs> --rustc (oracle)
 //   lust build <file.rs> [-o <out>] [-g] [--emit-c <prefix>] [--timings]
 //   lust build <file.rs> --release | --profile <name> [-o <out>]  (Cargo or rustc)
+//   lust build <file.rs> --release --target <triple>...            (lust + zig cc, per target)
 //   lust run   <file.rs> [-- <args>...]
 //   lust daemon            serve warm, incremental compiles for this directory
 //   lust port scan ...     gap report for a Rust crate (execs `lust-port`)
@@ -126,6 +127,13 @@ fn main() {
         // Release builds and the rustc oracle run right here, streaming output.
         Some(Invocation::Release { file, out, profile, debug, net }) => {
             protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net)
+        }
+        // The release driver runs in lust-core (cold, one target after
+        // another); the client only hands it the same arguments.
+        Some(Invocation::ReleaseCc { .. }) => {
+            let err = std::process::Command::new(&core).args(&args).exec();
+            eprintln!("error: cannot run {}: {err}", core.display());
+            std::process::exit(2);
         }
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
         Some(Invocation::Compile { req, run, args: run_args }) => {

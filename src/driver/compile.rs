@@ -2387,7 +2387,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // would for that target.
     let triple = &req.session.target_triple;
     let foreign_check = matches!(req.cmd, crate::protocol::Cmd::Check) && crate::resolve::cfg::CfgEnv::is_release_target(triple);
-    if !triple.is_empty() && triple != crate::protocol::host_triple() && !foreign_check {
+    // A release-driver build (cc backend) may name a release triple (or
+    // the host): its C goes to the cross compiler, never to tcc.
+    let cc_build = req.cc && (triple.is_empty() || crate::resolve::cfg::CfgEnv::is_release_target(triple));
+    if !triple.is_empty() && triple != crate::protocol::host_triple() && !foreign_check && !cc_build {
         return Response {
             stderr: format!(
                 "error: unsupported target `{triple}`: lust builds for the host target `{}` today\n",
@@ -4421,6 +4424,56 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     }
     t.lap("assemble C units (par)");
+    // The release driver (src/cc.rs): the same self-contained unit set
+    // goes to the external C compiler for the session target, and the
+    // tcc path below never runs. Cold one-shot sessions only (the
+    // driver builds them); a warm session would hold overlays this
+    // full-unit rebuild does not model.
+    if req.cc {
+        if caches.persistent {
+            return Response { stderr: "error: a release (cc) build needs a cold session\n".into(), code: 3, ..Default::default() };
+        }
+        let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
+        let built = crate::cc::spec_for(triple).and_then(|spec| {
+            let all: Vec<(String, String)> = [0, 1, 2, 3, LOC_UNIT]
+                .into_iter()
+                .chain(fn_units.iter().copied())
+                .map(|u| {
+                    let c = if u == 0 {
+                        cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize]))
+                    } else {
+                        gen_unit(u, false)
+                    };
+                    (format!("u{u}"), c)
+                })
+                .collect();
+            if let Some(parent) = req.out.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            let cache = crate::driver::cache::Cache::open(&req.file);
+            crate::cc::build(&all, &spec, &req.out, req.debug, cache.as_ref(), &dir.join("cc"))
+        });
+        t.lap("cc compile + link");
+        match built {
+            Ok(summary) => {
+                if req.timings {
+                    let _ = writeln!(resp.stderr, "lust build {path}: ok (cc {triple}: {summary})");
+                    t.render(&mut resp.stderr);
+                }
+                if leak_at_exit {
+                    std::mem::forget(bodies);
+                    std::mem::forget(units);
+                    std::mem::forget(program);
+                } else {
+                    drop((bodies, units));
+                    program.verified = verified;
+                    super::patch::keep(front, program);
+                }
+                return resp;
+            }
+            Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
+        }
+    }
     // `lust run` of a small program (one function unit, fresh base): compile in memory and run
     // it there, with no object files, link, or exec. The runtime comes from a cached object.
     // libtcc compiles serially, so bigger programs keep the parallel file-based path below.
@@ -5004,7 +5057,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
             emit_c: None,
             max_errors: 20,
             run_args: None,
-            harness: false,
+            harness: false, cc: false,
             client: Default::default(),
         }
     }

@@ -2886,7 +2886,7 @@ pub fn run() -> i64 {
             emit_c: None,
             max_errors: 0,
             run_args: None,
-            harness: false,
+            harness: false, cc: false,
             client: Default::default(),
         };
         let resp = compile(&req, session);
