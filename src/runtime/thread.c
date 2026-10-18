@@ -64,6 +64,13 @@ static lust_pthread_once_t lust_tls_once = LUST_PTHREAD_ONCE_INIT;
    fence shim, so no <stdatomic.h> here): 2 is acquire, 3 is release. */
 static int lust_tls_ready;
 
+#ifndef __TINYC__
+/* The calling thread's block, as pthread_getspecific gives it: the fast
+   path reads it with one native thread-local load (tcc has no native
+   TLS, so its builds keep the pthread lookup). */
+static __thread lust_tls_block *lust_tls_cur;
+#endif
+
 static int lust_tls_is_ready(void) {
     int r;
     __atomic_load(&lust_tls_ready, &r, 2);
@@ -95,8 +102,14 @@ static void lust_tls_run(lust_tls_block *b) {
 static void lust_tls_thread_end(void *p) {
     lust_tls_block *b = (lust_tls_block *)p;
     pthread_setspecific(lust_tls_key, b);
+#ifndef __TINYC__
+    lust_tls_cur = b;
+#endif
     lust_tls_run(b);
     pthread_setspecific(lust_tls_key, 0);
+#ifndef __TINYC__
+    lust_tls_cur = 0;
+#endif
     for (uint64_t i = 0; i < b->cap; i++) free(b->cells[i]);
     free(b->cells);
     free(b->dtors);
@@ -117,6 +130,9 @@ static lust_tls_block *lust_tls_block_get(void) {
         if (!b) lust_oom();
         pthread_setspecific(lust_tls_key, b);
     }
+#ifndef __TINYC__
+    lust_tls_cur = b;
+#endif
     return b;
 }
 
@@ -148,10 +164,15 @@ void *lust_tls_cell(uint64_t *key, uint64_t size, uint64_t align) LUST_BODY({
        then plain reads (a key's slot never changes, and the block key
        exists before any block does). */
     uint64_t s = *key;
+#ifndef __TINYC__
+    lust_tls_block *b = lust_tls_cur;
+    if (b && s <= b->cap && b->cells[s - 1]) return b->cells[s - 1];
+#else
     if (lust_tls_is_ready()) {
         lust_tls_block *b = (lust_tls_block *)pthread_getspecific(lust_tls_key);
         if (b && s <= b->cap && b->cells[s - 1]) return b->cells[s - 1];
     }
+#endif
     return lust_tls_cell_slow(s, size, align);
 })
 

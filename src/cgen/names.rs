@@ -153,6 +153,9 @@ pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
         .into_iter()
         .map(|keys| {
             let mut c = unit_header();
+            if p.unwind_tables {
+                c.push_str(noreturn_decls());
+            }
             let mut types = HashSet::new();
             let mut protos: BTreeSet<&str> = BTreeSet::new();
             let mut externs: BTreeSet<&str> = BTreeSet::new();

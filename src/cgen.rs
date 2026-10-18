@@ -2875,7 +2875,9 @@ impl FnGen<'_, '_> {
     fn index_unw(&self, len: &str, base: &str, l: Local, loc: &str, b: u32) -> String {
         if self.p.unwind_tables {
             // The bounds panic never returns: the frame's cleanup runs from `L.st`.
-            return format!("(*({{ if (l{l} >= {len}) (void)lust_bounds(l{l}, {len}, {loc}); &{base}[l{l}]; }}))");
+            return format!(
+                "(*({{ if (__builtin_expect(l{l} >= {len}, 0)) {{ (void)lust_bounds(l{l}, {len}, {loc}); __builtin_unreachable(); }} &{base}[l{l}]; }}))"
+            );
         }
         format!("(*({{ if (l{l} >= {len}) {{ (void)lust_bounds(l{l}, {len}, {loc}); lust_unw_take(&ex); goto bb{b}; }} &{base}[l{l}]; }}))")
     }
@@ -3077,6 +3079,13 @@ impl FnGen<'_, '_> {
             {
             }
             StmtKind::Assign(dest, rv) => {
+                // A promoted constant is the same value on every run: once its site has
+                // interned it (`lk{i}` set), the write is skipped, so threads do not all
+                // write the one static again.
+                let kguard = self.body.promoted.contains(&dest.local) && self.kconst_local(dest.local as usize);
+                if kguard {
+                    let _ = writeln!(self.out, "  if (!lk{}) {{", dest.local);
+                }
                 let mentions = rvalue_mentions(rv, dest.local);
                 let dest_cty = self.place(dest, &loc).1;
                 self.emit_assign(dest, mentions, &loc, |s, loc, post| match rv {
@@ -3090,6 +3099,9 @@ impl FnGen<'_, '_> {
                     }
                     _ => s.rvalue(rv, loc, post),
                 });
+                if kguard {
+                    self.out.push_str("  }\n");
+                }
             }
             StmtKind::Drop(l) => {
                 if self.local_drop[*l as usize] {
@@ -3206,6 +3218,14 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "  lust_unw_resume(&ex);\n  {}", self.unwind_return());
             }
             Terminator::Unreachable => self.out.push_str("  abort();\n"),
+            Terminator::Panic(parts)
+                if self.p.unwind
+                    && self.p.unwind_tables
+                    && parts.iter().any(|p| matches!(p, FmtPart::Arg { .. }))
+                    && let Some(call) = self.panic_outlined(parts, &loc) =>
+            {
+                let _ = writeln!(self.out, "  {call}\n  __builtin_unreachable();");
+            }
             Terminator::Panic(parts) => {
                 self.out.push_str("  {\n");
                 // A message with arguments formats inside the panic (std's
@@ -3226,11 +3246,84 @@ impl FnGen<'_, '_> {
                 {
                     let _ = writeln!(self.out, "  lust_unw_take(&ex);\n  goto bb{b};");
                 }
+                // Unwind tables: the panic never returns.
+                if self.p.unwind && self.p.unwind_tables {
+                    self.out.push_str("  __builtin_unreachable();\n");
+                }
             }
         }
     }
 
     // ---------- Rvalues ----------
+
+    /// Unwind tables: a panic whose message has arguments formats in a cold, never inlined,
+    /// noreturn fn of its own (in the unit before this fn), as rustc's panic paths do, so
+    /// the fn that panics stays small; the site passes its location and pointers to the
+    /// locals the message reads. None (format inline) when the text reads more than plain
+    /// locals, such as an interned constant's slot or the frame struct.
+    fn panic_outlined(&mut self, parts: &[FmtPart], loc: &str) -> Option<String> {
+        // The location is a parameter too: a #[track_caller] fn's is its caller's.
+        let saved = std::mem::take(&mut self.out);
+        let mut post = Vec::new();
+        self.out.push_str("  lust_panic_begin(qloc);\n");
+        let s = self.format(parts, "qloc", &mut post, 4);
+        let _ = writeln!(self.out, "  lust_panic_fmt(&{s}, qloc);");
+        let body = std::mem::replace(&mut self.out, saved);
+        // The identifiers the text reads: `l<N>` locals move to parameters; `lk..`
+        // slots, `L.` frame fields and `ex` belong to this fn and cannot move.
+        let bytes = body.as_bytes();
+        let mut used = std::collections::BTreeSet::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c.is_ascii_alphabetic() || c == b'_' {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &body[start..i];
+                if word.starts_with("lk") || (word == "L" && bytes.get(i) == Some(&b'.')) || word == "ex" {
+                    return None;
+                }
+                if let Some(n) = word.strip_prefix('l')
+                    && !n.is_empty()
+                    && n.bytes().all(|b| b.is_ascii_digit())
+                {
+                    let n: usize = n.parse().ok()?;
+                    if n >= self.local_cty.len() || c_size_align(self.p, &self.local_cty[n]).1 > 16 {
+                        return None;
+                    }
+                    used.insert(n);
+                }
+            } else if c.is_ascii_digit() {
+                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+            } else if c == b'"' {
+                // A C string literal.
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let slot = self.slots.of(self.body.fn_id);
+        let name = format!("pk{slot}_{}", self.tmp());
+        let params: Vec<String> =
+            std::iter::once("lust_loc qloc".to_string()).chain(used.iter().map(|n| format!("{} *q{n}", ctype(&self.local_cty[*n])))).collect();
+        let defs: String = used.iter().map(|n| format!("#define l{n} (*q{n})\n")).collect();
+        let undefs: String = used.iter().map(|n| format!("#undef l{n}\n")).collect();
+        let _ = writeln!(
+            self.prelude,
+            "static void __attribute__((cold, noinline, noreturn)) {name}({}) {{\n{defs}{body}{undefs}}}",
+            params.join(", ")
+        );
+        let args: Vec<String> = std::iter::once(loc.to_string()).chain(used.iter().map(|n| format!("&l{n}"))).collect();
+        Some(format!("{name}({});", args.join(", ")))
+    }
 
     /// Records `f` as `bad_callee` when its slot will have no C: every
     /// reference to another fn's slot goes through here first.
@@ -8437,6 +8530,33 @@ impl GlueSet {
     }
 }
 
+/// The runtime's panic entry points, declared again as noreturn and cold for a unit of a
+/// program with unwind tables: there they throw (mode 2) or abort (mode 0), never return,
+/// so the C compiler drops the code after them and keeps them out of the hot path.
+fn noreturn_decls() -> &'static str {
+    static DECLS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DECLS.get_or_init(|| {
+        const NAMES: &[&str] = &[
+            "lust_panic_at", "lust_panic", "lust_panic_lit", "lust_panic_fmt", "lust_panic_dyn", "lust_panic_cstr_dyn",
+            "lust_panic_str", "lust_panic_cstr", "lust_panic_cstr_owned", "lust_panic_std", "lust_panic_std_lit",
+            "lust_panic_read_buf_overrun", "lust_panic_box", "lust_oom", "lust_oom_size", "lust_vec_capacity_overflow",
+            "lust_panic_nn",
+        ];
+        let mut out = String::new();
+        for line in runtime_decls().lines() {
+            let l = line.trim();
+            if let Some(rest) = l.strip_prefix("void ")
+                && let Some((name, _)) = rest.split_once('(')
+                && NAMES.contains(&name)
+                && l.ends_with(';')
+            {
+                let _ = writeln!(out, "__attribute__((noreturn, cold)) {l}");
+            }
+        }
+        out
+    })
+}
+
 pub(crate) fn unit_header() -> String {
     let mut c = String::with_capacity(64 * 1024);
     c.push_str(runtime_decls());
@@ -8928,6 +9048,9 @@ pub fn table_unit(capacity: usize, fn_units: &[usize]) -> String {
 /// glue is static in the function units (see `GlueSet`).
 pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
     let mut c = unit_header();
+    if p.unwind_tables {
+        c.push_str(noreturn_decls());
+    }
     let mut types = HashSet::new();
     for st in &p.statics {
         let t = cty(&p.tys, st.ty);
@@ -9446,6 +9569,9 @@ fn used_statics<'a>(p: &Program, texts: impl Iterator<Item = &'a str>) -> HashSe
 /// stable across edits, local ids are not).
 pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, register: &str, main_slot: Option<u32>) -> String {
     let mut c = unit_header();
+    if p.unwind_tables {
+        c.push_str(noreturn_decls());
+    }
     let mut types = HashSet::new();
     let mut named = HashSet::new();
     let mut seen: HashSet<&(Glue, CTy)> = HashSet::new();
