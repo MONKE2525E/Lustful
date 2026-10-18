@@ -2183,12 +2183,16 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_sig, ll_cost, inline }
 }
 
-/// `f`'s `#[inline]` attribute (an instance has its template's). A closure body fn or a
-/// trait method stub has none.
+/// `f`'s `#[inline]` attribute (an instance has its template's). A closure body counts as
+/// `#[inline]`: it has one caller (the generic instance it is passed to), and rustc
+/// inlines it there. A trait method stub has none.
 fn inline_attr(p: &Program, f: LocalDefId) -> InlineAttr {
     use crate::ast::AttrInput;
     use crate::lexer::{Tok, TokenTree};
-    if p.gx.closure_fns.contains_key(&f) || matches!(p.gx.fn_class.get(f.0 as usize), Some(crate::check::generics::FnClass::Stub)) {
+    if p.gx.closure_fns.contains_key(&f) {
+        return InlineAttr::Hint;
+    }
+    if matches!(p.gx.fn_class.get(f.0 as usize), Some(crate::check::generics::FnClass::Stub)) {
         return InlineAttr::None;
     }
     let mut out = InlineAttr::None;
