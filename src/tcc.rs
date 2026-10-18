@@ -270,6 +270,34 @@ fn link_objects(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Links an executable at `out`. libtcc opens its output without O_CLOEXEC, so a child
+/// that another thread spawns while it writes (a tcc or cc compile of a daemon's other
+/// session, a guard) keeps the file open for writing for the child's whole life, and an
+/// exec of it fails with ETXTBSY until then: a client that runs the binary the daemon just
+/// built. tcc writes a private temp file, and a copy of it (a fresh inode, written through
+/// a close-on-exec descriptor) is renamed over `out`; a rename alone would keep the inode
+/// the child holds. A child cloned during the copy still holds it until its own exec, so a
+/// thread that execs `out` at once while others spawn retries on ETXTBSY (tests do). A
+/// running old `out` keeps its own inode.
+fn link_executable(tcc: &Tcc, objs: &[PathBuf], out: &Path) -> Result<(), String> {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = |tag: &str| {
+        let mut p = out.as_os_str().to_owned();
+        p.push(format!(".{tag}-{}-{n}", std::process::id()));
+        PathBuf::from(p)
+    };
+    let (written, fresh) = (tmp("tcc"), tmp("new"));
+    let linked = link_objects(tcc, objs, &written).and_then(|()| {
+        std::fs::copy(&written, &fresh).and_then(|_| std::fs::rename(&fresh, out)).map_err(|e| format!("cannot write {}: {e}", out.display()))
+    });
+    let _ = std::fs::remove_file(&written);
+    if linked.is_err() {
+        let _ = std::fs::remove_file(&fresh);
+    }
+    linked
+}
+
 /// Links object files into a shared library at `out`.
 pub fn link_shared(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), String> {
     let tcc = Tcc::new(TCC_OUTPUT_DLL, debug)?;
@@ -295,13 +323,13 @@ pub fn link_with_base(objs: &[PathBuf], dir: &Path, base: &str, out: &Path, debu
             return Err(tcc.fail("load libbase.so"));
         }
     }
-    link_objects(&tcc, objs, out)
+    link_executable(&tcc, objs, out)
 }
 
 /// Links object files into a standalone executable at `out`.
 pub fn link(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), String> {
     let tcc = Tcc::new(TCC_OUTPUT_EXE, debug)?;
-    link_objects(&tcc, objs, out)
+    link_executable(&tcc, objs, out)
 }
 
 /// The runtime unit compiled to an object once per lust build, cached in the temp directory.
