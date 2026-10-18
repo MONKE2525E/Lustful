@@ -10205,6 +10205,13 @@ fn inline_limit(a: InlineAttr) -> usize {
     }
 }
 
+/// Release C: the bytes of glue definitions a unit copies below the glue its own code calls
+/// (`fn_unit_parts`); `LUST_RELEASE_INLINE_GLUE_KB` sets it (0: one level, as before).
+fn inline_glue_budget() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("LUST_RELEASE_INLINE_GLUE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(32) * 1024)
+}
+
 /// False when `LUST_RELEASE_INLINE=0`: each release C unit then calls other units' fns and
 /// glue (smaller units, less recompiled when a small fn changes).
 fn inline_on() -> bool {
@@ -10335,28 +10342,47 @@ pub fn fn_unit_parts(
         seen.extend(f.glue.iter());
     }
     // Release C: small plain glue the unit calls (drop, eq, clone of simple types), as
-    // inline definitions; the prototypes of what they call come along.
+    // inline definitions, and at every level below the glue those call (a field's drop, a
+    // field's default), within `inline_glue_budget` bytes per unit; the glue left out gets
+    // its prototype, which takes its types by pointer. The LLVM backend gets the same set
+    // through its helpers' C (`cc` links it into the IR).
     let mut inl_glue: HashSet<&(Glue, CTy)> = HashSet::new();
     // What the inline glue reads, one step through pointers (`type_decls_with`'s `deep`).
     let mut glue_types: HashSet<CTy> = HashSet::new();
     if inline {
-        let mut deps: Vec<&(Glue, CTy)> = Vec::new();
-        for k in seen.iter().copied() {
-            if let Some(d) = g.def_map.get(k)
-                && d.len() <= INLINE_BYTES
-                && !d.contains("static ")
-                && !d.contains("__attribute__")
-                && !d.contains("#define")
-            {
+        let plain = |k: &(Glue, CTy)| {
+            g.def_map.get(k).is_some_and(|d| d.len() <= INLINE_BYTES && !d.contains("static ") && !d.contains("__attribute__") && !d.contains("#define"))
+        };
+        // Level by level in prototype order, so the budget picks the same glue every build.
+        let mut level: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
+        level.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
+        let mut budget = inline_glue_budget();
+        let mut nested = false;
+        while !level.is_empty() {
+            let mut next: Vec<&(Glue, CTy)> = Vec::new();
+            for k in level {
+                if !plain(k) {
+                    continue;
+                }
+                if nested {
+                    let n = g.def_map[k].len();
+                    if n > budget {
+                        continue;
+                    }
+                    budget -= n;
+                }
                 inl_glue.insert(k);
                 g.def_types(k, &mut glue_types);
-                deps.extend(g.deps.get(k).into_iter().flatten());
+                for d in g.deps.get(k).into_iter().flatten() {
+                    collect_types(&d.1, &mut named);
+                    if seen.insert(d) {
+                        next.push(d);
+                    }
+                }
             }
-        }
-        // The glue the inline glue calls: prototypes, which take their types by pointer.
-        for d in deps {
-            collect_types(&d.1, &mut named);
-            seen.insert(d);
+            next.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
+            level = next;
+            nested = true;
         }
         // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
