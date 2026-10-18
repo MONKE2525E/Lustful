@@ -102,10 +102,13 @@ impl OutCopy {
     /// where it can make anything: the closures, vtables, and the types
     /// that can name an Adt instance, in order. Collect then makes the
     /// same closures, instances, vtables, and glue from it (the other
-    /// types only enter the global store; the caller interns them). A
-    /// check walks no instance requests, so they must match only for a
-    /// build (`walk_instances`).
+    /// types only enter the global store; the caller interns them). The
+    /// instance requests must match too where discovery walks them: in a
+    /// build (`walk_instances`), and in a check of a program with generic
+    /// associated consts (`patch::walks_requests`), whose new instances
+    /// evaluate those consts.
     pub(crate) fn same(&self, p: &Program, out: &Discovered, walk_instances: bool) -> bool {
+        let walk_instances = walk_instances || super::patch::walks_requests(p);
         let (adt_tys, requests, closures, vtables) = out;
         let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).cloned().collect::<Vec<_>>();
         self.closures == *closures
