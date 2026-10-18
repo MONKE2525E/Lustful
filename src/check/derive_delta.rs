@@ -554,6 +554,13 @@ pub(crate) struct Reach {
 }
 
 impl Reach {
+    /// A reach over `defs` (another reach's, `defs()`) with empty memos,
+    /// for one thread of a parallel walk (`Program::moved_fn_names`): the
+    /// same answers as the reach it copies.
+    pub(crate) fn with_defs(defs: crate::intern::FxMap<DefId, ()>) -> Reach {
+        Reach { defs, memo: Default::default(), cold: Default::default() }
+    }
+
     /// The reach of the Adt template `def`: field users over every Adt
     /// row (templates and instances; an instance adds its template).
     pub(crate) fn of(p: &Program, def: DefId) -> Reach {

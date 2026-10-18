@@ -182,6 +182,25 @@ impl ConstReach {
         self.unqual.contains(&name) || self.quals.get(&name).is_some_and(|qs| qs.iter().any(|q| may_be(q) || (*q == name && may_be_const)))
     }
 
+    /// Why `reaches_inherent` holds, for `LUST_DERIVE_LOG`: the unqualified
+    /// mention, or the qualifiers that may denote the Adt.
+    pub(crate) fn inherent_why(&self, front: &Front, i: usize, adt: &str) -> String {
+        let (item, sub) = front.fn_loc[i];
+        let name = fn_def_at(&front.ast, item, sub).name;
+        let adt_s = crate::intern::source_name(adt).trim_start_matches("r#");
+        let qs: Vec<String> = self.quals.get(&name).map_or_else(Vec::new, |qs| {
+            qs.iter()
+                .filter(|qq| {
+                    let full = front.interner.get(**qq);
+                    let q = crate::intern::source_name(full).trim_start_matches("r#");
+                    q == adt_s || self.aliases.contains(q) || **qq == name
+                })
+                .map(|q| front.interner.get(*q).to_string())
+                .collect()
+        });
+        format!("unqual {}, quals {:?}", self.unqual.contains(&name), qs)
+    }
+
     /// True when the results of fns `fns` (`Front::fn_loc` indexes) can
     /// reach only const and static values (see the module docs).
     pub(crate) fn revaluable(&self, front: &Front, fns: &[usize]) -> bool {

@@ -337,6 +337,10 @@ fn untouched_refusals(
             None => reach.reaches(front, i),
         };
         if reached {
+            crate::check::derive_delta::log(&|| {
+                let why = adt.map_or("free fn".to_string(), |a| reach.inherent_why(front, i, p.name(p.adt(a).name)));
+                format!("sig const {}: {why}\n", p.display_name(p.fn_def(f).name))
+            });
             return Err("sig const");
         }
     }

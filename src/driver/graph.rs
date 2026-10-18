@@ -2940,6 +2940,21 @@ impl Program {
         if m.names.is_some() {
             return;
         }
+        // Every fn whose def is its own (`sig_moves`'s fn branch), in
+        // parallel with a reach copy per chunk; the rest walk below.
+        let own: Vec<u32> = (0..self.fns.len() as u32)
+            .filter(|&i| {
+                let d = self.def_id(LocalDefId(i));
+                !m.sig.contains_key(&d) && self.local_def(d.hash) == Some(LocalDefId(i))
+            })
+            .collect();
+        let chunks: Vec<&[u32]> = own.chunks(1024).collect();
+        let defs = m.reach.defs();
+        let parts = crate::driver::compile::par_map(&chunks, |c| {
+            let r = crate::check::derive_delta::Reach::with_defs(defs.clone());
+            c.iter().map(|&i| (self.def_id(LocalDefId(i)), self.fn_sig_moves(&r, LocalDefId(i)))).collect::<Vec<_>>()
+        });
+        m.sig.extend(parts.into_iter().flatten());
         let mut names = FxMap::default();
         for i in 0..self.fns.len() {
             let f = LocalDefId(i as u32);
@@ -3000,14 +3015,7 @@ impl Program {
         let reach = m.reach;
         let tys = &self.tys;
         let b = if let Some(local) = self.local_def(def.hash).filter(|l| self.def_id(*l) == def) {
-            let f = self.fn_info(local);
-            let od = crate::check::generics::opaque_def(def);
-            f.owner.is_some_and(|a| reach.row(self, a.0 as usize))
-                || f.params.iter().any(|&t| reach.ty(tys, t))
-                || reach.ty(tys, f.ret)
-                || self.gx.opaque_hidden.get(&od).is_some_and(|&t| reach.ty(tys, t))
-                || self.gx.opaques.get(&od).is_some_and(|o| o.bounds.iter().any(|q| reach.pred(tys, q)))
-                || self.gx.fn_templates.get(local.0 as usize).and_then(Option::as_ref).is_some_and(|t| t.generics.predicates.iter().any(|q| reach.pred(tys, q)))
+            self.fn_sig_moves(reach, local)
         } else if let Some(a) = self.adt_by_def(def) {
             reach.row(self, a.0 as usize) || self.hasher_reaches(m, def)
         } else if let Some(i) = self.const_by_def(def) {
@@ -3027,6 +3035,21 @@ impl Program {
         };
         m.sig.insert(def, b);
         b
+    }
+
+    /// `sig_moves` for the local fn `local` (its def's own fn): its owner,
+    /// signature, hidden type, opaque bounds, or predicates name the reach.
+    fn fn_sig_moves(&self, reach: &crate::check::derive_delta::Reach, local: LocalDefId) -> bool {
+        let tys = &self.tys;
+        let def = self.def_id(local);
+        let f = self.fn_info(local);
+        let od = crate::check::generics::opaque_def(def);
+        f.owner.is_some_and(|a| reach.row(self, a.0 as usize))
+            || f.params.iter().any(|&t| reach.ty(tys, t))
+            || reach.ty(tys, f.ret)
+            || self.gx.opaque_hidden.get(&od).is_some_and(|&t| reach.ty(tys, t))
+            || self.gx.opaques.get(&od).is_some_and(|o| o.bounds.iter().any(|q| reach.pred(tys, q)))
+            || self.gx.fn_templates.get(local.0 as usize).and_then(Option::as_ref).is_some_and(|t| t.generics.predicates.iter().any(|q| reach.pred(tys, q)))
     }
 
     /// True when Adt `def`'s layout fingerprint folds a written `Hasher`
