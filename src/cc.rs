@@ -318,8 +318,31 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
     let ll_path = src.with_extension("ll");
     let hc_path = src.with_extension("hc.c");
     let hbc = src.with_extension("hc.bc");
-    std::fs::write(&ll_path, ll).map_err(|e| format!("cannot write {}: {e}\n", ll_path.display()))?;
-    std::fs::write(&hc_path, hc).map_err(|e| format!("cannot write {}: {e}\n", hc_path.display()))?;
+    // One C file when the plain C marks its body (`cgen::ll::BODY_MARK`): the helpers' C
+    // already declares every type the wrappers name, so the body follows it, one parse of
+    // the unit header instead of two. That file links as builtin bitcode too; the IR lists
+    // the body's fns (the wrappers and trampolines other units call) in `llvm.used`, which
+    // keeps them external.
+    let merged = std::fs::read_to_string(src).ok().and_then(|c| c.split_once(crate::cgen::ll::BODY_MARK).map(|(_, body)| body.to_string()));
+    let (ll, hc) = match &merged {
+        Some(body) => {
+            let mut used = String::new();
+            let mut names = Vec::new();
+            for n in pgo::defined_externs(body) {
+                if !ll.contains(&format!("@{n}(")) {
+                    used.push_str(&format!("declare void @{n}()\n"));
+                }
+                names.push(format!("ptr @{n}"));
+            }
+            if !names.is_empty() {
+                used.push_str(&format!("@llvm.used = appending global [{} x ptr] [{}], section \"llvm.metadata\"\n", names.len(), names.join(", ")));
+            }
+            (format!("{ll}\n{used}"), format!("{hc}\n{body}"))
+        }
+        None => (ll.to_string(), hc.to_string()),
+    };
+    std::fs::write(&ll_path, &ll).map_err(|e| format!("cannot write {}: {e}\n", ll_path.display()))?;
+    std::fs::write(&hc_path, &hc).map_err(|e| format!("cannot write {}: {e}\n", hc_path.display()))?;
     let run = |cmd: &mut Command| -> Result<(), String> {
         match cmd.output() {
             Ok(o) if o.status.success() => Ok(()),
@@ -339,7 +362,9 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
             .arg("-o")
             .arg(to))
     };
-    to_bc(src, &bc)?;
+    if merged.is_none() {
+        to_bc(src, &bc)?;
+    }
     to_bc(&hc_path, &hbc)?;
     // A relative compiler path must not resolve against the work dir (PGO compiles there).
     let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
@@ -353,7 +378,10 @@ fn compile_pair(spec: &CcSpec, cflags: &[String], debug: bool, src: &Path, ll: &
         _ => cmd.arg(&ll_path),
     };
     let abs = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    cmd.args(["-Xclang", "-mlink-bitcode-file", "-Xclang"]).arg(abs(&bc)).args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(abs(&hbc));
+    if merged.is_none() {
+        cmd.args(["-Xclang", "-mlink-bitcode-file", "-Xclang"]).arg(abs(&bc));
+    }
+    cmd.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(abs(&hbc));
     if let Some(rt) = rt_inl {
         cmd.args(["-Xclang", "-mlink-builtin-bitcode", "-Xclang"]).arg(abs(rt));
     }
@@ -508,7 +536,7 @@ pub fn build(
             cache.map(|_| match ll_of.get(unit.as_str()) {
                 Some(ll) => {
                     let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
-                    unit_key(&format!("{c}\n/* llvm-v2 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), spec, debug, part.as_deref(), false)
+                    unit_key(&format!("{c}\n/* llvm-v3 {} {nopre} */\n{ll}\n/* helpers */\n{hc}\n/* rtinl {rt_digest} */", llflags(debug)), spec, debug, part.as_deref(), false)
                 }
                 None => unit_key(c, spec, debug, part.as_deref(), is_cxx(&names[i])),
             })

@@ -10346,6 +10346,8 @@ pub fn fn_unit_parts(
             let held: HashSet<CTy> = held.into_iter().collect();
             named.retain(|t| !held.contains(t));
             type_decls_with(p, &mut c, &held, &named, Decls::ByValue, &HashSet::new());
+            // cc.rs compiles what follows together with the helpers' C (`compile_pair`).
+            c.push_str(ll::BODY_MARK);
         }
         h
     } else {

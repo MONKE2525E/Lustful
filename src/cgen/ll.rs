@@ -1951,6 +1951,11 @@ fn ll_decl(p: &Program, f: LocalDefId, id: &str) -> String {
     format!("declare {ret} @fl_{id}({})", params.join(", "))
 }
 
+/// The line that ends an LLVM unit's plain C prelude (only its wrappers' types): what
+/// follows (the C ABI wrappers and trampolines) also compiles after the helpers' C, which
+/// declares every type the unit holds (cc.rs `compile_pair`).
+pub const BODY_MARK: &str = "/* lust: LLVM unit body */\n";
+
 /// True when `text` holds `word` as a whole C identifier outside literals.
 fn contains_word(text: &str, word: &str) -> bool {
     let b = text.as_bytes();
