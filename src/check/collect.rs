@@ -5039,7 +5039,8 @@ pub fn collect_reuse(
             Err(d) => errs.push(d),
         }
     }
-    let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
+    // Each impl's path and its methods' (`def::impl_ids`, as the driver's `fn_keys`).
+    let impl_ids = crate::def::impl_ids(p.stable_crate, ast, interner);
     // Top-level fn and method hashes by body block: the parents of fns
     // nested in bodies (`def::nested_fn_ids`).
     let mut top_hashes: HashMap<ast::BlockId, crate::def::DefPathHash> = HashMap::default();
@@ -5075,20 +5076,11 @@ pub fn collect_reuse(
                     errs.push(not_yet("L0614", imp.span, "negative impls"));
                     continue;
                 }
-                // Impl identity header, computed exactly as the
-                // driver's `fn_keys` computes it (self type's first
-                // segment name, else "<error>"), with one ordinal
-                // sequence per header across all impls.
-                let header = match ast.ty(imp.self_ty) {
-                    TyExpr::Path(segs) if !segs.is_empty() => interner.get(segs[0].name).to_string(),
-                    _ => "<error>".to_string(),
-                };
-                let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
-                impl_ordinals.insert(header.clone(), ordinal + 1);
-                let parent = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
-                for def in &imp.fns {
+                let ids = impl_ids[item_idx].as_ref().expect("an impl item has impl ids");
+                let parent = ids.path.0;
+                for (k, def) in imp.fns.iter().enumerate() {
                     if let Some(b) = def.body {
-                        top_hashes.insert(b, crate::def::method_hash(parent, interner.get(def.name)));
+                        top_hashes.insert(b, ids.methods[k].0);
                     }
                 }
                 let impl_def = DefId { krate: p.krate, hash: parent };
@@ -5386,7 +5378,7 @@ pub fn collect_reuse(
                             "Remove the `const`, or move the method to an inherent impl.",
                         ));
                     }
-                    let hash = crate::def::method_hash(parent, interner.get(def.name));
+                    let hash = ids.methods[k].0;
                     let site = FnSite { loc: FnLoc::Impl(item_idx as u32, k as u32), owner, self_ty: Some(self_pat), parent: Some(impl_def), hash };
                     let id = add_fn(&mut p, site, &parent_gen, &mut errs);
                     method_ids.push(id);
@@ -6608,8 +6600,8 @@ fn install_const_items(
 /// before that loop runs, as parents of type items in bodies.
 pub(crate) fn top_fn_hashes(ast: &Ast, interner: &Interner, stable: crate::def::StableCrateHash) -> HashMap<ast::BlockId, crate::def::DefPathHash> {
     let mut out: HashMap<ast::BlockId, crate::def::DefPathHash> = HashMap::default();
-    let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
-    for item in &ast.items {
+    let impl_ids = crate::def::impl_ids(stable, ast, interner);
+    for (item_idx, item) in ast.items.iter().enumerate() {
         match &item.kind {
             ItemKind::Fn(def) => {
                 if let Some(b) = def.body {
@@ -6620,16 +6612,10 @@ pub(crate) fn top_fn_hashes(ast: &Ast, interner: &Interner, stable: crate::def::
                 if imp.is_negative {
                     continue;
                 }
-                let header = match ast.ty(imp.self_ty) {
-                    TyExpr::Path(segs) if !segs.is_empty() => interner.get(segs[0].name).to_string(),
-                    _ => "<error>".to_string(),
-                };
-                let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
-                impl_ordinals.insert(header.clone(), ordinal + 1);
-                let parent = crate::def::impl_hash(stable, &[], &header, ordinal);
-                for def in &imp.fns {
+                let ids = impl_ids[item_idx].as_ref().expect("an impl item has impl ids");
+                for (k, def) in imp.fns.iter().enumerate() {
                     if let Some(b) = def.body {
-                        out.insert(b, crate::def::method_hash(parent, interner.get(def.name)));
+                        out.insert(b, ids.methods[k].0);
                     }
                 }
             }
@@ -7027,22 +7013,15 @@ fn register_assoc_consts(
 ) {
     let ast_arc = p.ast.clone();
     let ast = &*ast_arc;
-    let mut impl_ordinals: HashMap<String, u32> = HashMap::default();
+    // The impl paths the fn pass gave each impl (`def::impl_ids`).
+    let impl_ids = crate::def::impl_ids(p.stable_crate, ast, &p.interner);
     let mut inherent_seen: Vec<(DefId, Sym)> = Vec::new();
-    for item in &ast.items {
+    for (item_idx, item) in ast.items.iter().enumerate() {
         let ItemKind::Impl(imp) = &item.kind else { continue };
-        // The fn pass consumes one ordinal per impl header before
-        // any continue, negative and trait impls included.
-        let header = match ast.ty(imp.self_ty) {
-            TyExpr::Path(segs) if !segs.is_empty() => p.interner.get(segs[0].name).to_string(),
-            _ => "<error>".to_string(),
-        };
-        let ordinal = impl_ordinals.get(&header).copied().unwrap_or(0);
-        impl_ordinals.insert(header.clone(), ordinal + 1);
         if imp.is_negative || imp.consts.is_empty() {
             continue;
         }
-        let parent_hash = crate::def::impl_hash(p.stable_crate, &[], &header, ordinal);
+        let parent_hash = impl_ids[item_idx].as_ref().expect("an impl item has impl ids").path.0;
         let impl_def = DefId { krate: p.krate, hash: parent_hash };
         let owner = match ast.ty(imp.self_ty) {
             _ if imp.in_body => body_impl_owner(p, impl_def),

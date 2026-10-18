@@ -1849,24 +1849,8 @@ struct FnKey {
 /// computed here must equal the ones `collect` stores in `Program::fn_defs`;
 /// a test below checks both against one source.
 fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, stable: StableCrateHash) -> Vec<FnKey> {
-    // Each impl item's path, impls with the same header counted in file order.
-    let mut ordinals: FxMap<String, u32> = FxMap::default();
-    let mut impl_paths: Vec<Option<(def::DefPathHash, String)>> = Vec::with_capacity(ast.items.len());
-    for item in &ast.items {
-        let path = match &item.kind {
-            ItemKind::Impl(imp) => {
-                let header = match ast.ty(imp.self_ty) {
-                    crate::ast::TyExpr::Path(segs) if !segs.is_empty() => interner.get(segs[0].name).to_string(),
-                    _ => "<error>".to_string(),
-                };
-                let ordinal = ordinals.get(&header).copied().unwrap_or(0);
-                ordinals.insert(header.clone(), ordinal + 1);
-                Some(def::impl_path(stable, &[], &header, ordinal))
-            }
-            _ => None,
-        };
-        impl_paths.push(path);
-    }
+    // Each impl's path and its methods' (`def::impl_ids`, as `collect` computes them).
+    let impl_ids = def::impl_ids(stable, ast, interner);
     let key = |hash, path, free, name| FnKey { disk: DiskDefId { krate: stable, hash }, path, free, name };
     let mut keys = par_map(fn_loc, |&(item, sub)| match (item != usize::MAX, sub) {
         (false, Some(k)) => {
@@ -1883,8 +1867,7 @@ fn fn_keys(ast: &Ast, fn_loc: &[(usize, Option<usize>)], interner: &Interner, st
                 key(hash, path, true, d.name)
             }
             (ItemKind::Impl(imp), Some(k)) => {
-                let (ihash, itext) = impl_paths[item].as_ref().unwrap();
-                let (hash, path) = def::method_path(*ihash, itext, interner.get(imp.fns[k].name));
+                let (hash, path) = impl_ids[item].as_ref().unwrap().methods[k].clone();
                 key(hash, path, false, imp.fns[k].name)
             }
             _ => unreachable!("fn_loc points at a function"),

@@ -268,11 +268,9 @@ pub fn free_fn_path(krate: StableCrateHash, module: &[&str], name: &str) -> (Def
     item_path(krate, module, DefKind::Fn, name, 0)
 }
 
-/// An impl block's path. `header` is the normalized impl header text (generics,
-/// trait path, self type, where bounds); today an inherent impl's header is its
-/// self type name. `ordinal` counts impls with the same header earlier in the
-/// same module, in file order. Body edits keep the id; a header edit makes a
-/// new one (section 1.7).
+/// An impl block's path. `header` is the impl's canonical header text and `ordinal`
+/// counts impls with the same header earlier in the crate, in item order (`impl_ids`).
+/// Body edits keep the id; a header edit makes a new one (section 1.7).
 pub fn impl_path(krate: StableCrateHash, module: &[&str], header: &str, ordinal: u32) -> (DefPathHash, String) {
     item_path(krate, module, DefKind::Impl, header, ordinal)
 }
@@ -295,6 +293,151 @@ pub fn impl_hash(krate: StableCrateHash, module: &[&str], header: &str, ordinal:
 /// A method's hash. See `item_hash`.
 pub fn method_hash(impl_hash: DefPathHash, name: &str) -> DefPathHash {
     child_hash(impl_hash, DefKind::Method, name, 0)
+}
+
+/// One impl block's def path and its methods' (`impl_ids`).
+pub struct ImplIds {
+    /// The impl's own path: its header with its ordinal among impls of the same header.
+    pub path: (DefPathHash, String),
+    /// Each method's path, in `ImplDef::fns` order.
+    pub methods: Vec<(DefPathHash, String)>,
+}
+
+/// The identity of every impl block, by item index (None for other items). The header is
+/// the impl's self type and, for a trait impl, its trait, as canonical text with generic
+/// type args (`Clone for Foo<T>`, `Foo<u8>` for an inherent impl; `header_ty_text`). The
+/// impl's own path takes an ordinal among impls of the same header, in item order. A
+/// method's path does not: it is the header's (ordinal 0) plus the method name, with an
+/// ordinal only among methods of the same header and name (headers that differ only in a
+/// form the text leaves out). So inserting an impl, splitting an inherent impl into
+/// blocks, or moving one to another file renames no method of another block, and none of
+/// their instances: a positional number here once renamed every method of a type when an
+/// impl of it was added, and every caller and inline copy recompiled (rel-cache, merge 1
+/// of the tsgo replay: 285 units). The driver's `fn_keys` and `collect` both use this.
+pub fn impl_ids(krate: StableCrateHash, ast: &crate::ast::Ast, interner: &crate::intern::Interner) -> Vec<Option<ImplIds>> {
+    let mut impl_ordinals: crate::intern::FxMap<String, u32> = Default::default();
+    let mut method_ordinals: crate::intern::FxMap<(String, String), u32> = Default::default();
+    ast.items
+        .iter()
+        .map(|item| {
+            let crate::ast::ItemKind::Impl(imp) = &item.kind else { return None };
+            let mut header = String::new();
+            if let Some(t) = &imp.trait_ref {
+                if imp.is_negative {
+                    header.push('!');
+                }
+                path_text(ast, interner, &t.path, &mut header);
+                header.push_str(" for ");
+            }
+            header_ty_text(ast, interner, imp.self_ty, &mut header);
+            let ordinal = impl_ordinals.entry(header.clone()).or_insert(0);
+            let path = impl_path(krate, &[], &header, *ordinal);
+            *ordinal += 1;
+            let (parent, parent_text) = impl_path(krate, &[], &header, 0);
+            let methods = imp
+                .fns
+                .iter()
+                .map(|f| {
+                    let name = interner.get(f.name);
+                    let n = method_ordinals.entry((header.clone(), name.to_string())).or_insert(0);
+                    let m = child_path(parent, &parent_text, DefKind::Method, name, *n);
+                    *n += 1;
+                    m
+                })
+                .collect();
+            Some(ImplIds { path, methods })
+        })
+        .collect()
+}
+
+/// The canonical text of a type in an impl header (`impl_ids`): paths with their generic
+/// type args, references, pointers, tuples, slices, arrays; lifetimes left out, as regions
+/// do not tell impls apart. A form it does not spell out (a const arg, an array length, a
+/// fn pointer, `dyn`, `impl`) prints as `_`; impls that differ only there are told apart
+/// by ordinals.
+fn header_ty_text(ast: &crate::ast::Ast, interner: &crate::intern::Interner, t: crate::ast::TyId, out: &mut String) {
+    use crate::ast::TyExpr;
+    match ast.ty(t) {
+        TyExpr::Path(segs) => path_text(ast, interner, segs, out),
+        TyExpr::Ref { mutable, inner, .. } => {
+            out.push_str(if *mutable { "&mut " } else { "&" });
+            header_ty_text(ast, interner, *inner, out);
+        }
+        TyExpr::Ptr { mutable, inner } => {
+            out.push_str(if *mutable { "*mut " } else { "*const " });
+            header_ty_text(ast, interner, *inner, out);
+        }
+        TyExpr::Unit => out.push_str("()"),
+        TyExpr::Tuple(ts) => {
+            out.push('(');
+            for (i, t) in ts.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                header_ty_text(ast, interner, *t, out);
+            }
+            out.push(')');
+        }
+        TyExpr::Slice(t) => {
+            out.push('[');
+            header_ty_text(ast, interner, *t, out);
+            out.push(']');
+        }
+        TyExpr::Array { inner, .. } => {
+            out.push('[');
+            header_ty_text(ast, interner, *inner, out);
+            out.push_str("; _]");
+        }
+        TyExpr::Paren(t) => header_ty_text(ast, interner, *t, out),
+        TyExpr::Never => out.push('!'),
+        _ => out.push('_'),
+    }
+}
+
+/// A path's canonical text for `header_ty_text`: segments joined by `::`, each with its
+/// generic args.
+fn path_text(ast: &crate::ast::Ast, interner: &crate::intern::Interner, segs: &[crate::ast::PathSeg], out: &mut String) {
+    use crate::ast::{GenericArg, GenericArgs};
+    for (i, s) in segs.iter().enumerate() {
+        if i > 0 {
+            out.push_str("::");
+        }
+        out.push_str(interner.get(s.name));
+        match &s.args {
+            GenericArgs::None => {}
+            GenericArgs::Angle(args) => {
+                out.push('<');
+                for (k, a) in args.iter().filter(|a| !matches!(a, GenericArg::Lifetime(_))).enumerate() {
+                    if k > 0 {
+                        out.push_str(", ");
+                    }
+                    match a {
+                        GenericArg::Type(t) => header_ty_text(ast, interner, *t, out),
+                        GenericArg::Binding { name, .. } => {
+                            out.push_str(interner.get(*name));
+                            out.push_str(" = _");
+                        }
+                        _ => out.push('_'),
+                    }
+                }
+                out.push('>');
+            }
+            GenericArgs::Parenthesized { inputs, output } => {
+                out.push('(');
+                for (k, t) in inputs.iter().enumerate() {
+                    if k > 0 {
+                        out.push_str(", ");
+                    }
+                    header_ty_text(ast, interner, *t, out);
+                }
+                out.push(')');
+                if let Some(o) = output {
+                    out.push_str(" -> ");
+                    header_ty_text(ast, interner, *o, out);
+                }
+            }
+        }
+    }
 }
 
 /// The path of each trait default method, by its body block: the trait's
@@ -620,6 +763,42 @@ mod tests {
 
     /// A method's identity is its parent impl plus its name: same-named methods
     /// on different types, and in different same-header impl blocks, differ.
+    /// A method's id follows its impl's header (self type and trait, with generic args) and
+    /// its own name, never the impl's place: impls inserted before it, an inherent impl
+    /// split into blocks, or a trait impl moved elsewhere in the crate keep every method's
+    /// id, and same-name methods of impls for other args stay apart.
+    #[test]
+    fn method_ids_do_not_depend_on_impl_order() {
+        let ids = |src: &str| -> Vec<(String, DefPathHash)> {
+            let interner = crate::intern::Interner::default();
+            let known = crate::intern::Known::new(&interner);
+            let lexed = crate::lexer::lex(src, crate::diag::FileId(0), 0, &interner).unwrap();
+            let ast = crate::parser::parse(&lexed, &interner, &known).unwrap();
+            let mut out = Vec::new();
+            for (item, ids) in ast.items.iter().zip(impl_ids(StableCrateHash(7), &ast, &interner)) {
+                if let (crate::ast::ItemKind::Impl(imp), Some(ids)) = (&item.kind, ids) {
+                    out.extend(imp.fns.iter().zip(ids.methods).map(|(f, (h, _))| (interner.get(f.name).to_string(), h)));
+                }
+            }
+            out
+        };
+        let base = ids("struct Foo<T>(T);\nimpl Foo<u8> { fn new() {} }\nimpl Foo<u16> { fn new() {} }\nstruct S;\n\
+            impl S { fn get(&self) {} }\nimpl Clone for S { fn clone(&self) -> S { S } }\nfn main() {}\n");
+        // A third `new` block first, a split inherent block, the trait impl moved up, a new trait impl.
+        let edited = ids("struct Foo<T>(T);\nimpl Foo<u32> { fn new() {} }\nimpl S { fn other(&self) {} }\n\
+            impl Clone for S { fn clone(&self) -> S { S } }\nimpl Foo<u8> { fn new() {} }\nimpl Foo<u16> { fn new() {} }\n\
+            struct S;\nimpl Default for S { fn default() -> S { S } }\nimpl S { fn get(&self) {} }\nfn main() {}\n");
+        let names = |v: &[(String, DefPathHash)]| v.iter().map(|(n, _)| n.clone()).collect::<Vec<String>>();
+        assert_eq!(names(&base), ["new", "new", "get", "clone"]);
+        assert_eq!(names(&edited), ["new", "other", "clone", "new", "new", "default", "get"]);
+        assert_ne!(base[0].1, base[1].1, "Foo<u8>::new and Foo<u16>::new stay apart");
+        assert_eq!(base[0].1, edited[3].1, "Foo<u8>::new");
+        assert_eq!(base[1].1, edited[4].1, "Foo<u16>::new");
+        assert_eq!(base[2].1, edited[6].1, "S::get");
+        assert_eq!(base[3].1, edited[2].1, "<S as Clone>::clone");
+        assert_ne!(edited[0].1, edited[3].1, "Foo<u32>::new is its own");
+    }
+
     #[test]
     fn method_paths_use_the_parent_impl() {
         let k = krate();
