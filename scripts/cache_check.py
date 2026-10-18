@@ -18,12 +18,20 @@
 # missed a closure slot that an adapter chain called, so an edit that removed earlier
 # closures served the old object and the binary called the wrong closure.
 #
+# With --release, both builds go through the release driver (release C, `--release
+# --target <host>`, the cc backend) and the two binaries must be byte-identical: a
+# release binary is a function of the source, the toolchain and the flags, whatever the
+# cache held (rel-cache round 4: the location unit's slot numbers came from the cache's
+# slot manifest). Each sequence ends with a no-change rebuild that must take every unit
+# from the object cache.
+#
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: cache_check.py --seqs 40 --steps 4 [--seed 1] [--jobs N] [--threads 1,4,24]
-#                       [--rustc] [--daemon] [--keep DIR]
-# Sequence 0 of every run is the fx-unitcache repro shape. Exit 0 = all same, 1 = a
+#                       [--rustc] [--daemon] [--release] [--keep DIR]
+# Sequence 0 of every run is the fx-unitcache repro shape; with --release, sequence 1
+# drops and restores Debug glue (glue_drop_steps). Exit 0 = all same, 1 = a
 # difference, a build failure on one side, or a hang; 2 = setup error.
-import argparse, os, random, shutil, subprocess, sys, tempfile
+import argparse, os, random, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -216,6 +224,22 @@ def repro_steps():
     return [src(True), src(False), src(True)]
 
 
+def glue_drop_steps():
+    """Glue a session keeps: `show` stops printing S and E with Debug, so their Debug glue
+    leaves the program, then comes back. A build after that history must ship what a cold
+    build ships (a session keeps the dropped glue in its glue set)."""
+    def src(debug):
+        fill = [filler(i, 6) for i in range(40)]
+        head = "#[derive(Debug, Clone)]\nstruct S { a: u32, b: String }\n#[derive(Debug)]\nenum E { X(S), Y }\n"
+        show = ("fn show(s: &S) {\n    println!(\"{:?} {:?}\", s, E::X(s.clone()));\n}\n" if debug
+                else "fn show(s: &S) {\n    println!(\"{} {}\", s.a, s.b);\n}\n")
+        main = ("fn main() {\n    let s = S { a: 1, b: \"x\".to_string() };\n    show(&s);\n    let mut acc = 0u64;\n"
+                + "".join(f"    acc = acc.wrapping_add(filler{i}(acc));\n" for i in range(40))
+                + "    println!(\"{acc}\");\n    if let E::Y = E::Y {\n        println!(\"y\");\n    }\n}\n")
+        return "\n".join([head] + fill + [show, main])
+    return [src(True), src(False), src(True), src(False)]
+
+
 def sequence(seed, steps, n_fill):
     rng = random.Random(seed)
     p = Prog(rng, n_fill)
@@ -265,8 +289,11 @@ def check_seq(idx, srcs, threads, args, work):
                 problems.append(f"{where}: generator made a program rustc rejects: {r[:200]}")
                 break
             outs["rustc"] = run_bin("./rustc.bin", d)
-        ref = build([LUST, "build", "main.rs", "-o", "ref.bin"], dict(tenv, LUST_NO_CACHE="1", LUST_NO_DAEMON="1"), d)
-        cached = build([LUST, "build", "main.rs", "-o", "cached.bin"], dict(tenv, LUST_NO_DAEMON="1"), d)
+        rel = ["--release", "--target", args.host, "--timings"] if args.release else []
+        renv = dict(tenv, LUST_RELEASE_C="1") if args.release else tenv
+        cenv = dict(renv, LUST_NO_DAEMON="1")
+        ref = build([LUST, "build", "main.rs", *rel, "-o", "ref.bin"], dict(renv, LUST_NO_CACHE="1", LUST_NO_DAEMON="1"), d)
+        cached = build([LUST, "build", "main.rs", *rel, "-o", "cached.bin"], cenv, d)
         sides = [("ref", ref), ("cached", cached)]
         if args.daemon:
             sides.append(("daemon", build([LUST, "build", "main.rs", "-o", "daemon.bin"], tenv, d)))
@@ -281,6 +308,11 @@ def check_seq(idx, srcs, threads, args, work):
                 problems.append(f"{where}: {name} build {r[:200]}")
             else:
                 outs[name] = run_bin(f"./{name}.bin", d)
+        if args.release and ref == "ok" and cached == "ok":
+            a, b = open(os.path.join(d, "ref.bin"), "rb").read(), open(os.path.join(d, "cached.bin"), "rb").read()
+            if a != b:
+                first = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
+                problems.append(f"{where}: release binaries differ ({len(a)} vs {len(b)} bytes, first at byte {first})")
         ref_out = outs.get("rustc", outs.get("ref"))
         for name, o in outs.items():
             if o != ref_out:
@@ -291,6 +323,12 @@ def check_seq(idx, srcs, threads, args, work):
         stats["steps"] += 1
         if problems:
             break
+        if args.release and step == len(srcs) - 1:
+            # A no-change rebuild compiles nothing: every unit's key is the last build's.
+            r = subprocess.run([LUST, "build", "main.rs", *rel, "-o", "again.bin"], cwd=d, env=cenv, capture_output=True, timeout=BUILD_TIMEOUT)
+            m = re.search(rb"(\d+) units \((\d+) from cache", r.stderr)
+            if r.returncode != 0 or not m or m.group(1) != m.group(2):
+                problems.append(f"seq {idx}: a no-change release rebuild missed the object cache ({m.group(0).decode() if m else r.stderr.decode(errors='replace')[:200]})")
     for sock in [f for f in os.listdir(d) if f.startswith(".lust-daemon-") and f.endswith(".sock")]:
         os.unlink(os.path.join(d, sock))  # removing the socket stops the daemon
     if problems and args.keep:
@@ -314,16 +352,23 @@ def main():
     ap.add_argument("--threads", default="", help="comma list of LUST_THREADS values, cycled per step")
     ap.add_argument("--rustc", action="store_true")
     ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--release", action="store_true", help="release driver builds; binaries must be byte-identical")
     ap.add_argument("--keep", help="copy the steps of each failing sequence here")
     args = ap.parse_args()
     if not os.access(LUST, os.X_OK):
         print(f"error: {LUST} not built. Run scripts/build.sh first.")
         return 2
     threads = [int(t) for t in args.threads.split(",") if t]
+    if args.release:
+        if args.daemon:
+            print("error: --release and --daemon do not combine (release builds are one-shot)")
+            return 2
+        v = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
+        args.host = next((l.split()[1] for l in v.splitlines() if l.startswith("host:")), "x86_64-unknown-linux-gnu")
     work = tempfile.mkdtemp(prefix="cache-check.", dir=os.environ.get("TMPDIR"))
     jobs = []
     for i in range(args.seqs):
-        srcs = repro_steps() if i == 0 else sequence(args.seed * 1_000_003 + i, args.steps, args.fill)
+        srcs = repro_steps() if i == 0 else glue_drop_steps() if i == 1 and args.release else sequence(args.seed * 1_000_003 + i, args.steps, args.fill)
         # Each sequence rotates the thread list, so every count builds first somewhere.
         th = threads[i % len(threads):] + threads[:i % len(threads)] if threads else []
         jobs.append((i, srcs, th))

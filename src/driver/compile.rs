@@ -4579,7 +4579,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     };
     // Release C glue shards come after the fn units (`link_fn_units` counts both).
     let mut rshards: Vec<String> = match &rgroups {
-        Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, super::release_c::unit_bytes())),
+        Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, &caches.out, super::release_c::unit_bytes())),
         None => Vec::new(),
     };
     let n_shards = rshards.len();
@@ -4601,8 +4601,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     2 => (cgen::runtime_unit(), String::new()),
                     3 => (super::release_c::table_unit(&rg.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
                     LOC_UNIT => {
-                        let live = (0..caches.out.len()).filter(|&s| !caches.out[s].code.is_empty()).map(|s| s as u32);
-                        (cgen::loc_unit(&files, &slot_lines) + &cgen::names::slot_table(live), String::new())
+                        let live: Vec<u32> = (0..caches.out.len()).filter(|&s| !caches.out[s].code.is_empty()).map(|s| s as u32).collect();
+                        (cgen::names::loc_unit(&live, &files, &slot_lines), String::new())
                     }
                     g => {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];

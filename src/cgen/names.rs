@@ -79,9 +79,11 @@ pub(crate) fn body(slot: u32) -> String {
     fn_id(slot).map_or_else(|| format!("f{slot}"), |id| format!("f_{id}"))
 }
 
-/// The fn id of `slot` in release C (None: numbered names or no fn).
+/// The fn id of `slot` in release C (None: numbered names or no fn). The slot's own
+/// entry decides: an id is 16 hex digits and may start with `dead` like `fn_id`'s
+/// placeholder for an empty slot.
 pub(crate) fn fn_tag_opt(slot: u32) -> Option<String> {
-    fn_id(slot).filter(|id| !id.starts_with("dead"))
+    CUR.with(|c| c.borrow().as_ref().and_then(|n| n.fns.get(slot as usize).cloned().flatten()))
 }
 
 /// The C name of the trampoline of the fn in `slot`.
@@ -137,11 +139,28 @@ pub(crate) fn loc(slot: u32, rel: u64, col: u64, externs: &mut BTreeSet<String>)
     }
 }
 
-/// The location unit's slot table for release C: `lust_so_<id>` per live fn.
-pub(crate) fn slot_table(live: impl Iterator<Item = u32>) -> String {
-    let mut defs: Vec<String> = live.filter_map(|s| fn_id(s).map(|id| format!("const uint32_t lust_so_{id} = {s};\n"))).collect();
-    defs.sort();
-    defs.concat()
+/// The location unit of release C: `loc_unit`'s line and file tables plus a
+/// `lust_so_<id>` per live fn (the slot its panic sites pack). The tables are indexed
+/// canonically, a live fn by its rank by id and a file by its rank by path, so the unit
+/// is a function of the program: the slot numbers and file ids a disk cache or a front
+/// image carried over from earlier builds do not reach the binary.
+pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> String {
+    let mut fns: Vec<(String, u32)> = live.iter().filter_map(|&s| fn_id(s).map(|id| (id, s))).collect();
+    fns.sort_unstable();
+    let file_of = |s: u32| files.of_slot.get(s as usize).copied().unwrap_or(0) as usize;
+    let mut paths: Vec<&str> = fns.iter().map(|&(_, s)| files.paths.get(file_of(s)).copied().unwrap_or("")).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let of_slot: Vec<u32> = fns
+        .iter()
+        .map(|&(_, s)| paths.binary_search(&files.paths.get(file_of(s)).copied().unwrap_or("")).unwrap_or(0) as u32)
+        .collect();
+    let lines: Vec<u32> = fns.iter().map(|&(_, s)| slot_lines.get(s as usize).copied().unwrap_or(0)).collect();
+    let mut c = super::loc_unit(&SlotFiles { paths: &paths, of_slot: &of_slot }, &lines);
+    for (k, (id, _)) in fns.iter().enumerate() {
+        c.push_str(&format!("const uint32_t lust_so_{id} = {k};\n"));
+    }
+    c
 }
 
 /// Release C glue: every glue definition lives in exactly one shard, and fn units hold
@@ -149,9 +168,12 @@ pub(crate) fn slot_table(live: impl Iterator<Item = u32>) -> String {
 /// chunks of the keys in prototype order: a cut after each key whose prototype hash
 /// hits 1 in (`target` bytes / mean definition bytes), so new glue changes only the
 /// shard it lands in. Each shard declares the types (`Decls::OneStep`), prototypes (its
-/// keys' and their callees') and externs its definitions need.
-pub fn glue_shards(p: &Program, g: &GlueSet, target: usize) -> Vec<String> {
-    let mut keys: Vec<&(Glue, CTy)> = g.def_map.keys().collect();
+/// keys' and their callees') and externs its definitions need. Only the keys the fns in
+/// `out` reach (a dead slot's `FnOut` is empty), as a cold build has them: a session's set
+/// also keeps keys no fn reaches now (stale since a refresh, or left by a removed fn).
+pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Vec<String> {
+    let live = g.closure(out.iter().flat_map(|o| o.glue.iter()));
+    let mut keys: Vec<&(Glue, CTy)> = live.into_iter().filter(|k| g.def_map.contains_key(*k)).collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
     let mean = (keys.iter().map(|k| g.def_map[*k].len()).sum::<usize>() / keys.len().max(1)).max(1);
     let cut_every = (target / mean).max(1) as u64;
