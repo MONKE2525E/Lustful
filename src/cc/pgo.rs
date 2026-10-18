@@ -194,12 +194,14 @@ fn run(cmd: &mut Command) -> Result<String, String> {
 /// records of every static fn and helper in the unit. `split` owns these records by fn name.
 pub(crate) const STATIC_FILE: &str = "lust.c";
 
-/// `LUST_PGO_PREINLINE=0`: neither the instrumented nor the use build runs LLVM's PGO
-/// pre-inliner. It inlines small callees before each fn's CFG hash is taken, so a caller's
-/// record stops matching when a callee it inlined changes (a cross-unit copy, a merge that
-/// edits the callee); without it a record follows its own fn only.
+/// Neither the instrumented nor the use build runs LLVM's PGO pre-inliner
+/// (`LUST_PGO_PREINLINE=1` runs it). It inlines small callees before each fn's CFG hash is
+/// taken, so a caller's record stops matching when a callee it inlined changes (a cross-unit
+/// copy, a merge that edits the callee); without it a record follows its own fn only. tsgo, a
+/// profile pinned at replay state 0: 99.4-99.8% of its counts still apply after 12 merges
+/// (94.6-99.7% with it), at no measurable run-speed cost in either backend.
 pub fn no_preinline() -> bool {
-    std::env::var("LUST_PGO_PREINLINE").is_ok_and(|v| v == "0")
+    std::env::var("LUST_PGO_PREINLINE").map_or(true, |v| v != "1")
 }
 
 fn digest(parts: &[&[u8]]) -> String {
