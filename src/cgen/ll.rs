@@ -2098,7 +2098,11 @@ pub fn ll_unit(fns: &[FnOut], slots: &[usize], inl: &[usize], triple: &str) -> S
     }
     // No target line: clang compiles the IR for its own target, as it does the C halves.
     let _ = triple;
-    let mut out = String::from("; lust release LLVM IR unit\n\n");
+    // One source name for every unit: PGO names an internal fn (the helpers, once linked)
+    // `<source name>;<fn>`, and a unit's own name follows its members, so a merge that moves
+    // one fn would rename the records of every helper in the unit (`pgo::split` owns these
+    // records by fn name).
+    let mut out = format!("; lust release LLVM IR unit\nsource_filename = \"{}\"\n\n", crate::cc::pgo::STATIC_FILE);
     let mut decls: BTreeSet<&str> = BTreeSet::new();
     for &s in slots.iter().chain(inl) {
         decls.extend(fns[s].ll_decls.iter().map(String::as_str));

@@ -111,10 +111,10 @@ impl Mode {
     pub fn key_part(&self, file: &str) -> String {
         let nopre = if no_preinline() { " nopre" } else { "" };
         match self {
-            Mode::Gen => format!("gen{nopre}"),
+            Mode::Gen => format!("gen{nopre} {STATIC_FILE}"),
             Mode::Use(p) => {
                 let own = p.own.get(file).map(|r| r.join("\n\n")).unwrap_or_default();
-                digest(&[p.pins.join(" ").as_bytes(), nopre.as_bytes(), own.as_bytes()])
+                digest(&[p.pins.join(" ").as_bytes(), nopre.as_bytes(), STATIC_FILE.as_bytes(), own.as_bytes()])
             }
         }
     }
@@ -182,6 +182,12 @@ fn run(cmd: &mut Command) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
+/// The source file name every PGO unit compiles under (a C unit as `<work>/<unit>.d/lust.c`,
+/// an LLVM unit by its IR's `source_filename`). PGO names an internal fn `<source name>;<fn>`;
+/// the unit's own name hashes its members, so a merge that moved one fn would rename the
+/// records of every static fn and helper in the unit. `split` owns these records by fn name.
+pub(crate) const STATIC_FILE: &str = "lust.c";
+
 /// `LUST_PGO_PREINLINE=0`: neither the instrumented nor the use build runs LLVM's PGO
 /// pre-inliner. It inlines small callees before each fn's CFG hash is taken, so a caller's
 /// record stops matching when a callee it inlined changes (a cross-unit copy, a merge that
@@ -239,40 +245,44 @@ impl Pgo {
     }
 }
 
-/// The external fns each unit defines, by the file name it compiles as, and the names
-/// only a preprocessed text shows (macro-made).
+/// The external fns each unit defines, by the file name it compiles as, the names only a
+/// preprocessed text shows (macro-made), and the static fns each unit defines.
 struct UnitDefs {
     units: Vec<(String, Vec<String>)>,
     macro_made: std::collections::HashSet<String>,
+    statics: Vec<(String, Vec<String>)>,
 }
 
 /// The definitions of each unit (`defined_externs`), on every thread: of its preprocessed
 /// text when the caller has one (a unit with `#include`s; `cc::preprocessed`, else its text
 /// as given), so the fns its macros make count as its own.
 fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
-    let per: Vec<(String, Vec<String>, Vec<String>)> = crate::pool::par_map(units, |(file, c, pre)| {
+    let per: Vec<(String, Vec<String>, Vec<String>, Vec<String>)> = crate::pool::par_map(units, |(file, c, pre)| {
         let raw: std::collections::HashSet<&str> = defined_externs(c).into_iter().collect();
-        let names: Vec<String> = match pre {
-            Some(pre) => defined_externs(&String::from_utf8_lossy(pre)).into_iter().map(str::to_string).collect(),
+        let pre = pre.map(String::from_utf8_lossy);
+        let names: Vec<String> = match &pre {
+            Some(pre) => defined_externs(pre).into_iter().map(str::to_string).collect(),
             None => raw.iter().map(|n| n.to_string()).collect(),
         };
         let made = names.iter().filter(|n| !raw.contains(n.as_str())).cloned().collect();
-        (file.clone(), names, made)
+        let statics = defined_statics(pre.as_deref().unwrap_or(c)).into_iter().map(str::to_string).collect();
+        (file.clone(), names, made, statics)
     });
     let mut macro_made = std::collections::HashSet::new();
-    let units = per
-        .into_iter()
-        .map(|(file, names, made)| {
-            macro_made.extend(made);
-            (file, names)
-        })
-        .collect();
-    UnitDefs { units, macro_made }
+    let mut units = Vec::with_capacity(per.len());
+    let mut statics = Vec::with_capacity(per.len());
+    for (file, names, made, st) in per {
+        macro_made.extend(made);
+        statics.push((file.clone(), st));
+        units.push((file, names));
+    }
+    UnitDefs { units, macro_made, statics }
 }
 
 /// The records of each unit (by the file name it compiles as), sorted, how many are of
-/// macro-made fns, and how many went to no unit. A static fn's record goes to its file,
-/// an external one to every unit that defines it, else to none.
+/// macro-made fns, and how many external ones went to no unit. An external fn's record goes
+/// to every unit that defines it, a static fn's (`STATIC_FILE;<fn>`) to every unit that
+/// defines a static fn of that name; a static record of another file goes to that file.
 fn split(records: &HashMap<String, String>, defs: &UnitDefs) -> (HashMap<String, Vec<String>>, usize, usize) {
     let mut owner: HashMap<&str, Vec<&str>> = HashMap::new();
     for (file, names) in &defs.units {
@@ -280,10 +290,17 @@ fn split(records: &HashMap<String, String>, defs: &UnitDefs) -> (HashMap<String,
             owner.entry(n).or_default().push(file);
         }
     }
+    let mut static_owner: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (file, names) in &defs.statics {
+        for n in names {
+            static_owner.entry(n).or_default().push(file);
+        }
+    }
     let mut own: HashMap<String, Vec<String>> = HashMap::new();
     let (mut helpers, mut absent) = (0, 0);
     for (name, r) in records {
         let files: Vec<&str> = match name.split_once(';') {
+            Some((STATIC_FILE, f)) => static_owner.get(f).cloned().unwrap_or_default(),
             Some((file, _)) => vec![file],
             None => match owner.get(name.as_str()) {
                 Some(f) => {
@@ -396,9 +413,18 @@ fn pins(show: &str) -> Result<Vec<String>, String> {
 
 /// The external functions unit `c` defines: an identifier that starts a column-0
 /// declarator line and whose parameter list (over any number of lines) is followed by
-/// a body. A prototype ends in `;` instead; a static function's record name carries
-/// its file, so it is not listed.
+/// a body. A prototype ends in `;` instead; a static function's record is owned by name
+/// (`defined_statics`), so it is not listed.
 pub fn defined_externs(c: &str) -> Vec<&str> {
+    definitions(c, false)
+}
+
+/// The static functions `c` defines, as `defined_externs` finds the external ones.
+pub fn defined_statics(c: &str) -> Vec<&str> {
+    definitions(c, true)
+}
+
+fn definitions(c: &str, statics: bool) -> Vec<&str> {
     let b = c.as_bytes();
     let mut out = Vec::new();
     let mut at = 0;
@@ -407,7 +433,8 @@ pub fn defined_externs(c: &str) -> Vec<&str> {
         let line = &c[at..end];
         let first = line.bytes().next().unwrap_or(b' ');
         let skip = ["static", "typedef", "struct", "union", "enum", "extern", "#"];
-        if (first.is_ascii_alphabetic() || first == b'_') && !skip.iter().any(|s| line.starts_with(s)) {
+        let wanted = if statics { line.starts_with("static ") } else { !skip.iter().any(|s| line.starts_with(s)) };
+        if (first.is_ascii_alphabetic() || first == b'_') && wanted {
             if let Some((name, open)) = declarator_name(line) {
                 let mut depth = 0usize;
                 let mut i = at + open;
@@ -513,9 +540,26 @@ mod tests {
         let defs = UnitDefs {
             units: defs.iter().map(|(f, ns)| (f.to_string(), ns.iter().map(|n| n.to_string()).collect())).collect(),
             macro_made: macro_made.iter().map(|n| n.to_string()).collect(),
+            statics: Vec::new(),
         };
         let (own, helpers, absent) = split(&recs, &defs);
         Mode::Use(Pgo { head: String::new(), own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, kept: false, work: PathBuf::new() })
+    }
+
+    /// A static fn's record (`STATIC_FILE;<fn>`) goes to every unit that defines a static fn
+    /// of that name, whatever the unit is called: a merge that renames a unit keeps it.
+    #[test]
+    fn a_static_record_follows_its_fn_not_its_unit() {
+        let recs: HashMap<String, String> =
+            [("lust.c;lh_aa_0", 5), ("lust.c;lust_mix", 2), ("x1.c;old", 3)].iter().map(|(n, c)| (n.to_string(), rec(n, *c))).collect();
+        let st = |f: &str, ns: &[&str]| (f.to_string(), ns.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+        let defs = UnitDefs { units: Vec::new(), macro_made: Default::default(), statics: vec![st("x9.ll", &["lh_aa_0", "lust_mix"]), st("x7.c", &["lust_mix"])] };
+        let (own, _, absent) = split(&recs, &defs);
+        assert_eq!(own["x9.ll"].len(), 2);
+        assert!(own["x7.c"][0].starts_with("lust.c;lust_mix"));
+        assert!(own["x1.c"][0].starts_with("x1.c;old"), "another file's static record stays with that file");
+        assert_eq!(absent, 0);
+        assert_eq!(defined_statics("static inline int lust_mix(int a) {\n}\nstatic int g;\nint f(void) {\n}\n"), vec!["lust_mix"]);
     }
 
     /// A unit's key moves only with the records of the fns it defines (the runtime unit's

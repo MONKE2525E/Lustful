@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-mod pgo;
+pub(crate) mod pgo;
 mod rtinl;
 
 /// One target's compiler setup: the command words, the flags every unit
@@ -448,17 +448,27 @@ fn compile_runtime_ir(spec: &CcSpec, cflags: &[String], src: &Path, obj: &Path, 
     run(&["-emit-llvm", "-Xclang", "-disable-llvm-passes", "-c"], &inl_ll, inl, None)
 }
 
-/// What the PGO split (`pgo::defined_externs`, `pgo::stable_name`) reads for an LLVM unit:
-/// its C half, then a C definition line for each external fn its IR defines (its own and
-/// the `available_externally` copies, whose bodies the profile annotates too).
-fn ll_profile_text(c: &str, ll: &str) -> String {
+/// What the PGO split (`pgo::defined_externs`, `pgo::defined_statics`, `pgo::stable_name`)
+/// reads for an LLVM unit: its C half, then a C definition line for each external fn its IR
+/// defines (its own and the `available_externally` copies, whose bodies the profile annotates
+/// too), and a static one for each fn that ends up internal in the unit's module: the IR's
+/// internal fns, the helpers it calls, and the static fns of its helpers' C `hc`.
+fn ll_profile_text(c: &str, ll: &str, hc: &str) -> String {
     let mut out = c.to_string();
-    for line in ll.lines().filter(|l| l.starts_with("define ") && !l.starts_with("define internal ") && !l.starts_with("define private ")) {
-        if let Some(at) = line.find(" @")
-            && let Some(len) = line[at + 2..].find('(')
+    let name = |line: &str| line.find(" @").and_then(|at| line[at + 2..].find('(').map(|len| line[at + 2..at + 2 + len].to_string()));
+    for line in ll.lines() {
+        let local = line.starts_with("define internal ") || line.starts_with("define private ");
+        if let Some(n) = line.starts_with("define ").then(|| name(line)).flatten() {
+            out.push_str(&format!("\n{}void {n}(void) {{\n}}\n", if local { "static " } else { "" }));
+        } else if line.starts_with("declare ")
+            && let Some(n) = name(line).filter(|n| n.starts_with("lh_"))
         {
-            out.push_str(&format!("\nvoid {}(void) {{\n}}\n", &line[at + 2..at + 2 + len]));
+            // A helper the IR calls: its C (in `hc`) links into the module as an internal fn.
+            out.push_str(&format!("\nstatic void {n}(void) {{\n}}\n"));
         }
+    }
+    for n in pgo::defined_statics(hc) {
+        out.push_str(&format!("\nstatic void {n}(void) {{\n}}\n"));
     }
     out
 }
@@ -498,7 +508,9 @@ pub fn build(
     // unit's file name, and the preprocessed text of a C unit with `#include`s, which its key
     // and its PGO definitions both read.
     let ll_texts: Vec<Option<String>> =
-        crate::pool::par_map(&units, |(name, c)| ll_of.get(name.as_str()).filter(|_| pgo_on).map(|ll| ll_profile_text(c, ll)));
+        crate::pool::par_map(&units, |(name, c)| {
+            ll_of.get(name.as_str()).filter(|_| pgo_on).map(|ll| ll_profile_text(c, ll, hc_of.get(name.as_str()).copied().unwrap_or("")))
+        });
     let idx: Vec<usize> = (0..units.len()).collect();
     let names: Vec<String> = crate::pool::par_map(&idx, |&i| {
         let (name, c) = units[i];
@@ -558,7 +570,14 @@ pub fn build(
             if cached {
                 hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
-                let src = work.join(format!("{}.c", names[r]));
+                let src = match pgo_of(r) {
+                    Some(_) => {
+                        let d = work.join(format!("{}.d", names[r]));
+                        std::fs::create_dir_all(&d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
+                        d.join(pgo::STATIC_FILE)
+                    }
+                    None => work.join(format!("{}.c", names[r])),
+                };
                 std::fs::write(&src, &units[r].1).map_err(|e| format!("cannot write {}: {e}", src.display()))?;
                 let pf = pgo_of(r).map(|m| m.unit_flags(&pfile(r))).transpose()?;
                 compile_runtime_ir(spec, &flags, &src, &objs[r], &rt_inl, rt_max, pf.as_deref(), key.as_deref())
@@ -611,7 +630,20 @@ pub fn build(
                 // a compiler that wrote its output in place would change the entry.
                 let _ = std::fs::remove_file(obj);
                 let cxx = is_cxx(name);
-                let src = if cxx { work.join(name) } else { work.join(format!("{name}.c")) };
+                // PGO: a C unit compiles as `<unit>.d/lust.c`, so its static fns' records do not
+                // carry the unit's name (`pgo::STATIC_FILE`).
+                let pgo_dir = (!cxx && pgo_of(i).is_some() && !ll_of.contains_key(units[i].0.as_str())).then(|| work.join(format!("{name}.d")));
+                if let Some(d) = &pgo_dir
+                    && let Err(e) = std::fs::create_dir_all(d)
+                {
+                    errors.lock().unwrap_or_else(|e| e.into_inner()).push_str(&format!("cannot create {}: {e}\n", d.display()));
+                    continue;
+                }
+                let src = match &pgo_dir {
+                    Some(d) => d.join(pgo::STATIC_FILE),
+                    None if cxx => work.join(name),
+                    None => work.join(format!("{name}.c")),
+                };
                 let fail = |msg: String| errors.lock().unwrap_or_else(|e| e.into_inner()).push_str(&msg);
                 if let Err(e) = std::fs::write(&src, c) {
                     fail(format!("cannot write {}: {e}\n", src.display()));
@@ -645,7 +677,7 @@ pub fn build(
                 }
                 match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
                     Some(Ok(pf)) => {
-                        cmd.args(pf).current_dir(work).arg("-c").arg(format!("{name}.c"));
+                        cmd.args(pf).current_dir(pgo_dir.as_deref().unwrap_or(work)).arg("-c").arg(pgo::STATIC_FILE);
                     }
                     Some(Err(e)) => {
                         fail(format!("--- unit {name}: {e}\n"));
@@ -706,7 +738,7 @@ mod tests {
     fn an_llvm_unit_owns_the_records_of_its_ir_fns_and_copies() {
         let c = "void f_aa(void) {\n}\n";
         let ll = "define void @fl_aa(ptr %p) uwtable {\nentry:\n  ret void\n}\ndefine available_externally i64 @fl_bb() {\nentry:\n  ret i64 0\n}\ndefine internal void @k() {\nentry:\n  ret void\n}\n";
-        let text = super::ll_profile_text(c, ll);
+        let text = super::ll_profile_text(c, ll, "");
         assert_eq!(super::pgo::defined_externs(&text), vec!["f_aa", "fl_aa", "fl_bb"]);
     }
 
