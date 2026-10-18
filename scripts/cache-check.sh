@@ -7,9 +7,11 @@
 # warm-check.sh covers cold vs threads vs daemon on one source; this covers the cache and
 # the daemon's reused C across edits (fx-unitcache). Last, 6 sequences of 4 steps through
 # the release driver (with a front image), whose binaries must be byte-identical with and
-# without the cache and whose no-change rebuild must compile nothing.
+# without the cache and whose no-change rebuild must compile nothing. With zig on PATH,
+# the same through zig cc (musl, release C, then the epoch case with LLVM units): zig's
+# own compile cache must not change a binary.
 # Run after scripts/build.sh. Exit 0 = all same, 1 = a difference, 2 = setup error. The
-# last line is the release run's summary; the exit code covers all three runs.
+# last line is the last run's summary; the exit code covers all runs.
 set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 jobs=${1:-$(nproc)}
@@ -22,5 +24,18 @@ drc=$?
 # byte-identical, and a no-change rebuild must compile no unit.
 python3 "$root/scripts/cache_check.py" --seqs "${RELEASE_SEQS:-6}" --steps 4 --seed "${SEED:-1}" --jobs "$jobs" --release --front
 rrc=$?
+# zig keys a compile on its source and args only: the same unit text with another input
+# (a profile, linked bitcode, SOURCE_DATE_EPOCH) must still give its own object.
+zrc=0
+if command -v zig > /dev/null; then
+  python3 "$root/scripts/cache_check.py" --seqs "${ZIG_SEQS:-2}" --steps 3 --seed "${SEED:-1}" --jobs "$jobs" --release --front --zig
+  zc=$?
+  python3 "$root/scripts/cache_check.py" --seqs 0 --jobs "$jobs" --release --front --zig --backend llvm
+  zl=$?
+  zrc=$((zc > zl ? zc : zl))
+else
+  echo "cache-check: no zig on PATH, the zig cache runs are skipped"
+fi
 m=$((rc > drc ? rc : drc))
-exit $((m > rrc ? m : rrc))
+m=$((m > rrc ? m : rrc))
+exit $((m > zrc ? m : zrc))
