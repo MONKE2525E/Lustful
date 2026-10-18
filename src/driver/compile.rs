@@ -5022,6 +5022,20 @@ mod tests {
     use super::*;
     use crate::intern::Known;
 
+    /// The output of a binary just built. libtcc writes it without O_CLOEXEC, so a child
+    /// another test thread spawns meanwhile can hold it open for writing (ETXTBSY): retry
+    /// then, as `patch.rs`'s tests do.
+    fn run_bin(bin: &Path) -> std::process::Output {
+        for _ in 0..100 {
+            match std::process::Command::new(bin).output() {
+                Ok(o) => return o,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(e) => panic!("{}: {e}", bin.display()),
+            }
+        }
+        panic!("{}: still busy", bin.display())
+    }
+
     /// The base sweep never deletes a live owner's base (it may be a live
     /// session's current base, found by fuzz seed 7 multi when a guard
     /// session's first-build sweep deleted the warm session's base), but
@@ -5472,7 +5486,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
         assert_eq!(warm.code, 0, "signature edit: {}", warm.stderr);
         assert_eq!(s.front.ast.stmt_items.len(), 1, "the re-parsed chunk replaced its body items");
         assert_eq!(s.front.fn_slot.len(), 3, "one slot per fn, nested fn included once");
-        let out = std::process::Command::new(dir.join("nest.bin")).output().unwrap();
+        let out = run_bin(&dir.join("nest.bin"));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "2 3\n");
         std::fs::write(
             &file,
@@ -5482,7 +5496,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
         let warm = compile(&build, &mut s);
         assert_eq!(warm.code, 0, "body edit: {}", warm.stderr);
         assert_eq!(s.front.ast.stmt_items.len(), 1, "still one nested fn after the body edit");
-        let out = std::process::Command::new(dir.join("nest.bin")).output().unwrap();
+        let out = run_bin(&dir.join("nest.bin"));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "11 3\n");
         let cold_build = Request { out: dir.join("nest-cold.bin"), ..build };
         let cold = compile(&cold_build, &mut Session::new(dir.join("obj2"), false, key));
@@ -5511,7 +5525,7 @@ fn main() { println!(\"{}\", f0() + 5i64.d()); }
         let r = compile(&build, &mut s);
         assert_eq!(r.code, 0, "build after check: {}", r.stderr);
         assert!(work(&s).0 > 50, "the build checks the std templates: {:?}", work(&s));
-        let out = std::process::Command::new(dir.join("plat.bin")).output().unwrap();
+        let out = run_bin(&dir.join("plat.bin"));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "hi 1\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
