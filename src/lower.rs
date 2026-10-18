@@ -5755,14 +5755,15 @@ impl<'p> Lower<'p> {
                 _ => None,
             };
             h.or(o).or(a).or(bm).or_else(|| {
-                (crate::ty::iter::is_iter(&self.body.tys, ity) || self.body.tys.boxed_slice_elem(ity).is_some() || self.recv_iterable(ity).is_some())
+                (crate::ty::iter::is_iter(&self.body.tys, ity) || self.body.tys.boxed_slice_elem(ity).is_some() || self.body.tys.vec_elem(ity).is_some() || self.recv_iterable(ity).is_some())
                     .then_some(ERROR)
             })
         } {
             // `for x in it` over a builtin iterator (ty/iter.rs): call
             // `next` until it returns None, like the Chars arm. A map or
             // set (or a reference to one) first makes its hash iterator. A
-            // boxed slice by value iterates its `vec::IntoIter` (Rust 2024).
+            // Vec by value, and a boxed slice by value (Rust 2024), iterate
+            // their `vec::IntoIter`.
             let recv = self.recv_iterable(self.ty(iter));
             let (it_ty, it) = match self.body.tys.boxed_slice_elem(self.ty(iter)) {
                 // An array by value (fx-array-iter): first make its
@@ -5809,6 +5810,17 @@ impl<'p> Lower<'p> {
                     self.call_into(CallTarget::Builtin(Builtin::Sync(op)), vec![Operand::Move(Place::local(src))], Place::local(it), span);
                     (it_ty, it)
                 }
+                // A Vec by value: its `vec::IntoIter`, a cursor (not `remove(0)` per item). Its
+                // drop gives the remaining items front to back on `break`, `return` and panic
+                // exits, as rustc's desugaring does.
+                None if let Some(el) = self.body.tys.vec_elem(self.ty(iter)) => {
+                    let v = self.temp(self.ty(iter));
+                    self.expr_into(iter, Some(&Place::local(v)));
+                    let it_ty = crate::ty::iter::mk_iter(&mut self.body.tys, crate::ty::iter::IterKind::VecIntoIter, &[el]);
+                    let it = self.new_local(it_ty, true, None);
+                    self.call_into(CallTarget::Builtin(Builtin::IterVecIntoIter), vec![Operand::Move(Place::local(v))], Place::local(it), span);
+                    (it_ty, it)
+                }
                 Some(el) => {
                     let bx = self.temp(self.ty(iter));
                     self.expr_into(iter, Some(&Place::local(bx)));
@@ -5841,43 +5853,6 @@ impl<'p> Lower<'p> {
             let c = Place::local(nx).project(Proj::Downcast(1)).project(Proj::Field(0));
             let op = self.operand_from(c, item_ty);
             self.assign(Place::local(item), Rvalue::Use(op), span);
-        } else if self.body.tys.vec_elem(self.ty(iter)).is_some() {
-            // `for x in v` by value: move the Vec into a temporary
-            // and remove each front element in turn. Removing (not
-            // indexing) keeps the temporary's own drop exact on
-            // `break`, `return`, and `?` exits from the body: what
-            // is left in it is exactly what still must drop.
-            let vt = self.ty(iter);
-            let it = self.new_local(vt, true, None);
-            self.expr_into(iter, Some(&Place::local(it)));
-            // The Vec drops before the head's temporaries (as above).
-            self.scopes.last_mut().unwrap().push(it);
-            self.goto(head, span);
-            let sref_t = self.ref_ty(false, vt);
-            let sref = self.temp(sref_t);
-            self.assign(Place::local(sref), Rvalue::Ref(false, Place::local(it)), span);
-            let ln = self.temp(USIZE);
-            self.call_into(CallTarget::Builtin(Builtin::VecLen), vec![Operand::Copy(Place::local(sref))], Place::local(ln), span);
-            let c = self.temp(BOOL);
-            self.assign(
-                Place::local(c),
-                Rvalue::Bin(BinOp::Lt, Operand::Const(Const::Int(0, IntTy::Usize)), Operand::Copy(Place::local(ln))),
-                span,
-            );
-            let b = &mut self.body.blocks[self.cur.0 as usize];
-            b.term = Terminator::If(Operand::Copy(Place::local(c)), bodyb, exit);
-            b.term_span = span;
-            self.cur = bodyb;
-            let mref_t = self.ref_ty(true, vt);
-            let mref = self.temp(mref_t);
-            self.assign(Place::local(mref), Rvalue::Ref(true, Place::local(it)), span);
-            let zero = self.const_usize(0, span);
-            self.call_into(
-                CallTarget::Builtin(Builtin::VecRemove),
-                vec![Operand::Move(Place::local(mref)), Operand::Copy(Place::local(zero))],
-                Place::local(item),
-                span,
-            );
         } else {
             // `for x in &v` / `&mut v`: index loop over a reference held for the whole loop.
             // An array by value takes the `array::IntoIter` arm above.
