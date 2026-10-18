@@ -6,13 +6,17 @@
 // `std::env::args().count()`: the runner passes i+1 dummy arguments to run test i. With no extra
 // arguments the binary runs every test in order. A user `main` is renamed in place (same byte
 // length, so every span still matches the user file); `rustc --test` ignores `main` the same way.
+// Tests in inline modules (at any depth) are named by their path (`tests::adds`), as in rustc;
+// the harness reaches them through a `pub(crate)` fn it adds at each module's closing brace,
+// on that line (`harness_shims`). A module file (`mod name;`) is an error: the harness is a copy
+// of this one file and could not read the tests in it.
 //
 // Exit status follows cargo test: 0 when every selected test passes, 101 when the build fails or
 // any test fails or times out, 2 for bad arguments or an unreadable file. A filtered test is
 // never reported as a pass; it is counted in `filtered_out`. A `#[ignore]` test is reported as
 // ignored and never runs. A `#[should_panic]` test passes only when it panics with the
 // expected text, when one is written.
-use crate::ast::{Ast, Attr, AttrInput, Expr, ItemKind, TyExpr};
+use crate::ast::{Ast, Attr, AttrInput, Expr, Item, ItemKind, TyExpr};
 use crate::diag::{self, Diag, FileId, SourceMap};
 use crate::driver::{self, Cmd, Request, SessionKey};
 use crate::intern::{Interner, Known};
@@ -136,9 +140,120 @@ fn millis(start: Instant) -> f64 {
 /// panic text it must contain, or `None` inside for the bare form.
 #[derive(Clone)]
 struct TestCase {
+    /// The path from the crate root (`tests::adds`), as rustc --test names it.
     name: String,
+    /// The inline modules from the crate root to the fn (empty at the root).
+    module: Vec<String>,
+    /// The fn's own name.
+    fn_name: String,
     ignored: bool,
     should_panic: Option<Option<String>>,
+}
+
+/// Finds the `#[test]` fns in `items`, the crate root or an inline module body
+/// whose path is `module`, as rustc --test does: in every inline module, also
+/// nested ones. `mods` gets each inline module that holds a test, with the byte
+/// offset of its closing `}`, where the harness adds the fns that reach the
+/// tests (`harness_shims`). A test lust cannot reach is an error, never a test
+/// that silently does not run.
+fn find_tests(
+    items: &[Item],
+    module: &[String],
+    src: &str,
+    ast: &Ast,
+    interner: &Interner,
+    tests: &mut Vec<TestCase>,
+    mods: &mut Vec<(Vec<String>, usize)>,
+    bad: &mut Vec<Diag>,
+) {
+    for item in items {
+        match &item.kind {
+            ItemKind::Fn(def) if def.is_test => {
+                let fn_name = interner.get(def.name).to_string();
+                let ret_ok = def.ret.is_none_or(|t| matches!(ast.ty(t), TyExpr::Unit));
+                if def.self_param.is_some() || !def.params.is_empty() || !ret_ok {
+                    bad.push(Diag::new(
+                        "L0110",
+                        def.name_span,
+                        format!("test function `{fn_name}` must take no arguments and return `()`"),
+                        format!("Change the signature to `fn {fn_name}() {{ ... }}`."),
+                    ));
+                } else {
+                    let (ignored, should_panic) = harness_attrs(&item.attrs, ast, interner);
+                    let name = module.iter().chain([&fn_name]).cloned().collect::<Vec<_>>().join("::");
+                    tests.push(TestCase { name, module: module.to_vec(), fn_name, ignored, should_panic });
+                }
+            }
+            ItemKind::Impl(imp) => {
+                for def in &imp.fns {
+                    if def.is_test {
+                        bad.push(diag::unsupported(def.name_span, "#[test] functions inside impl blocks"));
+                    }
+                }
+            }
+            ItemKind::Mod(m) => {
+                let mut path = module.to_vec();
+                path.push(interner.get(m.name).to_string());
+                let Some(body) = &m.body else {
+                    // The harness is built from a copy of this one file, so it
+                    // cannot read the module's file or the tests in it.
+                    bad.push(diag::unsupported(m.name_span, "module files (`mod name;`) in `lust test`"));
+                    continue;
+                };
+                let before = tests.len();
+                find_tests(body, &path, src, ast, interner, tests, mods, bad);
+                if tests.len() > before {
+                    // A module a macro wrote has no closing brace of its own in the file.
+                    let close = (m.span.hi as usize).checked_sub(1).filter(|&c| src.as_bytes().get(c) == Some(&b'}'));
+                    match close {
+                        Some(c) if src.get(m.name_span.lo as usize..m.name_span.hi as usize) == Some(interner.get(m.name)) => {
+                            mods.push((path, c))
+                        }
+                        _ => bad.push(diag::unsupported(m.name_span, "#[test] fns in a module that a macro writes, in `lust test`")),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The text the harness adds before the closing `}` of each module in `mods`:
+/// one `pub(crate)` fn per selected test in or under that module, which calls
+/// the test (or the same fn of the child module on the way to it). Test `i`
+/// is `__lust_test_{i}`. A private test fn in a private module is reachable
+/// this way, as rustc's harness reaches it. The text has no newline, so lines
+/// (and panic locations) still match the user file. Returned last offset first,
+/// for in-place insertion.
+fn harness_shims(selected: &[TestCase], mods: &[(Vec<String>, usize)]) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = mods
+        .iter()
+        .filter_map(|(path, close)| {
+            let text: String = selected
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.module.starts_with(path))
+                .map(|(i, t)| {
+                    let target = match t.module.get(path.len()) {
+                        None => t.fn_name.clone(),
+                        Some(child) => format!("{child}::__lust_test_{i}"),
+                    };
+                    format!(" pub(crate) fn __lust_test_{i}() {{ self::{target}() }}")
+                })
+                .collect();
+            (!text.is_empty()).then_some((*close, text))
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out
+}
+
+/// The harness call that runs selected test `i`.
+fn harness_call(i: usize, t: &TestCase) -> String {
+    match t.module.first() {
+        None => t.fn_name.clone(),
+        Some(top) => format!("{top}::__lust_test_{i}"),
+    }
 }
 
 /// The string literal in an attribute input, whichever of the three
@@ -258,38 +373,16 @@ pub fn run(args: &[String]) -> i32 {
     let mut main_span = None;
     let mut bad: Vec<Diag> = Vec::new();
     for item in &ast.items {
-        match &item.kind {
-            ItemKind::Fn(def) => {
-                let name = interner.get(def.name).to_string();
-                if name == "main" {
-                    main_span = Some(def.name_span);
-                }
-                fn_names.push(name.clone());
-                if def.is_test {
-                    let ret_ok = def.ret.is_none_or(|t| matches!(ast.ty(t), TyExpr::Unit));
-                    if def.self_param.is_some() || !def.params.is_empty() || !ret_ok {
-                        bad.push(Diag::new(
-                            "L0110",
-                            def.name_span,
-                            format!("test function `{name}` must take no arguments and return `()`"),
-                            format!("Change the signature to `fn {name}() {{ ... }}`."),
-                        ));
-                    } else {
-                        let (ignored, should_panic) = harness_attrs(&item.attrs, &ast, &interner);
-                        tests.push(TestCase { name, ignored, should_panic });
-                    }
-                }
+        if let ItemKind::Fn(def) = &item.kind {
+            let name = interner.get(def.name).to_string();
+            if name == "main" {
+                main_span = Some(def.name_span);
             }
-            ItemKind::Impl(imp) => {
-                for def in &imp.fns {
-                    if def.is_test {
-                        bad.push(diag::unsupported(def.name_span, "#[test] functions inside impl blocks"));
-                    }
-                }
-            }
-            _ => {}
+            fn_names.push(name);
         }
     }
+    let mut mods: Vec<(Vec<String>, usize)> = Vec::new();
+    find_tests(&ast.items, &[], &src, &ast, &interner, &mut tests, &mut mods, &mut bad);
     if !bad.is_empty() {
         return fail_build(diag::render(&mut bad, &map, &src, opts.json, opts.max_errors), 0);
     }
@@ -363,12 +456,15 @@ pub fn run(args: &[String]) -> i32 {
             .expect("no free name for the user main");
         harness.replace_range(span.lo as usize..span.hi as usize, replacement);
     }
+    for (at, text) in harness_shims(&selected, &mods) {
+        harness.insert_str(at, &text);
+    }
     harness.push_str("\nfn main() {\n    let n = std::env::args().count();\n    if n == 1 {\n");
-    for t in selected.iter().filter(|t| !t.ignored) {
-        harness.push_str(&format!("        {}();\n", t.name));
+    for (i, t) in selected.iter().enumerate().filter(|(_, t)| !t.ignored) {
+        harness.push_str(&format!("        {}();\n", harness_call(i, t)));
     }
     for (i, t) in selected.iter().enumerate() {
-        harness.push_str(&format!("    }} else if n == {} {{\n        {}();\n", i + 2, t.name));
+        harness.push_str(&format!("    }} else if n == {} {{\n        {}();\n", i + 2, harness_call(i, t)));
     }
     harness.push_str("    }\n}\n");
     if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(dir.join("harness.rs"), &harness)) {
