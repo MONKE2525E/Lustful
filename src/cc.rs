@@ -277,6 +277,7 @@ pub fn build(
     let errors = std::sync::Mutex::new(String::new());
     let hits = std::sync::atomic::AtomicUsize::new(0);
     let limit = crate::pool::threads().max(1).min(units.len().max(1));
+    let t_compile = std::time::Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..limit {
             scope.spawn(|| loop {
@@ -320,15 +321,19 @@ pub fn build(
     if !errors.is_empty() {
         return Err(format!("the C compiler failed for target {}:\n{errors}", spec.triple));
     }
+    let compile_s = t_compile.elapsed().as_secs_f64();
+    let t_link = std::time::Instant::now();
     // A build with a C++ unit links with the C++ driver (its runtime and personality).
     let link = if units.iter().any(|(name, _)| is_cxx(name)) { &spec.cxx } else { &spec.cmd };
     let mut cmd = Command::new(&link[0]);
     cmd.args(&link[1..]).args(ldflags(spec, debug)).args(&objs).arg("-o").arg(out);
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(format!(
-            "{} units ({} from cache), linked {}",
+            "{} units ({} from cache, clang {:.2}s, link {:.2}s), linked {}",
             units.len(),
             hits.load(std::sync::atomic::Ordering::Relaxed),
+            compile_s,
+            t_link.elapsed().as_secs_f64(),
             out.display()
         )),
         Ok(o) => Err(format!("link failed for target {} ({})\n{}", spec.triple, o.status, String::from_utf8_lossy(&o.stderr))),

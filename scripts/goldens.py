@@ -8,27 +8,40 @@ lust tsc the same way, timed by the caller, and compare digests.
 Both bins need the lib files next to them (noembed)."""
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tsrust_parity as par
 
+def one(fork, bin_path, work, idx_cmd):
+    # tsc prints its lib dir (the bin's dir) and the project work root
+    # in some outputs; mask both so goldens made on one machine (or at
+    # one work path, or in parallel) compare anywhere. Written files
+    # are hashed by the parity tree digest as-is: their paths in the
+    # digest are relative, and no fixture writes an absolute path into
+    # a file (checked: parallel and serial digests agree, 216/216).
+    idx, (case, src, cmd) = idx_cmd
+    root = work / str(idx)
+    (rc, so, se), tree = par.run_one(cmd, src, root, 600)
+    for token in (str(bin_path.parent).encode(), str(root).encode()):
+        so, se = so.replace(token, b"@P@"), se.replace(token, b"@P@")
+    tag = f"{case} :: {' '.join(cmd[1:])}"
+    return tag, hashlib.sha256(repr(((rc, so, se), tree)).encode()).hexdigest()[:16]
+
+
 def digests(fork, bin_path, work):
-    # tsc prints its lib dir (the bin's dir) in some outputs; mask it
-    # so goldens made on one machine compare on another. Callers still
-    # run both bins from the same relative layout, which keeps the
-    # written-file digests (tree) honest.
-    bindir = str(bin_path.parent).encode()
-    out = {}
+    tasks = []
     for case, src in par.projects(fork):
         for cmd in par.commands(bin_path, case):
-            tag = f"{case} :: {' '.join(cmd[1:])}"
-            (rc, so, se), tree = par.run_one(cmd, src, work, 600)
-            res = (rc, so.replace(bindir, b"@BIN@"), se.replace(bindir, b"@BIN@"))
-            h = hashlib.sha256(repr((res, tree)).encode()).hexdigest()[:16]
-            out[tag] = h
-    return out
+            tasks.append((case, src, cmd))
+    jobs = int(os.environ.get("GOLDENS_JOBS", "8"))
+    if jobs <= 1:
+        return dict(one(fork, bin_path, work, t) for t in enumerate(tasks))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        return dict(ex.map(lambda t: one(fork, bin_path, work, t), enumerate(tasks)))
 
 mode, fork, bin_path, gold = sys.argv[1], Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
 work = Path(sys.argv[5]) if len(sys.argv) > 5 else Path("/tmp/gold-work")
