@@ -4501,18 +4501,23 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
         let built = crate::cc::spec_for(triple).and_then(|spec| {
-            let all: Vec<(String, String)> = [0, 1, 2, 3, LOC_UNIT]
-                .into_iter()
-                .chain(fn_units.iter().copied())
-                .map(|u| {
-                    let c = if u == 0 {
-                        cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize]))
-                    } else {
-                        gen_unit(u, false)
-                    };
-                    (format!("u{u}"), c)
-                })
-                .collect();
+            // Release C (`LUST_RELEASE_C=1`) already holds the content-addressed units.
+            let all: Vec<(String, String)> = if rgroups.is_some() {
+                units.iter().map(|(o, c)| (o.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned()), c.clone())).collect()
+            } else {
+                [0, 1, 2, 3, LOC_UNIT]
+                    .into_iter()
+                    .chain(fn_units.iter().copied())
+                    .map(|u| {
+                        let c = if u == 0 {
+                            cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize]))
+                        } else {
+                            gen_unit(u, false)
+                        };
+                        (format!("u{u}"), c)
+                    })
+                    .collect()
+            };
             if let Some(parent) = req.out.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }
