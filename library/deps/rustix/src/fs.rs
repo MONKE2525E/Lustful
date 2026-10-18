@@ -38,8 +38,17 @@ impl OFlags {
     pub const NONBLOCK: OFlags = OFlags(0o4000);
     pub const DSYNC: OFlags = OFlags(0o10000);
     pub const SYNC: OFlags = OFlags(0o4010000);
+    // O_DIRECTORY and O_NOFOLLOW differ between x86_64 and the
+    // asm-generic arches (aarch64 here); the bits go to openat raw.
+    // Another arch gets neither const, so its use rejects.
+    #[cfg(target_arch = "x86_64")]
     pub const DIRECTORY: OFlags = OFlags(0o200000);
+    #[cfg(target_arch = "aarch64")]
+    pub const DIRECTORY: OFlags = OFlags(0o40000);
+    #[cfg(target_arch = "x86_64")]
     pub const NOFOLLOW: OFlags = OFlags(0o400000);
+    #[cfg(target_arch = "aarch64")]
+    pub const NOFOLLOW: OFlags = OFlags(0o100000);
     pub const CLOEXEC: OFlags = OFlags(0o2000000);
     pub const PATH: OFlags = OFlags(0o10000000);
 
