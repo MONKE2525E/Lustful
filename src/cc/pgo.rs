@@ -176,6 +176,38 @@ fn major_after(text: &str, marker: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("no version after `{}` in: {}", marker.trim(), text.lines().next().unwrap_or("")))
 }
 
+/// The LLVM fns (`fl_<id>`, by id) whose largest counter in the `LUST_PGO_USE` profile is at
+/// least `min`: the callees worth an inline copy (`cgen::ll::ll_inline_set`). None without a
+/// profile to use. It follows the profile alone; `work/pgo-hot.memo` keeps it for the next
+/// build of the same profile (a pinned profile: every merge).
+pub fn hot_ids(work: &Path, min: u64) -> Result<Option<std::collections::HashSet<u64>>, String> {
+    let Some(path) = std::env::var_os("LUST_PGO_USE") else { return Ok(None) };
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", Path::new(&path).display()))?;
+    let key = digest(&[b"hot", &bytes, &min.to_le_bytes()]);
+    let memo = work.join("pgo-hot.memo");
+    if let Some(ids) = std::fs::read_to_string(&memo).ok().and_then(|m| m.strip_prefix(&format!("{key}\n")).map(str::to_string)) {
+        return Ok(Some(ids.lines().filter_map(|l| u64::from_str_radix(l, 16).ok()).collect()));
+    }
+    let (_, records) = parse(&run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(&path))?);
+    let mut ids: Vec<u64> = records
+        .iter()
+        .filter(|(_, rs)| rs.iter().any(|r| max_counter(r) >= min))
+        .filter_map(|(name, _)| name.strip_prefix("fl_").filter(|h| h.len() == 16).and_then(|h| u64::from_str_radix(h, 16).ok()))
+        .collect();
+    ids.sort_unstable();
+    std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
+    let text: String = ids.iter().map(|id| format!("{id:016x}\n")).collect();
+    std::fs::write(&memo, format!("{key}\n{text}")).map_err(|e| format!("cannot write {}: {e}", memo.display()))?;
+    Ok(Some(ids.into_iter().collect()))
+}
+
+/// The largest counter of one text-format record.
+fn max_counter(r: &str) -> u64 {
+    let mut lines = r.lines();
+    let n = lines.by_ref().skip_while(|l| *l != "# Num Counters:").nth(1).and_then(|l| l.trim().parse::<usize>().ok()).unwrap_or(0);
+    lines.skip_while(|l| *l != "# Counter Values:").skip(1).take(n).filter_map(|l| l.trim().parse::<u64>().ok()).max().unwrap_or(0)
+}
+
 fn profdata() -> String {
     std::env::var("LUST_PROFDATA").unwrap_or_else(|_| "llvm-profdata".into())
 }
@@ -563,6 +595,13 @@ mod tests {
 
     /// Two static fns of one source name with different bodies are two records of one name:
     /// the profile keeps both (clang picks the one whose CFG hash matches).
+    #[test]
+    fn a_record_s_largest_counter_is_read() {
+        let r = "fl_00000000000000aa\n# Func Hash:\n12\n# Num Counters:\n3\n# Counter Values:\n5\n70000\n9\n# Num Value Kinds:\n0";
+        assert_eq!(super::max_counter(r), 70000);
+        assert_eq!(super::max_counter("f\n# Func Hash:\n1\n# Num Counters:\n1\n# Counter Values:\n0"), 0);
+    }
+
     #[test]
     fn a_name_keeps_every_record_it_has() {
         let text = format!(":ir\n{}\n\n{}\n", rec("lust.c;h", 3), rec("lust.c;h", 4).replace("\n7\n", "\n8\n"));

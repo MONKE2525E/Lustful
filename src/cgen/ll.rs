@@ -2033,8 +2033,11 @@ fn ll_callee_ids(f: &FnOut) -> impl Iterator<Item = &str> {
 /// `available_externally` copy of each (`ll_unit`) and its helpers (`fn_unit_parts`), so the
 /// optimizer can inline it, as LTO would; its own unit still emits it. `slot_of` maps a fn
 /// id to its slot. The copies come in fn id order (slot order carries a persistent
-/// session's history, and its units are a one-shot build's).
-pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections::HashMap<&str, usize>) -> Vec<usize> {
+/// session's history, and its units are a one-shot build's). With a profile (`hot`: the fns
+/// whose largest counter is at least `LUST_LL_COPY_MIN`, `cc::pgo::hot_ids`) only those are
+/// copied: a copy of a fn the profile saw cold is not inlined, but it costs compile time and
+/// recompiles its unit with every change to the fn.
+pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections::HashMap<&str, usize>, hot: Option<&HashSet<u64>>) -> Vec<usize> {
     static LIMITS: std::sync::OnceLock<(usize, usize, usize, usize, usize, usize)> = std::sync::OnceLock::new();
     let (bytes, depth, hint, tiny, tiny_depth, path) = *LIMITS.get_or_init(|| {
         let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
@@ -2076,7 +2079,7 @@ pub fn ll_inline_set(fns: &[FnOut], slots: &[usize], slot_of: &std::collections:
                 let f = &fns[g];
                 let cost = f.ll_cost as usize;
                 let ok = if level < depth { cost <= limit(f) } else { cost <= tiny || (path > 0 && cost <= limit(f) && sum + cost <= path) };
-                if own.contains(&g) || f.ll.is_empty() || !ok || !seen.insert(g) {
+                if own.contains(&g) || f.ll.is_empty() || !ok || hot.is_some_and(|h| u64::from_str_radix(id, 16).is_ok_and(|n| !h.contains(&n))) || !seen.insert(g) {
                     continue;
                 }
                 picked.push((id, g));

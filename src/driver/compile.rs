@@ -4774,6 +4774,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // helpers' C. `main`'s is always kept (the termination entry calls it).
             let (c_jobs, fn_jobs) = jobs.split_at(5);
             // The C units (the statics unit is the slow one) and the inline sets, together.
+            // With a profile, the copies are of the fns it saw hot (`LUST_LL_COPY_MIN=<count>`,
+            // default 1000; 0: every callee the rule allows).
+            let copy_min: u64 = std::env::var("LUST_LL_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+            let hot = (llvm_on && copy_min > 0).then(|| crate::cc::pgo::hot_ids(&dir.join("cc"), copy_min).ok().flatten()).flatten();
             let first: Vec<usize> = c_jobs.iter().copied().chain(0..rg.len()).collect();
             let mut made = Vec::with_capacity(jobs.len());
             let mut inl: Vec<Vec<usize>> = Vec::with_capacity(rg.len());
@@ -4781,7 +4785,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 if k < c_jobs.len() {
                     Ok(assemble(first[k], &[], None))
                 } else {
-                    Err(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of))
+                    Err(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of, hot.as_ref()))
                 }
             })
             .into_iter()
