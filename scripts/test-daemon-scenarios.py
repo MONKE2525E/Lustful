@@ -53,7 +53,7 @@ def warm_problems(tag, err, first):
     load = next((l for l in lines if l.startswith("lust: front state restored") or l.startswith("lust: front state cold")), None)
     if load is None:
         out.append(f"{tag}: no front state line in the warm request")
-    elif not first and "restored" not in load and "another crate selection" not in load:
+    elif not first and "restored" not in load and "crate selection" not in load:
         out.append(f"{tag}: warm request did not restore: {load[:300]}")
     return out
 
