@@ -2448,8 +2448,16 @@ simple statements in IR and the rest as always_inline C
 helpers cut from cgen's own statement C. A unit is three
 texts (`u<N>.ll`, its helpers' C `u<N>.hc`, its C wrappers
 `u<N>`) that cc.rs compiles as one module and keys as one.
-`LUST_LL_INLINE=<cost>` (default 25) adds `available_externally`
-copies of small callees from other units. `LUST_LL_RTINL=<n>`
+`LUST_LL_INLINE=<cost>` (default 25, three levels) adds
+`available_externally` copies of small callees from other units;
+with a profile, only of callees it ran at least
+`LUST_LL_COPY_MIN` times (default 100000): a cold copy is not
+inlined and recompiles its unit with every change to the callee.
+C calls an LLVM fn through its C ABI wrapper `f_<id>`; a unit
+keeps the external wrapper (and the trampoline `tramp_<id>`)
+only when some C text names it, and a C text that calls it gets
+the wrapper as a C99 inline definition, so the call goes straight
+to `fl_<id>` (`cgen::ll::CRefs`, `cgen::ll::Adapters`). `LUST_LL_RTINL=<n>`
 (off by default) compiles the runtime unit through IR and links
 an `available_externally` copy of its fns of up to n
 instructions into each LLVM unit (cc/rtinl.rs). Tests: difftest LL=1,
