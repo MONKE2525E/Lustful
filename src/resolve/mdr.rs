@@ -371,6 +371,26 @@ impl<'t> Answers<'t> {
         }
     }
 
+    /// Computes on the pool the key answers that the reads of `deps` (with
+    /// structure hash `structure`) need and this memo lacks: each answer is a
+    /// pure function of the frozen tables, and a full resolve's chunk checks
+    /// (`still_valid`) read hundreds of thousands of keys, tens of thousands
+    /// of them distinct. Each run of keys has a memo of its own.
+    pub fn prefill<'d>(&mut self, deps: impl Iterator<Item = &'d ChunkDeps>, structure: u64) {
+        let mut keys: Vec<(u32, u8, Sym)> =
+            deps.filter(|d| d.structure == structure).flat_map(|d| d.reads.keys.iter().copied()).filter(|k| !self.keys.contains_key(k)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let t = self.t;
+        let runs: Vec<&[(u32, u8, Sym)]> = keys.chunks(512).collect();
+        for part in crate::pool::par_map(&runs, |run| {
+            let mut a = Answers::new(t);
+            run.iter().map(|&k| (k, a.key(k))).collect::<Vec<_>>()
+        }) {
+            self.keys.extend(part);
+        }
+    }
+
     /// The hash of one (module, namespace, name) answer: the binding (or its
     /// absence) with the def record of its target, and the key's ambiguity,
     /// glob source, std alias and order entries. A rewrite that looked the

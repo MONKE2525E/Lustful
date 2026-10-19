@@ -3756,8 +3756,18 @@ fn resolve_one(
     });
     lap!("resolve: names+structure");
     let mut answers = crate::resolve::mdr::Answers::new(tables);
-    // The hit decisions share one answer memo, so they run in order; the
-    // chunks they take are copied out in parallel.
+    // The hit decisions share one answer memo, so they run in order, after
+    // the answers they read are computed on the pool; the chunks they take
+    // are copied out in parallel.
+    if let Some(s) = structure {
+        answers.prefill(
+            works.iter().filter_map(|w| {
+                let c = cache.peek(&w.key, w.text_hash, w.file_id)?.final_chunk.as_ref()?;
+                (c.exp_hash == w.exp_hash).then_some(c.deps.as_ref()?)
+            }),
+            s,
+        );
+    }
     let mut hit_refs: Vec<Option<&FinalChunk>> = Vec::with_capacity(works.len());
     for w in works.iter() {
         let hit = cache.peek(&w.key, w.text_hash, w.file_id).and_then(|e| e.final_chunk.as_ref()).filter(|c| {
