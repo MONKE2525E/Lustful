@@ -41,7 +41,7 @@ use crate::check::collect::Program;
 use crate::check::generics::{CaptureShape, FnClass, OwnedArg, OwnedClosure, OwnedTy};
 use crate::check::picks::TraitPick;
 use crate::def::{DefId, LocalDefId};
-use crate::driver::graph::{Read, ReadKey, Reads};
+use crate::driver::graph::{Read, ReadKey, ReadKeys, Reads};
 use crate::intern::{FxHasher, FxMap};
 use std::hash::{Hash, Hasher};
 
@@ -250,7 +250,7 @@ impl GenReuse {
     /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part
     /// (0 templates, 1 closure templates, 2 discovery, 3 unstored, 4 held, 5 memo, 6 template
     /// and closure outputs, 7 readers index; 8 the discovery entries' read sets, 9 their
-    /// outputs).
+    /// outputs, 10 the read keys).
     pub(crate) fn drop_part(&mut self, part: usize) {
         use std::mem::take;
         match part {
@@ -273,6 +273,7 @@ impl GenReuse {
                 drop(take(&mut e.closures));
                 drop(take(&mut e.vtables));
             }),
+            10 => drop(take(&mut self.keys)),
             _ => {}
         }
     }
@@ -296,6 +297,9 @@ pub struct GenReuse {
     /// This request's item-level environment (item-scan hash and AST fn
     /// count), set by the driver before collect.
     pub env: u64,
+    /// The read keys the frozen read sets of these entries name
+    /// (`Reads::freeze`); `clear` drops them with the entries.
+    keys: ReadKeys,
     templates: FxMap<DefId, TemplateEntry>,
     /// The last clean check of each template with closures, if its last
     /// check was clean (`store_closure_template`).
@@ -374,6 +378,7 @@ enum ReaderKey {
 impl GenReuse {
     /// Drops every entry: the trait system they were made under changed.
     pub fn clear(&mut self) {
+        self.keys = ReadKeys::default();
         self.templates.clear();
         self.closure_templates.clear();
         self.discovery.clear();
@@ -448,7 +453,10 @@ impl GenReuse {
         self.keep_held(p.def_id(f));
         let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
         let copy = OutCopy { adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec(), vtables: vtables.to_vec() };
-        let pending = pending.filter(|_| self.on).and_then(|r| Some((self.src_of(p, f)?, with_own_sig(p, f, r))));
+        let pending = match pending.filter(|_| self.on) {
+            Some(r) => self.src_of(p, f).map(|src| (src, with_own_sig(p, f, r, &mut self.keys))),
+            None => None,
+        };
         self.unstored.insert(p.def_id(f), (next_stamp(), copy, pending));
     }
 
@@ -459,8 +467,8 @@ impl GenReuse {
             Some((_, _, None)) => "no reads".into(),
             Some((_, _, Some((src, _)))) if self.src_of(p, f) != Some(*src) => "source".into(),
             Some((_, _, Some((_, reads)))) => {
-                let moved = reads.iter().filter(|(k, _)| touched(k)).count();
-                let differ = reads.iter().find(|(k, stored)| touched(k) && p.read_fingerprint(k) != **stored);
+                let moved = reads.iter(&self.keys).filter(|(k, _)| touched(k)).count();
+                let differ = reads.iter(&self.keys).find(|(k, stored)| touched(k) && p.read_fingerprint(k) != *stored);
                 format!("{moved} moved reads, differs: {}", differ.map_or("none".into(), |(k, _)| format!("{k:?}")))
             }
         }
@@ -477,7 +485,7 @@ impl GenReuse {
             return false;
         }
         let memo = &mut self.memo;
-        reads.iter().all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored)
+        reads.iter(&self.keys).all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == stored)
     }
 
     /// Drops every entry when the trait-system key moved since the last
@@ -691,8 +699,8 @@ impl GenReuse {
 
     /// True when an entry made under `env` with `reads` still holds in
     /// this program: same environment, or every read answers the same.
-    fn reads_hold(memo: &mut FxMap<ReadKey, Read>, this_env: u64, p: &Program, env: u64, reads: &Reads) -> bool {
-        env == this_env || p.reads_dirty_memo(reads, memo) == 0
+    fn reads_hold(memo: &mut FxMap<ReadKey, Read>, this_env: u64, p: &Program, env: u64, reads: &Reads, keys: &ReadKeys) -> bool {
+        env == this_env || p.reads_dirty_memo(reads, keys, memo) == 0
     }
 
     /// The stored picks and closure call kinds of template `t`, rebased
@@ -705,7 +713,7 @@ impl GenReuse {
         let src = self.src_of(p, t)?;
         let (lo, hi) = p.fn_def(t).exprs;
         let e = self.templates.get_mut(&p.def_id(t))?;
-        if e.src != src || e.n_exprs != hi - lo || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
+        if e.src != src || e.n_exprs != hi - lo || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys) {
             return None;
         }
         e.env = self.env;
@@ -729,7 +737,7 @@ impl GenReuse {
         }
         let picks = picks.iter().map(|&(e, pick)| (e.0 - lo, pick)).collect();
         let calls = calls.iter().map(|&(e, k)| (e.0 - lo, k)).collect();
-        let entry = TemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads), n_exprs: hi - lo, picks, calls };
+        let entry = TemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads, &mut self.keys), n_exprs: hi - lo, picks, calls };
         self.index_reads(p, p.def_id(t), &entry.reads);
         self.templates.insert(p.def_id(t), entry);
     }
@@ -745,7 +753,7 @@ impl GenReuse {
             return;
         };
         let (lo, hi) = p.fn_def(t).exprs;
-        let entry = ClosureTemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads), n_exprs: hi - lo, out: None };
+        let entry = ClosureTemplateEntry { src, env: self.env, stamp: next_stamp(), reads: with_own_sig(p, t, reads, &mut self.keys), n_exprs: hi - lo, out: None };
         self.closure_templates.insert(def, entry);
     }
 
@@ -791,10 +799,10 @@ impl GenReuse {
         let (lo, hi) = p.fn_def(t).exprs;
         let e = self.closure_templates.get_mut(&p.def_id(t))?;
         let out = e.out.as_ref()?;
-        if e.src != src || e.n_exprs != hi - lo || e.reads.keys().any(|k| matches!(k, ReadKey::Checked(_))) {
+        if e.src != src || e.n_exprs != hi - lo || e.reads.keys(&self.keys).any(|k| matches!(k, ReadKey::Checked(_))) {
             return None;
         }
-        if !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
+        if !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys) {
             return None;
         }
         e.env = self.env;
@@ -821,7 +829,7 @@ impl GenReuse {
         let e = self.closure_templates.get(&p.def_id(t))?;
         let src = self.src_of(p, t)?;
         let (a, b) = p.fn_def(t).exprs;
-        if !self.on || e.stamp > lo || e.reads.keys().any(|k| matches!(k, ReadKey::Checked(_))) {
+        if !self.on || e.stamp > lo || e.reads.keys(&self.keys).any(|k| matches!(k, ReadKey::Checked(_))) {
             return None;
         }
         if e.src != src || e.n_exprs != b - a {
@@ -830,8 +838,8 @@ impl GenReuse {
         let memo = &mut self.memo;
         let mut same = |k: &ReadKey, stored: &Read| *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored;
         Some(match moves {
-            Some(moves) => e.reads.iter().all(|(k, stored)| !moves(k) || same(k, stored)),
-            None => e.reads.iter().all(|(k, stored)| same(k, stored)),
+            Some(moves) => e.reads.iter(&self.keys).all(|(k, stored)| !moves(k) || same(k, &stored)),
+            None => e.reads.iter(&self.keys).all(|(k, stored)| same(k, &stored)),
         })
     }
 
@@ -847,15 +855,15 @@ impl GenReuse {
         let src = self.src_of(p, t)?;
         let (lo, hi) = p.fn_def(t).exprs;
         let e = self.templates.get(&p.def_id(t))?;
-        Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads))
+        Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys))
     }
 
     /// The read keys of every stored template check, those of templates
     /// with closures included (the derive delta
     /// fingerprints the moved ones at once before its replay).
     pub(crate) fn template_read_keys(&self) -> impl Iterator<Item = &ReadKey> {
-        let closures = self.closure_templates.values().flat_map(|e| e.reads.iter().map(|(k, _)| k));
-        self.templates.values().flat_map(|e| e.reads.iter().map(|(k, _)| k)).chain(closures)
+        let closures = self.closure_templates.values().flat_map(|e| e.reads.keys(&self.keys));
+        self.templates.values().flat_map(|e| e.reads.keys(&self.keys)).chain(closures)
     }
 
     /// True when template `t` has a stored plain check (a log line).
@@ -872,7 +880,7 @@ impl GenReuse {
         let (lo, hi) = p.fn_def(t).exprs;
         let e = self.templates.get(&p.def_id(t))?;
         let memo = &mut self.memo;
-        let clean = e.reads.iter().all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored);
+        let clean = e.reads.iter(&self.keys).all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == stored);
         Some(self.on && e.src == src && e.n_exprs == hi - lo && clean)
     }
 
@@ -908,7 +916,7 @@ impl GenReuse {
             (None, Some(e)) if e.src == src => &e.reads,
             _ => return false,
         };
-        !reads.iter().any(|(k, _)| touched(k))
+        !reads.iter(&self.keys).any(|(k, _)| touched(k))
     }
 
     /// `untouched` for a header delta, through the reverse index: `readers`
@@ -944,9 +952,9 @@ impl GenReuse {
     /// from the live entries once stale keys outnumber them, before the new
     /// keys go in (the caller stores the entry after this).
     fn index_reads(&mut self, p: &Program, def: DefId, reads: &Reads) {
-        let push = |index: &mut FxMap<ReaderKey, Vec<DefId>>, def: DefId, reads: &Reads| {
+        let push = |index: &mut FxMap<ReaderKey, Vec<DefId>>, keys: &ReadKeys, def: DefId, reads: &Reads| {
             let mut n = 0;
-            for (k, _) in reads.iter() {
+            for (k, _) in reads.iter(keys) {
                 let mut add = |key| {
                     index.entry(key).or_default().push(def);
                     n += 1;
@@ -976,10 +984,10 @@ impl GenReuse {
         if self.readers_pushed > 64 * live.max(64) {
             let mut index = FxMap::default();
             let entries = self.templates.iter().map(|(d, e)| (*d, &e.reads)).chain(self.discovery.iter().map(|(d, e)| (*d, &e.reads)));
-            let pushed: usize = entries.map(|(d, r)| push(&mut index, d, r)).sum();
+            let pushed: usize = entries.map(|(d, r)| push(&mut index, &self.keys, d, r)).sum();
             (self.readers_index, self.readers_pushed) = (index, pushed);
         }
-        self.readers_pushed += push(&mut self.readers_index, def, reads);
+        self.readers_pushed += push(&mut self.readers_index, &self.keys, def, reads);
     }
 
     /// True when fn `f` has a stored discovery output made from its current
@@ -1003,7 +1011,7 @@ impl GenReuse {
         }
         let (Some(src), Some(e)) = (self.src_of(p, f), self.discovery.get(&def)) else { return false };
         let memo = &mut self.memo;
-        e.src == src && e.reads.iter().all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == *stored)
+        e.src == src && e.reads.iter(&self.keys).all(|(k, stored)| !moves(k) || *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) == stored)
     }
 
     /// The stored discovery output of fn `f`, if it still holds. Not when
@@ -1017,7 +1025,7 @@ impl GenReuse {
         }
         let src = self.src_of(p, f)?;
         let e = self.discovery.get_mut(&p.def_id(f))?;
-        if e.src != src || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads) {
+        if e.src != src || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys) {
             return None;
         }
         let mut requests = Vec::with_capacity(e.requests.len());
@@ -1035,7 +1043,7 @@ impl GenReuse {
     /// evaluation ran. The driver's const fn edit asks (compile.rs).
     pub(crate) fn reads_checked(&self, defs: &[DefId]) -> bool {
         let stored = self.templates.values().map(|e| &e.reads).chain(self.discovery.values().map(|e| &e.reads));
-        stored.into_iter().any(|r| defs.iter().any(|&d| r.contains(&ReadKey::Checked(d))))
+        stored.into_iter().any(|r| defs.iter().any(|&d| r.contains(&self.keys, &ReadKey::Checked(d))))
     }
 
     /// A copy of the last discovery output of the fn with def `def`, the
@@ -1068,7 +1076,7 @@ impl GenReuse {
         let Some(src) = self.src_of(p, f) else { return };
         self.keep_held(p.def_id(f));
         let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
-        let reads = with_own_sig(p, f, reads);
+        let reads = with_own_sig(p, f, reads, &mut self.keys);
         let entry = DiscoveryEntry {
             src,
             env: self.env,
@@ -1203,10 +1211,10 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool, DefId)>) 
 /// the compat `FnInfo` path, which records nothing, and its field
 /// accesses record nothing either. The driver adds the same read to
 /// each slot's stored set. Frozen: every caller stores it.
-fn with_own_sig(p: &Program, f: LocalDefId, reads: &Reads) -> Reads {
+fn with_own_sig(p: &Program, f: LocalDefId, reads: &Reads, keys: &mut ReadKeys) -> Reads {
     let mut reads = reads.clone();
     let _ = p.sig_of(&mut reads, p.def_id(f));
-    reads.freeze();
+    reads.freeze(keys);
     reads
 }
 

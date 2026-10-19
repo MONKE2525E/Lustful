@@ -114,6 +114,7 @@ pub(super) fn apply_derives(
         let out = caches.read_index.dirty_slots(
             prog,
             &mut caches.slot_reads,
+            &caches.read_keys,
             &quick,
             &mut |k| {
                 if !logging {

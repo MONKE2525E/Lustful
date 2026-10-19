@@ -780,14 +780,14 @@ fn dep_macros_shut(front: &Front, tables: &crate::resolve::imports::ResolvedTabl
 /// edit) go in parallel: the distinct keys split into one shard per
 /// thread by key hash, each shard computes its keys' fingerprints once,
 /// then each set compares against them. Few stay on this thread.
-fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::Reads>]) -> Vec<Option<usize>> {
+fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::Reads>], keys: &crate::driver::graph::ReadKeys) -> Vec<Option<usize>> {
     use crate::driver::graph::{Read, ReadKey};
     use std::hash::{Hash, Hasher};
     let total: usize = sets.iter().flatten().map(|r| r.len()).sum();
     let n = crate::pool::threads();
     if total < 4096 || n < 2 {
         let mut memo = FxMap::default();
-        return sets.iter().map(|r| r.map(|r| p.reads_dirty_memo(r, &mut memo))).collect();
+        return sets.iter().map(|r| r.map(|r| p.reads_dirty_memo(r, keys, &mut memo))).collect();
     }
     let shard_of = |k: &ReadKey| {
         let mut h = crate::intern::FxHasher::default();
@@ -800,7 +800,7 @@ fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::R
     let buckets: Vec<Vec<Vec<&ReadKey>>> = par_map(&parts, |part| {
         let mut b: Vec<Vec<&ReadKey>> = vec![Vec::new(); n];
         for r in part.iter().flatten() {
-            for (k, _) in r.iter() {
+            for (k, _) in r.iter(keys) {
                 b[shard_of(k)].push(k);
             }
         }
@@ -814,7 +814,7 @@ fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::R
         }
         now
     });
-    par_map(sets, |r| r.map(|r| r.iter().filter(|(k, stored)| shards[shard_of(k)].get(*k) != Some(*stored)).count()))
+    par_map(sets, |r| r.map(|r| r.iter(keys).filter(|(k, stored)| shards[shard_of(k)].get(*k) != Some(stored)).count()))
 }
 
 static NEXT_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -863,7 +863,7 @@ fn keyed_dirty(
     let def_slot = |d: def::DefId| p.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
     // `moved` is a pure test: every key takes it on all cores.
     let quick = |k: &crate::driver::graph::ReadKey| Some(moved(k));
-    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &quick, &mut |k| moved(k), &def_slot, answers);
+    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &caches.read_keys, &quick, &mut |k| moved(k), &def_slot, answers);
     caches.slot_reads.iter().zip(dirty).map(|(r, d)| r.as_ref().filter(|r| r.verified[mode] == base).map(|_| d)).collect()
 }
 
@@ -2222,7 +2222,7 @@ fn resolved_setup(
             if !const_fn && !p.const_edits.is_empty() {
                 let defs = local_def_ids(front, &p.const_edits);
                 let read = |r: &Option<crate::driver::graph::Reads>| {
-                    r.as_ref().is_some_and(|r| defs.iter().any(|&d| r.contains(&crate::driver::graph::ReadKey::Checked(d))))
+                    r.as_ref().is_some_and(|r| defs.iter().any(|&d| r.contains(&caches.read_keys, &crate::driver::graph::ReadKey::Checked(d))))
                 };
                 const_fn = caches.slot_reads.iter().any(read) || caches.gen_reuse.reads_checked(&defs);
             }
@@ -3890,7 +3890,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     };
     let keyed_clean = |caches: &Caches, s: usize, memo: &mut FxMap<_, _>, i: usize| {
         let clean = keyed.as_ref().is_some_and(|k| k.get(s) == Some(&Some(false)));
-        if clean && super::item_oracle::on() && caches.slot_reads[s].as_ref().is_some_and(|r| program.reads_dirty_memo(r, memo) != 0) {
+        if clean && super::item_oracle::on() && caches.slot_reads[s].as_ref().is_some_and(|r| program.reads_dirty_memo(r, &caches.read_keys, memo) != 0) {
             super::item_oracle::fail("keyed clean body has dirty reads", visits.path, &i.to_string());
         }
         clean
@@ -3915,7 +3915,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // no stored reads), with the read sets borrowed in place; then
         // the results land back in the caches.
         let sets: Vec<_> = mention_only.iter().map(|&i| caches.slot_reads.get(slot_at(i)).and_then(Option::as_ref)).collect();
-        let dirty = reads_dirty_par(&program, &sets);
+        let dirty = reads_dirty_par(&program, &sets, &caches.read_keys);
         // A mask, not a list: full mode makes every passing body a
         // candidate, and `changed` holds them all.
         let mut reused = vec![false; mention_only.iter().max().map_or(0, |&m| m + 1)];
@@ -4120,7 +4120,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 // (the oracle proves each clean one).
                 let mut clean = |r: &crate::driver::graph::Reads, d: &Vec<bool>| {
                     let clean = !d.get(s).copied().unwrap_or(true);
-                    if clean && super::item_oracle::on() && program.reads_dirty_memo(r, memo) != 0 {
+                    if clean && super::item_oracle::on() && program.reads_dirty_memo(r, &caches.read_keys, memo) != 0 {
                         super::item_oracle::fail("clean instance body has dirty reads", visits.path, &i.to_string());
                     }
                     clean
@@ -4147,7 +4147,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             recheck_of[i] = recheck;
         }
         let sets: Vec<_> = by_reads.iter().map(|&i| caches.slot_reads[front.fn_slot[i] as usize].as_ref()).collect();
-        for (&i, d) in by_reads.iter().zip(reads_dirty_par(&program, &sets)) {
+        for (&i, d) in by_reads.iter().zip(reads_dirty_par(&program, &sets, &caches.read_keys)) {
             recheck_of[i] = d != Some(0);
             if !recheck_of[i] {
                 front.slot_env[front.fn_slot[i] as usize] = env;
@@ -4253,7 +4253,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         {
             let mut stored = body.reads.clone();
             let _ = program.sig_of(&mut stored, program.def_id(LocalDefId(i as u32)));
-            stored.freeze();
+            stored.freeze(&mut caches.read_keys);
             stored.verified[mode_at] = verified;
             caches.slot_reads[slot(i)] = Some(stored);
         }
@@ -4263,7 +4263,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // where their bodies were just checked (sigedit P3.2): the first
     // request of a daemon builds it, so no edit request pays for that.
     if caches.persistent && !work.is_empty() {
-        caches.read_index.sync(&mut caches.slot_reads);
+        caches.read_index.sync(&mut caches.slot_reads, &caches.read_keys);
     }
     // rustc stops before monomorphization once a pre-mono check fails, so an
     // instance checked over an erroneous caller (an error-typed closure argument)
@@ -4434,13 +4434,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         if !noted.is_empty()
             && let Some(Some(r)) = caches.slot_reads.get_mut(slot(*i))
         {
+            r.thaw(&caches.read_keys);
             check::derive_delta::record(&program, r, noted);
-            r.freeze();
+            r.freeze(&mut caches.read_keys);
             cg_reads = true;
         }
     }
     if cg_reads {
-        caches.read_index.sync(&mut caches.slot_reads);
+        caches.read_index.sync(&mut caches.slot_reads, &caches.read_keys);
     }
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);

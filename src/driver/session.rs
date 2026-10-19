@@ -271,6 +271,9 @@ pub(crate) struct Caches {
     /// The reverse index over `slot_reads` the keyed dirty walk reads
     /// (driver/graph.rs `ReadIndex`; sigedit P3.2).
     pub(crate) read_index: crate::driver::graph::ReadIndex,
+    /// The read keys the frozen sets in `slot_reads` name (`Reads::freeze`):
+    /// as long-lived as those sets.
+    pub(crate) read_keys: crate::driver::graph::ReadKeys,
     /// This request's derive delta's keyed dirty walk (driver/kept_derive.rs):
     /// by slot, whether a stored read moved. Taken by the compile tail.
     pub(crate) derive_dirty: Option<Vec<bool>>,
@@ -481,6 +484,7 @@ impl Session {
                 has_out: Vec::new(),
                 slot_reads: Vec::new(),
                 read_index: Default::default(),
+                read_keys: Default::default(),
                 derive_dirty: None,
                 derive_only: false,
                 header_moves: None,

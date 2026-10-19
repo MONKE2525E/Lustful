@@ -10759,7 +10759,7 @@ pub(crate) fn template_body(p: &Program, t: LocalDefId, closure_fns: &[LocalDefI
             e.extend(crate::borrowck::borrowck(p, &body));
             for &cf in closure_fns {
                 let (cc, _) = crate::check::check_fn(p, cf);
-                cc.reads.iter().for_each(|(k, r)| reads.record(*k, r.fingerprint, r.failed));
+                cc.reads.iter(crate::driver::graph::ReadKeys::none()).for_each(|(k, r)| reads.record(*k, r.fingerprint, r.failed));
                 let cbody = crate::lower::lower(p, cf, cc);
                 e.extend(crate::borrowck::borrowck(p, &cbody));
             }

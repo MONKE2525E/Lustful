@@ -427,11 +427,11 @@ fn dirty_check(
             Some(reads) => {
                 // A `Checked` read names a body: dirty when that body checks again.
                 let dirty: Vec<String> = reads
-                    .iter()
+                    .iter(&caches.read_keys)
                     .filter(|(k, stored)| match k {
                         ReadKey::Checked(d) => warm.local_def(d.hash).is_some_and(|l| checked.get(l.0 as usize).copied().unwrap_or(false)),
-                        ReadKey::Binding(b) if cold_p.read_fingerprint(k) != **stored => !pattern_read(cold_p, front, i, b),
-                        _ => cold_p.read_fingerprint(k) != **stored,
+                        ReadKey::Binding(b) if cold_p.read_fingerprint(k) != *stored => !pattern_read(cold_p, front, i, b),
+                        _ => cold_p.read_fingerprint(k) != *stored,
                     })
                     .map(|(k, stored)| format!("{k:?} stored {:?} now {:?}", stored, cold_p.read_fingerprint(k)))
                     .take(3)

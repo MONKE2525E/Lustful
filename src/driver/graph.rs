@@ -245,6 +245,67 @@ pub struct Read {
     pub failed: bool,
 }
 
+/// Every read key one owner's stored read sets name, each once: a frozen
+/// set (`Reads::freeze`) names its keys by index here, 4 bytes for a
+/// 48-byte key. Keys are never removed, so a table lives as long as the
+/// sets that name it: `Caches::read_keys` (the slot read sets) and
+/// `GenReuse`'s own (its entries).
+#[derive(Debug)]
+pub(crate) struct ReadKeys {
+    /// This table's identity: a frozen set keeps it, and a read with
+    /// another table fails closed (see `Reads::check_table`).
+    id: u64,
+    keys: Vec<ReadKey>,
+    ids: FxMap<ReadKey, u32>,
+}
+
+impl Default for ReadKeys {
+    fn default() -> ReadKeys {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Unique across processes too: a front image restores tables made
+        // by earlier processes beside new ones.
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let id = t ^ (std::process::id() as u64).rotate_left(40) ^ NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed).rotate_left(20);
+        ReadKeys { id: id | 1, keys: Vec::new(), ids: FxMap::default() }
+    }
+}
+
+impl ReadKeys {
+    /// The index of `key`, added when new.
+    fn index(&mut self, key: ReadKey) -> u32 {
+        match self.ids.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let i = self.keys.len() as u32;
+                self.keys.push(key);
+                *v.insert(i)
+            }
+        }
+    }
+
+    /// How many keys the table holds.
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The table for a set that is never frozen (a sink, or a set stored
+    /// outside the tables: `Program::const_body_reads`): it holds no keys,
+    /// so a frozen set read with it fails closed.
+    pub(crate) fn none() -> &'static ReadKeys {
+        static NONE: std::sync::OnceLock<ReadKeys> = std::sync::OnceLock::new();
+        NONE.get_or_init(ReadKeys::default)
+    }
+}
+
+/// One read of a frozen set: its key's index in the set's `ReadKeys`, and
+/// the read (16 bytes, where a hash table entry took ~100).
+#[derive(Clone, Copy, Debug)]
+struct FrozenRead {
+    key: u32,
+    failed: bool,
+    fingerprint: Fingerprint,
+}
+
 /// The read sink one stage run collects into (section 8.2). One sink per
 /// checked body today; collect and mono get their own when their queries
 /// land. Recording the same key twice in one run is a no-op: query answers
@@ -252,11 +313,12 @@ pub struct Read {
 #[derive(Clone, Debug, Default)]
 pub struct Reads {
     map: FxMap<ReadKey, Read>,
-    /// A stored set's reads (`freeze`), sorted by key, with `map` empty: a
-    /// set that is done recording keeps no hash table, which cost more than
-    /// its entries (the image keeps ~1 GB of read sets). A new record moves
-    /// them back into `map`.
-    frozen: Box<[(ReadKey, Read)]>,
+    /// A stored set's reads (`freeze`), sorted by key index, with `map`
+    /// empty: a set that is done recording keeps no hash table and no keys
+    /// of its own (the image keeps ~1 GB of read sets).
+    frozen: Box<[FrozenRead]>,
+    /// The `ReadKeys::id` of the table `frozen` indexes, or 0.
+    table: u64,
     /// Set for a sink whose reads nobody will replay (a one-shot process
     /// exits after this compile): it records nothing and computes no
     /// fingerprints.
@@ -290,13 +352,14 @@ impl Reads {
 
     /// Records one read, computing the fingerprint only if the key is new:
     /// a body that asks the same question a hundred times pays for the
-    /// fingerprint once.
+    /// fingerprint once. Into a frozen set (with no table here to look up
+    /// its keys) the read joins `map` even when the frozen part holds the
+    /// key: readers then see that key twice, and a walk that compares both
+    /// rechecks at worst. The driver thaws a stored set before it records
+    /// into it (`thaw`).
     pub fn record_with(&mut self, key: ReadKey, failed: bool, fingerprint: impl FnOnce() -> Fingerprint) {
         if self.off {
             return;
-        }
-        if !self.frozen.is_empty() {
-            self.map.extend(std::mem::take(&mut self.frozen).into_vec());
         }
         if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
             v.insert(Read { fingerprint: fingerprint(), failed });
@@ -304,15 +367,45 @@ impl Reads {
         }
     }
 
-    /// Ends recording for a set that is stored (`frozen`): the same reads,
-    /// with no hash table. Every reader below sees no difference.
-    pub fn freeze(&mut self) {
-        if !self.map.is_empty() {
-            let mut all = std::mem::take(&mut self.frozen).into_vec();
-            all.extend(std::mem::take(&mut self.map));
-            all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            self.frozen = all.into_boxed_slice();
+    /// Ends recording for a set that is stored: its reads move into
+    /// `frozen`, their keys into `keys`. Every reader sees the same reads.
+    pub(crate) fn freeze(&mut self, keys: &mut ReadKeys) {
+        if self.map.is_empty() {
+            return;
         }
+        let mut all = self.thawed(keys);
+        all.extend(std::mem::take(&mut self.map));
+        let mut frozen: Vec<FrozenRead> =
+            all.into_iter().map(|(k, r)| FrozenRead { key: keys.index(k), failed: r.failed, fingerprint: r.fingerprint }).collect();
+        // Stable: of a key recorded twice (into a frozen set), the first
+        // record stays.
+        frozen.sort_by_key(|f| f.key);
+        frozen.dedup_by_key(|f| f.key);
+        self.frozen = frozen.into_boxed_slice();
+        self.table = keys.id;
+    }
+
+    /// Moves a frozen set's reads back into `map`, for a record into a
+    /// stored set (freeze it again after).
+    pub(crate) fn thaw(&mut self, keys: &ReadKeys) {
+        // A frozen read is older than any read the map took since: it wins.
+        let back = self.thawed(keys);
+        self.map.extend(back);
+    }
+
+    /// Takes the frozen reads out as (key, read) pairs, in index order.
+    fn thawed(&mut self, keys: &ReadKeys) -> Vec<(ReadKey, Read)> {
+        self.check_table(keys);
+        let out = self.frozen.iter().map(|f| (keys.keys[f.key as usize], Read { fingerprint: f.fingerprint, failed: f.failed })).collect();
+        self.frozen = Box::default();
+        self.table = 0;
+        out
+    }
+
+    /// A frozen set read with a table other than its own would answer with
+    /// other keys: fail closed.
+    fn check_table(&self, keys: &ReadKeys) {
+        assert!(self.frozen.is_empty() || self.table == keys.id, "a frozen read set was read with another ReadKeys table");
     }
 
     /// Records a call edge to a checked body whose *body* (not only its
@@ -328,21 +421,29 @@ impl Reads {
     }
 
     /// The read recorded for a key, if this run read that node (the keyed
-    /// walk's compare, `ReadIndex::dirty_slots`).
-    pub fn get(&self, key: &ReadKey) -> Option<Read> {
-        match self.map.get(key) {
-            Some(r) => Some(*r),
-            None => self.frozen.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| self.frozen[i].1),
+    /// walk's compare, `ReadIndex::dirty_slots`). The frozen part first: the
+    /// first record of a key wins.
+    pub(crate) fn get(&self, keys: &ReadKeys, key: &ReadKey) -> Option<Read> {
+        self.check_table(keys);
+        let frozen = keys.ids.get(key).and_then(|&i| self.frozen.binary_search_by_key(&i, |f| f.key).ok());
+        match frozen {
+            Some(at) => Some(Read { fingerprint: self.frozen[at].fingerprint, failed: self.frozen[at].failed }),
+            None => self.map.get(key).copied(),
         }
     }
 
     /// True if this run read that node.
-    #[allow(dead_code)] // Tests use it.
-    pub fn contains(&self, key: &ReadKey) -> bool {
-        self.get(key).is_some()
+    pub(crate) fn contains(&self, keys: &ReadKeys, key: &ReadKey) -> bool {
+        self.get(keys, key).is_some()
     }
 
-    /// Number of distinct nodes read.
+    /// The read this sink recorded for a key: its map only, for a sink
+    /// that still records (a frozen set's keys need their table, `get`).
+    pub fn recorded(&self, key: &ReadKey) -> Option<Read> {
+        self.map.get(key).copied()
+    }
+
+    /// Number of reads (a key recorded into a frozen set again counts twice).
     pub fn len(&self) -> usize {
         self.map.len() + self.frozen.len()
     }
@@ -354,14 +455,16 @@ impl Reads {
     }
 
     /// Every recorded key, in no stable order: nothing may key on it.
-    pub fn keys(&self) -> impl Iterator<Item = &ReadKey> {
-        self.iter().map(|(k, _)| k)
+    pub(crate) fn keys<'a>(&'a self, keys: &'a ReadKeys) -> impl Iterator<Item = &'a ReadKey> + 'a {
+        self.iter(keys).map(|(k, _)| k)
     }
 
     /// Every recorded (key, read) pair, in no stable order. The dirty walk
     /// (`Program::reads_dirty`) iterates this; order does not matter there.
-    pub fn iter(&self) -> impl Iterator<Item = (&ReadKey, &Read)> {
-        self.map.iter().chain(self.frozen.iter().map(|(k, r)| (k, r)))
+    pub(crate) fn iter<'a>(&'a self, keys: &'a ReadKeys) -> impl Iterator<Item = (&'a ReadKey, Read)> + 'a {
+        self.check_table(keys);
+        let frozen = self.frozen.iter().map(|f| (&keys.keys[f.key as usize], Read { fingerprint: f.fingerprint, failed: f.failed }));
+        frozen.chain(self.map.iter().map(|(k, r)| (k, *r)))
     }
 }
 
@@ -2542,7 +2645,7 @@ impl<'a> Program {
             reads.record_with(ReadKey::Layout(adt), true, || layout_fingerprint(self, adt));
             return None;
         }
-        if let Some(r) = reads.get(&ReadKey::Layout(adt)) {
+        if let Some(r) = reads.recorded(&ReadKey::Layout(adt)) {
             return Some(r.fingerprint);
         }
         let fp = layout_fingerprint(self, adt);
@@ -2698,15 +2801,15 @@ impl<'a> Program {
     /// is unchanged. The count (not just a bool) feeds the scale gate's
     /// invalidated-query row.
     #[cfg(test)]
-    pub fn reads_dirty(&self, reads: &Reads) -> usize {
-        reads.iter().filter(|(k, stored)| self.read_fingerprint(k) != **stored).count()
+    pub fn reads_dirty(&self, reads: &Reads, keys: &ReadKeys) -> usize {
+        reads.iter(keys).filter(|(k, stored)| self.read_fingerprint(k) != *stored).count()
     }
 
     /// `reads_dirty` with a per-program memo of node answers: a walk
     /// over many bodies computes each node's fingerprint once. The
     /// driver's walks use this form; tests use the plain one.
-    pub fn reads_dirty_memo(&self, reads: &Reads, memo: &mut FxMap<ReadKey, Read>) -> usize {
-        reads.iter().filter(|(k, stored)| *memo.entry(**k).or_insert_with(|| self.read_fingerprint(k)) != **stored).count()
+    pub(crate) fn reads_dirty_memo(&self, reads: &Reads, keys: &ReadKeys, memo: &mut FxMap<ReadKey, Read>) -> usize {
+        reads.iter(keys).filter(|(k, stored)| *memo.entry(**k).or_insert_with(|| self.read_fingerprint(k)) != *stored).count()
     }
 }
 
@@ -2736,7 +2839,7 @@ impl ReadIndex {
     /// Indexes every slot whose read set changed since the last sync. The
     /// compile tail of a daemon calls it after each request, so a keyed
     /// walk finds it current (the first request builds it).
-    pub(crate) fn sync(&mut self, slot_reads: &mut [Option<Reads>]) {
+    pub(crate) fn sync(&mut self, slot_reads: &mut [Option<Reads>], keys: &ReadKeys) {
         if self.entries > 2 * self.live + 100_000 {
             *self = ReadIndex { next: self.next, ..ReadIndex::default() };
         }
@@ -2750,7 +2853,7 @@ impl ReadIndex {
                 Some(r) => {
                     self.next += 1;
                     r.seal = self.next;
-                    for k in r.keys() {
+                    for k in r.keys(keys) {
                         self.by_key.entry(*k).or_default().push((s as u32, r.seal));
                     }
                     self.entries += r.len();
@@ -2776,12 +2879,13 @@ impl ReadIndex {
         &mut self,
         p: &Program,
         slot_reads: &mut [Option<Reads>],
+        keys: &ReadKeys,
         quick: &(dyn Fn(&ReadKey) -> Option<bool> + Sync),
         moves: &mut dyn FnMut(&ReadKey) -> bool,
         def_slot: &dyn Fn(DefId) -> Option<usize>,
         answers: &mut FxMap<ReadKey, Read>,
     ) -> (Vec<bool>, Vec<bool>) {
-        self.sync(slot_reads);
+        self.sync(slot_reads, keys);
         crate::driver::laps::mark("keyed/sync");
         // `quick` answers most keys from tables on all cores; `moves` the
         // rest, one at a time.
@@ -2808,7 +2912,7 @@ impl ReadIndex {
         let hits = crate::driver::compile::par_map(&chunks, |&(k, list)| {
             let now = answers[k];
             let live = |s: usize, seal: u64| stamp.get(s) == Some(&seal);
-            let changed = |s: usize| reads[s].as_ref().and_then(|r| r.get(k)).is_some_and(|stored| stored != now);
+            let changed = |s: usize| reads[s].as_ref().and_then(|r| r.get(keys, k)).is_some_and(|stored| stored != now);
             list.iter().map(|&(s, seal)| (s as usize, seal)).filter(|&(s, seal)| live(s, seal) && changed(s)).map(|(s, _)| s).collect::<Vec<_>>()
         });
         hits.into_iter().flatten().for_each(|s| dirty[s] = true);
@@ -3372,30 +3476,40 @@ mod tests {
     use crate::{lexer, parser};
 
     /// A frozen read set answers as before (the read index sees its keys);
-    /// a record of a key it holds changes nothing, and a new key thaws it
-    /// and resets its seal.
+    /// a record of a key it holds keeps the first read, a thawed set takes
+    /// a new key (and resets its seal), and another table fails closed.
     #[test]
     fn a_frozen_read_set_reads_the_same() {
         let a = DefId { krate: LOCAL_CRATE, hash: DefPathHash(1) };
         let mut r = Reads::new();
         r.record(ReadKey::Sig(a), Fingerprint(1), false);
         r.record(ReadKey::Layout(a), Fingerprint(2), true);
-        let all = |r: &Reads| r.iter().map(|(k, v)| (*k, *v)).collect::<FxMap<_, _>>();
-        let before = all(&r);
-        r.freeze();
-        assert!(r.map.is_empty() && r.frozen.len() == 2);
-        assert_eq!(all(&r), before);
-        assert_eq!(r.get(&ReadKey::Layout(a)), Some(Read { fingerprint: Fingerprint(2), failed: true }));
+        let mut keys = ReadKeys::default();
+        let all = |r: &Reads, keys: &ReadKeys| r.iter(keys).map(|(k, v)| (*k, v)).collect::<FxMap<_, _>>();
+        let before = all(&r, &keys);
+        r.freeze(&mut keys);
+        assert!(r.map.is_empty() && r.frozen.len() == 2 && keys.len() == 2);
+        assert_eq!(all(&r, &keys), before);
+        assert_eq!(r.get(&keys, &ReadKey::Layout(a)), Some(Read { fingerprint: Fingerprint(2), failed: true }));
         let mut slots = vec![Some(r)];
         let mut index = ReadIndex::default();
-        index.sync(&mut slots);
+        index.sync(&mut slots, &keys);
         assert_eq!((index.by_key.len(), index.live), (2, 2));
         let mut r = slots.pop().flatten().unwrap();
+        // A record into the frozen set (no thaw) keeps the first read of a key.
         r.seal = 7;
         r.record(ReadKey::Sig(a), Fingerprint(9), false);
-        assert_eq!((r.seal, r.get(&ReadKey::Sig(a)).map(|v| v.fingerprint)), (7, Some(Fingerprint(1))));
+        assert_eq!(r.get(&keys, &ReadKey::Sig(a)).map(|v| v.fingerprint), Some(Fingerprint(1)));
+        r.thaw(&keys);
+        r.freeze(&mut keys);
+        assert_eq!((r.len(), r.get(&keys, &ReadKey::Sig(a)).map(|v| v.fingerprint)), (2, Some(Fingerprint(1))));
+        r.thaw(&keys);
         r.record(ReadKey::Checked(a), Fingerprint(3), false);
         assert_eq!((r.seal, r.len()), (0, 3));
+        // Another table's keys are not this set's: a read fails closed.
+        r.freeze(&mut keys);
+        let other = ReadKeys::default();
+        assert!(std::panic::catch_unwind(|| r.get(&other, &ReadKey::Sig(a))).is_err());
     }
 
     /// Parses and collects one sample file, then runs `run` on the program.
@@ -3473,25 +3587,25 @@ fn main() {
             let value =
                 |name: &str| ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern(name) });
             // The `helper()` call reads one value binding, by that name only.
-            let helper = reads.get(&value("helper")).expect("helper binding read");
+            let helper = reads.recorded(&value("helper")).expect("helper binding read");
             assert!(!helper.failed);
             // The `let f: Foo` annotation reads one type binding.
             let foo_ty = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Type, name: interner.intern("Foo") });
-            assert_eq!(reads.get(&foo_ty).map(|r| r.failed), Some(false));
+            assert_eq!(reads.recorded(&foo_ty).map(|r| r.failed), Some(false));
             // A name the body never mentions has no read: reads are per name,
             // never per scope.
-            assert!(!reads.contains(&value("missing")));
+            assert!(reads.recorded(&value("missing")).is_none());
             // `f.get()` probes receiver forms in order: the by-value probe
             // misses and records a failed read, the `&self` probe hits, and
             // probing stops there.
             let head = foo_head(p, interner);
             let probe = |form| ReadKey::MethodSet(MethodSetKey { head, name: interner.intern("get"), form });
-            assert_eq!(reads.get(&probe(ReceiverForm::Value)).map(|r| r.failed), Some(true), "by-value probe miss is recorded");
-            assert_eq!(reads.get(&probe(ReceiverForm::Ref)).map(|r| r.failed), Some(false), "shared probe hit is recorded");
-            assert!(!reads.contains(&probe(ReceiverForm::RefMut)), "probing stops at the hit");
+            assert_eq!(reads.recorded(&probe(ReceiverForm::Value)).map(|r| r.failed), Some(true), "by-value probe miss is recorded");
+            assert_eq!(reads.recorded(&probe(ReceiverForm::Ref)).map(|r| r.failed), Some(false), "shared probe hit is recorded");
+            assert!(reads.recorded(&probe(ReceiverForm::RefMut)).is_none(), "probing stops at the hit");
             // The callee signatures the body used are on record too.
             let helper_def = p.def_id(p.fn_names[&interner.intern("helper")]);
-            assert!(reads.contains(&ReadKey::Sig(helper_def)));
+            assert!(reads.recorded(&ReadKey::Sig(helper_def)).is_some());
         });
     }
 
@@ -3503,16 +3617,16 @@ fn main() {
             let (ck, errs) = check_fn(p, p.main.unwrap());
             assert!(!errs.is_empty(), "the call must also be an error");
             let key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern("nosuch") });
-            assert_eq!(ck.reads.get(&key).map(|r| r.failed), Some(true));
+            assert_eq!(ck.reads.recorded(&key).map(|r| r.failed), Some(true));
             // The same key in a program that defines the name is a hit with a
             // different fingerprint.
             let mut reads = Reads::new();
             assert_eq!(p.binding(&mut reads, ROOT_MODULE, Namespace::Macro, interner.intern("nosuch")), BindingRes::Absent);
             let macro_key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Macro, name: interner.intern("nosuch") });
-            assert_eq!(reads.get(&macro_key).map(|r| r.failed), Some(true));
+            assert_eq!(reads.recorded(&macro_key).map(|r| r.failed), Some(true));
             // Different keys, same fingerprint: the fingerprint covers the
             // node's answer ("absent"), not which node was asked.
-            assert_eq!(reads.get(&macro_key).unwrap().fingerprint, ck.reads.get(&key).unwrap().fingerprint);
+            assert_eq!(reads.recorded(&macro_key).unwrap().fingerprint, ck.reads.recorded(&key).unwrap().fingerprint);
         });
     }
 
@@ -3575,7 +3689,7 @@ fn main() {}
             assert!(p.method_set(&mut reads, Head::Int(IntTy::I64), interner.intern("nope"), ReceiverForm::Value).candidates.is_empty());
             let key =
                 ReadKey::MethodSet(MethodSetKey { head: Head::Int(IntTy::I64), name: interner.intern("nope"), form: ReceiverForm::Value });
-            assert_eq!(reads.get(&key).map(|r| r.failed), Some(true));
+            assert_eq!(reads.recorded(&key).map(|r| r.failed), Some(true));
         });
     }
 
@@ -3589,14 +3703,14 @@ fn main() {}
             let head = foo_head(p, interner);
             assert!(p.impl_set(&mut reads, any_trait, head).impls.is_empty());
             let key = ReadKey::ImplSet(ImplSetKey { trait_: any_trait, head });
-            assert_eq!(reads.get(&key).map(|r| r.failed), Some(true));
+            assert_eq!(reads.recorded(&key).map(|r| r.failed), Some(true));
             // The layout query answers for a known Adt and fails the read for
             // a def this crate does not have.
             let Head::Adt(adt) = head else { unreachable!() };
             assert!(p.layout_of(&mut reads, adt).is_some());
             let missing = DefId { krate: p.krate, hash: DefPathHash(0xdead) };
             assert_eq!(p.layout_of(&mut reads, missing), None);
-            assert_eq!(reads.get(&ReadKey::Layout(missing)).map(|r| r.failed), Some(true));
+            assert_eq!(reads.recorded(&ReadKey::Layout(missing)).map(|r| r.failed), Some(true));
         });
     }
 
@@ -3614,7 +3728,7 @@ fn main() {}
                 let tr = p.gx.trait_names[&interner.intern("Tr")];
                 let head = Head::Adt(p.def_of_adt(p.type_names[&interner.intern("A")]));
                 let n = p.impl_set(&mut reads, tr, head).impls.len();
-                out = (n, reads.get(&ReadKey::ImplSet(ImplSetKey { trait_: tr, head })).unwrap().fingerprint);
+                out = (n, reads.recorded(&ReadKey::ImplSet(ImplSetKey { trait_: tr, head })).unwrap().fingerprint);
             });
             out
         };
@@ -3639,7 +3753,7 @@ fn main() {}
                 let mut reads = Reads::new();
                 let def = p.def_id(p.fn_names[&interner.intern("f")]);
                 let _ = p.sig_of(&mut reads, def);
-                out = reads.get(&ReadKey::Sig(def)).unwrap().fingerprint;
+                out = reads.recorded(&ReadKey::Sig(def)).unwrap().fingerprint;
             });
             out
         };
@@ -3710,7 +3824,7 @@ fn main() {}
             assert!(errs.is_empty(), "{errs:?}");
             let body = crate::lower::lower(p, main, ck);
             let key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern("helper") });
-            assert!(body.reads.contains(&key), "the read set rides with the body result");
+            assert!(body.reads.recorded(&key).is_some(), "the read set rides with the body result");
             let (mut fn_calls, mut builtin_calls) = (0, 0);
             for b in &body.blocks {
                 if let Terminator::Call { target, unwind, .. } = &b.term {
@@ -3748,7 +3862,7 @@ fn main() {}
         let ast = parser::parse(&lexed, interner, known).unwrap();
         let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
         let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
-        program.reads_dirty(reads)
+        program.reads_dirty(reads, &ReadKeys::default())
     }
 
     /// The dirty walk (8.3 step 5): an unrelated added fn dirties nothing
@@ -3858,8 +3972,8 @@ fn main() {}
         let (ck, errs) = check_fn(&program, program.fn_names[&interner.intern("ask")]);
         assert!(errs.is_empty(), "{errs:?}");
         let reads = ck.reads;
-        assert!(reads.keys().any(|k| matches!(k, ReadKey::Answer(_, answer::AUTO))), "the Send question reads Answer(Outer)");
-        assert!(!reads.keys().any(|k| matches!(k, ReadKey::Structure(_))), "and no Structure");
+        assert!(reads.keys(&ReadKeys::default()).any(|k| matches!(k, ReadKey::Answer(_, answer::AUTO))), "the Send question reads Answer(Outer)");
+        assert!(!reads.keys(&ReadKeys::default()).any(|k| matches!(k, ReadKey::Structure(_))), "and no Structure");
         let kept = src.replace("struct Inner { x: i64 }", "struct Inner { x: i64, y: u8 }");
         assert_eq!(dirty_in(&interner, &known, &kept, &reads), 0, "a field that keeps Send keeps the body clean");
         let lost = src.replace("struct Inner { x: i64 }", "struct Inner { x: *const i64 }");
@@ -3969,7 +4083,7 @@ fn main() {}
             let def = p.def_of_adt(a);
             let mut reads = Reads::new();
             let fp = p.layout_of(&mut reads, def).expect("known adt");
-            assert_eq!(reads.get(&ReadKey::Layout(def)).map(|r| r.fingerprint), Some(fp));
+            assert_eq!(reads.recorded(&ReadKey::Layout(def)).map(|r| r.fingerprint), Some(fp));
             assert_eq!(p.read_fingerprint(&ReadKey::Layout(def)).fingerprint, fp, "replay agrees with the recording");
             assert_ne!(fp, sig_fingerprint(p, def), "layout is a separate fingerprint from sig");
         });
@@ -3994,31 +4108,31 @@ fn main() {}
             };
             // No module tables: no privacy check, but the field read still
             // records Sig(Foo) (its type).
-            assert!(main_reads(p).contains(&ReadKey::Sig(def)), "a field read records Sig(Foo) without module tables too");
+            assert!(main_reads(p).recorded(&ReadKey::Sig(def)).is_some(), "a field read records Sig(Foo) without module tables too");
             let mut tables = ResolvedTables::new(interner.intern("test"));
             tables.field_vis.insert(def, (ROOT_MODULE, [(interner.intern("x"), VisKind::Pub)].into_iter().collect()));
             tables.assoc_vis.insert(def, [(interner.intern("get"), (VisKind::Pub, ROOT_MODULE))].into_iter().collect());
             p.resolved = Some(std::sync::Arc::new(tables));
             let stored = main_reads(p);
             let (sig, layout) = (sig_fingerprint(p, def), layout_fingerprint(p, def));
-            assert_eq!(stored.get(&ReadKey::Sig(def)).map(|r| r.fingerprint), Some(sig), "privacy checks read Sig(Foo)");
-            assert_eq!(p.reads_dirty(&stored), 0);
+            assert_eq!(stored.recorded(&ReadKey::Sig(def)).map(|r| r.fingerprint), Some(sig), "privacy checks read Sig(Foo)");
+            assert_eq!(p.reads_dirty(&stored, &ReadKeys::default()), 0);
             let t = std::sync::Arc::get_mut(p.resolved.as_mut().unwrap()).unwrap();
             t.field_vis.get_mut(&def).unwrap().1.insert(interner.intern("x"), VisKind::Priv);
             assert_ne!(sig_fingerprint(p, def), sig, "a field visibility edit moves Sig");
             assert_eq!(layout_fingerprint(p, def), layout, "and not the layout");
-            assert!(p.reads_dirty(&stored) > 0, "the field reader is dirty");
+            assert!(p.reads_dirty(&stored, &ReadKeys::default()) > 0, "the field reader is dirty");
             let t = std::sync::Arc::get_mut(p.resolved.as_mut().unwrap()).unwrap();
             t.field_vis.get_mut(&def).unwrap().1.insert(interner.intern("x"), VisKind::Pub);
             assert_eq!(sig_fingerprint(p, def), sig, "the edit back restores Sig");
             let get = ReadKey::AssocVis(def, interner.intern("get"));
-            let vis = stored.get(&get).map(|r| r.fingerprint);
+            let vis = stored.recorded(&get).map(|r| r.fingerprint);
             assert!(vis.is_some(), "the method privacy check reads AssocVis(Foo::get)");
             let t = std::sync::Arc::get_mut(p.resolved.as_mut().unwrap()).unwrap();
             t.assoc_vis.get_mut(&def).unwrap().insert(interner.intern("get"), (VisKind::Crate, ROOT_MODULE));
             assert_eq!(sig_fingerprint(p, def), sig, "a method visibility edit leaves Sig(Foo)");
             assert_ne!(Some(p.read_fingerprint(&get).fingerprint), vis, "and moves AssocVis(Foo::get)");
-            assert!(p.reads_dirty(&stored) > 0, "the method caller is dirty");
+            assert!(p.reads_dirty(&stored, &ReadKeys::default()) > 0, "the method caller is dirty");
         });
     }
 
@@ -4035,7 +4149,7 @@ fn main() {}
                    fn main() { let t = (A { x: 1 }, 2u8); let u = t; let o = Some(A { x: 3 }); let p = o.clone(); \
                    println!(\"{} {} {}\", t.0.x, u.0.x, p.unwrap().x); }\n";
         let reads = main_reads(&interner, &known, src);
-        assert!(reads.keys().any(|k| matches!(k, ReadKey::Derives(_) | ReadKey::DeriveBits(..))), "a derive read is recorded");
+        assert!(reads.keys(&ReadKeys::default()).any(|k| matches!(k, ReadKey::Derives(_) | ReadKey::DeriveBits(..))), "a derive read is recorded");
         assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
         // Per trait (DeriveBits): the type check asks A only about Clone
         // (`o.clone()`). The tuple copy is borrowck's question, which the
@@ -4097,7 +4211,7 @@ fn main() {}
         let known = std::sync::Arc::new(Known::new(&interner));
         let src = "const fn k() -> i64 { 3 }\nfn main() { let x = const { k() }; println!(\"{}\", x); }\n";
         let reads = main_reads(&interner, &known, src);
-        assert!(reads.keys().any(|k| matches!(k, ReadKey::Checked(_))), "a Checked read is recorded");
+        assert!(reads.keys(&ReadKeys::default()).any(|k| matches!(k, ReadKey::Checked(_))), "a Checked read is recorded");
         assert!(dirty_in(&interner, &known, src, &reads) >= 1, "Checked reads always dirty (sentinel replay)");
     }
 
@@ -4110,7 +4224,7 @@ fn main() {}
         let known = std::sync::Arc::new(Known::new(&interner));
         let src = "struct S { a: u8 }\nfn main() { println!(\"{}\", std::mem::size_of::<[S; 2]>()); }\n";
         let reads = main_reads(&interner, &known, src);
-        assert!(reads.keys().any(|k| matches!(k, ReadKey::Layout(_))), "a Layout read is recorded");
+        assert!(reads.keys(&ReadKeys::default()).any(|k| matches!(k, ReadKey::Layout(_))), "a Layout read is recorded");
         assert_eq!(dirty_in(&interner, &known, src, &reads), 0, "unchanged");
         let edited = src.replace("struct S { a: u8 }", "struct S { a: u64 }");
         assert!(dirty_in(&interner, &known, &edited, &reads) >= 1, "field edit dirties through the layout read");
@@ -4127,7 +4241,7 @@ fn main() {}
             let vec_def = p.tys.builtins().vec;
             let push_key =
                 ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("push"), form: ReceiverForm::Value });
-            let recorded = ck.reads.get(&push_key).expect("the push probe is recorded");
+            let recorded = ck.reads.recorded(&push_key).expect("the push probe is recorded");
             assert!(recorded.failed, "no user candidate: a failed (builtin) probe");
             let pop_key =
                 ReadKey::MethodSet(MethodSetKey { head: Head::Adt(vec_def), name: interner.intern("pop"), form: ReceiverForm::Value });

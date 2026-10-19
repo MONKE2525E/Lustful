@@ -30,7 +30,7 @@ use super::generics::{self, ConstScalar, FnClass, FnScope, FnTemplate};
 use crate::ast::{self, ItemKind};
 use crate::def::{DefId, LocalDefId};
 use crate::diag::{Diag, Span};
-use crate::driver::graph::ReadKey;
+use crate::driver::graph::{ReadKey, ReadKeys};
 use crate::ty::defs::{DefData, DefKind, ModuleId, SigData, Vis};
 use crate::ty::{AdtId, GenericArg, Region, Ty, TyIntern, TyKind};
 
@@ -123,21 +123,21 @@ pub fn check_dirty(
         let mut out = Vec::with_capacity(reads.len());
         for (_, r) in &reads {
             let mut d = false;
-            for (k, stored) in r.iter() {
+            for (k, stored) in r.iter(ReadKeys::none()) {
                 let h = *hit.entry(*k).or_insert_with(|| matches!(k, ReadKey::Checked(_)) || moved(p, k));
-                if h && *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) != *stored {
+                if h && *memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) != stored {
                     d = true;
                     break;
                 }
             }
-            if !d && prove && p.reads_dirty_memo(r, &mut memo) != 0 {
+            if !d && prove && p.reads_dirty_memo(r, ReadKeys::none(), &mut memo) != 0 {
                 unproven += 1;
             }
             out.push(d);
         }
         out
     } else {
-        reads.iter().map(|(_, r)| p.reads_dirty_memo(r, &mut memo) != 0).collect()
+        reads.iter().map(|(_, r)| p.reads_dirty_memo(r, ReadKeys::none(), &mut memo) != 0).collect()
     };
     super::derive_delta::log(&|| {
         let ms = t0.elapsed().as_secs_f64() * 1e3;

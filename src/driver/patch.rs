@@ -2647,7 +2647,7 @@ pub(super) fn reuse_kept(
         if let Some(m) = dmoves.as_mut() {
             let mut seen: crate::intern::FxMap<crate::driver::graph::ReadKey, ()> = crate::intern::FxMap::default();
             let keys: Vec<crate::driver::graph::ReadKey> =
-                p.const_body_reads.iter().flat_map(|(_, r)| r.iter().map(|(k, _)| *k)).filter(|k| seen.insert(*k, ()).is_none()).collect();
+                p.const_body_reads.iter().flat_map(|(_, r)| r.keys(crate::driver::graph::ReadKeys::none()).copied()).filter(|k| seen.insert(*k, ()).is_none()).collect();
             p.derive_keys_moved(m, &keys);
         }
         let mut moved = |q: &crate::check::collect::Program, k: &crate::driver::graph::ReadKey| {

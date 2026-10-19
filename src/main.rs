@@ -127,13 +127,14 @@ fn census(mut sessions: Vec<Box<driver::Session>>) {
             }
         }
         let c = &mut s.caches;
-        for (part, name) in [(8, "discovery reads"), (9, "discovery outputs"), (0, "templates"), (1, "closure templates"), (2, "discovery rest"), (3, "unstored"), (4, "held"), (5, "memo"), (6, "outputs"), (7, "readers index")] {
+        for (part, name) in [(8, "discovery reads"), (9, "discovery outputs"), (10, "read keys"), (0, "templates"), (1, "closure templates"), (2, "discovery rest"), (3, "unstored"), (4, "held"), (5, "memo"), (6, "outputs"), (7, "readers index")] {
             row(&mut rows, &format!("gen_reuse {name}"), &mut || c.gen_reuse.drop_part(part));
         }
         row(&mut rows, "caches.out code", &mut || c.out.iter_mut().for_each(|o| drop(take(&mut o.code))));
         row(&mut rows, "caches.out", &mut || drop(take(&mut c.out)));
         row(&mut rows, "caches.slot_reads", &mut || drop(take(&mut c.slot_reads)));
         row(&mut rows, "caches.read_index", &mut || drop(take(&mut c.read_index)));
+        row(&mut rows, "caches.read_keys", &mut || drop(take(&mut c.read_keys)));
         row(&mut rows, "caches.derive_tables", &mut || drop(take(&mut c.derive_tables)));
         row(&mut rows, "caches.slot_ir", &mut || drop(take(&mut c.slot_ir)));
         row(&mut rows, "caches.glue", &mut || drop(take(&mut c.glue)));
