@@ -125,10 +125,15 @@ typedef struct {
     uint64_t elem_align;
 } lust_hash_table;
 
+/* The empty singleton's control bytes (Group::static_empty). A unit's header gets these
+   declarations after inl.h, whose macros carry the names of the five functions that are in
+   parentheses below: the parentheses keep those macros out of the declarations. */
+extern const uint8_t lust_hash_static_empty[16];
+
 /* Creates the empty table (no allocation), for elements of this size and
    align. Rust layout rules apply: size is a multiple of align, align is a
    power of two. Size 0 (ZST elements) is supported. */
-void lust_hash_init(lust_hash_table *t, uint64_t elem_size, uint64_t elem_align);
+void (lust_hash_init)(lust_hash_table *t, uint64_t elem_size, uint64_t elem_align);
 /* Creates a table that holds `capacity` elements without growing.
    Capacity 0 gives the empty table. Bucket count follows hashbrown
    capacity_to_buckets, including its small-table minimums. */
@@ -137,12 +142,12 @@ void lust_hash_init_with_capacity(lust_hash_table *t, uint64_t elem_size, uint64
    iteration order (Rust drop order for maps in practice: bucket order).
    Without one (drop == NULL), elements are not dropped. Either way the
    table becomes the empty singleton and may be reused. */
-void lust_hash_drop_table(lust_hash_table *t, lust_hash_drop_fn drop, void *ctx);
+void (lust_hash_drop_table)(lust_hash_table *t, lust_hash_drop_fn drop, void *ctx);
 
-uint64_t lust_hash_len(const lust_hash_table *t);
-uint64_t lust_hash_capacity(const lust_hash_table *t); /* items + growth_left */
+uint64_t (lust_hash_len)(const lust_hash_table *t);
+uint64_t (lust_hash_capacity)(const lust_hash_table *t); /* items + growth_left */
 uint64_t lust_hash_buckets(const lust_hash_table *t);  /* 1 for the singleton */
-int lust_hash_is_empty(const lust_hash_table *t);
+int (lust_hash_is_empty)(const lust_hash_table *t);
 
 /* The slot for bucket `index`, or NULL when it is not full. */
 void *lust_hash_bucket(const lust_hash_table *t, uint64_t index);

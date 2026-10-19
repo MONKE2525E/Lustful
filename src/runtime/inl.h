@@ -327,5 +327,185 @@ extern __thread lust_inl_tls_block_ *lust_tls_cur;
         __builtin_expect(lust_x_.n < 128, 1) ? lust_inl_u128_of_(lust_inl_w_(lust_x_.a) >> lust_x_.n)  \
                                              : lust_u128_shr(lust_x_.a, lust_x_.n);                    \
     })
+/* Wrapping 128-bit add and sub, and the bitwise ops. */
+#define lust_inl_u128_op_(T, op, ...)                                                                  \
+    __extension__({                                                                                    \
+        struct { T a, b; } lust_x_ = {__VA_ARGS__};                                                    \
+        lust_u128 lust_r_ = lust_inl_u128_of_(lust_inl_w_(lust_x_.a) op lust_inl_w_(lust_x_.b));       \
+        (T){lust_r_.lo, lust_r_.hi};                                                                   \
+    })
+#define lust_u128_add(...) lust_inl_u128_op_(lust_u128, +, __VA_ARGS__)
+#define lust_u128_sub(...) lust_inl_u128_op_(lust_u128, -, __VA_ARGS__)
+#define lust_i128_add(...) lust_inl_u128_op_(lust_i128, +, __VA_ARGS__)
+#define lust_i128_sub(...) lust_inl_u128_op_(lust_i128, -, __VA_ARGS__)
+#define lust_u128_and(...) lust_inl_u128_op_(lust_u128, &, __VA_ARGS__)
+#define lust_u128_or(...) lust_inl_u128_op_(lust_u128, |, __VA_ARGS__)
+#define lust_u128_xor(...) lust_inl_u128_op_(lust_u128, ^, __VA_ARGS__)
 #endif
+
+/* Small helpers that every unit called out of line: on tsgo's pgo-train they ran 200 M
+   calls of 2 to 40 instructions each. Each keeps its function's arguments and result;
+   a panic or a slow case calls the function. */
+
+/* A hash table's item count and capacity (hash.c). */
+#define lust_hash_len(t) __extension__({ const lust_hash_table *lust_t_ = (t); lust_t_->items; })
+#define lust_hash_capacity(t) __extension__({ const lust_hash_table *lust_t_ = (t); lust_t_->items + lust_t_->growth_left; })
+#define lust_hash_is_empty(t) __extension__({ const lust_hash_table *lust_t_ = (t); (int)(lust_t_->items == 0); })
+/* The empty table with no allocation, as the function makes it. */
+#define lust_hash_init(t, size, align)                                                                 \
+    __extension__({                                                                                    \
+        lust_hash_table *lust_t_ = (t);                                                                \
+        uint64_t lust_al_ = (align);                                                                   \
+        lust_t_->elem_size = (size);                                                                   \
+        lust_t_->elem_align = lust_al_ ? lust_al_ : 1;                                                 \
+        lust_t_->ctrl = (uint8_t *)lust_hash_static_empty;                                             \
+        lust_t_->data = 0;                                                                             \
+        lust_t_->alloc_base = 0;                                                                       \
+        lust_t_->bucket_mask = 0;                                                                      \
+        lust_t_->items = 0;                                                                            \
+        lust_t_->growth_left = 0;                                                                      \
+        (void)0;                                                                                       \
+    })
+/* A table with no allocation is the empty one: nothing to drop or free. */
+#define lust_hash_drop_table(t, drop, ctx)                                                             \
+    __extension__({                                                                                    \
+        lust_hash_table *lust_t_ = (t);                                                                \
+        if (!(lust_t_->alloc_base == 0 && lust_t_->items == 0)) lust_hash_drop_table(lust_t_, (drop), (ctx)); \
+        (void)0;                                                                                       \
+    })
+
+/* An index in bounds is the result; the function panics with Rust's message otherwise. */
+#define lust_bounds(i, len, loc)                                                                       \
+    __extension__({                                                                                    \
+        uint64_t lust_i_ = (i), lust_n_ = (len);                                                       \
+        __builtin_expect(lust_i_ < lust_n_, 1) ? lust_i_ : lust_bounds(lust_i_, lust_n_, (loc));       \
+    })
+#define lust_vec_check_remove(v, i, loc)                                                               \
+    __extension__({                                                                                    \
+        lust_Vec *lust_v_ = (v);                                                                       \
+        uint64_t lust_i_ = (i);                                                                        \
+        if (__builtin_expect(lust_i_ >= lust_v_->len, 0)) lust_vec_check_remove(lust_v_, lust_i_, (loc)); \
+        (void)0;                                                                                       \
+    })
+
+/* The char at *i of valid UTF-8, and *i moved past it: an ASCII byte here, a wider char
+   in the function. */
+#define lust_utf8_next(p, i)                                                                           \
+    __extension__({                                                                                    \
+        const uint8_t *lust_p_ = (p);                                                                  \
+        uint64_t *lust_i_ = (i);                                                                       \
+        uint8_t lust_b_ = lust_p_[*lust_i_];                                                           \
+        __builtin_expect(lust_b_ < 0x80, 1) ? (*lust_i_ += 1, (uint32_t)lust_b_) : lust_utf8_next(lust_p_, lust_i_); \
+    })
+#define lust_chars(...) __extension__({ struct { lust_str s; } lust_x_ = {__VA_ARGS__}; (lust_Chars){lust_x_.s, 0}; })
+#define lust_str_starts_with(...)                                                                      \
+    __extension__({                                                                                    \
+        struct { lust_str s, p; } lust_x_ = {__VA_ARGS__};                                             \
+        (uint8_t)(lust_x_.p.len <= lust_x_.s.len                                                       \
+                  && (lust_x_.p.len == 0 || __builtin_memcmp(lust_x_.s.ptr, lust_x_.p.ptr, lust_x_.p.len) == 0)); \
+    })
+#define lust_str_ends_with(...)                                                                        \
+    __extension__({                                                                                    \
+        struct { lust_str s, p; } lust_x_ = {__VA_ARGS__};                                             \
+        (uint8_t)(lust_x_.p.len <= lust_x_.s.len                                                       \
+                  && (lust_x_.p.len == 0                                                               \
+                      || __builtin_memcmp(lust_x_.s.ptr + lust_x_.s.len - lust_x_.p.len, lust_x_.p.ptr, lust_x_.p.len) == 0)); \
+    })
+
+/* A range's start and end in a slice of `len` (`get(range)`), as core.c's function: the
+   tags give each end's kind (end: 0 included, 1 excluded, 2 none; start: 0 included,
+   1 excluded, 2 none); 0 when the range does not fit. */
+static inline int lust_inl_range_bounds_get_(uint64_t len, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val,
+                                             uint64_t *out_s, uint64_t *out_e) {
+    uint64_t end, start;
+    if (e_tag == 0) {
+        if (e_val >= len) return 0;
+        end = e_val + 1;
+    } else if (e_tag == 1) {
+        if (e_val > len) return 0;
+        end = e_val;
+    } else {
+        end = len;
+    }
+    if (s_tag == 2) {
+        start = 0;
+    } else if (s_tag == 1) {
+        if (s_val >= end) return 0;
+        start = s_val + 1;
+    } else {
+        if (s_val > end) return 0;
+        start = s_val;
+    }
+    *out_s = start;
+    *out_e = end;
+    return 1;
+}
+#define lust_range_bounds_get(...) lust_inl_range_bounds_get_(__VA_ARGS__)
+
+/* Allocation: malloc for a nonzero size at an alignment malloc gives; zero sizes, larger
+   alignments and a failed malloc (the function retries, then reports it) take the
+   function. (__builtin_malloc calls malloc; units declare no malloc of their own, and a
+   program's own extern malloc may declare it with other types.) free for a nonzero size,
+   but Windows' over-aligned blocks. */
+#define lust_alloc(size, align)                                                                        \
+    __extension__({                                                                                    \
+        uint64_t lust_sz_ = (size), lust_al_ = (align);                                                \
+        void *lust_r_ = __builtin_expect(lust_sz_ != 0 && lust_al_ <= 16, 1) ? __builtin_malloc(lust_sz_) : 0; \
+        __builtin_expect(lust_r_ != 0, 1) ? lust_r_ : lust_alloc(lust_sz_, lust_al_);                  \
+    })
+#ifdef _WIN32
+#define lust_inl_aligned_free_(align) ((align) > 16)
+#else
+#define lust_inl_aligned_free_(align) 0
+#endif
+#define lust_dealloc(ptr, size, align)                                                                 \
+    __extension__({                                                                                    \
+        void *lust_p_ = (ptr);                                                                         \
+        uint64_t lust_sz_ = (size), lust_al_ = (align);                                                \
+        if (lust_sz_) {                                                                                \
+            if (lust_inl_aligned_free_(lust_al_)) lust_dealloc(lust_p_, lust_sz_, lust_al_);           \
+            else free(lust_p_);                                                                        \
+        }                                                                                              \
+        (void)0;                                                                                       \
+    })
+
+/* Strings: the empty one, drop, and a push that fits the capacity (growth takes the
+   function). */
+#define lust_string_new() ((lust_String){(uint8_t *)(uintptr_t)1, 0, 0})
+#define lust_string_drop(s) __extension__({ lust_String *lust_s_ = (s); lust_dealloc(lust_s_->ptr, lust_s_->cap, 1); })
+#define lust_string_push_str(s, ...)                                                                   \
+    __extension__({                                                                                    \
+        lust_String *lust_s_ = (s);                                                                    \
+        struct { lust_str x; } lust_x_ = {__VA_ARGS__};                                                \
+        if (__builtin_expect(lust_s_->cap - lust_s_->len >= lust_x_.x.len, 1)) {                       \
+            if (lust_x_.x.len) __builtin_memcpy(lust_s_->ptr + lust_s_->len, lust_x_.x.ptr, lust_x_.x.len); \
+            lust_s_->len += lust_x_.x.len;                                                             \
+        } else                                                                                         \
+            lust_string_push_str(lust_s_, lust_x_.x);                                                  \
+        (void)0;                                                                                       \
+    })
+#define lust_string_push_char(s, c)                                                                    \
+    __extension__({                                                                                    \
+        lust_String *lust_s_ = (s);                                                                    \
+        uint32_t lust_c_ = (c);                                                                        \
+        if (__builtin_expect(lust_c_ < 0x80 && lust_s_->len < lust_s_->cap, 1))                        \
+            lust_s_->ptr[lust_s_->len++] = (uint8_t)lust_c_;                                           \
+        else                                                                                           \
+            lust_string_push_char(lust_s_, lust_c_);                                                   \
+        (void)0;                                                                                       \
+    })
+
+/* f64 and f32 min and max as float.c: a NaN loses to a number, and of two equal values
+   (0.0 and -0.0) the second wins. The integer to float casts round to nearest, ties to
+   even, as Rust's `as` (the runtime builds them from integer steps for tcc). */
+static inline double lust_inl_f64_min_(double a, double b) { return a < b ? a : b < a ? b : a == b ? b : a == a ? a : b; }
+static inline double lust_inl_f64_max_(double a, double b) { return a > b ? a : b > a ? b : a == b ? b : a == a ? a : b; }
+static inline float lust_inl_f32_min_(float a, float b) { return a < b ? a : b < a ? b : a == b ? b : a == a ? a : b; }
+static inline float lust_inl_f32_max_(float a, float b) { return a > b ? a : b > a ? b : a == b ? b : a == a ? a : b; }
+#define lust_f64_min(a, b) lust_inl_f64_min_((a), (b))
+#define lust_f64_max(a, b) lust_inl_f64_max_((a), (b))
+#define lust_f32_min(a, b) lust_inl_f32_min_((a), (b))
+#define lust_f32_max(a, b) lust_inl_f32_max_((a), (b))
+#define lust_u64_to_f64(v) ((double)(uint64_t)(v))
+#define lust_i64_to_f64(v) ((double)(int64_t)(v))
 #endif

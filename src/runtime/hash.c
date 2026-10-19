@@ -20,7 +20,7 @@ static int lh_is_full(uint8_t c) { return (c & 0x80u) == 0; }
 
 /* Group::static_empty for the empty singleton; 16 bytes cover both
    group widths this core supports. */
-static const uint8_t lust_hash_static_empty[16] = {
+const uint8_t lust_hash_static_empty[16] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 };
 
