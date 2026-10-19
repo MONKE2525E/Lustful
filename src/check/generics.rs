@@ -12441,6 +12441,10 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         let mut recheck: Vec<LocalDefId> = Vec::new();
         let round = std::mem::take(&mut queue);
         ahead.start(round.len());
+        // The round's stored discovery entries, judged on the pool before
+        // their turns (`GenReuse::prejudge`; the same verdicts).
+        crate::driver::graph::FpMemo::sync(p);
+        let mut prejudged = reuse.prejudge(p, &round);
         for (k, &fid) in round.iter().enumerate() {
             crate::driver::graph::FpMemo::sync(p);
             if ahead.fill(&round, k, |_| true, |&f| discover_one(p, f, lints)) && p.gx.walk_instances {
@@ -12478,7 +12482,8 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
             // then drop the checked body: it borrows the program
             // this loop is about to extend. A body whose stored
             // discovery still holds (driver session reuse) replays it.
-            let replayed = reuse.discovered(p, fid);
+            let pre = prejudged.get_mut(k).and_then(Option::take);
+            let replayed = reuse.discovered_prejudged(p, fid, pre);
             let from_store = replayed.is_some();
             let (adt_tys_owned, requests_owned, closures_owned, vtables_owned) = if let Some(stored) = replayed {
                 stored

@@ -246,6 +246,44 @@ fn owned_str(p: &Program, t: &OwnedTy) -> String {
 /// vtable requests.
 pub(crate) type Discovered = (Vec<OwnedTy>, Vec<(LocalDefId, Vec<OwnedArg>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>);
 
+type FxSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FxHasher>>;
+
+/// One discovery entry judged before its turn (`GenReuse::prejudge`): the
+/// entry's stamp then, whether its keys other than `Answer` held, its
+/// `Answer` keys with their stored fingerprints in stored order (asked at
+/// the turn), and a copy of its output when the rest held.
+pub(crate) struct Prejudged {
+    stamp: u64,
+    held: bool,
+    answers: Vec<(ReadKey, Read)>,
+    out: Option<(Vec<OwnedTy>, Vec<(DefId, Vec<OwnedArg>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>)>,
+}
+
+/// `LUST_CHECK_PREJUDGE=1`: at each prejudged turn, every key of the entry
+/// that `prejudge` answered must have that answer still, fingerprinted
+/// again now (`prejudge_oracle`).
+fn prejudge_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LUST_CHECK_PREJUDGE").is_some_and(|v| v != "0"))
+}
+
+/// The oracle of `prejudge_check`: panics at the first key whose answer
+/// moved between the round start and this turn.
+fn prejudge_oracle(p: &Program, memo: &FxMap<ReadKey, Read>, keys: &ReadKeys, e: &DiscoveryEntry, env: u64, pre: &Prejudged) {
+    if e.env == env {
+        return;
+    }
+    for (k, _) in e.reads.iter(keys) {
+        let (now, stable) = p.read_fingerprint_stable(k);
+        if matches!(k, ReadKey::Answer(..)) || !stable {
+            continue;
+        }
+        if memo.get(k) != Some(&now) {
+            panic!("prejudge oracle: key {k:?} answered {:?} at the round start, {now:?} at the turn (held {})", memo.get(k), pre.held);
+        }
+    }
+}
+
 impl GenReuse {
     /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part
     /// (0 templates, 1 closure templates, 2 discovery, 3 unstored, 4 held, 5 memo, 6 template
@@ -1068,6 +1106,127 @@ impl GenReuse {
     pub(crate) fn reads_checked(&self, defs: &[DefId]) -> bool {
         let stored = self.templates.values().map(|e| &e.reads).chain(self.discovery.values().map(|e| &e.reads));
         stored.into_iter().any(|r| defs.iter().any(|&d| r.contains(&self.keys, &ReadKey::Checked(d))))
+    }
+
+    /// Judges the stored discovery entries of one materialize round (`fns`)
+    /// on the pool, before its turns: their reads, and a copy of each
+    /// output. A key's answer goes into `memo` now, where `discovered` puts
+    /// it at the entry's turn: the same answer, since mono adds only rows no
+    /// walk of an existing def reaches (`FpMemo`). Two kinds of answer can
+    /// still move while mono runs and stay for the turn, asked in stored
+    /// order as `discovered` asks them (`discovered_prejudged`): `Answer`
+    /// keys (auto traits of the instances made), and keys whose answer read
+    /// an opaque definer's hidden type (`read_fingerprint_stable`). Empty
+    /// when generic reuse is off.
+    pub(crate) fn prejudge(&mut self, p: &Program, fns: &[LocalDefId]) -> Vec<Option<Prejudged>> {
+        use crate::pool::par_map;
+        if !self.on {
+            return Vec::new();
+        }
+        let entry = |f: LocalDefId| {
+            let def = p.def_id(f);
+            if self.unstored.contains_key(&def) { None } else { self.discovery.get(&def) }
+        };
+        let judged = |e: &DiscoveryEntry| e.env != self.env;
+        // The keys no earlier ask answered, by shard of their hash, then
+        // each shard's distinct keys answered on the pool (the stable ones
+        // go into `memo`).
+        const SHARDS: usize = 64;
+        let shard = |k: &ReadKey| {
+            let mut h = FxHasher::default();
+            k.hash(&mut h);
+            (h.finish() >> 32) as usize % SHARDS
+        };
+        let chunks: Vec<&[LocalDefId]> = fns.chunks(256).collect();
+        let missing: Vec<Vec<Vec<ReadKey>>> = par_map(&chunks, |c| {
+            let mut out = vec![Vec::new(); SHARDS];
+            for e in c.iter().filter_map(|&f| entry(f)).filter(|e| judged(e)) {
+                for (k, _) in e.reads.iter(&self.keys) {
+                    if !matches!(k, ReadKey::Answer(..)) && !self.memo.contains_key(k) {
+                        out[shard(k)].push(*k);
+                    }
+                }
+            }
+            out
+        });
+        let shards: Vec<usize> = (0..SHARDS).collect();
+        let found: Vec<Vec<(ReadKey, Read)>> = par_map(&shards, |&s| {
+            let mut seen: FxSet<ReadKey> = FxSet::default();
+            let mut out = Vec::new();
+            for k in missing.iter().flat_map(|m| &m[s]) {
+                if seen.insert(*k) {
+                    let (read, stable) = p.read_fingerprint_stable(k);
+                    if stable {
+                        out.push((*k, read));
+                    }
+                }
+            }
+            out
+        });
+        self.memo.reserve(found.iter().map(Vec::len).sum());
+        self.memo.extend(found.into_iter().flatten());
+        let memo = &self.memo;
+        par_map(fns, |&f| {
+            let e = entry(f)?;
+            let (held, answers) = if judged(e) {
+                let mut held = true;
+                let mut answers = Vec::new();
+                // A key with no answer in `memo` now is one of the two kinds
+                // that wait for the turn.
+                for (k, stored) in e.reads.iter(&self.keys) {
+                    match memo.get(k) {
+                        Some(&now) if !matches!(k, ReadKey::Answer(..)) => held &= now == stored,
+                        _ => answers.push((*k, stored)),
+                    }
+                }
+                (held, answers)
+            } else {
+                (true, Vec::new())
+            };
+            let out = held.then(|| (e.adt_tys.clone(), e.requests.clone(), e.closures.clone(), e.vtables.clone()));
+            Some(Prejudged { stamp: e.stamp, held, answers, out })
+        })
+    }
+
+    /// `discovered` for a round entry `prejudge` judged (`pre`): the same
+    /// verdict and the same `memo` answers, as of this turn. An entry stored
+    /// since (a newer stamp) is judged here, as `discovered` does.
+    pub fn discovered_prejudged(&mut self, p: &Program, f: LocalDefId, pre: Option<Prejudged>) -> Option<Discovered> {
+        let def = p.def_id(f);
+        if !self.on || self.unstored.contains_key(&def) {
+            return None;
+        }
+        let Some(pre) = pre.filter(|pre| self.discovery.get(&def).is_some_and(|e| e.stamp == pre.stamp)) else {
+            return self.discovered(p, f);
+        };
+        let src = self.src_of(p, f)?;
+        let e = self.discovery.get_mut(&def)?;
+        if e.src != src {
+            return None;
+        }
+        if prejudge_check() {
+            prejudge_oracle(p, &self.memo, &self.keys, e, self.env, &pre);
+        }
+        // As `reads_dirty_memo`: every key is asked (no short cut), so each
+        // `Answer` key's first answer comes at this turn, as before.
+        let mut held = pre.held;
+        for (k, stored) in &pre.answers {
+            if *self.memo.entry(*k).or_insert_with(|| p.read_fingerprint(k)) != *stored {
+                held = false;
+            }
+        }
+        if !held {
+            return None;
+        }
+        let (adt_tys, reqs, closures, vtables) = pre.out?;
+        let mut requests = Vec::with_capacity(reqs.len());
+        for (def, args) in reqs {
+            let l = p.local_def(def.hash).filter(|&l| p.def_id(l) == def)?;
+            requests.push((l, args));
+        }
+        e.env = self.env;
+        self.discovery_reused += 1;
+        Some((adt_tys, requests, closures, vtables))
     }
 
     /// A copy of the last discovery output of the fn with def `def`, the
