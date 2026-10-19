@@ -1218,6 +1218,11 @@ impl GenReuse {
         if !held {
             return None;
         }
+        // LUST_CHECK_GENREUSE=1: an entry its environment keeps must hold by its reads
+        // too, as in `reads_hold`.
+        if e.env == self.env && super::genreuse_oracle::on() {
+            super::genreuse_oracle::kept_reads("a discovery entry", p, f, &e.reads, &self.keys, &mut self.memo);
+        }
         let (adt_tys, reqs, closures, vtables) = pre.out?;
         let mut requests = Vec::with_capacity(reqs.len());
         for (def, args) in reqs {

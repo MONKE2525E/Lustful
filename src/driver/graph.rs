@@ -2045,6 +2045,12 @@ pub(crate) fn value_fp(p: &Program, value: &crate::ty::consteval::ConstValue, ce
     })
 }
 
+thread_local! {
+    /// Set by a fingerprint that read state mono still writes
+    /// (`Program::read_fingerprint_stable`).
+    static MONO_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The fingerprint of one def's resolved signature (section 8.1 `Sig` node):
 /// signature types with defs in stable form, plus the def's visibility
 /// facts (`hash_vis_facts`). Types hash *deeply* (see
@@ -2056,12 +2062,6 @@ pub(crate) fn value_fp(p: &Program, value: &crate::ty::consteval::ConstValue, ce
 /// value invalidates nothing); type aliases fold their resolved target.
 /// Generics and predicates join when generic collect fills them
 /// (W-TRAITS-CORE); today they are empty for every user def.
-thread_local! {
-    /// Set by a fingerprint that read state mono still writes
-    /// (`Program::read_fingerprint_stable`).
-    static MONO_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     let mut h = FxHasher::default();
     "sig-v4".hash(&mut h);
@@ -2745,13 +2745,6 @@ impl<'a> Program {
         self.defs.kind_of(def)
     }
 
-    /// What one recorded read would answer in this program now, without
-    /// recording anything: the node fingerprint and failed flag the query
-    /// functions above would store today. The dirty walk compares this
-    /// with the stored read (section 8.2 rule 2). `Checked` reads carry a
-    /// mono body fingerprint this stage cannot recompute (no mono stage
-    /// records them yet), so they report a sentinel that never matches a
-    /// stored fingerprint: a body with such a read always rechecks.
     /// `read_fingerprint`, and whether the answer read state that mono
     /// still writes while it runs (an opaque definer's hidden type, in a
     /// `Sig` or in a set that folds one): such an answer can move between
@@ -2765,6 +2758,13 @@ impl<'a> Program {
         (read, stable)
     }
 
+    /// What one recorded read would answer in this program now, without
+    /// recording anything: the node fingerprint and failed flag the query
+    /// functions above would store today. The dirty walk compares this
+    /// with the stored read (section 8.2 rule 2). `Checked` reads carry a
+    /// mono body fingerprint this stage cannot recompute (no mono stage
+    /// records them yet), so they report a sentinel that never matches a
+    /// stored fingerprint: a body with such a read always rechecks.
     pub fn read_fingerprint(&self, key: &ReadKey) -> Read {
         match key {
             ReadKey::Binding(k) => {
