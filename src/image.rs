@@ -674,7 +674,10 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
         return Err("image pack: a raw length that is not whole pages".into());
     }
     let n = (len as usize).div_ceil(SECTION);
-    let level: c_int = std::env::var("LUST_FRONT_ZSTD_LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    // Level 6 (LUST_FRONT_ZSTD_LEVEL sets another): a CI restore waits on the disk for the
+    // packed bytes, and level 6 packs them 13-15% smaller than level 1 for about the same
+    // save time (tsgo merges 7-12: restore median ~1.44 -> ~1.18 s).
+    let level: c_int = std::env::var("LUST_FRONT_ZSTD_LEVEL").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
     let parts: Vec<std::sync::Mutex<Option<Vec<u8>>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let failed = std::sync::atomic::AtomicBool::new(false);
