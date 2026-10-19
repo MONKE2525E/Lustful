@@ -18,6 +18,10 @@ void lust_panic_at(const uint8_t *msg, uint64_t len, const char *file, uint32_t 
 void lust_oom(void) { abort(); }
 void lust_oom_size(uint64_t n) { (void)n; abort(); }
 
+/* runtime.h's copy helper for run-time lengths, which hash.c's element moves use. */
+#include <string.h>
+#define lust_copy_small(d, s, n) ((void)memmove((d), (s), (size_t)(n)))
+
 #define LUST_IMPL 1
 #include "../../src/runtime/hash.h"
 #include <stdio.h>

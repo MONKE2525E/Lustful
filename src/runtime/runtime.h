@@ -50,6 +50,50 @@ void *memcpy(void *, const void *, size_t);
 #define lust_black_box(p) __asm__ __volatile__("" : : "r"(p) : "memory")
 #endif
 
+/* A byte copy whose length is known only at run time but is often one small value: an
+   element of the runtime's type-erased Vec, hash table and sort, a short string, a Drain
+   tail. Up to 32 bytes it is a few loads and stores with no call, every load before any
+   store, so the ranges may overlap (a memmove); a longer copy calls memmove. tcc units
+   call lust_memmove, as before. */
+#ifdef __TINYC__
+#define lust_copy_small(d, s, n) lust_memmove((d), (s), (n))
+#else
+static inline __attribute__((always_inline)) void lust_copy_small(void *d, const void *s, uint64_t n) {
+    unsigned char *dp = (unsigned char *)d;
+    const unsigned char *sp = (const unsigned char *)s;
+    if (__builtin_expect(n > 32, 0)) {
+        __builtin_memmove(d, s, (size_t)n);
+    } else if (n > 16) {
+        uint64_t a, b, c, e;
+        __builtin_memcpy(&a, sp, 8);
+        __builtin_memcpy(&b, sp + 8, 8);
+        __builtin_memcpy(&c, sp + n - 16, 8);
+        __builtin_memcpy(&e, sp + n - 8, 8);
+        __builtin_memcpy(dp, &a, 8);
+        __builtin_memcpy(dp + 8, &b, 8);
+        __builtin_memcpy(dp + n - 16, &c, 8);
+        __builtin_memcpy(dp + n - 8, &e, 8);
+    } else if (n >= 8) {
+        uint64_t a, e;
+        __builtin_memcpy(&a, sp, 8);
+        __builtin_memcpy(&e, sp + n - 8, 8);
+        __builtin_memcpy(dp, &a, 8);
+        __builtin_memcpy(dp + n - 8, &e, 8);
+    } else if (n >= 4) {
+        uint32_t a, e;
+        __builtin_memcpy(&a, sp, 4);
+        __builtin_memcpy(&e, sp + n - 4, 4);
+        __builtin_memcpy(dp, &a, 4);
+        __builtin_memcpy(dp + n - 4, &e, 4);
+    } else if (n) {
+        unsigned char a = sp[0], b = sp[n >> 1], c = sp[n - 1];
+        dp[0] = a;
+        dp[n >> 1] = b;
+        dp[n - 1] = c;
+    }
+}
+#endif
+
 
 #if defined(_WIN32) && defined(LUST_IMPL)
 /* The Win32 thread layer (rel-win): the runtime names pthread calls

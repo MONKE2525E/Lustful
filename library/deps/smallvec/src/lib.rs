@@ -331,11 +331,10 @@ impl<A: Array> SmallVec<A> {
         let mut w: usize = 1;
         let mut r = 1;
         while r < len {
-            // Item r leaves the Vec for the call (a move, not observable)
-            // so both can be borrowed mutably; then it goes back.
-            let mut cur = self.items.remove(r);
-            let same = same_bucket(&mut cur, &mut self.items[w - 1]);
-            self.items.insert(r, cur);
+            // Items r and w - 1 (w <= r) borrowed mutably at once, as
+            // upstream's raw pointers do: no element leaves the Vec.
+            let (head, tail) = self.items.split_at_mut(r);
+            let same = same_bucket(&mut tail[0], &mut head[w - 1]);
             if !same {
                 if r != w {
                     self.items.swap(r, w);

@@ -11973,7 +11973,7 @@ fn glue_def_value(
                     }
                     if c_layout(p, e).is_none_or(|l| l.size > 0) {
                         let et = ctype(e);
-                        let _ = writeln!(body, "  lust_memmove((({et}*)dv->ptr) + p->start, (({et}*)dv->ptr) + p->tail_start, p->tail_len * sizeof({et}));");
+                        let _ = writeln!(body, "  lust_copy_small((({et}*)dv->ptr) + p->start, (({et}*)dv->ptr) + p->tail_start, p->tail_len * sizeof({et}));");
                     }
                     body.push_str("  dv->len = p->start + p->tail_len;\n");
                 }
@@ -11981,7 +11981,7 @@ fn glue_def_value(
                     // The bytes not yielded are removed: the tail
                     // moves down to the drain start.
                     body.push_str("  lust_String *dv = (lust_String *)p->vec;\n");
-                    body.push_str("  lust_memmove(dv->ptr + p->start, dv->ptr + p->tail_start, p->tail_len);\n");
+                    body.push_str("  lust_copy_small(dv->ptr + p->start, dv->ptr + p->tail_start, p->tail_len);\n");
                     body.push_str("  dv->len = p->start + p->tail_len;\n");
                 }
                 CTy::Rc(e) => {
@@ -12265,7 +12265,7 @@ fn glue_def_value(
                     if is_copy_c(p, e) && !written(e) {
                         // std's TrivialClone path: one byte copy, free for
                         // zero-sized elements.
-                        let _ = writeln!(body, "  memcpy(r.ptr, p->ptr, p->len * sizeof({et}));\n  r.len = p->len;\n  return r;");
+                        let _ = writeln!(body, "  lust_copy_small(r.ptr, p->ptr, p->len * sizeof({et}));\n  r.len = p->len;\n  return r;");
                     } else {
                         let c = clone_of(e, &format!("(({et}*)p->ptr)[i]"), &mut need);
                         let _ = writeln!(body, "  for (uint64_t i = 0; i < p->len; i++) (({et}*)r.ptr)[i] = {c};\n  r.len = p->len;\n  return r;");

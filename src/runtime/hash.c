@@ -437,7 +437,7 @@ static void lh_rehash_in_place(lust_hash_table *t, lust_hash_of_fn hash_of, void
             lh_set_ctrl_hash(t, new_i, hash);
             if (prev == LUST_HASH_EMPTY) {
                 lh_set_ctrl(t, i, LUST_HASH_EMPTY);
-                memcpy(lh_slot(t, new_i), lh_slot(t, i), (size_t)t->elem_size);
+                lust_copy_small(lh_slot(t, new_i), lh_slot(t, i), t->elem_size);
                 break;
             }
             /* prev is DELETED: swap the two elements and retry bucket i. */
@@ -469,7 +469,7 @@ static void lh_resize_inner(lust_hash_table *t, uint64_t capacity, lust_hash_of_
             uint8_t old;
             uint64_t ni = lh_prepare_insert_index(&nt, hash, &old);
             (void)old;
-            memcpy(lh_slot(&nt, ni), lh_slot(t, i), (size_t)t->elem_size);
+            lust_copy_small(lh_slot(&nt, ni), lh_slot(t, i), t->elem_size);
         }
     }
     nt.growth_left -= t->items;
@@ -576,7 +576,7 @@ void *lust_hash_insert_no_grow_slot(lust_hash_table *t, uint64_t hash, uint64_t 
 }
 
 void lust_hash_erase_at(lust_hash_table *t, uint64_t index, void *out_elem) {
-    if (out_elem && t->elem_size) memcpy(out_elem, lh_slot(t, index), (size_t)t->elem_size);
+    if (out_elem && t->elem_size) lust_copy_small(out_elem, lh_slot(t, index), t->elem_size);
     lh_erase(t, index);
 }
 

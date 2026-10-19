@@ -39,9 +39,9 @@ void lust_sort_swap(lust_sort_cx *s, uint8_t *a, uint8_t *b) LUST_BODY({
     uint64_t left = s->size;
     while (left) {
         uint64_t n = left < 64 ? left : 64;
-        memcpy(tmp, a, n);
-        memcpy(a, b, n);
-        memcpy(b, tmp, n);
+        lust_copy_small(tmp, a, n);
+        lust_copy_small(a, b, n);
+        lust_copy_small(b, tmp, n);
         a += n;
         b += n;
         left -= n;
@@ -83,16 +83,16 @@ void lust_sort_insert_tail(lust_sort_cx *s, uint8_t *begin, uint8_t *tail) LUST_
     if (!LS_LESS(tail, sift)) return;
     lust_sort_tmp t;
     uint8_t *tmp = lust_sort_tmp_get(s, &t);
-    memcpy(tmp, tail, s->size);
+    lust_copy_small(tmp, tail, s->size);
     uint8_t *gap = tail;
     for (;;) {
-        memcpy(gap, sift, s->size);
+        lust_copy_small(gap, sift, s->size);
         gap = sift;
         if (sift == begin) break;
         sift -= s->size;
         if (!LS_LESS(tmp, sift)) break;
     }
-    memcpy(gap, tmp, s->size);
+    lust_copy_small(gap, tmp, s->size);
     lust_sort_tmp_free(&t);
 })
 
@@ -118,10 +118,10 @@ void lust_sort_sort4_stable(lust_sort_cx *s, uint8_t *v, uint8_t *dst) LUST_BODY
     uint8_t c5 = LS_LESS(unknown_right, unknown_left);
     uint8_t *lo = c5 ? unknown_right : unknown_left;
     uint8_t *hi = c5 ? unknown_left : unknown_right;
-    memcpy(LS_AT(dst, 0), min, s->size);
-    memcpy(LS_AT(dst, 1), lo, s->size);
-    memcpy(LS_AT(dst, 2), hi, s->size);
-    memcpy(LS_AT(dst, 3), max, s->size);
+    lust_copy_small(LS_AT(dst, 0), min, s->size);
+    lust_copy_small(LS_AT(dst, 1), lo, s->size);
+    lust_copy_small(LS_AT(dst, 2), hi, s->size);
+    lust_copy_small(LS_AT(dst, 3), max, s->size);
 })
 
 void lust_sort_ord_violation(void) LUST_BODY({
@@ -138,13 +138,13 @@ void lust_sort_bidir_merge(lust_sort_cx *s, uint8_t *src, uint64_t len, uint8_t 
     for (uint64_t i = 0; i < half; i++) {
         /* merge_up */
         uint8_t is_l = !LS_LESS(right, left);
-        memcpy(out, is_l ? left : right, sz);
+        lust_copy_small(out, is_l ? left : right, sz);
         right += is_l ? 0 : sz;
         left += is_l ? sz : 0;
         out += sz;
         /* merge_down */
         is_l = !LS_LESS(right_rev, left_rev);
-        memcpy(out_rev, is_l ? right_rev : left_rev, sz);
+        lust_copy_small(out_rev, is_l ? right_rev : left_rev, sz);
         right_rev -= is_l ? sz : 0;
         left_rev -= is_l ? 0 : sz;
         out_rev -= sz;
@@ -152,7 +152,7 @@ void lust_sort_bidir_merge(lust_sort_cx *s, uint8_t *src, uint64_t len, uint8_t 
     uint8_t *left_end = left_rev + sz, *right_end = right_rev + sz;
     if (len % 2 != 0) {
         uint8_t left_nonempty = left < left_end;
-        memcpy(out, left_nonempty ? left : right, sz);
+        lust_copy_small(out, left_nonempty ? left : right, sz);
         left += left_nonempty ? sz : 0;
         right += left_nonempty ? 0 : sz;
     }
@@ -179,8 +179,8 @@ void lust_sort_small_general(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t 
         lust_sort_sort4_stable(s, LS_AT(v, half), LS_AT(scratch, half));
         presorted = 4;
     } else {
-        memcpy(scratch, v, s->size);
-        memcpy(LS_AT(scratch, half), LS_AT(v, half), s->size);
+        lust_copy_small(scratch, v, s->size);
+        lust_copy_small(LS_AT(scratch, half), LS_AT(v, half), s->size);
         presorted = 1;
     }
     for (int k = 0; k < 2; k++) {
@@ -188,7 +188,7 @@ void lust_sort_small_general(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t 
         uint8_t *src = LS_AT(v, offset), *dst = LS_AT(scratch, offset);
         uint64_t desired = k == 0 ? half : len - half;
         for (uint64_t i = presorted; i < desired; i++) {
-            memcpy(LS_AT(dst, i), LS_AT(src, i), s->size);
+            lust_copy_small(LS_AT(dst, i), LS_AT(src, i), s->size);
             lust_sort_insert_tail(s, dst, LS_AT(dst, i));
         }
     }
@@ -239,7 +239,7 @@ void lust_sort_small_network(lust_sort_cx *s, uint8_t *v, uint64_t len) LUST_BOD
     uint8_t stack_buf[32 * 8] __attribute__((aligned(16)));
     uint8_t *stack = s->align <= 16 ? stack_buf : (uint8_t *)lust_alloc(sizeof stack_buf, s->align);
     lust_sort_bidir_merge(s, v, len, stack);
-    memcpy(v, stack, len * s->size);
+    lust_copy_small(v, stack, len * s->size);
     if (stack != stack_buf) free(stack);
 })
 
@@ -291,13 +291,13 @@ void lust_sort_merge(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *scratch
     uint8_t left_shorter = left_len <= right_len;
     uint8_t *save_base = left_shorter ? v : v_mid;
     uint64_t save_len = left_shorter ? left_len : right_len;
-    memcpy(buf, save_base, save_len * sz);
+    lust_copy_small(buf, save_base, save_len * sz);
     uint8_t *start = buf, *end = buf + save_len * sz, *dst = save_base;
     if (left_shorter) {
         uint8_t *right = v_mid;
         while (start != end && right != v_end) {
             uint8_t consume_left = !LS_LESS(right, start);
-            memcpy(dst, consume_left ? start : right, sz);
+            lust_copy_small(dst, consume_left ? start : right, sz);
             start += consume_left ? sz : 0;
             right += consume_left ? 0 : sz;
             dst += sz;
@@ -308,13 +308,13 @@ void lust_sort_merge(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *scratch
             uint8_t *left = dst - sz, *right = end - sz;
             out -= sz;
             uint8_t consume_left = LS_LESS(right, left);
-            memcpy(out, consume_left ? left : right, sz);
+            lust_copy_small(out, consume_left ? left : right, sz);
             dst = consume_left ? left : left + sz;
             end = consume_left ? right + sz : right;
             if (dst == v || end == buf) break;
         }
     }
-    memcpy(dst, start, (uint64_t)(end - start));
+    lust_copy_small(dst, start, (uint64_t)(end - start));
 })
 
 void lust_sort_drift(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *scratch, uint64_t scratch_len, uint8_t eager_sort);
@@ -334,21 +334,21 @@ uint64_t lust_sort_stable_partition(lust_sort_cx *s, uint8_t *v, uint64_t len, u
             uint8_t towards_left = inv ? !LS_LESS(pivot, scan) : LS_LESS(scan, pivot);
             scratch_rev -= sz;
             uint8_t *dst = (towards_left ? scratch : scratch_rev) + num_left * sz;
-            memcpy(dst, scan, sz);
+            lust_copy_small(dst, scan, sz);
             num_left += towards_left;
             scan += sz;
         }
         if (loop_end_pos == len) break;
         scratch_rev -= sz;
         pivot_in_scratch = (pivot_goes_left ? scratch : scratch_rev) + num_left * sz;
-        memcpy(pivot_in_scratch, scan, sz);
+        lust_copy_small(pivot_in_scratch, scan, sz);
         num_left += pivot_goes_left;
         scan += sz;
         loop_end_pos = len;
     }
-    if (!s->freeze) memcpy(pivot_in_scratch, pivot, sz);
-    memcpy(v, scratch, num_left * sz);
-    for (uint64_t i = 0; i < len - num_left; i++) memcpy(LS_AT(v, num_left + i), LS_AT(scratch, len - 1 - i), sz);
+    if (!s->freeze) lust_copy_small(pivot_in_scratch, pivot, sz);
+    lust_copy_small(v, scratch, num_left * sz);
+    for (uint64_t i = 0; i < len - num_left; i++) lust_copy_small(LS_AT(v, num_left + i), LS_AT(scratch, len - 1 - i), sz);
     return num_left;
 })
 
@@ -368,7 +368,7 @@ void lust_sort_stable_quick(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *
         uint64_t pivot_pos = lust_sort_choose_pivot(s, v, len);
         lust_sort_tmp t;
         uint8_t *pivot_copy = lust_sort_tmp_get(s, &t);
-        memcpy(pivot_copy, LS_AT(v, pivot_pos), s->size);
+        lust_copy_small(pivot_copy, LS_AT(v, pivot_pos), s->size);
         uint8_t *pivot_ref = s->freeze ? pivot_copy : 0;
         uint8_t perform_equal = 0;
         if (left_ancestor_pivot) perform_equal = !LS_LESS(left_ancestor_pivot, LS_AT(v, pivot_pos));
@@ -550,7 +550,7 @@ uint64_t lust_sort_lomuto(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *pi
     if (len == 0) return 0;
     lust_sort_tmp t;
     uint8_t *gap_value = lust_sort_tmp_get(s, &t);
-    memcpy(gap_value, v, sz);
+    lust_copy_small(gap_value, v, sz);
     uint64_t num_lt = 0;
     uint8_t *right = LS_AT(v, 1), *gap_pos = v, *end = LS_AT(v, len);
     for (;;) {
@@ -558,8 +558,8 @@ uint64_t lust_sort_lomuto(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *pi
         if (is_done) right = gap_value;
         uint8_t right_is_lt = lust_sort_cmp(s, right, pivot, inv);
         uint8_t *left = LS_AT(v, num_lt);
-        memmove(gap_pos, left, sz);
-        memcpy(left, right, sz);
+        lust_copy_small(gap_pos, left, sz);
+        lust_copy_small(left, right, sz);
         gap_pos = right;
         num_lt += right_is_lt;
         right += sz;
@@ -584,15 +584,15 @@ uint64_t lust_sort_hoare(lust_sort_cx *s, uint8_t *v, uint64_t len, uint8_t *piv
         }
         if (left >= right) break;
         if (!gap_pos) {
-            memcpy(gap_value, left, sz);
+            lust_copy_small(gap_value, left, sz);
         } else {
-            memcpy(gap_pos, left, sz);
+            lust_copy_small(gap_pos, left, sz);
         }
         gap_pos = right;
-        memcpy(left, right, sz);
+        lust_copy_small(left, right, sz);
         left += sz;
     }
-    if (gap_pos) memcpy(gap_pos, gap_value, sz);
+    if (gap_pos) lust_copy_small(gap_pos, gap_value, sz);
     lust_sort_tmp_free(&t);
     return (uint64_t)(left - v) / sz;
 })

@@ -181,7 +181,7 @@ lust_String lust_string_with_capacity(uint64_t n) LUST_BODY({
 void lust_string_push_bytes(lust_String *s, const void *p, uint64_t n) LUST_BODY({
     if (!n) return;
     lust_string_reserve(s, n);
-    memcpy(s->ptr + s->len, p, n);
+    lust_copy_small(s->ptr + s->len, p, n);
     s->len += n;
 })
 
@@ -1560,7 +1560,7 @@ void lust_vec_insert_at(lust_Vec *v, uint64_t i, uint64_t elem, uint64_t align, 
         return;
     }
     lust_vec_reserve(v, 1, elem, align);
-    memmove((char *)v->ptr + (i + 1) * elem, (char *)v->ptr + i * elem, (v->len - i) * elem);
+    lust_copy_small((char *)v->ptr + (i + 1) * elem, (char *)v->ptr + i * elem, (v->len - i) * elem);
     v->len++;
 })
 
@@ -1577,7 +1577,7 @@ void lust_vec_check_remove(lust_Vec *v, uint64_t i, lust_loc loc) LUST_BODY({
 })
 
 void lust_vec_remove_at(lust_Vec *v, uint64_t i, uint64_t elem) LUST_BODY({
-    memmove((char *)v->ptr + i * elem, (char *)v->ptr + (i + 1) * elem, (v->len - i - 1) * elem);
+    lust_copy_small((char *)v->ptr + i * elem, (char *)v->ptr + (i + 1) * elem, (v->len - i - 1) * elem);
     v->len--;
 })
 
