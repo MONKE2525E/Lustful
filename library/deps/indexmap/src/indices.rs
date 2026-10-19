@@ -62,15 +62,9 @@ fn capacity_to_buckets(cap: usize) -> Option<usize> {
 }
 
 impl Indices {
-    /// The empty table (no allocation in hashbrown).
+    /// The empty table (no allocation in hashbrown; one here, of `WIDTH` bytes).
     pub(crate) fn new() -> Indices {
-        let mut ctrl = Vec::new();
-        let mut i = 0;
-        while i < WIDTH {
-            ctrl.push(EMPTY);
-            i += 1;
-        }
-        Indices { ctrl, slots: Vec::new(), bucket_mask: 0, items: 0, growth_left: 0 }
+        Indices { ctrl: vec![EMPTY; WIDTH], slots: Vec::new(), bucket_mask: 0, items: 0, growth_left: 0 }
     }
 
     /// A table that holds `capacity` items without growing.
@@ -82,19 +76,13 @@ impl Indices {
             Some(b) => b,
             None => panic!("Hash table capacity overflow"),
         };
-        let mut ctrl = Vec::new();
-        let mut slots = Vec::new();
-        let mut i = 0;
-        while i < buckets + WIDTH {
-            ctrl.push(EMPTY);
-            i += 1;
+        Indices {
+            ctrl: vec![EMPTY; buckets + WIDTH],
+            slots: vec![0; buckets],
+            bucket_mask: buckets - 1,
+            items: 0,
+            growth_left: bucket_mask_to_capacity(buckets - 1),
         }
-        i = 0;
-        while i < buckets {
-            slots.push(0);
-            i += 1;
-        }
-        Indices { ctrl, slots, bucket_mask: buckets - 1, items: 0, growth_left: bucket_mask_to_capacity(buckets - 1) }
     }
 
     pub(crate) fn len(&self) -> usize {

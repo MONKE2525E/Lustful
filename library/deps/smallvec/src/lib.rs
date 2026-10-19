@@ -120,8 +120,21 @@ impl<A: Array> SmallVec<A> {
     pub fn push(&mut self, value: A::Item) {
         if self.items.len() == self.capacity() {
             self.reserve_one_unchecked();
+        } else if self.items.len() == self.items.capacity() {
+            self.fill_inline();
         }
         self.items.push(value);
+    }
+
+    /// Inline, upstream's buffer holds `inline_size()` items with no allocation: here the
+    /// Vec gets them in one allocation, not grown from 4 a push at a time (at most 256
+    /// bytes; a larger inline buffer keeps Vec growth).
+    fn fill_inline(&mut self) {
+        let size = core::mem::size_of::<A::Item>();
+        let inline = SmallVec::<A>::inline_capacity();
+        if size > 0 && inline * size <= 256 && self.items.len() < inline {
+            self.items.reserve_exact(inline - self.items.len());
+        }
     }
 
     pub fn pop(&mut self) -> Option<A::Item> {
@@ -253,6 +266,8 @@ impl<A: Array> SmallVec<A> {
     pub fn insert(&mut self, index: usize, element: A::Item) {
         if self.items.len() == self.capacity() {
             self.reserve_one_unchecked();
+        } else if self.items.len() == self.items.capacity() {
+            self.fill_inline();
         }
         if index > self.items.len() {
             panic!("index exceeds length");
@@ -471,7 +486,12 @@ impl<A: Array> Extend<A::Item> for SmallVec<A> {
         let cap = self.capacity();
         while self.items.len() < cap {
             match iter.next() {
-                Some(x) => self.items.push(x),
+                Some(x) => {
+                    if self.items.len() == self.items.capacity() {
+                        self.fill_inline();
+                    }
+                    self.items.push(x)
+                }
                 None => return,
             }
         }
@@ -492,7 +512,12 @@ impl<A: Array> FromIterator<A::Item> for SmallVec<A> {
         let cap = v.capacity();
         while v.items.len() < cap {
             match iter.next() {
-                Some(x) => v.items.push(x),
+                Some(x) => {
+                    if v.items.len() == v.items.capacity() {
+                        v.fill_inline();
+                    }
+                    v.items.push(x)
+                }
                 None => return v,
             }
         }
