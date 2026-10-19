@@ -6442,11 +6442,49 @@ fn eval_pending_items(
         goals: Vec::new(),
         tmpls,
         quals: HashMap::default(),
+        body_modules: HashMap::default(),
     };
+    cx.body_modules = body_item_modules(cx.p, &cx.pending);
     for i in 0..n {
         cx.eval_pending(i);
     }
     Some(EvaluatedItems { pending: cx.pending, static_count, tmpls: cx.tmpls, goals: cx.goals, quals: cx.quals })
+}
+
+/// The module of each pending body item's initializer (`CollectCx::
+/// pending_module`): the module of the smallest fn expression range that
+/// holds it, the first such fn in fn order on a tie, among fns whose
+/// module is known. One pass over the fns answers every item (the fns do
+/// not change while consts evaluate), in place of a pass per item.
+fn body_item_modules(p: &Program, pending: &[(PendingConst, PendingState)]) -> HashMap<u32, Option<crate::ty::defs::ModuleId>> {
+    let mut out: HashMap<u32, Option<crate::ty::defs::ModuleId>> = HashMap::default();
+    let Some(tables) = p.resolved.as_deref() else { return out };
+    let mut exprs: Vec<u32> =
+        pending.iter().map(|(it, _)| it).filter(|it| it.stmt_idx.is_some() && !tables.const_init_module.contains_key(&it.span)).map(|it| it.expr.0).collect();
+    exprs.sort_unstable();
+    exprs.dedup();
+    if exprs.is_empty() {
+        return out;
+    }
+    let mut best: Vec<Option<(u32, crate::ty::defs::ModuleId)>> = vec![None; exprs.len()];
+    for (i, f) in p.fns.iter().enumerate() {
+        let (lo, hi) = f.def(&p.ast).exprs;
+        let size = hi.wrapping_sub(lo);
+        let (a, b) = (exprs.partition_point(|&e| e < lo), exprs.partition_point(|&e| e < hi));
+        let mut module: Option<Option<crate::ty::defs::ModuleId>> = None;
+        for k in a..b {
+            if best[k].is_none_or(|(s, _)| size < s) {
+                let m = *module.get_or_insert_with(|| def_module_of_fn(p, i).or_else(|| tables.fn_module.get(i).copied()));
+                if let Some(m) = m {
+                    best[k] = Some((size, m));
+                }
+            }
+        }
+    }
+    for (k, e) in exprs.into_iter().enumerate() {
+        out.insert(e, best[k].map(|(_, m)| m));
+    }
+    out
 }
 
 /// What `eval_pending_items` gives: each item with its state, the
@@ -7424,6 +7462,9 @@ enum ScopeItem {
 /// The const evaluator's context over the collected tables.
 struct CollectCx<'x> {
     p: &'x mut Program,
+    /// `pending_module`'s answer for each body item's initializer, by
+    /// expression (`body_item_modules`).
+    body_modules: HashMap<u32, Option<crate::ty::defs::ModuleId>>,
     /// The program's Ast, borrowed apart from `p` (const evaluation reads
     /// it while it writes the program's type store).
     ast: &'x Ast,
@@ -7536,19 +7577,7 @@ impl CollectCx<'_> {
         if it.stmt_idx.is_none() {
             return None;
         }
-        let mut best: Option<(u32, crate::ty::defs::ModuleId)> = None;
-        for (i, f) in self.p.fns.iter().enumerate() {
-            let (lo, hi) = f.def(&self.p.ast).exprs;
-            if it.expr.0 >= lo && it.expr.0 < hi {
-                let size = hi - lo;
-                if best.is_none_or(|(b, _)| size < b)
-                    && let Some(m) = def_module_of_fn(self.p, i).or_else(|| tables.fn_module.get(i).copied())
-                {
-                    best = Some((size, m));
-                }
-            }
-        }
-        best.map(|(_, m)| m)
+        self.body_modules.get(&it.expr.0).copied().flatten()
     }
 
     /// The body item `name` denotes in the scope now evaluating,
