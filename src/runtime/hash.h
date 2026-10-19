@@ -444,6 +444,81 @@ void lust_index_drain_range(lust_index_table *t, uint64_t start, uint64_t end, l
    Required after the caller reorders or rewrites entry bytes. */
 void lust_index_rebuild(lust_index_table *t);
 
+#if !defined(__TINYC__) && !defined(LUST_IMPL) && !defined(LUST_NO_INL)
+/* Units an optimizing C compiler builds (inl.h's rule: not tcc, the runtime unit or
+   -DLUST_NO_INL) run a hash lookup's probe in the caller's unit, as hashbrown's
+   monomorphized find runs in rustc's code: the key compare is the caller's eq glue, a known
+   fn that clang calls directly or inlines. hash.c's order and results (lh_find_inner):
+   h1 = hash & mask, a triangular stride of one group, matches in bit order, stop at a group
+   with an EMPTY byte. The group test is hash.c's: one SSE2 load on x86_64 (vector builtins:
+   units read no system header), its SWAR otherwise (a SWAR tag test may also flag the byte
+   above a match, a candidate eq rejects). */
+#if LUST_HASH_GROUP_WIDTH == 16 && defined(__SSE2__)
+typedef char lust_hash_v16_ __attribute__((vector_size(16)));
+static inline uint32_t lust_hash_group_(const uint8_t *ctrl, uint8_t tag, uint32_t *empty) {
+    lust_hash_v16_ g, zero = {0};
+    __builtin_memcpy(&g, ctrl, 16);
+    *empty = (uint32_t)__builtin_ia32_pmovmskb128((lust_hash_v16_)(g == zero + (char)LUST_HASH_EMPTY));
+    return (uint32_t)__builtin_ia32_pmovmskb128((lust_hash_v16_)(g == zero + (char)tag));
+}
+#else
+static inline uint32_t lust_hash_bytes_(uint64_t w, uint8_t b) {
+    uint64_t x = w ^ (b * 0x0101010101010101ull);
+    uint64_t spread = (x - 0x0101010101010101ull) & ~x & 0x8080808080808080ull;
+    return (uint32_t)((((spread >> 7) & 0x0101010101010101ull) * 0x0102040810204080ull) >> 56);
+}
+static inline uint32_t lust_hash_group_(const uint8_t *ctrl, uint8_t tag, uint32_t *empty) {
+    uint32_t tb = 0, eb = 0;
+    for (uint32_t off = 0; off < LUST_HASH_GROUP_WIDTH; off += 8) {
+        uint64_t w;
+        __builtin_memcpy(&w, ctrl + off, 8);
+        tb |= lust_hash_bytes_(w, tag) << off;
+        eb |= lust_hash_bytes_(w, LUST_HASH_EMPTY) << off;
+    }
+    *empty = eb;
+    return tb;
+}
+#endif
+static inline void *lust_hash_find_inl_(const lust_hash_table *t, uint64_t hash, lust_hash_eq_fn eq, void *ctx, uint64_t *out) {
+    uint8_t tag = lust_hash_tag(hash);
+    uint64_t mask = t->bucket_mask, pos = hash & mask, stride = 0;
+    for (;;) {
+        uint32_t empty, m = lust_hash_group_(t->ctrl + pos, tag, &empty);
+        while (m) {
+            uint64_t index = (pos + (uint64_t)__builtin_ctz(m)) & mask;
+            m &= m - 1;
+            void *slot = (void *)(t->data + index * t->elem_size);
+            if (eq(ctx, slot)) {
+                if (out) *out = index;
+                return slot;
+            }
+        }
+        if (empty) return 0;
+        stride += LUST_HASH_GROUP_WIDTH;
+        pos = (pos + stride) & mask;
+    }
+}
+/* The function reserves room for one first, which may move every element; with room that is
+   a no-op, so a hit is found here. A miss or a full table calls it (it finds the insert
+   index). */
+static inline int lust_hash_find_or_insert_inl_(lust_hash_table *t, uint64_t hash, lust_hash_eq_fn eq, void *ctx,
+                                                lust_hash_of_fn hash_of, void *hash_ctx, void **out_slot, uint64_t *out_index) {
+    if (t->growth_left != 0) {
+        uint64_t index;
+        void *slot = lust_hash_find_inl_(t, hash, eq, ctx, &index);
+        if (slot) {
+            if (out_slot) *out_slot = slot;
+            if (out_index) *out_index = index;
+            return 1;
+        }
+    }
+    return lust_hash_find_or_insert(t, hash, eq, ctx, hash_of, hash_ctx, out_slot, out_index);
+}
+#define lust_hash_find(t, hash, eq, ctx, out) lust_hash_find_inl_((t), (hash), (eq), (ctx), (out))
+#define lust_hash_find_or_insert(t, hash, eq, ctx, hash_of, hash_ctx, out_slot, out_index) \
+    lust_hash_find_or_insert_inl_((t), (hash), (eq), (ctx), (hash_of), (hash_ctx), (out_slot), (out_index))
+#endif
+
 #ifdef LUST_IMPL
 #include "hash.c"
 #endif
