@@ -4307,8 +4307,8 @@ impl FnGen<'_, '_> {
             Rvalue::Use(o) => self.operand(o, loc, post).0,
             Rvalue::Ref(_, pl) => {
                 if let Some(a) = self.const_zst_addr(pl) {
-                    let (_, t) = self.place(pl, loc);
-                    return format!("(({} *){a})", ctype(&t));
+                    let (e, t) = self.place(pl, loc);
+                    return format!("({}(({} *){a}))", zst_checks(pl, &e), ctype(&t));
                 }
                 // Release C: taking an address needs no definition of the place's type.
                 self.addr_only = true;
@@ -4350,7 +4350,7 @@ impl FnGen<'_, '_> {
             Rvalue::SliceOf(pl) => {
                 let (e, t) = self.kplace(pl, loc);
                 if let (Some(a), CTy::Array(el, n)) = (self.const_zst_addr(pl), &t) {
-                    return format!("(({}){{ ({} *){a}, {n} }})", ctype(&CTy::Slice(el.clone())), ctype(el));
+                    return format!("({}(({}){{ ({} *){a}, {n} }}))", zst_checks(pl, &e), ctype(&CTy::Slice(el.clone())), ctype(el));
                 }
                 self.slice_of(&e, &t)
             }
@@ -10355,6 +10355,13 @@ fn is_hot(hot: &HashSet<u64>, id: &str) -> bool {
 
 /// The largest fn definition a unit copies (`inline_callees`), by its `#[inline]`
 /// attribute; 0 copies none.
+/// The checks a `const_zst_addr` place still runs before its address is used: the
+/// place's bounds checks (`[7u8; 0][i]` must panic, rustc's "index out of bounds"),
+/// as the C text of the place `e` holds them. Empty for a place with no index.
+fn zst_checks(pl: &Place, e: &str) -> String {
+    if pl.proj.iter().any(|pr| matches!(pr, Proj::Index(_))) { format!("(void)&({e}), ") } else { String::new() }
+}
+
 fn inline_limit(a: InlineAttr) -> usize {
     match a {
         InlineAttr::None => INLINE_BYTES,
