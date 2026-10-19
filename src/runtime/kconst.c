@@ -265,11 +265,41 @@ static const void *lust_kfind(const void *p, uint64_t n, uint64_t align, const u
     return e->addr;
 }
 
-static void lust_klock_take(void) {
+/* A spin-wait hint: lets the core that holds the lock run, and stops the
+   wait loop from filling the pipeline with loads. */
+static void lust_kpause(void) {
+#if !defined(__TINYC__) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_ia32_pause();
+#elif !defined(__TINYC__) && defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+/* Takes the table lock, or returns 0 without it as soon as `*cache` (when
+   given) holds an address, which another thread published for the same
+   site. A waiter reads the lock word with a pause between reads (test and
+   test-and-set): an exchange in a loop would take the cache line from the
+   holder on every try. */
+static int lust_klock_take(const void **cache, const void **r) {
     int32_t one = 1, old;
+    /* Each load goes into a local: tcc's __atomic_load does not write through a result
+       pointer that is not the address of a variable. */
+    const void *v;
     for (;;) {
+        if (cache) {
+            __atomic_load(cache, &v, 2);
+            if (v) return *r = v, 0;
+        }
         __atomic_exchange(&lust_klock, &one, &old, 2);
-        if (!old) return;
+        if (!old) return 1;
+        do {
+            lust_kpause();
+            if (cache) {
+                __atomic_load(cache, &v, 2);
+                if (v) return *r = v, 0;
+            }
+            __atomic_load(&lust_klock, &old, 0);
+        } while (old);
     }
 }
 
@@ -280,11 +310,18 @@ static void lust_klock_give(void) {
 #endif
 
 /* The canonical address of the `n` bytes at `p`
-   (alignment `align`, descriptor `desc`), stored into `*cache`. */
+   (alignment `align`, descriptor `desc`), stored into `*cache`. Threads
+   that run a site for the first time together all come here: one interns,
+   and the others return its address once it is in the site's slot, without
+   taking the lock. */
 const void *lust_kintern(const void **cache, const void *p, uint64_t n, uint64_t align, const uint64_t *desc) LUST_BODY({
-    lust_klock_take();
-    const void *r = lust_kfind(p, n, align, desc, 1);
-    __atomic_store(cache, &r, 3);
+    const void *r;
+    if (!lust_klock_take(cache, &r)) return r;
+    __atomic_load(cache, &r, 0);
+    if (!r) {
+        r = lust_kfind(p, n, align, desc, 1);
+        __atomic_store(cache, &r, 3);
+    }
     lust_klock_give();
     return r;
 })
@@ -292,7 +329,7 @@ const void *lust_kintern(const void **cache, const void *p, uint64_t n, uint64_t
 /* A static's pointee of `n` bytes at `p`, as the canonical storage of
    its content (the glue unit's lust_kstatics_init, before main). */
 void lust_kreg(const void *p, uint64_t n, uint64_t align, const uint64_t *desc) LUST_BODY({
-    lust_klock_take();
+    (void)lust_klock_take(0, 0);
     (void)lust_kfind(p, n, align, desc, 0);
     lust_klock_give();
 })
