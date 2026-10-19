@@ -354,6 +354,15 @@ pub(super) fn frame_glue(m: &str, ct: &str, body: &str) -> Option<String> {
         let line = &body[body[..d.start].rfind('\n').map_or(0, |n| n + 1)..d.start];
         line.trim_start().starts_with(FOR_I)
     };
+    // One drop with nothing after it (an Option's or a one-field struct's glue): a panic
+    // there leaves nothing to drop, so the frame's cleanup would do nothing. The plain
+    // body keeps the glue inlinable (`fn_unit_parts` inlines only plain glue).
+    if let [d] = stmts.as_slice()
+        && !has_loop
+        && nothing_after(&body[d.end..])
+    {
+        return Some(format!("void drop_{m}({ct} *p) {{\n{body}}}\n"));
+    }
     let (mut fast, mut rest) = (String::with_capacity(body.len() + 64), String::with_capacity(body.len() + 64));
     let mut copied = 0;
     for (k, d) in stmts.iter().enumerate() {
@@ -411,6 +420,21 @@ pub(super) fn frame_glue(m: &str, ct: &str, body: &str) -> Option<String> {
     out.push_str(&tail);
     out.push_str("}\n");
     Some(out)
+}
+
+/// True when glue text after a drop statement runs nothing more: only closing braces,
+/// `break;` and the switch labels after it (`case N:`, `default:`).
+fn nothing_after(rest: &str) -> bool {
+    let mut s: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+    s = s.replace("break;", "").replace("default:", "");
+    while let Some(i) = s.find("case") {
+        let digits = s[i + 4..].chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 || s.as_bytes().get(i + 4 + digits) != Some(&b':') {
+            return false;
+        }
+        s.replace_range(i..i + 4 + digits + 1, "");
+    }
+    s.chars().all(|c| c == '}' || c == ';')
 }
 
 /// The blocks of `body` that are cleanup: every block reachable from a
@@ -592,7 +616,23 @@ fn stmt_start(b: &[u8], at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_calls;
+    use super::{frame_glue, wrap_calls};
+
+    #[test]
+    fn frame_glue_skips_a_frame_with_nothing_to_clean() {
+        let framed = |body: &str| frame_glue("T_", "T", body).expect("covered").contains("struct dgf_T_");
+        // One drop and nothing after it: plain glue, which units can inline.
+        let opt = "  if (disc_O_X_(p)) drop_X_(&(*p).u.v1.f0);\n";
+        assert_eq!(frame_glue("T_", "T", opt).as_deref(), Some(format!("void drop_T_(T *p) {{\n{opt}}}\n").as_str()));
+        assert!(!framed("  ((void (*)(T *))f_0123456789abcdef)(p);\n"));
+        assert!(!framed("  switch (disc_E_(p)) {\n  case 0: drop_X_(&p->u.v0.f0); break;\n  case 1: break;\n  default: break;\n  }\n"));
+        // A drop with more after it keeps the frame: the rest runs as cleanup.
+        assert!(framed("  drop_X_(&p->f0);\n  drop_Y_(&p->f1);\n"));
+        assert!(framed("  ((void (*)(T *))f_0123456789abcdef)(p);\n  drop_X_(&p->f0);\n"));
+        assert!(framed("  drop_X_(*p);\n  lust_dealloc(*p, 8, 8);\n"));
+        assert!(framed("  switch (disc_E_(p)) {\n  case 0: drop_X_(&p->u.v0.f0); break;\n  case 1: lust_x(p); break;\n  }\n"));
+        assert!(framed("  for (uint64_t i = 0; i < p->len; i++) drop_X_(&((X *)p->ptr)[i]);\n"));
+    }
 
     #[test]
     fn wraps_statement_calls_only() {
