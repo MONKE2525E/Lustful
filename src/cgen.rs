@@ -10344,6 +10344,9 @@ const INLINE_DEPTH: usize = 3;
 /// behind an accessor) and `#[inline]` ones.
 const INLINE_DEPTH_TINY: usize = 6;
 const INLINE_TINY_BYTES: usize = 400;
+/// The largest hot callee a copies profile copies (`inline_pick_hot`) when it has no
+/// `#[inline]`: on tsgo, 6000 bytes ran no faster and cost 6% more warm build time.
+const HOT_COPY_BYTES: usize = 3000;
 
 /// Whether the fn with release C id `id` (16 hex digits) is in a copies profile's hot set.
 fn is_hot(hot: &HashSet<u64>, id: &str) -> bool {
@@ -10434,7 +10437,7 @@ fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
 /// LTO (their holder keeps the external definition, so calls and addresses are the same).
 /// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns. With a copies
 /// profile (`hot`: the fns it ran often, `LUST_PGO_COPIES`), only the fns it saw hot, up to
-/// the `#[inline]` limit at every level.
+/// `HOT_COPY_BYTES` at every level (`inline_pick_hot`).
 fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, skip: &HashSet<usize>, deep: bool, hot: Option<&HashSet<u64>>) -> Vec<usize> {
     let mut out = BTreeSet::new();
     let rec = record::on();
@@ -10476,10 +10479,10 @@ fn inline_pick(f: &FnOut, deep: bool) -> bool {
         })
 }
 
-/// Whether `inline_callees` copies `f`, a callee a copies profile saw hot: up to the
-/// `#[inline]` limit at every level.
+/// Whether `inline_callees` copies `f`, a callee a copies profile saw hot: up to
+/// `HOT_COPY_BYTES` (or its `#[inline]` limit when larger) at every level.
 fn inline_pick_hot(f: &FnOut) -> bool {
-    f.error.is_none() && f.inline != InlineAttr::Never && plain_fn_def(&f.code).is_some_and(|d| d.len <= inline_limit(f.inline).max(inline_limit(InlineAttr::Hint)))
+    f.error.is_none() && f.inline != InlineAttr::Never && plain_fn_def(&f.code).is_some_and(|d| d.len <= inline_limit(f.inline).max(HOT_COPY_BYTES))
 }
 
 /// The unit for `slots` (`fns` is indexed by slot; empty slots have no code). Its
