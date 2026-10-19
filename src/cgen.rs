@@ -10387,6 +10387,9 @@ const INLINE_TINY_BYTES: usize = 400;
 /// The largest hot callee a copies profile copies (`inline_pick_hot`) when it has no
 /// `#[inline]`: on tsgo, 6000 bytes ran no faster and cost 6% more warm build time.
 const HOT_COPY_BYTES: usize = 3000;
+/// Copy levels with a copies profile: Rust's layers (iterator, closure, hasher, accessor)
+/// put hot accessors 7 and more calls below a hot fn.
+const HOT_COPY_DEPTH: usize = 12;
 
 /// Whether the fn with release C id `id` (16 hex digits) is in a copies profile's hot set.
 fn is_hot(hot: &HashSet<u64>, id: &str) -> bool {
@@ -10453,11 +10456,23 @@ struct PlainDef<'a> {
     pks: Vec<&'a str>,
     /// The definition's size in bytes (not its comment, panic fns or trampoline).
     len: usize,
+    /// It holds kconst's static locals (`kconst_static`): only a hot copy may.
+    statics: bool,
+}
+
+/// Whether `line` declares one of kconst's static locals: a constant local `lN`, its slot
+/// `lkN` and descriptor `lkdN`, the literal slots `lks` and their flag `lks_ok`.
+fn kconst_static(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("  static ") else { return false };
+    let decl = rest.split(['=', '[', ';']).next().unwrap_or("");
+    let name = decl.trim_end().rsplit([' ', '*']).next().unwrap_or("");
+    let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name == "lks" || name == "lks_ok" || name.strip_prefix("lkd").is_some_and(num) || name.strip_prefix("lk").is_some_and(num) || name.strip_prefix('l').is_some_and(num)
 }
 
 /// The one fn definition at the start of `code` (after its outlined panics and its
 /// comment line): None when the text holds anything an inline definition may not have
-/// (static storage, a static helper, a frame's cleanup variable).
+/// (static storage other than kconst's, a static helper, a frame's cleanup variable).
 fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
     let mut rest = code;
     let mut pks = Vec::new();
@@ -10474,17 +10489,22 @@ fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
     let end = rest[start..].find("\n}\n")? + start + 3;
     let def = &rest[start..end];
     let head = def.split(" {\n").next()?;
-    // `#define`: an over-aligned local's macro, whose `#undef` follows the fn.
-    (!def.contains("static ") && !def.contains("__attribute__") && !def.contains("#define") && !head.contains('\n'))
-        .then_some(PlainDef { head, def, pks, len: def.len() })
+    // `#define`: an over-aligned local's macro, whose `#undef` follows the fn. Static storage
+    // only as kconst's locals (`statics`): each unit's copy then has its own (clang and gcc
+    // take them in an inline definition), which only cache the canonical program-wide
+    // addresses (cgen/kconst.rs), so identity stays the table's.
+    let statics = def.lines().any(kconst_static);
+    let other_static = def.matches("static ").count() != def.lines().filter(|l| kconst_static(l)).count();
+    (!other_static && !def.contains("__attribute__") && !def.contains("#define") && !head.contains('\n'))
+        .then_some(PlainDef { head, def, pks, len: def.len(), statics })
 }
 
 /// Release C: the small fns that the fns in `slots` call and another unit holds; this
 /// unit gets them as C99 inline definitions, so the C compiler can inline them without
 /// LTO (their holder keeps the external definition, so calls and addresses are the same).
 /// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns. With a copies
-/// profile (`hot`: the fns it ran often, `LUST_PGO_COPIES`), only the fns it saw hot, up to
-/// `HOT_COPY_BYTES` at every level (`inline_pick_hot`).
+/// profile (`hot`: the fns it ran often, `LUST_PGO_COPIES`), only the fns it saw hot, by
+/// `inline_pick_hot` at every level.
 fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, skip: &HashSet<usize>, deep: bool, hot: Option<&HashSet<u64>>) -> Vec<usize> {
     let mut out = BTreeSet::new();
     let rec = record::on();
@@ -10522,14 +10542,30 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, ski
 fn inline_pick(f: &FnOut, deep: bool) -> bool {
     f.error.is_none()
         && plain_fn_def(&f.code).is_some_and(|d| {
-            d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
+            !d.statics && d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
         })
 }
 
 /// Whether `inline_callees` copies `f`, a callee a copies profile saw hot: up to
-/// `HOT_COPY_BYTES` (or its `#[inline]` limit when larger) at every level.
+/// `HOT_COPY_BYTES` (or its `#[inline]` limit when larger) at every level, kconst's static
+/// locals and all.
 fn inline_pick_hot(f: &FnOut) -> bool {
     f.error.is_none() && f.inline != InlineAttr::Never && plain_fn_def(&f.code).is_some_and(|d| d.len <= inline_limit(f.inline).max(HOT_COPY_BYTES))
+}
+
+/// The deeper copy levels below `frontier` (`fn_unit_parts`): the callees of each level's
+/// copies, added to `inl`, until a level adds none; to `INLINE_DEPTH_TINY` levels, or with a
+/// copies profile (`hot`) to `HOT_COPY_DEPTH`.
+fn copy_levels(fns: &[FnOut], own: &HashSet<usize>, inl: &mut Vec<usize>, mut frontier: Vec<usize>, hot: Option<&HashSet<u64>>) {
+    for level in 1..if hot.is_some() { HOT_COPY_DEPTH } else { INLINE_DEPTH_TINY } {
+        let skip: HashSet<usize> = own.iter().chain(inl.iter()).copied().collect();
+        let more = inline_callees(fns, frontier.iter().flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &skip, level >= INLINE_DEPTH, hot);
+        if more.is_empty() {
+            break;
+        }
+        inl.extend(&more);
+        frontier = more;
+    }
 }
 
 /// The unit for `slots` (`fns` is indexed by slot; empty slots have no code). Its
@@ -10584,16 +10620,8 @@ pub fn fn_unit_parts(
     let callers = slots.iter().filter(|&&s| copy_hot.is_none_or(|h| names::fn_tag_opt(s as u32).is_some_and(|id| is_hot(h, &id))));
     let mut inl = if inline && !llvm { inline_callees(fns, callers.flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &own, false, copy_hot) } else { Vec::new() };
     // Deeper levels: the small callees of the inline callees.
-    let mut frontier = inl.clone();
-    for level in 1..INLINE_DEPTH_TINY {
-        let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
-        let more = inline_callees(fns, frontier.iter().flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &skip, level >= INLINE_DEPTH, copy_hot);
-        if more.is_empty() {
-            break;
-        }
-        inl.extend(&more);
-        frontier = more;
-    }
+    let frontier = inl.clone();
+    copy_levels(fns, &own, &mut inl, frontier, copy_hot);
     for f in slots.iter().chain(&inl).chain(ll_inl).map(|&s| &fns[s]) {
         types.extend(f.types.iter().cloned());
         named.extend(f.named.iter().cloned());
@@ -10646,12 +10674,17 @@ pub fn fn_unit_parts(
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
         let more =
             if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten().map(String::as_str)), &skip, false, copy_hot) };
-        for &s in &more {
+        let start = inl.len();
+        inl.extend(&more);
+        // With a copies profile, their hot callees too (a hasher's `write` below a hash glue).
+        if copy_hot.is_some() {
+            copy_levels(fns, &own, &mut inl, more, copy_hot);
+        }
+        for &s in &inl[start..] {
             types.extend(fns[s].types.iter().cloned());
             named.extend(fns[s].named.iter().cloned());
             seen.extend(fns[s].glue.iter());
         }
-        inl.extend(more);
     }
     // The inline definitions in fn id order: slot order carries a persistent
     // session's history, and its units are a one-shot build's.

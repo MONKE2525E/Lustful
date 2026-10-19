@@ -266,11 +266,16 @@ fn main() {{
 
 def hot_flip(runs):
     """Release C copies by profile: only main changes, so `walk` runs or not; a profile of each
-    version makes `walk` (and its std callees) hot or cold while its unit's code stays."""
-    return f'''fn walk(v: &[u64]) -> u64 {{
+    version makes `walk` (and its std callees, and `label` with its literals: a copy with
+    kconst's slots) hot or cold while its unit's code stays."""
+    return f'''fn label(x: u64) -> &'static str {{
+    if x % 3 == 0 {{ "fizz" }} else {{ "buzz" }}
+}}
+
+fn walk(v: &[u64]) -> u64 {{
     let mut s = 0;
     for i in 0..v.len() {{
-        s += v[i] * 3 + (v[i] >> 1);
+        s += v[i] * 3 + (v[i] >> 1) + label(v[i]).len() as u64;
     }}
     s + v.iter().copied().max().unwrap_or(0)
 }}

@@ -4830,7 +4830,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // instrumented build and the use build alike, so both copy the same callees and a
     // caller's profile record matches its use): the fns it ran `LUST_PGO_COPY_MIN`
     // times or more (default 1000) get copies of the callees it ran as often.
+    // `LUST_PGO_COPIES=*`: every fn counts as hot, a test of the copy rules on any program.
     let copy_hot = match std::env::var_os("LUST_PGO_COPIES").filter(|_| rgroups.is_some() && !llvm_on) {
+        Some(path) if path == "*" => Some(rn.map(|n| n.fns.iter().flatten().filter_map(|id| u64::from_str_radix(id, 16).ok()).collect()).unwrap_or_default()),
         Some(path) => {
             let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
             match crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, "pgo-copies.memo") {
