@@ -6691,6 +6691,15 @@ impl Ex<'_, '_> {
             let u = this.local(UNIT);
             this.call_builtin(Builtin::VecPush, vec![Operand::Move(Place::local(rv)), x], Place::local(u));
         };
+        // An item of type `have` for a side of element `want`: the item itself, or a copy
+        // through it when it is `&want` (`Vec<T>: Extend<&T>`, check `extends_by_copy`).
+        let item_for = |this: &mut Self, pl: Place, have: Ty, want: Ty| -> Operand {
+            if have != want && matches!(this.body.tys.kind(have), TyKind::Ref(_, _, inner) if inner == want) {
+                Operand::Copy(pl.deref())
+            } else {
+                this.take(pl, want)
+            }
+        };
         if f.is_none() {
             let (lo, _) = self.hint(itp.clone(), ty)?;
             let some = self.cmp(crate::ast::BinOp::Gt, Operand::Copy(Place::local(lo)), Self::usize_c(0));
@@ -6716,19 +6725,23 @@ impl Ex<'_, '_> {
                     let (yes, no) = this.branch(Operand::Copy(Place::local(r)));
                     let join = this.block();
                     this.cur = yes;
-                    let ax = this.take(Place::local(x), item);
+                    let ax = item_for(this, Place::local(x), item, ea);
                     push(this, a, va, ax);
                     this.goto(join);
                     this.cur = no;
-                    let ax = this.take(Place::local(x), item);
+                    let ax = item_for(this, Place::local(x), item, eb);
                     push(this, b, vb, ax);
                     this.goto(join);
                     this.cur = join;
                 }
                 None => {
-                    let x0 = this.take(Place::local(x).project(Proj::Field(0)), ea);
+                    let parts = match this.body.tys.kind(item) {
+                        TyKind::Tuple(ts) => this.body.tys.tys_of(ts).to_vec(),
+                        _ => vec![ea, eb],
+                    };
+                    let x0 = item_for(this, Place::local(x).project(Proj::Field(0)), parts[0], ea);
                     push(this, a, va, x0);
-                    let x1 = this.take(Place::local(x).project(Proj::Field(1)), eb);
+                    let x1 = item_for(this, Place::local(x).project(Proj::Field(1)), parts[1], eb);
                     push(this, b, vb, x1);
                 }
             }

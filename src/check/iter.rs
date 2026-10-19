@@ -1952,6 +1952,17 @@ impl<'p> Ctx<'p> {
     /// half must be a Vec of its items; an open half is rustc's E0282
     /// when nothing fixes it, so lust asks for the annotation (L0610),
     /// and another collection is L0640.
+    /// True when `el` is a known `Copy` type and `item` is `&el`: a Vec of `el` extends
+    /// from such items (alloc's `impl Extend<&T> for Vec<T>`), as `partition` and
+    /// `unzip` fill their sides.
+    fn extends_by_copy(&mut self, el: Ty, item: Ty) -> bool {
+        let (el, item) = (self.deep(el), self.deep(item));
+        if self.tys.flags(el).contains_infer() || !is_copy(self.p, &self.tys, el) {
+            return false;
+        }
+        matches!(self.kind(item), TyKind::Ref(_, Mut::Shared, inner) if self.deep(inner) == el)
+    }
+
     fn pair_target(&mut self, expected: Option<Ty>, named: Option<Ty>, items: [Ty; 2], what: &str, span: Span) -> Option<Ty> {
         let halves = match (named, expected.map(|t| self.deep(t))) {
             (Some(b), _) => [b, b],
@@ -1971,6 +1982,9 @@ impl<'p> Ctx<'p> {
             // out: its `extend_reserve` path is not lowered for a deque.
             let deque = self.tys.local_adt(h).filter(|&a| what == "partition" && self.p.is_vec_deque_adt(a));
             match deque.and_then(|_| self.tys.adt_first_ty_arg(h)).or_else(|| self.tys.vec_elem(h)) {
+                // `Vec<T>: Extend<&T>` for `T: Copy`: a known element type also
+                // takes shared refs to itself (lowering copies through them).
+                Some(el) if self.extends_by_copy(el, it) => {}
                 Some(el) => {
                     if !self.unify(el, it) {
                         self.mismatch(span, el, it);
