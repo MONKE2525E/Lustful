@@ -1754,6 +1754,19 @@ pub fn resolve_crate_with(
         order.insert(at, sj);
     }
     let mut shared = SharedFiles::default();
+    // Every file an earlier resolve canonicalized, read again now in
+    // parallel: discovery walks the module tree one file at a time and
+    // finds these texts here (a CI checkout is not in the page cache, and
+    // the walk read about 1000 files in turn). A file gone since is left
+    // out, and a new one is the walk's own read, as before.
+    {
+        let seen: Vec<(&PathBuf, &String)> = cache.canon.iter().collect();
+        for ((_, canon), text) in seen.iter().zip(par_map(&seen, |(path, _)| std::fs::read_to_string(path).ok())) {
+            if let Some(text) = text {
+                shared.text_by_path.insert((*canon).clone(), text);
+            }
+        }
+    }
     // The selected crate's root file is FileId(0) even though its
     // dependencies resolve first: the spliced std ranges, the error
     // footer, and `Program::shipped_crate_at` all read file 0 as the
