@@ -3379,13 +3379,11 @@ fn resolve_one(
     }
     lap!("resolve: discovery");
     // Unknown cfg names (L0520) are checked on the original tokens of
-    // every file before expansion can strip the item that carries one.
-    for disc in &discs {
-        if let Some(orig) = &disc.lexed
-            && let Err(d) = check_cfg_names(orig, &input.env, interner)
-        {
-            return Err(OneError { diags: vec![d], seen: seen_of(&discs), std_asks });
-        }
+    // every file before expansion can strip the item that carries one, on
+    // the pool; the first error in disc order is the answer.
+    let checked = par_map(&discs, |disc| disc.lexed.as_ref().map_or(Ok(()), |orig| check_cfg_names(orig, &input.env, interner)));
+    if let Some(Err(d)) = checked.into_iter().find(Result::is_err) {
+        return Err(OneError { diags: vec![d], seen: seen_of(&discs), std_asks });
     }
     // Expansion rounds (6.1): expand every file with the macro
     // environment the outlines now prove, then look for module edges

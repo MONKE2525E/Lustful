@@ -438,7 +438,7 @@ impl<'t> Answers<'t> {
             for (k, v) in &t.ambig_vis {
                 sides.entry(k.0.0).or_default().add(|h| (0x51u8, k.1, k.2.0, format!("{v:?}")).hash(h));
             }
-            for (k, src) in &t.glob_src {
+            for (k, src) in t.glob_src.iter() {
                 sides.entry(k.0.0).or_default().add(|h| (0x52u8, k.1, k.2.0, src.0).hash(h));
             }
             for (k, (v, path)) in &t.std_aliases {
@@ -618,8 +618,8 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
     for (k, v) in &t.ambig_vis {
         keyed(&mut out, k, &|h| (0x51u8, k.1, k.2.0, format!("{v:?}")).hash(h));
     }
-    for (k, src) in &t.glob_src {
-        keyed(&mut out, k, &|h| (0x52u8, k.1, k.2.0, src.0).hash(h));
+    for (k, src) in t.glob_src.iter() {
+        keyed(&mut out, &k, &|h| (0x52u8, k.1, k.2.0, src.0).hash(h));
     }
     for (k, (v, path)) in &t.std_aliases {
         keyed(&mut out, k, &|h| {
@@ -682,8 +682,9 @@ pub fn build(t: &ResolvedTables, map: &SourceMap, parts: Vec<CratePart>) -> Mdr 
             keys.extend(m.keys().map(|&name| (i as u32, ns as u8, name)));
         }
     }
-    let side_keys = t.ambig_vis.keys().chain(t.glob_src.keys()).chain(t.std_aliases.keys()).chain(t.std_glob_aliases.keys()).chain(t.order_dep.keys());
+    let side_keys = t.ambig_vis.keys().chain(t.std_aliases.keys()).chain(t.std_glob_aliases.keys()).chain(t.order_dep.keys());
     keys.extend(side_keys.map(|k| (k.0.0, k.1, k.2)));
+    keys.extend(t.glob_src.iter().map(|(k, _)| (k.0.0, k.1, k.2)));
     keys.sort_unstable();
     keys.dedup();
     let mut a = Answers::new(t);

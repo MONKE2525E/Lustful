@@ -165,8 +165,8 @@ fn table_lines(t: &ResolvedTables) -> Vec<String> {
     for (k, v) in &t.std_glob_aliases {
         d.line("std_glob_aliases", k, v);
     }
-    for (k, v) in &t.glob_src {
-        d.line("glob_src", k, v);
+    for (k, v) in t.glob_src.iter() {
+        d.line("glob_src", &k, &v);
     }
     for (k, v) in &t.pending_single {
         d.line("pending_single", k, v);

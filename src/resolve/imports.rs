@@ -24,6 +24,40 @@ use crate::intern::{FxMap, Interner, Sym};
 use crate::ty::defs::ModuleId;
 use std::collections::BTreeMap;
 
+/// `ResolvedTables::glob_src`, keyed by (module, namespace, name): one map
+/// per module, so the writes of a glob copy stay in its importer's map. One
+/// map for every module held millions of entries on tsgo, and each copy's
+/// writes went all over it.
+#[derive(Clone, Debug, Default)]
+pub struct GlobSrc(Vec<FxMap<(u8, Sym), ModuleId>>);
+
+impl GlobSrc {
+    pub fn get(&self, k: &(ModuleId, u8, Sym)) -> Option<&ModuleId> {
+        self.0.get(k.0.0 as usize)?.get(&(k.1, k.2))
+    }
+
+    pub fn contains_key(&self, k: &(ModuleId, u8, Sym)) -> bool {
+        self.get(k).is_some()
+    }
+
+    pub fn insert(&mut self, k: (ModuleId, u8, Sym), src: ModuleId) -> Option<ModuleId> {
+        let m = k.0.0 as usize;
+        if self.0.len() <= m {
+            self.0.resize_with(m + 1, FxMap::default);
+        }
+        self.0[m].insert((k.1, k.2), src)
+    }
+
+    pub fn remove(&mut self, k: &(ModuleId, u8, Sym)) -> Option<ModuleId> {
+        self.0.get_mut(k.0.0 as usize)?.remove(&(k.1, k.2))
+    }
+
+    /// Every entry, module by module.
+    pub fn iter(&self) -> impl Iterator<Item = ((ModuleId, u8, Sym), ModuleId)> + '_ {
+        self.0.iter().enumerate().flat_map(|(m, map)| map.iter().map(move |(&(ns, name), &src)| ((ModuleId(m as u32), ns, name), src)))
+    }
+}
+
 /// The namespace index of a binding table (type, value, macro).
 pub fn ns_index(ns: Namespace) -> usize {
     match ns {
@@ -276,7 +310,7 @@ pub struct ResolvedTables {
     /// replaces this binding instead of making the name ambiguous, as
     /// rustc resolves the name through the source's final binding.
     /// Fixpoint state only; the final answer stays in `maps`.
-    pub glob_src: FxMap<(ModuleId, u8, Sym), ModuleId>,
+    pub glob_src: GlobSrc,
     /// The single imports (`use a::b::n;`) each module still waits on,
     /// by bound name, with each import's span, visibility, module path,
     /// leading `::`, and the name it reads. rustc
@@ -449,7 +483,7 @@ impl ResolvedTables {
             crate_magic: FxMap::default(),
             std_aliases: BTreeMap::new(),
             std_glob_aliases: FxMap::default(),
-            glob_src: FxMap::default(),
+            glob_src: GlobSrc::default(),
             pending_single: FxMap::default(),
             import_stall: false,
             single_binds: Vec::new(),
