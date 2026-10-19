@@ -115,13 +115,15 @@ typedef void (*lust_hash_clone_fn)(void *ctx, void *dst, const void *src);
    head, as in hashbrown). An unallocated table is the empty singleton:
    bucket_mask 0 with `ctrl` pointing at static empty tags. */
 typedef struct {
+    /* The four fields a lookup reads come first, in 32 bytes: a map inside a struct then
+       touches one cache line for its header more often (hashbrown's header is 32 bytes). */
     uint8_t *ctrl;
-    uint8_t *data;       /* bucket i at data + i * elem_size; NULL if singleton or ZST */
-    void *alloc_base;    /* raw malloc pointer, NULL if singleton */
     uint64_t bucket_mask;
+    uint8_t *data;       /* bucket i at data + i * elem_size; NULL if singleton or ZST */
+    uint64_t elem_size;
     uint64_t items;
     uint64_t growth_left;
-    uint64_t elem_size;
+    void *alloc_base;    /* raw malloc pointer, NULL if singleton */
     uint64_t elem_align;
 } lust_hash_table;
 
