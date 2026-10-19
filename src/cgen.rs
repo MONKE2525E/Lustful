@@ -2437,8 +2437,9 @@ impl FnGen<'_, '_> {
             stack.extend(self.body.stmt_unwind.iter().filter(|e| e.0.0 as usize == b).map(|e| e.2.0 as usize));
         }
         let order: Vec<usize> = (0..n).filter(|&b| reachable[b]).collect();
-        // Unwind tables: the cleanup blocks go to their own fn (`cleanup_fn`), and the
-        // locals they read live in the frame struct its cleanup variable points at.
+        // Unwind tables: the cleanup blocks go to their own fn (`cleanup_fn`), and the frame
+        // struct its cleanup variable points at holds the flags of the locals they read and
+        // a pointer to each.
         let zc = p.unwind && p.unwind_tables;
         let cl_order: Vec<usize> = if zc { order.iter().copied().filter(|&b| self.cleanup[b]).collect() } else { Vec::new() };
         let order: Vec<usize> = if zc { order.into_iter().filter(|&b| !self.cleanup[b]).collect() } else { order };
@@ -2452,11 +2453,15 @@ impl FnGen<'_, '_> {
             cl_text = std::mem::replace(&mut self.out, saved);
         }
         // A ladder with no call (only jumps and returns) drops nothing: no frame.
+        let mut cl_inline = false;
         if cl_text.contains('(') {
             let kept: Vec<bool> = (0..self.local_cty.len()).map(|l| self.local_drop[l] && self.dflags.keeps(l as Local)).collect();
             members = unwind::frame_members(&cl_text, self.local_cty.len(), &self.move_paths, &kept, &self.body.promoted);
             self.zc_frame = true;
-            let decls = self.frame_struct(&names::fn_tag(slot), &members);
+            let flags = members.iter().flatten().filter(|nm| !nm.starts_with('l')).count();
+            let calls = self.body.blocks.iter().filter(|b| matches!(b.term, Terminator::Call { unwind: Some(_), .. })).count();
+            cl_inline = unwind::frame_inline(flags, self.stmt_unw.len() + calls);
+            let decls = self.frame_struct(&names::fn_tag(slot), &members, cl_inline);
             self.out.push_str(&decls);
         }
         // Release C bodies are extern: other units call them directly (`names`).
@@ -2479,26 +2484,19 @@ impl FnGen<'_, '_> {
             if self.byte_blobs.get(i).is_some_and(|b| b.is_some()) {
                 continue;
             }
-            // A local the cleanup ladder reads lives in the frame struct: its
-            // parameter copy and flags are set right after `L` is declared.
-            if members.get(i).is_some_and(|m| !m.is_empty()) {
-                let is_param = i >= 1 && i <= self.body.arg_count;
-                if is_param && param_dropped(p, t) {
-                    frame_init.push(format!("L.l{i} = {};", zero_lit(p, t)));
-                } else if is_param && param_by_ptr(p, t) {
-                    frame_init.push(format!("L.l{i} = *p{i};"));
-                } else if is_param {
-                    frame_init.push(format!("L.l{i} = p{i};"));
-                }
+            let is_param = i >= 1 && i <= self.body.arg_count;
+            // A local the cleanup ladder reads stays a local; the frame struct holds a pointer
+            // to it and its flags, set right after `L` is declared.
+            let member = members.get(i).is_some_and(|m| !m.is_empty());
+            if member {
+                frame_init.push(format!("L.pl{i} = &l{i};"));
                 if self.local_drop[i] && self.dflags.entry(i as Local) {
                     frame_init.push(format!("L.d{i} = {};", is_param as u8));
                 }
                 for k in 0..self.move_paths[i].len() {
                     frame_init.push(format!("L.m{i}_{k} = 1;"));
                 }
-                continue;
             }
-            let is_param = i >= 1 && i <= self.body.arg_count;
             // A dropped parameter (see `param_dropped`) has no `p{i}`; its
             // local is the one possible value of a zero-sized type.
             let decl = if is_param && param_dropped(p, t) {
@@ -2533,6 +2531,9 @@ impl FnGen<'_, '_> {
                     Some((_, v)) => v.push(decl),
                     None => by_type.push((ct, vec![decl])),
                 }
+            }
+            if member {
+                continue;
             }
             if self.local_drop[i] && self.dflags.entry(i as Local) {
                 flags.push(format!("d{i} = {}", is_param as u8));
@@ -2576,11 +2577,9 @@ impl FnGen<'_, '_> {
             for s in &frame_init {
                 let _ = writeln!(self.out, "  {s}");
             }
-            for (i, names) in members.iter().enumerate() {
-                for nm in names {
-                    let _ = writeln!(self.out, "#define {nm} (L.{nm})");
-                }
-                let _ = i;
+            // The body reads its member locals directly; only their flags are in the frame.
+            for nm in members.iter().flatten().filter(|nm| !nm.starts_with('l')) {
+                let _ = writeln!(self.out, "#define {nm} (L.{nm})");
             }
         }
         if zc {
@@ -2604,7 +2603,7 @@ impl FnGen<'_, '_> {
             let _ = writeln!(self.out, "#undef l{i}");
         }
         if self.zc_frame {
-            unwind::cleanup_fn(&mut self.out, &names::fn_tag(slot), &members, &cl_order, &cl_text);
+            unwind::cleanup_fn(&mut self.out, &names::fn_tag(slot), &members, &cl_order, &cl_text, cl_inline);
             self.zc_frame = false;
         }
         self.out.push('\n');

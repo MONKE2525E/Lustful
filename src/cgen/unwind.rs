@@ -102,10 +102,11 @@ impl FnGen<'_, '_> {
 }
 
 /// Unwind tables (`Program::unwind_tables`, runtime/panic.c mode 2): per local, the C names
-/// that live in the fn's frame struct because the cleanup blocks' C (`cl_text`) reads the
-/// local, its drop flag or one of its move flags; empty for every other local. A member
-/// local keeps its value, drop flag and move flags there, so the cleanup fn sees what the
-/// fn body last wrote. Promoted constants (static storage) never move there.
+/// the fn's frame struct holds because the cleanup blocks' C (`cl_text`) reads the local,
+/// its drop flag or one of its move flags; empty for every other local. The frame holds a
+/// member local's drop flag and move flags, and a pointer to the local itself (which stays
+/// a local of the fn), so the cleanup fn sees what the fn body last wrote. Promoted
+/// constants (static storage) are never members.
 pub(super) fn frame_members(cl_text: &str, n: usize, move_paths: &[Vec<Vec<Step>>], local_drop: &[bool], promoted: &[Local]) -> Vec<Vec<String>> {
     let mut used = vec![false; n];
     let b = cl_text.as_bytes();
@@ -149,17 +150,18 @@ pub(super) fn frame_members(cl_text: &str, n: usize, move_paths: &[Vec<Vec<Step>
 
 impl FnGen<'_, '_> {
     /// Unwind tables: the frame struct type of the fn `tag` names (`names::fn_tag`: its
-    /// slot, or its stable id in release C) with the ladder entry `st`, then each member
-    /// local, its drop flag and move flags; and its cleanup fn's prototype, both before the fn.
-    pub(super) fn frame_struct(&self, tag: &str, members: &[Vec<String>]) -> String {
+    /// slot, or its stable id in release C) with the ladder entry `st`, then a pointer to
+    /// each member local (`pl<N>`: the local's own name may be a macro, `overaligned_local`),
+    /// its drop flag and move flags; and its cleanup fn's prototype, both before the fn.
+    /// With `inline` (`frame_inline`) the cleanup fn is always_inline: clang inlines it into
+    /// the landing pad, so `&L` never leaves the fn and SROA keeps `st` and the flags in
+    /// registers, with no store to memory for them.
+    pub(super) fn frame_struct(&self, tag: &str, members: &[Vec<String>], inline: bool) -> String {
         let mut s = format!("struct fr{tag} {{\n  int32_t st;\n");
         for (l, names) in members.iter().enumerate() {
             for nm in names {
                 if nm.starts_with('l') {
-                    let t = &self.local_cty[l];
-                    let align = c_size_align(self.p, t).1;
-                    let al = if align > 16 { format!("_Alignas({align}) ") } else { String::new() };
-                    let _ = writeln!(s, "  {al}{} {nm};", ctype(t));
+                    let _ = writeln!(s, "  {} *p{nm};", ctype(&self.local_cty[l]));
                 } else {
                     let _ = writeln!(s, "  uint8_t {nm};");
                 }
@@ -170,25 +172,45 @@ impl FnGen<'_, '_> {
         // left a ladder entry and runs the cleanup.
         let _ = writeln!(
             s,
-            "}};\nstatic void cl{tag}(struct fr{tag} *Lc);\nstatic inline __attribute__((always_inline)) void clw{tag}(struct fr{tag} *Lc) {{ if (__builtin_expect(Lc->st != 0, 0)) cl{tag}(Lc); }}"
+            "}};\n{} void cl{tag}(struct fr{tag} *Lc);\nstatic inline __attribute__((always_inline)) void clw{tag}(struct fr{tag} *Lc) {{ if (__builtin_expect(Lc->st != 0, 0)) cl{tag}(Lc); }}",
+            cleanup_linkage(inline)
         );
         s
     }
+}
+
+/// Unwind tables: whether a fn's cleanup fn is inlined into its landing pad
+/// (`frame_struct`). Not when its flags times its unwind points (calls and statements that
+/// may unwind) pass `LUST_RELEASE_FRAME_INLINE` (default 100000; 0: never): SROA puts a phi
+/// per flag on every unwind edge and then runs for minutes, as the LLVM backend found
+/// (`LUST_LL_FLAGMEM`). Such a fn keeps the cleanup fn out of line, and its frame in memory.
+pub(super) fn frame_inline(flags: usize, unwind_points: usize) -> bool {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| std::env::var("LUST_RELEASE_FRAME_INLINE").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000));
+    (flags + 1) * unwind_points <= limit
+}
+
+fn cleanup_linkage(inline: bool) -> &'static str {
+    if inline { "static inline __attribute__((always_inline))" } else { "static" }
 }
 
 /// Unwind tables: the cleanup fn of the fn `tag` names, after it. The unwinder calls it (the
 /// cleanup variable `L`) at each scope exit: a normal return stored `st = 0`; an unwind
 /// left the ladder entry of the call or statement that panicked, so it runs the cleanup
 /// blocks from there and returns, and the unwinder goes on. `cl_text` is the cleanup
-/// blocks' C, emitted with the members' names.
-pub(super) fn cleanup_fn(out: &mut String, tag: &str, members: &[Vec<String>], cl_order: &[usize], cl_text: &str) {
+/// blocks' C, emitted with the members' names: a member local is read through its pointer.
+pub(super) fn cleanup_fn(out: &mut String, tag: &str, members: &[Vec<String>], cl_order: &[usize], cl_text: &str, inline: bool) {
     let names: Vec<&String> = members.iter().flatten().collect();
     for nm in &names {
         let _ = writeln!(out, "#undef {nm}");
     }
-    let _ = writeln!(out, "static void cl{tag}(struct fr{tag} *Lc) {{");
+    let _ = writeln!(out, "{} void cl{tag}(struct fr{tag} *Lc) {{", cleanup_linkage(inline));
     for nm in &names {
-        let _ = writeln!(out, "#define {nm} (Lc->{nm})");
+        if nm.starts_with('l') {
+            let _ = writeln!(out, "#define {nm} (*Lc->p{nm})");
+        } else {
+            let _ = writeln!(out, "#define {nm} (Lc->{nm})");
+        }
     }
     out.push_str("  lust_exc ex;\n  (void)ex;\n  switch (Lc->st) {\n  case 0: return;\n");
     for b in cl_order {
