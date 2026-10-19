@@ -4010,6 +4010,7 @@ impl FnGen<'_, '_> {
                     let ct = cty(&self.p.tys, t);
                     self.note_held(&ct);
                 }
+                let ops = args;
                 let mut args: Vec<String> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
                 // The LLVM backend calls the fn's internal ABI entry (cgen/ll.rs).
                 if ll::on(self.p) {
@@ -4030,6 +4031,9 @@ impl FnGen<'_, '_> {
                 // fn received when it is itself `#[track_caller]` (`loc`).
                 if crate::check::caller::is_track_caller(self.p, f) {
                     args.push(loc.to_string());
+                }
+                if let Some(v) = self.unwrap_inline(f, ops, &args) {
+                    return v;
                 }
                 if ret_is_large(self.p, f) {
                     let (decl, t) = self.out_target(&ctype(&cty(&self.p.tys, info.ret)));
@@ -4300,6 +4304,40 @@ impl FnGen<'_, '_> {
     fn disc(&mut self, t: &CTy, ptr: &str) -> String {
         self.note_held(t);
         disc_call(self.p, t, ptr)
+    }
+
+    /// Release C: std's `unwrap` or `expect` of an Option or Result that the x86-64 ABI passes
+    /// in two eightbytes cutting through its fields (9 to 16 bytes, aligned under 8, such as
+    /// the `Result<[u8; 8], _>` of a slice `try_into`). Passed by value, the value stays in
+    /// memory even when clang inlines the call (SROA cannot split it), and the loads that
+    /// rebuild the eightbytes cannot take their data from its stores. So the payload is read
+    /// here, and only the panic path calls the fn, with a copy. `args` are the call's C
+    /// arguments (with the caller location); None for any other call.
+    fn unwrap_inline(&mut self, f: LocalDefId, ops: &[Operand], args: &[String]) -> Option<String> {
+        if !names::release() || (self.p.unwind && !self.p.unwind_tables) {
+            return None;
+        }
+        let def = self.p.fn_info(f).def(&self.p.ast);
+        if !matches!(self.p.name(def.name), "unwrap" | "expect") || !self.p.std_source_span(def.name_span) {
+            return None;
+        }
+        let op = ops.first().filter(|o| matches!(o, Operand::Move(_) | Operand::Copy(_)))?;
+        let t = cty(&self.body.tys, self.callable_place_ty(op));
+        let ok = match t {
+            CTy::Result(..) => 0,
+            CTy::Option(_) => 1,
+            _ => return None,
+        };
+        let (size, align) = c_size_align(self.p, &t);
+        if !(9..=16).contains(&size) || align >= 8 || ret_is_large(self.p, f) {
+            return None;
+        }
+        let recv = &args[0];
+        let disc = self.disc(&t, &format!("(&{recv})"));
+        let payload = variant_field(self.p, &t, recv, ok, 0);
+        let rest: String = args[1..].iter().map(|a| format!(", {a}")).collect();
+        let callee = self.slots.callee(self.p, f);
+        Some(format!("(__builtin_expect({disc} == {ok}, 1) ? {payload} : ({{ {} lust_uw = {recv}; {callee}(lust_uw{rest}); }}))", ctype(&t)))
     }
 
     fn rvalue(&mut self, rv: &Rvalue, loc: &str, post: &mut Vec<String>) -> String {
