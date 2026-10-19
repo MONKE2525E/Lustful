@@ -22,6 +22,7 @@ mod bytes;
 mod unwind;
 pub mod names;
 mod own;
+pub mod record;
 mod slices;
 mod kconst;
 pub mod ll;
@@ -10408,14 +10409,19 @@ pub fn fn_unit_parts(
     main_slot: Option<u32>,
     c_refs: Option<&ll::CRefs>,
 ) -> (String, String) {
+    // B1 (`record`): every text appended below is one recorded piece; an LLVM-backend unit
+    // is never recorded.
     let mut c = unit_header();
+    record::piece(record::Kind::Fixed, 0, &c);
     let llvm = slots.iter().any(|&s| !fns[s].ll.is_empty());
     // The LLVM backend's internal ABI returns 16-byte values as this pair (`ll::Pass::Pair`).
     if llvm {
+        record::abandon();
         c.push_str(ll::PAIR_TYPEDEF);
     }
     if p.unwind_tables {
         c.push_str(noreturn_decls());
+        record::piece(record::Kind::Fixed, 1, noreturn_decls());
     }
     let mut types = HashSet::new();
     let mut named = HashSet::new();
@@ -10562,7 +10568,9 @@ pub fn fn_unit_parts(
     let decls = if names::release() { Decls::ByValue { blocks: !llvm && blocks_on() } } else { Decls::Full };
     named.retain(|t| !glue_types.contains(t));
     type_decls_with(p, &mut c, &types, &named, decls, &glue_types);
+    let m = c.len();
     c.push_str(&static_decls_for(p, &used));
+    record::piece(record::Kind::Statics, 0, &c[m..]);
     // Release C (`names`): the prototypes and location slots that the code (and its
     // static glue) names outside itself, in one sorted list.
     let mut externs: BTreeSet<&str> = BTreeSet::new();
@@ -10576,37 +10584,49 @@ pub fn fn_unit_parts(
         externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
     }
     externs.retain(|e| proto_body_id(e).is_none_or(|id| !inl_ids.contains(id)));
+    let m = c.len();
     externs.into_iter().for_each(|e| c.push_str(e));
+    record::piece(record::Kind::Externs, 0, &c[m..]);
     // Inline fn definitions: declared before any glue or body can call them.
     let defs: Vec<PlainDef> = inl.iter().filter_map(|&s| plain_fn_def(&fns[s].code)).collect();
     for d in &defs {
+        let m = c.len();
         for pk in &d.pks {
             let _ = writeln!(c, "{pk};");
         }
         let _ = writeln!(c, "inline {};", d.head);
+        record::piece(record::Kind::InlineDef, record::key(&d.head), &c[m..]);
     }
     let mut keys: Vec<&(Glue, CTy)> = seen.iter().copied().collect();
     keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
     for k in &keys {
+        let m = c.len();
         if hybrid && !g.is_shared(k) {
             c.push_str("static ");
         } else if inl_glue.contains(*k) {
             c.push_str("inline ");
         }
         c.push_str(&g.protos[*k]);
+        record::piece(record::Kind::GlueProto, record::key(&g.protos[*k]), &c[m..]);
     }
     for k in keys.iter().filter(|k| inl_glue.contains(**k)) {
+        let m = c.len();
         c.push_str("inline ");
         c.push_str(&g.def_map[*k]);
+        record::piece(record::Kind::GlueDef, record::key(&g.protos[*k]), &c[m..]);
     }
     if hybrid {
         for k in keys.iter().filter(|k| !g.is_shared(k)) {
+            let m = c.len();
             c.push_str("static ");
             c.push_str(&g.def_map[*k]);
+            record::piece(record::Kind::GlueDef, record::key(&g.protos[*k]), &c[m..]);
         }
     }
     for d in &defs {
+        let m = c.len();
         let _ = write!(c, "inline {}\n", d.def);
+        record::piece(record::Kind::InlineDef, record::key(&d.head), &c[m..]);
     }
     let helpers = if llvm {
         let mut h = c.clone();
@@ -10623,11 +10643,13 @@ pub fn fn_unit_parts(
     };
     for &s in slots {
         let f = &fns[s];
+        let m = c.len();
         // An LLVM fn's C is its C ABI wrapper and trampoline: kept only when a text names them.
         match (c_refs, f.ll.is_empty(), names::fn_tag_opt(s as u32)) {
             (Some(r), false, Some(id)) => c.push_str(&r.c_body(&f.code, &id)),
             _ => c.push_str(&f.code),
         }
+        record::piece(record::Kind::Body, s as u64, &c[m..]);
     }
     // Termination entry for a `main` returning `ExitCode` or
     // `Result<T, E>` (T `()` or `ExitCode`): call main through the
@@ -10636,6 +10658,7 @@ pub fn fn_unit_parts(
     // in `lust_main_entry_p`, which the main unit prefers over the
     // plain void call. The Debug and Drop glue it calls is wanted
     // by main's own FnOut (see `gen_fn`).
+    let entry_at = c.len();
     if let Some((m, idx)) = term_main {
         let ret = p.fn_info(m).ret;
         let rc = cty(&p.tys, ret);
@@ -10674,6 +10697,8 @@ pub fn fn_unit_parts(
         }
         let _ = writeln!(c, "  return rc;\n}}");
     }
+    record::piece(record::Kind::Entry, 0, &c[entry_at..]);
+    let register_at = c.len();
     let _ = writeln!(c, "void {register}(void) {{");
     // Release C calls bodies by name: no table to fill.
     for &i in slots.iter().filter(|&&i| !fns[i].code.is_empty() && !names::release()) {
@@ -10690,6 +10715,7 @@ pub fn fn_unit_parts(
         let _ = writeln!(c, "  lust_main_entry_p = 0;");
     }
     c.push_str("}\n");
+    record::piece(record::Kind::Register, 0, &c[register_at..]);
     (c, helpers)
 }
 
@@ -11061,12 +11087,17 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
     }
     // The hash core's declarations, only in units that name a hash type
     // (see `runtime_source`).
+    // B1 (`record`): each type's typedefs and definition are one piece of a recorded unit.
+    let rec = record::on();
     if wanted.iter().any(|t| matches!(t, CTy::Hash(..))) {
+        let m = out.len();
         out.push_str(&hash_decls());
+        record::piece(record::Kind::Fixed, 2, &out[m..]);
     }
     let mut list: Vec<CTy> = wanted.into_iter().collect();
     list.sort_by_cached_key(mangle);
     for t in &list {
+        let m = out.len();
         if let CTy::Adt(a) = t {
             let _ = writeln!(out, "typedef struct {0} {0};", names::adt(*a));
         }
@@ -11093,24 +11124,35 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         {
             let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
         }
+        if rec && out.len() > m {
+            record::piece(record::Kind::TypeDecl, record::key(&format!("fwd {}", mangle(t))), &out[m..]);
+        }
     }
     // Each definition comes after the types it holds by value.
-    fn emit(p: &Program, t: &CTy, blocks: &HashSet<CTy>, emitted: &mut HashSet<CTy>, out: &mut String) {
+    fn emit(p: &Program, t: &CTy, blocks: &HashSet<CTy>, emitted: &mut HashSet<CTy>, out: &mut String, rec: bool) {
         if !emitted.insert(t.clone()) {
             return;
         }
-        if blocks.contains(t)
-            && let (CTy::Adt(a), Some(l)) = (t, nested_block(p, t))
-        {
+        let block = if blocks.contains(t) { nested_block(p, t).filter(|_| matches!(t, CTy::Adt(_))) } else { None };
+        if block.is_none() {
+            for d in &def_deps(p, t) {
+                emit(p, d, blocks, emitted, out, rec);
+            }
+        }
+        let m = out.len();
+        emit_own(p, t, block, out);
+        if rec {
+            record::piece(record::Kind::TypeDecl, record::key(&mangle(t)), &out[m..]);
+        }
+    }
+    // One type's own definition (its block form, for `block`), after its deps.
+    fn emit_own(p: &Program, t: &CTy, block: Option<Layout>, out: &mut String) {
+        if let (CTy::Adt(a), Some(l)) = (t, block) {
             let an = names::adt(*a);
             let _ = writeln!(out, "/* {} */", p.display_path(p.adt(*a).name));
             let _ = writeln!(out, "struct {an} {{ _Alignas({}) uint8_t b[{}]; }};", l.align, l.size);
             layout_assert(out, &an, &l);
             return;
-        }
-        let deps = def_deps(p, t);
-        for d in &deps {
-            emit(p, d, blocks, emitted, out);
         }
         if let CTy::Hash(k, _) = t
             && hash::has_struct(*k)
@@ -11321,9 +11363,10 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
     }
     let mut emitted = HashSet::new();
     for t in list.iter().filter(|t| defined.as_ref().is_none_or(|d| d.contains(*t))) {
-        emit(p, t, &blocks, &mut emitted, out);
+        emit(p, t, &blocks, &mut emitted, out, rec);
     }
     out.push('\n');
+    record::piece(record::Kind::Fixed, 3, "\n");
 }
 
 /// The body of a glue fn that returns what written impl method `f`

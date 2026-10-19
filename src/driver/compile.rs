@@ -4745,6 +4745,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                 }
             }
+            // B1 step 1 (observation, LUST_B1_OBSERVE=1): the pieces each C fn unit is made of
+            // (`cgen::record`), set against the last build's.
+            let b1_observe = std::env::var_os("LUST_B1_OBSERVE").is_some_and(|v| v == "1");
+            let b1_records: std::sync::Mutex<Vec<(String, Option<Vec<cgen::record::Piece>>)>> = Default::default();
             let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>| {
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
@@ -4757,7 +4761,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                     g => {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];
+                        if b1_observe {
+                            cgen::record::open();
+                        }
                         let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs);
+                        if b1_observe {
+                            let rec = cgen::record::close(&c);
+                            b1_records.lock().unwrap_or_else(|e| e.into_inner()).push((reg.clone(), rec));
+                        }
                         if adapters.is_none() {
                             return (c, h);
                         }
@@ -4824,6 +4835,24 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 r
             });
             made.extend(par_map(fn_jobs, |&u| assemble(u, &inl, c_refs.as_ref())));
+            if b1_observe {
+                let (mut same, mut changed, mut new, mut unrecorded) = (0, 0, 0, 0);
+                let mut next = FxMap::default();
+                for (reg, rec) in b1_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                    let Some(pieces) = rec else {
+                        unrecorded += 1;
+                        continue;
+                    };
+                    match caches.unit_records.get(&reg) {
+                        Some(old) if *old == pieces => same += 1,
+                        Some(_) => changed += 1,
+                        None => new += 1,
+                    }
+                    next.insert(reg, pieces);
+                }
+                caches.unit_records = next;
+                eprintln!("b1-observe: {} C fn units: {same} the same pieces as the last build, {changed} changed, {new} new, {unrecorded} unrecorded", same + changed + new + unrecorded);
+            }
             let mut units: Vec<(PathBuf, String)> = Vec::with_capacity(made.len());
             // The LLVM backend (cgen/ll.rs): a fn unit whose fns have LLVM IR gets two
             // companions after the glue shards, its IR `u<N>.ll` and its helpers' C `u<N>.hc`,
