@@ -134,6 +134,7 @@ fn census(mut sessions: Vec<Box<driver::Session>>) {
         row(&mut rows, "caches.out", &mut || drop(take(&mut c.out)));
         row(&mut rows, "caches.slot_reads", &mut || drop(take(&mut c.slot_reads)));
         row(&mut rows, "caches.read_keys", &mut || drop(take(&mut c.read_keys)));
+        row(&mut rows, "caches.unit_reads", &mut || drop(take(&mut c.unit_reads)));
         row(&mut rows, "caches.derive_tables", &mut || drop(take(&mut c.derive_tables)));
         row(&mut rows, "caches.slot_ir", &mut || drop(take(&mut c.slot_ir)));
         row(&mut rows, "caches.glue", &mut || drop(take(&mut c.glue)));

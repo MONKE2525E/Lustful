@@ -271,6 +271,8 @@ pub(crate) struct Caches {
     /// The read keys the frozen sets in `slot_reads` name (`Reads::freeze`):
     /// as long-lived as those sets.
     pub(crate) read_keys: crate::driver::graph::ReadKeys,
+    /// The reads B1's unit records (`unit_records`) name, each once (`cgen::record::ReadTable`).
+    pub(crate) unit_reads: crate::cgen::record::ReadTable,
     /// This request's derive delta's keyed dirty walk (driver/kept_derive.rs):
     /// by slot, whether a stored read moved. Taken by the compile tail.
     pub(crate) derive_dirty: Option<Vec<bool>>,
@@ -481,6 +483,7 @@ impl Session {
                 has_out: Vec::new(),
                 slot_reads: Vec::new(),
                 read_keys: Default::default(),
+                unit_reads: Default::default(),
                 derive_dirty: None,
                 derive_only: false,
                 header_moves: None,
