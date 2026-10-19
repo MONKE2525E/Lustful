@@ -7,7 +7,7 @@ mod xid_table {
     include!("xid_table.rs");
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IntSuffix {
     I8,
     I16,
@@ -50,7 +50,7 @@ impl IntSuffix {
 /// when the text is the canonical form `lit_text` prints from the value
 /// (`1`, `"a"`, `'a'`), which is also the text of a token a builtin
 /// macro makes. `Float`, `ByteStr`, and `ByteChar` hold only their text.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tok {
     Ident(Sym),
     /// A Rust 2024 keyword that cannot be used as an identifier (`gen`, `try`, `await`, and kin).
@@ -362,6 +362,85 @@ pub fn flatten_trees(trees: &[TokenTree], out: &mut Vec<Token>) {
                 out.push(Token { tok: close, span: *span });
             }
         }
+    }
+}
+
+/// A token stream packed for a cache that keeps it across builds (resolve/worklist.rs
+/// `ResolveCache`, which a front image saves and restores each build): each distinct token
+/// once (`palette`), then per token, as LEB128 varints, its palette index (doubled, plus one
+/// when its file or context differs from the last token's, which then follow), its start as a
+/// zigzag delta from the last token's start, and its length. Tokens repeat and spans climb, so
+/// a stream packs to a fraction of `Lexed`'s 48 bytes a token.
+#[derive(Clone, Default)]
+pub struct PackedLexed {
+    palette: Vec<Tok>,
+    codes: Vec<u8>,
+    len: usize,
+    strings: Vec<String>,
+}
+
+impl PackedLexed {
+    pub fn pack(l: &Lexed) -> PackedLexed {
+        fn put(out: &mut Vec<u8>, mut v: u64) {
+            while v >= 0x80 {
+                out.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            out.push(v as u8);
+        }
+        let zig = |d: i64| ((d << 1) ^ (d >> 63)) as u64;
+        let mut index: FxMap<Tok, u64> = FxMap::default();
+        let mut palette: Vec<Tok> = Vec::new();
+        let mut codes = Vec::with_capacity(l.tokens.len() * 4);
+        let (mut file, mut ctxt, mut lo) = (FileId(0), crate::diag::CtxtId(0), 0u32);
+        for t in &l.tokens {
+            let i = *index.entry(t.tok).or_insert_with(|| {
+                palette.push(t.tok);
+                palette.len() as u64 - 1
+            });
+            let moved = t.span.file != file || t.span.ctxt != ctxt;
+            put(&mut codes, i << 1 | moved as u64);
+            if moved {
+                (file, ctxt) = (t.span.file, t.span.ctxt);
+                put(&mut codes, file.0 as u64);
+                put(&mut codes, ctxt.0 as u64);
+            }
+            put(&mut codes, zig(t.span.lo as i64 - lo as i64));
+            put(&mut codes, zig(t.span.hi as i64 - t.span.lo as i64));
+            lo = t.span.lo;
+        }
+        codes.shrink_to_fit();
+        PackedLexed { palette, codes, len: l.tokens.len(), strings: l.strings.clone() }
+    }
+
+    /// The stream back, token for token.
+    pub fn unpack(&self) -> Lexed {
+        let get = |at: &mut usize| {
+            let (mut v, mut shift) = (0u64, 0);
+            while let Some(&b) = self.codes.get(*at) {
+                *at += 1;
+                v |= ((b & 0x7f) as u64) << shift;
+                if b < 0x80 {
+                    break;
+                }
+                shift += 7;
+            }
+            v
+        };
+        let unzig = |v: u64| (v >> 1) as i64 ^ -((v & 1) as i64);
+        let mut tokens = Vec::with_capacity(self.len);
+        let (mut at, mut file, mut ctxt, mut lo) = (0, FileId(0), crate::diag::CtxtId(0), 0u32);
+        for _ in 0..self.len {
+            let c = get(&mut at);
+            if c & 1 == 1 {
+                file = FileId(get(&mut at) as u32);
+                ctxt = crate::diag::CtxtId(get(&mut at) as u32);
+            }
+            lo = (lo as i64 + unzig(get(&mut at))) as u32;
+            let hi = (lo as i64 + unzig(get(&mut at))) as u32;
+            tokens.push(Token { tok: self.palette[(c >> 1) as usize], span: Span { file, lo, hi, ctxt } });
+        }
+        Lexed { tokens, strings: self.strings.clone() }
     }
 }
 
@@ -1477,6 +1556,22 @@ fn lex_escape(src: &str, i: &mut usize) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A packed stream unpacks to the same tokens and strings, spans that jump back (a macro
+    /// call's tokens) and another file and context included.
+    #[test]
+    fn a_packed_stream_unpacks_token_for_token() {
+        let interner = Interner::default();
+        let mut l = lex("fn f(x: u32) -> u32 { let s = \"a\"; x + 1_000u32 }\n/// doc\nstruct S;", FileId(3), 40, &interner).unwrap();
+        l.tokens.push(Token { tok: Tok::Comma, span: Span { file: FileId(9), lo: 2, hi: 3, ctxt: crate::diag::CtxtId(5) } });
+        l.tokens.push(Token { tok: l.tokens[0].tok, span: Span { file: FileId(3), lo: 41, hi: 44, ctxt: crate::diag::CtxtId(0) } });
+        let back = PackedLexed::pack(&l).unpack();
+        assert_eq!(back.strings, l.strings);
+        assert_eq!(back.tokens.len(), l.tokens.len());
+        for (a, b) in back.tokens.iter().zip(&l.tokens) {
+            assert_eq!((a.tok, a.span), (b.tok, b.span));
+        }
+    }
 
     /// XID properties at known chars, as rustc 1.99 (Unicode 17)
     /// decides them: emoji and circled letters are not identifier

@@ -1788,16 +1788,18 @@ fn expand_by_file(front: &Front, base: &PatchBase, text: &str, edit: Edit, body:
 /// strings hold only the ones the tokens name.
 fn kept_body(front: &Front, base: &PatchBase, fn_index: usize, edit: Edit, body: (u32, u32)) -> Result<lexer::Lexed, &'static str> {
     let file = edit.file;
+    let stored_owned: lexer::Lexed;
     let (tokens, strings) = match base.kept_bodies.iter().find(|k| k.fn_index == fn_index && k.file == file && k.span == body) {
         Some(k) => (&k.body.tokens[..], &k.body.strings[..]),
         None => {
             let cache = &front.resolve_cache;
             let old = front.map.text(file).ok_or("no text")?;
             let own = if file == FileId(0) { base.root_unspliced.as_str() } else { old };
-            let stored = match cache.expansion_of(file, own).or_else(|| cache.expansion_of(file, old)) {
+            stored_owned = match cache.expansion_of(file, own).or_else(|| cache.expansion_of(file, old)) {
                 Some(l) if cache.expansions() == base.expansions => l,
                 _ => return Err("item: body macro"),
             };
+            let stored = &stored_owned;
             // The expander gives both delimiters of a group the group's span.
             let at = |t: &lexer::Token, tok: Tok| t.tok == tok && t.span == crate::diag::Span { file, lo: body.0, hi: body.1, ctxt: CtxtId::ROOT };
             let i0 = stored.tokens.iter().position(|t| at(t, Tok::LBrace)).ok_or("item: body macro")?;

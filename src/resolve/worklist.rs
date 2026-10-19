@@ -752,18 +752,19 @@ pub struct ResolveCache {
     /// The local crate's per-file expander from the last resolve that
     /// got past expansion (see `FileExpander`).
     file_expander: Option<std::sync::Arc<FileExpander>>,
+    /// This request's raw streams, unpacked on the pool before discovery takes them one
+    /// file at a time (`unpack_raw`, `raw`): key, text hash, file id, stream. Empty between
+    /// requests.
+    unpacked: FxMap<String, (u64, FileId, lexer::Lexed)>,
 }
 
 impl ResolveCache {
-    /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part of
-    /// every cached file (0 raw tokens, 1 outline, 2 expanded tokens, 3 parsed Ast, 4 final
-    /// chunk, 5 std asks), or with 6 the path table, the seed and the file expander.
     /// For `main::census`: (cached files, files whose expanded stream has the raw stream's
     /// tokens and strings, those files' raw token count).
     pub(crate) fn same_streams(&self) -> (usize, usize, usize) {
         let mut same = (0, 0);
         for f in self.files.values() {
-            if let (Some(raw), Some((_, exp, _, _))) = (&f.raw, &f.expanded)
+            if let (Some(raw), Some(exp)) = (f.raw.as_ref().map(lexer::PackedLexed::unpack), f.expanded.as_ref().map(|e| e.1.unpack()))
                 && raw.tokens.len() == exp.tokens.len()
                 && raw.strings == exp.strings
                 && raw.tokens.iter().zip(&exp.tokens).all(|(a, b)| a.tok == b.tok && a.span == b.span)
@@ -775,6 +776,9 @@ impl ResolveCache {
         (self.files.len(), same.0, same.1)
     }
 
+    /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part of
+    /// every cached file (0 raw tokens, 1 outline, 2 expanded tokens, 3 parsed Ast, 4 final
+    /// chunk, 5 std asks), or with 6 the path table, the seed and the file expander.
     pub(crate) fn drop_part(&mut self, part: usize) {
         for f in self.files.values_mut() {
             match part {
@@ -935,14 +939,14 @@ struct CachedFile {
     file_id: FileId,
     /// The raw (unexpanded) token stream. Discovery outlines it and
     /// reads cfg strings from it; the parse phase starts from it.
-    raw: Option<lexer::Lexed>,
+    raw: Option<lexer::PackedLexed>,
     /// The outline scanned from `raw`.
     outline: Option<scan::Outline>,
     /// The expanded token stream the parser consumes (cfg-name
     /// checking and expansion already applied to `raw`), with the
     /// hash of every other input that expansion read
     /// (`expansion_input_hash`) and the outside reads it recorded.
-    expanded: Option<(u64, std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>,
+    expanded: Option<(u64, lexer::PackedLexed, Vec<crate::expand::Dep>, u64)>,
     /// The parsed Ast with the hash of the expanded token stream
     /// it was parsed from. Expansion answers depend on the whole
     /// crate's macro environment, so own text alone cannot key a
@@ -1024,12 +1028,6 @@ fn reads_outside(text: &str) -> bool {
     NEEDLES.iter().any(|n| text.contains(n))
 }
 
-/// Clones a lexed token stream (tokens are `Copy`; the string table
-/// clones its strings).
-fn clone_lexed(l: &lexer::Lexed) -> lexer::Lexed {
-    lexer::Lexed { tokens: l.tokens.clone(), strings: l.strings.clone() }
-}
-
 /// The cfg-environment fingerprint a cache's entries were built under.
 fn env_fingerprint(input: &CrateInput) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1109,7 +1107,7 @@ impl ResolveCache {
         }
         self.resolves += 1;
         if let Some((key, text_hash, lexed)) = self.seed.take() {
-            self.entry(&key, text_hash, FileId(0)).raw = Some(lexed);
+            self.entry(&key, text_hash, FileId(0)).raw = Some(lexer::PackedLexed::pack(&lexed));
         }
     }
 
@@ -1136,17 +1134,31 @@ impl ResolveCache {
     }
 
     /// The cached raw token stream for one file, when its text and file
-    /// id stand: cloned out, or moved out of a one-shot cache.
+    /// id stand: unpacked (the cache keeps streams packed, `PackedLexed`,
+    /// as a front image saves and restores the cache every build).
     fn raw(&mut self, key: &str, text_hash: u64, file_id: FileId) -> Option<lexer::Lexed> {
+        if let Some((h, f, l)) = self.unpacked.remove(key)
+            && h == text_hash
+            && f == file_id
+        {
+            return Some(l);
+        }
         let one_shot = self.one_shot;
         let e = self.files.get_mut(key).filter(|e| e.text_hash == text_hash && e.file_id == file_id)?;
-        if one_shot { e.raw.take() } else { e.raw.as_ref().map(clone_lexed) }
+        if one_shot { e.raw.take().map(|p| p.unpack()) } else { e.raw.as_ref().map(lexer::PackedLexed::unpack) }
+    }
+
+    /// Unpacks every stored raw stream on the pool, for this request's discovery (`raw`).
+    fn unpack_raw(&mut self) {
+        let stored: Vec<(&String, &CachedFile)> = self.files.iter().filter(|(_, e)| e.raw.is_some()).collect();
+        let streams = par_map(&stored, |(_, e)| e.raw.as_ref().map(lexer::PackedLexed::unpack));
+        self.unpacked = stored.iter().zip(streams).filter_map(|((k, e), l)| Some(((*k).clone(), (e.text_hash, e.file_id, l?)))).collect();
     }
 
     /// Every put stores nothing in a one-shot cache (see `one_shot`).
     fn put_raw(&mut self, key: &str, text_hash: u64, file_id: FileId, lexed: &lexer::Lexed) {
         if !self.one_shot {
-            self.entry(key, text_hash, file_id).raw = Some(clone_lexed(lexed));
+            self.entry(key, text_hash, file_id).raw = Some(lexer::PackedLexed::pack(lexed));
         }
     }
 
@@ -1177,11 +1189,11 @@ impl ResolveCache {
     }
 
     /// The cached expansion of one file whose other inputs hash to
-    /// `input_hash` (`expansion_input_hash`), shared, with the stream's
+    /// `input_hash` (`expansion_input_hash`), unpacked, with the stream's
     /// own `hash_lexed`.
-    fn expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64) -> Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)> {
+    fn expanded(&self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64) -> Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)> {
         match self.peek(key, text_hash, file_id).and_then(|e| e.expanded.as_ref()) {
-            Some((h, l, deps, exp_hash)) if *h == input_hash => Some((l.clone(), deps.clone(), *exp_hash)),
+            Some((h, l, deps, exp_hash)) if *h == input_hash => Some((std::sync::Arc::new(l.unpack()), deps.clone(), *exp_hash)),
             _ => None,
         }
     }
@@ -1190,7 +1202,7 @@ impl ResolveCache {
     fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64, lexed: &std::sync::Arc<lexer::Lexed>, deps: &[crate::expand::Dep]) -> u64 {
         let exp_hash = hash_lexed(lexed);
         self.expansions += 1;
-        self.entry(key, text_hash, file_id).expanded = Some((input_hash, lexed.clone(), deps.to_vec(), exp_hash));
+        self.entry(key, text_hash, file_id).expanded = Some((input_hash, lexer::PackedLexed::pack(lexed), deps.to_vec(), exp_hash));
         exp_hash
     }
 
@@ -1207,9 +1219,9 @@ impl ResolveCache {
     /// The stored expansion of the file lexed as `file_id` with text
     /// `text`, if any. The item patch takes an unchanged body's expanded
     /// tokens from it (driver/patch.rs `kept_body`).
-    pub fn expansion_of(&self, file_id: FileId, text: &str) -> Option<&lexer::Lexed> {
+    pub fn expansion_of(&self, file_id: FileId, text: &str) -> Option<lexer::Lexed> {
         let text_hash = hash_str(text);
-        self.files.values().find(|e| e.file_id == file_id && e.text_hash == text_hash).and_then(|e| e.expanded.as_ref()).map(|e| &*e.1)
+        self.files.values().find(|e| e.file_id == file_id && e.text_hash == text_hash).and_then(|e| e.expanded.as_ref()).map(|e| e.1.unpack())
     }
 
     /// The cached parsed Ast for one expanded token stream, cloned out.
@@ -1808,6 +1820,8 @@ pub fn resolve_crate_with(
             }
         }
     }
+    // And every stored raw token stream, unpacked on the pool (discovery takes them in turn).
+    cache.unpack_raw();
     // The selected crate's root file is FileId(0) even though its
     // dependencies resolve first: the spliced std ranges, the error
     // footer, and `Program::shipped_crate_at` all read file 0 as the
@@ -1900,6 +1914,7 @@ pub fn resolve_crate_with(
             Err(e) => {
                 add_asks(j, e.std_asks);
                 all_seen.extend(seen_whole(e.seen, j, std_job, input));
+                cache.unpacked.clear();
                 let (map, all_text) = make_map(&all_seen);
                 return Err(ResolveError { map, all_text, std_asks, platform_asks, diags: e.diags });
             }
@@ -1908,6 +1923,8 @@ pub fn resolve_crate_with(
     fn_lines.extend(nested_lines);
     body_hashes.extend(nested_hashes);
     tables.fn_module.extend(nested_modules);
+    // Streams of files no job took this request do not stay.
+    cache.unpacked.clear();
     let (map, all_text) = make_map(&all_seen);
     let ast = Ast::concat(chunks);
     scan_bodies.extend(nested_scan_bodies);
@@ -3429,11 +3446,13 @@ fn resolve_one(
                 })
             })
             .collect();
-        let exp_hits: Vec<std::sync::Mutex<Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>>> = exp_keys
-            .iter()
-            .enumerate()
-            .map(|(di, k)| std::sync::Mutex::new(k.as_ref().and_then(|(key, th, ih)| cache.expanded(key, *th, discs[di].file_id, *ih))))
-            .collect();
+        // Each stored expansion unpacks on the pool (`PackedLexed`).
+        let exp_hits: Vec<std::sync::Mutex<Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>>> = {
+            let cache: &ResolveCache = cache;
+            par_map(&(0..exp_keys.len()).collect::<Vec<_>>(), |&di| {
+                std::sync::Mutex::new(exp_keys[di].as_ref().and_then(|(key, th, ih)| cache.expanded(key, *th, discs[di].file_id, *ih)))
+            })
+        };
         exp_known.clear();
         exp_known.extend(exp_hits.iter().map(|h| h.lock().unwrap().as_ref().map(|x| x.2)));
         let results = par_map(&indices, |&di| -> Result<(Option<std::sync::Arc<lexer::Lexed>>, Vec<crate::expand::Dep>), Diag> {
