@@ -3273,18 +3273,32 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // instance discovery of a generic program are stored per stable def.
     // They hold while the trait system holds (collect checks
     // `gen_reuse::trait_key` before its body checks run); an entry made
-    // under another item-level environment (item-scan hash and AST fn
-    // count) replays its recorded reads first. Anything else drops them:
-    // a const fn body edit (const values move), a nested static (its
-    // index can move), or a slot compaction (cached C carries slot
-    // numbers). The source key of an AST fn is its body and head hash.
+    // under another item-level environment (item-scan hash, AST fn count,
+    // and const fn bodies, whose edits move values) replays its recorded
+    // reads first. Anything else drops them: a nested static (its index
+    // can move), or a slot compaction (cached C carries slot numbers). A
+    // const fn edit on a patch path drops them too (`const_fn_checked`). The source key of an AST fn is its body and head hash.
     // A body patch moves no static (body items keep their indexes), so
     // on that path nested statics keep their indices and the cache holds.
     // A full resolve keeps it too once a program's static ids are known:
     // after collect, they must equal the last program's (below).
+    // Const fn bodies join the environment: a const fn edit moves const and
+    // static values while no reader's source moves, so every entry and slot
+    // checked before it must ask its reads (`Sig` folds a value), discovery
+    // and template entries (`GenReuse::reads_hold`) as instance and closure
+    // slots. Body hashes do not hold the fn's line, so a shift does not move it.
+    let const_fns = {
+        let mut h = crate::intern::FxHasher::default();
+        for (i, &(item, sub)) in front.fn_loc.iter().enumerate().take(fn_count) {
+            if fn_def_at(&front.ast, item, sub).qual.is_const {
+                std::hash::Hash::hash(&(i, body_hashes_all.get(i)), &mut h);
+            }
+        }
+        std::hash::Hasher::finish(&h)
+    };
     let gen_env = front.env_hash.map(|env| {
         let mut h = crate::intern::FxHasher::default();
-        std::hash::Hash::hash(&(env, fn_count), &mut h);
+        std::hash::Hash::hash(&(env, fn_count, const_fns), &mut h);
         std::hash::Hasher::finish(&h)
     });
     // The item patch moves no static either: it refuses a fn with body
@@ -4068,6 +4082,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         };
         let reuse = &caches.gen_reuse;
         let env = gen_env.unwrap_or(0);
+        let consts_moved = const_fn_changed || front.walked_const_fns != const_fns;
         let memo = &mut answers;
         // Slots some fn of this program holds. A body whose stored C
         // names any other slot rebuilds it: that callee's identity moved
@@ -4126,9 +4141,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     clean
                 };
                 recheck = srcs[i - fn_count] != Some(front.slot_hash[s]);
+                // Const fn bodies are in `env` (`gen_env`): after a const fn
+                // edit every slot checked before it asks its reads, and a check
+                // makes no instances, so the next build asks theirs. Neither the
+                // derive nor the keyed walk follows a moved value: while the
+                // const fns differ from the last build's walk, the full read
+                // check decides.
                 if !recheck && front.slot_env[s] != env {
                     match (&caches.slot_reads[s], &derive_dirty) {
                         (None, _) => recheck = true,
+                        (Some(_), _) if consts_moved => {
+                            by_reads.push(i);
+                            continue;
+                        }
                         (Some(r), Some(d)) => recheck = !clean(r, d),
                         (Some(_), None) if keyed.as_ref().is_some_and(|k| matches!(k.get(s), Some(Some(_)))) => {
                             recheck = !keyed_clean(caches, s, memo, i);
@@ -4156,6 +4181,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         work = (0..program.fns.len()).filter(|&i| recheck_of[i]).collect();
         if build {
             caches.held_slots = held;
+            front.walked_const_fns = const_fns;
         }
         // A recheck leaves the slot's C stale until codegen replaces
         // it; a check request, or a build that stops on errors, never

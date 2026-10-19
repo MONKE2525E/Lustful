@@ -453,6 +453,32 @@ fn main() {{
 '''
 
 
+def const_fn_closure(val, body_const, generic=False):
+    """A const that calls a const fn, read by a closure body (or a generic instance's body):
+    the const fn's body edit moves the const's value with no change to the reader's source.
+    `body_const` adds a const item in another fn's body, so the request takes a full resolve
+    (two edit windows) and not the body patch. The fuzzer's small2 seed 11 (2026-10-19): the
+    image build kept the closure's old value."""
+    k9 = "    const K9: i64 = 5;\n" if body_const else ""
+    reader = ("fn use_seed<T: Into<i64>>(n: T) -> i64 {\n    n.into() + SEED\n}\n" if generic else
+              "fn use_seed(n: i64) -> i64 {\n    let add_seed = |x: i64| x + SEED;\n    add_seed(n)\n}\n")
+    return f'''const fn seed_val() -> i64 {{
+    {val}
+}}
+
+const SEED: i64 = seed_val();
+
+fn label(n: i64) -> i64 {{
+{k9}    n
+}}
+
+{reader}
+fn main() {{
+    println!("{{}} {{}}", label(1), use_seed(10i64));
+}}
+'''
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -535,6 +561,18 @@ def corpus():
     seqs.append(("dt01-b1-skip", dt01, {"quiet": True, "b1": "skip"}))
     # Recovery (the kept-program reviews): a rejected build, then the state after it. A
     # ("check", src) step runs `lust check` on both sides, on the same image (a mode switch).
+    # A const fn edit across skipped image states: the image builds the first and the last
+    # state only (`steps`), as a CI disk that missed the states between.
+    c = const_fn_closure
+    seqs.append(("const-fn-closure", [c(3, False), c(7, False), c(10, True)], {"steps": [0, 2]}))
+    seqs.append(("const-fn-closure-each", [c(3, False), c(10, True), c(4, False), c(4, True)]))
+    seqs.append(("const-fn-generic", [c(3, False, True), c(7, False, True), c(10, True, True)], {"steps": [0, 2]}))
+    # rel-front's discovery case (2026-10-19): a stored discovery entry asks for
+    # `make::<[u8; N]>`, and a const fn edit moves N; the entry must replay its reads.
+    disc = os.path.join(ROOT, "tests/daemon/cv02_const_fn_value_in_discovery")
+    dv = [open(os.path.join(disc, f"v{k}.rs")).read() for k in (1, 2, 3)]
+    seqs.append(("const-fn-discovery", dv))
+    seqs.append(("const-fn-discovery-jump", dv, {"steps": [0, 2]}))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))

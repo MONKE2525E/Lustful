@@ -107,6 +107,10 @@ pub(crate) struct Front {
     /// moved, and no body rechecked under them. The next request is a
     /// const fn edit too (`compile`).
     pub(crate) const_fn_pending: bool,
+    /// The const fn bodies (`compile`'s `const_fns`) at the last build's
+    /// generic reuse walk: while they differ, no derive or keyed shortcut
+    /// stands in for an instance or closure body's reads.
+    pub(crate) walked_const_fns: u64,
     /// Top-level items of the last parse (to see which items an edit changed).
     pub(crate) items: Vec<scan::ItemScan>,
     /// Where each LocalDefId's definition lives: item index, and index inside an impl block.
@@ -445,6 +449,7 @@ impl Session {
                 walk_pending: Vec::new(),
                 pending_derive_only: false,
                 const_fn_pending: false,
+                walked_const_fns: 0,
                 items: Vec::new(),
                 fn_loc: Vec::new(),
                 fn_slot: Vec::new(),
