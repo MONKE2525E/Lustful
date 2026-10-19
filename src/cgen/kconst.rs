@@ -193,8 +193,15 @@ fn enum_ops(p: &Program, t: &CTy, off: u64, size: u64, out: &mut Vec<Op>) {
     match l.enum_tag {
         Some(EnumTag::None(v)) => fields_at(v, off, out),
         Some(EnumTag::Explicit { size: ts, .. }) if matches!(ts, 1 | 2 | 4 | 8 | 16) => {
+            // With no variant data, a value's bytes are its tag's (a tag op marks those and its
+            // variant adds none): plain bytes, not a table of every discriminant (tsgo's
+            // SyntaxKind has 352).
+            let vars: Vec<Vec<Op>> = subs();
+            if vars.iter().all(Vec::is_empty) {
+                return init_bytes(out, off, ts);
+            }
             let mask = scalar_mask(ts);
-            out.push(Op::Tag(off, ts, adt_discs(p, t).iter().map(|&d| d as u128 & mask).collect(), subs()));
+            out.push(Op::Tag(off, ts, adt_discs(p, t).iter().map(|&d| d as u128 & mask).collect(), vars));
         }
         Some(EnumTag::NicheFilled { variant, niche, first, last, start }) if matches!(niche.scalar_size, 1 | 2 | 4 | 8 | 16) => {
             let span = (last - first + 1) as u64;
