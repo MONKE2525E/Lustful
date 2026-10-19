@@ -694,23 +694,25 @@ pub(crate) fn check_cfg_names(lexed: &lexer::Lexed, env: &CfgEnv, interner: &Int
     Ok(())
 }
 
-/// Builds a source map from discovered (path, text, file id) triples.
+/// Builds a source map from discovered (path, text, file id) triples: an id no triple has
+/// gets an empty file, and of two triples with one id the map keeps the first (the text
+/// keeps both). The files' line indexes are made on the pool (`SourceMap::with_texts`).
 fn make_map(seen: &[(PathBuf, String, FileId)]) -> (SourceMap, String) {
-    let mut map = SourceMap::default();
-    let mut all = String::new();
     let mut sorted: Vec<&(PathBuf, String, FileId)> = seen.iter().collect();
     sorted.sort_by_key(|(_, _, f)| f.0);
+    let mut files: Vec<(String, &str)> = Vec::with_capacity(sorted.len());
+    let mut all = String::with_capacity(sorted.iter().map(|(_, text, _)| text.len() + 1).sum());
     for (path, text, file_id) in sorted {
-        while (map.file_count() as u32) < file_id.0 {
-            map.add_file_with_text("", "");
+        while (files.len() as u32) < file_id.0 {
+            files.push((String::new(), ""));
         }
-        if map.file_count() as u32 == file_id.0 {
-            map.add_file_with_text(&path.to_string_lossy(), text);
+        if files.len() as u32 == file_id.0 {
+            files.push((path.to_string_lossy().into_owned(), text));
         }
         all.push_str(text);
         all.push('\n');
     }
-    (map, all)
+    (SourceMap::with_texts(&files), all)
 }
 
 /// Per-file front-end cache for one crate session (W-DRIVER phase 2):
@@ -3568,7 +3570,6 @@ fn resolve_one(
         tables.macro_scopes.insert(discs[di].file_id, (discs[di].module, scope.map(|i| def_of[i])));
     }
     let seen = seen_of(&discs);
-    let (map, _all) = make_map(&seen);
     // Parse the expanded files in parallel, in FileId order. A
     // file whose expanded stream hashes to a cached parse clones
     // that Ast instead of parsing again; the hash runs in parallel
@@ -3924,6 +3925,17 @@ fn resolve_one(
             })
         })
         .collect();
+    // Each file's text as `make_map` maps it (the first disc with the id), and the line
+    // of a span, its line index made on first use: only chunks that missed read lines, and
+    // a warm request flattens few of them.
+    let mut texts: FxMap<FileId, &str> = FxMap::default();
+    for (_, text, file_id) in &seen {
+        texts.entry(*file_id).or_insert(text.as_str());
+    }
+    let mut line_indexes: FxMap<FileId, crate::diag::LineIndex> = FxMap::default();
+    let mut line_of = |span: Span| {
+        line_indexes.entry(span.file).or_insert_with(|| crate::diag::LineIndex::new(texts.get(&span.file).copied().unwrap_or(""))).line_col(span.lo).0
+    };
     let mut pendings: Vec<Pending> = Vec::with_capacity(works.len());
     for ((fi, mut w), hit) in works.into_iter().enumerate().zip(final_hits) {
         if let Some(c) = hit {
@@ -3957,8 +3969,8 @@ fn resolve_one(
         let (mut p_lines, mut p_hashes, mut p_paths) = (Vec::new(), Vec::new(), Vec::new());
         for (item, module) in flat_items.iter().zip(flat_mods.iter()) {
             let mut push = |def: &FnDef| {
-                p_lines.push(map.line_col(def.name_span).0);
-                let text = map.text(def.name_span.file).unwrap_or("");
+                p_lines.push(line_of(def.name_span));
+                let text = texts.get(&def.name_span.file).copied().unwrap_or("");
                 let body_span = def.body.map(|b| w.ast.block(b).span).unwrap_or(def.name_span);
                 let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
                 p_hashes.push(hash_str(slice));
@@ -3979,8 +3991,8 @@ fn resolve_one(
         let (mut n_lines, mut n_hashes, mut n_paths) = (Vec::new(), Vec::new(), Vec::new());
         for item in &w.ast.stmt_items {
             if let crate::ast::ItemKind::Fn(d) = &item.kind {
-                n_lines.push(map.line_col(d.name_span).0);
-                let text = map.text(d.name_span.file).unwrap_or("");
+                n_lines.push(line_of(d.name_span));
+                let text = texts.get(&d.name_span.file).copied().unwrap_or("");
                 let body_span = d.body.map(|b| w.ast.block(b).span).unwrap_or(d.name_span);
                 let slice = text.get(body_span.lo as usize..body_span.hi as usize).unwrap_or("");
                 n_hashes.push(hash_str(slice));

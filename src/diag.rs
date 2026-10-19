@@ -581,6 +581,15 @@ impl SourceMap {
         }));
         id
     }
+    /// A map of `files` (path and text, in id order) as `add_file_with_text` makes it, with
+    /// each file's line index, text copy and hash made on the pool: a multi-file crate's
+    /// resolve maps every file on every request.
+    pub fn with_texts(files: &[(String, &str)]) -> SourceMap {
+        let files = crate::pool::par_map(files, |(path, src)| {
+            std::sync::Arc::new(SourceFile { path: path.clone(), lines: LineIndex::new(src), text: Some(src.to_string()), hash: text_hash(src) })
+        });
+        SourceMap { files, ..SourceMap::default() }
+    }
     /// The number of files in the map.
     pub fn file_count(&self) -> usize {
         self.files.len()
