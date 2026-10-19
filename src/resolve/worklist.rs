@@ -1907,8 +1907,12 @@ pub fn resolve_crate_with(
     tables.fn_module.extend(nested_modules);
     // Streams of files no job took this request do not stay.
     cache.unpacked.clear();
-    let (map, all_text) = make_map(&all_seen);
-    let ast = Ast::concat(chunks);
+    // The source map builds beside the merged Ast (each 10-70 ms on tsgo).
+    let ((map, all_text), ast) = std::thread::scope(|s| {
+        let map = s.spawn(|| make_map(&all_seen));
+        let ast = Ast::concat(chunks);
+        (map.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), ast)
+    });
     scan_bodies.extend(nested_scan_bodies);
     let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
     let mdr = crate::resolve::mdr::on().then(|| crate::resolve::mdr::build(&tables, &map, mdr_parts));

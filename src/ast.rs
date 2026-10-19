@@ -1673,24 +1673,65 @@ impl Ast {
             paren_tys: Vec::new(),
             anon_consts: Vec::new(),
         };
-        for mut c in chunks {
-            out.inner_attrs.append(&mut c.inner_attrs);
-            out.items.append(&mut c.items);
-            out.stmt_items.append(&mut c.stmt_items);
-            out.exprs.append(&mut c.exprs);
-            out.expr_spans.append(&mut c.expr_spans);
-            out.pats.append(&mut c.pats);
-            out.pat_spans.append(&mut c.pat_spans);
-            out.tys.append(&mut c.tys);
-            out.ty_spans.append(&mut c.ty_spans);
-            out.blocks.append(&mut c.blocks);
-            out.strings.append(&mut c.strings);
-            out.blobs.append(&mut c.blobs);
-            out.use_traits.append(&mut c.use_traits);
-            out.paren_exprs.append(&mut c.paren_exprs);
-            out.paren_tys.append(&mut c.paren_tys);
-            out.anon_consts.append(&mut c.anon_consts);
+        fn cat<T>(parts: Vec<Vec<T>>, mut out: Vec<T>) -> Vec<T> {
+            for mut p in parts {
+                out.append(&mut p);
+            }
+            out
         }
+        // The expression, pattern and type arenas move out of the chunks first. A large Ast
+        // (a tsgo resolve: 1.2M exprs, 60+ ms on one thread, much of it the first-touch
+        // faults of the merged arenas) moves them on three scoped threads (exprs, their
+        // spans, patterns and types) while this thread moves the rest.
+        let wide = sh.e > 1 << 18;
+        let n = chunks.len();
+        let (mut exprs, mut expr_spans, mut pats_tys) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        for c in &mut chunks {
+            exprs.push(std::mem::take(&mut c.exprs));
+            expr_spans.push(std::mem::take(&mut c.expr_spans));
+            pats_tys.push((std::mem::take(&mut c.pats), std::mem::take(&mut c.pat_spans), std::mem::take(&mut c.tys), std::mem::take(&mut c.ty_spans)));
+        }
+        let (e_out, es_out) = (std::mem::take(&mut out.exprs), std::mem::take(&mut out.expr_spans));
+        let mut pt_out = (std::mem::take(&mut out.pats), std::mem::take(&mut out.pat_spans), std::mem::take(&mut out.tys), std::mem::take(&mut out.ty_spans));
+        let pats_tys_into = move || {
+            for (mut p, mut ps, mut t, mut ts) in pats_tys {
+                pt_out.0.append(&mut p);
+                pt_out.1.append(&mut ps);
+                pt_out.2.append(&mut t);
+                pt_out.3.append(&mut ts);
+            }
+            pt_out
+        };
+        let rest = |out: &mut Ast| {
+            for mut c in chunks {
+                out.inner_attrs.append(&mut c.inner_attrs);
+                out.items.append(&mut c.items);
+                out.stmt_items.append(&mut c.stmt_items);
+                out.blocks.append(&mut c.blocks);
+                out.strings.append(&mut c.strings);
+                out.blobs.append(&mut c.blobs);
+                out.use_traits.append(&mut c.use_traits);
+                out.paren_exprs.append(&mut c.paren_exprs);
+                out.paren_tys.append(&mut c.paren_tys);
+                out.anon_consts.append(&mut c.anon_consts);
+            }
+        };
+        let (e, es, pt) = if wide {
+            std::thread::scope(|s| {
+                let e = s.spawn(move || cat(exprs, e_out));
+                let es = s.spawn(move || cat(expr_spans, es_out));
+                let pt = s.spawn(pats_tys_into);
+                rest(&mut out);
+                let e = e.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                let es = es.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                (e, es, pt.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            })
+        } else {
+            rest(&mut out);
+            (cat(exprs, e_out), cat(expr_spans, es_out), pats_tys_into())
+        };
+        (out.exprs, out.expr_spans) = (e, es);
+        (out.pats, out.pat_spans, out.tys, out.ty_spans) = pt;
         out
     }
 
