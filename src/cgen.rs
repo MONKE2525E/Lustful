@@ -10386,25 +10386,32 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, 
     let mut out = BTreeSet::new();
     let rec = record::on();
     for e in externs {
-        if rec && let Some(id) = proto_body_id(e) {
+        let Some(id) = proto_body_id(e) else { continue };
+        if rec {
             record::read(record::Read::SlotOf(id.to_string()));
-            if let Some(c) = names::slot_of_id(id) {
-                record::read(record::Read::Fn(c as usize));
-            }
         }
-        if let Some(id) = proto_body_id(e)
-            && let Some(c) = names::slot_of_id(id)
-            && let Some(f) = fns.get(c as usize)
-            && !skip.contains(&(c as usize))
-            && f.error.is_none()
-            && plain_fn_def(&f.code).is_some_and(|d| {
-                d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
-            })
-        {
-            out.insert(c as usize);
+        let Some(c) = names::slot_of_id(id).map(|c| c as usize) else { continue };
+        if skip.contains(&c) {
+            continue;
+        }
+        let pick = fns.get(c).is_some_and(|f| inline_pick(f, deep));
+        // B1 (`record`): a copied callee's whole output is read; of one left out, only that.
+        if rec {
+            record::read(if pick { record::Read::Fn(c) } else { record::Read::Pick(c, deep) });
+        }
+        if pick {
+            out.insert(c);
         }
     }
     out.into_iter().collect()
+}
+
+/// Whether `inline_callees` copies `f` (a callee another unit holds), at a `deep` level or not.
+fn inline_pick(f: &FnOut, deep: bool) -> bool {
+    f.error.is_none()
+        && plain_fn_def(&f.code).is_some_and(|d| {
+            d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
+        })
 }
 
 /// The unit for `slots` (`fns` is indexed by slot; empty slots have no code). Its
@@ -11363,6 +11370,7 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
             }
         },
         Read::SlotOf(id) => names::slot_of_id(id).map_or((0, 2), |s| h(&[&s.to_le_bytes()])),
+        Read::Pick(s, deep) => fns.get(*s).map_or((0, 3), |f| h(&[&[inline_pick(f, *deep) as u8]])),
         Read::Glue(k, t) => {
             let key = (*k, t.clone());
             let deps = g.deps.get(&key).map(|d| d.iter().map(|(a, b)| format!("{a:?} {}", mangle(b))).collect::<Vec<_>>().join("\n")).unwrap_or_default();

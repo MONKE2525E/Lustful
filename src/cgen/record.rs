@@ -53,6 +53,9 @@ pub enum Read {
     Fn(usize),
     /// The slot a fn id names (`names::slot_of_id`).
     SlotOf(String),
+    /// A callee `inline_callees` left out (by slot, and whether at a deep level): only that
+    /// it is still left out (`inline_pick`), not its whole output.
+    Pick(usize, bool),
     /// A glue key's entry in the glue set.
     Glue(super::Glue, super::CTy),
     /// What a type's declarations print and the types they reach, with the type's release

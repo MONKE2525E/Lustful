@@ -4792,8 +4792,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let b1_statics = b1_record.then(|| cgen::names::with(rn, || cgen::static_decl_map(&program))).unwrap_or_default();
             b1_ms[0] = t_b1.elapsed().as_secs_f64() * 1e3;
             // With LUST_B1_OBSERVE=1, the workers' time per read kind (Fn, SlotOf, Glue, Type,
-            // Static, Main) and the count of each.
-            let kind_ns: [std::sync::atomic::AtomicU64; 12] = Default::default();
+            // Static, Main, Pick) and the count of each.
+            let kind_ns: [std::sync::atomic::AtomicU64; 14] = Default::default();
             // One read's fingerprint now (`cgen::read_fp`), in the assembly's layout phase.
             let read_fp = |r: &cgen::record::Read| {
                 let t = b1_observe.then(Instant::now);
@@ -4807,9 +4807,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         R::Type(..) => 3,
                         R::Static(_) => 4,
                         R::Main => 5,
+                        R::Pick(..) => 6,
                     };
                     kind_ns[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    kind_ns[6 + k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    kind_ns[7 + k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 f
             };
@@ -5011,8 +5012,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 let n_reads = now.iter().map(FxMap::len).sum::<usize>() + more.len();
                 let (mut same, mut new, mut unrecorded, mut unsound, mut missed) = (0, 0, 0, 0, 0);
                 // With LUST_B1_OBSERVE=1: in the missed units, the reads whose fingerprint moved,
-                // by kind (Fn, SlotOf, Glue, Type, Static, Main).
-                let mut moved = [0usize; 6];
+                // by kind (Fn, SlotOf, Glue, Type, Static, Main, Pick).
+                let mut moved = [0usize; 7];
                 let mut unsound_names: Vec<String> = Vec::new();
                 type Fresh = std::sync::Mutex<Option<(Vec<cgen::record::Piece>, Vec<(Read, (u64, u64))>)>>;
                 let mut fresh: Vec<(usize, Fresh)> = Vec::new();
@@ -5043,6 +5044,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                                             Read::Type(..) => 3,
                                             Read::Static(_) => 4,
                                             Read::Main => 5,
+                                            Read::Pick(..) => 6,
                                         }] += 1;
                                     }
                                 }
@@ -5099,8 +5101,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 if b1_observe {
                     let k: Vec<u64> = kind_ns.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
                     eprintln!(
-                        "b1-observe: {line}; worker time (count) Fn {:.0} ms ({}), SlotOf {:.0} ({}), Glue {:.0} ({}), Type {:.0} ({}), Static {:.0} ({}), Main {:.0} ({}); wall ms statics {:.0}, buckets {:.0}, clean {:.0}, memo {:.0}, new reads {:.0}, records {:.0}; moved reads in missed units {moved:?}",
-                        k[0] as f64 / 1e6, k[6], k[1] as f64 / 1e6, k[7], k[2] as f64 / 1e6, k[8], k[3] as f64 / 1e6, k[9], k[4] as f64 / 1e6, k[10], k[5] as f64 / 1e6, k[11],
+                        "b1-observe: {line}; worker time (count) Fn {:.0} ms ({}), SlotOf {:.0} ({}), Glue {:.0} ({}), Type {:.0} ({}), Static {:.0} ({}), Main {:.0} ({}), Pick {:.0} ({}); wall ms statics {:.0}, buckets {:.0}, clean {:.0}, memo {:.0}, new reads {:.0}, records {:.0}; moved reads in missed units {moved:?}",
+                        k[0] as f64 / 1e6, k[7], k[1] as f64 / 1e6, k[8], k[2] as f64 / 1e6, k[9], k[3] as f64 / 1e6, k[10], k[4] as f64 / 1e6, k[11], k[5] as f64 / 1e6, k[12],
+                        k[6] as f64 / 1e6, k[13],
                         b1_ms[0], b1_ms[1], b1_ms[2], b1_ms[3], b1_ms[4], b1_ms[5]
                     );
                 }
