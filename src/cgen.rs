@@ -2178,14 +2178,20 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     let mut types = std::mem::take(&mut g.sig_types);
     let mut named = std::mem::take(&mut g.sig_named);
     let release = names::release();
-    for t in &g.local_cty {
+    // An LLVM fn without a C side (no helpers, cgen/ll.rs) holds no local in C: only its
+    // wrapper's signature (the return value, the parameters) needs definitions. The C
+    // prototypes of its native callees still name its other locals' types.
+    let c_side = llfn.as_ref().is_none_or(|f| f.c_side);
+    for (i, t) in g.local_cty.iter().enumerate() {
         if release {
             // Release C: a local needs defined only what it holds by value; what it
             // points at (through `&`, `Box`, `Rc`, `Vec`, ...) it only names. A deref
             // records what it opens (`place`), and so does a builtin (`call_value`).
-            let mut held = Vec::new();
-            by_value_deps(t, &mut held);
-            types.extend(held);
+            if c_side || i <= body.arg_count {
+                let mut held = Vec::new();
+                by_value_deps(t, &mut held);
+                types.extend(held);
+            }
             collect_types(t, &mut named);
         } else {
             collect_types(t, &mut types);

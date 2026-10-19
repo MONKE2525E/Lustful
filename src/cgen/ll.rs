@@ -154,6 +154,13 @@ fn native_on() -> bool {
 enum PStep {
     /// Load the thin pointer stored here (a reference or `Box`) to a value of this C type.
     Load(CTy),
+    /// Load the pointer to an `Rc`/`Arc` count block stored here; its value of this C type
+    /// is at this offset in the block (two words, then the value at its alignment).
+    LoadAt(CTy, u64),
+    /// Element `local` of the Vec, slice (its fat value here) or array of this length here,
+    /// of this C type, after the bounds check that panics at this location (cgen's
+    /// `index_unw`).
+    Index(usize, Option<u64>, CTy, LocWord),
     /// Move this many bytes into the value; the C member path, for the layout check.
     Offset(u64, String),
 }
@@ -163,6 +170,53 @@ struct Plan {
     local: usize,
     steps: Vec<PStep>,
     ty: CTy,
+}
+
+/// One operand of a value built in place (`FnGen::ll_shape`): its offset in the value and
+/// its C type.
+struct Part<'o> {
+    op: &'o Operand,
+    off: u64,
+    ty: CTy,
+}
+
+/// A value an assignment builds in place: its operands at their offsets, the tag or niche
+/// scalar of an enum variant (offset, bytes, bits), and whether it starts zeroed (cgen's
+/// `zero_lit` form: no fields and no tag).
+struct Shape<'o> {
+    parts: Vec<Part<'o>>,
+    tag: Option<(u64, u64, u128)>,
+    zero: bool,
+}
+
+/// An operand read before its store (`FnGen::ll_native_parts`).
+enum Held {
+    Skip,
+    /// An SSA value of this LLVM type: a scalar, or the bits of a small aggregate.
+    Ssa(&'static str, String),
+    /// The address of the bytes to copy and its alignment; true: a temporary whose lifetime
+    /// ends at the copy.
+    Mem(String, u64, bool),
+}
+
+/// The text of an LLVM `c"..."` string constant for `bytes`.
+fn ll_bytes_lit(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' {
+            s.push(b as char);
+        } else {
+            let _ = write!(s, "\\{b:02X}");
+        }
+    }
+    s
+}
+
+/// An LLVM integer literal of `size` bytes for the bit pattern `bits`, written signed.
+fn ll_int_lit(bits: u128, size: u64) -> String {
+    let w = size * 8;
+    let m = bits & scalar_mask(size);
+    if w < 128 && (m >> (w - 1)) & 1 == 1 { ((m as i128) - (1i128 << w)).to_string() } else { m.to_string() }
 }
 
 /// A name of the fn's frame that a statement's C reads.
@@ -185,6 +239,8 @@ pub struct LlFn {
     /// The fn's size for cross-unit inlining (`ll_inline_set`): statements and blocks of its
     /// body outside cleanup, whatever form they take in IR.
     pub cost: u32,
+    /// False when the fn has no C side (no helpers): only its C ABI wrapper names C types.
+    pub c_side: bool,
 }
 
 /// The per-fn state of LLVM emission.
@@ -209,6 +265,12 @@ struct Ll {
     allocas: String,
     /// Per block: the locals whose drop flag may be set at its terminator (`flags_maybe_set`).
     flags_at_term: Vec<Vec<bool>>,
+    /// The span and cleanup entry of the statement or terminator being lowered: a bounds
+    /// check in its address code panics there (`PStep::Index`).
+    span: Span,
+    unwind: Option<u32>,
+    /// The C types whose member offsets `asserts` checks: the C side must define them.
+    assert_types: Vec<CTy>,
 }
 
 impl FnGen<'_, '_> {
@@ -435,9 +497,12 @@ impl FnGen<'_, '_> {
             asserts: BTreeSet::new(),
             allocas: String::new(),
             flags_at_term: self.flags_maybe_set(),
+            span: Span::default(),
+            unwind: None,
+            assert_types: Vec::new(),
         };
-        // Str literal caches (`kstr`) are on: the slots and their interning go in a prologue
-        // helper below.
+        // Str literal caches (`kstr`) are on: the slots and their interning become IR globals
+        // and prologue code below (`ll_kstr_init`).
         self.kdecl_at = Some(0);
         for &bi in &order {
             let block = self.body.block(Bb(bi as u32));
@@ -449,6 +514,7 @@ impl FnGen<'_, '_> {
                 }
                 let unwind = if cleanup || !p.unwind { None } else { self.stmt_unw.get(&(bi as u32, si as u32)).copied() };
                 self.at = (bi as u32, si as u32);
+                (ll.span, ll.unwind) = (s.span, unwind);
                 if native_on() && self.ll_native_stmt(&mut ll, s, unwind) {
                     continue;
                 }
@@ -461,6 +527,7 @@ impl FnGen<'_, '_> {
             }
             let term_unwind = if cleanup { None } else { self.stmt_unw.get(&(bi as u32, block.stmts.len() as u32)).copied() };
             self.at = (bi as u32, block.stmts.len() as u32);
+            (ll.span, ll.unwind) = (block.term_span, term_unwind.filter(|_| p.unwind));
             self.ll_term(&mut ll, bi, cleanup, term_unwind.filter(|_| p.unwind));
         }
         if let Some(e) = ll.error.take() {
@@ -479,16 +546,28 @@ impl FnGen<'_, '_> {
         let kstr_init = self.ll_kstr_init(&mut ll);
         let def = self.ll_define(&mut ll, kstr_init.as_deref());
         // The C sides: the helpers with the macros and statics they read; then the C ABI
-        // wrapper and the trampoline, which stay in the unit's plain C.
-        let saved = std::mem::take(&mut self.out);
-        self.ll_c_side(&ll, kstr_init.as_deref(), &kdecls);
-        let helpers = std::mem::replace(&mut self.out, saved);
+        // wrapper and the trampoline, which stay in the unit's plain C. A fn with no helpers
+        // (and no literal or constant prologue) has no helper side: nothing in C reads its
+        // frame, so its layout checks and its locals' types would only make the unit's C
+        // bigger and change it more often.
+        let c_side = ll.n_helpers > 0 || kstr_init.is_some() || kdecls.iter().any(Option::is_some) || !self.prelude.is_empty();
+        let helpers = if c_side {
+            for t in std::mem::take(&mut ll.assert_types) {
+                collect_types(&t, &mut self.sig_types);
+            }
+            let saved = std::mem::take(&mut self.out);
+            self.ll_c_side(&ll, kstr_init.as_deref(), &kdecls);
+            std::mem::replace(&mut self.out, saved)
+        } else {
+            self.kstrs.clear();
+            String::new()
+        };
         let wrapper = self.ll_wrapper(slot);
         let _ = writeln!(self.out, "/* {} */\n{wrapper}{}", p.display_path(p.fn_info(fid).name), trampoline(p, fid, slot));
         ll.decls.insert("declare i32 @__gcc_personality_v0(...)".into());
         // The inline cost on a comment line above the fn, for reading the IR.
         let def = format!("; cost {cost}\n{def}");
-        Ok(LlFn { def, decls: std::mem::take(&mut ll.decls), helpers, cost })
+        Ok(LlFn { def, decls: std::mem::take(&mut ll.decls), helpers, cost, c_side })
     }
 
     /// The terminator of block `bi`.
@@ -528,6 +607,9 @@ impl FnGen<'_, '_> {
                     self.ll_native_call(ll, *f, args, dest, dest_clear, span, if cleanup || !self.p.unwind { None } else { call_unwind.map(|u| u.0) })
                 } =>
             {
+                let _ = writeln!(ll.body, "  br label %bb{}", next.0);
+            }
+            Terminator::Call { target: CallTarget::Builtin(b), args, dest, next, .. } if native_on() && self.ll_native_builtin(ll, *b, args, dest) => {
                 let _ = writeln!(ll.body, "  br label %bb{}", next.0);
             }
             Terminator::Call { next, unwind: call_unwind, .. } => {
@@ -734,11 +816,14 @@ impl FnGen<'_, '_> {
         }
         allocas.push_str(&ll.allocas);
         let mut attrs = String::new();
-        // A giant body (`LUST_LL_HUGE` lines of IR, default 40000; tsgo has one, a cold
-        // table initializer) is not optimized: promoting its thousands of allocas and drop
-        // flags over thousands of blocks costs the optimizer minutes per run.
+        // A giant body (`LUST_LL_HUGE` lines of IR, default 60000; tsgo has two, a cold
+        // table initializer and a registration fn) is not optimized: promoting its thousands
+        // of allocas and drop flags over thousands of blocks costs the optimizer minutes per
+        // run. The line count grows with each statement lowered natively instead of through a
+        // helper (a helper's body is not counted, though it inlines all the same): at 40000,
+        // tsgo's hot lib snapshot decoder went over and ran unoptimized.
         static HUGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let huge = *HUGE.get_or_init(|| std::env::var("LUST_LL_HUGE").ok().and_then(|v| v.parse().ok()).unwrap_or(40_000));
+        let huge = *HUGE.get_or_init(|| std::env::var("LUST_LL_HUGE").ok().and_then(|v| v.parse().ok()).unwrap_or(60_000));
         if huge > 0 && ll.body.lines().count() > huge {
             attrs.push_str(" optnone noinline");
         } else {
@@ -753,6 +838,13 @@ impl FnGen<'_, '_> {
             }
         } else {
             attrs.push_str(" nounwind");
+        }
+        // The C halves' null pointer rule (`-fno-delete-null-pointer-checks`): LLVM inlines no
+        // fn into one with another rule, and every helper and runtime fn has this one, so a fn
+        // without helpers would otherwise neither inline them nor be inlined into their callers.
+        attrs = attrs.replacen(" personality", " null_pointer_is_valid personality", 1);
+        if !attrs.contains("null_pointer_is_valid") {
+            attrs.push_str(" null_pointer_is_valid");
         }
         let id = names::fn_tag(self.slots.of(fid));
         let mut d = String::new();
@@ -906,6 +998,29 @@ impl FnGen<'_, '_> {
         format!("{}{} {{ {pre}{body} }}\n", ll_proto(p, f, &id), fn_sig(p, f, slot))
     }
 
+    /// Registers the C prototype of written fn `f`'s internal ABI entry `fl_<id>`
+    /// (`ll_proto`) with the C types it names: a value it passes by value (a scalar, a fn
+    /// pointer, whose typedef has no forward form) by what that holds, a value it passes by
+    /// pointer by name. A fn without a C side declares its locals' types by name only
+    /// (`gen_fn`), so the prototype must not rely on them.
+    fn ll_note_proto(&mut self, f: LocalDefId, id: &str) {
+        let p = self.p;
+        self.slots.externs.borrow_mut().insert(ll_proto(p, f, id));
+        let info = p.fn_info(f);
+        for t in info.params.iter().chain(std::iter::once(&info.ret)).map(|&t| cty(&p.tys, t)) {
+            match pass_of(p, &t) {
+                Pass::Scalar(..) => {
+                    let mut held = Vec::new();
+                    by_value_deps(&t, &mut held);
+                    self.sig_types.extend(held);
+                    collect_types(&t, &mut self.sig_named);
+                }
+                Pass::Mem => collect_types(&t, &mut self.sig_named),
+                Pass::Skip | Pass::Bits(_) | Pass::Pair => {}
+            }
+        }
+    }
+
     /// A call of written fn `f` with C argument values `args` (all of its params, in
     /// order) through its internal ABI entry `fl_<id>` (an LLVM fn), from a helper's C:
     /// an aggregate argument goes as the address of a fresh copy the callee owns, an
@@ -915,7 +1030,7 @@ impl FnGen<'_, '_> {
         let p = self.p;
         let slot = self.slots.of(f);
         let id = names::fn_tag(slot);
-        self.slots.externs.borrow_mut().insert(ll_proto(p, f, &id));
+        self.ll_note_proto(f, &id);
         let info = p.fn_info(f);
         let mut all: Vec<String> = Vec::new();
         let rt = cty(&p.tys, info.ret);
@@ -985,10 +1100,42 @@ impl FnGen<'_, '_> {
         let mut steps = Vec::new();
         let mut variant: Option<u32> = None;
         let mut path = String::new();
-        for pr in &pl.proj {
+        for (k, pr) in pl.proj.iter().enumerate() {
             match (pr, t.clone()) {
+                // `(*s)[i]` of a slice reference: the slice place is the fat value itself.
+                (Proj::Deref, CTy::Slice(_)) if matches!(pl.proj.get(k + 1), Some(Proj::Index(_))) => {}
+                (&Proj::Index(i), CTy::Vec(el) | CTy::Slice(el) | CTy::Array(el, _)) => {
+                    let i = i as usize;
+                    if ll.statics[i] || self.local_cty[i] != CTy::Int(IntTy::Usize) || c_layout(self.p, &el).is_none() || c_size_align(self.p, &el).0 == 0 {
+                        return None;
+                    }
+                    let n = if let CTy::Array(_, n) = t { Some(n) } else { None };
+                    let w = loc_word(&self.index_loc(i as Local, &self.loc(ll.span)))?;
+                    steps.push(PStep::Index(i, n, (*el).clone(), w));
+                    path.clear();
+                    t = *el;
+                }
                 (Proj::Deref, CTy::Ref(inner) | CTy::Boxed(inner)) if *inner != CTy::Str && c_layout(self.p, &inner).is_some() => {
                     steps.push(PStep::Load((*inner).clone()));
+                    path.clear();
+                    t = *inner;
+                }
+                // Release C's offset place (cgen's `place`): the value at its offset in the block.
+                (Proj::Deref, CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner)) => {
+                    let l = c_layout(self.p, &inner).filter(|l| l.align > 0 && l.size > 0)?;
+                    steps.push(PStep::LoadAt((*inner).clone(), 16u64.div_ceil(l.align) * l.align));
+                    path.clear();
+                    t = *inner;
+                }
+                // A `RefCell` guard points at its cell (`{ isize, T }`): the value is field 1.
+                (Proj::Deref, CTy::Guard(inner, _)) => {
+                    let cell = CTy::RefCell(inner.clone());
+                    let off = *c_layout(self.p, &cell)?.field_offsets.get(1)?;
+                    if c_size_align(self.p, &inner).0 == 0 {
+                        return None;
+                    }
+                    steps.push(PStep::Load(cell));
+                    steps.push(PStep::Offset(off, "f1".into()));
                     path.clear();
                     t = *inner;
                 }
@@ -1070,12 +1217,59 @@ impl FnGen<'_, '_> {
                     members.clear();
                     cum = 0;
                 }
+                PStep::Index(i, n, el, w) => {
+                    ll.conts += 1;
+                    let k = ll.conts;
+                    let (ptr, len) = match n {
+                        Some(n) => (cur.clone(), n.to_string()),
+                        None => {
+                            let a = align.min(8);
+                            let _ = writeln!(ll.body, "  %xp{k} = load ptr, ptr {cur}, align {a}\n  %xq{k} = getelementptr inbounds i8, ptr {cur}, i64 8\n  %xl{k} = load i64, ptr %xq{k}, align {a}");
+                            (format!("%xp{k}"), format!("%xl{k}"))
+                        }
+                    };
+                    let _ = writeln!(
+                        ll.body,
+                        "  %xi{k} = load i64, ptr %l{i}\n  %xc{k} = icmp uge i64 %xi{k}, {len}\n  br i1 %xc{k}, label %xf{k}, label %xo{k}, !prof !{{!\"branch_weights\", i32 1, i32 2000}}\nxf{k}:"
+                    );
+                    let lv = ll_loc_value(ll, w, k);
+                    ll.decls.insert("declare i64 @lust_bounds(i64, i64, i64)".into());
+                    match ll.unwind {
+                        Some(u) => {
+                            ll.pads.insert(u);
+                            let _ = writeln!(ll.body, "  %xr{k} = invoke i64 @lust_bounds(i64 %xi{k}, i64 {len}, i64 {lv}) to label %xu{k} unwind label %lp{u}\nxu{k}:\n  unreachable");
+                        }
+                        None => {
+                            let _ = writeln!(ll.body, "  %xr{k} = call i64 @lust_bounds(i64 %xi{k}, i64 {len}, i64 {lv})\n  unreachable");
+                        }
+                    }
+                    let stride = c_size_align(self.p, el).0;
+                    // An element GEP, as clang writes `&base[i]`: its offset cannot wrap, which
+                    // loop analysis needs (a plain multiply hides that).
+                    let _ = writeln!(ll.body, "xo{k}:\n  %xe{k} = getelementptr inbounds [{stride} x i8], ptr {ptr}, i64 %xi{k}");
+                    cur = format!("%xe{k}");
+                    ty = el.clone();
+                    align = c_size_align(self.p, el).1.max(1);
+                    members.clear();
+                    cum = 0;
+                }
+                PStep::LoadAt(inner, off) => {
+                    ll.conts += 1;
+                    let v = format!("%v{}", ll.conts);
+                    let facts = if facts_on() { ", !nonnull !{}, !noundef !{}, !align !{i64 8}" } else { "" };
+                    let _ = writeln!(ll.body, "  {v} = load ptr, ptr {cur}, align {}{facts}\n  {v}o = getelementptr inbounds i8, ptr {v}, i64 {off}", align.min(8));
+                    cur = format!("{v}o");
+                    ty = inner.clone();
+                    align = c_size_align(self.p, inner).1.max(1);
+                    members.clear();
+                    cum = 0;
+                }
                 PStep::Offset(off, member) => {
                     members.push(member.clone());
                     cum += off;
                     // The helper C must define what native code projects into (release C
                     // defines only what a unit holds by value, `gen_fn`).
-                    collect_types(&ty, &mut self.sig_types);
+                    ll.assert_types.push(ty.clone());
                     let _ = ll.asserts.insert(format!(
                         "_Static_assert(__builtin_offsetof({}, {}) == {cum}, \"ll offset\");\n",
                         ctype(&ty),
@@ -1335,38 +1529,121 @@ impl FnGen<'_, '_> {
             }
             Rvalue::Discriminant(pl) => {
                 let Some(plan) = self.ll_plan(ll, pl) else { return false };
-                let Some(lay) = c_layout(self.p, &plan.ty) else { return false };
-                let n = adt_discs(self.p, &plan.ty).len();
-                if !matches!(dp.ty, CTy::Int(i) if !is128(i)) {
+                if !matches!(dp.ty, CTy::Int(i) if !is128(i)) || !self.ll_disc_ok(&plan.ty) {
                     return false;
                 }
-                match lay.enum_tag {
-                    Some(EnumTag::None(vi)) => vi.to_string(),
-                    // A sequential tag holds the variant index (`disc_call`).
-                    Some(EnumTag::Explicit { size, .. }) if size <= 8 && n > 0 && discs_sequential(&adt_discs(self.p, &plan.ty)) => {
-                        let tt = bits_types(size).0;
-                        let (a, align) = self.ll_addr(ll, &plan);
-                        ll.conts += 1;
-                        let k = ll.conts;
-                        let range = if facts_on() { format!(", !range !{{{tt} 0, {tt} {n}}}, !noundef !{{}}") } else { String::new() };
-                        let _ = writeln!(ll.body, "  %t{k} = load {tt}, ptr {a}, align {}{range}", align.min(size));
-                        let (tw, dw) = (size * 8, dt[1..].parse::<u64>().unwrap_or(64));
-                        if tw == dw {
-                            format!("%t{k}")
-                        } else {
-                            let inst = if dw < tw { "trunc" } else { "zext" };
-                            let _ = writeln!(ll.body, "  %v{k} = {inst} {tt} %t{k} to {dt}");
-                            format!("%v{k}")
-                        }
-                    }
-                    _ => return false,
-                }
+                self.ll_disc(ll, &plan, dt)
             }
             _ => return false,
         };
         let (da, dalign) = self.ll_addr(ll, dp);
         let _ = writeln!(ll.body, "  store {dt} {value}, ptr {da}, align {dalign}");
         true
+    }
+
+    /// True when `ll_disc` reads the variant index of a value of C type `t`: a tag or a niche
+    /// scalar of up to 8 bytes, or no tag.
+    fn ll_disc_ok(&self, t: &CTy) -> bool {
+        let Some(lay) = c_layout(self.p, t) else { return false };
+        let discs = adt_discs(self.p, t);
+        match lay.enum_tag {
+            Some(EnumTag::None(_)) => true,
+            Some(EnumTag::NicheFilled { niche, .. }) => niche.scalar_size <= 8,
+            Some(EnumTag::Explicit { size, .. }) => size <= 8 && !discs.is_empty(),
+            None => false,
+        }
+    }
+
+    /// Emits the variant index of the enum value at `plan` as an LLVM integer of type `dt`
+    /// (`disc_call`): a sequential tag holds the index; the other tags as cgen's `disc_` glue
+    /// maps them: a niche value within the span is variant `first` plus its wrapping
+    /// distance from `start`, any other value the dataful variant; a non-sequential tag
+    /// value is the index of the variant with that discriminant (0 for none). The caller
+    /// checked `ll_disc_ok`.
+    fn ll_disc(&mut self, ll: &mut Ll, plan: &Plan, dt: &str) -> String {
+        let lay = c_layout(self.p, &plan.ty).expect("checked by ll_disc_ok");
+        let n = adt_discs(self.p, &plan.ty).len();
+        match lay.enum_tag {
+            Some(EnumTag::None(vi)) => vi.to_string(),
+            Some(EnumTag::NicheFilled { variant, niche, first, last, start }) => {
+                let n = niche.scalar_size;
+                let tt = bits_types(n).0;
+                let (a, align) = self.ll_addr(ll, plan);
+                ll.conts += 1;
+                let k = ll.conts;
+                let off = niche.offset;
+                let (ptr, al) = if off == 0 {
+                    (a, align)
+                } else {
+                    let _ = writeln!(ll.body, "  %nq{k} = getelementptr inbounds i8, ptr {a}, i64 {off}");
+                    (format!("%nq{k}"), align.min(1 << off.trailing_zeros()))
+                };
+                let span = (last - first + 1) as u128;
+                let db = dt[1..].parse::<u64>().unwrap_or(64) / 8;
+                let _ = writeln!(
+                    ll.body,
+                    "  %nt{k} = load {tt}, ptr {ptr}, align {}\n  %nd{k} = sub {tt} %nt{k}, {}\n  %nc{k} = icmp ult {tt} %nd{k}, {}",
+                    al.min(n),
+                    ll_int_lit(start, n),
+                    ll_int_lit(span, n)
+                );
+                let dist = match (n * 8).cmp(&(db * 8)) {
+                    std::cmp::Ordering::Equal => format!("%nd{k}"),
+                    o => {
+                        let inst = if o == std::cmp::Ordering::Greater { "trunc" } else { "zext" };
+                        let _ = writeln!(ll.body, "  %nz{k} = {inst} {tt} %nd{k} to {dt}");
+                        format!("%nz{k}")
+                    }
+                };
+                let _ = writeln!(
+                    ll.body,
+                    "  %na{k} = add {dt} {dist}, {}\n  %v{k} = select i1 %nc{k}, {dt} %na{k}, {dt} {}",
+                    ll_int_lit(first as u128, db),
+                    ll_int_lit(variant as u128, db)
+                );
+                format!("%v{k}")
+            }
+            // As cgen's `disc_` glue: a switch over the tag values (LLVM makes it a table, or
+            // folds it into the switch that reads the result).
+            Some(EnumTag::Explicit { size, .. }) if !discs_sequential(&adt_discs(self.p, &plan.ty)) => {
+                let tt = bits_types(size).0;
+                let db = dt[1..].parse::<u64>().unwrap_or(64) / 8;
+                let (a, align) = self.ll_addr(ll, plan);
+                ll.conts += 1;
+                let k = ll.conts;
+                let discs = adt_discs(self.p, &plan.ty);
+                let _ = write!(ll.body, "  %nt{k} = load {tt}, ptr {a}, align {}\n  switch {tt} %nt{k}, label %nd{k} [", align.min(size));
+                for (vi, &d) in discs.iter().enumerate().skip(1) {
+                    let _ = write!(ll.body, " {tt} {}, label %nc{k}_{vi}", ll_int_lit((d as u128) & scalar_mask(size), size));
+                }
+                ll.body.push_str(" ]\n");
+                let mut phi = format!("[ 0, %nd{k} ]");
+                let _ = writeln!(ll.body, "nd{k}:\n  br label %nw{k}");
+                for vi in 1..discs.len() {
+                    let _ = writeln!(ll.body, "nc{k}_{vi}:\n  br label %nw{k}");
+                    let _ = write!(phi, ", [ {}, %nc{k}_{vi} ]", ll_int_lit(vi as u128, db));
+                }
+                let _ = writeln!(ll.body, "nw{k}:\n  %nv{k} = phi {dt} {phi}");
+                format!("%nv{k}")
+            }
+            Some(EnumTag::Explicit { size, .. }) => {
+                let tt = bits_types(size).0;
+                let (a, align) = self.ll_addr(ll, plan);
+                ll.conts += 1;
+                let k = ll.conts;
+                let range = if facts_on() { format!(", !range !{{{tt} 0, {tt} {n}}}, !noundef !{{}}") } else { String::new() };
+                let _ = writeln!(ll.body, "  %t{k} = load {tt}, ptr {a}, align {}{range}", align.min(size));
+                let (tw, dw) = (size * 8, dt[1..].parse::<u64>().unwrap_or(64));
+                if tw == dw {
+                    format!("%t{k}")
+                } else {
+                    let inst = if dw < tw { "trunc" } else { "zext" };
+                    let _ = writeln!(ll.body, "  %v{k} = {inst} {tt} %t{k} to {dt}");
+                    format!("%v{k}")
+                }
+            }
+            _ => unreachable!("checked by ll_disc_ok"),
+        }
     }
 
     /// A call of written fn `f` (args `args`, result to `dest`) lowered natively: arguments
@@ -1398,13 +1675,18 @@ impl FnGen<'_, '_> {
             return false;
         }
         let rt = cty(&p.tys, info.ret);
+        if dest.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
+            return false;
+        }
         let Some(dp) = self.ll_plan(ll, dest) else { return false };
         if dp.ty != rt {
             return false;
         }
         let dl = dest.local as usize;
         let drop_old = needs_drop_c(p, &dp.ty);
-        if drop_old && (!dest.proj.is_empty() || !self.local_drop[dl] || !self.move_paths[dl].is_empty()) {
+        // A destination with move paths drops an old value by elaboration (`ll_elab`).
+        let elab = drop_old && !self.move_paths[dl].is_empty();
+        if drop_old && (!dest.proj.is_empty() || !self.local_drop[dl] || (elab && !dest_clear && (!self.dflags.keeps(dest.local) || !self.ll_elab_ok(ll, dl, &[])))) {
             return false;
         }
         // Check every argument before emitting anything.
@@ -1441,7 +1723,7 @@ impl FnGen<'_, '_> {
         }
         self.note_callee(f);
         let id = names::fn_tag(self.slots.of(f));
-        self.slots.externs.borrow_mut().insert(ll_proto(p, f, &id));
+        self.ll_note_proto(f, &id);
         ll.decls.insert(ll_decl(p, f, &id));
         ll.conts += 1;
         let k = ll.conts;
@@ -1532,21 +1814,7 @@ impl FnGen<'_, '_> {
             }
         }
         if let Some(w) = loc {
-            let v = match w {
-                LocWord::Ltc => {
-                    let _ = writeln!(ll.body, "  %lc{k} = load i64, ptr %ltc");
-                    format!("%lc{k}")
-                }
-                LocWord::Const(n) => n.to_string(),
-                LocWord::Slot(id, low) => {
-                    ll.decls.insert(format!("@lust_so_{id} = external constant i32"));
-                    let _ = writeln!(
-                        ll.body,
-                        "  %ls{k} = load i32, ptr @lust_so_{id}\n  %lz{k} = zext i32 %ls{k} to i64\n  %lh{k} = shl i64 %lz{k}, 40\n  %lc{k} = or i64 %lh{k}, {low}"
-                    );
-                    format!("%lc{k}")
-                }
-            };
+            let v = ll_loc_value(ll, &w, k);
             vals.push(format!("i64 {v}"));
         }
         for flag in &clears {
@@ -1580,9 +1848,6 @@ impl FnGen<'_, '_> {
         }
         // The old value of a whole local drops once the call returned (`drop_old_value`).
         if old_live {
-            let glue = format!("drop_{}", mangle(&dp.ty));
-            self.want(Glue::Drop, &dp.ty);
-            ll.decls.insert(format!("declare void @{glue}(ptr)"));
             if static_old.is_some() {
                 let _ = writeln!(ll.body, "  br label %od{k}\nod{k}:");
             } else {
@@ -1591,12 +1856,20 @@ impl FnGen<'_, '_> {
                     "  %o{k} = load i8, ptr %d{dl}\n  %oc{k} = icmp ne i8 %o{k}, 0\n  br i1 %oc{k}, label %od{k}, label %on{k}\nod{k}:\n  store i8 0, ptr %d{dl}"
                 );
             }
-            match unwind {
-                Some(u) => {
-                    let _ = writeln!(ll.body, "  invoke void @{glue}(ptr %l{dl}) to label %on{k} unwind label %lp{u}");
-                }
-                None => {
-                    let _ = writeln!(ll.body, "  call void @{glue}(ptr %l{dl})\n  br label %on{k}");
+            if elab {
+                self.ll_elab(ll, dl, &[], unwind);
+                let _ = writeln!(ll.body, "  br label %on{k}");
+            } else {
+                let glue = format!("drop_{}", mangle(&dp.ty));
+                self.want(Glue::Drop, &dp.ty);
+                ll.decls.insert(format!("declare void @{glue}(ptr)"));
+                match unwind {
+                    Some(u) => {
+                        let _ = writeln!(ll.body, "  invoke void @{glue}(ptr %l{dl}) to label %on{k} unwind label %lp{u}");
+                    }
+                    None => {
+                        let _ = writeln!(ll.body, "  call void @{glue}(ptr %l{dl})\n  br label %on{k}");
+                    }
                 }
             }
             let _ = writeln!(ll.body, "on{k}:");
@@ -1629,6 +1902,12 @@ impl FnGen<'_, '_> {
         }
         if drop_old && static_old.is_none() {
             let _ = writeln!(ll.body, "  store i8 1, ptr %d{dl}");
+        }
+        // The whole value is there again (`drop_old_value`'s `reset_move_flags`).
+        if drop_old {
+            for k in 0..self.move_paths[dl].len() {
+                let _ = writeln!(ll.body, "  store i8 1, ptr %m{dl}_{k}");
+            }
         }
         true
     }
@@ -1714,6 +1993,753 @@ impl FnGen<'_, '_> {
         at_term
     }
 
+    /// The shape of rvalue `rv` stored into a place of C type `dt`: a copy or move of a value
+    /// of that type, or an aggregate (struct, enum variant, tuple, array, `Some`/`None`,
+    /// `Ok`/`Err`) as cgen's compound literals build it (`variant_lit`). None for any other
+    /// rvalue, or a tag wider than 8 bytes.
+    fn ll_shape<'o>(&self, rv: &'o Rvalue, dt: &CTy) -> Option<Shape<'o>> {
+        let p = self.p;
+        let lay = c_layout(p, dt)?;
+        // The parts and the enum variant built (None: not an enum).
+        let (parts, variant): (Vec<Part<'o>>, Option<usize>) = match rv {
+            Rvalue::Use(o @ (Operand::Copy(_) | Operand::Move(_))) => (vec![Part { op: o, off: 0, ty: dt.clone() }], None),
+            Rvalue::Aggregate(a, v, ops) => {
+                let a = p.tys.c_adt(*a);
+                if *dt != CTy::Adt(a) {
+                    return None;
+                }
+                let adt = p.adt(a);
+                let vi = if adt.is_enum { *v as usize } else { 0 };
+                let fields = &adt.variants.get(vi)?.fields;
+                let offs = if adt.is_enum { lay.variant_offsets.get(vi)? } else { &lay.field_offsets };
+                if fields.len() != ops.len() || offs.len() != ops.len() {
+                    return None;
+                }
+                let parts = ops.iter().zip(fields).zip(offs).map(|((o, f), &off)| Part { op: o, off, ty: cty(&p.tys, f.ty) }).collect();
+                (parts, adt.is_enum.then_some(vi))
+            }
+            Rvalue::TupleAgg(ty, ops) => {
+                let CTy::Tuple(es) = dt else { return None };
+                if cty(&self.body.tys, *ty) != *dt || es.len() != ops.len() || lay.field_offsets.len() != ops.len() {
+                    return None;
+                }
+                (ops.iter().zip(es).zip(&lay.field_offsets).map(|((o, e), &off)| Part { op: o, off, ty: e.clone() }).collect(), None)
+            }
+            Rvalue::ArrayAgg(ty, ops) => {
+                let CTy::Array(el, n) = dt else { return None };
+                if cty(&self.body.tys, *ty) != *dt || *n != ops.len() as u64 {
+                    return None;
+                }
+                let stride = c_size_align(p, el).0;
+                (ops.iter().enumerate().map(|(i, o)| Part { op: o, off: i as u64 * stride, ty: (**el).clone() }).collect(), None)
+            }
+            Rvalue::Opt(ty, o) => {
+                let CTy::Option(inner) = dt else { return None };
+                if cty(&self.body.tys, *ty) != *dt {
+                    return None;
+                }
+                match o {
+                    Some(o) => (vec![Part { op: o, off: *lay.variant_offsets.get(1)?.first()?, ty: (**inner).clone() }], Some(1)),
+                    None => (Vec::new(), Some(0)),
+                }
+            }
+            Rvalue::Res(ty, is_ok, o) => {
+                let CTy::Result(a, b) = dt else { return None };
+                if cty(&self.body.tys, *ty) != *dt {
+                    return None;
+                }
+                let vi = usize::from(!*is_ok);
+                let ty = if vi == 0 { (**a).clone() } else { (**b).clone() };
+                (vec![Part { op: o, off: *lay.variant_offsets.get(vi)?.first()?, ty }], Some(vi))
+            }
+            _ => return None,
+        };
+        let mut tag = None;
+        let mut zero = parts.is_empty();
+        if let Some(vi) = variant {
+            match lay.enum_tag {
+                Some(EnumTag::Explicit { size, .. }) => {
+                    if size > 8 {
+                        return None;
+                    }
+                    tag = Some((0, size, (*adt_discs(p, dt).get(vi)? as u128) & scalar_mask(size)));
+                    zero = false;
+                }
+                Some(EnumTag::NicheFilled { variant: nv, niche, first, start, .. }) if vi != nv => {
+                    if niche.scalar_size > 8 {
+                        return None;
+                    }
+                    tag = Some((niche.offset, niche.scalar_size, niche_tag_value(niche, first, start, vi)));
+                    zero = false;
+                }
+                _ => {}
+            }
+        }
+        Some(Shape { parts, tag, zero })
+    }
+
+    /// The bytes of a value of `size` bytes built from scalar constants (`ll_native_parts`):
+    /// each part's bits little-endian at its offset, the tag or niche scalar, zeroes
+    /// elsewhere. None when a part is not a scalar constant.
+    fn ll_const_bytes(&self, shape: &Shape, size: u64) -> Option<Vec<u8>> {
+        let mut b = vec![0u8; size as usize];
+        let mut put = |off: u64, n: u64, bits: u128| {
+            for i in 0..n {
+                b[(off + i) as usize] = (bits >> (8 * i)) as u8;
+            }
+        };
+        if let Some((off, n, bits)) = shape.tag {
+            put(off, n, bits);
+        }
+        for part in &shape.parts {
+            let n = c_size_align(self.p, &part.ty).0;
+            let bits = match part.op {
+                Operand::Const(Const::Int(v, it)) if !is128(*it) => *v & scalar_mask(n),
+                Operand::Const(Const::Bool(x)) => *x as u128,
+                Operand::Const(Const::Char(c)) => *c as u128,
+                Operand::Const(Const::Float(bits, FloatTy::F64)) => *bits as u128,
+                Operand::Const(Const::Float(bits, FloatTy::F32)) => (*bits as u32) as u128,
+                Operand::Const(Const::Unit) if n == 0 => continue,
+                _ => return None,
+            };
+            put(part.off, n, bits);
+        }
+        Some(b)
+    }
+
+    /// Drops the old value at plan `dp` of local `l`: its type's drop glue, or with `elab`
+    /// the drop elaboration of `l` at that path (`ll_elab`: moves went through it). Drop
+    /// calls are `invoke`s when `unwind` names a cleanup entry. With `flag`, `l`'s drop flag
+    /// is tested and cleared first (a panic in the drop leaves the local unowned, as cgen's
+    /// `emit_assign`).
+    fn ll_drop_old(&mut self, ll: &mut Ll, dp: &Plan, flag: bool, elab: Option<&[Step]>, unwind: Option<u32>) {
+        let l = dp.local;
+        ll.conts += 1;
+        let k = ll.conts;
+        if flag {
+            let _ = writeln!(ll.body, "  %o{k} = load i8, ptr %d{l}\n  %oc{k} = icmp ne i8 %o{k}, 0\n  br i1 %oc{k}, label %od{k}, label %on{k}\nod{k}:\n  store i8 0, ptr %d{l}");
+        }
+        match elab {
+            Some(path) => self.ll_elab(ll, l, path, unwind),
+            None => self.ll_glue_drop(ll, dp, unwind),
+        }
+        let _ = writeln!(ll.body, "  br label %on{k}\non{k}:");
+    }
+
+    /// A call of the drop glue of `pl`'s type on its address (an `invoke` when `unwind`
+    /// names a cleanup entry; the code goes on after it).
+    fn ll_glue_drop(&mut self, ll: &mut Ll, pl: &Plan, unwind: Option<u32>) {
+        let glue = format!("drop_{}", mangle(&pl.ty));
+        ll.decls.insert(format!("declare void @{glue}(ptr)"));
+        let (a, _) = self.ll_addr(ll, pl);
+        match unwind {
+            Some(u) => {
+                ll.pads.insert(u);
+                ll.conts += 1;
+                let _ = writeln!(ll.body, "  invoke void @{glue}(ptr {a}) to label %c{0} unwind label %lp{u}\nc{0}:", ll.conts);
+            }
+            None => {
+                let _ = writeln!(ll.body, "  call void @{glue}(ptr {a})");
+            }
+        }
+    }
+
+    /// The native address plan of move path `path` of local `l` (the steps `path_place`
+    /// reads): fields of structs, tuples, enum variants and the std iterators, array
+    /// elements and box derefs, with exact C layouts. A trailing variant view stays on the
+    /// enum. None for any other step or a zero-sized part.
+    fn ll_path_plan(&self, ll: &Ll, l: usize, path: &[Step]) -> Option<Plan> {
+        if ll.statics[l] {
+            return None;
+        }
+        let p = self.p;
+        let mut t = self.local_cty[l].clone();
+        let mut steps = Vec::new();
+        let mut variant: Option<u32> = None;
+        for step in path {
+            let (off, member, next) = match (*step, t.clone()) {
+                (Step::Downcast(v), _) => {
+                    variant = Some(v);
+                    continue;
+                }
+                (Step::Deref, CTy::Boxed(inner)) => {
+                    if *inner == CTy::Str || c_layout(p, &inner).is_none() || c_size_align(p, &inner).0 == 0 {
+                        return None;
+                    }
+                    steps.push(PStep::Load((*inner).clone()));
+                    t = *inner;
+                    continue;
+                }
+                (Step::Field(i), CTy::Adt(a)) => {
+                    let lay = c_layout(p, &t)?;
+                    let v = variant.take();
+                    let (off, member) = match v {
+                        Some(v) => (*lay.variant_offsets.get(v as usize)?.get(i as usize)?, format!("u.v{v}.f{i}")),
+                        None => (*lay.field_offsets.get(i as usize)?, format!("f{i}")),
+                    };
+                    (off, member, cty(&p.tys, p.adt(a).variants.get(v.unwrap_or(0) as usize)?.fields.get(i as usize)?.ty))
+                }
+                (Step::Field(i), CTy::Tuple(es)) => (*c_layout(p, &t)?.field_offsets.get(i as usize)?, format!("f{i}"), es.get(i as usize)?.clone()),
+                (Step::Field(0), CTy::OptIter(_, el)) => (*c_layout(p, &t)?.field_offsets.first()?, "f0".into(), CTy::Option(el)),
+                (Step::Field(i), CTy::ArrayIter(el, n)) => {
+                    let next = match i {
+                        0 => CTy::Array(el, n),
+                        1 | 2 => CTy::Int(IntTy::Usize),
+                        _ => return None,
+                    };
+                    (*c_layout(p, &t)?.field_offsets.get(i as usize)?, format!("f{i}"), next)
+                }
+                (Step::Field(_), CTy::Option(inner)) => {
+                    variant = None;
+                    (*c_layout(p, &t)?.variant_offsets.get(1)?.first()?, "u.v1.f0".into(), *inner)
+                }
+                (Step::Field(_), CTy::Result(a, b)) => {
+                    let v = variant.take().unwrap_or(0);
+                    (*c_layout(p, &t)?.variant_offsets.get(v as usize)?.first()?, format!("u.v{v}.f0"), if v == 0 { *a } else { *b })
+                }
+                (Step::Elem(c), CTy::Array(el, n)) if c < n => {
+                    c_layout(p, &t)?;
+                    (c * c_size_align(p, &el).0, format!("v[{c}]"), *el)
+                }
+                _ => return None,
+            };
+            if c_size_align(p, &next).0 == 0 {
+                return None;
+            }
+            steps.push(PStep::Offset(off, member));
+            t = next;
+        }
+        c_layout(p, &t)?;
+        Some(Plan { local: l, steps, ty: t })
+    }
+
+    /// The distinct next steps of local `l`'s move paths below `prefix`, in path order.
+    fn elab_next_steps(&self, l: usize, prefix: &[Step]) -> Vec<Step> {
+        let mut v: Vec<Step> = Vec::new();
+        for p in &self.move_paths[l] {
+            if p.len() > prefix.len() && p.starts_with(prefix) && !v.contains(&p[prefix.len()]) {
+                v.push(p[prefix.len()]);
+            }
+        }
+        v
+    }
+
+    /// True when `ll_elab` lowers `elab_drop(l, prefix)` natively: every part it drops has
+    /// a native address, every enum it switches on a native discriminant (`ll_disc_ok`).
+    fn ll_elab_ok(&self, ll: &Ll, l: usize, prefix: &[Step]) -> bool {
+        let deeper = self.move_paths[l].iter().any(|p| p.len() > prefix.len() && p.starts_with(prefix));
+        let Some((_, t)) = self.path_place(l as Local, prefix) else { return false };
+        let plan = self.ll_path_plan(ll, l, prefix);
+        if !deeper {
+            return !needs_drop_c(self.p, &t) || plan.is_some();
+        }
+        let sub = |s: Step| [prefix, &[s]].concat();
+        let variant = matches!(prefix.last(), Some(Step::Downcast(_)));
+        let next = self.elab_next_steps(l, prefix);
+        match &t {
+            CTy::Array(..) if !variant => plan.is_some() && next.iter().all(|s| matches!(s, Step::Elem(_)) && self.ll_elab_ok(ll, l, &sub(*s))),
+            CTy::ArrayIter(..) => !needs_drop_c(self.p, &t) || plan.is_some(),
+            CTy::Boxed(_) => plan.is_some() && self.ll_elab_ok(ll, l, &sub(Step::Deref)),
+            _ if self.elab_is_enum(&t) && !variant => {
+                plan.is_some() && self.ll_disc_ok(&t) && next.iter().all(|s| !matches!(s, Step::Downcast(_)) || self.ll_elab_ok(ll, l, &sub(*s)))
+            }
+            _ => (0..self.elab_fields(&t, prefix)).all(|f| self.ll_elab_ok(ll, l, &sub(Step::Field(f as u32)))),
+        }
+    }
+
+    /// True for an enum C type (`elab_parts` switches on its variant).
+    fn elab_is_enum(&self, t: &CTy) -> bool {
+        match t {
+            CTy::Adt(a) => self.p.adt(*a).is_enum,
+            CTy::Option(_) | CTy::Result(..) => true,
+            _ => false,
+        }
+    }
+
+    /// The number of fields `elab_parts` drops one by one in a value of type `t` at `prefix`
+    /// (after a variant view: that variant's).
+    fn elab_fields(&self, t: &CTy, prefix: &[Step]) -> usize {
+        let variant = match prefix.last() {
+            Some(Step::Downcast(v)) => Some(*v as usize),
+            _ => None,
+        };
+        match t {
+            CTy::Tuple(es) => es.len(),
+            CTy::OptIter(..) => 1,
+            CTy::Adt(a) => self.p.adt(*a).variants.get(variant.unwrap_or(0)).map_or(0, |v| v.fields.len()),
+            CTy::Option(_) => usize::from(variant == Some(1)),
+            CTy::Result(..) => usize::from(variant.is_some()),
+            _ => 0,
+        }
+    }
+
+    /// `elab_drop` as native IR: drops the part of local `l` at `prefix` that the fn still
+    /// owns, in cgen's order: a moved path only while its flag is set, a place above moved
+    /// paths part by part (an enum only in the variant the paths go through), any other
+    /// place whole. Drop calls are `invoke`s when `unwind` names a cleanup entry. The caller
+    /// checked `ll_elab_ok`.
+    fn ll_elab(&mut self, ll: &mut Ll, l: usize, prefix: &[Step], unwind: Option<u32>) {
+        let own = self.move_paths[l].iter().position(|p| p == prefix);
+        let deeper = self.move_paths[l].iter().any(|p| p.len() > prefix.len() && p.starts_with(prefix));
+        let (_, t) = self.path_place(l as Local, prefix).expect("checked by ll_elab_ok");
+        let skip = own.map(|k| {
+            ll.conts += 1;
+            let j = ll.conts;
+            let _ = writeln!(ll.body, "  %ef{j} = load i8, ptr %m{l}_{k}\n  %ec{j} = icmp ne i8 %ef{j}, 0\n  br i1 %ec{j}, label %ey{j}, label %en{j}\ney{j}:");
+            j
+        });
+        if deeper {
+            self.ll_elab_parts(ll, l, prefix, &t, unwind);
+        } else if needs_drop_c(self.p, &t) {
+            self.want(Glue::Drop, &t);
+            let plan = self.ll_path_plan(ll, l, prefix).expect("checked by ll_elab_ok");
+            self.ll_glue_drop(ll, &plan, unwind);
+        }
+        if let Some(j) = skip {
+            let _ = writeln!(ll.body, "  br label %en{j}\nen{j}:");
+        }
+    }
+
+    /// `elab_parts` as native IR (`ll_elab` one level down): the fields of a struct, tuple
+    /// or enum variant in order, an array's elements (runs with no move path drop as a loop;
+    /// runs and elements in reverse), a box's pointee then its allocation, or a switch over
+    /// the enum variants the moved paths go through (the others drop whole).
+    fn ll_elab_parts(&mut self, ll: &mut Ll, l: usize, prefix: &[Step], t: &CTy, unwind: Option<u32>) {
+        let p = self.p;
+        let sub = |s: Step| [prefix, &[s]].concat();
+        let next = self.elab_next_steps(l, prefix);
+        let variant = matches!(prefix.last(), Some(Step::Downcast(_)));
+        match t {
+            CTy::Array(el, n) if !variant => {
+                let kept: Vec<u64> = next.iter().filter_map(|s| if let Step::Elem(c) = s { Some(*c) } else { None }).collect();
+                let mut parts: Vec<Result<(u64, u64), u64>> = Vec::new();
+                let (mut dropping, mut start) = (true, 0);
+                for i in 0..*n {
+                    let keep = kept.contains(&i);
+                    if dropping && keep {
+                        parts.push(Ok((start, i)));
+                        dropping = false;
+                    } else if !dropping && !keep {
+                        dropping = true;
+                        start = i;
+                    }
+                    if keep {
+                        parts.push(Err(i));
+                    }
+                }
+                if dropping {
+                    parts.push(Ok((start, *n)));
+                }
+                for part in parts.into_iter().rev() {
+                    match part {
+                        Ok((a, b)) if b > a => {
+                            self.want(Glue::Drop, el);
+                            let glue = format!("drop_{}", mangle(el));
+                            ll.decls.insert(format!("declare void @{glue}(ptr)"));
+                            let plan = self.ll_path_plan(ll, l, prefix).expect("checked by ll_elab_ok");
+                            let (base, _) = self.ll_addr(ll, &plan);
+                            let stride = c_size_align(p, el).0;
+                            ll.conts += 1;
+                            let j = ll.conts;
+                            let _ = writeln!(ll.allocas, "  %ai{j} = alloca i64");
+                            let _ = writeln!(
+                                ll.body,
+                                "  store i64 {a}, ptr %ai{j}\n  br label %ah{j}\nah{j}:\n  %av{j} = load i64, ptr %ai{j}\n  %ac{j} = icmp ult i64 %av{j}, {b}\n  br i1 %ac{j}, label %ab{j}, label %ax{j}\nab{j}:\n  %ae{j} = getelementptr inbounds [{stride} x i8], ptr {base}, i64 %av{j}"
+                            );
+                            match unwind {
+                                Some(u) => {
+                                    ll.pads.insert(u);
+                                    let _ = writeln!(ll.body, "  invoke void @{glue}(ptr %ae{j}) to label %ak{j} unwind label %lp{u}\nak{j}:");
+                                }
+                                None => {
+                                    let _ = writeln!(ll.body, "  call void @{glue}(ptr %ae{j})");
+                                }
+                            }
+                            let _ = writeln!(ll.body, "  %an{j} = add i64 %av{j}, 1\n  store i64 %an{j}, ptr %ai{j}\n  br label %ah{j}\nax{j}:");
+                        }
+                        Ok(_) => {}
+                        Err(c) => self.ll_elab(ll, l, &sub(Step::Elem(c)), unwind),
+                    }
+                }
+            }
+            CTy::ArrayIter(..) => {
+                if needs_drop_c(p, t) {
+                    self.want(Glue::Drop, t);
+                    let plan = self.ll_path_plan(ll, l, prefix).expect("checked by ll_elab_ok");
+                    self.ll_glue_drop(ll, &plan, unwind);
+                }
+            }
+            CTy::Boxed(inner) => {
+                // The still-owned part behind the pointer, then the allocation itself.
+                self.ll_elab(ll, l, &sub(Step::Deref), unwind);
+                let plan = self.ll_path_plan(ll, l, prefix).expect("checked by ll_elab_ok");
+                let (a, al) = self.ll_addr(ll, &plan);
+                let (size, align) = c_size_align(p, inner);
+                ll.decls.insert("declare void @lust_dealloc(ptr, i64, i64)".into());
+                ll.conts += 1;
+                let _ = writeln!(ll.body, "  %bx{0} = load ptr, ptr {a}, align {1}\n  call void @lust_dealloc(ptr %bx{0}, i64 {size}, i64 {align})", ll.conts, al.min(8));
+            }
+            _ if self.elab_is_enum(t) && !variant => {
+                let plan = self.ll_path_plan(ll, l, prefix).expect("checked by ll_elab_ok");
+                let idx = self.ll_disc(ll, &plan, "i32");
+                ll.conts += 1;
+                let j = ll.conts;
+                let cases: Vec<u32> = next.iter().filter_map(|s| if let Step::Downcast(v) = s { Some(*v) } else { None }).collect();
+                let _ = write!(ll.body, "  switch i32 {idx}, label %sd{j} [");
+                for v in &cases {
+                    let _ = write!(ll.body, " i32 {v}, label %sc{j}_{v}");
+                }
+                ll.body.push_str(" ]\n");
+                for v in cases {
+                    let _ = writeln!(ll.body, "sc{j}_{v}:");
+                    self.ll_elab(ll, l, &sub(Step::Downcast(v)), unwind);
+                    let _ = writeln!(ll.body, "  br label %sx{j}");
+                }
+                let _ = writeln!(ll.body, "sd{j}:");
+                self.want(Glue::Drop, t);
+                self.ll_glue_drop(ll, &plan, unwind);
+                let _ = writeln!(ll.body, "  br label %sx{j}\nsx{j}:");
+            }
+            _ => {
+                for f in 0..self.elab_fields(t, prefix) {
+                    self.ll_elab(ll, l, &sub(Step::Field(f as u32)), unwind);
+                }
+            }
+        }
+    }
+
+    /// Statement `dest = rv` built in place: an aggregate (`ll_shape`) into any native
+    /// place, or a copy or move into a place that needs drop. Every operand is read before
+    /// the first store, so a source cannot overlap the destination. A destination that needs
+    /// drop drops its old value and is marked owned again as cgen's `emit_assign` and
+    /// `drop_old_value` do, in their order. False (nothing emitted) for any other shape, a
+    /// value that reads the destination's local, or an old value that needs drop
+    /// elaboration (moves went through it).
+    fn ll_native_parts(&mut self, ll: &mut Ll, dest: &Place, rv: &Rvalue, dp: &Plan, unwind: Option<u32>) -> bool {
+        let p = self.p;
+        let Some(shape) = self.ll_shape(rv, &dp.ty) else { return false };
+        if rvalue_mentions(rv, dest.local) {
+            return false;
+        }
+        // Check every operand before emitting anything; collect the flags its moves clear.
+        let mut clears: Vec<String> = Vec::new();
+        for part in &shape.parts {
+            match part.op {
+                Operand::Copy(pl) | Operand::Move(pl) => {
+                    if !self.ll_plan(ll, pl).is_some_and(|sp| sp.ty == part.ty) {
+                        return false;
+                    }
+                    if matches!(part.op, Operand::Move(_)) && self.local_drop[pl.local as usize] {
+                        if pl.proj.is_empty() {
+                            if self.dflags.keeps(pl.local) {
+                                clears.push(format!("%d{}", pl.local));
+                            }
+                        } else if let Some(k) = self.steps_of(pl).and_then(|path| self.move_flag(pl.local, &path)) {
+                            clears.push(format!("%m{}_{k}", pl.local));
+                        }
+                    }
+                }
+                Operand::Const(Const::Unit) if c_size_align(p, &part.ty).0 == 0 => {}
+                o => {
+                    if !self.ll_scalar_ok(ll, o).is_some_and(|(t, _)| t == part.ty) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // The old value (`drop_old_value`): `old` is Some when it drops here, true when the
+        // local's drop flag is tested first (else it drops on every path); `elab` the move
+        // path to elaborate when moves went through the place; `refill` the flags set after
+        // the store (the local's drop flag, the move flags at or below the place).
+        let l = dest.local as usize;
+        let drop = needs_drop_c(p, &dp.ty);
+        let mut old: Option<bool> = None;
+        let mut elab: Option<Vec<Step>> = None;
+        let mut refill: Vec<String> = Vec::new();
+        if drop {
+            if dest.proj.is_empty() {
+                if !self.local_drop[l] {
+                    return false;
+                }
+                if !self.move_paths[l].is_empty() {
+                    if !self.dflags.keeps(dest.local) || !self.ll_elab_ok(ll, l, &[]) {
+                        return false;
+                    }
+                    elab = Some(Vec::new());
+                }
+                if self.dflags.keeps(dest.local) {
+                    old = Some(true);
+                    refill.push(format!("%d{l}"));
+                } else if self.dflags.test(self.at, dest.local) == Some(true) {
+                    old = Some(false);
+                }
+                refill.extend((0..self.move_paths[l].len()).map(|k| format!("%m{l}_{k}")));
+            } else {
+                old = Some(false);
+                if let Some(path) = self.steps_of(dest)
+                    && self.move_paths[l].iter().any(|m| m.starts_with(&path))
+                {
+                    if !self.ll_elab_ok(ll, l, &path) {
+                        return false;
+                    }
+                    refill.extend(self.move_paths[l].iter().enumerate().filter(|(_, m)| m.starts_with(&path)).map(|(k, _)| format!("%m{l}_{k}")));
+                    elab = Some(path);
+                }
+            }
+            // Wanted even with no drop here: other C names the glue too. (An elaborated
+            // drop wants the glue of the parts it drops.)
+            if elab.is_none() {
+                self.want(Glue::Drop, &dp.ty);
+            }
+        }
+        // cgen's order: a statement that can unwind computes the value first and drops the old
+        // one after (a panic leaves the destination as it was); otherwise a whole local drops
+        // its old value first.
+        let unw = self.stmt_action(self.at.0 as usize, self.at.1 as usize).is_some() && (drop || !dest.proj.is_empty());
+        let drop_first = drop && dest.proj.is_empty() && !unw;
+        if drop_first && let Some(flag) = old {
+            self.ll_drop_old(ll, dp, flag, elab.as_deref(), unwind);
+        }
+        // A value read before the old value drops is held in temporaries (the drop may write
+        // memory); so is an operand read through a pointer while other parts get stored.
+        let stage_all = old.is_some() && !drop_first;
+        let mut held = Vec::new();
+        for part in &shape.parts {
+            let pass = pass_of(p, &part.ty);
+            let h = match part.op {
+                _ if pass == Pass::Skip => Held::Skip,
+                Operand::Copy(pl) | Operand::Move(pl) => {
+                    let sp = self.ll_plan(ll, pl).expect("checked above");
+                    let (a, al) = self.ll_addr(ll, &sp);
+                    ll.conts += 1;
+                    let k = ll.conts;
+                    match pass {
+                        Pass::Scalar(t, _) => {
+                            let facts = self.ll_load_facts(&sp.ty);
+                            let _ = writeln!(ll.body, "  %h{k} = load {t}, ptr {a}, align {al}{facts}");
+                            Held::Ssa(t, format!("%h{k}"))
+                        }
+                        Pass::Bits(n) => {
+                            let t = bits_types(n).0;
+                            let _ = writeln!(ll.body, "  %h{k} = load {t}, ptr {a}, align {}", al.min(n));
+                            Held::Ssa(t, format!("%h{k}"))
+                        }
+                        // A 16-byte part (a `&str`, a slice) is copied as bytes like any other
+                        // aggregate: two `i64` words would make SROA cast its pointer word.
+                        _ if stage_all || (shape.parts.len() > 1 && sp.steps.iter().any(|s| matches!(s, PStep::Load(_) | PStep::LoadAt(..)))) => {
+                            let (size, align) = c_size_align(p, &part.ty);
+                            ll.decls.insert("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)".into());
+                            ll.decls.insert("declare void @llvm.lifetime.start.p0(i64, ptr)".into());
+                            ll.decls.insert("declare void @llvm.lifetime.end.p0(i64, ptr)".into());
+                            let _ = writeln!(ll.allocas, "  %h{k} = alloca [{size} x i8], align {align}");
+                            let _ = writeln!(
+                                ll.body,
+                                "  call void @llvm.lifetime.start.p0(i64 {size}, ptr %h{k})\n  call void @llvm.memcpy.p0.p0.i64(ptr align {align} %h{k}, ptr align {al} {a}, i64 {size}, i1 false)"
+                            );
+                            Held::Mem(format!("%h{k}"), align, true)
+                        }
+                        _ => Held::Mem(a, al, false),
+                    }
+                }
+                o => {
+                    let Pass::Scalar(t, _) = pass else { unreachable!("checked above") };
+                    Held::Ssa(t, self.ll_scalar(ll, o))
+                }
+            };
+            held.push(h);
+        }
+        let clear = |ll: &mut Ll| {
+            for f in &clears {
+                let _ = writeln!(ll.body, "  store i8 0, ptr {f}");
+            }
+        };
+        if !drop_first && let Some(flag) = old {
+            clear(ll);
+            self.ll_drop_old(ll, dp, flag, elab.as_deref(), unwind);
+        }
+        // A table of scalar constants is one copy of its bytes from a constant, as clang
+        // makes a compound literal of constants (each element stored apart is a few IR lines,
+        // and a table of thousands of them is a giant body).
+        let size = c_size_align(p, &dp.ty).0;
+        if old.is_none()
+            && shape.parts.len() >= 8
+            && let Some(bytes) = self.ll_const_bytes(&shape, size)
+        {
+            let (da, dalign) = self.ll_addr(ll, dp);
+            ll.conts += 1;
+            let k = ll.conts;
+            let align = c_size_align(p, &dp.ty).1.max(1);
+            ll.decls.insert(format!("@lkc_{}_{k} = private unnamed_addr constant [{size} x i8] c\"{}\", align {align}", ll.tag, ll_bytes_lit(&bytes)));
+            ll.decls.insert("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)".into());
+            let _ = writeln!(ll.body, "  call void @llvm.memcpy.p0.p0.i64(ptr align {dalign} {da}, ptr align {align} @lkc_{}_{k}, i64 {size}, i1 false)", ll.tag);
+            for f in &refill {
+                let _ = writeln!(ll.body, "  store i8 1, ptr {f}");
+            }
+            clear(ll);
+            return true;
+        }
+        // The stores: zeroes, the tag, the parts.
+        let (da, dalign) = self.ll_addr(ll, dp);
+        let at = |ll: &mut Ll, off: u64| -> (String, u64) {
+            if off == 0 {
+                return (da.clone(), dalign);
+            }
+            ll.conts += 1;
+            let _ = writeln!(ll.body, "  %g{0} = getelementptr inbounds i8, ptr {da}, i64 {off}", ll.conts);
+            (format!("%g{}", ll.conts), dalign.min(1 << off.trailing_zeros()))
+        };
+        if shape.zero && size > 0 {
+            ll.decls.insert("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)".into());
+            let _ = writeln!(ll.body, "  call void @llvm.memset.p0.i64(ptr align {dalign} {da}, i8 0, i64 {size}, i1 false)");
+        }
+        if let Some((off, n, bits)) = shape.tag {
+            let (a, al) = at(ll, off);
+            let _ = writeln!(ll.body, "  store {} {}, ptr {a}, align {}", bits_types(n).0, ll_int_lit(bits, n), al.min(n));
+        }
+        for (part, h) in shape.parts.iter().zip(held) {
+            match h {
+                Held::Skip => {}
+                Held::Ssa(t, v) => {
+                    let (a, al) = at(ll, part.off);
+                    let _ = writeln!(ll.body, "  store {t} {v}, ptr {a}, align {al}");
+                }
+                Held::Mem(src, sal, temp) => {
+                    let (a, al) = at(ll, part.off);
+                    let n = c_size_align(p, &part.ty).0;
+                    ll.decls.insert("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)".into());
+                    let _ = writeln!(ll.body, "  call void @llvm.memcpy.p0.p0.i64(ptr align {al} {a}, ptr align {sal} {src}, i64 {n}, i1 false)");
+                    if temp {
+                        let _ = writeln!(ll.body, "  call void @llvm.lifetime.end.p0(i64 {n}, ptr {src})");
+                    }
+                }
+            }
+        }
+        for f in &refill {
+            let _ = writeln!(ll.body, "  store i8 1, ptr {f}");
+        }
+        if drop_first || old.is_none() {
+            clear(ll);
+        }
+        true
+    }
+
+    /// A call of a builtin that only reads its argument's fields (a length, a capacity,
+    /// emptiness, `String::as_str`, `Cell::get`), lowered natively as cgen's builtin forms
+    /// write it. False (nothing emitted) for any other builtin or shape.
+    fn ll_native_builtin(&mut self, ll: &mut Ll, b: Builtin, args: &[Operand], dest: &Place) -> bool {
+        use Builtin as B;
+        let p = self.p;
+        if dest.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
+            return false;
+        }
+        let Some(dp) = self.ll_plan(ll, dest) else { return false };
+        let [a] = args else { return false };
+        if needs_drop_c(p, &dp.ty) {
+            return false;
+        }
+        let usize_dest = dp.ty == CTy::Int(IntTy::Usize);
+        let bool_dest = dp.ty == CTy::Bool;
+        // The value: `Word(i64 value)` or `Str(ptr, len)`.
+        let thin = self.ll_scalar_ok(ll, a).and_then(|(t, _)| match t {
+            CTy::Ref(inner) | CTy::Ptr(inner) => Some(*inner),
+            _ => None,
+        });
+        // A word at `off` behind the thin pointer argument.
+        let field = |s: &mut Self, ll: &mut Ll, off: u64| -> String {
+            let ptr = s.ll_scalar_operand_value(ll, a);
+            ll.conts += 1;
+            let k = ll.conts;
+            let _ = writeln!(ll.body, "  %bq{k} = getelementptr inbounds i8, ptr {ptr}, i64 {off}\n  %bv{k} = load i64, ptr %bq{k}, align 8");
+            format!("%bv{k}")
+        };
+        // A word at `off` in the fat argument (a `&str` or slice value).
+        let fat_field = |s: &mut Self, ll: &mut Ll, off: u64| -> Option<String> {
+            let (Operand::Copy(pl) | Operand::Move(pl)) = a else { return None };
+            let plan = s.ll_plan(ll, pl)?;
+            let (addr, al) = s.ll_addr(ll, &plan);
+            ll.conts += 1;
+            let k = ll.conts;
+            let _ = writeln!(ll.body, "  %bq{k} = getelementptr inbounds i8, ptr {addr}, i64 {off}\n  %bv{k} = load i64, ptr %bq{k}, align {}", al.min(8));
+            Some(format!("%bv{k}"))
+        };
+        let is_empty = |ll: &mut Ll, v: String| -> String {
+            ll.conts += 1;
+            let k = ll.conts;
+            let _ = writeln!(ll.body, "  %be{k} = icmp eq i64 {v}, 0\n  %bz{k} = zext i1 %be{k} to i8");
+            format!("%bz{k}")
+        };
+        let fat_ok = |s: &Self, ll: &Ll, want: &dyn Fn(&CTy) -> bool| -> bool {
+            matches!(a, Operand::Copy(pl) | Operand::Move(pl) if s.ll_plan(ll, pl).is_some_and(|pl| want(&pl.ty)))
+        };
+        let str_ty = |t: &CTy| matches!(t, CTy::Ref(i) if **i == CTy::Str);
+        let slice_ty = |t: &CTy| matches!(t, CTy::Slice(_));
+        let (value, ty): (String, &str) = match b {
+            B::VecLen | B::StringLen if usize_dest && matches!(thin, Some(CTy::Vec(_) | CTy::String)) => (field(self, ll, 8), "i64"),
+            B::VecIsEmpty | B::StringIsEmpty if bool_dest && matches!(thin, Some(CTy::Vec(_) | CTy::String)) => {
+                let v = field(self, ll, 8);
+                (is_empty(ll, v), "i8")
+            }
+            B::StringCapacity if usize_dest && thin == Some(CTy::String) => (field(self, ll, 16), "i64"),
+            // A zero-sized element's capacity is `usize::MAX` (`vec_cap`).
+            B::VecCapacity if usize_dest && matches!(&thin, Some(CTy::Vec(_))) => {
+                let Some(CTy::Vec(el)) = &thin else { unreachable!() };
+                if c_size_align(p, el).0 == 0 { ("-1".into(), "i64") } else { (field(self, ll, 16), "i64") }
+            }
+            B::VecIterLen if usize_dest && matches!(thin, Some(CTy::VecIter(_))) => {
+                let (len, front) = (field(self, ll, 8), field(self, ll, 24));
+                ll.conts += 1;
+                let _ = writeln!(ll.body, "  %bl{0} = sub i64 {len}, {front}", ll.conts);
+                (format!("%bl{}", ll.conts), "i64")
+            }
+            B::StrLen | B::StrIsEmpty if (usize_dest || bool_dest) && fat_ok(self, ll, &str_ty) => {
+                let v = fat_field(self, ll, 8).expect("checked");
+                if b == B::StrLen { (v, "i64") } else { (is_empty(ll, v), "i8") }
+            }
+            B::SliceLen | B::SliceIsEmpty if (usize_dest || bool_dest) && (fat_ok(self, ll, &slice_ty) || matches!(thin, Some(CTy::Array(..)))) => {
+                let v = match &thin {
+                    Some(CTy::Array(_, n)) => n.to_string(),
+                    _ => fat_field(self, ll, 8).expect("checked"),
+                };
+                if b == B::SliceLen { (v, "i64") } else { (is_empty(ll, v), "i8") }
+            }
+            B::StringAsStr | B::StringAsMutStr if thin == Some(CTy::String) && str_ty(&dp.ty) => {
+                let ptr = self.ll_scalar_operand_value(ll, a);
+                let (da, dalign) = self.ll_addr(ll, &dp);
+                ll.conts += 1;
+                let k = ll.conts;
+                let al = dalign.min(8);
+                let _ = writeln!(
+                    ll.body,
+                    "  %bp{k} = load ptr, ptr {ptr}, align 8\n  %bq{k} = getelementptr inbounds i8, ptr {ptr}, i64 8\n  %bn{k} = load i64, ptr %bq{k}, align 8\n  store ptr %bp{k}, ptr {da}, align {al}\n  %br{k} = getelementptr inbounds i8, ptr {da}, i64 8\n  store i64 %bn{k}, ptr %br{k}, align {al}"
+                );
+                return true;
+            }
+            // `(*p)`: a Cell's C form is its value's.
+            B::CellGet if matches!(&thin, Some(CTy::Cell(e)) if **e == dp.ty) => {
+                let ptr = self.ll_scalar_operand_value(ll, a);
+                let (da, dalign) = self.ll_addr(ll, &dp);
+                let (size, align) = c_size_align(p, &dp.ty);
+                match pass_of(p, &dp.ty) {
+                    Pass::Skip => {}
+                    Pass::Scalar(t, _) => {
+                        ll.conts += 1;
+                        let facts = self.ll_load_facts(&dp.ty);
+                        let _ = writeln!(ll.body, "  %bc{0} = load {t}, ptr {ptr}, align {align}{facts}\n  store {t} %bc{0}, ptr {da}, align {dalign}", ll.conts);
+                    }
+                    _ => {
+                        ll.decls.insert("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)".into());
+                        let _ = writeln!(ll.body, "  call void @llvm.memcpy.p0.p0.i64(ptr align {dalign} {da}, ptr align {align} {ptr}, i64 {size}, i1 false)");
+                    }
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        let (da, dalign) = self.ll_addr(ll, &dp);
+        let _ = writeln!(ll.body, "  store {ty} {value}, ptr {da}, align {dalign}");
+        true
+    }
+
     /// `ll_scalar` without the move's flag clear: a call clears its arguments' flags itself.
     fn ll_scalar_operand_value(&mut self, ll: &mut Ll, o: &Operand) -> String {
         match o {
@@ -1732,9 +2758,15 @@ impl FnGen<'_, '_> {
             // initializer (`kstatic`): its defining assignment never runs.
             StmtKind::Assign(dest, _) if dest.proj.is_empty() && self.kstatic.contains_key(&dest.local) => true,
             StmtKind::Assign(dest, rv) => {
-                let Some(dp) = self.ll_plan(ll, dest) else { return false };
-                if needs_drop_c(self.p, &dp.ty) {
+                // An indexed destination keeps cgen's form: its bounds check runs before the value
+                // moves in, with a guard that drops the value (`emit_assign`).
+                if dest.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
                     return false;
+                }
+                let Some(dp) = self.ll_plan(ll, dest) else { return false };
+                let aggregate = matches!(rv, Rvalue::Aggregate(..) | Rvalue::TupleAgg(..) | Rvalue::ArrayAgg(..) | Rvalue::Opt(..) | Rvalue::Res(..));
+                if aggregate || needs_drop_c(self.p, &dp.ty) {
+                    return self.ll_native_parts(ll, dest, rv, &dp, unwind);
                 }
                 match rv {
                     Rvalue::Use(o @ (Operand::Copy(src) | Operand::Move(src))) => {
@@ -1781,6 +2813,11 @@ impl FnGen<'_, '_> {
                             (Const::Int(v, it), CTy::Int(dt)) if it == dt && !is128(*it) => (*v as i128 & ((1i128 << it.bits()) - 1)).to_string(),
                             (Const::Bool(b), CTy::Bool) => (*b as u8).to_string(),
                             (Const::Char(ch), CTy::Char) => (*ch as u32).to_string(),
+                            // As `ll_scalar` writes a float constant.
+                            (Const::Float(bits, f), CTy::Float(df)) if f == df => match f {
+                                FloatTy::F64 => format!("0x{bits:016X}"),
+                                FloatTy::F32 => format!("0x{:016X}", (f32::from_bits(*bits as u32) as f64).to_bits()),
+                            },
                             (Const::Unit, CTy::Unit) => return true,
                             _ => return false,
                         };
@@ -1790,6 +2827,20 @@ impl FnGen<'_, '_> {
                         true
                     }
                     Rvalue::Ref(_, place) => {
+                        // `&*x` of a fat `x` (`&str`, `&[T]`, `&dyn`) is the fat value itself
+                        // (cgen's `Rvalue::Ref`): its two words copied, when the C types agree.
+                        if let Some((Proj::Deref, head)) = place.proj.split_last()
+                            && let Some(xp) = self.ll_plan(ll, &Place { local: place.local, proj: head.to_vec() })
+                            && (matches!(&xp.ty, CTy::Ref(inner) if **inner == CTy::Str) || matches!(&xp.ty, CTy::Slice(_) | CTy::Dyn))
+                            && ctype(&xp.ty) == ctype(&dp.ty)
+                            && pass_of(self.p, &dp.ty) == Pass::Pair
+                        {
+                            let (sa, salign) = self.ll_addr(ll, &xp);
+                            let (da, dalign) = self.ll_addr(ll, &dp);
+                            ll.decls.insert("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)".into());
+                            let _ = writeln!(ll.body, "  call void @llvm.memcpy.p0.p0.i64(ptr align {dalign} {da}, ptr align {salign} {sa}, i64 16, i1 false)");
+                            return true;
+                        }
                         let Some(sp) = self.ll_plan(ll, place) else { return false };
                         // Only a thin reference to the place: fat places (str, slices, dyn) keep cgen's forms.
                         let thin = matches!(&dp.ty, CTy::Ref(inner) if **inner == sp.ty) || matches!(&dp.ty, CTy::Ptr(inner) if **inner == sp.ty);
@@ -1812,15 +2863,33 @@ impl FnGen<'_, '_> {
                 if !self.local_drop[l] {
                     return true;
                 }
-                if !self.move_paths[l].is_empty() || ll.statics[l] {
+                if ll.statics[l] {
+                    return false;
+                }
+                // Partial moves: the drop elaboration (`ll_elab`), under a runtime flag.
+                let elab = !self.move_paths[l].is_empty();
+                if elab && (!self.dflags.keeps(l as Local) || !self.ll_elab_ok(ll, l, &[])) {
                     return false;
                 }
                 // A static flag (`ir::dropflags`): drop on every path here, or on none.
                 let static_drop = if self.dflags.keeps(l as Local) { None } else { self.dflags.test(self.at, l as Local) };
                 let t = self.local_cty[l].clone();
                 // Wanted even with no drop here: other C names the glue too.
-                self.want(Glue::Drop, &t);
+                if !elab {
+                    self.want(Glue::Drop, &t);
+                }
                 if static_drop == Some(false) {
+                    return true;
+                }
+                if elab {
+                    ll.conts += 1;
+                    let k = ll.conts;
+                    let _ = writeln!(
+                        ll.body,
+                        "  %v{k} = load i8, ptr %d{l}\n  %c{k} = icmp ne i8 %v{k}, 0\n  br i1 %c{k}, label %dr{k}, label %dn{k}\ndr{k}:\n  store i8 0, ptr %d{l}"
+                    );
+                    self.ll_elab(ll, l, &[], unwind);
+                    let _ = writeln!(ll.body, "  br label %dn{k}\ndn{k}:");
                     return true;
                 }
                 let glue = format!("drop_{}", mangle(&t));
@@ -1891,7 +2960,24 @@ fn source_fn_attrs(p: &Program, f: LocalDefId) -> String {
     out
 }
 
+/// Emits location word `w` as an LLVM `i64` value (names numbered `k`).
+fn ll_loc_value(ll: &mut Ll, w: &LocWord, k: usize) -> String {
+    match w {
+        LocWord::Ltc => {
+            let _ = writeln!(ll.body, "  %lc{k} = load i64, ptr %ltc");
+            format!("%lc{k}")
+        }
+        LocWord::Const(n) => n.to_string(),
+        LocWord::Slot(id, low) => {
+            ll.decls.insert(format!("@lust_so_{id} = external constant i32"));
+            let _ = writeln!(ll.body, "  %ls{k} = load i32, ptr @lust_so_{id}\n  %lz{k} = zext i32 %ls{k} to i64\n  %lh{k} = shl i64 %lz{k}, 40\n  %lc{k} = or i64 %lh{k}, {low}");
+            format!("%lc{k}")
+        }
+    }
+}
+
 /// A `#[track_caller]` location word as cgen's `loc` writes it in C.
+#[derive(Clone, Debug)]
 enum LocWord {
     /// The calling fn's own received location (`ltc`: it is `#[track_caller]` too).
     Ltc,
