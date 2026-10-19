@@ -20,7 +20,9 @@
 //   3. After the build, `save` writes the image as layers: a base
 //      (`front.img`) after a cold build, then one delta per build
 //      (`front.d<k>.img`) holding only the restored pages this process
-//      wrote (`/proc/self/pagemap`) plus the new arena's live pages; after
+//      wrote (`/proc/self/pagemap`) plus the new arena's live pages, and
+//      the pages left of each older section it leaves mostly replaced, so
+//      no restore reads that section again (`takeover`); after
 //      MAX_DELTAS deltas, or deltas whose data passes half the base, a new
 //      base, which copies the untouched pages from the old layer files (or
 //      from memory, after `fill`).
@@ -828,9 +830,17 @@ fn zero_page(b: &[u8]) -> bool {
 /// all layers share one pool of workers, and a section that no newest page
 /// comes from is not read.
 /// Returns the deltas' data (`base_due`): the nonzero bytes of the delta
-/// sections it read; and a note of what the fill read, unpacked and placed,
-/// and the workers' time in each, for the build line (`layers_note`).
-fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: &[(usize, usize)], hashes: &[AtomicU64], z: &Zstd) -> Result<(u64, String), String> {
+/// sections it read; a note of what the fill read, unpacked and placed,
+/// and the workers' time in each, for the build line (`layers_note`); and
+/// each section it read (`takeover`).
+fn fill(
+    dir: &Path,
+    chain: &[Header],
+    src: &[(usize, usize, usize, u64)],
+    runs: &[(usize, usize)],
+    hashes: &[AtomicU64],
+    z: &Zstd,
+) -> Result<(u64, String, Vec<ReadSection>), String> {
     // The index of each run's first page.
     let mut first = Vec::with_capacity(runs.len());
     let mut pages = 0;
@@ -862,6 +872,8 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
     let failed = std::sync::atomic::AtomicBool::new(false);
     // Bytes read, unpacked, placed; then the nanoseconds spent on each.
     let stats: [AtomicU64; 6] = Default::default();
+    // Per job: the section's nonzero bytes and the runs it placed.
+    let placed_by_job: Vec<std::sync::Mutex<(u64, Vec<(usize, usize)>)>> = jobs.iter().map(|_| Default::default()).collect();
     let threads = workers().min(jobs.len().max(1));
     // Readers keep reads in flight while the workers unpack and place: a
     // worker that read its own sections left its CPU idle while it waited
@@ -933,6 +945,7 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
                         continue;
                     };
                     let t2 = std::time::Instant::now();
+                    let mut placed: Vec<(usize, usize)> = Vec::new();
                     // Each part takes the runs it overlaps: the section's
                     // nonzero pages there.
                     for &(a, at, n) in &parts[k][sec] {
@@ -949,6 +962,11 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
                             // writes it (`src` ranges are disjoint).
                             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (a + (x0 - at)) as *mut u8, x1 - x0) };
                             mine[2] += (x1 - x0) as u64;
+                            let (p0, p1) = (a + (x0 - at), a + (x1 - at));
+                            match placed.last_mut() {
+                                Some((_, end)) if *end == p0 => *end = p1,
+                                _ => placed.push((p0, p1)),
+                            }
                             for (j, page) in src.chunks_exact(PAGE).enumerate() {
                                 let h = page_hash(page);
                                 let w = 2 * (index + (x0 - at) / PAGE + j);
@@ -961,11 +979,13 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
                     mine[0] += clen;
                     mine[4] += (t2 - t1).as_nanos() as u64;
                     mine[5] += (t3 - t2).as_nanos() as u64;
+                    let nonzero = runs.iter().map(|r| r.1).sum::<usize>();
                     if k > 0 {
                         // A delta's data: its whole section's nonzero pages, as a
                         // memfd's blocks count them (`unpack`).
-                        data.fetch_add(runs.iter().map(|r| r.1).sum::<usize>(), Ordering::Relaxed);
+                        data.fetch_add(nonzero, Ordering::Relaxed);
                     }
+                    *placed_by_job[i].lock().unwrap_or_else(|e| e.into_inner()) = (nonzero as u64, placed);
                 }
                 for (total, m) in stats.iter().zip(mine) {
                     total.fetch_add(m, Ordering::Relaxed);
@@ -987,7 +1007,92 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
         s(t_unpack),
         s(t_place)
     );
-    Ok((data.into_inner() as u64, note))
+    let sections = jobs
+        .iter()
+        .zip(placed_by_job)
+        .map(|(&(k, sec), p)| {
+            let (nonzero, placed) = p.into_inner().unwrap_or_else(|e| e.into_inner());
+            let mut newest: Vec<(usize, usize)> = Vec::with_capacity(parts[k][sec].len());
+            for &(a, _, n) in &parts[k][sec] {
+                match newest.last_mut() {
+                    Some((_, end)) if *end == a => *end = a + n,
+                    _ => newest.push((a, a + n)),
+                }
+            }
+            let packed = chain[k].packed.as_ref().map_or(0, |(_, s)| s[sec].1);
+            ReadSection { packed, nonzero, newest, placed }
+        })
+        .collect();
+    Ok((data.into_inner() as u64, note, sections))
+}
+
+/// A packed section `fill` read: its packed and nonzero bytes, the address
+/// runs it was the newest source of (zero pages included), and the runs of
+/// those it placed (its nonzero pages there). Sorted, disjoint, page aligned.
+struct ReadSection {
+    packed: u64,
+    nonzero: u64,
+    newest: Vec<(usize, usize)>,
+    placed: Vec<(usize, usize)>,
+}
+
+/// `LUST_FRONT_TAKEOVER=<percent>` (default 50, 0 turns it off): see `takeover`.
+const TAKEOVER_ENV: &str = "LUST_FRONT_TAKEOVER";
+
+/// The runs a delta save writes: the pages this process `changed`, plus
+/// every newest page of each section the restore read that would be left
+/// at most `share` percent newest by its nonzero bytes. Those pages are in
+/// memory as `fill` placed them, so the delta holds them unchanged and the
+/// next restore reads no byte of that section: it read the section whole
+/// for a few pages, after later layers had replaced the rest. Returns the
+/// runs (sorted, disjoint, merged), the sections taken, and their packed
+/// bytes.
+fn takeover(sections: &[ReadSection], changed: Vec<(usize, usize)>, share: u64) -> (Vec<(usize, usize)>, usize, u64) {
+    let mut extra: Vec<(usize, usize)> = Vec::new();
+    let (mut taken, mut packed) = (0, 0);
+    for s in sections {
+        let left: u64 = subtract_runs(&s.placed, &changed).iter().map(|&(a, e)| (e - a) as u64).sum();
+        if left * 100 <= share * s.nonzero {
+            let rest = subtract_runs(&s.newest, &changed);
+            if !rest.is_empty() {
+                extra.extend(rest);
+                taken += 1;
+                packed += s.packed;
+            }
+        }
+    }
+    if extra.is_empty() {
+        return (changed, 0, 0);
+    }
+    extra.extend(changed);
+    extra.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(extra.len());
+    for (a, e) in extra {
+        match runs.last_mut() {
+            Some((_, end)) if a <= *end => *end = (*end).max(e),
+            _ => runs.push((a, e)),
+        }
+    }
+    (runs, taken, packed)
+}
+
+/// `runs` without the parts that `minus` covers; both sorted and disjoint.
+fn subtract_runs(runs: &[(usize, usize)], minus: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(a, e) in runs {
+        let mut at = a;
+        let first = minus.partition_point(|&(_, me)| me <= a);
+        for &(ma, me) in minus[first..].iter().take_while(|&&(ma, _)| ma < e) {
+            if ma > at {
+                out.push((at, ma));
+            }
+            at = at.max(me);
+        }
+        if at < e {
+            out.push((at, e));
+        }
+    }
+    out
 }
 
 /// The hash of a page as `fill` placed it; a page it left zero keeps
@@ -1156,6 +1261,7 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     let deltas: u64;
     let mut fill_note = String::new();
     let mut hashes = 0;
+    let mut sections = Vec::new();
     if anon {
         let z = zstd().ok_or("a packed image, and no libzstd")?;
         for &(a, e) in &runs {
@@ -1183,7 +1289,7 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
         // SAFETY: 16 zeroed bytes per page, page aligned, never unmapped.
         let words = unsafe { std::slice::from_raw_parts(words as *const AtomicU64, 2 * pages) };
         match fill(dir, &chain, &src, &runs, words, z) {
-            Ok((d, note)) => {
+            Ok((d, note, read)) => {
                 let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
                 let t4 = std::time::Instant::now();
                 let regions: usize = chain.iter().map(|h| h.regions.len()).sum();
@@ -1196,6 +1302,7 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
                     ms(t3, t4)
                 );
                 deltas = d;
+                sections = read;
             }
             Err(e) => {
                 unmap_all(&mapped);
@@ -1230,7 +1337,21 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     OLD_LEN.store(runs.last().map_or(0, |r| r.1) - runs.first().map_or(0, |r| r.0), Ordering::Relaxed);
     GEN.store(top.generation as usize + 1, Ordering::Relaxed);
     let packed = chain.iter().filter(|h| h.packed.is_some()).count();
-    let _ = LOADED.set(Loaded { runs, src, layers: chain.len(), top_id: top.id, base_live: chain[0].live, delta_bytes: deltas, live: top.live, files, packed, anon, fill_note, hashes });
+    let _ = LOADED.set(Loaded {
+        runs,
+        src,
+        layers: chain.len(),
+        top_id: top.id,
+        base_live: chain[0].live,
+        delta_bytes: deltas,
+        live: top.live,
+        files,
+        packed,
+        anon,
+        fill_note,
+        hashes,
+    });
+    *READ_SECTIONS.lock().unwrap_or_else(|e| e.into_inner()) = sections;
     // SAFETY: the root was a leaked `Box<Roots>` of a process running this
     // same binary at the same addresses (checked: build id, anchors), and
     // every page it reaches is mapped back above.
@@ -1265,6 +1386,10 @@ struct Loaded {
     /// The address of `fill`'s page hashes (`hash_words`); 0 without.
     hashes: usize,
 }
+
+/// The sections `fill` read, for the save's `takeover`, which takes them
+/// first: they are heap blocks, which an image must not hold.
+static READ_SECTIONS: std::sync::Mutex<Vec<ReadSection>> = std::sync::Mutex::new(Vec::new());
 
 static LOADED: std::sync::OnceLock<Loaded> = std::sync::OnceLock::new();
 
@@ -1991,11 +2116,29 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         None => (0, 0),
     };
     let anon = loaded.is_some_and(|l| l.anon);
-    // A delta: the pages this process wrote. A base: the runs whole.
-    let old_runs: Vec<(usize, usize)> = match delta {
-        Some(l) if l.anon => changed_runs(restored, hash_words(l))?,
-        Some(_) => modified_runs(restored)?,
-        None => restored.to_vec(),
+    // A delta: the pages this process wrote, plus the newest pages of the
+    // sections the restore read that it leaves mostly replaced (`takeover`).
+    // A base: the runs whole.
+    let mut took = (0, 0);
+    let old_runs: Vec<(usize, usize)> = {
+        // Taken in every save, and dropped at the end of this block: heap
+        // blocks the image must not hold.
+        let sections = std::mem::take(&mut *READ_SECTIONS.lock().unwrap_or_else(|e| e.into_inner()));
+        match delta {
+            Some(l) if l.anon => {
+                let changed = changed_runs(restored, hash_words(l))?;
+                match std::env::var(TAKEOVER_ENV).ok().map_or(Some(50), |v| v.parse().ok()) {
+                    Some(share) if share > 0 => {
+                        let (runs, n, packed) = takeover(&sections, changed, share);
+                        took = (n, packed);
+                        runs
+                    }
+                    _ => changed,
+                }
+            }
+            Some(_) => modified_runs(restored)?,
+            None => restored.to_vec(),
+        }
     };
     // A base over restored runs copies their untouched pages from the
     // layer files (`write_base_run`); the written ones come from memory.
@@ -2222,13 +2365,14 @@ fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
         k += 1;
     }
     Ok(format!(
-        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}, {:.0} ms, {} MB live ({} MB of restored blocks freed){}",
+        "lust: front state saved: generation {} as {}, {} blocks, {} MB new + {} MB {}{}, {:.0} ms, {} MB live ({} MB of restored blocks freed){}",
         h.generation,
         if layer == 0 { "base".to_string() } else { format!("delta {layer}") },
         w.blocks,
         arena_bytes >> 20,
         old_bytes >> 20,
         if layer == 0 { "kept" } else { "rewritten" },
+        if took.0 > 0 { format!(" ({} older sections taken over, {} MB packed)", took.0, took.1 >> 20) } else { String::new() },
         t.elapsed().as_secs_f64() * 1e3,
         live >> 20,
         OLD_FREED.load(Ordering::Relaxed) >> 20,
@@ -2303,6 +2447,45 @@ mod tests {
         ];
         assert_eq!(overlay(&base, &delta), want);
         assert_eq!(overlay(&[], &base), base);
+    }
+
+    #[test]
+    fn subtract_runs_cuts_out_the_covered_parts() {
+        let runs = [(0, 10), (20, 30), (40, 50)];
+        let minus = [(2, 3), (5, 7), (9, 22), (45, 60)];
+        assert_eq!(subtract_runs(&runs, &minus), vec![(0, 2), (3, 5), (7, 9), (22, 30), (40, 45)]);
+        assert_eq!(subtract_runs(&runs, &[]), runs.to_vec());
+        assert_eq!(subtract_runs(&[(5, 8)], &[(0, 100)]), vec![]);
+    }
+
+    /// A section the changes leave at most `share` percent newest (by its
+    /// nonzero bytes) joins the delta whole: its newest pages that are left,
+    /// zero ones too, so the next restore reads nothing of it. Others stay.
+    #[test]
+    fn takeover_takes_mostly_replaced_sections() {
+        let p = PAGE;
+        let sec = |newest: Vec<(usize, usize)>, placed: Vec<(usize, usize)>| ReadSection {
+            packed: 100,
+            nonzero: placed.iter().map(|&(a, e)| (e - a) as u64).sum(),
+            newest,
+            placed,
+        };
+        // a: pages 0-3 nonzero, page 4 zero; the changes leave 1 of its 4 nonzero pages.
+        // b: pages 10-13 nonzero; the changes leave 3 of 4.
+        // c: page 20 nonzero, page 21 zero; the changes replace its nonzero page.
+        let secs = || {
+            [
+                sec(vec![(0, 5 * p)], vec![(0, 4 * p)]),
+                sec(vec![(10 * p, 14 * p)], vec![(10 * p, 14 * p)]),
+                sec(vec![(20 * p, 22 * p)], vec![(20 * p, 21 * p)]),
+            ]
+        };
+        let changed = vec![(p, 4 * p), (12 * p, 13 * p), (20 * p, 21 * p)];
+        assert_eq!(takeover(&secs(), changed.clone(), 50), (vec![(0, 5 * p), (12 * p, 13 * p), (20 * p, 22 * p)], 2, 200));
+        assert_eq!(takeover(&secs(), changed.clone(), 80), (vec![(0, 5 * p), (10 * p, 14 * p), (20 * p, 22 * p)], 3, 300));
+        // No section left at most 10% newest but c, whose last newest page is zero.
+        assert_eq!(takeover(&secs(), changed.clone(), 10), (vec![(p, 4 * p), (12 * p, 13 * p), (20 * p, 22 * p)], 1, 100));
+        assert_eq!(takeover(&[], changed.clone(), 50), (changed, 0, 0));
     }
 
     /// A copy keeps the source's data and its holes (a sparse base stays
