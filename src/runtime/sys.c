@@ -255,6 +255,10 @@ static void lust_sys_push(lust_Vec *out, const void *p, uint64_t n) {
     out->len += n;
 }
 
+/* As std's fs::read: the Vec gets the size fstat reports, and the bytes are read straight
+   into its spare capacity. When it is full, a read into a small buffer finds the end
+   without growing it (std's small_probe_read); bytes past the reported size (a file that
+   grew, or one whose size reads as 0) grow the Vec as usual. */
 int32_t lust_sys_read_file(const uint8_t *p, uint64_t len, lust_Vec *out) {
     char *s = lust_sys_cstr(p, len);
     if (!s) return -1;
@@ -262,9 +266,13 @@ int32_t lust_sys_read_file(const uint8_t *p, uint64_t len, lust_Vec *out) {
     int e = errno;
     free(s);
     if (fd < 0) return e;
-    uint8_t buf[65536];
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) lust_vec_reserve_exact(out, (uint64_t)st.st_size, 1, 1);
     for (;;) {
-        ssize_t n = read(fd, buf, sizeof buf);
+        uint8_t probe[32];
+        uint64_t room = out->cap - out->len;
+        ssize_t n = room ? read(fd, (uint8_t *)out->ptr + out->len, room > 0x7ffff000 ? 0x7ffff000 : (size_t)room)
+                         : read(fd, probe, sizeof probe);
         if (n < 0) {
             if (errno == EINTR) continue;
             e = errno;
@@ -272,7 +280,8 @@ int32_t lust_sys_read_file(const uint8_t *p, uint64_t len, lust_Vec *out) {
             return e;
         }
         if (n == 0) break;
-        lust_sys_push(out, buf, (uint64_t)n);
+        if (room) out->len += (uint64_t)n;
+        else lust_sys_push(out, probe, (uint64_t)n);
     }
     close(fd);
     return 0;
