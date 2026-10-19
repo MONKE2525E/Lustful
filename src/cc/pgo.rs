@@ -291,7 +291,7 @@ impl Pgo {
             run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
         }
         let (own, helpers, absent) = split(&index, defs);
-        Ok(Pgo { own, pins, records: index.values().map(|(_, n)| n).sum(), helpers, absent, kept: hit, all, key })
+        Ok(Pgo { own, pins, records: index.iter().map(|(_, _, n)| n).sum(), helpers, absent, kept: hit, all, key })
     }
 }
 
@@ -337,8 +337,11 @@ pub(super) fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
 /// LLVM build: 728k records over ~4,300 units, each with the unit header's static fns).
 fn split(index: &Index, defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, usize, usize) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    let entries: Vec<(&str, u128)> = index.iter().map(|(n, (d, _))| (n.as_str(), *d)).collect();
-    let (mut ext, mut stat) = (HashMap::new(), HashMap::new());
+    let entries: Vec<(&str, u128)> = index.iter().map(|(n, d, _)| (n.as_str(), *d)).collect();
+    let mut ext: crate::intern::FxMap<&str, usize> = Default::default();
+    let mut stat: crate::intern::FxMap<&str, usize> = Default::default();
+    ext.reserve(entries.len() / 4);
+    stat.reserve(entries.len());
     let mut other: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, (n, _)) in entries.iter().enumerate() {
         match n.split_once(';') {
@@ -394,36 +397,51 @@ type Records = HashMap<String, Vec<Arc<str>>>;
 /// Per record name, the digest of its records (sorted) and their number: all a unit's key
 /// reads of the profile (`key_part`), so a warm build of the same profile reads this file
 /// (`pgo-all.index`) and not the profile text (tsgo's LLVM profile: 731k records).
-type Index = HashMap<String, (u128, usize)>;
+type Index = Vec<(String, u128, usize)>;
 
 fn index(records: &Records) -> Index {
-    records
+    let mut index: Index = records
         .iter()
         .map(|(n, rs)| {
             let mut rs: Vec<&[u8]> = rs.iter().map(|r| r.as_bytes()).collect();
             rs.sort_unstable();
             let (a, b) = crate::driver::cache::hash128(&rs, 41);
-            (n.clone(), (((a as u128) << 64) | b as u128, rs.len()))
+            (n.clone(), ((a as u128) << 64) | b as u128, rs.len())
         })
-        .collect()
+        .collect();
+    index.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    index
 }
 
 fn write_index(path: &Path, index: &Index) -> Result<(), String> {
     let mut text = String::with_capacity(index.len() * 64);
-    for (n, (d, k)) in index {
+    for (n, d, k) in index {
         let _ = writeln!(text, "{n}\t{d:032x}\t{k}");
     }
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// None when the file is missing or not an index: the caller reads the profile again.
+/// None when the file is missing or not an index: the caller reads the profile again. Its
+/// lines are parsed on every thread, in chunks.
 fn read_index(path: &Path) -> Option<Index> {
     let text = std::fs::read_to_string(path).ok()?;
-    let mut index = HashMap::with_capacity(text.len() / 64);
-    for line in text.lines() {
+    let mut chunks = Vec::new();
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let cut = rest.get(1 << 20..).and_then(|r| r.find('\n')).map_or(rest.len(), |k| (1 << 20) + k + 1);
+        let (chunk, tail) = rest.split_at(cut);
+        chunks.push(chunk);
+        rest = tail;
+    }
+    let parse = |line: &str| {
         let mut f = line.rsplitn(3, '\t');
         let (k, d, n) = (f.next()?.parse().ok()?, u128::from_str_radix(f.next()?, 16).ok()?, f.next()?);
-        index.insert(n.to_string(), (d, k));
+        Some((n.to_string(), d, k))
+    };
+    let parts = crate::pool::par_map(&chunks, |c| c.lines().map(parse).collect::<Option<Vec<_>>>());
+    let mut index = Vec::with_capacity(text.len() / 64);
+    for p in parts {
+        index.extend(p?);
     }
     Some(index)
 }
@@ -679,7 +697,7 @@ mod tests {
         let back = read_index(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(back.as_ref(), Some(&ix));
-        assert_eq!(ix["lust.c;h"].1, 2);
+        assert_eq!(ix.iter().find(|e| e.0 == "lust.c;h").map(|e| e.2), Some(2));
         assert!(read_index(&std::env::temp_dir().join("lust-pgo-no-such-index")).is_none());
     }
 
@@ -692,10 +710,11 @@ mod tests {
         let st = |f: &str, ns: &[&str]| (f.to_string(), ns.iter().map(|n| n.to_string()).collect::<Vec<_>>());
         let defs = UnitDefs { units: Vec::new(), macro_made: Default::default(), statics: vec![st("x9.ll", &["lh_aa_0", "lust_mix"]), st("x7.c", &["lust_mix"])] };
         let ix = index(&recs);
+        let digest_of = |n: &str| ix.iter().find(|e| e.0 == n).map(|e| e.1).unwrap();
         let (own, _, absent) = split(&ix, &defs);
         assert_eq!(own["x9.ll"].len(), 2);
-        assert_eq!(own["x7.c"], vec![ix["lust.c;lust_mix"].0]);
-        assert_eq!(own["x1.c"], vec![ix["x1.c;old"].0], "another file's static record stays with that file");
+        assert_eq!(own["x7.c"], vec![digest_of("lust.c;lust_mix")]);
+        assert_eq!(own["x1.c"], vec![digest_of("x1.c;old")], "another file's static record stays with that file");
         assert_eq!(absent, 0);
         assert_eq!(defined_statics("static inline int lust_mix(int a) {\n}\nstatic int g;\nint f(void) {\n}\n"), vec!["lust_mix"]);
     }
