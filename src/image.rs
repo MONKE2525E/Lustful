@@ -157,6 +157,7 @@ unsafe extern "C" {
     ) -> bool;
     fn mi_option_set(option: c_int, value: std::ffi::c_long);
     fn mi_heap_visit_blocks(heap: *mut c_void, visit_blocks: bool, visitor: Visitor, arg: *mut c_void) -> bool;
+    fn mi_usable_size(p: *const c_void) -> usize;
     fn dlopen(file: *const c_char, mode: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn memfd_create(name: *const c_char, flags: std::ffi::c_uint) -> c_int;
@@ -269,6 +270,26 @@ fn valid_base(b: usize) -> bool {
     b >= WINDOW_LO && b.checked_add(ARENA_SIZE).is_some_and(|e| e <= WINDOW_HI) && b % (1 << 30) == 0
 }
 
+/// In an arena process, zeroes the bytes of a new block past `size`: mimalloc
+/// rounds a size up to its size class, and those bytes keep what the memory
+/// held before. A save writes whole blocks and the free of a restored block
+/// zeroes only its layout's bytes, so without this every image keeps that
+/// old data, in live and freed blocks, until a cold build: on tsgo about
+/// 160 MB of the cold image, growing with each delta.
+#[inline]
+fn zero_slack(p: *mut u8, size: usize) {
+    if MODE.load(Ordering::Relaxed) == 2 && !p.is_null() {
+        // SAFETY: `p` is a block mimalloc just handed out; its usable size
+        // counts from `p`, so the bytes past `size` are this block's own.
+        unsafe {
+            let usable = mi_usable_size(p as *const c_void);
+            if usable > size {
+                std::ptr::write_bytes(p.add(size), 0, usable - size);
+            }
+        }
+    }
+}
+
 // SAFETY: every path forwards to mimalloc's GlobalAlloc, except frees and
 // reallocs of restored blocks, which mimalloc never handed out: those
 // copy out (realloc) and zero the old bytes, and never free them.
@@ -279,7 +300,9 @@ unsafe impl GlobalAlloc for Alloc {
             start();
         }
         // SAFETY: the caller's layout contract passes through.
-        unsafe { mimalloc::MiMalloc.alloc(l) }
+        let p = unsafe { mimalloc::MiMalloc.alloc(l) };
+        zero_slack(p, l.size());
+        p
     }
     #[inline]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
@@ -287,7 +310,9 @@ unsafe impl GlobalAlloc for Alloc {
             start();
         }
         // SAFETY: as `alloc`.
-        unsafe { mimalloc::MiMalloc.alloc_zeroed(l) }
+        let p = unsafe { mimalloc::MiMalloc.alloc_zeroed(l) };
+        zero_slack(p, l.size());
+        p
     }
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -316,7 +341,9 @@ unsafe impl GlobalAlloc for Alloc {
             }
         }
         // SAFETY: as `alloc`.
-        unsafe { mimalloc::MiMalloc.realloc(p, l, n) }
+        let q = unsafe { mimalloc::MiMalloc.realloc(p, l, n) };
+        zero_slack(q, n);
+        q
     }
 }
 
