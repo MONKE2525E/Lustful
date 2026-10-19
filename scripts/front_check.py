@@ -22,6 +22,9 @@
 # step (an instrumented one-shot build, run once) and needs zig plus a clang and llvm-profdata
 # of zig's LLVM major (LUST_PGO_CC, LUST_PROFDATA, or clang-<N> and llvm-profdata-<N> on PATH);
 # without them it is skipped and says so.
+# Three dt01 sequences take the shapes of CI jobs (rel-cache's merge 12 replay, 2026-10-18): image
+# builds that emit no C before the compared build, a jump over versions no build saw, and builds
+# that each start again from an older state (a CI disk whose commits did not land).
 #
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: front_check.py [--jobs N] [--keep DIR] [--only NAME]
@@ -414,7 +417,13 @@ def corpus():
     seqs.append(("llvm-helper-only-edit", [helper_edit("v1", 1), helper_edit("v2-label", 1), helper_edit("v2-label", 3)]))
     seqs.append(("remove-impl-pgo", [shapes(True), shapes(False), shapes(True)], {"pgo": True}))
     dt = os.path.join(ROOT, "tests/daemon/dt01_deep_type_edits")
-    seqs.append(("dt01", [open(os.path.join(dt, f"v{k}.rs")).read() for k in range(1, 7)]))
+    dt01 = [open(os.path.join(dt, f"v{k}.rs")).read() for k in range(1, 7)]
+    seqs.append(("dt01", dt01))
+    # A CI job's shapes on the image (check_seq): five builds without emitted C before the compared
+    # one, a jump over three versions, and four builds that each start from the second's state.
+    seqs.append(("dt01-quiet", dt01, {"quiet": True}))
+    seqs.append(("dt01-jump", dt01, {"steps": [0, 1, 5]}))
+    seqs.append(("dt01-stale", dt01, {"stale_after": 1}))
     return seqs
 
 
@@ -495,21 +504,46 @@ def check_seq(name, srcs, backend, args, work, opts):
     img = dict(base, LUST_FRONT_STATE=os.path.join(d, "front"), LUST_FRONT_SAVE="background", LUST_CACHE_DIR=os.path.join(d, "cache"), LUST_THREADS="1")
     one = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4")
     problems = []
-    for step, src in enumerate(srcs):
+    lock = os.path.join(d, "front", "lock")
+
+    def saved():
+        """Waits for the last background image save."""
+        if os.path.exists(lock):
+            subprocess.run(["flock", lock, "true"], timeout=BUILD_TIMEOUT)
+
+    # CI job shapes (opts): `steps`, the steps the image side builds (a jump skips the rest);
+    # `quiet`, emitted C only at the last step (a CI job's builds emit none); `stale_after`, a
+    # step whose state (image and cache) every later step starts from again (a CI disk whose
+    # commits did not land: merges 10, 11 and 12 each built from merge 9's state).
+    order = opts.get("steps", list(range(len(srcs))))
+    snap = None
+    for step in order:
         with open(os.path.join(d, "main.rs"), "w") as f:
-            f.write(src)
+            f.write(srcs[step])
         where = f"{name} {backend} step {step + 1}"
+        if snap:
+            saved()
+            for sub in ("front", "cache"):
+                shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
+                shutil.copytree(os.path.join(snap, sub), os.path.join(d, sub), symlinks=True)
+        emit = not opts.get("quiet") or step == order[-1]
         for side in ("ew", "ec"):
             shutil.rmtree(os.path.join(d, side), ignore_errors=True)
             os.makedirs(os.path.join(d, side))
-        rw, ew = build([LUST, "build", "main.rs", *rel, "-o", "image.bin", "--emit-c", os.path.join(d, "ew", "t")], img, d)
-        rc, ec = build([LUST, "build", "main.rs", *rel, "-o", "one.bin", "--emit-c", os.path.join(d, "ec", "t")], one, d)
+        ce = lambda side: ["--emit-c", os.path.join(d, side, "t")] if emit else []
+        rw, ew = build([LUST, "build", "main.rs", *rel, "-o", "image.bin", *ce("ew")], img, d)
+        rc, ec = build([LUST, "build", "main.rs", *rel, "-o", "one.bin", *ce("ec")], one, d)
         if rw != rc:
             problems.append(f"{where}: build status image {rw} vs one-shot {rc}: {(ew if rw else ec)[:300]}")
             break
+        if opts.get("stale_after") == step:
+            saved()
+            snap = os.path.join(d, "snap")
+            for sub in ("front", "cache"):
+                shutil.copytree(os.path.join(d, sub), os.path.join(snap, sub), symlinks=True)
         if rw != 0:
             continue
-        diff = unit_diff(os.path.join(d, "ew"), os.path.join(d, "ec"))
+        diff = unit_diff(os.path.join(d, "ew"), os.path.join(d, "ec")) if emit else ""
         if diff:
             problems.append(f"{where}: {diff}")
         ow, oc = run_bin(os.path.join(d, "image.bin"), d), run_bin(os.path.join(d, "one.bin"), d)
@@ -518,9 +552,7 @@ def check_seq(name, srcs, backend, args, work, opts):
         if problems:
             break
     # The last background image save ends before the directory goes.
-    lock = os.path.join(d, "front", "lock")
-    if os.path.exists(lock):
-        subprocess.run(["flock", lock, "true"], timeout=BUILD_TIMEOUT)
+    saved()
     if problems and args.keep:
         shutil.copytree(d, os.path.join(args.keep, f"{name}-{backend}"), dirs_exist_ok=True)
     return name, backend, problems, len(srcs)
