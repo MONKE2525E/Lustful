@@ -699,8 +699,24 @@ impl GenReuse {
 
     /// True when an entry made under `env` with `reads` still holds in
     /// this program: same environment, or every read answers the same.
-    fn reads_hold(memo: &mut FxMap<ReadKey, Read>, this_env: u64, p: &Program, env: u64, reads: &Reads, keys: &ReadKeys) -> bool {
-        env == this_env || p.reads_dirty_memo(reads, keys, memo) == 0
+    /// `entry` names it for the generic reuse oracle (its kind and def).
+    fn reads_hold(
+        memo: &mut FxMap<ReadKey, Read>,
+        this_env: u64,
+        p: &Program,
+        env: u64,
+        reads: &Reads,
+        keys: &ReadKeys,
+        entry: (&str, LocalDefId),
+    ) -> bool {
+        if env == this_env {
+            // LUST_CHECK_GENREUSE=1: an entry its environment keeps must hold by its reads too.
+            if super::genreuse_oracle::on() {
+                super::genreuse_oracle::kept_reads(entry.0, p, entry.1, reads, keys, memo);
+            }
+            return true;
+        }
+        p.reads_dirty_memo(reads, keys, memo) == 0
     }
 
     /// The stored picks and closure call kinds of template `t`, rebased
@@ -713,7 +729,10 @@ impl GenReuse {
         let src = self.src_of(p, t)?;
         let (lo, hi) = p.fn_def(t).exprs;
         let e = self.templates.get_mut(&p.def_id(t))?;
-        if e.src != src || e.n_exprs != hi - lo || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys) {
+        if e.src != src
+            || e.n_exprs != hi - lo
+            || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys, ("a template entry", t))
+        {
             return None;
         }
         e.env = self.env;
@@ -802,7 +821,7 @@ impl GenReuse {
         if e.src != src || e.n_exprs != hi - lo || e.reads.keys(&self.keys).any(|k| matches!(k, ReadKey::Checked(_))) {
             return None;
         }
-        if !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys) {
+        if !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys, ("a closure template entry", t)) {
             return None;
         }
         e.env = self.env;
@@ -855,7 +874,12 @@ impl GenReuse {
         let src = self.src_of(p, t)?;
         let (lo, hi) = p.fn_def(t).exprs;
         let e = self.templates.get(&p.def_id(t))?;
-        Some(self.on && e.src == src && e.n_exprs == hi - lo && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys))
+        Some(
+            self.on
+                && e.src == src
+                && e.n_exprs == hi - lo
+                && Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys, ("a template entry", t)),
+        )
     }
 
     /// The read keys of every stored template check, those of templates
@@ -1025,7 +1049,7 @@ impl GenReuse {
         }
         let src = self.src_of(p, f)?;
         let e = self.discovery.get_mut(&p.def_id(f))?;
-        if e.src != src || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys) {
+        if e.src != src || !Self::reads_hold(&mut self.memo, self.env, p, e.env, &e.reads, &self.keys, ("a discovery entry", f)) {
             return None;
         }
         let mut requests = Vec::with_capacity(e.requests.len());

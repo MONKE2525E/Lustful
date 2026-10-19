@@ -11,6 +11,7 @@ mod const_reach;
 pub(crate) mod kept_delta;
 mod kept_derive;
 pub(crate) mod laps;
+mod genreuse_oracle;
 mod item_oracle;
 mod resolve_oracle;
 mod macro_scope;

@@ -32,7 +32,9 @@
 # builds that emit no C before the compared build, a jump over versions no build saw, and builds
 # that each start again from an older state (a CI disk whose commits did not land).
 # The image side runs B1's oracle (LUST_CHECK_UNIT_FP=1); dt01-b1-skip runs B1's skipping
-# (LUST_B1=1) in builds that emit no C.
+# (LUST_B1=1) in builds that emit no C. It also runs the generic reuse oracle
+# (LUST_CHECK_GENREUSE=1, src/driver/genreuse_oracle.rs): every body and stored entry the image's
+# session keeps must have clean reads, and every kept body made again without reuse the same C.
 #
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: front_check.py [--jobs N] [--keep DIR] [--only NAME]
@@ -708,6 +710,7 @@ def check_seq(name, srcs, backend, args, work, opts):
     # (LUST_CHECK_UNIT_FP=1: every unit assembles, and one its recorded reads call clean must
     # have the same text), or with `b1` skip the skipping itself (LUST_B1=1).
     img.update({"LUST_B1": "1"} if opts.get("b1") == "skip" else {"LUST_CHECK_UNIT_FP": "1"})
+    img["LUST_CHECK_GENREUSE"] = "1"
     one = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4")
     problems, paths, seen = [], [], 0
     lock = os.path.join(d, "front", "lock")

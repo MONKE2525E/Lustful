@@ -4179,6 +4179,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         work = (0..program.fns.len()).filter(|&i| recheck_of[i]).collect();
+        if super::genreuse_oracle::on() {
+            for i in fn_count..program.fns.len() {
+                if !recheck_of[i]
+                    && let Some(Some(r)) = caches.slot_reads.get(slot(i))
+                {
+                    super::genreuse_oracle::kept_reads("an instance or closure body", &program, LocalDefId(i as u32), r, &caches.read_keys, memo);
+                }
+            }
+        }
         if build {
             caches.held_slots = held;
             front.walked_const_fns = const_fns;
@@ -4490,6 +4499,37 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         if let Some(slot_ir) = caches.slot_ir.get_mut(s) {
             *slot_ir = cached;
         }
+    }
+    // LUST_CHECK_GENREUSE=1 (genreuse_oracle.rs): every concrete body a release C build keeps
+    // is checked, lowered and generated again without reuse (nothing stored), and its C must
+    // equal the kept C. Release C names are content-addressed; dev C names a vtable by a
+    // session number, which a body made again may not take.
+    if super::genreuse_oracle::on() && req.cmd == Cmd::Build && release {
+        let mut made = vec![false; program.fns.len()];
+        bodies.iter().for_each(|(i, _)| made[*i] = true);
+        let kept: Vec<usize> = (0..program.fns.len())
+            .filter(|&i| !made[i] && caches.has_out.get(slot(i)) == Some(&true))
+            .filter(|&i| {
+                use crate::check::generics::FnClass as C;
+                matches!(program.gx.fn_class.get(i), Some(C::Plain | C::Instance | C::Closure) | None)
+            })
+            .collect();
+        let fresh = par_map(&kept, |&i| {
+            let f = LocalDefId(i as u32);
+            let ((checked, errs), _) = check::derive_delta::scoped(program.record_reads, || check::check_fn(&program, f));
+            if !errs.is_empty() {
+                return Err(errs[0].message.clone());
+            }
+            let body = lower::lower(&program, f, checked);
+            let out = cgen::in_layout_phase(layout_tag, || {
+                cgen::names::with(rn, || cgen::gen_fn(&program, &body, &map, line_base_of(front, i), &front.fn_slot))
+            });
+            Ok([out.code, out.ll, out.ll_c])
+        });
+        super::genreuse_oracle::compare_bodies(&program, visits.path, &kept, fresh, |i| {
+            let o = &caches.out[slot(i)];
+            [o.code.clone(), o.ll.clone(), o.ll_c.clone()]
+        });
     }
     // Group slots into function units by C bytes (see
     // `Caches::groups`): regroup all on a fresh base (or when the

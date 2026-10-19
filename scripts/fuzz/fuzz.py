@@ -601,7 +601,10 @@ class Harness:
         keep = ("LUST_CHECK_ITEMPATCH", "LUST_ITEMPATCH_LOG", "LUST_DAEMON_SOCKET", "LUST_FRONT_STATE", "LUST_NO_CACHE")
         base = {k: v for k, v in self.cold.items() if k not in keep}
         base.update(LUST_RELEASE_C="1", LUST_NO_DAEMON="1")
-        img = dict(base, LUST_FRONT_STATE=os.path.join(self.work, "rel-front"), LUST_CACHE_DIR=os.path.join(self.work, "rel-cache"))
+        # The image side proves what its session reuses (LUST_CHECK_GENREUSE=1: a kept body or
+        # stored entry with moved reads, or a kept body whose C made again differs, fails the build).
+        img = dict(base, LUST_FRONT_STATE=os.path.join(self.work, "rel-front"), LUST_CACHE_DIR=os.path.join(self.work, "rel-cache"),
+                   LUST_CHECK_GENREUSE="1")
         one = dict(base, LUST_NO_CACHE="1")
         out = []
         for side, env in (("rw", img), ("rc", one)):
