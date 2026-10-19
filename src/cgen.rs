@@ -9952,7 +9952,9 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let f = LocalDefId(*f);
             let slot = *slots.get(f.0 as usize).expect("internal: a fn pointer in static data has no fn slot");
             let name = format!("stramp{}", names::fn_tag(slot));
-            if !pre.contains(&format!(" {name}(")) {
+            // Once per prelude (`cx` and `pre` live and die together): a scan of `pre`
+            // here was quadratic in a 10 MB statics prelude (tsgo).
+            if cx.stramps.insert(name.clone()) {
                 let tr = trampoline(p, f, slot).replacen(&format!(" {}(", names::tramp(slot)), &format!(" {name}("), 1);
                 if names::release() {
                     // Release C: the copy calls the body by name, so it needs the

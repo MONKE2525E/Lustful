@@ -353,6 +353,8 @@ pub(super) struct StaticCx {
     pub lits: Option<HashMap<Vec<u8>, usize>>,
     defs: HashMap<Vec<u8>, String>,
     alias: HashMap<String, String>,
+    /// The fn pointer trampolines (`stramp<tag>`) this pass's prelude defines.
+    pub stramps: std::collections::HashSet<String>,
     regs: Vec<(String, u64, u64, Option<Vec<u64>>)>,
 }
 

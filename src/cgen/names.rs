@@ -250,11 +250,10 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     let data = static_defs(p, &g.slots);
     // Only the glue the data names (a vtable's drop entry, say): the unit must not
     // change when unrelated glue comes or goes.
-    let named: HashSet<&str> = data.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).collect();
+    let named = names_in(&data, g.protos.values().map(|proto| proto_name(proto)));
     let mut protos: Vec<&String> = Vec::new();
     for (k, proto) in &g.protos {
-        let name = proto.split('(').next().and_then(|h| h.rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).next()).unwrap_or("");
-        if named.contains(name) {
+        if named.contains(proto_name(proto)) {
             collect_types(&k.1, &mut pointed);
             protos.push(proto);
         }
@@ -266,6 +265,41 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     protos.into_iter().for_each(|x| c.push_str(x));
     c.push_str(&data);
     c
+}
+
+/// The fn a glue prototype declares: the last name before its parameter list.
+fn proto_name(proto: &str) -> &str {
+    proto.split('(').next().and_then(|h| h.rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).next()).unwrap_or("")
+}
+
+/// The names among `wanted` that `text` holds as identifiers (runs of ASCII letters,
+/// digits and `_`; the empty name when `text` has an empty run, as `str::split` gives).
+/// The statics unit asks it for the glue names of 20k+ prototypes over its 15 MB of data
+/// (tsgo): the text is scanned on all cores, in pieces cut at ASCII bytes outside names.
+fn names_in<'a>(text: &str, wanted: impl Iterator<Item = &'a str>) -> HashSet<&'a str> {
+    let wanted: HashSet<&str, std::hash::BuildHasherDefault<crate::intern::FxHasher>> = wanted.collect();
+    let sep = |ch: char| !(ch.is_ascii_alphanumeric() || ch == '_');
+    let mut found: HashSet<&str> = HashSet::new();
+    if wanted.contains("") && text.split(sep).any(str::is_empty) {
+        found.insert("");
+    }
+    let (bytes, step) = (text.as_bytes(), text.len().div_ceil(64).max(1 << 16));
+    let mut cuts = vec![0];
+    while let Some(&last) = cuts.last() {
+        let mut at = (last + step).min(text.len());
+        while at < text.len() && (bytes[at] >= 0x80 || !sep(bytes[at] as char)) {
+            at += 1;
+        }
+        cuts.push(at);
+        if at == text.len() {
+            break;
+        }
+    }
+    let pieces: Vec<&str> = cuts.windows(2).map(|w| &text[w[0]..w[1]]).collect();
+    for part in crate::pool::par_map(&pieces, |piece| piece.split(sep).filter_map(|w| wanted.get(w).copied()).collect::<Vec<&str>>()) {
+        found.extend(part);
+    }
+    found
 }
 
 /// The fns whose pointers the constant `v` holds.
@@ -291,4 +325,26 @@ fn hash64(s: &str) -> u64 {
     let mut x = crate::intern::FxHasher::default();
     std::hash::Hash::hash(s, &mut x);
     std::hash::Hasher::finish(&x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::names_in;
+    use std::collections::HashSet;
+
+    /// `names_in` finds what the set of every identifier of the text finds, over a text of many
+    /// pieces with UTF-8 and names at every offset, the empty name included.
+    #[test]
+    fn names_in_matches_the_split_of_the_whole_text() {
+        let mut text = String::from(";;");
+        for i in 0..40_000u32 {
+            text.push_str(&format!("glue_{}(x){}", i % 997, if i % 7 == 0 { " é→ " } else { ", " }));
+        }
+        let wanted: Vec<String> = (0..1200).map(|i| format!("glue_{i}")).chain(["".to_string(), "x".into(), "é".into()]).collect();
+        let all: HashSet<&str> = text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).collect();
+        let want: HashSet<&str> = wanted.iter().map(String::as_str).filter(|w| all.contains(w)).collect();
+        assert!(text.len() > 4 << 16 && want.contains("") && want.contains("glue_996") && !want.contains("glue_997"));
+        assert_eq!(names_in(&text, wanted.iter().map(String::as_str)), want);
+        assert_eq!(names_in("abc", ["", "abc"].into_iter()), HashSet::from(["abc"]));
+    }
 }
