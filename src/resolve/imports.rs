@@ -10,9 +10,11 @@
 // is no alias def. Visibility is checked per path segment against the
 // binding found in that module, never as a minimum over the chain.
 //
-// Determinism: work items process in ModuleId order, names in name-string
-// order. Each binding changes state at most twice (absent, glob,
-// explicit), so the fixpoint ends; a round cap of `modules + 2` full
+// Determinism: work items process in ModuleId order. The names of one
+// glob copy go in any order: each name's copy reads the source's state of
+// that name and writes the importer's (only the order of the importer's
+// `glob_log`, which is read as a set, shows it). Each binding changes
+// state at most twice (absent, glob, explicit), so the fixpoint ends; a round cap of `modules + 2` full
 // sweeps guards against bugs (a hit is an internal error today).
 use crate::ast;
 use crate::def::DefId;
@@ -214,12 +216,6 @@ pub struct ResolvedTables {
     /// `run_imports` call per crate read all ~2M of them for tsgo). Not
     /// part of any answer.
     pub ambiguous_keys: FxMap<(ModuleId, u8, Sym), ()>,
-    /// While `run_imports` runs: the names of each source module's
-    /// namespace in string order, with the map length and `glob_log`
-    /// length they were sorted at (`sorted_source_names`): the full
-    /// copies of one source (a prelude has hundreds of importers) sort
-    /// it once while it stands. Empty otherwise. Not part of any answer.
-    pub sorted_names: FxMap<(ModuleId, u8), (usize, usize, Vec<Sym>)>,
     pub externs: Vec<ExternInfo>,
     /// Adt def -> associated fn name -> (vis, defining module).
     pub assoc_vis: FxMap<DefId, FxMap<Sym, (VisKind, ModuleId)>>,
@@ -439,7 +435,6 @@ impl ResolvedTables {
             maps: vec![Default::default()],
             glob_log: Vec::new(),
             ambiguous_keys: FxMap::default(),
-            sorted_names: FxMap::default(),
             externs: Vec::new(),
             assoc_vis: FxMap::default(),
             field_vis: FxMap::default(),
@@ -1057,6 +1052,32 @@ impl ResolvedTables {
     /// ambiguous. A copy from any other source keeps the plain rules.
     pub fn insert_glob(&mut self, module: ModuleId, ns: Namespace, name: Sym, bind: Bind, src: ModuleId) -> InsertOut {
         let key = (module, ns_index(ns) as u8, name);
+        // The two common cases first, each with the outcome of the general path below in
+        // fewer table reads (a glob copy inserts millions of names on tsgo): with no std alias
+        // of the name here, a name with no binding and no glob source takes the copy, and a
+        // binding that the copy would not change stays.
+        if !self.std_glob_aliases.contains_key(&key) {
+            match self.maps[module.0 as usize][ns_index(ns)].get(&name) {
+                None if !self.glob_src.contains_key(&key) => {
+                    self.maps[module.0 as usize][ns_index(ns)].insert(name, BindState::One(bind));
+                    self.touch(module, name);
+                    self.glob_src.insert(key, src);
+                    return InsertOut::Changed;
+                }
+                Some(BindState::One(old))
+                    if if old.target == bind.target {
+                        bind.rank <= old.rank
+                            && !(old.rank == 2 && bind.rank == 2)
+                            && !(old.rank == 1 && bind.rank == 1 && self.glob_vis_wider(&bind, old))
+                    } else {
+                        bind.rank < old.rank && old.rank >= 2
+                    } =>
+                {
+                    return InsertOut::Same;
+                }
+                _ => {}
+            }
+        }
         // The name's binding here now, read once: a stale copy of this
         // source (another item at glob rank), an ambiguity it made, or
         // the same item.
@@ -2354,7 +2375,6 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
         }
     }
     tables.pending_single.clear();
-    tables.sorted_names = FxMap::default();
     crate::resolve::order::compute_order_dep(tables, imports, interner);
     // The plain checks first: where they report (L0507, L0510), rustc
     // does too; the order rule (L0509) takes the imports they pass.
@@ -2429,35 +2449,6 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     Ok(diags)
 }
 
-/// Sorts `v` by the string order of `name(x)`. Each name's key is computed
-/// once: its first 16 bytes as one big-endian number (shorter names padded
-/// with zero bytes, which no name holds), then the whole string, which only
-/// a tie on those bytes compares. Names are distinct, so the order is total.
-fn sort_by_name<T>(v: &mut [T], name: impl Fn(&T) -> Sym, interner: &Interner) {
-    v.sort_by_cached_key(|x| {
-        let s = interner.get(name(x));
-        let mut k = [0u8; 16];
-        let n = s.len().min(16);
-        k[..n].copy_from_slice(&s.as_bytes()[..n]);
-        (u128::from_be_bytes(k), s)
-    });
-}
-
-/// Sorts the names of module `src` in `ns` into `ResolvedTables::sorted_names`,
-/// unless the list there was sorted at the same map length and `glob_log`
-/// length: a new name grows the map and every change is logged (`touch`), so
-/// the list stands for the same names.
-fn sorted_source_names(tables: &mut ResolvedTables, src: ModuleId, ns: Namespace, interner: &Interner) {
-    let key = (src, ns_index(ns) as u8);
-    let (len, log) = (tables.maps[src.0 as usize][ns_index(ns)].len(), tables.log_len(src));
-    if tables.sorted_names.get(&key).is_some_and(|(l, g, _)| (*l, *g) == (len, log)) {
-        return;
-    }
-    let mut names: Vec<Sym> = tables.maps[src.0 as usize][ns_index(ns)].keys().copied().collect();
-    sort_by_name(&mut names, |s| *s, interner);
-    tables.sorted_names.insert(key, (len, log, names));
-}
-
 /// The bindings of module `src` in one namespace, all or those `only`
 /// names, borrowed (`copy_glob` copies only the ones it takes).
 fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only: Option<&[Sym]>) -> Vec<(Sym, &'t BindState)> {
@@ -2470,41 +2461,35 @@ fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only
 
 /// Copies the names of module `src` that importer `imp.module` can
 /// see into it (a module glob, `use src::*`): bindings, ambiguous
-/// names, and std aliases, in name order. `only` limits the copy to
-/// those names (`run_imports` passes the names changed since the last
-/// copy; each name's copy reads and writes that name alone). Returns
-/// true on a change.
+/// names, and std aliases. `only` limits the copy to those names
+/// (`run_imports` passes the names changed since the last copy). Each
+/// name's copy reads and writes that name alone, so the names go in the
+/// source map's order, or `only`'s. Returns true on a change.
 fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Option<&[Sym]>, interner: &Interner) -> bool {
     // `only` is sorted by symbol (`run_imports`).
     let want = |name: &Sym| only.is_none_or(|o| o.binary_search(name).is_ok());
     let mut changed = false;
-    // Copy in deterministic name order.
     let mut entries: Vec<(Namespace, Sym, Bind)> = Vec::new();
+    // The source's ambiguous names per namespace, read in the same pass: the copies write
+    // the importer only, so the source's states stand as read.
+    let mut ambiguous: [Vec<Sym>; 3] = Default::default();
     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
-        let names: Vec<(Sym, &BindState)> = match only {
-            None => {
-                sorted_source_names(tables, src, ns, interner);
-                let map = &tables.maps[src.0 as usize][ns_index(ns)];
-                tables.sorted_names[&(src, ns_index(ns) as u8)].2.iter().map(|n| (*n, &map[n])).collect()
-            }
-            Some(_) => {
-                let mut names = glob_names(tables, src, ns, only);
-                sort_by_name(&mut names, |x| x.0, interner);
-                names
-            }
-        };
-        for (name, state) in names {
+        for (name, state) in glob_names(tables, src, ns, only) {
             // A `macro_rules!` definition is not in its
             // module's namespace, so no glob copies it.
             // A glob binding a pending single import of
             // the name hides is not copied yet.
-            if let BindState::One(b) = state
-                && (b.rank >= 2 || !tables.pending_single.contains_key(&(src, name)))
-                && tables.visible(&b.vis, b.def_module, imp.module, interner)
-                && !(ns == Namespace::Macro && tables.is_textual_bind(src, name, b))
-            {
-                let (vis, def_module) = tables.glob_vis(imp, &b.vis, b.def_module, interner);
-                entries.push((ns, name, Bind { target: b.target, vis, rank: 1, def_module }));
+            match state {
+                BindState::One(b)
+                    if (b.rank >= 2 || !tables.pending_single.contains_key(&(src, name)))
+                        && tables.visible(&b.vis, b.def_module, imp.module, interner)
+                        && !(ns == Namespace::Macro && tables.is_textual_bind(src, name, b)) =>
+                {
+                    let (vis, def_module) = tables.glob_vis(imp, &b.vis, b.def_module, interner);
+                    entries.push((ns, name, Bind { target: b.target, vis, rank: 1, def_module }));
+                }
+                BindState::Ambiguous => ambiguous[ns_index(ns)].push(name),
+                BindState::One(_) => {}
             }
         }
     }
@@ -2525,25 +2510,13 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
     // (`ambig_vis`), and none that a pending single
     // import in the source hides.
     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
-        // A full copy reads the source's names in the order `sorted_source_names` keeps; its
-        // ambiguous names are a subset of them, in the same order.
-        let pairs: Vec<(Sym, &BindState)> = match only {
-            None => {
-                sorted_source_names(tables, src, ns, interner);
-                let map = &tables.maps[src.0 as usize][ns_index(ns)];
-                tables.sorted_names[&(src, ns_index(ns) as u8)].2.iter().map(|n| (*n, &map[n])).collect()
-            }
-            Some(_) => glob_names(tables, src, ns, only),
-        };
-        let mut names: Vec<Sym> = pairs
-            .into_iter()
-            .filter_map(|(name, state)| matches!(state, BindState::Ambiguous).then_some(name))
-            .filter(|name| !tables.pending_single.contains_key(&(src, *name)))
-            .filter(|name| tables.ambiguous_visible(src, ns, *name, imp.module, interner))
-            .collect();
-        if only.is_some() {
-            sort_by_name(&mut names, |x| *x, interner);
+        let mut names = std::mem::take(&mut ambiguous[ns_index(ns)]);
+        // A glob of the importer itself (only a std overlay's could be) wrote the source: its
+        // ambiguous names are read again, after the copies.
+        if src == imp.module {
+            names = glob_names(tables, src, ns, only).into_iter().filter_map(|(name, state)| matches!(state, BindState::Ambiguous).then_some(name)).collect();
         }
+        names.retain(|name| !tables.pending_single.contains_key(&(src, *name)) && tables.ambiguous_visible(src, ns, *name, imp.module, interner));
         for name in names {
             let certain = tables.ambiguous_certain(src, ns, name, Some(imp.module), interner);
             let item = AmbItem::Amb { certain };
@@ -3547,27 +3520,4 @@ pub fn ambiguous_diag(name: &str, span: Span) -> Diag {
         format!("`{name}` is ambiguous: two glob imports bring different items with this name"),
         "Import the one you mean explicitly: an explicit import wins over globs.",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sort_by_name;
-    use crate::intern::Interner;
-
-    /// `sort_by_name` gives the strings' order: names that share eight or more bytes,
-    /// names shorter than eight bytes and prefixes of others, and UTF-8.
-    #[test]
-    fn sort_by_name_is_string_order() {
-        let interner = Interner::default();
-        let words = [
-            "visit_expr_call", "visit_expr", "visit_expr_binary", "visit_ex", "v", "a", "ab", "abc", "abcdefgh",
-            "abcdefghi", "abcdefg", "Zeta", "_x", "é", "éa", "visit_expr_call2", "x", "X1",
-        ];
-        let mut syms: Vec<_> = words.iter().map(|w| interner.intern(w)).collect();
-        syms.reverse();
-        sort_by_name(&mut syms, |s| *s, &interner);
-        let mut want = words.to_vec();
-        want.sort();
-        assert_eq!(syms.iter().map(|s| interner.get(*s)).collect::<Vec<_>>(), want);
-    }
 }
