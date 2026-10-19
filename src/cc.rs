@@ -702,6 +702,29 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
         }
         memo::save(work, tag, &next)?;
     }
+    // While the misses compile, read the objects the cache holds for this build, 16 at once, so
+    // the link finds them in the page cache: lld page-faults its inputs in with few reads in
+    // flight, slow from a cold page cache (a CI job's freshly mounted disk). The link waits for
+    // it. LUST_LINK_PREFETCH=0 turns it off.
+    let prefetch = cache.filter(|_| std::env::var_os("LUST_LINK_PREFETCH").is_none_or(|v| v != "0")).map(|c| {
+        let paths: Vec<PathBuf> = keys.iter().flatten().map(|k| c.unit_object_path(k)).collect();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let at = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..16 {
+                    s.spawn(|| {
+                        while let Some(p) = paths.get(at.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                            if let Ok(mut f) = std::fs::File::open(p) {
+                                let _ = std::io::copy(&mut f, &mut std::io::sink());
+                            }
+                        }
+                    });
+                }
+            });
+            t.elapsed().as_secs_f64()
+        })
+    });
     let next = std::sync::atomic::AtomicUsize::new(0);
     let errors = std::sync::Mutex::new(String::new());
     // Memo units whose object left the cache since the check above (another build evicted it).
@@ -821,6 +844,7 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
         return Err(CcError::NeedText(lost));
     }
     let compile_s = t_compile.elapsed().as_secs_f64();
+    let prefetch_s = prefetch.map(|h| h.join().unwrap_or(0.0));
     let t_link = std::time::Instant::now();
     // A build with a C++ unit links with the C++ driver (its runtime and personality).
     let link = if units.iter().any(|u| is_cxx(&u.name)) { &spec.cxx } else { &spec.cmd };
@@ -828,10 +852,11 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
     cmd.args(&link[1..]).args(ldflags(spec, debug)).args(pgo.as_ref().map(pgo::Mode::link_flags).unwrap_or_default()).args(&objs).arg("-o").arg(out);
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(format!(
-            "{} units ({} from cache, clang {:.2}s, link {:.2}s{}), linked {}",
+            "{} units ({} from cache, clang {:.2}s, {}link {:.2}s{}), linked {}",
             units.len(),
             hits.load(std::sync::atomic::Ordering::Relaxed),
             compile_s,
+            prefetch_s.map(|p| format!("prefetch {p:.2}s, ")).unwrap_or_default(),
             t_link.elapsed().as_secs_f64(),
             pgo.as_ref().map(|m| format!(", {}", m.describe())).unwrap_or_default(),
             out.display()

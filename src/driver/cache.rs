@@ -295,7 +295,12 @@ impl Cache {
     /// Whether the cache holds a unit object under `key` (`cc::build` asks before it takes
     /// a unit's key from the memo instead of its text).
     pub fn has_unit_object(&self, key: &str) -> bool {
-        self.dir.join(format!("unit-{key}.o")).is_file()
+        self.unit_object_path(key).is_file()
+    }
+
+    /// Where the cache keeps the unit object of `key`.
+    pub fn unit_object_path(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("unit-{key}.o"))
     }
 
     /// Stores a freshly compiled unit object under `key`. The build evicts once
