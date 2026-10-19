@@ -4763,15 +4763,21 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
             // B1 (`cgen::record`): each C fn unit records the pieces it is made of and what it
             // read, and the next build sets the record against its program
-            // (`Caches::unit_records`). LUST_B1=1 skips the assembly of a unit whose reads all
-            // kept their fingerprints and whose object the unit memo holds (`cc::memo_misses`):
-            // cc takes its fingerprint and no text. Not with --emit-c (it writes every unit) nor
-            // for LLVM units (never recorded). LUST_CHECK_UNIT_FP=1 is the oracle: every unit
+            // (`Caches::unit_records`). A session that keeps its caches (a daemon, a front
+            // image) skips the assembly of a unit whose reads all kept their fingerprints and
+            // whose object the unit memo holds (`cc::memo_misses`): cc takes its fingerprint and
+            // no text (LUST_B1=0 turns it off). Not with --emit-c (it writes every unit) nor for
+            // LLVM units (never recorded). LUST_CHECK_UNIT_FP=1 is the oracle: every unit
             // assembles, a unit clean by its reads must have the same pieces, and cc's memo the
             // same key for its fingerprint. LUST_B1_OBSERVE=1 prints the counts.
             let b1_observe = std::env::var_os("LUST_B1_OBSERVE").is_some_and(|v| v == "1");
             let b1_check = !llvm_on && std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
-            let b1_skip = !llvm_on && !b1_check && req.cc && req.emit_c.is_none() && std::env::var_os("LUST_B1").is_some_and(|v| v == "1");
+            let b1_skip = !llvm_on
+                && !b1_check
+                && caches.persistent
+                && req.cc
+                && req.emit_c.is_none()
+                && std::env::var_os("LUST_B1").is_none_or(|v| v != "0");
             let b1_record = b1_observe || b1_check || b1_skip;
             type B1Rec = (usize, Option<(Vec<cgen::record::Piece>, Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
