@@ -2798,29 +2798,33 @@ impl MacroEnv {
         // a stream with no `use` token has no sites. Either way
         // the token trees (the expensive part) are not built.
         let no_sources = srcs.is_empty() && dep_exports.iter().all(|(_, s)| s.is_empty());
+        // Each file's sites on the pool (its token trees are the cost: about
+        // 1000 files a tsgo resolve), then in disc order.
+        let file_sites = |di: &usize| {
+            let (di, disc) = (*di, &discs[*di]);
+            let mut mine: Vec<UseSite> = Vec::new();
+            let base = &tables.modules[disc.module.0 as usize].path;
+            if let Some(orig) = &disc.lexed
+                && orig.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
+            {
+                let (trees, _) = crate::lexer::build_trees(&orig.tokens);
+                scan_use_sites(&trees, base, interner, &mut mine);
+            }
+            if let Some(Some(exp)) = expanded.get(di)
+                && exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
+            {
+                let (trees, _) = crate::lexer::build_trees(&exp.tokens);
+                scan_use_sites(&trees, base, interner, &mut mine);
+            }
+            mine
+        };
+        let sites_by_disc: Vec<Vec<UseSite>> =
+            if no_sources { vec![Vec::new(); discs.len()] } else { par_map(&(0..discs.len()).collect::<Vec<_>>(), file_sites) };
         let mut sites: Vec<UseSite> = Vec::new();
         let mut site_disc: Vec<usize> = Vec::new();
-        let mut sites_by_disc: Vec<Vec<UseSite>> = Vec::with_capacity(discs.len());
-        for (di, disc) in discs.iter().enumerate() {
-            let mut mine: Vec<UseSite> = Vec::new();
-            if !no_sources {
-                let base = tables.modules[disc.module.0 as usize].path.clone();
-                if let Some(orig) = &disc.lexed
-                    && orig.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
-                {
-                    let (trees, _) = crate::lexer::build_trees(&orig.tokens);
-                    scan_use_sites(&trees, &base, interner, &mut mine);
-                }
-                if let Some(Some(exp)) = expanded.get(di)
-                    && exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
-                {
-                    let (trees, _) = crate::lexer::build_trees(&exp.tokens);
-                    scan_use_sites(&trees, &base, interner, &mut mine);
-                }
-            }
+        for (di, mine) in sites_by_disc.iter().enumerate() {
             sites.extend(mine.iter().cloned());
             site_disc.extend(std::iter::repeat_n(di, mine.len()));
-            sites_by_disc.push(mine);
         }
         let owned_names: Vec<Sym> = owned.iter().map(|o| o.name).collect();
         let (inherited, after_mods, scopes) = textual_env(job, discs, expanded, &srcs, &dep_owned, &owned_names, tables, interner);
