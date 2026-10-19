@@ -303,6 +303,11 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
         return resps;
     }
     sessions.iter_mut().for_each(|s| s.settle());
+    // The kept programs ride only when the next build may reuse them
+    // (`Front::image_keeps_kept`).
+    for s in sessions.iter_mut().filter(|s| !s.front.image_keeps_kept()) {
+        s.front.kept = Default::default();
+    }
     let roots = Box::new(image::Roots {
         sessions,
         tables: diag::take_global_tables(),

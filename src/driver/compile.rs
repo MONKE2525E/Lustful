@@ -3534,6 +3534,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             None
         }
     };
+    front.note_kept_use(visits.path, visits.kept);
     // Template check errors from the kept program are collect's errors
     // (`gen_reuse.template_errors` counts them).
     let collect = |front: &mut Front, caches: &mut Caches| {

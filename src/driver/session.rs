@@ -77,6 +77,12 @@ pub(crate) struct Front {
     /// passing body is a read-set candidate, as for `rpit_edit`. Cleared by
     /// the next request.
     pub(crate) kept_put_back: bool,
+    /// How the last builds used the kept programs (`note_kept_use`): the
+    /// last one reused one, and how many builds in a row took the patch
+    /// path. A front image save keeps the kept programs on these alone
+    /// (`image_keeps_kept`).
+    kept_reused: bool,
+    patch_streak: u32,
     /// The templates whose check failed in the request that `reuse_kept`
     /// answered with their errors: `patch::keep` gives them to the kept
     /// program (`KeptProgram::recheck`).
@@ -421,6 +427,28 @@ pub struct Session {
     pub(crate) cache_tried: bool,
 }
 
+impl Front {
+    /// Notes how this build used the kept programs: its path (`patch` and
+    /// `item` patch the last build's state, `resolve` and `chunks` start
+    /// again) and whether `patch::reuse_kept` took one (`reuse`).
+    pub(crate) fn note_kept_use(&mut self, path: &str, kept: &str) {
+        self.kept_reused = kept == "reuse";
+        self.patch_streak = if matches!(path, "patch" | "item") { self.patch_streak + 1 } else { 0 };
+    }
+
+    /// True when a front image save should keep the kept programs: the
+    /// next build may reuse them. That is when the last build reused one,
+    /// or when it and the build before it took the patch path: an edit
+    /// loop without a daemon, whose next edit can reuse what this build
+    /// kept. A CI merge is a full resolve, which drops the kept programs
+    /// unread, or one patch between full resolves (the tsgo replay never
+    /// reused one); there they are the largest churn of every image delta
+    /// (253 MB raw each) and 20-25 MB of every restore.
+    pub(crate) fn image_keeps_kept(&self) -> bool {
+        self.kept_reused || self.patch_streak >= 2
+    }
+}
+
 impl Session {
     pub fn new(obj_dir: PathBuf, persistent: bool, key: SessionKey) -> Session {
         let interner = Interner::default();
@@ -443,6 +471,8 @@ impl Session {
                 revalue_consts: false,
                 rpit_edit: false,
                 kept_put_back: false,
+                kept_reused: false,
+                patch_streak: 0,
                 template_recheck: Vec::new(),
                 delta_errs: None,
                 walk_after_reject: false,
@@ -728,6 +758,30 @@ mod tests {
         key.features = vec!["alpha".into()];
         let s = Session::new(dir, false, key);
         assert_eq!(s.crate_ids().stable, crate::def::synthetic_crate_hash("/tmp/x/main.rs", false), "features do not rename defs");
+    }
+
+    /// An image keeps the kept programs after a build that reused one, and
+    /// after two patch-path builds in a row (the second edit of a loop
+    /// without a daemon); it drops them after a full resolve, and after a
+    /// single patch between full resolves (a CI merge).
+    #[test]
+    fn image_keeps_kept_programs_only_for_a_next_reuse() {
+        let key = SessionKey::synthetic(Path::new("/tmp/x/main.rs"), false);
+        let mut s = Session::new(PathBuf::from("/tmp/lust-session-test"), true, key);
+        let f = &mut s.front;
+        assert!(!f.image_keeps_kept(), "a new session has no use for them");
+        f.note_kept_use("resolve", "none");
+        assert!(!f.image_keeps_kept(), "a full resolve drops them unread");
+        f.note_kept_use("patch", "none");
+        assert!(!f.image_keeps_kept(), "one patch between full resolves");
+        f.note_kept_use("item", "discovery");
+        assert!(f.image_keeps_kept(), "a second patch in a row: an edit loop");
+        f.note_kept_use("patch", "reuse");
+        assert!(f.image_keeps_kept(), "the last build reused one");
+        f.note_kept_use("resolve", "none");
+        assert!(!f.image_keeps_kept(), "a full resolve ends the loop");
+        f.note_kept_use("patch", "reuse");
+        assert!(f.image_keeps_kept(), "a reuse keeps them at once");
     }
 
     /// Serialize, then read back in a fresh map (a restarted daemon): every
