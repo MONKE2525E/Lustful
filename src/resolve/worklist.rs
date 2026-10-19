@@ -3891,8 +3891,12 @@ fn resolve_one(
         line_indexes.entry(span.file).or_insert_with(|| crate::diag::LineIndex::new(texts.get(&span.file).copied().unwrap_or(""))).line_col(span.lo).0
     };
     let mut pendings: Vec<Pending> = Vec::with_capacity(works.len());
+    // The parsed Asts of the files whose cached chunk stands (most files of a full resolve):
+    // they are freed off this thread, where their frees cost more than the rest of flatten.
+    let mut unused: Vec<Ast> = Vec::new();
     for ((fi, mut w), hit) in works.into_iter().enumerate().zip(final_hits) {
         if let Some(c) = hit {
+            unused.push(std::mem::take(&mut w.ast));
             pendings.push(Pending {
                 key: w.key,
                 text_hash: w.text_hash,
@@ -3971,6 +3975,9 @@ fn resolve_one(
             scan: None,
             deps: rw_deps[fi].take(),
         });
+    }
+    if !unused.is_empty() {
+        crate::pool::drop_detached("lust-drop", unused);
     }
     lap!("resolve: flatten");
     // Structural scans for the chunks that missed, in parallel

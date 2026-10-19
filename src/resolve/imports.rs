@@ -1242,17 +1242,28 @@ impl ResolvedTables {
     /// frozen tables instead of rescanning every module map per
     /// unresolved path, which was quadratic in the module count.
     /// The value is a bit set of the namespaces (by `ns_index`) some
-    /// module defines the name in.
+    /// module defines the name in. The maps hold every glob copy too
+    /// (millions on tsgo, scanned once per crate job), so runs of modules
+    /// are scanned on the pool and their sets joined.
     pub fn local_named_set(&self) -> FxMap<Sym, u8> {
-        let mut out: FxMap<Sym, u8> = FxMap::default();
-        for (mi, maps) in self.maps.iter().enumerate() {
-            for (ns, m) in maps.iter().enumerate() {
-                for (name, state) in m {
-                    if matches!(state, BindState::One(b) if b.rank == 2 && b.def_module.0 as usize == mi) {
-                        *out.entry(*name).or_default() |= 1 << ns;
+        let run = self.maps.len().div_ceil(crate::pool::threads() * 4).max(1);
+        let starts: Vec<usize> = (0..self.maps.len()).step_by(run).collect();
+        let parts = crate::pool::par_map(&starts, |&lo| {
+            let mut out: FxMap<Sym, u8> = FxMap::default();
+            for (mi, maps) in self.maps.iter().enumerate().skip(lo).take(run) {
+                for (ns, m) in maps.iter().enumerate() {
+                    for (name, state) in m {
+                        if matches!(state, BindState::One(b) if b.rank == 2 && b.def_module.0 as usize == mi) {
+                            *out.entry(*name).or_default() |= 1 << ns;
+                        }
                     }
                 }
             }
+            out
+        });
+        let mut out: FxMap<Sym, u8> = FxMap::default();
+        for (name, bits) in parts.into_iter().flatten() {
+            *out.entry(name).or_default() |= bits;
         }
         out
     }
