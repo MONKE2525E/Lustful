@@ -4745,10 +4745,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                 }
             }
-            // B1 step 1 (observation, LUST_B1_OBSERVE=1): the pieces each C fn unit is made of
-            // (`cgen::record`), set against the last build's.
+            // B1 (observation, LUST_B1_OBSERVE=1): the pieces each C fn unit is made of and what
+            // it read (`cgen::record`), set against the last build's record. A unit whose reads
+            // all kept their fingerprints must have the same pieces (the unsound count is 0).
             let b1_observe = std::env::var_os("LUST_B1_OBSERVE").is_some_and(|v| v == "1");
-            let b1_records: std::sync::Mutex<Vec<(String, Option<Vec<cgen::record::Piece>>)>> = Default::default();
+            type B1Rec = (String, Vec<usize>, Option<(Vec<cgen::record::Piece>, Vec<cgen::record::Read>)>);
+            let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
             let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>| {
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
@@ -4767,7 +4769,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs);
                         if b1_observe {
                             let rec = cgen::record::close(&c);
-                            b1_records.lock().unwrap_or_else(|e| e.into_inner()).push((reg.clone(), rec));
+                            b1_records.lock().unwrap_or_else(|e| e.into_inner()).push((reg.clone(), slots.clone(), rec));
                         }
                         if adapters.is_none() {
                             return (c, h);
@@ -4837,22 +4839,62 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             });
             made.extend(par_map(fn_jobs, |&u| assemble(u, &inl, c_refs.as_ref())));
             if b1_observe {
-                let (mut same, mut changed, mut new, mut unrecorded) = (0, 0, 0, 0);
+                use cgen::record::{Read, UnitRecord};
+                // The switches every unit's text may read: all LUST_* knobs but paths and B1's own.
+                let env_fp = {
+                    let mut vars: Vec<(String, String)> = std::env::vars()
+                        .filter(|(k, _)| k.starts_with("LUST_") && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "B1_", "UNIT_FP"].iter().any(|x| k.contains(x)))
+                        .collect();
+                    vars.sort();
+                    let text: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    crate::driver::cache::hash128(&[text.join("\n").as_bytes()], 12)
+                };
+                let recs = b1_records.into_inner().unwrap_or_else(|e| e.into_inner());
+                // Every read's fingerprint now, once: the last build's reads and this one's.
+                let mut all: Vec<Read> = recs.iter().filter_map(|(_, _, r)| r.as_ref()).flat_map(|(_, reads)| reads.iter().cloned()).collect();
+                all.extend(caches.unit_records.values().flat_map(|u| u.reads.iter().map(|(r, _)| r.clone())));
+                all.sort_by_cached_key(|r| format!("{r:?}"));
+                all.dedup();
+                let t_fp = std::time::Instant::now();
+                let statics = cgen::names::with(rn, || cgen::static_decl_map(&program));
+                let fps = par_map(&all, |r| cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &statics, r))));
+                let now: FxMap<&Read, (u64, u64)> = all.iter().zip(fps).collect();
+                let fp_ms = t_fp.elapsed().as_secs_f64() * 1e3;
+                let (mut same, mut new, mut unrecorded, mut clean, mut unsound, mut missed) = (0, 0, 0, 0, 0, 0);
+                let mut unsound_names: Vec<String> = Vec::new();
                 let mut next = FxMap::default();
-                for (reg, rec) in b1_records.into_inner().unwrap_or_else(|e| e.into_inner()) {
-                    let Some(pieces) = rec else {
+                for (reg, slots, rec) in &recs {
+                    let Some((pieces, reads)) = rec else {
                         unrecorded += 1;
                         continue;
                     };
-                    match caches.unit_records.get(&reg) {
-                        Some(old) if *old == pieces => same += 1,
-                        Some(_) => changed += 1,
+                    let id = crate::driver::cache::hash128(&[reg.as_bytes(), format!("{slots:?} {main_slot}").as_bytes(), &env_fp.0.to_le_bytes(), &env_fp.1.to_le_bytes()], 13);
+                    match caches.unit_records.get(reg) {
+                        Some(old) => {
+                            let same_pieces = old.pieces == *pieces;
+                            let by_reads = old.id == id && old.reads.iter().all(|(r, fp)| now.get(r) == Some(fp));
+                            same += same_pieces as usize;
+                            clean += by_reads as usize;
+                            if by_reads && !same_pieces {
+                                unsound += 1;
+                                if unsound_names.len() < 3 {
+                                    unsound_names.push(reg.clone());
+                                }
+                            }
+                            missed += (same_pieces && !by_reads) as usize;
+                        }
                         None => new += 1,
                     }
-                    next.insert(reg, pieces);
+                    let reads = reads.iter().map(|r| (r.clone(), now[r])).collect();
+                    next.insert(reg.clone(), UnitRecord { id, pieces: pieces.clone(), reads });
                 }
                 caches.unit_records = next;
-                eprintln!("b1-observe: {} C fn units: {same} the same pieces as the last build, {changed} changed, {new} new, {unrecorded} unrecorded", same + changed + new + unrecorded);
+                eprintln!(
+                    "b1-observe: {} C fn units, {same} the same pieces as the last build, {new} new, {unrecorded} unrecorded; by reads {clean} clean, {unsound} of them with changed pieces (unsound{}), {missed} unchanged units the reads miss; {} reads, fingerprinted in {fp_ms:.0} ms",
+                    recs.len(),
+                    if unsound_names.is_empty() { String::new() } else { format!(": {}", unsound_names.join(", ")) },
+                    all.len()
+                );
             }
             let mut units: Vec<(PathBuf, String)> = Vec::with_capacity(made.len());
             // The LLVM backend (cgen/ll.rs): a fn unit whose fns have LLVM IR gets two

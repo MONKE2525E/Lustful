@@ -7,6 +7,7 @@
 // written, so a unit's text is the same with or without a record. Off unless open: dev
 // builds, the daemon and LLVM-backend units (`abandon`) never record.
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 /// What a piece of a unit is.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -43,14 +44,55 @@ pub struct Piece {
     pub len: usize,
 }
 
+/// What a unit read to choose and make its pieces (B1 step 2): the next build compares each
+/// read's fingerprint (`cgen::read_fp`), so a unit whose reads all stand is made of the
+/// same text without being assembled.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Read {
+    /// A fn's output (`FnOut`) and release name, by slot.
+    Fn(usize),
+    /// The slot a fn id names (`names::slot_of_id`).
+    SlotOf(String),
+    /// A glue key's entry in the glue set.
+    Glue(super::Glue, super::CTy),
+    /// What a type's declarations print and the types they reach, with the type's release
+    /// name when it was read (an Adt id can name another Adt in a later build).
+    Type(super::CTy, String),
+    /// The static a `lust_static_*` symbol of the unit's text names, by symbol.
+    Static(String),
+    /// The main fn and its return type.
+    Main,
+}
+
+/// What the last build recorded of one unit (the driver's `Caches::unit_records`): its
+/// identity (registration name, fns, switches), its pieces, and each read with the
+/// fingerprint it had (`cgen::read_fp`).
+#[derive(Clone, Debug)]
+pub struct UnitRecord {
+    pub id: (u64, u64),
+    pub pieces: Vec<Piece>,
+    pub reads: Vec<(Read, (u64, u64))>,
+}
+
+/// The open record: its pieces, their text so far, and its reads.
+type Open = (Vec<Piece>, String, HashSet<Read>);
+
 thread_local! {
-    /// The open record: its pieces and their text so far.
-    static OPEN: RefCell<Option<(Vec<Piece>, String)>> = const { RefCell::new(None) };
+    static OPEN: RefCell<Option<Open>> = const { RefCell::new(None) };
 }
 
 /// Starts recording the next unit this thread assembles.
 pub fn open() {
-    OPEN.with(|r| *r.borrow_mut() = Some((Vec::new(), String::new())));
+    OPEN.with(|r| *r.borrow_mut() = Some((Vec::new(), String::new(), HashSet::new())));
+}
+
+/// Records a read of the open unit; nothing without a record.
+pub fn read(what: Read) {
+    OPEN.with(|r| {
+        if let Some((_, _, reads)) = r.borrow_mut().as_mut() {
+            reads.insert(what);
+        }
+    });
 }
 
 /// True while a record is open on this thread.
@@ -61,7 +103,7 @@ pub fn on() -> bool {
 /// Records `text` (just appended to the unit) as its next piece; nothing without a record.
 pub fn piece(kind: Kind, key: u64, text: &str) {
     OPEN.with(|r| {
-        if let Some((pieces, all)) = r.borrow_mut().as_mut() {
+        if let Some((pieces, all, _)) = r.borrow_mut().as_mut() {
             pieces.push(Piece { kind, key, hash: crate::driver::cache::hash128(&[text.as_bytes()], 0), len: text.len() });
             all.push_str(text);
         }
@@ -73,10 +115,10 @@ pub fn abandon() {
     OPEN.with(|r| *r.borrow_mut() = None);
 }
 
-/// Ends the record: its pieces when they make exactly `whole`, else none.
-pub fn close(whole: &str) -> Option<Vec<Piece>> {
+/// Ends the record: its pieces and reads when the pieces make exactly `whole`, else none.
+pub fn close(whole: &str) -> Option<(Vec<Piece>, Vec<Read>)> {
     let open = OPEN.with(|r| r.borrow_mut().take());
-    open.and_then(|(pieces, all)| (all == whole).then_some(pieces))
+    open.and_then(|(pieces, all, reads)| (all == whole).then(|| (pieces, reads.into_iter().collect())))
 }
 
 /// A key for an item given by name or text (a type's mangled name, a fn's tag).
@@ -96,7 +138,7 @@ mod tests {
         piece(Kind::Fixed, 0, "head\n");
         piece(Kind::Body, key("f"), "int f(void) { return 1; }\n");
         let whole = "head\nint f(void) { return 1; }\n";
-        assert_eq!(close(whole).map(|p| p.len()), Some(2));
+        assert_eq!(close(whole).map(|(p, _)| p.len()), Some(2));
         open();
         piece(Kind::Fixed, 0, "head\n");
         assert_eq!(close(whole), None, "text outside the pieces");

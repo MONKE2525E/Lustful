@@ -10258,11 +10258,15 @@ fn static_decls_for(p: &Program, keep: &HashSet<usize>) -> String {
 /// in every unit.
 fn used_statics<'a>(p: &Program, texts: impl Iterator<Item = &'a str>) -> HashSet<usize> {
     let mut syms: HashSet<&'a str> = HashSet::new();
+    let rec = record::on();
     for text in texts {
         let mut rest = text;
         while let Some(i) = rest.find("lust_static_") {
             rest = &rest[i..];
             let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+            if rec && !syms.contains(&rest[..end]) {
+                record::read(record::Read::Static(rest[..end].to_string()));
+            }
             syms.insert(&rest[..end]);
             rest = &rest[end..];
             if rest.is_empty() {
@@ -10370,7 +10374,14 @@ fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
 /// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns.
 fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, skip: &HashSet<usize>, deep: bool) -> Vec<usize> {
     let mut out = BTreeSet::new();
+    let rec = record::on();
     for e in externs {
+        if rec && let Some(id) = proto_body_id(e) {
+            record::read(record::Read::SlotOf(id.to_string()));
+            if let Some(c) = names::slot_of_id(id) {
+                record::read(record::Read::Fn(c as usize));
+            }
+        }
         if let Some(id) = proto_body_id(e)
             && let Some(c) = names::slot_of_id(id)
             && let Some(f) = fns.get(c as usize)
@@ -10421,6 +10432,9 @@ pub fn fn_unit_parts(
     if p.unwind_tables {
         c.push_str(noreturn_decls());
         record::piece(record::Kind::Fixed, 1, noreturn_decls());
+    }
+    if record::on() {
+        slots.iter().for_each(|&s| record::read(record::Read::Fn(s)));
     }
     let mut types = HashSet::new();
     let mut named = HashSet::new();
@@ -10513,7 +10527,15 @@ pub fn fn_unit_parts(
         p.tys.is_exit_code(ret) || p.tys.result_args(ret).is_some()
     });
     if let Some((m, _)) = term_main {
-        collect_types(&cty(&p.tys, p.fn_info(m).ret), &mut types);
+        let ret = p.fn_info(m).ret;
+        if record::on() {
+            read_type(&cty(&p.tys, ret));
+            if let Some((ok_t, err_t)) = p.tys.result_args(ret) {
+                read_type(&cty(&p.tys, ok_t));
+                read_type(&cty(&p.tys, err_t));
+            }
+        }
+        collect_types(&cty(&p.tys, ret), &mut types);
     }
     // With a frozen shared set, glue that is not shared is static in this unit: walk its deps
     // too, and stop at shared keys (their deps live in the glue unit). Shared keys still need
@@ -10528,6 +10550,7 @@ pub fn fn_unit_parts(
                 // declares the rest; dev C defines it all.
                 if names::release() {
                     let mut held = Vec::new();
+                    read_type(&k.1);
                     by_value_deps(&CTy::Ref(Box::new(k.1.clone())), &mut held);
                     types.extend(held);
                     collect_types(&k.1, &mut named);
@@ -10544,6 +10567,12 @@ pub fn fn_unit_parts(
                     }
                 }
             }
+        }
+    }
+    if record::on() {
+        seen.iter().for_each(|k| record::read(record::Read::Glue(k.0, k.1.clone())));
+        if main_slot.is_some_and(|m| slots.contains(&(m as usize))) {
+            record::read(record::Read::Main);
         }
     }
     // Only the statics this unit's code (and its local glue) names:
@@ -11015,6 +11044,341 @@ fn may_hold_float(p: &Program, t: &CTy, seen: &mut HashSet<CTy>) -> bool {
     }
 }
 
+/// A type's forward typedefs (`type_decls_with`): what lets other declarations name it
+/// before its definition.
+fn decl_forward(t: &CTy, out: &mut String) {
+    if let CTy::Adt(a) = t {
+        let _ = writeln!(out, "typedef struct {0} {0};", names::adt(*a));
+    }
+    // Every struct-typed C type too: a closure env holds references
+    // (`&(captures..)`, `&Result<..>`) that can sit in a type emitted
+    // before the referenced type's own definition.
+    if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) | CTy::ArrayIter(..) | CTy::OptIter(..) = t {
+        let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
+    }
+    match t {
+        CTy::Rc(e) => {
+            let _ = writeln!(out, "typedef struct RcI_{0} RcI_{0};", mangle(e));
+        }
+        CTy::RefCell(e) => {
+            let _ = writeln!(out, "typedef struct RCL_{0} RCL_{0};", mangle(e));
+        }
+        CTy::Sync(k, _) if k.is_cell_struct() => {
+            let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
+        }
+        _ => {}
+    }
+    if let CTy::Hash(k, _) = t
+        && hash::has_struct(*k)
+    {
+        let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
+    }
+}
+
+/// One type's own definition (its block form, for `block`), after its deps (`type_decls_with`).
+fn decl_own(p: &Program, t: &CTy, block: Option<Layout>, out: &mut String) {
+    if let (CTy::Adt(a), Some(l)) = (t, block) {
+        let an = names::adt(*a);
+        let _ = writeln!(out, "/* {} */", p.display_path(p.adt(*a).name));
+        let _ = writeln!(out, "struct {an} {{ _Alignas({}) uint8_t b[{}]; }};", l.align, l.size);
+        layout_assert(out, &an, &l);
+        return;
+    }
+    if let CTy::Hash(k, _) = t
+        && hash::has_struct(*k)
+    {
+        let _ = writeln!(out, "struct {} {{ {} }};", ctype(t), hash::struct_fields(t));
+        return;
+    }
+    match t {
+        CTy::Option(e) => match c_layout(p, t) {
+            Some(l) => emit_enum_decl(p, out, &format!("typedef struct {}", ctype(t)), t, &[vec![], vec![(**e).clone()]], &l),
+            None => {
+                let _ = writeln!(out, "typedef struct {0} {{ uint32_t tag; {1} v; }} {0};", ctype(t), ctype(e));
+            }
+        },
+        CTy::Result(a, b) => match c_layout(p, t) {
+            Some(l) => {
+                emit_enum_decl(p, out, &format!("typedef struct {}", ctype(t)), t, &[vec![(**a).clone()], vec![(**b).clone()]], &l)
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "typedef struct {0} {{ uint32_t tag; union {{ struct {{ {1} f0; }} v0; struct {{ {2} f0; }} v1; }} u; }} {0};",
+                    ctype(t),
+                    ctype(a),
+                    ctype(b)
+                );
+            }
+        },
+        CTy::Tuple(es) => match c_layout(p, t) {
+            Some(l) => {
+                let ct = ctype(t);
+                if es.is_empty() {
+                    let _ = writeln!(out, "typedef struct {ct} {{ }} {ct};");
+                } else {
+                    let fields: Vec<(String, Layout, u64)> = es
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (format!("{} f{i}", ctype(e)), field_layout(p, e), l.field_offsets[i]))
+                        .collect();
+                    let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
+                }
+                layout_assert(out, &ct, &l);
+            }
+            None => {
+                let fields: String = es.iter().enumerate().map(|(i, e)| format!("{} f{i}; ", ctype(e))).collect();
+                let fields = if fields.is_empty() { "uint8_t unused; ".to_string() } else { fields };
+                let _ = writeln!(out, "typedef struct {0} {{ {fields}}} {0};", ctype(t));
+            }
+        },
+        CTy::Array(e, n) => match c_layout(p, t) {
+            Some(l) => {
+                let ct = ctype(t);
+                // tcc and gcc refuse a C array longer than 2^31 - 1 even
+                // when its element is zero-sized (`[(); usize::MAX]`); such
+                // an array has size 0 either way, so it is declared `v[0]`.
+                let n = if l.size == 0 && *n > i32::MAX as u64 { 0 } else { *n };
+                let _ = writeln!(out, "typedef struct {ct} {{ {} v[{n}]; }} {ct};", ctype(e));
+                layout_assert(out, &ct, &l);
+            }
+            None => {
+                let _ = writeln!(out, "typedef struct {0} {{ {1} v[{2}]; }} {0};", ctype(t), ctype(e), (*n).max(1));
+            }
+        },
+        CTy::ArrayIter(e, n) => {
+            let at = CTy::Array(e.clone(), *n);
+            let ct = ctype(t);
+            match c_layout(p, t) {
+                Some(l) => {
+                    let es = [at.clone(), CTy::Int(IntTy::Usize), CTy::Int(IntTy::Usize)];
+                    let fields: Vec<(String, Layout, u64)> = es
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (format!("{} f{i}", ctype(e)), field_layout(p, e), l.field_offsets[i]))
+                        .collect();
+                    let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
+                    layout_assert(out, &ct, &l);
+                }
+                None => {
+                    let _ = writeln!(out, "typedef struct {ct} {{ {} f0; uint64_t f1; uint64_t f2; }} {ct};", ctype(&at));
+                }
+            }
+        },
+        CTy::OptIter(_, e) => {
+            let ot = CTy::Option(e.clone());
+            let ct = ctype(t);
+            match c_layout(p, t) {
+                Some(l) => {
+                    let fields = vec![(format!("{} f0", ctype(&ot)), field_layout(p, &ot), l.field_offsets[0])];
+                    let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
+                    layout_assert(out, &ct, &l);
+                }
+                None => {
+                    let _ = writeln!(out, "typedef struct {ct} {{ {} f0; }} {ct};", ctype(&ot));
+                }
+            }
+        }
+        CTy::Slice(e) => {
+            let _ = writeln!(out, "typedef struct {0} {{ {1}* ptr; uint64_t len; }} {0};", ctype(t), ctype(e));
+            if let Some(l) = c_layout(p, t) {
+                layout_assert(out, &ctype(t), &l);
+            }
+        }
+        CTy::Rc(e) => {
+            let _ = writeln!(out, "typedef struct RcI_{0} {{ uint64_t strong; uint64_t weak; {1} v; }} RcI_{0};", mangle(e), ctype(e));
+        }
+        CTy::RefCell(e) => {
+            let _ = writeln!(out, "typedef struct RCL_{0} {{ int64_t f0; {1} f1; }} RCL_{0};", mangle(e), ctype(e));
+        }
+        // `Mutex<T>`: the futex word, the poison flag, the value;
+        // `RwLock<T>` adds the waiter count (runtime/sync.c).
+        CTy::Sync(k, e) if k.is_cell_struct() => {
+            // A Mutex has no `wn`: its second word is `poison`.
+            let names: &[&str] = if *k == crate::ty::sync::SyncTy::Mutex { &["st", "poison"] } else { &["st", "wn", "poison"] };
+            let words: String = names.iter().zip(sync::cell_words(*k)).map(|(n, i)| format!("{} {n}; ", int_c(*i))).collect();
+            let _ = writeln!(out, "struct {0} {{ {words}{1} v; }};", ctype(t), ctype(e));
+        }
+        CTy::FnPtr(ps, r) => {
+            let ct = ctype(t);
+            let large = ret_by_out(p, r);
+            let mut params: Vec<String> = Vec::new();
+            if large {
+                params.push(format!("{}*", ctype(r)));
+            }
+            params.extend(ps.iter().filter(|t| !param_dropped(p, t)).map(|t| param_ctype(p, t)));
+            let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+            if large {
+                let _ = writeln!(out, "typedef void (*{ct})({params});");
+            } else {
+                let _ = writeln!(out, "typedef {} (*{ct})({params});", ctype(r));
+            }
+            if let Some(l) = c_layout(p, t) {
+                layout_assert(out, &ct, &l);
+            }
+        }
+        CTy::Adt(a) => {
+            let adt = p.adt(*a);
+            let an = names::adt(*a);
+            let _ = writeln!(out, "/* {} */", p.display_path(adt.name));
+            let packed = adt.repr.pack;
+            if let Some(n) = packed {
+                let _ = writeln!(out, "#pragma pack(push, {n})");
+            }
+            let layout = c_layout(p, t);
+            if adt.is_enum {
+                match layout {
+                    Some(l) => {
+                        let variants: Vec<Vec<CTy>> =
+                            adt.variants.iter().map(|v| v.fields.iter().map(|f| cty(&p.tys, f.ty)).collect()).collect();
+                        emit_enum_decl(p, out, &format!("struct {an}"), t, &variants, &l);
+                    }
+                    None => {
+                        let fields = |v: &Variant| -> String {
+                            v.fields.iter().enumerate().map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty)))).collect()
+                        };
+                        let _ = write!(out, "struct {an} {{ uint32_t tag; ");
+                        if adt.variants.iter().any(|v| !v.fields.is_empty()) {
+                            out.push_str("union { ");
+                            for (vi, v) in adt.variants.iter().enumerate() {
+                                if !v.fields.is_empty() {
+                                    let _ = write!(out, "struct {{ {}}} v{vi}; ", fields(v));
+                                }
+                            }
+                            out.push_str("} u; ");
+                        }
+                        out.push_str("};\n");
+                    }
+                }
+            } else {
+                match layout {
+                    Some(l) => {
+                        let v = &adt.variants[0];
+                        if v.fields.is_empty() && l.align > 1 {
+                            let _ = writeln!(out, "struct {an} {{ _Alignas({}) lust_Unit _z; }};", l.align);
+                        } else if v.fields.is_empty() {
+                            let _ = writeln!(out, "struct {an} {{ }};");
+                        } else {
+                            let fields: Vec<(String, Layout, u64)> = v
+                                .fields
+                                .iter()
+                                .enumerate()
+                                .map(|(i, f)| {
+                                    let ft = cty(&p.tys, f.ty);
+                                    (format!("{} f{i}", ctype(&ft)), field_layout(p, &ft), l.field_offsets[i])
+                                })
+                                .collect();
+                            let _ = writeln!(out, "struct {} {{ {}}};", an.clone(), layout_members(&fields, Some(l.size), l.align));
+                        }
+                        layout_assert(out, &an.clone(), &l);
+                    }
+                    None => {
+                        let f: String = adt.variants[0]
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty))))
+                            .collect();
+                        let f = if f.is_empty() { "uint8_t unused; ".to_string() } else { f };
+                        let _ = writeln!(out, "struct {an} {{ {f}}};");
+                    }
+                }
+            }
+            if packed.is_some() {
+                out.push_str("#pragma pack(pop)\n");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Records a read of type `t` with its release name (`record::Read::Type`), when a record is
+/// open.
+fn read_type(t: &CTy) {
+    if record::on() {
+        record::read(record::Read::Type(t.clone(), mangle(t)));
+    }
+}
+
+/// Each live static's declaration by its symbol (`read_fp`'s `statics`), made once a build.
+pub fn static_decl_map(p: &Program) -> HashMap<String, String> {
+    (0..p.statics.len()).filter(|&i| p.static_live(i)).map(|i| (static_sym(p, i as u32), static_decls_for(p, &HashSet::from([i])))).collect()
+}
+
+/// The fingerprint of what a recorded read of a release C fn unit saw (B1, `record::Read`),
+/// from this program, its fns' outputs and its glue set: an equal fingerprint means the read
+/// sees the same now. Call within the release names (`names::with`).
+pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String, String>, r: &record::Read) -> (u64, u64) {
+    use record::Read;
+    let h = |parts: &[&[u8]]| crate::driver::cache::hash128(parts, 11);
+    // A read of the last build can name an Adt id this program no longer has, or has for
+    // another Adt: changed, before anything lays it out.
+    let known = |t: &CTy| {
+        let d = format!("{t:?}");
+        d.split("AdtId(").skip(1).all(|rest| {
+            rest.split(')').next().and_then(|n| n.parse::<usize>().ok()).is_some_and(|n| {
+                n < p.adts.len() && (p.adts[n].is_enum || !p.adts[n].variants.is_empty())
+            })
+        })
+    };
+    match r {
+        Read::Type(t, _) | Read::Glue(_, t) if !known(t) => return (u64::MAX, u64::MAX),
+        Read::Type(t, name) if mangle(t) != *name => return (u64::MAX, u64::MAX),
+        _ => {}
+    }
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v.join("\n")
+    };
+    match r {
+        Read::Fn(s) => match fns.get(*s) {
+            None => (0, 1),
+            Some(f) => {
+                let types = sorted(f.types.iter().map(mangle).collect());
+                let named = sorted(f.named.iter().map(mangle).collect());
+                let glue = sorted(f.glue.iter().map(|(k, t)| format!("{k:?} {}", mangle(t))).collect());
+                let externs: Vec<&str> = f.externs.iter().map(String::as_str).collect();
+                let tag = names::fn_tag_opt(*s as u32).unwrap_or_default();
+                let flags = format!("{:?} {}", f.inline, f.error.is_some());
+                h(&[f.code.as_bytes(), externs.join("\n").as_bytes(), types.as_bytes(), named.as_bytes(), glue.as_bytes(), f.ll.as_bytes(), f.ll_c.as_bytes(), flags.as_bytes(), tag.as_bytes()])
+            }
+        },
+        Read::SlotOf(id) => h(&[format!("{:?}", names::slot_of_id(id)).as_bytes()]),
+        Read::Glue(k, t) => {
+            let key = (*k, t.clone());
+            let deps = g.deps.get(&key).map(|d| d.iter().map(|(a, b)| format!("{a:?} {}", mangle(b))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            let externs = g.externs.get(&key).map(|e| e.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            let types = g.types.get(&key).map(|v| v.iter().map(mangle).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            let none = b"-".as_slice();
+            h(&[
+                g.protos.get(&key).map_or(none, |s| s.as_bytes()),
+                g.def_map.get(&key).map_or(none, |s| s.as_bytes()),
+                deps.as_bytes(),
+                externs.as_bytes(),
+                types.as_bytes(),
+                &[g.is_shared(&key) as u8],
+            ])
+        }
+        Read::Type(t, _) => {
+            let (mut fwd, mut full, mut blk) = (String::new(), String::new(), String::new());
+            decl_forward(t, &mut fwd);
+            decl_own(p, t, None, &mut full);
+            if let (CTy::Adt(_), Some(l)) = (t, nested_block(p, t)) {
+                decl_own(p, t, Some(l), &mut blk);
+            }
+            let deps: Vec<String> = def_deps(p, t).iter().map(mangle).collect();
+            let fields = sorted(field_types(p, t).iter().map(mangle).collect());
+            let elem = if let CTy::Hash(..) = t { mangle(&hash::elem_cty(t)) } else { String::new() };
+            h(&[mangle(t).as_bytes(), fwd.as_bytes(), full.as_bytes(), blk.as_bytes(), deps.join(" ").as_bytes(), fields.as_bytes(), elem.as_bytes()])
+        }
+        Read::Static(sym) => h(&[statics.get(sym).map_or(b"-".as_slice(), |d| d.as_bytes())]),
+        Read::Main => {
+            let ret = p.main.map(|m| mangle(&cty(&p.tys, p.fn_info(m).ret))).unwrap_or_default();
+            h(&[format!("{} {} {}", p.main.is_some(), p.unwind, p.unwind_tables).as_bytes(), ret.as_bytes()])
+        }
+    }
+}
+
 /// `type_decls`, plus forward declarations of `named` (release C: types the code only
 /// points at). `deep` (with `ByValue`): roots defined one step deep as `OneStep` does,
 /// for inline glue in a release C fn unit, which reads through pointers as a shard does. With `by_value` (release C fn units), define only what the roots hold by
@@ -11026,10 +11390,15 @@ fn may_hold_float(p: &Program, t: &CTy, seen: &mut HashSet<CTy>) -> bool {
 fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &HashSet<CTy>, decls: Decls, deep: &HashSet<CTy>) {
     // With `open` (`blocks`), an Adt that `open` does not hold and `nested_block`
     // allows goes to `blocks`, and its fields are not walked.
+    // B1 (`record`): every type whose facts a walk below reads is a read of the unit.
+    let rec = record::on();
     let by_value = |roots: Vec<CTy>, open: Option<&HashSet<CTy>>, blocks: &mut HashSet<CTy>| {
         let mut defined = HashSet::new();
         let mut stack = roots;
         while let Some(t) = stack.pop() {
+            if rec {
+                read_type(&t);
+            }
             if open.is_some_and(|o| !o.contains(&t)) && nested_block(p, &t).is_some() {
                 blocks.insert(t);
             } else if defined.insert(t.clone()) {
@@ -11050,6 +11419,9 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
     // A glue definition reads the fields of its own types (`open`), and only addresses or
     // sizes the types they hold.
     let one_step = |roots: &HashSet<CTy>, open: Option<&HashSet<CTy>>, blocks: &mut HashSet<CTy>| {
+        if rec {
+            roots.iter().for_each(read_type);
+        }
         let step: Vec<CTy> = roots.iter().flat_map(|t| field_types(p, t)).chain(roots.iter().cloned()).collect();
         by_value(step, open, blocks)
     };
@@ -11079,6 +11451,9 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         if !wanted.insert(t.clone()) {
             continue;
         }
+        if rec {
+            read_type(&t);
+        }
         if defined.as_ref().is_some_and(|d| !d.contains(&t)) || blocks.contains(&t) {
             continue;
         }
@@ -11087,7 +11462,6 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
     // The hash core's declarations, only in units that name a hash type
     // (see `runtime_source`).
     // B1 (`record`): each type's typedefs and definition are one piece of a recorded unit.
-    let rec = record::on();
     if wanted.iter().any(|t| matches!(t, CTy::Hash(..))) {
         let m = out.len();
         out.push_str(&hash_decls());
@@ -11097,32 +11471,7 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
     list.sort_by_cached_key(mangle);
     for t in &list {
         let m = out.len();
-        if let CTy::Adt(a) = t {
-            let _ = writeln!(out, "typedef struct {0} {0};", names::adt(*a));
-        }
-        // Every struct-typed C type too: a closure env holds references
-        // (`&(captures..)`, `&Result<..>`) that can sit in a type emitted
-        // before the referenced type's own definition.
-        if let CTy::Tuple(_) | CTy::Option(_) | CTy::Result(..) | CTy::Array(..) | CTy::Slice(_) | CTy::ArrayIter(..) | CTy::OptIter(..) = t {
-            let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
-        }
-        match t {
-            CTy::Rc(e) => {
-                let _ = writeln!(out, "typedef struct RcI_{0} RcI_{0};", mangle(e));
-            }
-            CTy::RefCell(e) => {
-                let _ = writeln!(out, "typedef struct RCL_{0} RCL_{0};", mangle(e));
-            }
-            CTy::Sync(k, _) if k.is_cell_struct() => {
-                let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
-            }
-            _ => {}
-        }
-        if let CTy::Hash(k, _) = t
-            && hash::has_struct(*k)
-        {
-            let _ = writeln!(out, "typedef struct {0} {0};", ctype(t));
-        }
+        decl_forward(t, out);
         if rec && out.len() > m {
             record::piece(record::Kind::TypeDecl, record::key(&format!("fwd {}", mangle(t))), &out[m..]);
         }
@@ -11139,225 +11488,9 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
             }
         }
         let m = out.len();
-        emit_own(p, t, block, out);
+        decl_own(p, t, block, out);
         if rec {
             record::piece(record::Kind::TypeDecl, record::key(&mangle(t)), &out[m..]);
-        }
-    }
-    // One type's own definition (its block form, for `block`), after its deps.
-    fn emit_own(p: &Program, t: &CTy, block: Option<Layout>, out: &mut String) {
-        if let (CTy::Adt(a), Some(l)) = (t, block) {
-            let an = names::adt(*a);
-            let _ = writeln!(out, "/* {} */", p.display_path(p.adt(*a).name));
-            let _ = writeln!(out, "struct {an} {{ _Alignas({}) uint8_t b[{}]; }};", l.align, l.size);
-            layout_assert(out, &an, &l);
-            return;
-        }
-        if let CTy::Hash(k, _) = t
-            && hash::has_struct(*k)
-        {
-            let _ = writeln!(out, "struct {} {{ {} }};", ctype(t), hash::struct_fields(t));
-            return;
-        }
-        match t {
-            CTy::Option(e) => match c_layout(p, t) {
-                Some(l) => emit_enum_decl(p, out, &format!("typedef struct {}", ctype(t)), t, &[vec![], vec![(**e).clone()]], &l),
-                None => {
-                    let _ = writeln!(out, "typedef struct {0} {{ uint32_t tag; {1} v; }} {0};", ctype(t), ctype(e));
-                }
-            },
-            CTy::Result(a, b) => match c_layout(p, t) {
-                Some(l) => {
-                    emit_enum_decl(p, out, &format!("typedef struct {}", ctype(t)), t, &[vec![(**a).clone()], vec![(**b).clone()]], &l)
-                }
-                None => {
-                    let _ = writeln!(
-                        out,
-                        "typedef struct {0} {{ uint32_t tag; union {{ struct {{ {1} f0; }} v0; struct {{ {2} f0; }} v1; }} u; }} {0};",
-                        ctype(t),
-                        ctype(a),
-                        ctype(b)
-                    );
-                }
-            },
-            CTy::Tuple(es) => match c_layout(p, t) {
-                Some(l) => {
-                    let ct = ctype(t);
-                    if es.is_empty() {
-                        let _ = writeln!(out, "typedef struct {ct} {{ }} {ct};");
-                    } else {
-                        let fields: Vec<(String, Layout, u64)> = es
-                            .iter()
-                            .enumerate()
-                            .map(|(i, e)| (format!("{} f{i}", ctype(e)), field_layout(p, e), l.field_offsets[i]))
-                            .collect();
-                        let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
-                    }
-                    layout_assert(out, &ct, &l);
-                }
-                None => {
-                    let fields: String = es.iter().enumerate().map(|(i, e)| format!("{} f{i}; ", ctype(e))).collect();
-                    let fields = if fields.is_empty() { "uint8_t unused; ".to_string() } else { fields };
-                    let _ = writeln!(out, "typedef struct {0} {{ {fields}}} {0};", ctype(t));
-                }
-            },
-            CTy::Array(e, n) => match c_layout(p, t) {
-                Some(l) => {
-                    let ct = ctype(t);
-                    // tcc and gcc refuse a C array longer than 2^31 - 1 even
-                    // when its element is zero-sized (`[(); usize::MAX]`); such
-                    // an array has size 0 either way, so it is declared `v[0]`.
-                    let n = if l.size == 0 && *n > i32::MAX as u64 { 0 } else { *n };
-                    let _ = writeln!(out, "typedef struct {ct} {{ {} v[{n}]; }} {ct};", ctype(e));
-                    layout_assert(out, &ct, &l);
-                }
-                None => {
-                    let _ = writeln!(out, "typedef struct {0} {{ {1} v[{2}]; }} {0};", ctype(t), ctype(e), (*n).max(1));
-                }
-            },
-            CTy::ArrayIter(e, n) => {
-                let at = CTy::Array(e.clone(), *n);
-                let ct = ctype(t);
-                match c_layout(p, t) {
-                    Some(l) => {
-                        let es = [at.clone(), CTy::Int(IntTy::Usize), CTy::Int(IntTy::Usize)];
-                        let fields: Vec<(String, Layout, u64)> = es
-                            .iter()
-                            .enumerate()
-                            .map(|(i, e)| (format!("{} f{i}", ctype(e)), field_layout(p, e), l.field_offsets[i]))
-                            .collect();
-                        let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
-                        layout_assert(out, &ct, &l);
-                    }
-                    None => {
-                        let _ = writeln!(out, "typedef struct {ct} {{ {} f0; uint64_t f1; uint64_t f2; }} {ct};", ctype(&at));
-                    }
-                }
-            },
-            CTy::OptIter(_, e) => {
-                let ot = CTy::Option(e.clone());
-                let ct = ctype(t);
-                match c_layout(p, t) {
-                    Some(l) => {
-                        let fields = vec![(format!("{} f0", ctype(&ot)), field_layout(p, &ot), l.field_offsets[0])];
-                        let _ = writeln!(out, "typedef struct {ct} {{ {}}} {ct};", layout_members(&fields, Some(l.size), l.align));
-                        layout_assert(out, &ct, &l);
-                    }
-                    None => {
-                        let _ = writeln!(out, "typedef struct {ct} {{ {} f0; }} {ct};", ctype(&ot));
-                    }
-                }
-            }
-            CTy::Slice(e) => {
-                let _ = writeln!(out, "typedef struct {0} {{ {1}* ptr; uint64_t len; }} {0};", ctype(t), ctype(e));
-                if let Some(l) = c_layout(p, t) {
-                    layout_assert(out, &ctype(t), &l);
-                }
-            }
-            CTy::Rc(e) => {
-                let _ = writeln!(out, "typedef struct RcI_{0} {{ uint64_t strong; uint64_t weak; {1} v; }} RcI_{0};", mangle(e), ctype(e));
-            }
-            CTy::RefCell(e) => {
-                let _ = writeln!(out, "typedef struct RCL_{0} {{ int64_t f0; {1} f1; }} RCL_{0};", mangle(e), ctype(e));
-            }
-            // `Mutex<T>`: the futex word, the poison flag, the value;
-            // `RwLock<T>` adds the waiter count (runtime/sync.c).
-            CTy::Sync(k, e) if k.is_cell_struct() => {
-                // A Mutex has no `wn`: its second word is `poison`.
-                let names: &[&str] = if *k == crate::ty::sync::SyncTy::Mutex { &["st", "poison"] } else { &["st", "wn", "poison"] };
-                let words: String = names.iter().zip(sync::cell_words(*k)).map(|(n, i)| format!("{} {n}; ", int_c(*i))).collect();
-                let _ = writeln!(out, "struct {0} {{ {words}{1} v; }};", ctype(t), ctype(e));
-            }
-            CTy::FnPtr(ps, r) => {
-                let ct = ctype(t);
-                let large = ret_by_out(p, r);
-                let mut params: Vec<String> = Vec::new();
-                if large {
-                    params.push(format!("{}*", ctype(r)));
-                }
-                params.extend(ps.iter().filter(|t| !param_dropped(p, t)).map(|t| param_ctype(p, t)));
-                let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-                if large {
-                    let _ = writeln!(out, "typedef void (*{ct})({params});");
-                } else {
-                    let _ = writeln!(out, "typedef {} (*{ct})({params});", ctype(r));
-                }
-                if let Some(l) = c_layout(p, t) {
-                    layout_assert(out, &ct, &l);
-                }
-            }
-            CTy::Adt(a) => {
-                let adt = p.adt(*a);
-                let an = names::adt(*a);
-                let _ = writeln!(out, "/* {} */", p.display_path(adt.name));
-                let packed = adt.repr.pack;
-                if let Some(n) = packed {
-                    let _ = writeln!(out, "#pragma pack(push, {n})");
-                }
-                let layout = c_layout(p, t);
-                if adt.is_enum {
-                    match layout {
-                        Some(l) => {
-                            let variants: Vec<Vec<CTy>> =
-                                adt.variants.iter().map(|v| v.fields.iter().map(|f| cty(&p.tys, f.ty)).collect()).collect();
-                            emit_enum_decl(p, out, &format!("struct {an}"), t, &variants, &l);
-                        }
-                        None => {
-                            let fields = |v: &Variant| -> String {
-                                v.fields.iter().enumerate().map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty)))).collect()
-                            };
-                            let _ = write!(out, "struct {an} {{ uint32_t tag; ");
-                            if adt.variants.iter().any(|v| !v.fields.is_empty()) {
-                                out.push_str("union { ");
-                                for (vi, v) in adt.variants.iter().enumerate() {
-                                    if !v.fields.is_empty() {
-                                        let _ = write!(out, "struct {{ {}}} v{vi}; ", fields(v));
-                                    }
-                                }
-                                out.push_str("} u; ");
-                            }
-                            out.push_str("};\n");
-                        }
-                    }
-                } else {
-                    match layout {
-                        Some(l) => {
-                            let v = &adt.variants[0];
-                            if v.fields.is_empty() && l.align > 1 {
-                                let _ = writeln!(out, "struct {an} {{ _Alignas({}) lust_Unit _z; }};", l.align);
-                            } else if v.fields.is_empty() {
-                                let _ = writeln!(out, "struct {an} {{ }};");
-                            } else {
-                                let fields: Vec<(String, Layout, u64)> = v
-                                    .fields
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, f)| {
-                                        let ft = cty(&p.tys, f.ty);
-                                        (format!("{} f{i}", ctype(&ft)), field_layout(p, &ft), l.field_offsets[i])
-                                    })
-                                    .collect();
-                                let _ = writeln!(out, "struct {} {{ {}}};", an.clone(), layout_members(&fields, Some(l.size), l.align));
-                            }
-                            layout_assert(out, &an.clone(), &l);
-                        }
-                        None => {
-                            let f: String = adt.variants[0]
-                                .fields
-                                .iter()
-                                .enumerate()
-                                .map(|(i, f)| format!("{} f{i}; ", ctype(&cty(&p.tys, f.ty))))
-                                .collect();
-                            let f = if f.is_empty() { "uint8_t unused; ".to_string() } else { f };
-                            let _ = writeln!(out, "struct {an} {{ {f}}};");
-                        }
-                    }
-                }
-                if packed.is_some() {
-                    out.push_str("#pragma pack(pop)\n");
-                }
-            }
-            _ => {}
         }
     }
     let mut emitted = HashSet::new();

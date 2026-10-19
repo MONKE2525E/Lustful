@@ -311,9 +311,9 @@ pub(crate) struct Caches {
     /// the build that compiles the unit starts, so an edit consumed
     /// by a check request still rebuilds the unit in the next build.
     pub(crate) loc_fp: u64,
-    /// B1 (`cgen::record`, LUST_B1_OBSERVE=1): the pieces each release C fn unit was made
-    /// of in the last build, by registration name.
-    pub(crate) unit_records: crate::intern::FxMap<String, Vec<crate::cgen::record::Piece>>,
+    /// B1 (`cgen::record`, LUST_B1_OBSERVE=1): what each release C fn unit was made of and
+    /// read in the last build, by registration name.
+    pub(crate) unit_records: crate::intern::FxMap<String, crate::cgen::record::UnitRecord>,
     /// `release_c::codegen_key` of the last build: a build under another key makes
     /// every slot's C again (release C and classic C share the slot cache).
     pub(crate) codegen_key: u64,
