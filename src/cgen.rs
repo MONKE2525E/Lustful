@@ -5628,6 +5628,10 @@ impl FnGen<'_, '_> {
         for (i, t) in ps.iter().enumerate() {
             if param_dropped(p, t) {
                 let _ = write!(inits, "  {} l{} = {};", ctype(t), i + 1, zero_lit(p, t));
+            } else if param_by_ptr(p, t) {
+                // The fn pointer type passes it by pointer (`param_ctype`): copy it in.
+                decls.push(format!("{} p{}", param_ctype(p, t), i + 1));
+                let _ = write!(inits, "  {} l{} = *p{};", ctype(t), i + 1, i + 1);
             } else {
                 decls.push(format!("{} l{}", ctype(t), i + 1));
             }

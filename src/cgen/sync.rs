@@ -1366,16 +1366,21 @@ impl FnGen<'_, '_> {
                 self.note_held(r);
                 // A zero-sized parameter is not in the entry's C
                 // signature (`param_dropped`), so its argument is not
-                // passed either.
-                let mut tys = vec!["void *".to_string()];
-                let mut pre = String::new();
+                // passed either. One the entry takes by pointer
+                // (`param_by_ptr`) gets the address of a fresh copy.
+                let mut kept: Vec<CTy> = Vec::new();
+                let mut vals: Vec<String> = Vec::new();
                 for (t, a) in params.iter().zip(args) {
                     self.note_held(t);
                     if !param_dropped(self.p, t) {
-                        tys.push(ctype(t));
-                        let _ = write!(pre, ", {a}");
+                        kept.push(t.clone());
+                        vals.push(a.clone());
                     }
                 }
+                self.spill_by_ptr(out, &kept, &mut vals);
+                let mut tys = vec!["void *".to_string()];
+                tys.extend(kept.iter().map(|t| param_ctype(self.p, t)));
+                let pre: String = vals.iter().map(|a| format!(", {a}")).collect();
                 let (v, rt, k, tys) = (self.tmp(), ctype(r), crate::check::object::VT_HEADER, tys.join(", "));
                 if ret_by_out(self.p, r) {
                     let _ = writeln!(out, "  {rt} {v}; ((void (*)({rt} *, {tys}))({env}.vt[{k}]))(&{v}, {env}.data{pre});");
