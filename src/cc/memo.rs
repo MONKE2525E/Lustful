@@ -1,7 +1,7 @@
 // The unit memo (plan item A, approved 07:57): what `cc::build` needs of a unit whose text
 // it is not given. A persistent session (a daemon or a front image) fingerprints each
 // release unit's inputs (`UnitIn::fp`) and passes no text for a unit whose fingerprint is
-// the one the last build made under that name; the memo maps that fingerprint to the
+// one the last build made (under any unit name: names are positions); the memo maps it to the
 // unit's key (the exact text key: compiler, flags, target, profile part and text, so the
 // object cache stays exact), so the session neither assembles nor hashes the unit.
 //
@@ -16,7 +16,7 @@ use std::path::Path;
 
 /// A unit for `cc::build`: its name, its text, and the session's fingerprint of its inputs.
 /// Without a fingerprint the unit is not memoized; without text, its fingerprint must be in
-/// the memo under this name, with its object in the cache (else `CcError::NeedText`).
+/// the memo, with its object in the cache (else `CcError::NeedText`).
 pub struct UnitIn {
     pub name: String,
     pub fp: Option<u128>,

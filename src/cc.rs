@@ -519,11 +519,18 @@ fn memo_tag(spec: &CcSpec, debug: bool) -> String {
     format!("memo-v1 {a:016x}{b:016x}")
 }
 
+/// The memo entry of a unit's fingerprint (`memo_state` and `build` both ask it). It serves
+/// the fingerprint under any unit name: release unit names are positions, and a unit inserted
+/// before others renames them all.
+fn memo_entry<'a>(memo: &'a std::collections::HashMap<u128, memo::Entry>, u: &UnitIn) -> Option<&'a memo::Entry> {
+    u.fp.and_then(|fp| memo.get(&fp))
+}
+
 /// The memo state of a build (`build`, `memo_misses`): the memo's tag when the units carry
 /// fingerprints, its entries, and the names of the units passed without text that `build`
-/// cannot take, sorted: no memo entry with that name, or its object left the cache (an LLVM
-/// unit's three parts come with text or without as one). Reads the memo file and stats the
-/// cache's objects only.
+/// cannot take, sorted: no memo entry for its fingerprint (`memo_entry`), or its object left
+/// the cache (an LLVM unit's three parts come with text or without as one). Reads the memo
+/// file and stats the cache's objects only.
 fn memo_state(
     units: &[UnitIn],
     spec: &CcSpec,
@@ -537,7 +544,7 @@ fn memo_state(
     let instrumented = std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1");
     let tag = (units.iter().any(|u| u.fp.is_some()) && rt_max == 0 && !instrumented).then(|| memo_tag(spec, debug));
     let memo = tag.as_deref().map(|t| memo::load(work, t)).unwrap_or_default();
-    let entry_of = |u: &UnitIn| u.fp.and_then(|fp| memo.get(&fp)).filter(|e| e.name == u.name);
+    let entry_of = |u: &UnitIn| memo_entry(&memo, u);
     // A unit without text: its memo entry, with the object in the cache. An LLVM unit's
     // parts come as one (its key covers the three texts): with text, or all without.
     let mut parts: std::collections::HashMap<&str, Vec<&UnitIn>> = std::collections::HashMap::new();
@@ -585,7 +592,7 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
     if !need.is_empty() {
         return Err(CcError::NeedText(need));
     }
-    let entry_of = |u: &UnitIn| u.fp.and_then(|fp| memo.get(&fp)).filter(|e| e.name == u.name);
+    let entry_of = |u: &UnitIn| memo_entry(&memo, u);
     // The LLVM backend (cgen/ll.rs): a unit `u<N>.ll` is the LLVM IR of the C unit `u<N>`, and
     // `u<N>.hc` the C of its helpers; the three compile as one module into `u<N>.o`
     // (`compile_pair`) and key on all three texts. For PGO such a unit is `<name>.ll`: the
@@ -618,7 +625,10 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
     let names: Vec<String> = crate::pool::par_map(&idx, |&i| {
         let name = &units[i].name;
         match entries[i] {
-            Some(e) => e.file.rsplit_once('.').map_or(e.file.clone(), |(stem, _)| stem.to_string()),
+            // A PGO name is its text's (`pgo::stable_name`); else the unit's name now: its
+            // object goes there, whatever name the entry had in the last build.
+            Some(e) if pgo_on => e.file.rsplit_once('.').map_or(e.file.clone(), |(stem, _)| stem.to_string()),
+            Some(_) => name.clone(),
             None if pgo_on && !is_cxx(name) => pgo::stable_name(ll_texts[i].as_deref().unwrap_or(text(i))).unwrap_or_else(|| name.clone()),
             None => name.clone(),
         }
@@ -736,10 +746,10 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
             if pre[i].is_some() || is_cxx(&units[i].name) || text(i).contains("#include <") {
                 continue;
             }
-            if check && let Some(old) = memo.get(&fp).filter(|e| e.name == units[i].name && &e.key != key) {
+            if check && let Some(old) = memo.get(&fp).filter(|e| &e.key != key) {
                 panic!("LUST_CHECK_UNIT_FP: unit {} has the input fingerprint {fp:032x} of the last build, whose text had key {}; its text now has key {key}", units[i].name, old.key);
             }
-            let entry = entries[i].cloned().unwrap_or_else(|| memo::Entry {
+            let entry = entries[i].map(|e| memo::Entry { name: units[i].name.clone(), file: pfile(i), ..e.clone() }).unwrap_or_else(|| memo::Entry {
                 name: units[i].name.clone(),
                 key: key.clone(),
                 file: pfile(i),
@@ -954,6 +964,28 @@ mod tests {
             Err(CcError::NeedText(n)) => assert_eq!(n, ["u0", "u1"], "a memo entry whose object left the cache needs its text"),
             r => panic!("{r:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fingerprint finds its object under another unit name: release unit names are
+    /// positions, and a unit inserted before others renames them.
+    #[test]
+    fn a_fingerprint_finds_its_object_under_a_new_name() {
+        use super::UnitIn;
+        let Ok(spec) = super::spec_for(crate::protocol::host_triple()) else { return };
+        let root = std::env::temp_dir().join(format!("lust-cc-rename-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = crate::driver::cache::Cache::at(&root.join("cache"));
+        let (work, bin) = (root.join("work"), root.join("bin"));
+        let unit = |name: &str, fp: u128, text: Option<&str>| UnitIn { name: name.into(), fp: Some(fp), text: text.map(str::to_string) };
+        let main = "int f(void);\nint main(void) {\n  return f();\n}\n";
+        let f = "int f(void) {\n  return 3;\n}\n";
+        super::build(&[unit("u0", 1, Some(main)), unit("u1", 7, Some(f))], &spec, &bin, false, Some(&cache), &work).unwrap();
+        let moved = [unit("u0", 1, Some(main)), unit("u1", 9, Some("int h(void) {\n  return 0;\n}\n")), unit("u2", 7, None)];
+        assert!(super::memo_misses(&moved, &spec, false, Some(&cache), &work).is_empty());
+        let r = super::build(&moved, &spec, &bin, false, Some(&cache), &work).unwrap();
+        assert!(r.contains("3 units (2 from cache"), "u2 takes u1's object: {r}");
+        assert_eq!(std::process::Command::new(&bin).status().ok().and_then(|s| s.code()), Some(3));
         let _ = std::fs::remove_dir_all(&root);
     }
 
