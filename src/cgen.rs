@@ -9158,7 +9158,13 @@ impl GlueSet {
             let mut types = Vec::new();
             let rec = Slots::new(slots);
             glue_def(p, &rec, &g.0, &g.1, &mut proto, &mut def, &mut more, &mut types);
-            let (used, externs) = rec.into_used();
+            // The set keeps every entry (the front image saves it): no growth slack.
+            proto.shrink_to_fit();
+            def.shrink_to_fit();
+            more.shrink_to_fit();
+            types.shrink_to_fit();
+            let (mut used, externs) = rec.into_used();
+            used.shrink_to_fit();
             self.used.insert(g.clone(), used);
             self.externs.insert(g.clone(), externs);
             let changed = is_new
