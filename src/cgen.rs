@@ -11389,6 +11389,14 @@ fn read_type(t: &CTy) {
     }
 }
 
+/// Records a read of type `t`'s forward typedef only (`record::Read::TypeFwd`), when a
+/// record is open.
+fn read_type_fwd(t: &CTy) {
+    if record::on() {
+        record::read(record::Read::TypeFwd(t.clone(), mangle(t)));
+    }
+}
+
 /// What every release C fn unit's text reads besides its `record::Read`s (B1): the unwind
 /// tables switch (the noreturn prototypes), whether the glue set is frozen (static glue), and
 /// release names. The fixed texts and limits are the compiler's own (its build hash), the
@@ -11420,8 +11428,8 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
         })
     };
     match r {
-        Read::Type(t, _) | Read::Glue(_, t) if !known(t) => return (u64::MAX, u64::MAX),
-        Read::Type(t, name) if mangle(t) != *name => return (u64::MAX, u64::MAX),
+        Read::Type(t, _) | Read::TypeFwd(t, _) | Read::Glue(_, t) if !known(t) => return (u64::MAX, u64::MAX),
+        Read::Type(t, name) | Read::TypeFwd(t, name) if mangle(t) != *name => return (u64::MAX, u64::MAX),
         _ => {}
     }
     let sorted = |mut v: Vec<String>| {
@@ -11470,6 +11478,11 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
             let fields = sorted(field_types(p, t).iter().map(mangle).collect());
             let elem = if let CTy::Hash(..) = t { mangle(&hash::elem_cty(t)) } else { String::new() };
             h(&[mangle(t).as_bytes(), fwd.as_bytes(), full.as_bytes(), blk.as_bytes(), deps.join(" ").as_bytes(), fields.as_bytes(), elem.as_bytes()])
+        }
+        Read::TypeFwd(t, _) => {
+            let mut fwd = String::new();
+            decl_forward(t, &mut fwd);
+            h(&[mangle(t).as_bytes(), fwd.as_bytes()])
         }
         Read::Static(sym) => h(&[statics.get(sym).map_or(b"-".as_slice(), |d| d.as_bytes())]),
         Read::Main => {
@@ -11551,10 +11564,13 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
         if !wanted.insert(t.clone()) {
             continue;
         }
+        // A type no walk defines gets its forward typedef only, and that is all the unit
+        // reads of it (the walks above read every type they define).
+        let fwd_only = defined.as_ref().is_some_and(|d| !d.contains(&t));
         if rec {
-            read_type(&t);
+            if fwd_only { read_type_fwd(&t) } else { read_type(&t) }
         }
-        if defined.as_ref().is_some_and(|d| !d.contains(&t)) || blocks.contains(&t) {
+        if fwd_only || blocks.contains(&t) {
             continue;
         }
         stack.extend(field_types(p, &t));

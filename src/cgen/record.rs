@@ -64,6 +64,9 @@ pub enum Read {
     /// What a type's declarations print and the types they reach, with the type's release
     /// name when it was read (an Adt id can name another Adt in a later build).
     Type(super::CTy, String),
+    /// Only a type's forward typedef, for a unit that names the type but defines it nowhere
+    /// (it points at it): its release name and that one line, not its definition.
+    TypeFwd(super::CTy, String),
     /// The static a `lust_static_*` symbol of the unit's text names, by symbol.
     Static(String),
     /// The main fn and its return type.
