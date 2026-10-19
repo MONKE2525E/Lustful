@@ -860,27 +860,63 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
     // Bytes read, unpacked, placed; then the nanoseconds spent on each.
     let stats: [AtomicU64; 6] = Default::default();
     let threads = workers().min(jobs.len().max(1));
+    // Readers keep reads in flight while the workers unpack and place: a
+    // worker that read its own sections left its CPU idle while it waited
+    // (CI, merge 12's chain: restore 1302-1415 -> 1238-1291 ms).
+    let readers = (threads / 2).clamp(1, jobs.len().max(1));
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(64);
+    let rx = std::sync::Mutex::new(rx);
+    // The packed bytes of job `i`, or None on a read error.
+    let read_job = |i: usize| -> Option<Vec<u8>> {
+        let (k, sec) = jobs[i];
+        let (off, clen, _) = chain[k].packed.as_ref()?.1[sec];
+        let mut cbuf = vec![0u8; clen as usize];
+        read_full_at(&files[k], &mut cbuf, off).then_some(cbuf)
+    };
     std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                let mut cbuf: Vec<u8> = Vec::new();
-                let mut rbuf = vec![0u8; UNPACKED_MAX];
-                let mut mine = [0u64; 6];
+        for _ in 0..readers {
+            let tx = tx.clone();
+            let (next, failed, stats, read_job, jobs) = (&next, &failed, &stats, &read_job, &jobs);
+            s.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= jobs.len() || failed.load(Ordering::Relaxed) {
                         break;
                     }
-                    let (k, sec) = jobs[i];
-                    let Some((raw_len, sections)) = &chain[k].packed else {
+                    let t0 = std::time::Instant::now();
+                    let Some(cbuf) = read_job(i) else {
                         failed.store(true, Ordering::Relaxed);
                         break;
                     };
-                    let (off, clen, check) = sections[sec];
+                    stats[3].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    if tx.send((i, cbuf)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut rbuf = vec![0u8; UNPACKED_MAX];
+                let mut mine = [0u64; 6];
+                loop {
+                    let got = rx.lock().unwrap_or_else(|e| e.into_inner()).recv().ok();
+                    let Some((i, cbuf)) = got else { break };
+                    // After a failure the workers drain the channel: the
+                    // readers stop at their next section, and a reader
+                    // blocked on a full channel must not wait forever.
+                    if failed.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let (k, sec) = jobs[i];
+                    let Some((raw_len, sections)) = &chain[k].packed else {
+                        failed.store(true, Ordering::Relaxed);
+                        continue;
+                    };
+                    let (_, clen, check) = sections[sec];
                     let rlen = (*raw_len as usize).saturating_sub(sec * SECTION).min(SECTION);
-                    cbuf.resize(clen as usize, 0);
-                    let t0 = std::time::Instant::now();
-                    let ok = read_full_at(&files[k], &mut cbuf, off) && section_check(&cbuf) == check && parts[k][sec].iter().all(|&(_, at, n)| at % PAGE == 0 && n % PAGE == 0 && at + n <= rlen);
+                    let ok = section_check(&cbuf) == check && parts[k][sec].iter().all(|&(_, at, n)| at % PAGE == 0 && n % PAGE == 0 && at + n <= rlen);
                     let t1 = std::time::Instant::now();
                     let mut runs = None;
                     if ok {
@@ -891,7 +927,7 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
                     }
                     let Some(runs) = runs else {
                         failed.store(true, Ordering::Relaxed);
-                        break;
+                        continue;
                     };
                     let t2 = std::time::Instant::now();
                     // Each part takes the runs it overlaps: the section's
@@ -920,7 +956,6 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
                     }
                     let t3 = std::time::Instant::now();
                     mine[0] += clen;
-                    mine[3] += (t1 - t0).as_nanos() as u64;
                     mine[4] += (t2 - t1).as_nanos() as u64;
                     mine[5] += (t3 - t2).as_nanos() as u64;
                     if k > 0 {
@@ -941,7 +976,7 @@ fn fill(dir: &Path, chain: &[Header], src: &[(usize, usize, usize, u64)], runs: 
     let [read, unpacked, placed, t_read, t_unpack, t_place] = stats.map(|a| a.into_inner());
     let (mb, s) = (|b: u64| b >> 20, |ns: u64| ns as f64 / 1e9);
     let note = format!(
-        "{} MB read, {} MB unpacked, {} MB placed; worker time read {:.1} s, unpack {:.1} s, place {:.1} s, {threads} workers",
+        "{} MB read, {} MB unpacked, {} MB placed; worker time read {:.1} s, unpack {:.1} s, place {:.1} s, {threads} workers, {readers} readers",
         mb(read),
         mb(unpacked),
         mb(placed),
