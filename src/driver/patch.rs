@@ -95,6 +95,11 @@ struct Stamp {
 }
 
 impl PatchBase {
+    /// For `main::census`: the base's resolved tables, when no one else holds them.
+    pub(crate) fn tables_mut(&mut self) -> Option<&mut ResolvedTables> {
+        Arc::get_mut(&mut self.tables)
+    }
+
     /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part
     /// (1 file ranges and extras, 2 item scans, 3 dropped, 4 the rest of its lists; what is
     /// left after them is mostly the tables).

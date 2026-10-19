@@ -151,6 +151,19 @@ fn census(mut sessions: Vec<Box<driver::Session>>) {
             row(&mut rows, &format!("kept{i}.ast"), &mut || drop(take(&mut p.ast)));
         }
         row(&mut rows, "kept.rest", &mut || f.kept = Default::default());
+        if let Some(t) = f.patch.as_mut().and_then(|pb| pb.tables_mut()) {
+            row(&mut rows, "tables maps", &mut || drop(take(&mut t.maps)));
+            row(&mut rows, "tables glob log", &mut || drop(take(&mut t.glob_log)));
+            row(&mut rows, "tables def info", &mut || drop(take(&mut t.def_info)));
+            row(&mut rows, "tables flat", &mut || drop(take(&mut t.flat)));
+            row(&mut rows, "tables pending single", &mut || drop(take(&mut t.pending_single)));
+            row(&mut rows, "tables modules", &mut || drop(take(&mut t.modules)));
+            row(&mut rows, "tables vis", &mut || {
+                drop(take(&mut t.assoc_vis));
+                drop(take(&mut t.field_vis));
+                drop(take(&mut t.tuple_field_vis));
+            });
+        }
         row(&mut rows, "front.patch (tables, rest)", &mut || drop(f.patch.take()));
         row(&mut rows, "front.resolve_cache", &mut || drop(take(&mut f.resolve_cache)));
         row(&mut rows, "front.mdr", &mut || drop(take(&mut f.mdr)));
