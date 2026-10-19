@@ -1422,7 +1422,10 @@ impl CrateJob {
 
 /// What one resolved crate contributes to the merged program.
 struct CrateOut {
-    ast: Ast,
+    /// Its files' chunks in order. The caller concatenates every crate's
+    /// chunks at once: a crate's own concat was copied whole again, its
+    /// shift on one thread.
+    chunks: Vec<Ast>,
     fn_lines: Vec<u32>,
     body_hashes: Vec<u64>,
     fn_module: Vec<ModuleId>,
@@ -1905,7 +1908,7 @@ pub fn resolve_crate_with(
                         None => timings.push((name, ms)),
                     }
                 }
-                chunks.push(out.ast);
+                chunks.extend(out.chunks);
             }
             Err(e) => {
                 add_asks(j, e.std_asks);
@@ -4116,7 +4119,6 @@ fn resolve_one(
         scan_bodies.extend(scan.bodies);
         chunks.push(pd.ast);
     }
-    let ast = Ast::concat(chunks);
     let structure_hash = {
         use std::hash::Hasher;
         structure.finish()
@@ -4140,7 +4142,7 @@ fn resolve_one(
     let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
     lap!("resolve: chunk scan+concat");
     Ok(CrateOut {
-        ast,
+        chunks,
         fn_lines,
         body_hashes,
         fn_module,
