@@ -1891,10 +1891,12 @@ fn hash_vis(h: &mut FxHasher, p: &Program, vis: &VisKind) {
         VisKind::Crate => 2u8.hash(h),
         VisKind::Super => 3u8.hash(h),
         VisKind::In(path) => {
+            // By name, as when the segments were a list: their count, then each.
+            let segs: Vec<&str> = p.name(*path).split("::").collect();
             4u8.hash(h);
-            (path.len() as u64).hash(h);
-            for s in path {
-                p.name(*s).hash(h);
+            (segs.len() as u64).hash(h);
+            for s in segs {
+                s.hash(h);
             }
         }
     }

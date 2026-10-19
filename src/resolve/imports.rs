@@ -31,16 +31,25 @@ pub fn ns_index(ns: Namespace) -> usize {
     }
 }
 
-/// Visibility in resolver form. `In` holds the written path segments of a
-/// `pub(in ...)` after the `in` keyword, resolved against module paths by
-/// name when checked.
+/// Visibility in resolver form. `In` holds the written path of a
+/// `pub(in ...)` after the `in` keyword as one name, its segments joined by
+/// `::` (`in_path` splits it), resolved against module paths by name when
+/// checked: one `Sym` keeps a binding (`Bind`) at 40 bytes, where a list of
+/// segments made it 56 (the binding maps hold millions).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VisKind {
     Priv,
     Pub,
     Crate,
     Super,
-    In(Vec<Sym>),
+    In(Sym),
+}
+
+impl VisKind {
+    /// The segments of a `pub(in path)` path (`VisKind::In`).
+    pub fn in_path(path: Sym, interner: &Interner) -> Vec<Sym> {
+        interner.get(path).split("::").map(|s| interner.intern(s)).collect()
+    }
 }
 
 /// Converts written AST visibility to resolver form.
@@ -54,7 +63,7 @@ pub fn vis_from_ast(v: &ast::Vis, interner: &Interner) -> VisKind {
                 ["crate"] => VisKind::Crate,
                 ["super"] => VisKind::Super,
                 ["self"] => VisKind::Priv,
-                _ => VisKind::In(path.iter().map(|s| s.name).collect()),
+                _ => VisKind::In(interner.intern(&names.join("::"))),
             }
         }
     }
@@ -624,7 +633,7 @@ impl ResolvedTables {
                 Some(p) => self.is_within(from, p),
                 None => true, // pub(super) at the root behaves as pub(crate)-ish in rustc (it warns); the root has no parent.
             },
-            VisKind::In(path) => match self.resolve_in_path(path, def_module, interner) {
+            VisKind::In(path) => match self.resolve_in_path(&VisKind::in_path(*path, interner), def_module, interner) {
                 Some(m) => self.is_within(from, m),
                 None => false,
             },
@@ -641,10 +650,12 @@ impl ResolvedTables {
             // `pub(in $crate::..)` from another crate's macro starts with a
             // magic segment that `resolve_in_path` does not place; it is
             // not checked here.
-            VisKind::In(path) if path.first().is_some_and(|s| self.crate_magic.contains_key(s)) => true,
             VisKind::In(path) => {
-                matches!(path.first().map(|s| interner.get(*s)), Some("crate" | "self" | "super"))
-                    && self.resolve_in_path(path, module, interner).is_some_and(|m| self.is_within(module, m))
+                let path = VisKind::in_path(*path, interner);
+                // `pub(in $crate::..)` (see above): its magic first segment.
+                path.first().is_some_and(|s| self.crate_magic.contains_key(s))
+                    || matches!(path.first().map(|s| interner.get(*s)), Some("crate" | "self" | "super"))
+                        && self.resolve_in_path(&path, module, interner).is_some_and(|m| self.is_within(module, m))
             }
             VisKind::Priv | VisKind::Pub | VisKind::Crate => true,
         }
@@ -673,7 +684,7 @@ impl ResolvedTables {
                 Some(p) => (0, Some(p)),
                 None => (1, None),
             },
-            VisKind::In(path) => match self.resolve_in_path(path, def_module, interner) {
+            VisKind::In(path) => match self.resolve_in_path(&VisKind::in_path(*path, interner), def_module, interner) {
                 Some(m) => (0, Some(m)),
                 None => (0, Some(def_module)),
             },
@@ -1235,9 +1246,7 @@ impl ResolvedTables {
                 VisKind::Super => h.write_u64(4),
                 VisKind::In(path) => {
                     h.write_u64(5);
-                    for s in path {
-                        h.write_u64(s.0 as u64);
-                    }
+                    h.write_u64(path.0 as u64);
                 }
             }
         }

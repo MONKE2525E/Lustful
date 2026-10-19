@@ -3140,9 +3140,11 @@ impl MacroEnv {
                     VisKind::Crate => Some(Vec::new()),
                     VisKind::Priv => Some(up.to_vec()),
                     VisKind::Super => Some(up[..up.len().saturating_sub(1)].to_vec()),
-                    VisKind::In(p) => {
-                        Some(tables.resolve_in_path(p, parent, interner).map_or_else(|| up.to_vec(), |r| tables.modules[r.0 as usize].path.clone()))
-                    }
+                    VisKind::In(p) => Some(
+                        tables
+                            .resolve_in_path(&VisKind::in_path(*p, interner), parent, interner)
+                            .map_or_else(|| up.to_vec(), |r| tables.modules[r.0 as usize].path.clone()),
+                    ),
                 };
                 out = narrower(out, scope);
             }
