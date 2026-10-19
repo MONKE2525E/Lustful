@@ -318,7 +318,7 @@ pub struct GenReuse {
     /// answered that request, often with errors).
     held: Option<(u64, FxMap<DefId, OutCopy>)>,
     /// Node answers of this collect's program, for read replays (and the
-    /// derive delta's keyed walk, graph.rs `ReadIndex::dirty_slots`).
+    /// derive delta's keyed walk, graph.rs `keyed_dirty_slots`).
     pub(crate) memo: FxMap<ReadKey, Read>,
     /// This collect's template check outputs that instances replay, by
     /// template, and its closure records, by closure def (fingerprints;

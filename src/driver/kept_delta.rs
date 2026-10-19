@@ -503,8 +503,8 @@ impl Touched {
         h
     }
 
-    /// `hit` without its memo: a keyed walk asks it for every key of the
-    /// read index at once, on all cores (`ReadIndex::dirty_slots`' quick
+    /// `hit` without its memo: a keyed walk asks it for every key the slot
+    /// read sets hold at once, on all cores (`keyed_dirty_slots`' quick
     /// answers).
     pub(crate) fn hit_pure(&self, p: &Program, k: &ReadKey) -> bool {
         let (defs, methods, traits) = (&self.defs, &self.methods, &self.traits);

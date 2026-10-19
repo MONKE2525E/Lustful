@@ -849,7 +849,7 @@ impl Stamps {
 /// program (`Reads::verified` of its mode is `base`), where only the keys the delta can
 /// move (`moved`: `kept_delta::Touched`, or only `Checked` keys after body
 /// edits alone) may have moved, so only those compare (graph.rs
-/// `ReadIndex::dirty_slots`). None for any other slot: a read set of
+/// `keyed_dirty_slots`). None for any other slot: a read set of
 /// another program, or none; the full walk decides it.
 fn keyed_dirty(
     p: &collect::Program,
@@ -863,7 +863,7 @@ fn keyed_dirty(
     let def_slot = |d: def::DefId| p.local_def(d.hash).and_then(|l| front.fn_slot.get(l.0 as usize)).map(|&s| s as usize);
     // `moved` is a pure test: every key takes it on all cores.
     let quick = |k: &crate::driver::graph::ReadKey| Some(moved(k));
-    let (dirty, _) = caches.read_index.dirty_slots(p, &mut caches.slot_reads, &caches.read_keys, &quick, &mut |k| moved(k), &def_slot, answers);
+    let (dirty, _) = crate::driver::graph::keyed_dirty_slots(p, &caches.slot_reads, &caches.read_keys, &quick, &mut |k| moved(k), &def_slot, answers);
     caches.slot_reads.iter().zip(dirty).map(|(r, d)| r.as_ref().filter(|r| r.verified[mode] == base).map(|_| d)).collect()
 }
 
@@ -4259,12 +4259,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         diags.extend(results[k].1.iter().cloned());
     }
-    // The read index of the keyed walks follows the new read sets here,
-    // where their bodies were just checked (sigedit P3.2): the first
-    // request of a daemon builds it, so no edit request pays for that.
-    if caches.persistent && !work.is_empty() {
-        caches.read_index.sync(&mut caches.slot_reads, &caches.read_keys);
-    }
     // rustc stops before monomorphization once a pre-mono check fails, so an
     // instance checked over an erroneous caller (an error-typed closure argument)
     // must not add cascade errors ahead of the real ones.
@@ -4429,7 +4423,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         .filter(|&(_, &u)| wanted.get(u as usize).copied().unwrap_or(false))
         .map(|(l, &u)| (u, program.disk_id(LocalDefId(l as u32))))
         .collect();
-    let mut cg_reads = false;
     for ((i, _), noted) in bodies.iter().zip(&cg_noted) {
         if !noted.is_empty()
             && let Some(Some(r)) = caches.slot_reads.get_mut(slot(*i))
@@ -4437,11 +4430,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             r.thaw(&caches.read_keys);
             check::derive_delta::record(&program, r, noted);
             r.freeze(&mut caches.read_keys);
-            cg_reads = true;
         }
-    }
-    if cg_reads {
-        caches.read_index.sync(&mut caches.slot_reads, &caches.read_keys);
     }
     for ((i, body), out) in bodies.iter().zip(outs) {
         let s = slot(*i);

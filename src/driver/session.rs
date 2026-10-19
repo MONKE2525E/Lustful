@@ -268,9 +268,6 @@ pub(crate) struct Caches {
     /// without a recheck. Session-local only (`Sym` and `DefId` keys are
     /// stable inside one session, never written to disk in this form).
     pub(crate) slot_reads: Vec<Option<crate::driver::graph::Reads>>,
-    /// The reverse index over `slot_reads` the keyed dirty walk reads
-    /// (driver/graph.rs `ReadIndex`; sigedit P3.2).
-    pub(crate) read_index: crate::driver::graph::ReadIndex,
     /// The read keys the frozen sets in `slot_reads` name (`Reads::freeze`):
     /// as long-lived as those sets.
     pub(crate) read_keys: crate::driver::graph::ReadKeys,
@@ -483,7 +480,6 @@ impl Session {
                 out: Vec::new(),
                 has_out: Vec::new(),
                 slot_reads: Vec::new(),
-                read_index: Default::default(),
                 read_keys: Default::default(),
                 derive_dirty: None,
                 derive_only: false,

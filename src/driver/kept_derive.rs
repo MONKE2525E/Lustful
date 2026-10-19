@@ -8,7 +8,7 @@
 // the synthetic derive records, and runs the collect checks a derive list
 // feeds again, over the items that reach the Adt. Then:
 //
-// - the keyed dirty walk (graph.rs `ReadIndex`): only the read keys the
+// - the keyed dirty walk (graph.rs `keyed_dirty_slots`): only the read keys the
 //   delta can move (`Program::derive_key_moves`) are compared, for the
 //   slots that read them; the compile tail rechecks the dirty slots and
 //   reuses the rest without walking their reads;
@@ -111,9 +111,9 @@ pub(super) fn apply_derives(
         // moved, and the time, per kind.
         let logging = std::env::var_os("LUST_DERIVE_KEYLOG").is_some();
         let mut kinds: Vec<(&str, usize, usize, f64)> = Vec::new();
-        let out = caches.read_index.dirty_slots(
+        let out = crate::driver::graph::keyed_dirty_slots(
             prog,
-            &mut caches.slot_reads,
+            &caches.slot_reads,
             &caches.read_keys,
             &quick,
             &mut |k| {

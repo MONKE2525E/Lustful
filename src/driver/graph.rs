@@ -323,10 +323,6 @@ pub struct Reads {
     /// exits after this compile): it records nothing and computes no
     /// fingerprints.
     off: bool,
-    /// The identity the read index (`ReadIndex`) gave this set's content,
-    /// or 0 when none: a new key resets it, so a changed set is indexed
-    /// again.
-    seal: u64,
     /// By mode (check, build), the generation of the kept program these
     /// reads last held against (`Program::verified`), or 0: the driver's
     /// keyed walk trusts a key a delta did not move only for a set of the
@@ -363,7 +359,6 @@ impl Reads {
         }
         if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
             v.insert(Read { fingerprint: fingerprint(), failed });
-            self.seal = 0;
         }
     }
 
@@ -420,9 +415,8 @@ impl Reads {
         self.record(ReadKey::Checked(def), fingerprint, false);
     }
 
-    /// The read recorded for a key, if this run read that node (the keyed
-    /// walk's compare, `ReadIndex::dirty_slots`). The frozen part first: the
-    /// first record of a key wins.
+    /// The read recorded for a key, if this run read that node. The frozen
+    /// part first: the first record of a key wins.
     pub(crate) fn get(&self, keys: &ReadKeys, key: &ReadKey) -> Option<Read> {
         self.check_table(keys);
         let frozen = keys.ids.get(key).and_then(|&i| self.frozen.binary_search_by_key(&i, |f| f.key).ok());
@@ -2813,138 +2807,112 @@ impl<'a> Program {
     }
 }
 
-// ---------- The read index and the keyed dirty walk (sigedit P3.2) ----------
+// ---------- The keyed dirty walk (sigedit P3.2) ----------
 
-/// A reverse index over the per-slot read sets (`Caches::slot_reads`):
-/// each read key to the slots whose stored reads hold it. A derive delta
-/// knows which keys it can move (`Program::derive_key_moves`); the keyed
-/// walk compares only those keys' fingerprints, for only the slots that
-/// read them, in place of every passing body's whole read set.
-///
-/// Entries stay valid while the slot holds the same read set: `sync`
-/// gives each new set a seal (`Reads::seal`, reset by any new key), and an
-/// entry whose seal is not its slot's current one is stale and skipped.
-#[derive(Default)]
-pub(crate) struct ReadIndex {
-    by_key: FxMap<ReadKey, Vec<(u32, u64)>>,
-    /// The seal each slot was indexed under (0: none).
-    stamp: Vec<u64>,
-    next: u64,
-    /// Entries in `by_key`, stale ones included (a rebuild drops those).
-    entries: usize,
-    live: usize,
-}
-
-impl ReadIndex {
-    /// Indexes every slot whose read set changed since the last sync. The
-    /// compile tail of a daemon calls it after each request, so a keyed
-    /// walk finds it current (the first request builds it).
-    pub(crate) fn sync(&mut self, slot_reads: &mut [Option<Reads>], keys: &ReadKeys) {
-        if self.entries > 2 * self.live + 100_000 {
-            *self = ReadIndex { next: self.next, ..ReadIndex::default() };
-        }
-        self.stamp.resize(slot_reads.len(), 0);
-        for (s, r) in slot_reads.iter_mut().enumerate() {
-            let cur = r.as_ref().map_or(0, |r| r.seal);
-            if cur != 0 && cur == self.stamp[s] {
-                continue;
-            }
-            match r {
-                Some(r) => {
-                    self.next += 1;
-                    r.seal = self.next;
-                    for k in r.keys(keys) {
-                        self.by_key.entry(*k).or_default().push((s as u32, r.seal));
-                    }
-                    self.entries += r.len();
-                    self.stamp[s] = r.seal;
-                }
-                None => self.stamp[s] = 0,
-            }
-        }
-        self.live = slot_reads.iter().flatten().map(Reads::len).sum();
+/// The slots whose stored reads (`Caches::slot_reads`) hold a key that
+/// `moves` takes and whose fingerprint differs from `p`'s now, and then, to a
+/// fixpoint, the slots with a `Checked(d)` read of a body `d` whose slot is
+/// dirty (`def_slot`; the oracle's rule: it checks again). Every other slot's
+/// reads are clean, given that no key outside `moves` changed (the caller's
+/// proof). Also returns, by slot, whether its reads hold any `Checked` key.
+/// The moved keys' fingerprints come from `answers`, the request's node
+/// answers for `p`, and the missing ones are computed in parallel and join it
+/// (the template and discovery replays read the same map, `GenReuse::memo`).
+/// A derive delta knows which keys it can move (`Program::derive_key_moves`),
+/// so only those keys' fingerprints are compared. Each set is scanned whole:
+/// a frozen set is an array of key indexes, a moved key one bit (a reverse
+/// index from keys to readers cost ~250 MB of front image).
+pub(crate) fn keyed_dirty_slots(
+    p: &Program,
+    slot_reads: &[Option<Reads>],
+    keys: &ReadKeys,
+    quick: &(dyn Fn(&ReadKey) -> Option<bool> + Sync),
+    moves: &mut dyn FnMut(&ReadKey) -> bool,
+    def_slot: &dyn Fn(DefId) -> Option<usize>,
+    answers: &mut FxMap<ReadKey, Read>,
+) -> (Vec<bool>, Vec<bool>) {
+    use crate::driver::compile::par_map;
+    // The keys the sets read: by index (frozen parts), or whole (a part still
+    // in its map).
+    let mut used = vec![false; keys.len()];
+    let mut loose: FxMap<ReadKey, ()> = FxMap::default();
+    for r in slot_reads.iter().flatten() {
+        r.check_table(keys);
+        r.frozen.iter().for_each(|f| used[f.key as usize] = true);
+        loose.extend(r.map.keys().map(|k| (*k, ())));
     }
-
-    /// The slots whose stored reads hold a key that `moves` takes and whose
-    /// fingerprint differs from `p`'s now, and then, to a fixpoint, the
-    /// slots with a `Checked(d)` read of a body `d` whose slot is dirty
-    /// (`def_slot`; the oracle's rule: it checks again). Every other slot's
-    /// reads are clean, given that no key outside `moves` changed (the
-    /// caller's proof). Also returns, by slot, whether its reads hold any
-    /// `Checked` key. Syncs the index first. The moved keys' fingerprints
-    /// come from `answers`, the request's node answers for `p`, and the
-    /// missing ones are computed in parallel and join it (the template and
-    /// discovery replays read the same map, `GenReuse::memo`).
-    pub(crate) fn dirty_slots(
-        &mut self,
-        p: &Program,
-        slot_reads: &mut [Option<Reads>],
-        keys: &ReadKeys,
-        quick: &(dyn Fn(&ReadKey) -> Option<bool> + Sync),
-        moves: &mut dyn FnMut(&ReadKey) -> bool,
-        def_slot: &dyn Fn(DefId) -> Option<usize>,
-        answers: &mut FxMap<ReadKey, Read>,
-    ) -> (Vec<bool>, Vec<bool>) {
-        self.sync(slot_reads, keys);
-        crate::driver::laps::mark("keyed/sync");
-        // `quick` answers most keys from tables on all cores; `moves` the
-        // rest, one at a time.
-        let entries: Vec<(&ReadKey, &Vec<(u32, u64)>)> = self.by_key.iter().collect();
-        let quick_answers: Vec<Vec<Option<bool>>> =
-            crate::driver::compile::par_map(&entries.chunks(4096).collect::<Vec<_>>(), |c| c.iter().map(|(k, _)| quick(k)).collect());
-        let moved: Vec<(&ReadKey, &Vec<(u32, u64)>)> = entries
-            .into_iter()
-            .zip(quick_answers.into_iter().flatten())
-            .filter(|((k, _), q)| q.unwrap_or_else(|| moves(k)))
-            .map(|(e, _)| e)
-            .collect();
-        crate::driver::laps::mark("keyed/classify");
-        let missing: Vec<ReadKey> = moved.iter().map(|(k, _)| **k).filter(|k| !answers.contains_key(k)).collect();
-        let fresh = crate::driver::compile::par_map(&missing, |k| p.read_fingerprint(k));
-        answers.extend(missing.into_iter().zip(fresh));
-        crate::driver::laps::mark("keyed/fingerprint");
-        // Each live entry compares its slot's stored answer, a lookup in a
-        // read set apiece: a widely read moved key has many thousands, so
-        // the entries go out in chunks to all cores.
-        let mut dirty = vec![false; slot_reads.len()];
-        let chunks: Vec<(&ReadKey, &[(u32, u64)])> = moved.iter().flat_map(|&(k, list)| list.chunks(2048).map(move |c| (k, c))).collect();
-        let (stamp, reads, answers) = (&self.stamp, &*slot_reads, &*answers);
-        let hits = crate::driver::compile::par_map(&chunks, |&(k, list)| {
-            let now = answers[k];
-            let live = |s: usize, seal: u64| stamp.get(s) == Some(&seal);
-            let changed = |s: usize| reads[s].as_ref().and_then(|r| r.get(keys, k)).is_some_and(|stored| stored != now);
-            list.iter().map(|&(s, seal)| (s as usize, seal)).filter(|&(s, seal)| live(s, seal) && changed(s)).map(|(s, _)| s).collect::<Vec<_>>()
+    crate::driver::laps::mark("keyed/used");
+    // `quick` answers most keys from tables on all cores; `moves` the rest,
+    // one at a time.
+    let ids: Vec<u32> = (0..keys.len() as u32).filter(|&i| used[i as usize]).collect();
+    let quick_answers: Vec<Vec<Option<bool>>> =
+        par_map(&ids.chunks(4096).collect::<Vec<_>>(), |c| c.iter().map(|&i| quick(&keys.keys[i as usize])).collect());
+    let mut moved = vec![false; keys.len()];
+    for (&i, q) in ids.iter().zip(quick_answers.into_iter().flatten()) {
+        moved[i as usize] = q.unwrap_or_else(|| moves(&keys.keys[i as usize]));
+    }
+    let moved_loose: FxMap<ReadKey, ()> = loose.into_keys().filter(|k| quick(k).unwrap_or_else(|| moves(k))).map(|k| (k, ())).collect();
+    crate::driver::laps::mark("keyed/classify");
+    let missing: Vec<ReadKey> = ids
+        .iter()
+        .filter(|&&i| moved[i as usize])
+        .map(|&i| keys.keys[i as usize])
+        .chain(moved_loose.keys().copied())
+        .filter(|k| !answers.contains_key(k))
+        .collect();
+    let fresh = par_map(&missing, |k| p.read_fingerprint(k));
+    answers.extend(missing.into_iter().zip(fresh));
+    crate::driver::laps::mark("keyed/fingerprint");
+    // Each set compares its moved reads, and lists the bodies its `Checked`
+    // reads name, on all cores.
+    let checked: Vec<bool> = keys.keys.iter().map(|k| matches!(k, ReadKey::Checked(_))).collect();
+    let answers = &*answers;
+    let per_slot: Vec<(bool, Vec<DefId>)> = par_map(slot_reads, |r| {
+        let Some(r) = r else { return (false, Vec::new()) };
+        let changed = |k: &ReadKey, stored: Read| answers.get(k) != Some(&stored);
+        let frozen_dirty = r.frozen.iter().any(|f| {
+            moved[f.key as usize] && changed(&keys.keys[f.key as usize], Read { fingerprint: f.fingerprint, failed: f.failed })
         });
-        hits.into_iter().flatten().for_each(|s| dirty[s] = true);
-        crate::driver::laps::mark("keyed/compare");
-        let live = |s: usize, seal: u64| self.stamp.get(s) == Some(&seal);
-        let mut has_checked = vec![false; slot_reads.len()];
-        // The readers of each body by its slot, through `Checked` reads;
-        // dirt spreads from each dirty slot to its live readers.
-        let mut readers_of: FxMap<usize, Vec<&Vec<(u32, u64)>>> = FxMap::default();
-        for (k, list) in &self.by_key {
-            if let ReadKey::Checked(d) = k {
-                list.iter().filter(|&&(s, seal)| live(s as usize, seal)).for_each(|&(s, _)| has_checked[s as usize] = true);
-                if let Some(s) = def_slot(*d) {
-                    readers_of.entry(s).or_default().push(list);
-                }
+        let dirty = frozen_dirty || r.map.iter().any(|(k, v)| moved_loose.contains_key(k) && changed(k, *v));
+        let mut defs: Vec<DefId> = r
+            .frozen
+            .iter()
+            .filter(|f| checked[f.key as usize])
+            .filter_map(|f| match keys.keys[f.key as usize] {
+                ReadKey::Checked(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        defs.extend(r.map.keys().filter_map(|k| match k {
+            ReadKey::Checked(d) => Some(*d),
+            _ => None,
+        }));
+        (dirty, defs)
+    });
+    crate::driver::laps::mark("keyed/compare");
+    let mut dirty: Vec<bool> = per_slot.iter().map(|(d, _)| *d).collect();
+    let has_checked: Vec<bool> = per_slot.iter().map(|(_, defs)| !defs.is_empty()).collect();
+    // The readers of each body by its slot, through `Checked` reads; dirt
+    // spreads from each dirty slot to its readers.
+    let mut readers_of: FxMap<usize, Vec<usize>> = FxMap::default();
+    for (s, (_, defs)) in per_slot.iter().enumerate() {
+        for &d in defs {
+            if let Some(ds) = def_slot(d) {
+                readers_of.entry(ds).or_default().push(s);
             }
         }
-        let mut work: Vec<usize> = (0..dirty.len()).filter(|&s| dirty[s]).collect();
-        while let Some(s) = work.pop() {
-            for list in readers_of.get(&s).into_iter().flatten() {
-                for &(r, seal) in list.iter() {
-                    let r = r as usize;
-                    if live(r, seal) && !dirty[r] {
-                        dirty[r] = true;
-                        work.push(r);
-                    }
-                }
-            }
-        }
-        crate::driver::laps::mark("keyed/checked");
-        (dirty, has_checked)
     }
+    let mut work: Vec<usize> = (0..dirty.len()).filter(|&s| dirty[s]).collect();
+    while let Some(s) = work.pop() {
+        for &r in readers_of.get(&s).into_iter().flatten() {
+            if !dirty[r] {
+                dirty[r] = true;
+                work.push(r);
+            }
+        }
+    }
+    crate::driver::laps::mark("keyed/checked");
+    (dirty, has_checked)
 }
 
 /// What a derive delta can move, per read key (`Program::derive_key_moves`),
@@ -3475,9 +3443,9 @@ mod tests {
     use crate::intern::{Interner, Known};
     use crate::{lexer, parser};
 
-    /// A frozen read set answers as before (the read index sees its keys);
-    /// a record of a key it holds keeps the first read, a thawed set takes
-    /// a new key (and resets its seal), and another table fails closed.
+    /// A frozen read set answers as before; a record of a key it holds keeps
+    /// the first read, a thawed set takes a new key, and another table fails
+    /// closed.
     #[test]
     fn a_frozen_read_set_reads_the_same() {
         let a = DefId { krate: LOCAL_CRATE, hash: DefPathHash(1) };
@@ -3491,13 +3459,7 @@ mod tests {
         assert!(r.map.is_empty() && r.frozen.len() == 2 && keys.len() == 2);
         assert_eq!(all(&r, &keys), before);
         assert_eq!(r.get(&keys, &ReadKey::Layout(a)), Some(Read { fingerprint: Fingerprint(2), failed: true }));
-        let mut slots = vec![Some(r)];
-        let mut index = ReadIndex::default();
-        index.sync(&mut slots, &keys);
-        assert_eq!((index.by_key.len(), index.live), (2, 2));
-        let mut r = slots.pop().flatten().unwrap();
         // A record into the frozen set (no thaw) keeps the first read of a key.
-        r.seal = 7;
         r.record(ReadKey::Sig(a), Fingerprint(9), false);
         assert_eq!(r.get(&keys, &ReadKey::Sig(a)).map(|v| v.fingerprint), Some(Fingerprint(1)));
         r.thaw(&keys);
@@ -3505,7 +3467,7 @@ mod tests {
         assert_eq!((r.len(), r.get(&keys, &ReadKey::Sig(a)).map(|v| v.fingerprint)), (2, Some(Fingerprint(1))));
         r.thaw(&keys);
         r.record(ReadKey::Checked(a), Fingerprint(3), false);
-        assert_eq!((r.seal, r.len()), (0, 3));
+        assert_eq!(r.len(), 3);
         // Another table's keys are not this set's: a read fails closed.
         r.freeze(&mut keys);
         let other = ReadKeys::default();
