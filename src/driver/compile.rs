@@ -4253,6 +4253,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         {
             let mut stored = body.reads.clone();
             let _ = program.sig_of(&mut stored, program.def_id(LocalDefId(i as u32)));
+            stored.freeze();
             stored.verified[mode_at] = verified;
             caches.slot_reads[slot(i)] = Some(stored);
         }
@@ -4434,6 +4435,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             && let Some(Some(r)) = caches.slot_reads.get_mut(slot(*i))
         {
             check::derive_delta::record(&program, r, noted);
+            r.freeze();
             cg_reads = true;
         }
     }

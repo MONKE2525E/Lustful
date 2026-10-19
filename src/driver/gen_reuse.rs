@@ -1202,10 +1202,11 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool, DefId)>) 
 /// reads its own signature (parameter and return types, deep) through
 /// the compat `FnInfo` path, which records nothing, and its field
 /// accesses record nothing either. The driver adds the same read to
-/// each slot's stored set.
+/// each slot's stored set. Frozen: every caller stores it.
 fn with_own_sig(p: &Program, f: LocalDefId, reads: &Reads) -> Reads {
     let mut reads = reads.clone();
     let _ = p.sig_of(&mut reads, p.def_id(f));
+    reads.freeze();
     reads
 }
 

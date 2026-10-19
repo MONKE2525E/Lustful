@@ -142,7 +142,7 @@ impl InferId {
 }
 
 #[allow(dead_code)] // The 128-bit variants are representation only until W-CORELANG.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IntTy {
     I8,
     I16,
@@ -281,7 +281,7 @@ impl IntTy {
 }
 
 /// Floating point types (W-CORELANG wave A).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FloatTy {
     F32,
     F64,

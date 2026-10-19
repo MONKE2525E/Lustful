@@ -35,7 +35,7 @@ pub struct Fingerprint(pub u64);
 
 /// One of Rust's three item namespaces (section 1.3). Modules live in `Type`.
 /// Variant order is frozen; add nothing here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Namespace {
     Type,
     Value,
@@ -44,7 +44,7 @@ pub enum Namespace {
 
 /// The key of one `Binding` node: one name in one module and namespace.
 /// Reads are per name, never per scope (section 8.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BindingKey {
     pub module: ModuleId,
     pub ns: Namespace,
@@ -68,7 +68,7 @@ pub enum BindingRes {
 
 /// A receiver form probed by method resolution, in Rust's probe order
 /// (section 2.10 step 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ReceiverForm {
     Value,
     Ref,
@@ -85,7 +85,7 @@ impl ReceiverForm {
 /// `ReceiverForm`. `Unknown` is the head of a type with no bucket yet (an
 /// unbound inference variable, a generic parameter): probes against it still
 /// record a read, so a later impl or method rechecks the body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Head {
     Adt(DefId),
     Int(IntTy),
@@ -123,7 +123,7 @@ impl Head {
 }
 
 /// The key of one `MethodSet` node: the candidate set for one probe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MethodSetKey {
     pub head: Head,
     pub name: Sym,
@@ -159,7 +159,7 @@ impl MethodSet {
 }
 
 /// The key of one `ImplSet` node: the impl bucket for one trait and Self head.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ImplSetKey {
     pub trait_: DefId,
     pub head: Head,
@@ -178,7 +178,7 @@ pub struct ImplSet {
 
 /// One recorded read's key. Frozen (section 9.2): new node kinds go at the
 /// end only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ReadKey {
     Binding(BindingKey),
     MethodSet(MethodSetKey),
@@ -252,6 +252,11 @@ pub struct Read {
 #[derive(Clone, Debug, Default)]
 pub struct Reads {
     map: FxMap<ReadKey, Read>,
+    /// A stored set's reads (`freeze`), sorted by key, with `map` empty: a
+    /// set that is done recording keeps no hash table, which cost more than
+    /// its entries (the image keeps ~1 GB of read sets). A new record moves
+    /// them back into `map`.
+    frozen: Box<[(ReadKey, Read)]>,
     /// Set for a sink whose reads nobody will replay (a one-shot process
     /// exits after this compile): it records nothing and computes no
     /// fingerprints.
@@ -275,18 +280,12 @@ impl Reads {
 
     /// A sink that records nothing (see `off`).
     pub fn off() -> Reads {
-        Reads { map: FxMap::default(), off: true, seal: 0, verified: [0; 2] }
+        Reads { off: true, ..Reads::default() }
     }
 
     /// Records one read. The first record of a key wins.
     pub fn record(&mut self, key: ReadKey, fingerprint: Fingerprint, failed: bool) {
-        if self.off {
-            return;
-        }
-        if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
-            v.insert(Read { fingerprint, failed });
-            self.seal = 0;
-        }
+        self.record_with(key, failed, || fingerprint);
     }
 
     /// Records one read, computing the fingerprint only if the key is new:
@@ -296,9 +295,23 @@ impl Reads {
         if self.off {
             return;
         }
+        if !self.frozen.is_empty() {
+            self.map.extend(std::mem::take(&mut self.frozen).into_vec());
+        }
         if let std::collections::hash_map::Entry::Vacant(v) = self.map.entry(key) {
             v.insert(Read { fingerprint: fingerprint(), failed });
             self.seal = 0;
+        }
+    }
+
+    /// Ends recording for a set that is stored (`frozen`): the same reads,
+    /// with no hash table. Every reader below sees no difference.
+    pub fn freeze(&mut self) {
+        if !self.map.is_empty() {
+            let mut all = std::mem::take(&mut self.frozen).into_vec();
+            all.extend(std::mem::take(&mut self.map));
+            all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            self.frozen = all.into_boxed_slice();
         }
     }
 
@@ -314,41 +327,41 @@ impl Reads {
         self.record(ReadKey::Checked(def), fingerprint, false);
     }
 
-    /// The read recorded for a key, if this run read that node.
-    #[allow(dead_code)] // Read by invalidation when it lands (W-DRIVER); tests use it now.
+    /// The read recorded for a key, if this run read that node (the keyed
+    /// walk's compare, `ReadIndex::dirty_slots`).
     pub fn get(&self, key: &ReadKey) -> Option<Read> {
-        self.map.get(key).copied()
+        match self.map.get(key) {
+            Some(r) => Some(*r),
+            None => self.frozen.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| self.frozen[i].1),
+        }
     }
 
     /// True if this run read that node.
-    #[allow(dead_code)] // See `get`.
+    #[allow(dead_code)] // Tests use it.
     pub fn contains(&self, key: &ReadKey) -> bool {
-        self.map.contains_key(key)
+        self.get(key).is_some()
     }
 
     /// Number of distinct nodes read.
-    #[allow(dead_code)] // See `get`.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.len() + self.frozen.len()
     }
 
     /// True if nothing was read.
-    #[allow(dead_code)] // See `get`.
+    #[allow(dead_code)] // Tests use it.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
 
-    /// Every recorded key, in hash order. For tests and debug dumps; the
-    /// order is not stable, so nothing may key on it.
-    #[allow(dead_code)] // See `get`.
+    /// Every recorded key, in no stable order: nothing may key on it.
     pub fn keys(&self) -> impl Iterator<Item = &ReadKey> {
-        self.map.keys()
+        self.iter().map(|(k, _)| k)
     }
 
-    /// Every recorded (key, read) pair, in hash order. The dirty walk
+    /// Every recorded (key, read) pair, in no stable order. The dirty walk
     /// (`Program::reads_dirty`) iterates this; order does not matter there.
     pub fn iter(&self) -> impl Iterator<Item = (&ReadKey, &Read)> {
-        self.map.iter()
+        self.map.iter().chain(self.frozen.iter().map(|(k, r)| (k, r)))
     }
 }
 
@@ -2737,10 +2750,10 @@ impl ReadIndex {
                 Some(r) => {
                     self.next += 1;
                     r.seal = self.next;
-                    for k in r.map.keys() {
+                    for k in r.keys() {
                         self.by_key.entry(*k).or_default().push((s as u32, r.seal));
                     }
-                    self.entries += r.map.len();
+                    self.entries += r.len();
                     self.stamp[s] = r.seal;
                 }
                 None => self.stamp[s] = 0,
@@ -3357,6 +3370,33 @@ mod tests {
     use crate::diag::FileId;
     use crate::intern::{Interner, Known};
     use crate::{lexer, parser};
+
+    /// A frozen read set answers as before (the read index sees its keys);
+    /// a record of a key it holds changes nothing, and a new key thaws it
+    /// and resets its seal.
+    #[test]
+    fn a_frozen_read_set_reads_the_same() {
+        let a = DefId { krate: LOCAL_CRATE, hash: DefPathHash(1) };
+        let mut r = Reads::new();
+        r.record(ReadKey::Sig(a), Fingerprint(1), false);
+        r.record(ReadKey::Layout(a), Fingerprint(2), true);
+        let all = |r: &Reads| r.iter().map(|(k, v)| (*k, *v)).collect::<FxMap<_, _>>();
+        let before = all(&r);
+        r.freeze();
+        assert!(r.map.is_empty() && r.frozen.len() == 2);
+        assert_eq!(all(&r), before);
+        assert_eq!(r.get(&ReadKey::Layout(a)), Some(Read { fingerprint: Fingerprint(2), failed: true }));
+        let mut slots = vec![Some(r)];
+        let mut index = ReadIndex::default();
+        index.sync(&mut slots);
+        assert_eq!((index.by_key.len(), index.live), (2, 2));
+        let mut r = slots.pop().flatten().unwrap();
+        r.seal = 7;
+        r.record(ReadKey::Sig(a), Fingerprint(9), false);
+        assert_eq!((r.seal, r.get(&ReadKey::Sig(a)).map(|v| v.fingerprint)), (7, Some(Fingerprint(1))));
+        r.record(ReadKey::Checked(a), Fingerprint(3), false);
+        assert_eq!((r.seal, r.len()), (0, 3));
+    }
 
     /// Parses and collects one sample file, then runs `run` on the program.
     fn with_program(src: &str, run: impl FnOnce(&Interner, &mut Program)) {

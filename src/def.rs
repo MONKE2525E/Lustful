@@ -90,7 +90,7 @@ pub struct DefPathHash(pub u64);
 
 /// One definition in memory: which crate (session-local), and which item in it
 /// (stable). Never written to disk as-is; see `DiskDefId`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DefId {
     pub krate: CrateId,
     pub hash: DefPathHash,
