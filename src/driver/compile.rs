@@ -4548,6 +4548,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             [o.code.clone(), o.ll.clone(), o.ll_c.clone()]
         });
     }
+    // The phase is over: the pool's tables and its references would otherwise stay until the
+    // next phase, and a front image save would write them where no later process reaches them
+    // (60 MB of a cold tsgo image).
+    cgen::clear_extern_pool();
     // Group slots into function units by C bytes (see
     // `Caches::groups`): regroup all on a fresh base (or when the
     // frozen groups no longer cover the slots exactly, after a

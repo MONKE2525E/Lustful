@@ -2248,8 +2248,8 @@ fn shared_extern(e: String) -> std::sync::Arc<str> {
     a
 }
 
-/// Empties the extern pool (the driver, before a codegen phase): FnOuts
-/// keep their copies; the pool keeps nothing past the phase.
+/// Empties the extern pool (the driver, before and after a codegen phase):
+/// FnOuts keep their copies; the pool keeps nothing past the phase.
 pub fn clear_extern_pool() {
     for shard in EXTERN_POOL.iter() {
         *shard.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
