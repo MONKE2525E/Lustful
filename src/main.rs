@@ -118,7 +118,7 @@ fn census(mut sessions: Vec<Box<driver::Session>>) {
         let rc = &mut s.front.resolve_cache;
         let (files, same, toks) = rc.same_streams();
         eprintln!("census: resolve_cache: {same} of {files} files expand to their raw tokens ({toks} tokens)");
-        for (part, name) in ["raw tokens", "outlines", "expanded tokens", "parsed Asts", "final chunks", "std asks", "paths, seed, expander"].iter().enumerate() {
+        for (part, name) in ["raw tokens", "outlines", "expanded tokens", "final chunks", "std asks", "paths, seed, expander"].iter().enumerate() {
             row(&mut rows, &format!("resolve_cache {name}"), &mut || rc.drop_part(part));
         }
         if let Some(pb) = s.front.patch.as_mut() {

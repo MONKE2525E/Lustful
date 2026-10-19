@@ -734,9 +734,9 @@ pub struct ResolveCache {
     /// on every request.
     canon: FxMap<PathBuf, String>,
     /// Set for a one-shot process, which compiles once: no later request
-    /// reads the cache, so it stores nothing (no copies of token streams,
-    /// parsed Asts, or final chunks), and the resolve skips the
-    /// expanded-stream hashes that only key those entries.
+    /// reads the cache, so it stores nothing (no copies of token streams
+    /// or final chunks), and the resolve skips the expanded-stream
+    /// hashes that only key those entries.
     one_shot: bool,
     /// A root token list from routing (`seed_root`), stored by `begin`
     /// after its environment check: (key, text hash, tokens).
@@ -776,21 +776,20 @@ impl ResolveCache {
     }
 
     /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part of
-    /// every cached file (0 raw tokens, 1 outline, 2 expanded tokens, 3 parsed Ast, 4 final
-    /// chunk, 5 std asks), or with 6 the path table, the seed and the file expander.
+    /// every cached file (0 raw tokens, 1 outline, 2 expanded tokens, 3 final chunk, 4 std
+    /// asks), or with 5 the path table, the seed and the file expander.
     pub(crate) fn drop_part(&mut self, part: usize) {
         for f in self.files.values_mut() {
             match part {
                 0 => drop(f.raw.take()),
                 1 => drop(f.outline.take()),
                 2 => drop(f.expanded.take()),
-                3 => drop(f.parsed.take()),
-                4 => drop(f.final_chunk.take()),
-                5 => drop(f.std_asks.take()),
+                3 => drop(f.final_chunk.take()),
+                4 => drop(f.std_asks.take()),
                 _ => {}
             }
         }
-        if part == 6 {
+        if part == 5 {
             drop(std::mem::take(&mut self.canon));
             drop(self.seed.take());
             drop(self.file_expander.take());
@@ -947,11 +946,6 @@ struct CachedFile {
     /// (`expansion_input_hash`) and the outside reads it recorded (a
     /// hit stands while they read the same, `expand::deps_stale_in`).
     expanded: Option<(u64, lexer::PackedLexed, Vec<crate::expand::Dep>, u64)>,
-    /// The parsed Ast with the hash of the expanded token stream
-    /// it was parsed from. Expansion answers depend on the whole
-    /// crate's macro environment, so own text alone cannot key a
-    /// parsed Ast; the expanded stream's own hash can.
-    parsed: Option<(u64, Ast)>,
     /// What the file asks of std, with the length of the text it was
     /// read from (`ResolveCache::std_asks`).
     std_asks: Option<(usize, StdPlan)>,
@@ -1108,7 +1102,7 @@ impl ResolveCache {
 
     fn entry(&mut self, key: &str, text_hash: u64, file_id: FileId) -> &mut CachedFile {
         let fresh =
-            || CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None, parsed: None, std_asks: None, final_chunk: None };
+            || CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None, std_asks: None, final_chunk: None };
         let e = self.files.entry(key.to_string()).or_insert_with(fresh);
         if e.text_hash != text_hash || e.file_id != file_id {
             *e = fresh();
@@ -1220,17 +1214,6 @@ impl ResolveCache {
         self.files.values().find(|e| e.file_id == file_id && e.text_hash == text_hash).and_then(|e| e.expanded.as_ref()).map(|e| e.1.unpack())
     }
 
-    /// The cached parsed Ast for one expanded token stream, cloned out.
-    fn parsed(&self, key: &str, text_hash: u64, file_id: FileId, expanded_hash: u64) -> Option<Ast> {
-        self.peek(key, text_hash, file_id).and_then(|e| e.parsed.as_ref()).filter(|(h, _)| *h == expanded_hash).map(|(_, a)| a.clone())
-    }
-
-    fn put_parsed(&mut self, key: &str, text_hash: u64, file_id: FileId, expanded_hash: u64, ast: Ast) {
-        if !self.one_shot {
-            self.entry(key, text_hash, file_id).parsed = Some((expanded_hash, ast));
-        }
-    }
-
     fn put_final(&mut self, key: &str, text_hash: u64, file_id: FileId, chunk: FinalChunk) {
         if !self.one_shot {
             self.entry(key, text_hash, file_id).final_chunk = Some(chunk);
@@ -1239,9 +1222,9 @@ impl ResolveCache {
 }
 
 /// A content hash of one expanded token stream: token kinds,
-/// payloads, spans, and string contents. This keys the parsed-Ast
-/// cache, because expansion output is exactly what the parser
-/// consumes, whatever macro environment produced it.
+/// payloads, spans, and string contents. This keys a file's final
+/// chunk (`FinalChunk::exp_hash`): expansion output is exactly what
+/// the parser consumes, whatever macro environment produced it.
 fn hash_lexed(l: &lexer::Lexed) -> u64 {
     hash_tokens(&l.tokens, &l.strings)
 }
@@ -3586,11 +3569,12 @@ fn resolve_one(
         tables.macro_scopes.insert(discs[di].file_id, (discs[di].module, scope.map(|i| def_of[i])));
     }
     let seen = seen_of(&discs);
-    // Parse the expanded files in parallel, in FileId order. A
-    // file whose expanded stream hashes to a cached parse clones
-    // that Ast instead of parsing again; the hash runs in parallel
-    // first because the cache itself is serial. A one-shot cache
-    // holds no parse, so it needs no hashes (0 keys nothing).
+    // Parse the expanded files in parallel, in FileId order. Every file
+    // parses again from its expanded stream: a cache of parsed Asts held
+    // a copy of the crate's Ast (240 MB of a tsgo front image) to save
+    // about 20 ms of parsing per full resolve. The stream's hash keys the
+    // file's final chunk; a one-shot cache stores none, so it needs no
+    // hashes (0 keys nothing).
     let mut order: Vec<usize> = (0..discs.len()).collect();
     order.sort_by_key(|&di| discs[di].file_id.0);
     let keep = !cache.one_shot;
@@ -3608,42 +3592,12 @@ fn resolve_one(
     // a parse reads it and copies nothing.
     let streams: Vec<std::sync::Mutex<Option<std::sync::Arc<lexer::Lexed>>>> =
         expanded.into_iter().zip(discs.iter_mut()).map(|(e, d)| std::sync::Mutex::new(e.or_else(|| d.lexed.take().map(std::sync::Arc::new)))).collect();
-    // Each file's works: one, or one per item segment (see below).
-    let mut works: Vec<Vec<FileWork>> = Vec::with_capacity(order.len());
-    let mut todo: Vec<usize> = Vec::new();
     // Each file's cache key (the canonical path memo is the cache's own,
-    // so serial), then its text hash and cached parse in parallel: cloning every unchanged file's Ast in one loop cost a
-    // warm tsgo merge about 0.25 s (perf, merge 11).
+    // so serial).
     let keys: Vec<String> = order.iter().map(|&di| job.file_key(&cache.canon(&discs[di].path), discs[di].module)).collect();
     let positions: Vec<usize> = (0..order.len()).collect();
-    let probes: Vec<(u64, Option<Ast>)> = {
-        let cache: &ResolveCache = cache;
-        par_map(&positions, |&pos| {
-            let disc = &discs[order[pos]];
-            let text_hash = hash_str(&disc.text);
-            (text_hash, cache.parsed(&keys[pos], text_hash, disc.file_id, exp_hashes[pos]))
-        })
-    };
-    for ((pos, &di), (key, (text_hash, hit))) in order.iter().enumerate().zip(keys.into_iter().zip(probes)) {
-        let disc = &discs[di];
-        match hit {
-            Some(ast) => works.push(vec![FileWork {
-                path: disc.path.clone(),
-                file_id: disc.file_id,
-                ast,
-                module: disc.module,
-                segment: 0,
-                key,
-                text_hash,
-                exp_hash: exp_hashes[pos],
-            }]),
-            None => {
-                works.push(Vec::new());
-                todo.push(pos);
-            }
-        }
-    }
-    let parsed = par_map(&todo, |&pos| -> Result<(Vec<FileWork>, Option<Ast>), Diag> {
+    // Each file's works: one, or one per item segment (see below).
+    let parsed = par_map(&positions, |&pos| -> Result<Vec<FileWork>, Diag> {
         let di = order[pos];
         let disc = &discs[di];
         let lexed = streams[di].lock().unwrap().take().unwrap_or_else(|| std::sync::Arc::new(lexer::Lexed { tokens: Vec::new(), strings: Vec::new() }));
@@ -3676,10 +3630,8 @@ fn resolve_one(
                 Err(_) => vec![parser::parse(&lexed, interner, known)?],
             }
         };
-        let store = keep.then(|| asts[0].clone());
-        let key = job.file_key(&modules::canonical_string(&disc.path), disc.module);
         let text_hash = hash_str(&disc.text);
-        let works = asts
+        Ok(asts
             .into_iter()
             .enumerate()
             .map(|(k, ast)| FileWork {
@@ -3688,28 +3640,19 @@ fn resolve_one(
                 ast,
                 module: disc.module,
                 segment: k,
-                key: key.clone(),
+                key: keys[pos].clone(),
                 text_hash,
-                exp_hash: 0,
+                exp_hash: exp_hashes[pos],
             })
-            .collect();
-        Ok((works, store))
+            .collect())
     });
-    for (&pos, r) in todo.iter().zip(parsed) {
+    let mut works: Vec<FileWork> = Vec::with_capacity(order.len());
+    for r in parsed {
         match r {
-            Ok((mut ws, store)) => {
-                if let Some(ast) = store {
-                    cache.put_parsed(&ws[0].key, ws[0].text_hash, ws[0].file_id, exp_hashes[pos], ast);
-                }
-                for w in &mut ws {
-                    w.exp_hash = exp_hashes[pos];
-                }
-                works[pos] = ws;
-            }
+            Ok(ws) => works.extend(ws),
             Err(d) => return Err(OneError { diags: vec![d], seen, std_asks }),
         }
     }
-    let mut works: Vec<FileWork> = works.into_iter().flatten().collect();
     lap!("resolve: expand+parse");
     // The module of every item list, by (works index, inline path).
     let mut list_module: FxMap<ItemListKey, ModuleId> = FxMap::default();
@@ -8953,9 +8896,9 @@ mod tests {
         assert_eq!(first.body_hashes, second.body_hashes);
         assert_eq!(first.structure_hash, second.structure_hash);
         assert_eq!(first.ast.items.len(), second.ast.items.len());
-        // The cache now holds parsed Asts and final chunks, and the
-        // assembled chunk scans equal a fresh scan of the merged Ast.
-        assert!(cache.files.values().all(|f| f.parsed.is_some() && f.final_chunk.is_some()), "every file is cached");
+        // The cache now holds final chunks, and the assembled chunk
+        // scans equal a fresh scan of the merged Ast.
+        assert!(cache.files.values().all(|f| f.final_chunk.is_some()), "every file is cached");
         let fresh = crate::driver::ast_hash::scan_ast(&second.ast);
         assert_eq!(
             second.scans.items.iter().map(|i| i.hash).collect::<Vec<_>>(),
