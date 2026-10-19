@@ -548,9 +548,6 @@ struct FileWork {
     /// final-chunk lookup and store at flatten time.
     key: String,
     text_hash: u64,
-    /// True when the file's expansion reads outside data: its
-    /// parsed Ast and final chunk are never cached.
-    outside: bool,
     /// The hash of the expanded token stream this Ast came from:
     /// a final-chunk hit needs it to stand too, because a macro
     /// environment change can move bodies without moving the
@@ -947,13 +944,13 @@ struct CachedFile {
     /// The expanded token stream the parser consumes (cfg-name
     /// checking and expansion already applied to `raw`), with the
     /// hash of every other input that expansion read
-    /// (`expansion_input_hash`) and the outside reads it recorded.
+    /// (`expansion_input_hash`) and the outside reads it recorded (a
+    /// hit stands while they read the same, `expand::deps_stale_in`).
     expanded: Option<(u64, lexer::PackedLexed, Vec<crate::expand::Dep>, u64)>,
     /// The parsed Ast with the hash of the expanded token stream
     /// it was parsed from. Expansion answers depend on the whole
     /// crate's macro environment, so own text alone cannot key a
-    /// parsed Ast; the expanded stream's own hash can. Never
-    /// stored for a file whose expansion reads outside data.
+    /// parsed Ast; the expanded stream's own hash can.
     parsed: Option<(u64, Ast)>,
     /// What the file asks of std, with the length of the text it was
     /// read from (`ResolveCache::std_asks`).
@@ -1021,15 +1018,6 @@ impl FinalChunk {
     }
 }
 
-/// True when a file's expansion can read data outside its own text
-/// (`env!`, the `include!` family): its expanded stream must never be
-/// cached across requests, because the outside data can change while
-/// the text stands. The raw stream is only lexing and stays cacheable.
-fn reads_outside(text: &str) -> bool {
-    const NEEDLES: &[&str] = &["env!", "option_env!", "include!", "include_str!", "include_bytes!"];
-    NEEDLES.iter().any(|n| text.contains(n))
-}
-
 /// The cfg-environment fingerprint a cache's entries were built under.
 fn env_fingerprint(input: &CrateInput) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1051,9 +1039,8 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
     input.env.allow_lust_dev.hash(&mut h);
     // Cargo env values, per-dependency build script cfg outputs, and
     // each dependency's own selection (features, edition, lib root):
-    // files that read env are never cached, but a `rustc-cfg` or
-    // feature change re-expands a dependency's files, so the
-    // fingerprint must move (a path dependency's `default` feature
+    // a `rustc-cfg` or feature change re-expands a dependency's files,
+    // so the fingerprint must move (a path dependency's `default` feature
     // edit kept its old `cfg!(feature)` answers, w-daemon-sound).
     for (k, v) in &input.cargo_env {
         k.hash(&mut h);
@@ -1075,8 +1062,9 @@ fn env_fingerprint(input: &CrateInput) -> u64 {
     }
     dep_fp(&input.deps, &mut h);
     input.crate_ids.stable.0.hash(&mut h);
-    // `file!` text: a shown root change re-expands every file. (The env
-    // is not here: files that read it are never cached, see `reads_outside`.)
+    // `file!` text: a shown root change re-expands every file. (The
+    // client env is not here: an expansion that read env keeps the
+    // values it saw, and a hit needs them to stand, `deps_stale_in`.)
     input.client.shown_root.hash(&mut h);
     // `file!()` expands relative to it.
     input.display_root.hash(&mut h);
@@ -1191,11 +1179,18 @@ impl ResolveCache {
     }
 
     /// The cached expansion of one file whose other inputs hash to
-    /// `input_hash` (`expansion_input_hash`), unpacked, with the stream's
-    /// own `hash_lexed`.
-    fn expanded(&self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64) -> Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)> {
+    /// `input_hash` (`expansion_input_hash`) and whose outside reads are
+    /// not `stale`, unpacked, with the stream's own `hash_lexed`.
+    fn expanded(
+        &self,
+        key: &str,
+        text_hash: u64,
+        file_id: FileId,
+        input_hash: u64,
+        stale: &dyn Fn(&[crate::expand::Dep]) -> bool,
+    ) -> Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)> {
         match self.peek(key, text_hash, file_id).and_then(|e| e.expanded.as_ref()) {
-            Some((h, l, deps, exp_hash)) if *h == input_hash => Some((std::sync::Arc::new(l.unpack()), deps.clone(), *exp_hash)),
+            Some((h, l, deps, exp_hash)) if *h == input_hash && !stale(deps) => Some((std::sync::Arc::new(l.unpack()), deps.clone(), *exp_hash)),
             _ => None,
         }
     }
@@ -3433,7 +3428,9 @@ fn resolve_one(
         // A daemon session keeps each file's expansion: a file whose
         // text and other expansion inputs stand takes it back instead
         // of expanding again (a signature edit used to re-expand every
-        // file of the crate). Files that read outside data never do.
+        // file of the crate). An expansion that read outside data (`env!`,
+        // the `include!` family) comes back only while each of those reads
+        // reads the same (`expand::deps_stale_in`).
         let keep = !cache.one_shot;
         let env_hash = if keep { expansion_env_hash(&menv, job, input, client) } else { 0 };
         let owned_hashes: Vec<u64> = if keep { menv.owned_all.iter().map(|o| hash_tokens(&o.tokens, &o.strings) ^ o.magic.0 as u64).collect() } else { Vec::new() };
@@ -3441,7 +3438,7 @@ fn resolve_one(
             .iter()
             .enumerate()
             .map(|(di, d)| {
-                (keep && d.lexed.is_some() && !reads_outside(&d.text)).then(|| {
+                (keep && d.lexed.is_some()).then(|| {
                     let key = job.file_key(&cache.canon(&d.path), d.module);
                     (key, hash_str(&d.text), expansion_input_hash(env_hash, &menv, &owned_hashes, di, &module_paths[di], &d.path))
                 })
@@ -3451,7 +3448,9 @@ fn resolve_one(
         let exp_hits: Vec<std::sync::Mutex<Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>>> = {
             let cache: &ResolveCache = cache;
             par_map(&(0..exp_keys.len()).collect::<Vec<_>>(), |&di| {
-                std::sync::Mutex::new(exp_keys[di].as_ref().and_then(|(key, th, ih)| cache.expanded(key, *th, discs[di].file_id, *ih)))
+                std::sync::Mutex::new(exp_keys[di].as_ref().and_then(|(key, th, ih)| {
+                    cache.expanded(key, *th, discs[di].file_id, *ih, &|deps| crate::expand::deps_stale_in(deps, &input.cargo_env, client))
+                }))
             })
         };
         exp_known.clear();
@@ -3608,21 +3607,19 @@ fn resolve_one(
     let mut works: Vec<Vec<FileWork>> = Vec::with_capacity(order.len());
     let mut todo: Vec<usize> = Vec::new();
     // Each file's cache key (the canonical path memo is the cache's own,
-    // so serial), then its text hash, outside flag and cached parse in
-    // parallel: cloning every unchanged file's Ast in one loop cost a
+    // so serial), then its text hash and cached parse in parallel: cloning every unchanged file's Ast in one loop cost a
     // warm tsgo merge about 0.25 s (perf, merge 11).
     let keys: Vec<String> = order.iter().map(|&di| job.file_key(&cache.canon(&discs[di].path), discs[di].module)).collect();
     let positions: Vec<usize> = (0..order.len()).collect();
-    let probes: Vec<(u64, bool, Option<Ast>)> = {
+    let probes: Vec<(u64, Option<Ast>)> = {
         let cache: &ResolveCache = cache;
         par_map(&positions, |&pos| {
             let disc = &discs[order[pos]];
-            let (text_hash, outside) = (hash_str(&disc.text), reads_outside(&disc.text));
-            let hit = if outside { None } else { cache.parsed(&keys[pos], text_hash, disc.file_id, exp_hashes[pos]) };
-            (text_hash, outside, hit)
+            let text_hash = hash_str(&disc.text);
+            (text_hash, cache.parsed(&keys[pos], text_hash, disc.file_id, exp_hashes[pos]))
         })
     };
-    for ((pos, &di), (key, (text_hash, outside, hit))) in order.iter().enumerate().zip(keys.into_iter().zip(probes)) {
+    for ((pos, &di), (key, (text_hash, hit))) in order.iter().enumerate().zip(keys.into_iter().zip(probes)) {
         let disc = &discs[di];
         match hit {
             Some(ast) => works.push(vec![FileWork {
@@ -3633,7 +3630,6 @@ fn resolve_one(
                 segment: 0,
                 key,
                 text_hash,
-                outside,
                 exp_hash: exp_hashes[pos],
             }]),
             None => {
@@ -3675,8 +3671,7 @@ fn resolve_one(
                 Err(_) => vec![parser::parse(&lexed, interner, known)?],
             }
         };
-        let outside = reads_outside(&disc.text);
-        let store = if outside || !keep { None } else { Some(asts[0].clone()) };
+        let store = keep.then(|| asts[0].clone());
         let key = job.file_key(&modules::canonical_string(&disc.path), disc.module);
         let text_hash = hash_str(&disc.text);
         let works = asts
@@ -3690,7 +3685,6 @@ fn resolve_one(
                 segment: k,
                 key: key.clone(),
                 text_hash,
-                outside,
                 exp_hash: 0,
             })
             .collect();
@@ -4013,7 +4007,7 @@ fn resolve_one(
         }
         w.ast.items = flat_items;
         pendings.push(Pending {
-            cacheable: !w.outside && keep,
+            cacheable: keep,
             key: w.key,
             text_hash: w.text_hash,
             exp_hash: w.exp_hash,

@@ -793,8 +793,20 @@ pub fn deps_stale_with(deps: &[Dep], env: &dyn Fn(&str) -> Option<String>) -> bo
 /// `deps_stale_with` against `client`, the view this request expands
 /// under (ARCH 6.4): its env, and how it shows the paths `file!` read.
 pub fn deps_stale(deps: &[Dep], client: &ClientView) -> bool {
-    deps_stale_with(deps, &|name| client.env_var(name))
+    deps_stale_in(deps, &[], client)
+}
+
+/// `deps_stale` for an expansion under a crate's Cargo env, its env names read as the
+/// expander reads them (`env_value`): the multi-file resolver's expansion cache.
+pub fn deps_stale_in(deps: &[Dep], cargo_env: &[(String, String)], client: &ClientView) -> bool {
+    deps_stale_with(deps, &|name| env_value(cargo_env, client, name))
         || deps.iter().any(|dep| matches!(dep, Dep::Shown { path, shown } if client.shown(path) != *shown))
+}
+
+/// The compile-time value of env var `name`: the crate's Cargo env first (Cargo sets those
+/// vars in the rustc process, over the inherited ones), then the requesting client's env.
+pub fn env_value(cargo_env: &[(String, String)], client: &ClientView, name: &str) -> Option<String> {
+    cargo_env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).or_else(|| client.env_var(name))
 }
 
 /// One segment of a macro call path.
@@ -1445,11 +1457,9 @@ impl<'a> Expander<'a> {
         shown
     }
 
-    /// The compile-time value of env var `name`: this crate's Cargo
-    /// env first (Cargo sets those vars in the rustc process, over the
-    /// inherited ones), then the requesting client's env.
+    /// The compile-time value of env var `name` (`env_value`).
     pub fn env_lookup(&self, name: &str) -> Option<String> {
-        self.ctx.cargo_env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).or_else(|| self.ctx.client.env_var(name))
+        env_value(&self.ctx.cargo_env, self.ctx.client, name)
     }
 
     /// Records an env var a builtin read and the value it saw.
