@@ -722,6 +722,23 @@ pub fn sweep_bases(base_dir: &Path, exiting_pid: u32) {
     }
 }
 
+/// A thread a build starts early for an answer it takes later (`take`). Dropped untaken, it
+/// is joined: no thread of a build outlives it (the image's background save forks after).
+struct Joined<T>(Option<std::thread::JoinHandle<T>>);
+
+impl<T> Joined<T> {
+    /// The thread's answer; None when it panicked, or once taken.
+    fn take(&mut self) -> Option<T> {
+        self.0.take().and_then(|h| h.join().ok())
+    }
+}
+
+impl<T> Drop for Joined<T> {
+    fn drop(&mut self) {
+        self.take();
+    }
+}
+
 /// Runs `f` for each item on all cores, on the persistent pool (src/pool.rs).
 /// Results keep the input order.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -4789,6 +4806,67 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             cgen::fn_unit(&program, &caches.out, &groups[g - FIRST_FN_UNIT].clone().collect::<Vec<_>>(), &caches.glue, &register, Some(main_slot))
         }
     };
+    // Release C: whether fn bodies are LLVM IR (cgen/ll.rs), and B1's switches.
+    let llvm_on = cgen::names::with(rn, || cgen::ll::on(&program));
+    // B1 (`cgen::record`): each C fn unit records the pieces it is made of and what it
+    // read, and the next build sets the record against its program
+    // (`Caches::unit_records`). A session that keeps its caches (a daemon, a front
+    // image) skips the assembly of a unit whose reads all kept their fingerprints and
+    // whose object the unit memo holds (`cc::memo_misses`): cc takes its fingerprint and
+    // no text (LUST_B1=0 turns it off). Not with --emit-c (it writes every unit) nor for
+    // LLVM units (never recorded). LUST_CHECK_UNIT_FP=1 is the oracle: every unit
+    // assembles, a unit clean by its reads must have the same pieces, and cc's memo the
+    // same key for its fingerprint. LUST_B1_OBSERVE=1 prints the counts.
+    let b1_observe = std::env::var_os("LUST_B1_OBSERVE").is_some_and(|v| v == "1");
+    let b1_check = !llvm_on && std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
+    let b1_skip = !llvm_on
+        && !b1_check
+        && caches.persistent
+        && req.cc
+        && req.emit_c.is_none()
+        && std::env::var_os("LUST_B1").is_none_or(|v| v != "0");
+    let b1_record = b1_observe || b1_check || b1_skip;
+    // Release C copies from a pinned profile (`LUST_PGO_COPIES=<profdata>`, read by the
+    // instrumented build and the use build alike, so both copy the same callees and a
+    // caller's profile record matches its use): the fns it ran `LUST_PGO_COPY_MIN`
+    // times or more (default 1000) get copies of the callees it ran as often.
+    let copy_hot = match std::env::var_os("LUST_PGO_COPIES").filter(|_| rgroups.is_some() && !llvm_on) {
+        Some(path) => {
+            let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+            match crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, "pgo-copies.memo") {
+                Ok(h) => Some(h),
+                Err(e) => return Response { stderr: format!("error: LUST_PGO_COPIES: {e}\n"), code: 3, ..Default::default() },
+            }
+        }
+        None => None,
+    };
+    // B1's memo pre-check (`cc::memo_misses`) reads the unit memo (10 MB for tsgo), stats each
+    // unit's object and, for the memo's tag, asks the compiler its version: 60-90 ms on a boat
+    // box with the page cache dropped, more on a CI job's cold disk, and the fn units waited
+    // for it. It starts here on a thread of its own, beside the glue shards and B1's
+    // fingerprints, for every unit the last build recorded (which of them are clean is known
+    // only then).
+    let mut b1_memo = Joined(match &rgroups {
+        Some(rg) if b1_skip && !caches.unit_records.is_empty() => {
+            let bare: Vec<crate::cc::UnitIn> = rg
+                .iter()
+                .enumerate()
+                .filter_map(|(g, (reg, _))| {
+                    let fp = caches.unit_records.get(reg)?.fp;
+                    Some(crate::cc::UnitIn { name: format!("u{}", g + FIRST_FN_UNIT), fp: Some(fp), text: None })
+                })
+                .collect();
+            let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple().to_string() } else { req.session.target_triple.clone() };
+            let (file, debug, work) = (req.file.clone(), req.debug, dir.join("cc"));
+            Some(std::thread::spawn(move || -> std::collections::HashSet<String> {
+                match crate::cc::spec_for(&triple) {
+                    Ok(spec) => crate::cc::memo_misses(&bare, &spec, debug, crate::driver::cache::Cache::open(&file).as_ref(), &work).into_iter().collect(),
+                    Err(_) => bare.into_iter().map(|u| u.name).collect(),
+                }
+            }))
+        }
+        _ => None,
+    });
     asm_ms[0] = t_asm.elapsed().as_secs_f64() * 1e3;
     // The cc stream, started during codegen (above).
     let stream = stream_start.and_then(|h| h.join().ok()).flatten();
@@ -4820,7 +4898,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // One layout phase (cgen `in_layout_phase`): the program is frozen, so each
             // worker keeps its `c_layout` answers across the units it assembles.
             let asm_tag = cgen::layout_phase();
-            let llvm_on = cgen::names::with(rn, || cgen::ll::on(&program));
             // The LLVM backend: C that calls an LLVM fn through its C ABI wrapper gets the
             // wrapper inline (`cgen::ll::Adapters`); an LLVM unit's own wrappers stay external.
             let adapters = if llvm_on { cgen::ll::Adapters::new(&caches.out) } else { None };
@@ -4836,40 +4913,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                 }
             }
-            // B1 (`cgen::record`): each C fn unit records the pieces it is made of and what it
-            // read, and the next build sets the record against its program
-            // (`Caches::unit_records`). A session that keeps its caches (a daemon, a front
-            // image) skips the assembly of a unit whose reads all kept their fingerprints and
-            // whose object the unit memo holds (`cc::memo_misses`): cc takes its fingerprint and
-            // no text (LUST_B1=0 turns it off). Not with --emit-c (it writes every unit) nor for
-            // LLVM units (never recorded). LUST_CHECK_UNIT_FP=1 is the oracle: every unit
-            // assembles, a unit clean by its reads must have the same pieces, and cc's memo the
-            // same key for its fingerprint. LUST_B1_OBSERVE=1 prints the counts.
-            let b1_observe = std::env::var_os("LUST_B1_OBSERVE").is_some_and(|v| v == "1");
-            let b1_check = !llvm_on && std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
-            let b1_skip = !llvm_on
-                && !b1_check
-                && caches.persistent
-                && req.cc
-                && req.emit_c.is_none()
-                && std::env::var_os("LUST_B1").is_none_or(|v| v != "0");
-            let b1_record = b1_observe || b1_check || b1_skip;
             type B1Rec = (usize, Option<((u64, u64), Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
-            // Release C copies from a pinned profile (`LUST_PGO_COPIES=<profdata>`, read by the
-            // instrumented build and the use build alike, so both copy the same callees and a
-            // caller's profile record matches its use): the fns it ran `LUST_PGO_COPY_MIN`
-            // times or more (default 1000) get copies of the callees it ran as often.
-            let copy_hot = match std::env::var_os("LUST_PGO_COPIES").filter(|_| !llvm_on) {
-                Some(path) => {
-                    let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
-                    match crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, "pgo-copies.memo") {
-                        Ok(h) => Some(h),
-                        Err(e) => return Response { stderr: format!("error: LUST_PGO_COPIES: {e}\n"), code: 3, ..Default::default() },
-                    }
-                }
-                None => None,
-            };
             // A unit's identity: its registration name, fns and main slot, the switches every
             // unit reads, every LUST_* knob but paths, B1's own and the cc stream's (`cc::Stream`
             // changes no unit's text), the copies profile's hot set (the copy choice reads it),
@@ -5039,17 +5084,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 let fp_now = |r: &cgen::record::Read| table.find(r).and_then(|i| now.get(i as usize).copied().flatten());
                 b1_ms[2] = t_clean.elapsed().as_secs_f64() * 1e3;
                 let mut b1_skipped = vec![false; rg.len()];
-                if b1_skip && b1_clean.iter().any(Option::is_some) {
-                    let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
-                    let bare: Vec<crate::cc::UnitIn> = b1_clean
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(g, fp)| fp.map(|fp| crate::cc::UnitIn { name: format!("u{}", g + FIRST_FN_UNIT), fp: Some(fp), text: None }))
-                        .collect();
-                    let lost: std::collections::HashSet<String> = match crate::cc::spec_for(triple) {
-                        Ok(spec) => crate::cc::memo_misses(&bare, &spec, req.debug, crate::driver::cache::Cache::open(&req.file).as_ref(), &dir.join("cc")).into_iter().collect(),
-                        Err(_) => bare.iter().map(|u| u.name.clone()).collect(),
-                    };
+                // The memo pre-check's answer (`b1_memo`); none when its thread panicked, and then
+                // every clean unit assembles.
+                if b1_skip
+                    && b1_clean.iter().any(Option::is_some)
+                    && let Some(lost) = b1_memo.take()
+                {
                     for (g, skip) in b1_skipped.iter_mut().enumerate() {
                         *skip = b1_clean[g].is_some() && !lost.contains(&format!("u{}", g + FIRST_FN_UNIT));
                     }
