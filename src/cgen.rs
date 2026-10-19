@@ -9309,6 +9309,24 @@ impl GlueSet {
         collect_types(&k.1, out);
         self.types.get(k).into_iter().flatten().for_each(|t| collect_types(t, out));
     }
+
+    /// True for drop glue of a struct, enum, Option, Result, tuple, array or RefCell: it
+    /// passes each field's address to the field's own glue and reads through none of the
+    /// pointers it holds (an Rc's glue reads the counts, a Vec's its elements).
+    fn passes_fields(k: &(Glue, CTy)) -> bool {
+        k.0 == Glue::Drop && matches!(k.1, CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::RefCell(_))
+    }
+
+    /// `def_types` for a definition that `passes_fields`: the types it holds by value
+    /// (its key type, whose fields it reads) go to `held`, and every type it names to
+    /// `named`, which a unit only declares.
+    fn held_types(&self, k: &(Glue, CTy), held: &mut HashSet<CTy>, named: &mut HashSet<CTy>) {
+        let mut by_value = Vec::new();
+        by_value_deps(&k.1, &mut by_value);
+        self.types.get(k).into_iter().flatten().for_each(|t| by_value_deps(t, &mut by_value));
+        held.extend(by_value);
+        self.def_types(k, named);
+    }
 }
 
 /// True for an enum whose variants have no fields and whose `==` is structural (no
@@ -10655,6 +10673,9 @@ pub fn fn_unit_parts(
     // through its helpers' C (`cc` links it into the IR).
     let mut inl_glue: HashSet<&(Glue, CTy)> = HashSet::new();
     // What the inline glue reads, one step through pointers (`type_decls_with`'s `deep`).
+    // Drop glue that only passes its fields on (`GlueSet::passes_fields`) holds its types as
+    // the unit's own code does: an Option of an Rc then needs no layout of the Rc's value,
+    // so the unit does not change when that value's struct does.
     let mut glue_types: HashSet<CTy> = HashSet::new();
     if inline {
         let plain = |k: &(Glue, CTy)| {
@@ -10679,7 +10700,11 @@ pub fn fn_unit_parts(
                     budget -= n;
                 }
                 inl_glue.insert(k);
-                g.def_types(k, &mut glue_types);
+                if GlueSet::passes_fields(k) {
+                    g.held_types(k, &mut types, &mut named);
+                } else {
+                    g.def_types(k, &mut glue_types);
+                }
                 for d in g.deps.get(k).into_iter().flatten() {
                     collect_types(&d.1, &mut named);
                     if seen.insert(d) {
@@ -13005,6 +13030,51 @@ mod tests {
         });
         assert!(regen, "field type edit regenerates the Debug glue");
         assert_ne!(text2, text1, "regenerated glue text differs");
+    }
+
+    /// Release C with unwind tables: a fn that drops an enum through `&mut` gets the enum's
+    /// one-arm drop glue inline, and that glue only passes its `Rc` field to the Rc's own glue
+    /// (a call: dropping `Big` can panic, so it keeps its cleanup frame). The unit defines the
+    /// enum, but neither the Rc's counted block nor `Big`: holding `Big`'s size made every
+    /// unit that dropped such an enum change with `Big` (tsgo's merges 9 and 11).
+    #[test]
+    fn inline_drop_glue_defines_no_type_behind_a_field() {
+        let src = "use std::rc::Rc;\nstruct D;\nimpl Drop for D { fn drop(&mut self) {} }\nstruct Big { a: u64, d: D }\n\
+                   enum E { A, B(Rc<Big>) }\nfn clear(e: &mut E) { *e = E::A; }\n\
+                   fn main() { let mut e = E::B(Rc::new(Big { a: 1, d: D })); clear(&mut e); }\n";
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let mut program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        (program.unwind, program.unwind_tables) = (true, true);
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let n = program.fns.len();
+        let slots: Vec<u32> = (0..n as u32).collect();
+        let names = std::sync::Arc::new(names::Names {
+            fns: (0..n).map(|s| Some(format!("{s:016x}"))).collect(),
+            adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
+            by_id: Default::default(),
+        });
+        let clear = program.fn_names[&interner.intern("clear")];
+        let (big, e) = (program.type_names[&interner.intern("Big")], program.type_names[&interner.intern("E")]);
+        names::with(Some(&names), || {
+            let outs: Vec<FnOut> = (0..n)
+                .map(|i| {
+                    let (ck, errs) = check_fn(&program, LocalDefId(i as u32));
+                    assert!(errs.is_empty(), "{errs:?}");
+                    gen_fn(&program, &crate::lower::lower(&program, LocalDefId(i as u32), ck), &map, 1, &slots)
+                })
+                .collect();
+            let mut glue = GlueSet::default();
+            glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
+            let unit = fn_unit(&program, &outs, &[clear.0 as usize], &glue, "lust_register_t", None);
+            let (big, e) = (ctype(&CTy::Adt(big)), ctype(&CTy::Adt(e)));
+            assert!(unit.contains(&format!("inline void drop_{e}_(")), "the enum's drop glue is inline:\n{unit}");
+            assert!(!unit.contains(&format!("struct {big} {{")) && !unit.contains(&format!("sizeof({big})")), "the unit defines no {big}:\n{unit}");
+        });
     }
 
     /// Replaces `main` with a hand-built body: an indirect call
