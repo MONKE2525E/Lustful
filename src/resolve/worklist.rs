@@ -1200,12 +1200,11 @@ impl ResolveCache {
         }
     }
 
-    /// Stores one file's expansion; returns the stream's `hash_lexed`.
-    fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64, lexed: &std::sync::Arc<lexer::Lexed>, deps: &[crate::expand::Dep]) -> u64 {
-        let exp_hash = hash_lexed(lexed);
+    /// Stores one file's expansion, packed, with the stream's `hash_lexed`.
+    #[allow(clippy::too_many_arguments)]
+    fn put_expanded(&mut self, key: &str, text_hash: u64, file_id: FileId, input_hash: u64, stream: lexer::PackedLexed, exp_hash: u64, deps: &[crate::expand::Dep]) {
         self.expansions += 1;
-        self.entry(key, text_hash, file_id).expanded = Some((input_hash, lexer::PackedLexed::pack(lexed), deps.to_vec(), exp_hash));
-        exp_hash
+        self.entry(key, text_hash, file_id).expanded = Some((input_hash, stream, deps.to_vec(), exp_hash));
     }
 
     /// The `expansions` count (see there).
@@ -3488,14 +3487,27 @@ fn resolve_one(
             crate::expand::expand_lexed_seeded_extra(spliced, &ects, &menv.seeds, extra).map(|(l, deps)| (Some(std::sync::Arc::new(l)), deps))
         });
         file_deps.resize_with(discs.len(), Vec::new);
+        // The new expansions the cache keeps (those before the first error, as a store in
+        // file order kept them), packed and hashed on the pool.
+        let stop = results.iter().position(Result::is_err).unwrap_or(results.len());
+        let to_store: Vec<(usize, &lexer::Lexed)> = results[..stop]
+            .iter()
+            .enumerate()
+            .filter_map(|(di, r)| match r {
+                Ok((Some(l), _)) if exp_keys[di].is_some() && exp_known[di].is_none() => Some((di, &**l)),
+                _ => None,
+            })
+            .collect();
+        let packed = par_map(&to_store, |&(_, l)| (lexer::PackedLexed::pack(l), hash_lexed(l)));
+        for (&(di, _), (stream, exp_hash)) in to_store.iter().zip(packed) {
+            if let (Some((key, th, ih)), Ok((_, deps))) = (&exp_keys[di], &results[di]) {
+                cache.put_expanded(key, *th, discs[di].file_id, *ih, stream, exp_hash, deps);
+                exp_known[di] = Some(exp_hash);
+            }
+        }
         for (di, r) in results.into_iter().enumerate() {
             match r {
                 Ok((l, deps)) => {
-                    if let (Some((key, th, ih)), Some(l)) = (&exp_keys[di], &l)
-                        && exp_known[di].is_none()
-                    {
-                        exp_known[di] = Some(cache.put_expanded(key, *th, discs[di].file_id, *ih, l, &deps));
-                    }
                     expanded[di] = l;
                     file_deps[di] = deps;
                 }
