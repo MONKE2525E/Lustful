@@ -124,9 +124,6 @@ fn table_lines(t: &ResolvedTables) -> Vec<String> {
         }
     }
     d.line("glob_log", &"", &t.glob_log);
-    for (s, r) in &t.name_rank {
-        d.line("name_rank", s, r);
-    }
     d.line("externs", &"", &t.externs);
     for (def, m) in &t.assoc_vis {
         for (s, v) in m {

@@ -234,16 +234,13 @@ fn seed_keys(tables: &ResolvedTables, globs: &Globs, interner: &Interner) -> Vec
             work.extend(count.iter().filter(|&(_, &n)| n >= 2).map(|(&(nsi, name), _)| (m, nsi, name)));
         }
     }
-    for (src, maps) in tables.maps.iter().enumerate() {
-        let src = ModuleId(src as u32);
-        let list = globs.importers.get(&src);
-        for (nsi, map) in maps.iter().enumerate() {
-            for (&name, state) in map {
-                if matches!(state, BindState::Ambiguous) {
-                    work.push((src, nsi as u8, name));
-                    work.extend(list.into_iter().flatten().map(|&m| (m, nsi as u8, name)));
-                }
-            }
+    // Every ambiguous name with its glob importers (`ambiguous_keys`
+    // holds every key ever made ambiguous; the order of `work` does not
+    // matter, `run_values` sorts it).
+    for &(src, nsi, name) in tables.ambiguous_keys.keys() {
+        if matches!(tables.maps[src.0 as usize][nsi as usize].get(&name), Some(BindState::Ambiguous)) {
+            work.push((src, nsi, name));
+            work.extend(globs.importers.get(&src).into_iter().flatten().map(|&m| (m, nsi, name)));
         }
     }
     work
