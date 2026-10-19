@@ -534,10 +534,15 @@ fn user_fmt_call(p: &Program, a: AdtId, kind: FmtKind, slots: &Slots, this: &str
     let rt = ctype(&ret);
     let callee = glue_callee(p, slots, m, types);
     let disc = disc_call(p, &ret, "(&r)");
+    // An unsized newtype's receiver is its fat value (`*p`): a fresh copy when the method
+    // takes it by pointer (`param_by_ptr`).
+    let mut pre = String::new();
+    let this = super::glue_args(p, m, &[this, "f"], &mut pre).swap_remove(0);
+    let pre = pre.replace('\n', "");
     Some(if ret_is_large(p, m) {
-        format!("{{ {rt} r; {callee}(&r, {this}, f); return {disc} != 0; }}")
+        format!("{{{pre} {rt} r; {callee}(&r, {this}, f); return {disc} != 0; }}")
     } else {
-        format!("{{ {rt} r = {callee}({this}, f); return {disc} != 0; }}")
+        format!("{{{pre} {rt} r = {callee}({this}, f); return {disc} != 0; }}")
     })
 }
 

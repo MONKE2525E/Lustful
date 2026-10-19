@@ -157,9 +157,19 @@ fn hasher_call(p: &Program, slots: &Slots, hc: &CTy, m: usize, h: &str, arg: &st
         },
         CTy::Adt(a) => {
             if let Some(&f) = p.gx.hasher_methods.get(&(*a, m as u8)) {
+                // `finish` takes only the hasher; a `write*` argument whose parameter goes by
+                // pointer (`param_by_ptr`) is a fresh copy, so that call is a block.
+                let mut pre = String::new();
+                let arg = if arg.is_empty() { String::new() } else { super::glue_args(p, f, &[h, arg], &mut pre).swap_remove(1) };
                 let call =
                     format!("({}({h}{}{arg}))", slots.callee(p, f), if arg.is_empty() { "" } else { ", " });
-                return if name == "finish" { call } else { format!("{call};") };
+                return if name == "finish" {
+                    call
+                } else if pre.is_empty() {
+                    format!("{call};")
+                } else {
+                    format!("{{{} {call}; }}", pre.replace('\n', ""))
+                };
             }
             match name {
                 "finish" | "write" => "0".into(),
@@ -451,8 +461,10 @@ pub(super) fn glue(p: &Program, slots: &Slots, g: &Glue, t: &CTy, need: &mut dyn
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
                 let key = key_of(map, &format!("({e}*)elem"));
                 let borrowed = borrow_expr(p, slots, &k_cty, q, &format!("({}*){key}", ctype(&k_cty)));
-                let call = format!("{}(*(lust_dyn*)ctx, *{borrowed})", slots.callee(p, dk.eq));
-                (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("  return {call};\n"))
+                let mut pre = String::new();
+                let args = super::glue_args(p, dk.eq, &["*(lust_dyn*)ctx", &format!("*{borrowed}")], &mut pre).join(", ");
+                let call = format!("{}({args})", slots.callee(p, dk.eq));
+                (format!("int heqq_{m}(void *ctx, const void *elem)"), format!("{pre}  return {call};\n"))
             } else {
                 let (k_cty, e) = (key_cty(map), ctype(&elem_cty(map)));
                 let key = key_of(map, &format!("({e}*)elem"));
@@ -491,8 +503,10 @@ fn dyn_hash_body(p: &Program, slots: &Slots, map: &CTy, dk: &crate::check::gener
     } else {
         String::new()
     };
-    let call = format!("{}(*k, &h);", slots.callee(p, f));
-    format!("  {build}\n  {call}\n  uint64_t r = {finish};{drop}\n  return r;\n")
+    let mut pre = String::new();
+    let args = super::glue_args(p, f, &["*k", "&h"], &mut pre).join(", ");
+    let call = format!("{}({args});", slots.callee(p, f));
+    format!("  {build}\n{pre}  {call}\n  uint64_t r = {finish};{drop}\n  return r;\n")
 }
 
 /// A `Q*` expression for `<K as Borrow<Q>>::borrow` of the key at `k`

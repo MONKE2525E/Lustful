@@ -1934,15 +1934,49 @@ fn param_dropped(p: &Program, t: &CTy) -> bool {
 }
 
 /// True when a by-value parameter of C type `t` crosses the C call as a
-/// pointer to a caller copy: its alignment is over 16. tcc 0.9.28 puts
-/// such an argument on the stack 8-aligned, while the callee rounds the
-/// parameter's offset up to the alignment, so the callee reads garbage
+/// pointer to a caller copy: its alignment is over 16, or it is a big
+/// aggregate in release C (`big_param_by_ptr`). tcc 0.9.28 puts an
+/// over-aligned argument on the stack 8-aligned, while the callee rounds
+/// the parameter's offset up to the alignment, so the callee reads garbage
 /// (fx-overalign). Every C signature and fn pointer type says `T *`
 /// (`param_ctype`), every call passes the address of a fresh copy
 /// (`FnGen::spill_by_ptr`), forwarding shims pass the pointer on, and
 /// the body copies the value into its local on entry (`FnGen::function`).
 fn param_by_ptr(p: &Program, t: &CTy) -> bool {
-    c_size_align(p, t).1 > 16
+    let (size, align) = c_size_align(p, t);
+    align > 16 || big_param_by_ptr(p, size)
+}
+
+/// `LUST_RELEASE_AGG_PARAM`: which by-value parameters of release C go by pointer besides the
+/// over-aligned ones.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggParam {
+    /// `0`: none.
+    Off,
+    /// Unset or `1`: those over 16 bytes.
+    Big,
+    /// `all`: every one of 9 bytes or more (a stress switch for tests: every call site,
+    /// shim and glue call must agree).
+    All,
+}
+
+fn agg_param_mode() -> AggParam {
+    static MODE: std::sync::OnceLock<AggParam> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("LUST_RELEASE_AGG_PARAM").as_deref() {
+        Ok("0") => AggParam::Off,
+        Ok("all") => AggParam::All,
+        _ => AggParam::Big,
+    })
+}
+
+/// Release C, outside the LLVM backend's C boundary (which keeps the C ABI): a parameter over
+/// 16 bytes goes by pointer to a fresh copy. The C ABI passes it in memory ("byval"): the
+/// caller builds the value in a temporary with field-sized stores, and the call copies it to
+/// the argument area in the backend, with 16-byte loads that fail to forward from those
+/// stores. A copy in C is one clang can merge with its source or split into field loads.
+fn big_param_by_ptr(p: &Program, size: u64) -> bool {
+    let mode = agg_param_mode();
+    mode != AggParam::Off && (size > 16 || (mode == AggParam::All && size >= 9)) && names::release() && !ll::on(p)
 }
 
 /// The C type of a parameter of type `t` in a signature: `T *` when the
@@ -4329,7 +4363,9 @@ impl FnGen<'_, '_> {
             _ => return None,
         };
         let (size, align) = c_size_align(self.p, &t);
-        if !(9..=16).contains(&size) || align >= 8 || ret_is_large(self.p, f) {
+        // A receiver that goes by pointer (`param_by_ptr`) is already the address of a spill
+        // here: the call takes the normal path.
+        if !(9..=16).contains(&size) || align >= 8 || ret_is_large(self.p, f) || param_by_ptr(self.p, &t) {
             return None;
         }
         let recv = &args[0];
@@ -11965,13 +12001,33 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
 /// when the method uses one (see `FnGen::call_value`).
 fn written_glue_call(p: &Program, slots: &Slots, f: LocalDefId, args: &str, types: &mut Vec<CTy>) -> String {
     let callee = glue_callee(p, slots, f, types);
+    let mut pre = String::new();
+    let args = if args.is_empty() { String::new() } else { glue_args(p, f, &args.split(", ").collect::<Vec<_>>(), &mut pre).join(", ") };
     if ret_is_large(p, f) {
         let ret = ctype(&cty(&p.tys, p.fn_info(f).ret));
-        let pre = if args.is_empty() { String::new() } else { format!(", {args}") };
-        format!("  {ret} r; {callee}(&r{pre});\n  return r;\n")
+        let rest = if args.is_empty() { String::new() } else { format!(", {args}") };
+        format!("{pre}  {ret} r; {callee}(&r{rest});\n  return r;\n")
     } else {
-        format!("  return {callee}({args});\n")
+        format!("{pre}  return {callee}({args});\n")
     }
+}
+
+/// The C arguments of a call from glue (C text with fixed signatures) to written fn `f`, from
+/// `args`, its value expressions in the order of the parameters its C signature keeps (not
+/// `param_dropped`): one whose parameter goes by pointer (`param_by_ptr`) becomes the address
+/// of a fresh copy, declared in `pre`, which goes before the call in the same block.
+fn glue_args(p: &Program, f: LocalDefId, args: &[&str], pre: &mut String) -> Vec<String> {
+    let ps: Vec<CTy> = p.fn_info(f).params.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).collect();
+    args.iter()
+        .enumerate()
+        .map(|(i, a)| match ps.get(i) {
+            Some(t) if param_by_ptr(p, t) => {
+                let _ = writeln!(pre, "  {} ga{i} = {a};", ctype(t));
+                format!("&ga{i}")
+            }
+            _ => a.to_string(),
+        })
+        .collect()
 }
 
 /// `(CAST lust_fns[SLOT])`, the callee text for glue that calls written fn `f`. Adds the C
@@ -12648,6 +12704,10 @@ fn glue_def_value(
                 let opt = CTy::Option(Box::new(CTy::Adt(ord)));
                 let callee = glue_callee(p, slots, f, types);
                 let ot = ctype(&opt);
+                let (a, b) = match &glue_args(p, f, &[a, b], &mut body)[..] {
+                    [a, b] => (a.clone(), b.clone()),
+                    _ => unreachable!("two arguments"),
+                };
                 if ret_is_large(p, f) {
                     let _ = writeln!(body, "  {ot} r; {callee}(&r, {a}, {b});");
                 } else {

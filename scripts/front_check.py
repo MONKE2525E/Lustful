@@ -599,6 +599,124 @@ fn main() {{
     raise ValueError(case)
 
 
+def agg_param(k):
+    """Callees in another module take a 24-byte struct (release C: by pointer), a 16-byte pair
+    (by value; by pointer under LUST_RELEASE_AGG_PARAM=all) and a 9-byte Option the unwrap fast
+    path reads, through direct calls, a fn pointer and a dyn method; each step edits only the
+    callees' bodies (`k`)."""
+    return f'''mod m {{
+    #[derive(Debug, Clone, Copy)]
+    pub struct Wide {{
+        pub a: u64,
+        pub b: u64,
+        pub c: u8,
+    }}
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct Pair {{
+        pub a: u64,
+        pub b: u64,
+    }}
+
+    #[inline(never)]
+    pub fn wide(x: Wide) -> u64 {{
+        x.a * {k} + x.b + x.c as u64
+    }}
+
+    #[inline(never)]
+    pub fn pair(x: Pair) -> u64 {{
+        x.a + x.b * {k}
+    }}
+
+    #[inline(never)]
+    pub fn first(o: Option<[u8; 8]>) -> u8 {{
+        o.unwrap()[0] + {k}
+    }}
+
+    pub trait Area {{
+        fn area(&self, x: Wide) -> u64;
+    }}
+
+    pub struct Sq;
+
+    impl Area for Sq {{
+        fn area(&self, x: Wide) -> u64 {{
+            x.a * x.b + {k}
+        }}
+    }}
+}}
+
+fn main() {{
+    let w = m::Wide {{ a: 2, b: 3, c: 4 }};
+    let f: fn(m::Wide) -> u64 = m::wide;
+    let s: &dyn m::Area = &m::Sq;
+    println!("{{}} {{}} {{}} {{}} {{}}", m::wide(w), f(w), m::pair(m::Pair {{ a: 5, b: 6 }}), m::first(std::hint::black_box(Some([9u8; 8]))), s.area(w));
+}}
+'''
+
+
+def agg_layout(grow):
+    """A struct grows from 16 to 24 bytes and an array struct from 8 to 9 (and back), so the
+    callees that take them by value change their C parameter passing, while the callers' text
+    (`mid`, `main`) stays the same."""
+    extra, init, add, n = (",\n    pub c: u8", ", c: 1", " + self.c as u64", 9) if grow else ("", "", "", 8)
+    return f'''mod m {{
+    #[derive(Debug, Clone, Copy)]
+    pub struct S {{
+        pub a: u64,
+        pub b: u64{extra}
+    }}
+
+    impl S {{
+        pub fn new(x: u64) -> S {{
+            S {{ a: x, b: x + 1{init} }}
+        }}
+
+        pub fn total(self) -> u64 {{
+            self.a + self.b{add}
+        }}
+    }}
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct T {{
+        pub a: [u8; {n}],
+    }}
+
+    impl T {{
+        pub fn new(x: u8) -> T {{
+            T {{ a: [x; {n}] }}
+        }}
+    }}
+
+    #[inline(never)]
+    pub fn use_s(s: S) -> u64 {{
+        s.total()
+    }}
+
+    #[inline(never)]
+    pub fn use_t(t: T) -> u64 {{
+        t.a.iter().map(|&b| b as u64).sum()
+    }}
+
+    #[inline(never)]
+    pub fn pass(s: S, t: T) -> (S, T) {{
+        (s, t)
+    }}
+}}
+
+fn mid(x: u64) -> u64 {{
+    let s = m::S::new(x);
+    let f: fn(m::S) -> u64 = m::use_s;
+    let (s2, t2) = m::pass(s, m::T::new(x as u8));
+    m::use_s(s) + f(s2) + m::use_t(t2)
+}}
+
+fn main() {{
+    println!("{{}} {{}}", mid(3), mid(7));
+}}
+'''
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -745,6 +863,16 @@ def corpus():
     # Sol's review cases for a kept type store (B1-PLAN.md), each through three versions.
     for case in ("rename", "params", "lifetimes", "closure", "hidden", "array", "layout", "instance"):
         seqs.append((f"b1-{case}", [b1_case(case, v) for v in range(3)]))
+    # The release C ABI parameter mode (LUST_RELEASE_AGG_PARAM) default -> all -> default -> 0 -> default, a
+    # callee-body edit at each step; and layout edits across 8/9 and 16/17 bytes under
+    # unchanged callers (each mode).
+    ap = [agg_param(k) for k in (3, 4, 5, 6, 7)]
+    pmodes = [{}, {"LUST_RELEASE_AGG_PARAM": "all"}, {}, {"LUST_RELEASE_AGG_PARAM": "0"}, {}]
+    seqs.append(("agg-param-mode", ap, {"env": pmodes}))
+    seqs.append(("agg-param-mode-b1-skip", ap, {"env": pmodes, "quiet": True, "b1": "skip"}))
+    lay = [agg_layout(False), agg_layout(True), agg_layout(False)]
+    seqs.append(("agg-param-layout", lay))
+    seqs.append(("agg-param-layout-all", lay, {"env": [{"LUST_RELEASE_AGG_PARAM": "all"}] * 3}))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))
@@ -960,8 +1088,10 @@ def check_seq(name, srcs, backend, args, work, opts):
             shutil.rmtree(os.path.join(d, side), ignore_errors=True)
             os.makedirs(os.path.join(d, side))
         ce = lambda side: ["--emit-c", os.path.join(d, side, "t")] if emit else []
-        rw, ew = build([LUST, "build", "main.rs", *rel, "-o", "image.bin", *ce("ew")], img, d)
-        rc, ec = build([LUST, "build", "main.rs", *rel, "-o", "one.bin", *ce("ec")], one, d)
+        # `env`: this step's extra environment, on every side (both image chains and one-shot).
+        extra = opts["env"][step] if opts.get("env") else {}
+        rw, ew = build([LUST, "build", "main.rs", *rel, "-o", "image.bin", *ce("ew")], dict(img, **extra), d)
+        rc, ec = build([LUST, "build", "main.rs", *rel, "-o", "one.bin", *ce("ec")], dict(one, **extra), d)
         path, seen = last_path(visits, seen)
         paths.append(path)
         if rw != rc:
@@ -974,7 +1104,7 @@ def check_seq(name, srcs, backend, args, work, opts):
             problems.append(f"{where}: stderr differs, {first_diff(ew, ec)}")
             break
         if img2:
-            r2, e2 = build([LUST, "build", "main.rs", *rel, "-o", "image2.bin", *ce("ew2")], img2, d)
+            r2, e2 = build([LUST, "build", "main.rs", *rel, "-o", "image2.bin", *ce("ew2")], dict(img2, **extra), d)
             path2, seen2 = last_path(visits2, seen2)
             paths.append("chain2 " + path2)
             e2 = e2.replace("image2.bin", "OUT")
