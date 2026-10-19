@@ -2213,6 +2213,16 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
             ll_c_refs.scan(&ll);
         }
     }
+    // A session keeps every FnOut (the front image saves them whole):
+    // no growth slack.
+    let (mut code, mut glue, mut used, mut ll, mut ll_c) = (code, glue, used, ll, ll_c);
+    code.shrink_to_fit();
+    glue.shrink_to_fit();
+    types.shrink_to_fit();
+    named.shrink_to_fit();
+    used.shrink_to_fit();
+    ll.shrink_to_fit();
+    ll_c.shrink_to_fit();
     FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, ll_c_refs, inline }
 }
 
