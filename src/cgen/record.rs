@@ -65,13 +65,33 @@ pub enum Read {
 }
 
 /// What the last build recorded of one unit (the driver's `Caches::unit_records`): its
-/// identity (registration name, fns, switches), its pieces, and each read with the
-/// fingerprint it had (`cgen::read_fp`).
+/// identity (registration name, fns, switches), its pieces, each read with the fingerprint it
+/// had (`cgen::read_fp`), and the unit's fingerprint over both (`new`), the key the unit memo
+/// (`cc::UnitIn::fp`) knows its object by.
 #[derive(Clone, Debug)]
 pub struct UnitRecord {
     pub id: (u64, u64),
     pub pieces: Vec<Piece>,
     pub reads: Vec<(Read, (u64, u64))>,
+    pub fp: u128,
+}
+
+impl UnitRecord {
+    /// The record of a unit just assembled. Its fingerprint takes no read order (a record
+    /// keeps its reads as they came): the identity's hash with the sum of one hash per read
+    /// and its fingerprint, so the same identity and reads give the same fingerprint in any
+    /// build. Units differ in identity (their registration names), so two units never share one.
+    pub fn new(id: (u64, u64), pieces: Vec<Piece>, reads: Vec<(Read, (u64, u64))>) -> UnitRecord {
+        use std::hash::{Hash, Hasher};
+        let sum = reads.iter().fold(0u128, |sum, (r, f)| {
+            let mut h = crate::intern::FxHasher::default();
+            r.hash(&mut h);
+            let (a, b) = crate::driver::cache::hash128(&[&h.finish().to_le_bytes(), &f.0.to_le_bytes(), &f.1.to_le_bytes()], 15);
+            sum.wrapping_add((a as u128) << 64 | b as u128)
+        });
+        let (a, b) = crate::driver::cache::hash128(&[&id.0.to_le_bytes(), &id.1.to_le_bytes(), &sum.to_le_bytes()], 14);
+        UnitRecord { id, pieces, reads, fp: (a as u128) << 64 | b as u128 }
+    }
 }
 
 /// The open record: its pieces, their text so far, and its reads.
@@ -144,5 +164,20 @@ mod tests {
         assert_eq!(close(whole), None, "text outside the pieces");
         piece(Kind::Fixed, 0, "nothing open");
         assert!(!on() && close("nothing open").is_none(), "no record without open");
+    }
+
+    /// A unit's fingerprint follows its identity and its reads' fingerprints, not the order
+    /// the reads came in.
+    #[test]
+    fn the_unit_fingerprint_is_its_reads() {
+        let reads = vec![(Read::Fn(3), (1, 2)), (Read::Static("lust_static_a".into()), (3, 4)), (Read::Main, (5, 6))];
+        let mut turned = reads.clone();
+        turned.reverse();
+        let a = UnitRecord::new((7, 8), Vec::new(), reads.clone());
+        assert_eq!(a.fp, UnitRecord::new((7, 8), Vec::new(), turned).fp);
+        let mut moved = reads.clone();
+        moved[1].1 = (3, 5);
+        assert_ne!(a.fp, UnitRecord::new((7, 8), Vec::new(), moved).fp, "a read whose fingerprint moved");
+        assert_ne!(a.fp, UnitRecord::new((7, 9), Vec::new(), reads).fp, "another identity");
     }
 }

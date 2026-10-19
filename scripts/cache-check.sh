@@ -25,6 +25,10 @@ drc=$?
 # byte-identical, and a no-change rebuild must compile no unit.
 python3 "$root/scripts/cache_check.py" --seqs "${RELEASE_SEQS:-6}" --steps 4 --seed "${SEED:-1}" --jobs "$jobs" --release --front
 rrc=$?
+# B1's skipping (the run above is its oracle): unassembled units' objects, programs' output.
+python3 "$root/scripts/cache_check.py" --seqs "${RELEASE_SEQS:-6}" --steps 4 --seed "$((${SEED:-1} + 3))" --jobs "$jobs" --release --front --b1 skip
+src=$?
+rrc=$((rrc > src ? rrc : src))
 # The same with one fn per unit: most of a unit's types are then held only by other
 # definitions and declared as byte blocks (cgen `nested_block`), so a code path that reads
 # an Adt's fields without recording it fails to compile here.

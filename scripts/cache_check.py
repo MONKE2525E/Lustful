@@ -351,6 +351,10 @@ def check_seq(idx, srcs, threads, args, work):
         rel = ["--release", "--target", args.host, "--timings"] if args.release else []
         renv = dict(tenv, LUST_RELEASE_C="1", **args.backend_env) if args.release else tenv
         cenv = dict(renv, LUST_NO_DAEMON="1", **({"LUST_FRONT_STATE": os.path.join(d, "front")} if args.front else {}))
+        # B1 with a front image: its oracle (every unit assembles; one its recorded reads call
+        # clean must keep its text), or with --b1 skip its skipping (LUST_B1=1).
+        if args.front:
+            cenv.update({"LUST_B1": "1"} if args.b1 == "skip" else {"LUST_CHECK_UNIT_FP": "1"})
         refenv = dict(renv, LUST_NO_CACHE="1", LUST_NO_DAEMON="1")
         if args.zig:
             # A fresh zig cache with only zig's libc and runtime for the reference, the
@@ -425,6 +429,8 @@ def main():
     ap.add_argument("--daemon", action="store_true")
     ap.add_argument("--release", action="store_true", help="release driver builds; binaries must be byte-identical")
     ap.add_argument("--front", action="store_true", help="with --release: the cached builds keep a front image")
+    ap.add_argument("--b1", choices=["check", "skip"], default="check",
+                    help="with --front: B1's oracle (LUST_CHECK_UNIT_FP=1, default) or its skipping (LUST_B1=1)")
     ap.add_argument("--zig", action="store_true", help="with --release --front: musl through zig cc; zig's cache must not change a binary")
     ap.add_argument("--backend", default="c", choices=["c", "llvm"], help="with --release: the release backend")
     ap.add_argument("--keep", help="copy the steps of each failing sequence here")

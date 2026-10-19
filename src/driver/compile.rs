@@ -4686,6 +4686,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Release C: every glue key is shared (fn units hold its prototype, `glue_shards`
     // its definition: a set that follows the grouping would move with it), and the fn
     // units are `release_c::groups`.
+    // With LUST_B1_OBSERVE=1 or LUST_ASM_PARTS=1, the parts of release C assembly (ms from
+    // here): groups, glue shards, B1 before with the C units and inline sets, C refs, fn
+    // units, B1 after, the rest.
+    let t_asm = Instant::now();
+    let mut asm_ms = [0f64; 7];
     let rgroups = rnames.as_ref().map(|names| {
         caches.glue.shared = Some(caches.glue.protos.keys().cloned().collect());
         let mut file = vec![String::new(); caches.out.len()];
@@ -4710,12 +4715,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             cgen::fn_unit(&program, &caches.out, &groups[g - FIRST_FN_UNIT].clone().collect::<Vec<_>>(), &caches.glue, &register, Some(main_slot))
         }
     };
+    asm_ms[0] = t_asm.elapsed().as_secs_f64() * 1e3;
     // Release C glue shards come after the fn units (`link_fn_units` counts both).
     let mut rshards: Vec<String> = match &rgroups {
         Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, &caches.out, super::release_c::unit_bytes())),
         None => Vec::new(),
     };
     let n_shards = rshards.len();
+    asm_ms[1] = t_asm.elapsed().as_secs_f64() * 1e3;
+    // B1 (below): the release C fn units cc takes with a fingerprint, by unit name, and whether
+    // without text (a skipped assembly).
+    let mut b1_units: FxMap<String, (u128, bool)> = FxMap::default();
+    let mut b1_line: Option<String> = None;
     let mut units: Vec<(PathBuf, String)> = match &rgroups {
         None => par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay))),
         Some(rg) => {
@@ -4745,12 +4756,99 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                 }
             }
-            // B1 (observation, LUST_B1_OBSERVE=1): the pieces each C fn unit is made of and what
-            // it read (`cgen::record`), set against the last build's record. A unit whose reads
-            // all kept their fingerprints must have the same pieces (the unsound count is 0).
+            // B1 (`cgen::record`): each C fn unit records the pieces it is made of and what it
+            // read, and the next build sets the record against its program
+            // (`Caches::unit_records`). LUST_B1=1 skips the assembly of a unit whose reads all
+            // kept their fingerprints and whose object the unit memo holds (`cc::memo_misses`):
+            // cc takes its fingerprint and no text. Not with --emit-c (it writes every unit) nor
+            // for LLVM units (never recorded). LUST_CHECK_UNIT_FP=1 is the oracle: every unit
+            // assembles, a unit clean by its reads must have the same pieces, and cc's memo the
+            // same key for its fingerprint. LUST_B1_OBSERVE=1 prints the counts.
             let b1_observe = std::env::var_os("LUST_B1_OBSERVE").is_some_and(|v| v == "1");
-            type B1Rec = (String, Vec<usize>, Option<(Vec<cgen::record::Piece>, Vec<cgen::record::Read>)>);
+            let b1_check = !llvm_on && std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
+            let b1_skip = !llvm_on && !b1_check && req.cc && req.emit_c.is_none() && std::env::var_os("LUST_B1").is_some_and(|v| v == "1");
+            let b1_record = b1_observe || b1_check || b1_skip;
+            type B1Rec = (usize, Option<(Vec<cgen::record::Piece>, Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
+            // A unit's identity: its registration name, fns and main slot, the switches every
+            // unit reads, every LUST_* knob but paths and B1's own, and the compiler build.
+            let b1_switches = b1_record.then(|| {
+                let mut vars: Vec<(String, String)> = std::env::vars()
+                    .filter(|(k, _)| k.starts_with("LUST_") && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP"].iter().any(|x| k.contains(x)))
+                    .collect();
+                vars.sort();
+                let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!("{}\n{}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)), env!("LUST_BUILD_HASH"))
+            });
+            let unit_id = |g: usize| {
+                let (reg, slots) = &rg[g];
+                crate::driver::cache::hash128(&[reg.as_bytes(), format!("{slots:?} {main_slot}").as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()], 13)
+            };
+            // With LUST_B1_OBSERVE=1, where B1's own time goes (ms): the statics' declarations,
+            // the last build's reads into shards, the clean test, the memo pre-check, the new
+            // reads, the new records.
+            let mut b1_ms = [0f64; 6];
+            let t_b1 = Instant::now();
+            let b1_statics = b1_record.then(|| cgen::names::with(rn, || cgen::static_decl_map(&program))).unwrap_or_default();
+            b1_ms[0] = t_b1.elapsed().as_secs_f64() * 1e3;
+            // With LUST_B1_OBSERVE=1, the workers' time per read kind (Fn, SlotOf, Glue, Type,
+            // Static, Main) and the count of each.
+            let kind_ns: [std::sync::atomic::AtomicU64; 12] = Default::default();
+            // One read's fingerprint now (`cgen::read_fp`), in the assembly's layout phase.
+            let read_fp = |r: &cgen::record::Read| {
+                let t = b1_observe.then(Instant::now);
+                let f = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &b1_statics, r)));
+                if let Some(t) = t {
+                    use cgen::record::Read as R;
+                    let k = match r {
+                        R::Fn(_) => 0,
+                        R::SlotOf(_) => 1,
+                        R::Glue(..) => 2,
+                        R::Type(..) => 3,
+                        R::Static(_) => 4,
+                        R::Main => 5,
+                    };
+                    kind_ns[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    kind_ns[6 + k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                f
+            };
+            // Reads go to shards by their hash, so threads dedup and fingerprint them apart.
+            let b1_shards = crate::pool::threads().max(1) * 4;
+            let shard_of = |r: &cgen::record::Read| {
+                let mut h = crate::intern::FxHasher::default();
+                std::hash::Hash::hash(r, &mut h);
+                (std::hash::Hasher::finish(&h) >> 32) as usize % b1_shards
+            };
+            // The last build's records: their reads go to shards by hash, which the pass over
+            // the C units below fingerprints (each distinct read once: many units read one type)
+            // on the threads its long jobs leave idle.
+            let olds: Vec<&cgen::record::UnitRecord> = if b1_record { caches.unit_records.values().collect() } else { Vec::new() };
+            let buckets: Vec<Vec<Vec<&cgen::record::Read>>> = if olds.is_empty() {
+                Vec::new()
+            } else {
+                let parts: Vec<&[&cgen::record::UnitRecord]> = olds.chunks(olds.len().div_ceil(crate::pool::threads().max(1))).collect();
+                par_map(&parts, |part| {
+                    let mut b: Vec<Vec<&cgen::record::Read>> = vec![Vec::new(); b1_shards];
+                    for u in *part {
+                        for (r, _) in &u.reads {
+                            b[shard_of(r)].push(r);
+                        }
+                    }
+                    b
+                })
+            };
+            let shard_jobs = if buckets.is_empty() { 0 } else { b1_shards };
+            let fingerprint_shard = |t: usize| {
+                let mut m: FxMap<&cgen::record::Read, (u64, u64)> = FxMap::default();
+                for &r in buckets.iter().flat_map(|b| &b[t]) {
+                    if let std::collections::hash_map::Entry::Vacant(v) = m.entry(r) {
+                        v.insert(read_fp(r));
+                    }
+                }
+                m
+            };
+            b1_ms[1] = t_b1.elapsed().as_secs_f64() * 1e3 - b1_ms[0];
             let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>| {
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
@@ -4763,13 +4861,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                     g => {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];
-                        if b1_observe {
+                        if b1_record {
                             cgen::record::open();
                         }
                         let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs);
-                        if b1_observe {
+                        if b1_record {
                             let rec = cgen::record::close(&c);
-                            b1_records.lock().unwrap_or_else(|e| e.into_inner()).push((reg.clone(), slots.clone(), rec));
+                            b1_records.lock().unwrap_or_else(|e| e.into_inner()).push((g - FIRST_FN_UNIT, rec));
                         }
                         if adapters.is_none() {
                             return (c, h);
@@ -4792,27 +4890,72 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // release C: +11.5% at 1000, +3.7% at 100000, run speed the same.
             let copy_min: u64 = std::env::var("LUST_LL_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
             let hot = (llvm_on && copy_min > 0).then(|| crate::cc::pgo::hot_ids(&dir.join("cc"), copy_min).ok().flatten()).flatten();
+            // With B1's shards of the last build's reads (`fingerprint_shard`) last.
             let first: Vec<usize> = c_jobs.iter().copied().chain(0..rg.len()).collect();
             let mut made = Vec::with_capacity(jobs.len());
             let mut inl: Vec<Vec<usize>> = Vec::with_capacity(rg.len());
-            for (k, r) in par_map(&(0..first.len()).collect::<Vec<_>>(), |&k| {
+            let mut now: Vec<FxMap<&cgen::record::Read, (u64, u64)>> = Vec::with_capacity(shard_jobs);
+            enum Part<M, S> {
+                Made(M),
+                Inline(Vec<usize>),
+                Shard(S),
+            }
+            // With LUST_ASM_PARTS=1 (or B1 observed), each C unit's time.
+            let c_unit_ms: [std::sync::atomic::AtomicU64; 5] = Default::default();
+            for r in par_map(&(0..first.len() + shard_jobs).collect::<Vec<_>>(), |&k| {
                 if k < c_jobs.len() {
-                    Ok(assemble(first[k], &[], None))
+                    let t = Instant::now();
+                    let m = assemble(first[k], &[], None);
+                    c_unit_ms[k].store(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    Part::Made(m)
+                } else if k < first.len() {
+                    Part::Inline(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of, hot.as_ref()))
                 } else {
-                    Err(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of, hot.as_ref()))
+                    Part::Shard(fingerprint_shard(k - first.len()))
                 }
-            })
-            .into_iter()
-            .enumerate()
-            {
+            }) {
                 match r {
-                    Ok(m) => made.push(m),
-                    Err(set) => {
-                        debug_assert!(k >= c_jobs.len());
-                        inl.push(set)
-                    }
+                    Part::Made(m) => made.push(m),
+                    Part::Inline(set) => inl.push(set),
+                    Part::Shard(m) => now.push(m),
                 }
             }
+            // B1: each unit still clean by its last record keeps its old fingerprint; skipped
+            // are the clean units the unit memo can serve (their fingerprint in it, their object
+            // in the cache), and the rest assemble after all.
+            let t_clean = Instant::now();
+            let b1_clean: Vec<Option<u128>> = if now.is_empty() {
+                vec![None; rg.len()]
+            } else {
+                par_map(&(0..rg.len()).collect::<Vec<_>>(), |&g| {
+                    caches
+                        .unit_records
+                        .get(&rg[g].0)
+                        .filter(|old| old.id == unit_id(g) && old.reads.iter().all(|(r, f)| now[shard_of(r)].get(r) == Some(f)))
+                        .map(|old| old.fp)
+                })
+            };
+            // A read's fingerprint now, when a last build's record holds it.
+            let fp_now = |r: &cgen::record::Read| now.get(shard_of(r)).and_then(|m| m.get(r)).copied();
+            b1_ms[2] = t_clean.elapsed().as_secs_f64() * 1e3;
+            let mut b1_skipped = vec![false; rg.len()];
+            if b1_skip && b1_clean.iter().any(Option::is_some) {
+                let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
+                let bare: Vec<crate::cc::UnitIn> = b1_clean
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(g, fp)| fp.map(|fp| crate::cc::UnitIn { name: format!("u{}", g + FIRST_FN_UNIT), fp: Some(fp), text: None }))
+                    .collect();
+                let lost: std::collections::HashSet<String> = match crate::cc::spec_for(triple) {
+                    Ok(spec) => crate::cc::memo_misses(&bare, &spec, req.debug, crate::driver::cache::Cache::open(&req.file).as_ref(), &dir.join("cc")).into_iter().collect(),
+                    Err(_) => bare.iter().map(|u| u.name.clone()).collect(),
+                };
+                for (g, skip) in b1_skipped.iter_mut().enumerate() {
+                    *skip = b1_clean[g].is_some() && !lost.contains(&format!("u{}", g + FIRST_FN_UNIT));
+                }
+            }
+            b1_ms[3] = t_clean.elapsed().as_secs_f64() * 1e3 - b1_ms[2];
+            asm_ms[2] = t_asm.elapsed().as_secs_f64() * 1e3;
             let c_refs = cgen::names::with(rn, || cgen::ll::on(&program)).then(|| {
                 // The C units and glue shards are made this build; each fn's C was read when
                 // its FnOut was made (`FnOut::ll_c_refs`; a C body's `code` is read here).
@@ -4837,65 +4980,133 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 r
             });
-            made.extend(par_map(fn_jobs, |&u| assemble(u, &inl, c_refs.as_ref())));
-            if b1_observe {
+            asm_ms[3] = t_asm.elapsed().as_secs_f64() * 1e3;
+            made.extend(par_map(fn_jobs, |&u| match b1_skipped[u - FIRST_FN_UNIT] {
+                true => (base_obj(u), String::new(), String::new()),
+                false => assemble(u, &inl, c_refs.as_ref()),
+            }));
+            asm_ms[4] = t_asm.elapsed().as_secs_f64() * 1e3;
+            if b1_record {
                 use cgen::record::{Read, UnitRecord};
-                // The switches every unit's text may read: all LUST_* knobs but paths and B1's own.
-                let env_fp = {
-                    let mut vars: Vec<(String, String)> = std::env::vars()
-                        .filter(|(k, _)| k.starts_with("LUST_") && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "B1_", "UNIT_FP"].iter().any(|x| k.contains(x)))
-                        .collect();
-                    vars.sort();
-                    let text: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
-                    crate::driver::cache::hash128(&[text.join("\n").as_bytes()], 12)
+                let mut recs = b1_records.into_inner().unwrap_or_else(|e| e.into_inner());
+                recs.sort_unstable_by_key(|(g, _)| *g);
+                // The reads of the units assembled now that no old record holds.
+                let t_more = Instant::now();
+                let missing: Vec<Read> = {
+                    let mut m: FxMap<&Read, ()> = FxMap::default();
+                    for (_, rec) in &recs {
+                        for r in rec.iter().flat_map(|(_, reads)| reads) {
+                            if fp_now(r).is_none() {
+                                m.insert(r, ());
+                            }
+                        }
+                    }
+                    m.into_keys().cloned().collect()
                 };
-                let recs = b1_records.into_inner().unwrap_or_else(|e| e.into_inner());
-                // Every read's fingerprint now, once: the last build's reads and this one's.
-                let mut all: Vec<Read> = recs.iter().filter_map(|(_, _, r)| r.as_ref()).flat_map(|(_, reads)| reads.iter().cloned()).collect();
-                all.extend(caches.unit_records.values().flat_map(|u| u.reads.iter().map(|(r, _)| r.clone())));
-                all.sort_by_cached_key(|r| format!("{r:?}"));
-                all.dedup();
-                let t_fp = std::time::Instant::now();
-                let statics = cgen::names::with(rn, || cgen::static_decl_map(&program));
-                let fps = par_map(&all, |r| cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &statics, r))));
-                let now: FxMap<&Read, (u64, u64)> = all.iter().zip(fps).collect();
-                let fp_ms = t_fp.elapsed().as_secs_f64() * 1e3;
-                let (mut same, mut new, mut unrecorded, mut clean, mut unsound, mut missed) = (0, 0, 0, 0, 0, 0);
+                let fps = par_map(&missing, |r| read_fp(r));
+                let more: FxMap<Read, (u64, u64)> = missing.into_iter().zip(fps).collect();
+                b1_ms[4] = t_more.elapsed().as_secs_f64() * 1e3;
+                // B1's own wall time: the last build's reads fingerprint while the C units assemble.
+                let fp_ms = b1_ms[0] + b1_ms[1] + b1_ms[2] + b1_ms[3] + b1_ms[4];
+                let n_reads = now.iter().map(FxMap::len).sum::<usize>() + more.len();
+                let (mut same, mut new, mut unrecorded, mut unsound, mut missed) = (0, 0, 0, 0, 0);
+                // With LUST_B1_OBSERVE=1: in the missed units, the reads whose fingerprint moved,
+                // by kind (Fn, SlotOf, Glue, Type, Static, Main).
+                let mut moved = [0usize; 6];
                 let mut unsound_names: Vec<String> = Vec::new();
-                let mut next = FxMap::default();
-                for (reg, slots, rec) in &recs {
+                type Fresh = std::sync::Mutex<Option<(Vec<cgen::record::Piece>, Vec<(Read, (u64, u64))>)>>;
+                let mut fresh: Vec<(usize, Fresh)> = Vec::new();
+                for (g, rec) in recs {
                     let Some((pieces, reads)) = rec else {
                         unrecorded += 1;
                         continue;
                     };
-                    let id = crate::driver::cache::hash128(&[reg.as_bytes(), format!("{slots:?} {main_slot}").as_bytes(), &env_fp.0.to_le_bytes(), &env_fp.1.to_le_bytes()], 13);
+                    let reg = &rg[g].0;
                     match caches.unit_records.get(reg) {
                         Some(old) => {
-                            let same_pieces = old.pieces == *pieces;
-                            let by_reads = old.id == id && old.reads.iter().all(|(r, fp)| now.get(r) == Some(fp));
+                            let same_pieces = old.pieces == pieces;
                             same += same_pieces as usize;
-                            clean += by_reads as usize;
-                            if by_reads && !same_pieces {
+                            if b1_clean[g].is_some() && !same_pieces {
                                 unsound += 1;
                                 if unsound_names.len() < 3 {
                                     unsound_names.push(reg.clone());
                                 }
                             }
-                            missed += (same_pieces && !by_reads) as usize;
+                            missed += (same_pieces && b1_clean[g].is_none()) as usize;
+                            if b1_observe && same_pieces && b1_clean[g].is_none() && old.id == unit_id(g) {
+                                for (r, f) in &old.reads {
+                                    if fp_now(r) != Some(*f) {
+                                        moved[match r {
+                                            Read::Fn(_) => 0,
+                                            Read::SlotOf(_) => 1,
+                                            Read::Glue(..) => 2,
+                                            Read::Type(..) => 3,
+                                            Read::Static(_) => 4,
+                                            Read::Main => 5,
+                                        }] += 1;
+                                    }
+                                }
+                            }
                         }
                         None => new += 1,
                     }
-                    let reads = reads.iter().map(|r| (r.clone(), now[r])).collect();
-                    next.insert(reg.clone(), UnitRecord { id, pieces: pieces.clone(), reads });
+                    let reads = reads
+                        .into_iter()
+                        .map(|r| {
+                            let f = fp_now(&r).or_else(|| more.get(&r).copied()).unwrap_or((u64::MAX, u64::MAX));
+                            (r, f)
+                        })
+                        .collect();
+                    fresh.push((g, std::sync::Mutex::new(Some((pieces, reads)))));
+                }
+                // The new records, on every thread (each sorts its reads by their text).
+                let fresh: Vec<(usize, UnitRecord)> = par_map(&fresh, |(g, m)| {
+                    let (pieces, reads) = m.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+                    (*g, UnitRecord::new(unit_id(*g), pieces, reads))
+                });
+                if b1_check && unsound > 0 {
+                    panic!("LUST_CHECK_UNIT_FP: {unsound} C fn units are clean by their recorded reads, but their text changed: {}", unsound_names.join(", "));
+                }
+                // The next build's records: a skipped unit keeps its own, an assembled one takes
+                // its new one. cc takes each recorded unit's fingerprint; the oracle gives a unit
+                // clean by its reads its old one with its new text, so cc's memo fails a key
+                // that moved.
+                drop(now);
+                let mut old = std::mem::take(&mut caches.unit_records);
+                let mut next: FxMap<String, UnitRecord> = FxMap::default();
+                for (g, &skipped) in b1_skipped.iter().enumerate() {
+                    if skipped && let Some(r) = old.remove(&rg[g].0) {
+                        b1_units.insert(format!("u{}", g + FIRST_FN_UNIT), (r.fp, true));
+                        next.insert(rg[g].0.clone(), r);
+                    }
+                }
+                for (g, r) in fresh {
+                    if b1_check || b1_skip {
+                        let fp = if b1_check { b1_clean[g].unwrap_or(r.fp) } else { r.fp };
+                        b1_units.insert(format!("u{}", g + FIRST_FN_UNIT), (fp, false));
+                    }
+                    next.insert(rg[g].0.clone(), r);
                 }
                 caches.unit_records = next;
-                eprintln!(
-                    "b1-observe: {} C fn units, {same} the same pieces as the last build, {new} new, {unrecorded} unrecorded; by reads {clean} clean, {unsound} of them with changed pieces (unsound{}), {missed} unchanged units the reads miss; {} reads, fingerprinted in {fp_ms:.0} ms",
-                    recs.len(),
+                b1_ms[5] = t_more.elapsed().as_secs_f64() * 1e3 - b1_ms[4];
+                let line = format!(
+                    "{} C fn units, {same} the same pieces as the last build, {new} new, {unrecorded} unrecorded; by reads {} clean, {unsound} of them with changed pieces (unsound{}), {missed} unchanged units the reads miss; {} not assembled; {n_reads} reads; B1 {fp_ms:.0} ms",
+                    rg.len(),
+                    b1_clean.iter().filter(|c| c.is_some()).count(),
                     if unsound_names.is_empty() { String::new() } else { format!(": {}", unsound_names.join(", ")) },
-                    all.len()
+                    b1_skipped.iter().filter(|&&s| s).count()
                 );
+                if b1_observe {
+                    let k: Vec<u64> = kind_ns.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
+                    eprintln!(
+                        "b1-observe: {line}; worker time (count) Fn {:.0} ms ({}), SlotOf {:.0} ({}), Glue {:.0} ({}), Type {:.0} ({}), Static {:.0} ({}), Main {:.0} ({}); wall ms statics {:.0}, buckets {:.0}, clean {:.0}, memo {:.0}, new reads {:.0}, records {:.0}; moved reads in missed units {moved:?}",
+                        k[0] as f64 / 1e6, k[6], k[1] as f64 / 1e6, k[7], k[2] as f64 / 1e6, k[8], k[3] as f64 / 1e6, k[9], k[4] as f64 / 1e6, k[10], k[5] as f64 / 1e6, k[11],
+                        b1_ms[0], b1_ms[1], b1_ms[2], b1_ms[3], b1_ms[4], b1_ms[5]
+                    );
+                }
+                b1_line = Some(line);
             }
+            asm_ms[5] = t_asm.elapsed().as_secs_f64() * 1e3;
             let mut units: Vec<(PathBuf, String)> = Vec::with_capacity(made.len());
             // The LLVM backend (cgen/ll.rs): a fn unit whose fns have LLVM IR gets two
             // companions after the glue shards, its IR `u<N>.ll` and its helpers' C `u<N>.hc`,
@@ -4917,6 +5128,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
             }
             units.extend(companions);
+            asm_ms[6] = t_asm.elapsed().as_secs_f64() * 1e3;
+            if b1_observe || std::env::var_os("LUST_ASM_PARTS").is_some_and(|v| v == "1") {
+                let d: Vec<String> = (0..7).map(|i| format!("{:.0}", asm_ms[i] - if i > 0 { asm_ms[i - 1] } else { 0.0 })).collect();
+                let c: Vec<u64> = c_unit_ms.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) / 1000).collect();
+                eprintln!(
+                    "b1-observe asm parts ms: groups {}, glue shards {}, B1 before + C units + inline sets {} (main {}, statics {}, runtime {}, table {}, locations {}), C refs {}, fn units {}, B1 after {}, the rest {}",
+                    d[0], d[1], d[2], c[0], c[1], c[2], c[3], c[4], d[3], d[4], d[5], d[6]
+                );
+            }
             units
         }
     };
@@ -5034,7 +5254,19 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             Err(e) => return Response { stderr: format!("error: {e}\n"), code: 3, ..Default::default() },
         };
         let (out, debug, cc_dir) = (req.out.clone(), req.debug, dir.join("cc"));
-        let all: Vec<crate::cc::UnitIn> = all.into_iter().map(|(name, text)| crate::cc::UnitIn::text(name, text)).collect();
+        // B1: a unit with a record goes with its fingerprint, a skipped one without its text.
+        let all: Vec<crate::cc::UnitIn> = all
+            .into_iter()
+            .map(|(name, text)| match b1_units.get(&name) {
+                Some(&(fp, bare)) => crate::cc::UnitIn { name, fp: Some(fp), text: (!bare).then_some(text) },
+                None => crate::cc::UnitIn::text(name, text),
+            })
+            .collect();
+        if req.timings
+            && let Some(l) = &b1_line
+        {
+            let _ = writeln!(resp.stderr, "b1: {l}");
+        }
         let job = move || {
             let built = crate::cc::build(&all, &spec, &out, debug, cache.as_ref(), &cc_dir).map_err(|e| e.to_string());
             // A build that leaks at exit leaks the unit texts too (they moved out of `units`).

@@ -25,6 +25,8 @@
 # Three dt01 sequences take the shapes of CI jobs (rel-cache's merge 12 replay, 2026-10-18): image
 # builds that emit no C before the compared build, a jump over versions no build saw, and builds
 # that each start again from an older state (a CI disk whose commits did not land).
+# The image side runs B1's oracle (LUST_CHECK_UNIT_FP=1); dt01-b1-skip runs B1's skipping
+# (LUST_B1=1) in builds that emit no C.
 #
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: front_check.py [--jobs N] [--keep DIR] [--only NAME]
@@ -424,6 +426,9 @@ def corpus():
     seqs.append(("dt01-quiet", dt01, {"quiet": True}))
     seqs.append(("dt01-jump", dt01, {"steps": [0, 1, 5]}))
     seqs.append(("dt01-stale", dt01, {"stale_after": 1}))
+    # B1's skipping itself: builds that emit no C skip the units their reads call clean; their
+    # programs' output must match the one-shot builds'.
+    seqs.append(("dt01-b1-skip", dt01, {"quiet": True, "b1": "skip"}))
     return seqs
 
 
@@ -502,6 +507,10 @@ def check_seq(name, srcs, backend, args, work, opts):
             return name, backend, [f"{name} {backend}: llvm-profdata merge failed: {m.stderr[:300]}"], len(srcs)
         base.update(LUST_PGO_USE=prof, LUST_PROFDATA=args.pgo["profdata"])
     img = dict(base, LUST_FRONT_STATE=os.path.join(d, "front"), LUST_FRONT_SAVE="background", LUST_CACHE_DIR=os.path.join(d, "cache"), LUST_THREADS="1")
+    # B1 (release C fn units a warm build does not assemble): the image side runs its oracle
+    # (LUST_CHECK_UNIT_FP=1: every unit assembles, and one its recorded reads call clean must
+    # have the same text), or with `b1` skip the skipping itself (LUST_B1=1).
+    img.update({"LUST_B1": "1"} if opts.get("b1") == "skip" else {"LUST_CHECK_UNIT_FP": "1"})
     one = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4")
     problems = []
     lock = os.path.join(d, "front", "lock")

@@ -11310,6 +11310,15 @@ fn read_type(t: &CTy) {
     }
 }
 
+/// What every release C fn unit's text reads besides its `record::Read`s (B1): the unwind
+/// tables switch (the noreturn prototypes), whether the glue set is frozen (static glue), and
+/// release names. The fixed texts and limits are the compiler's own (its build hash), the
+/// knobs LUST_* variables (both in the driver's unit identity). A program-wide input of
+/// `fn_unit_parts` that no read names goes here. Call within the release names.
+pub fn unit_switches(p: &Program, g: &GlueSet) -> String {
+    format!("unwind_tables={} frozen_glue={} release={}", p.unwind_tables, g.shared.is_some(), names::release())
+}
+
 /// Each live static's declaration by its symbol (`read_fp`'s `statics`), made once a build.
 pub fn static_decl_map(p: &Program) -> HashMap<String, String> {
     (0..p.statics.len()).filter(|&i| p.static_live(i)).map(|i| (static_sym(p, i as u32), static_decls_for(p, &HashSet::from([i])))).collect()
@@ -11353,7 +11362,7 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
                 h(&[f.code.as_bytes(), externs.join("\n").as_bytes(), types.as_bytes(), named.as_bytes(), glue.as_bytes(), f.ll.as_bytes(), f.ll_c.as_bytes(), flags.as_bytes(), tag.as_bytes()])
             }
         },
-        Read::SlotOf(id) => h(&[format!("{:?}", names::slot_of_id(id)).as_bytes()]),
+        Read::SlotOf(id) => names::slot_of_id(id).map_or((0, 2), |s| h(&[&s.to_le_bytes()])),
         Read::Glue(k, t) => {
             let key = (*k, t.clone());
             let deps = g.deps.get(&key).map(|d| d.iter().map(|(a, b)| format!("{a:?} {}", mangle(b))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
