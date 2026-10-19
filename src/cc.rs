@@ -519,18 +519,18 @@ fn memo_tag(spec: &CcSpec, debug: bool) -> String {
     format!("memo-v1 {a:016x}{b:016x}")
 }
 
-/// Compiles every unit and links `out`. `units` are in link order (a name ending in `.cc`
-/// is C++ text, for `spec.cxx`; `u<N>.ll` and `u<N>.hc` are the IR and helpers' C of the
-/// LLVM unit `u<N>`); `work` is a scratch dir for C files and objects the caller owns, and
-/// holds the unit memo (`memo.rs`) for the next build. A unit without text needs its
-/// fingerprint in the memo and its object in the cache, else `CcError::NeedText` names the
-/// units to pass again with text (an LLVM unit's three parts come with text or without as
-/// one). Returns a one-line summary, or the compiler's error text.
-pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Option<&crate::driver::cache::Cache>, work: &Path) -> Result<String, CcError> {
-    std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
-    let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
-    let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
-    let is_cxx = |name: &str| name.ends_with(".cc");
+/// The memo state of a build (`build`, `memo_misses`): the memo's tag when the units carry
+/// fingerprints, its entries, and the names of the units passed without text that `build`
+/// cannot take, sorted: no memo entry with that name, or its object left the cache (an LLVM
+/// unit's three parts come with text or without as one). Reads the memo file and stats the
+/// cache's objects only.
+fn memo_state(
+    units: &[UnitIn],
+    spec: &CcSpec,
+    debug: bool,
+    cache: Option<&crate::driver::cache::Cache>,
+    work: &Path,
+) -> (Option<String>, std::collections::HashMap<u128, memo::Entry>, Vec<String>) {
     // The memo (`memo.rs`), for a build given fingerprints. Not with runtime IR
     // (`LUST_LL_RTINL`): LLVM unit keys hold its digest, known only after it compiles.
     let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -554,10 +554,38 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
             need.extend(ps.iter().filter(|p| p.text.is_none()).map(|p| p.name.clone()));
         }
     }
+    need.sort();
+    (tag, memo, need)
+}
+
+/// The units passed without text that `build` would send back with `CcError::NeedText`
+/// for these same inputs (one rule: `build` asks `memo_state` too). A caller that cannot
+/// answer `NeedText` later (a release cc step parked after the save fork) assembles these
+/// first. Another process can still evict an object in between: `build` then answers
+/// `NeedText`, which that caller treats as a failed build.
+pub fn memo_misses(units: &[UnitIn], spec: &CcSpec, debug: bool, cache: Option<&crate::driver::cache::Cache>, work: &Path) -> Vec<String> {
+    memo_state(units, spec, debug, cache, work).2
+}
+
+/// Compiles every unit and links `out`. `units` are in link order (a name ending in `.cc`
+/// is C++ text, for `spec.cxx`; `u<N>.ll` and `u<N>.hc` are the IR and helpers' C of the
+/// LLVM unit `u<N>`); `work` is a scratch dir for C files and objects the caller owns, and
+/// holds the unit memo (`memo.rs`) for the next build. A unit without text needs its
+/// fingerprint in the memo and its object in the cache, else `CcError::NeedText` names the
+/// units to pass again with text (an LLVM unit's three parts come with text or without as
+/// one). Returns a one-line summary, or the compiler's error text.
+pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Option<&crate::driver::cache::Cache>, work: &Path) -> Result<String, CcError> {
+    std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
+    let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
+    let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
+    let is_cxx = |name: &str| name.ends_with(".cc");
+    let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let instrumented = std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1");
+    let (tag, memo, need) = memo_state(units, spec, debug, cache, work);
     if !need.is_empty() {
-        need.sort();
         return Err(CcError::NeedText(need));
     }
+    let entry_of = |u: &UnitIn| u.fp.and_then(|fp| memo.get(&fp)).filter(|e| e.name == u.name);
     // The LLVM backend (cgen/ll.rs): a unit `u<N>.ll` is the LLVM IR of the C unit `u<N>`, and
     // `u<N>.hc` the C of its helpers; the three compile as one module into `u<N>.o`
     // (`compile_pair`) and key on all three texts. For PGO such a unit is `<name>.ll`: the
@@ -925,6 +953,37 @@ mod tests {
         match run(&[unit("u0", 2, None), unit("u1", 7, None)]) {
             Err(CcError::NeedText(n)) => assert_eq!(n, ["u0", "u1"], "a memo entry whose object left the cache needs its text"),
             r => panic!("{r:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `memo_misses` answers what `build` answers for the same inputs: the units it sends
+    /// back with `NeedText` (an LLVM unit's parts with mixed text among them), or none
+    /// when it builds.
+    #[test]
+    fn memo_misses_agrees_with_build() {
+        use super::{CcError, UnitIn};
+        let Ok(spec) = super::spec_for(crate::protocol::host_triple()) else { return };
+        let root = std::env::temp_dir().join(format!("lust-cc-misses-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = crate::driver::cache::Cache::at(&root.join("cache"));
+        let (work, bin) = (root.join("work"), root.join("bin"));
+        let main = |ret: u32| Some(format!("int f(void);\nint main(void) {{\n  return f() + {ret};\n}}\n"));
+        let f = || Some("int f(void) {\n  return 3;\n}\n".to_string());
+        let unit = |name: &str, fp: u128, text: Option<String>| UnitIn { name: name.into(), fp: Some(fp), text };
+        super::build(&[unit("u0", 1, main(1)), unit("u1", 7, f())], &spec, &bin, false, Some(&cache), &work).unwrap();
+        let cases = [
+            vec![unit("u0", 2, main(2)), unit("u1", 7, None)],
+            vec![unit("u0", 2, None), unit("u1", 8, None)],
+            vec![unit("u0", 3, main(3)), unit("u1", 7, None), unit("u1.ll", 9, Some("ir".into())), unit("u1.hc", 9, None)],
+        ];
+        for units in &cases {
+            let misses = super::memo_misses(units, &spec, false, Some(&cache), &work);
+            match super::build(units, &spec, &bin, false, Some(&cache), &work) {
+                Err(CcError::NeedText(n)) => assert_eq!(n, misses),
+                Ok(_) => assert!(misses.is_empty(), "built, but the pre-check named {misses:?}"),
+                Err(e) => panic!("{e}"),
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }
