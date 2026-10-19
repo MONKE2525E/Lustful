@@ -564,6 +564,24 @@ pub(super) fn eval_promoted(p: &Program, body: &Body) -> crate::intern::FxMap<Lo
     env
 }
 
+/// True when the assignment that defines promoted local `l` moves a value that needs
+/// drop (`&Some(D(2))` moves its `D` temp in). Skipping that assignment (`kstatic`)
+/// would skip the move too, and a dynamic drop flag (the LLVM backend's) would then drop
+/// the temp at its scope end: such a local keeps the run-time path.
+pub(super) fn moves_drop_value(p: &Program, body: &Body, local_cty: &[CTy], l: Local) -> bool {
+    let moved = |op: &Operand| matches!(op, Operand::Move(pl) if needs_drop_c(p, &local_cty[pl.local as usize]));
+    body.blocks.iter().flat_map(|b| &b.stmts).any(|s| match &s.kind {
+        StmtKind::Assign(d, rv) if d.local == l => match rv {
+            Rvalue::Use(op) | Rvalue::ArrayRepeat(_, op, _) | Rvalue::Res(_, _, op) | Rvalue::Un(_, op) | Rvalue::Cast(op, _) => moved(op),
+            Rvalue::Opt(_, x) => x.as_ref().is_some_and(moved),
+            Rvalue::Aggregate(_, _, ops) | Rvalue::TupleAgg(_, ops) | Rvalue::ArrayAgg(_, ops) => ops.iter().any(moved),
+            Rvalue::Bin(_, a, b) => moved(a) || moved(b),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 /// Per local: true for an unnamed non-parameter temp with exactly one
 /// whole-local assignment and no other write (a projection write, a
 /// call result, a mutable borrow), as `ir::byte_blob_locals` asks.

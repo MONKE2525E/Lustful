@@ -2261,7 +2261,11 @@ impl<'b, 'p> FnGen<'b, 'p> {
         let kstatic: crate::intern::FxMap<Local, crate::ty::consteval::ConstValue> = if names::release() {
             kconst::eval_promoted(p, body)
                 .into_iter()
-                .filter(|(l, v)| !byte_blobs.get(*l as usize).is_some_and(|b| b.is_some()) && kconst::entry_ok(v))
+                .filter(|(l, v)| {
+                    !byte_blobs.get(*l as usize).is_some_and(|b| b.is_some())
+                        && kconst::entry_ok(v)
+                        && !kconst::moves_drop_value(p, body, &local_cty, *l)
+                })
                 .collect()
         } else {
             Default::default()
