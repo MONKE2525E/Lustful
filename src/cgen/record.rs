@@ -56,6 +56,9 @@ pub enum Read {
     /// A callee `inline_callees` left out (by slot, and whether at a deep level): only that
     /// it is still left out (`inline_pick`), not its whole output.
     Pick(usize, bool),
+    /// A callee a copies profile saw hot that `inline_callees` left out (by slot): only that
+    /// it is still left out (`inline_pick_hot`).
+    PickHot(usize),
     /// A glue key's entry in the glue set.
     Glue(super::Glue, super::CTy),
     /// What a type's declarations print and the types they reach, with the type's release

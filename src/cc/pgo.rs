@@ -185,23 +185,29 @@ fn major_after(text: &str, marker: &str) -> Result<u32, String> {
 /// build of the same profile (a pinned profile: every merge).
 pub fn hot_ids(work: &Path, min: u64) -> Result<Option<std::collections::HashSet<u64>>, String> {
     let Some(path) = std::env::var_os("LUST_PGO_USE") else { return Ok(None) };
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", Path::new(&path).display()))?;
+    hot_ids_of(Path::new(&path), work, min, "pgo-hot.memo").map(Some)
+}
+
+/// The ids of the fns (`fl_<id>`, release C `f_<id>`) whose record in the profile at `path`
+/// has a counter of at least `min`, memoized in `work` under `memo` by the profile's bytes.
+pub fn hot_ids_of(path: &Path, work: &Path, min: u64, memo: &str) -> Result<std::collections::HashSet<u64>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let key = digest(&[b"hot", &bytes, &min.to_le_bytes()]);
-    let memo = work.join("pgo-hot.memo");
+    let memo = work.join(memo);
     if let Some(ids) = std::fs::read_to_string(&memo).ok().and_then(|m| m.strip_prefix(&format!("{key}\n")).map(str::to_string)) {
-        return Ok(Some(ids.lines().filter_map(|l| u64::from_str_radix(l, 16).ok()).collect()));
+        return Ok(ids.lines().filter_map(|l| u64::from_str_radix(l, 16).ok()).collect());
     }
-    let (_, records) = parse(&run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(&path))?);
+    let (_, records) = parse(&run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(path))?);
     let mut ids: Vec<u64> = records
         .iter()
         .filter(|(_, rs)| rs.iter().any(|r| max_counter(r) >= min))
-        .filter_map(|(name, _)| name.strip_prefix("fl_").filter(|h| h.len() == 16).and_then(|h| u64::from_str_radix(h, 16).ok()))
+        .filter_map(|(name, _)| name.strip_prefix("fl_").or_else(|| name.strip_prefix("f_")).filter(|h| h.len() == 16).and_then(|h| u64::from_str_radix(h, 16).ok()))
         .collect();
     ids.sort_unstable();
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let text: String = ids.iter().map(|id| format!("{id:016x}\n")).collect();
     std::fs::write(&memo, format!("{key}\n{text}")).map_err(|e| format!("cannot write {}: {e}", memo.display()))?;
-    Ok(Some(ids.into_iter().collect()))
+    Ok(ids.into_iter().collect())
 }
 
 /// The largest counter of one text-format record.

@@ -256,6 +256,46 @@ fn main() {{
 '''
 
 
+def hot_flip(runs):
+    """Release C copies by profile: only main changes, so `walk` runs or not; a profile of each
+    version makes `walk` (and its std callees) hot or cold while its unit's code stays."""
+    return f'''fn walk(v: &[u64]) -> u64 {{
+    let mut s = 0;
+    for i in 0..v.len() {{
+        s += v[i] * 3 + (v[i] >> 1);
+    }}
+    s + v.iter().copied().max().unwrap_or(0)
+}}
+
+fn fill_a(n: u64) -> u64 {{
+    (0..n).map(|i| i * i).sum()
+}}
+
+fn fill_b(n: u64) -> u64 {{
+    let mut s = String::new();
+    for i in 0..n {{
+        s.push_str(&i.to_string());
+    }}
+    s.len() as u64
+}}
+
+fn fill_c(n: u64) -> u64 {{
+    let mut v: Vec<u64> = (0..n).collect();
+    v.sort_by(|a, b| b.cmp(a));
+    v[0]
+}}
+
+fn main() {{
+    let v: Vec<u64> = (0..100).collect();
+    let runs = {runs};
+    if runs > 0 {{
+        println!("{{}}", walk(&v));
+    }}
+    println!("{{}}", fill_a(10) + fill_b(10) + fill_c(10));
+}}
+'''
+
+
 def shapes(with_tag):
     """Methods in several impl blocks of one type, called across fns; a merge removes one."""
     tag_impl = '''impl Shape {
@@ -418,6 +458,7 @@ def corpus():
     seqs.append(("lifetime-variant-order", [lifetime_variants(False), lifetime_variants(True), lifetime_variants(False)]))
     seqs.append(("llvm-helper-only-edit", [helper_edit("v1", 1), helper_edit("v2-label", 1), helper_edit("v2-label", 3)]))
     seqs.append(("remove-impl-pgo", [shapes(True), shapes(False), shapes(True)], {"pgo": True}))
+    seqs.append(("hot-flip-pgo-copies", [hot_flip(1), hot_flip(0), hot_flip(1)], {"pgo": True, "copies": True, "retrain": True}))
     dt = os.path.join(ROOT, "tests/daemon/dt01_deep_type_edits")
     dt01 = [open(os.path.join(dt, f"v{k}.rs")).read() for k in range(1, 7)]
     seqs.append(("dt01", dt01))
@@ -488,24 +529,36 @@ def check_seq(name, srcs, backend, args, work, opts):
         if args.llvm_cc:
             base["LUST_CC"] = args.llvm_cc
     rel = ["--release", "--target", args.host]
+    prof = os.path.join(d, "train.profdata")
+
+    def train(src):
+        """The profile both sides use (`prof`): an instrumented one-shot build of `src`, run
+        once. None, or what failed."""
+        with open(os.path.join(d, "main.rs"), "w") as f:
+            f.write(src)
+        raw = os.path.join(d, "raw")
+        shutil.rmtree(raw, ignore_errors=True)
+        gen = {k: v for k, v in base.items() if not k.startswith(("LUST_PGO_USE", "LUST_PGO_COPIES"))}
+        gen.update(LUST_NO_CACHE="1", LUST_THREADS="4", LUST_PGO_GEN="1", LUST_PGO_CC=args.pgo["cc"])
+        rg, eg = build([LUST, "build", "main.rs", *rel, "-o", "gen.bin"], gen, d)
+        if rg != 0:
+            return f"{name} {backend}: the instrumented build failed ({rg}): {eg[:300]}"
+        subprocess.run([os.path.join(d, "gen.bin")], cwd=d, env=dict(os.environ, LLVM_PROFILE_FILE=os.path.join(raw, "%p.profraw")),
+                       capture_output=True, timeout=RUN_TIMEOUT)
+        m = subprocess.run([args.pgo["profdata"], "merge", "-o", prof, raw], capture_output=True, text=True)
+        return f"{name} {backend}: llvm-profdata merge failed: {m.stderr[:300]}" if m.returncode != 0 else None
+
     if opts.get("pgo"):
         if not args.pgo:
             return name, backend, [], 0
-        # The profile both sides use: an instrumented one-shot build of the first step, run once.
-        with open(os.path.join(d, "main.rs"), "w") as f:
-            f.write(srcs[0])
-        raw = os.path.join(d, "raw")
-        gen = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4", LUST_PGO_GEN="1", LUST_PGO_CC=args.pgo["cc"])
-        rg, eg = build([LUST, "build", "main.rs", *rel, "-o", "gen.bin"], gen, d)
-        if rg != 0:
-            return name, backend, [f"{name} {backend}: the instrumented build failed ({rg}): {eg[:300]}"], len(srcs)
-        subprocess.run([os.path.join(d, "gen.bin")], cwd=d, env=dict(os.environ, LLVM_PROFILE_FILE=os.path.join(raw, "%p.profraw")),
-                       capture_output=True, timeout=RUN_TIMEOUT)
-        prof = os.path.join(d, "train.profdata")
-        m = subprocess.run([args.pgo["profdata"], "merge", "-o", prof, raw], capture_output=True, text=True)
-        if m.returncode != 0:
-            return name, backend, [f"{name} {backend}: llvm-profdata merge failed: {m.stderr[:300]}"], len(srcs)
+        err = train(srcs[0])
+        if err:
+            return name, backend, [err], len(srcs)
         base.update(LUST_PGO_USE=prof, LUST_PROFDATA=args.pgo["profdata"])
+        # `copies`: release C copies chosen by the same profile (LUST_PGO_COPIES; every fn it saw
+        # run is hot), in 1 KB units so most calls cross units.
+        if opts.get("copies"):
+            base.update(LUST_PGO_COPIES=prof, LUST_PGO_COPY_MIN="1", LUST_RELEASE_UNIT_KB="1")
     img = dict(base, LUST_FRONT_STATE=os.path.join(d, "front"), LUST_FRONT_SAVE="background", LUST_CACHE_DIR=os.path.join(d, "cache"), LUST_THREADS="1")
     # B1 (release C fn units a warm build does not assemble): the image side runs its oracle
     # (LUST_CHECK_UNIT_FP=1: every unit assembles, and one its recorded reads call clean must
@@ -527,9 +580,16 @@ def check_seq(name, srcs, backend, args, work, opts):
     order = opts.get("steps", list(range(len(srcs))))
     snap = None
     for step in order:
+        where = f"{name} {backend} step {step + 1}"
+        # `retrain`: a profile of the second step replaces the first at the same path, so the
+        # image side must see the new hot set (B1 keys units on it, not on the path).
+        if opts.get("retrain") and step == 1:
+            err = train(srcs[step])
+            if err:
+                problems.append(err)
+                break
         with open(os.path.join(d, "main.rs"), "w") as f:
             f.write(srcs[step])
-        where = f"{name} {backend} step {step + 1}"
         if snap:
             saved()
             for sub in ("front", "cache"):

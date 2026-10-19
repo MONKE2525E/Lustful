@@ -10299,6 +10299,11 @@ const INLINE_DEPTH: usize = 3;
 const INLINE_DEPTH_TINY: usize = 6;
 const INLINE_TINY_BYTES: usize = 400;
 
+/// Whether the fn with release C id `id` (16 hex digits) is in a copies profile's hot set.
+fn is_hot(hot: &HashSet<u64>, id: &str) -> bool {
+    u64::from_str_radix(id, 16).is_ok_and(|id| hot.contains(&id))
+}
+
 /// The largest fn definition a unit copies (`inline_callees`), by its `#[inline]`
 /// attribute; 0 copies none.
 fn inline_limit(a: InlineAttr) -> usize {
@@ -10381,8 +10386,10 @@ fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
 /// Release C: the small fns that the fns in `slots` call and another unit holds; this
 /// unit gets them as C99 inline definitions, so the C compiler can inline them without
 /// LTO (their holder keeps the external definition, so calls and addresses are the same).
-/// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns.
-fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, skip: &HashSet<usize>, deep: bool) -> Vec<usize> {
+/// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns. With a copies
+/// profile (`hot`: the fns it ran often, `LUST_PGO_COPIES`), only the fns it saw hot, up to
+/// the `#[inline]` limit at every level.
+fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, skip: &HashSet<usize>, deep: bool, hot: Option<&HashSet<u64>>) -> Vec<usize> {
     let mut out = BTreeSet::new();
     let rec = record::on();
     for e in externs {
@@ -10394,10 +10401,19 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, 
         if skip.contains(&c) {
             continue;
         }
-        let pick = fns.get(c).is_some_and(|f| inline_pick(f, deep));
+        // A copies profile never copies a callee it did not see hot (the hot set is part of
+        // the unit's identity, so that needs no read).
+        if hot.is_some_and(|h| !is_hot(h, id)) {
+            continue;
+        }
+        let pick = fns.get(c).is_some_and(|f| if hot.is_some() { inline_pick_hot(f) } else { inline_pick(f, deep) });
         // B1 (`record`): a copied callee's whole output is read; of one left out, only that.
         if rec {
-            record::read(if pick { record::Read::Fn(c) } else { record::Read::Pick(c, deep) });
+            record::read(match (pick, hot.is_some()) {
+                (true, _) => record::Read::Fn(c),
+                (false, false) => record::Read::Pick(c, deep),
+                (false, true) => record::Read::PickHot(c),
+            });
         }
         if pick {
             out.insert(c);
@@ -10414,17 +10430,24 @@ fn inline_pick(f: &FnOut, deep: bool) -> bool {
         })
 }
 
+/// Whether `inline_callees` copies `f`, a callee a copies profile saw hot: up to the
+/// `#[inline]` limit at every level.
+fn inline_pick_hot(f: &FnOut) -> bool {
+    f.error.is_none() && f.inline != InlineAttr::Never && plain_fn_def(&f.code).is_some_and(|d| d.len <= inline_limit(f.inline).max(inline_limit(InlineAttr::Hint)))
+}
+
 /// The unit for `slots` (`fns` is indexed by slot; empty slots have no code). Its
 /// functions are static; the function `register` stores them in `lust_fns`.
 /// `main_slot` is the slot of `p.main` (not its `LocalDefId`: slots are
 /// stable across edits, local ids are not).
 pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, register: &str, main_slot: Option<u32>) -> String {
-    fn_unit_parts(p, fns, slots, &[], g, register, main_slot, None).0
+    fn_unit_parts(p, fns, slots, &[], g, register, main_slot, None, None).0
 }
 
 /// `fn_unit`, and for the LLVM backend (cgen/ll.rs) the C of the unit's helpers: the same
 /// declarations, then each fn's `ll_c` (empty when no fn of the unit has LLVM IR). The fns
 /// in `inl` (cross-unit inlining, `ll::ll_inline_set`) add their declarations and helpers.
+/// `copy_hot`: release C, the fns a copies profile ran often (`inline_callees`).
 #[allow(clippy::too_many_arguments)]
 pub fn fn_unit_parts(
     p: &Program,
@@ -10435,6 +10458,7 @@ pub fn fn_unit_parts(
     register: &str,
     main_slot: Option<u32>,
     c_refs: Option<&ll::CRefs>,
+    copy_hot: Option<&HashSet<u64>>,
 ) -> (String, String) {
     // B1 (`record`): every text appended below is one recorded piece; an LLVM-backend unit
     // is never recorded.
@@ -10460,12 +10484,14 @@ pub fn fn_unit_parts(
     // backend calls fns through `fl_<id>` and gets their copies from `ll_inl` instead.
     let own: HashSet<usize> = slots.iter().copied().collect();
     let inline = names::release() && inline_on();
-    let mut inl = if inline && !llvm { inline_callees(fns, slots.iter().flat_map(|&s| &fns[s].externs), &own, false) } else { Vec::new() };
+    // With a copies profile, only the unit's hot fns get copies (a cold unit gets none).
+    let callers = slots.iter().filter(|&&s| copy_hot.is_none_or(|h| names::fn_tag_opt(s as u32).is_some_and(|id| is_hot(h, &id))));
+    let mut inl = if inline && !llvm { inline_callees(fns, callers.flat_map(|&s| &fns[s].externs), &own, false, copy_hot) } else { Vec::new() };
     // Deeper levels: the small callees of the inline callees.
     let mut frontier = inl.clone();
     for level in 1..INLINE_DEPTH_TINY {
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
-        let more = inline_callees(fns, frontier.iter().flat_map(|&s| &fns[s].externs), &skip, level >= INLINE_DEPTH);
+        let more = inline_callees(fns, frontier.iter().flat_map(|&s| &fns[s].externs), &skip, level >= INLINE_DEPTH, copy_hot);
         if more.is_empty() {
             break;
         }
@@ -10523,7 +10549,7 @@ pub fn fn_unit_parts(
         // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
         let more =
-            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip, false) };
+            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip, false, copy_hot) };
         for &s in &more {
             types.extend(fns[s].types.iter().cloned());
             named.extend(fns[s].named.iter().cloned());
@@ -11371,6 +11397,7 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
         },
         Read::SlotOf(id) => names::slot_of_id(id).map_or((0, 2), |s| h(&[&s.to_le_bytes()])),
         Read::Pick(s, deep) => fns.get(*s).map_or((0, 3), |f| h(&[&[inline_pick(f, *deep) as u8]])),
+        Read::PickHot(s) => fns.get(*s).map_or((0, 3), |f| h(&[&[inline_pick_hot(f) as u8]])),
         Read::Glue(k, t) => {
             let key = (*k, t.clone());
             let deps = g.deps.get(&key).map(|d| d.iter().map(|(a, b)| format!("{a:?} {}", mangle(b))).collect::<Vec<_>>().join("\n")).unwrap_or_default();

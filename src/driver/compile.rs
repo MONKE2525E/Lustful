@@ -4770,15 +4770,35 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let b1_record = b1_observe || b1_check || b1_skip;
             type B1Rec = (usize, Option<(Vec<cgen::record::Piece>, Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
+            // Release C copies from a pinned profile (`LUST_PGO_COPIES=<profdata>`, read by the
+            // instrumented build and the use build alike, so both copy the same callees and a
+            // caller's profile record matches its use): the fns it ran `LUST_PGO_COPY_MIN`
+            // times or more (default 1000) get copies of the callees it ran as often.
+            let copy_hot = match std::env::var_os("LUST_PGO_COPIES").filter(|_| !llvm_on) {
+                Some(path) => {
+                    let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+                    match crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, "pgo-copies.memo") {
+                        Ok(h) => Some(h),
+                        Err(e) => return Response { stderr: format!("error: LUST_PGO_COPIES: {e}\n"), code: 3, ..Default::default() },
+                    }
+                }
+                None => None,
+            };
             // A unit's identity: its registration name, fns and main slot, the switches every
-            // unit reads, every LUST_* knob but paths and B1's own, and the compiler build.
+            // unit reads, every LUST_* knob but paths and B1's own, the copies profile's hot set
+            // (the copy choice reads it), and the compiler build.
             let b1_switches = b1_record.then(|| {
                 let mut vars: Vec<(String, String)> = std::env::vars()
                     .filter(|(k, _)| k.starts_with("LUST_") && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP"].iter().any(|x| k.contains(x)))
                     .collect();
                 vars.sort();
                 let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
-                format!("{}\n{}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)), env!("LUST_BUILD_HASH"))
+                let copies = copy_hot.as_ref().map(|h| {
+                    let mut ids: Vec<u64> = h.iter().copied().collect();
+                    ids.sort_unstable();
+                    crate::driver::cache::hash128(&[&ids.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>()], 14)
+                });
+                format!("{}\n{}\ncopies={copies:?}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)), env!("LUST_BUILD_HASH"))
             });
             let unit_id = |g: usize| {
                 let (reg, slots) = &rg[g];
@@ -4807,7 +4827,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         R::Type(..) => 3,
                         R::Static(_) => 4,
                         R::Main => 5,
-                        R::Pick(..) => 6,
+                        R::Pick(..) | R::PickHot(_) => 6,
                     };
                     kind_ns[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                     kind_ns[7 + k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4839,7 +4859,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         if b1_record {
                             cgen::record::open();
                         }
-                        let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs);
+                        let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs, copy_hot.as_ref());
                         if b1_record {
                             let rec = cgen::record::close(&c);
                             b1_records.lock().unwrap_or_else(|e| e.into_inner()).push((g - FIRST_FN_UNIT, rec));
@@ -5054,7 +5074,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                                                 Read::Type(..) => 3,
                                                 Read::Static(_) => 4,
                                                 Read::Main => 5,
-                                                Read::Pick(..) => 6,
+                                                Read::Pick(..) | Read::PickHot(_) => 6,
                                             }] += 1;
                                         }
                                     }
