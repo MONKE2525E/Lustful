@@ -388,7 +388,7 @@ fn main() {
                 if image::arena_on() {
                     let resps = image_run(&reqs, &dir);
                     resps.iter().for_each(|r| eprint!("{}", r.stderr));
-                    std::process::exit(resps.iter().map(|r| r.code).find(|&c| c != 0).unwrap_or(0));
+                    image::exit_fast(resps.iter().map(|r| r.code).find(|&c| c != 0).unwrap_or(0));
                 }
                 let why = image::reexec(&dir);
                 // A compacting process (src/image.rs `compact_exec`) builds nothing without the image.

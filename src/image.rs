@@ -162,6 +162,8 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn memfd_create(name: *const c_char, flags: std::ffi::c_uint) -> c_int;
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+    fn clone(f: extern "C" fn(*mut c_void) -> c_int, stack: *mut c_void, flags: c_int, arg: *mut c_void, ...) -> c_int;
+    fn syscall(n: std::ffi::c_long, ...) -> std::ffi::c_long;
 }
 
 const PROT_RW: c_int = 0x1 | 0x2;
@@ -353,6 +355,55 @@ pub fn state_dir() -> Option<PathBuf> {
         return None;
     }
     std::env::var_os(STATE_ENV).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Ends an image process with `code` at once. Rust's buffered output is flushed; `_exit` then
+/// skips the C exit handlers, of which mimalloc's collects the whole heap (tsgo: 3.5 GB) and
+/// no other has work a build needs; and the kernel frees the memory after this process has
+/// gone (`hand_off_memory`). A background save's child holds the state lock until it has
+/// written the image, so a caller that waits for the save still waits for that.
+pub fn exit_fast(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    hand_off_memory();
+    // SAFETY: ends the process; its output is flushed above.
+    unsafe { _exit(code) }
+}
+
+/// Before an image process exits: a new task that shares this address space (`clone` with
+/// CLONE_VM) closes its copies of every descriptor and waits for this process to exit, so the
+/// memory goes when that task exits, after this process has gone. Without it the exit frees the
+/// heap first (on tsgo 3.5 GB mapped, 0.1-0.24 s on one core) and only then closes the
+/// descriptors: a caller's pipes and the state lock stay open that long. Elsewhere nothing.
+fn hand_off_memory() {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if arena_on() {
+        const CLONE_VM: c_int = 0x100;
+        const SIGCHLD: c_int = 17;
+        extern "C" fn teardown(parent: *mut c_void) -> c_int {
+            // SAFETY: raw syscalls only (close_range 436, prctl 157, getppid 110, pause 34,
+            // exit 60): this task shares the memory of a process that is exiting and must
+            // touch none of it. PR_SET_PDEATHSIG (1) ends it with SIGKILL (9) when its parent
+            // exits; a parent that has exited already shows as another parent. Were this task
+            // to exit first, the parent's own exit would free the memory.
+            unsafe {
+                syscall(436, 0u32, u32::MAX, 0u32);
+                syscall(157, 1, 9);
+                while syscall(110) == parent as std::ffi::c_long {
+                    syscall(34);
+                }
+                syscall(60, 0);
+            }
+            0
+        }
+        if let Some((stack, len)) = raw(64 << 10) {
+            let parent = std::process::id() as usize as *mut c_void;
+            // SAFETY: the new task runs `teardown` on a stack of its own (a raw mapping, not
+            // the heap) and makes only raw syscalls; it ends with exit or SIGKILL.
+            unsafe { clone(teardown, stack.wrapping_add(len) as *mut c_void, CLONE_VM | SIGCHLD, parent) };
+        }
+    }
 }
 
 /// True in the re-executed process whose heap is the fixed arena.
@@ -2082,6 +2133,8 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
         }
         let line = write_image(dir, roots).unwrap_or_else(|e| format!("lust: front state not saved: {e}"));
         let _ = std::fs::write(&log, line + "\n");
+        // The image is written: the lock frees now, not after the heap is freed.
+        hand_off_memory();
         // SAFETY: ends the child now; the parent's exit handlers and
         // buffered output are the parent's to run.
         unsafe { _exit(0) }
