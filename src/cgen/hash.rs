@@ -520,7 +520,12 @@ fn borrow_expr(p: &Program, slots: &Slots, k: &CTy, q: &CTy, kp: &str) -> String
     if let CTy::Adt(a) = k
         && let Some((_, &f)) = p.gx.borrow_impls.iter().find(|((b, t), _)| b == a && cty(&p.tys, *t) == *q)
     {
-        let call = format!("{}({kp})", slots.callee(p, f));
+        let call = if super::ret_is_large(p, f) {
+            // A return through the out pointer (`ret_by_out`): a statement expression.
+            format!("({{ {} r_; {}(&r_, {kp}); r_; }})", ctype(&cty(&p.tys, p.fn_info(f).ret)), slots.callee(p, f))
+        } else {
+            format!("{}({kp})", slots.callee(p, f))
+        };
         // `&str`, `&[T]` and `&dyn Tr` come back as fat values: point at a temporary.
         return match q {
             CTy::Str => format!("((lust_str[]){{ {call} }})"),

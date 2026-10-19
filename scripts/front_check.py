@@ -935,6 +935,37 @@ fn main() {{
 """
 
 
+def agg_ret(k):
+    """`main` calls fns in another module that return 12-byte `Option<(u32, u32)>` (release C:
+    through the out pointer) and a 16-byte pair of u64 (by value, but through the out pointer
+    under LUST_RELEASE_AGG_RET=all); each step edits only the callees' bodies (`k`), so a cached
+    `main` keeps its calls unless the ABI mode is part of the cache key."""
+    return f'''mod m {{
+    #[derive(Debug, Clone, Copy)]
+    pub struct W {{
+        pub a: u64,
+        pub b: u64,
+    }}
+
+    #[inline(never)]
+    pub fn pair(x: u32) -> Option<(u32, u32)> {{
+        if x == 0 {{ None }} else {{ Some((x + {k}, x * {k})) }}
+    }}
+
+    #[inline(never)]
+    pub fn wide(x: W) -> W {{
+        W {{ a: x.b + {k}, b: x.a * {k} }}
+    }}
+}}
+
+fn main() {{
+    let f: fn(u32) -> Option<(u32, u32)> = m::pair;
+    let w = m::wide(m::W {{ a: 2, b: 3 }});
+    println!("{{:?}} {{:?}} {{}} {{}}", m::pair(5), f(0), w.a, w.b);
+}}
+'''
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -1087,6 +1118,13 @@ def corpus():
     dv = [open(os.path.join(disc, f"v{k}.rs")).read() for k in (1, 2, 3)]
     seqs.append(("const-fn-discovery", dv))
     seqs.append(("const-fn-discovery-jump", dv, {"steps": [0, 2]}))
+    # The release C ABI mode (LUST_RELEASE_AGG_RET) switched between steps, with a callee-body
+    # edit at each step (`env`: one environment per step, both sides): every unit's calls and
+    # definitions must follow the mode of their build. Once with B1's oracle, once skipping.
+    ar = [agg_ret(3), agg_ret(4), agg_ret(5)]
+    modes = [{}, {"LUST_RELEASE_AGG_RET": "all"}, {}]
+    seqs.append(("agg-ret-mode", ar, {"env": modes}))
+    seqs.append(("agg-ret-mode-b1-skip", ar, {"env": modes, "quiet": True, "b1": "skip"}))
     # Sol's review cases for a kept type store (B1-PLAN.md), each through three versions.
     for case in ("rename", "params", "lifetimes", "closure", "hidden", "array", "layout", "instance"):
         seqs.append((f"b1-{case}", [b1_case(case, v) for v in range(3)]))

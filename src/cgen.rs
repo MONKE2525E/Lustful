@@ -2063,7 +2063,85 @@ fn assume_unreachable(p: &Program) -> bool {
 
 fn ret_by_out(p: &Program, t: &CTy) -> bool {
     let size = c_size_align(p, t).0;
-    size > 32 || (size == 0 && zst_holds_array(p, t))
+    size > 32 || (size == 0 && zst_holds_array(p, t)) || split_ret_by_out(p, t, size)
+}
+
+/// `LUST_RELEASE_AGG_RET`: which 9-32 byte returns release C passes through the out pointer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggRet {
+    /// `0`: none (the C ABI returns them).
+    Off,
+    /// Unset or `1`: the 9-16 byte ones that `crosses_eightbyte`.
+    Split,
+    /// `all`: every one (a stress switch for tests: every call site must agree).
+    All,
+}
+
+fn agg_ret_mode() -> AggRet {
+    static MODE: std::sync::OnceLock<AggRet> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("LUST_RELEASE_AGG_RET").as_deref() {
+        Ok("0") => AggRet::Off,
+        Ok("all") => AggRet::All,
+        _ => AggRet::Split,
+    })
+}
+
+/// Release C, outside the LLVM backend's C boundary (which keeps the C ABI): a 9-16 byte
+/// return whose pieces do not follow the SysV split at byte 8 goes through the out pointer.
+/// The C ABI returns it in two registers, bytes 0-7 and 8-15, so the caller rebuilds the
+/// value from two 8-byte loads that span the narrower stores of its fields; after inlining,
+/// SROA cannot split such a value (an access crosses byte 8), and the reload fails to
+/// forward from the store buffer (`Option<TextRange>`: tag at 0, payload at 4-11).
+fn split_ret_by_out(p: &Program, t: &CTy, size: u64) -> bool {
+    let mode = agg_ret_mode();
+    if mode == AggRet::Off || !(9..=32).contains(&size) || !names::release() || ll::on(p) {
+        return false;
+    }
+    mode == AggRet::All || (size <= 16 && crosses_eightbyte(p, t, 0))
+}
+
+/// True when a piece of a value of type `t`, placed at byte `base` of a larger value, starts
+/// before byte 8 and ends after it. A piece is a scalar or an aggregate of at most 8 bytes,
+/// which clang copies as one integer; a larger aggregate is looked into. A type this cannot
+/// look into counts as crossing when it spans byte 8, unless it is made of 8-byte words.
+fn crosses_eightbyte(p: &Program, t: &CTy, base: u64) -> bool {
+    let (size, align) = c_size_align(p, t);
+    if size == 0 || base >= 8 || base + size <= 8 {
+        return false;
+    }
+    if size <= 8 {
+        return true;
+    }
+    let Some(l) = c_layout(p, t) else { return true };
+    let fields = |tys: &[CTy], offs: &[u64]| tys.len() != offs.len() || tys.iter().zip(offs).any(|(f, &o)| crosses_eightbyte(p, f, base + o));
+    // An enum: its explicit tag (at byte 0), then every variant's fields.
+    let variants = |vs: &[Vec<CTy>]| {
+        let tag = matches!(l.enum_tag, Some(EnumTag::Explicit { size, .. }) if base + size > 8);
+        tag || vs.len() != l.variant_offsets.len() || vs.iter().zip(&l.variant_offsets).any(|(tys, offs)| fields(tys, offs))
+    };
+    match t {
+        CTy::Tuple(es) => fields(es, &l.field_offsets),
+        CTy::Array(e, n) => {
+            let stride = c_size_align(p, e).0;
+            (0..*n).any(|i| crosses_eightbyte(p, e, base + i * stride))
+        }
+        CTy::Option(e) => variants(&[vec![], vec![(**e).clone()]]),
+        CTy::Result(a, b) => variants(&[vec![(**a).clone()], vec![(**b).clone()]]),
+        CTy::Adt(a) => {
+            let adt = p.adt(*a);
+            let tys: Vec<Vec<CTy>> = adt.variants.iter().map(|v| v.fields.iter().map(|f| cty(&p.tys, f.ty)).collect()).collect();
+            if adt.is_enum {
+                variants(&tys)
+            } else {
+                tys.first().is_none_or(|f| fields(f, &l.field_offsets))
+            }
+        }
+        CTy::Cell(e) => crosses_eightbyte(p, e, base),
+        // Pointers, lengths and counts: 8-byte words, which cross byte 8 only off an
+        // 8-byte boundary (in a packed struct).
+        _ if align >= 8 => base % 8 != 0,
+        _ => true,
+    }
 }
 
 /// True when the C struct of zero-sized type `t` holds an array member.
