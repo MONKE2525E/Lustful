@@ -148,7 +148,12 @@ impl<T, E> Result<T, E> {
     {
         match self {
             Ok(t) => t,
-            Err(e) => panic!("{}: {:?}", msg, e),
+            // The panic formats a copy made here: a borrow of `msg` itself kept it on the
+            // stack from every call's entry (core puts this panic in a cold `unwrap_failed`).
+            Err(e) => {
+                let m = msg;
+                panic!("{}: {:?}", m, e)
+            }
         }
     }
 
@@ -179,7 +184,11 @@ impl<T, E> Result<T, E> {
         T: core::fmt::Debug,
     {
         match self {
-            Ok(t) => panic!("{}: {:?}", msg, t),
+            // A copy, as in `expect`.
+            Ok(t) => {
+                let m = msg;
+                panic!("{}: {:?}", m, t)
+            }
             Err(e) => e,
         }
     }

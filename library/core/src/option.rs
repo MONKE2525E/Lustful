@@ -71,7 +71,12 @@ impl<T> Option<T> {
     pub const fn expect(self, msg: &str) -> T {
         match self {
             Some(val) => val,
-            None => panic!("{}", msg),
+            // The panic formats a copy made here: a borrow of `msg` itself kept it on the
+            // stack from every call's entry (core puts this panic in a cold `expect_failed`).
+            None => {
+                let m = msg;
+                panic!("{}", m)
+            }
         }
     }
 
