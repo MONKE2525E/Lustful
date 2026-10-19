@@ -509,3 +509,16 @@ static inline float lust_inl_f32_max_(float a, float b) { return a > b ? a : b >
 #define lust_u64_to_f64(v) ((double)(uint64_t)(v))
 #define lust_i64_to_f64(v) ((double)(int64_t)(v))
 #endif
+
+/* `p` is a reference made just before (Rust's validity invariant: never null). cgen states
+   it only on the path that makes the reference, never on a pointer that may be null: a slice
+   element `&ptr[i]` inside its bounds check, the payload of a `Some(r)` the program builds.
+   A later niche check of the `Option<&T>` (`p != 0`) then folds. tcc ignores it. */
+#if !defined(__TINYC__)
+#define lust_ref_nn(p)                       \
+    do {                                     \
+        if (!(p)) __builtin_unreachable();   \
+    } while (0)
+#else
+#define lust_ref_nn(p) ((void)0)
+#endif

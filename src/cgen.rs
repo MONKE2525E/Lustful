@@ -4578,6 +4578,20 @@ impl FnGen<'_, '_> {
                 match op {
                     Some(o) => {
                         let (v, _) = self.operand(o, loc, post);
+                        // Release C: the payload of `Some(r)` with `r` a thin reference is never
+                        // null, so a later niche check of this Option folds (`lust_ref_nn`). This
+                        // runs only where the program builds the Some, and only for a plain local,
+                        // which reading twice cannot change.
+                        if names::release()
+                            && let CTy::Option(inner) = &t
+                            && matches!(**inner, CTy::Ref(_))
+                            && ctype(inner).ends_with('*')
+                            && v.starts_with('l')
+                            && v[1..].bytes().all(|b| b.is_ascii_digit())
+                            && v.len() > 1
+                        {
+                            let _ = writeln!(self.out, "    lust_ref_nn({v});");
+                        }
                         self.make_variant(&t, 1, &[v])
                     }
                     None => self.make_variant(&t, 0, &[]),
@@ -7257,7 +7271,10 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
                 let some = disc_set(self.p, &opt, &t, 1);
                 let some = if some.is_empty() { String::new() } else { format!(" {some}") };
-                let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {r}{ptr}[{idx}];{some} }}");
+                // Release C: the element reference is never null, so the niche check that reads
+                // the Option back folds (`lust_ref_nn`, runtime/inl.h).
+                let nn = if !r.is_empty() && names::release() { format!(" lust_ref_nn({field});") } else { String::new() };
+                let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {r}{ptr}[{idx}];{nn}{some} }}");
                 t
             }
             B::VecContains => {
