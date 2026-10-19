@@ -1054,7 +1054,7 @@ pub struct FnOut {
     pub used: Vec<u32>,
     /// Release C (`names`): the extern declarations `code` needs (callee and
     /// trampoline prototypes, location slots). Empty for numbered names.
-    pub externs: BTreeSet<String>,
+    pub externs: BTreeSet<std::sync::Arc<str>>,
     /// Release C: types the code only points at (a `&T` local it never derefs):
     /// declared, not defined (`type_decls_with`). Empty for numbered names.
     pub named: HashSet<CTy>,
@@ -2223,7 +2223,37 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     used.shrink_to_fit();
     ll.shrink_to_fit();
     ll_c.shrink_to_fit();
+    let externs = externs.into_iter().map(shared_extern).collect();
     FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, ll_c_refs, inline }
+}
+
+/// The extern declarations of the codegen phase running now, each kept once
+/// (`shared_extern`): fns that call the same callee hold one copy of its
+/// prototype.
+static EXTERN_POOL: std::sync::LazyLock<Vec<std::sync::Mutex<std::collections::HashSet<std::sync::Arc<str>, std::hash::BuildHasherDefault<crate::intern::FxHasher>>>>> =
+    std::sync::LazyLock::new(|| (0..64).map(|_| Default::default()).collect());
+
+/// One extern declaration of a new FnOut, as the pool's copy.
+fn shared_extern(e: String) -> std::sync::Arc<str> {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::intern::FxHasher::default();
+    e.hash(&mut h);
+    let shard = &EXTERN_POOL[(h.finish() >> 58) as usize];
+    let mut set = shard.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(a) = set.get(e.as_str()) {
+        return a.clone();
+    }
+    let a: std::sync::Arc<str> = e.into();
+    set.insert(a.clone());
+    a
+}
+
+/// Empties the extern pool (the driver, before a codegen phase): FnOuts
+/// keep their copies; the pool keeps nothing past the phase.
+pub fn clear_extern_pool() {
+    for shard in EXTERN_POOL.iter() {
+        *shard.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+    }
 }
 
 /// `f`'s `#[inline]` attribute (an instance has its template's). A closure body counts as
@@ -10399,7 +10429,7 @@ fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
 /// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns. With a copies
 /// profile (`hot`: the fns it ran often, `LUST_PGO_COPIES`), only the fns it saw hot, up to
 /// the `#[inline]` limit at every level.
-fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a String>, skip: &HashSet<usize>, deep: bool, hot: Option<&HashSet<u64>>) -> Vec<usize> {
+fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, skip: &HashSet<usize>, deep: bool, hot: Option<&HashSet<u64>>) -> Vec<usize> {
     let mut out = BTreeSet::new();
     let rec = record::on();
     for e in externs {
@@ -10496,12 +10526,12 @@ pub fn fn_unit_parts(
     let inline = names::release() && inline_on();
     // With a copies profile, only the unit's hot fns get copies (a cold unit gets none).
     let callers = slots.iter().filter(|&&s| copy_hot.is_none_or(|h| names::fn_tag_opt(s as u32).is_some_and(|id| is_hot(h, &id))));
-    let mut inl = if inline && !llvm { inline_callees(fns, callers.flat_map(|&s| &fns[s].externs), &own, false, copy_hot) } else { Vec::new() };
+    let mut inl = if inline && !llvm { inline_callees(fns, callers.flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &own, false, copy_hot) } else { Vec::new() };
     // Deeper levels: the small callees of the inline callees.
     let mut frontier = inl.clone();
     for level in 1..INLINE_DEPTH_TINY {
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
-        let more = inline_callees(fns, frontier.iter().flat_map(|&s| &fns[s].externs), &skip, level >= INLINE_DEPTH, copy_hot);
+        let more = inline_callees(fns, frontier.iter().flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &skip, level >= INLINE_DEPTH, copy_hot);
         if more.is_empty() {
             break;
         }
@@ -10559,7 +10589,7 @@ pub fn fn_unit_parts(
         // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
         let more =
-            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten()), &skip, false, copy_hot) };
+            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten().map(String::as_str)), &skip, false, copy_hot) };
         for &s in &more {
             types.extend(fns[s].types.iter().cloned());
             named.extend(fns[s].named.iter().cloned());
@@ -10656,7 +10686,7 @@ pub fn fn_unit_parts(
     // static glue) names outside itself, in one sorted list.
     let mut externs: BTreeSet<&str> = BTreeSet::new();
     for &s in slots.iter().chain(&inl).chain(ll_inl) {
-        externs.extend(fns[s].externs.iter().map(String::as_str));
+        externs.extend(fns[s].externs.iter().map(|e| &**e));
     }
     // An inline callee's plain prototype would make its definition here external.
     let inl_ids: HashSet<String> = inl.iter().filter_map(|&s| names::fn_tag_opt(s as u32)).collect();
@@ -11399,7 +11429,7 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
                 let types = sorted(f.types.iter().map(mangle).collect());
                 let named = sorted(f.named.iter().map(mangle).collect());
                 let glue = sorted(f.glue.iter().map(|(k, t)| format!("{k:?} {}", mangle(t))).collect());
-                let externs: Vec<&str> = f.externs.iter().map(String::as_str).collect();
+                let externs: Vec<&str> = f.externs.iter().map(|e| &**e).collect();
                 let tag = names::fn_tag_opt(*s as u32).unwrap_or_default();
                 let flags = format!("{:?} {}", f.inline, f.error.is_some());
                 h(&[f.code.as_bytes(), externs.join("\n").as_bytes(), types.as_bytes(), named.as_bytes(), glue.as_bytes(), f.ll.as_bytes(), f.ll_c.as_bytes(), flags.as_bytes(), tag.as_bytes()])
