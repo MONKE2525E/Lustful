@@ -14,7 +14,13 @@
 # zig is on PATH and cc is not clang). The corpus: a type held by value inside a struct that
 # fns read through a pointer grows (directly, as an enum payload, behind Option, as an array,
 # as a generic arg), statics and thread_local keys are added, and tests/daemon/dt01's six
-# versions. A step that fails to build must fail on both sides with the same status.
+# versions. Every step must give the same status and stderr on both sides, a rejected build
+# too (the same diagnostics in the same order). The one-shot side is a fresh session: its own
+# numbering and no caches, so it shares no state with the image side. Four recovery sequences
+# (the kept-program reviews, 2026-10-19) put rejected builds between accepted ones, and mix
+# `lust check` steps into the image's builds (a mode switch). At the end the run prints the
+# image side's front-end paths (path/why/kept of each request, from LUST_VISITS_LOG): a green
+# run where every step took the full path proves little about a fast path.
 # Two sequences cover the LLVM units' inputs that zig's compile cache cannot see (b41791434):
 # an edit that changes a unit's helpers' C but not its IR (zig keyed the object on the IR and
 # served the last one at that path: the old string printed), and a merge that removes items,
@@ -385,7 +391,69 @@ fn second(r: Rc<dyn Tr>, s: &'static str) -> u32 {
 }
 """
     a, b = (second, first) if swap else (first, second)
-    return """use std::rc::Rc;
+    return LIFETIME_HEAD + a + "\n" + b + """
+fn main() {
+    let k: Rc<dyn Tr> = Rc::new(K(3));
+    println!("{} {}", first(k.clone(), "abc"), second(k, "de"));
+}
+"""
+
+
+def recovery(state):
+    """A small program with a trait, a generic, a closure and a struct read through a
+    pointer, in one of five states for the recovery sequences: `ok1`, `ok2` (other
+    bodies, one more generic instance), `body_err` and `body_err2` (two different body
+    errors), and `type_err` (a field names a type that does not exist). A rejected
+    build must not leave state that changes a later answer."""
+    field = "    w: Missing," if state == "type_err" else "    w: u16,"
+    scale = {
+        "body_err": '    let bad: u8 = "x";\n    p.v as u64 * 3 + bad as u64',
+        "ok2": "    p.v as u64 * 5 + p.w as u64",
+    }.get(state, "    p.v as u64 * 3 + p.w as u64")
+    extra = {
+        "body_err2": "    let n = p.no_such_method();\n    n + wrap(1u8).0 as u64",
+        "ok2": "    wrap(1u8).0 as u64 + wrap(2u64).0",
+    }.get(state, "    wrap(1u8).0 as u64")
+    return f'''struct P {{
+    v: u32,
+{field}
+}}
+
+struct Wrap<T>(T);
+
+fn wrap<T>(t: T) -> Wrap<T> {{
+    Wrap(t)
+}}
+
+trait Area {{
+    fn area(&self) -> u64;
+}}
+
+impl Area for P {{
+    fn area(&self) -> u64 {{
+        self.v as u64 * 2
+    }}
+}}
+
+#[inline(never)]
+fn scale(p: &P) -> u64 {{
+{scale}
+}}
+
+#[inline(never)]
+fn extra(p: &P) -> u64 {{
+{extra}
+}}
+
+fn main() {{
+    let p = P {{ v: 7, w: 9 }};
+    let add = |x: u64| x + p.area();
+    println!("{{}} {{}}", add(scale(&p)), extra(&p));
+}}
+'''
+
+
+LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
     fn v(&self) -> u32;
@@ -411,11 +479,6 @@ impl<T> M<T> {
     }
 }
 
-""" + a + "\n" + b + """
-fn main() {
-    let k: Rc<dyn Tr> = Rc::new(K(3));
-    println!("{} {}", first(k.clone(), "abc"), second(k, "de"));
-}
 """
 
 
@@ -470,6 +533,14 @@ def corpus():
     # B1's skipping itself: builds that emit no C skip the units their reads call clean; their
     # programs' output must match the one-shot builds'.
     seqs.append(("dt01-b1-skip", dt01, {"quiet": True, "b1": "skip"}))
+    # Recovery (the kept-program reviews): a rejected build, then the state after it. A
+    # ("check", src) step runs `lust check` on both sides, on the same image (a mode switch).
+    r = recovery
+    seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
+    seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))
+    seqs.append(("recover-type", [r("ok1"), r("type_err"), r("ok2"), r("type_err"), r("ok1")]))
+    seqs.append(("recover-mixed", [("check", r("ok1")), r("ok1"), ("check", r("body_err")), r("body_err"),
+                                   ("check", r("ok2")), r("type_err"), ("check", r("ok1")), r("ok2")]))
     return seqs
 
 
@@ -508,16 +579,49 @@ def run_bin(path, cwd):
 
 
 def build(cmd, env, cwd):
-    """(exit status or 'hang', stderr head)."""
+    """(exit status or 'hang', stderr). The image's own `lust: front state` lines are dropped:
+    the rest is the answer, which must equal the one-shot's."""
     try:
         r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, timeout=BUILD_TIMEOUT)
     except subprocess.TimeoutExpired:
         return ("hang", "")
-    return (r.returncode, r.stderr.decode(errors="replace")[-400:].replace("\n", " "))
+    err = r.stderr.decode(errors="replace")
+    return (r.returncode, "".join(l for l in err.splitlines(keepends=True) if not l.startswith("lust: front state")))
+
+
+def head(err):
+    """The end of a stderr text, on one line, for a message."""
+    return err[-400:].replace("\n", " ")
+
+
+def first_diff(a, b):
+    """The first differing line of two texts, for a message."""
+    x, y = a.splitlines(), b.splitlines()
+    n = next((i for i in range(min(len(x), len(y))) if x[i] != y[i]), min(len(x), len(y)))
+    return f"line {n + 1}: image {x[n][:200] if n < len(x) else ''!r} vs one-shot {y[n][:200] if n < len(y) else ''!r}"
+
+
+VISIT = re.compile(r"\b(path|why|kept)=(\S+)")
+
+
+def last_path(log, seen):
+    """The image request's front-end path from the visits log (`lust-visits:`, LUST_VISITS_LOG):
+    'path/why/kept' of the first line after `seen` bytes, or '-' when the request logged none."""
+    if not os.path.exists(log):
+        return "-", seen
+    with open(log) as f:
+        f.seek(seen)
+        new = f.read()
+    lines = [l for l in new.splitlines() if l.startswith("lust-visits:")]
+    if not lines:
+        return "-", seen + len(new)
+    v = dict(VISIT.findall(lines[-1]))
+    return f"{v.get('path', '-')}/{v.get('why', '-')}/{v.get('kept', '-')}", seen + len(new)
 
 
 def check_seq(name, srcs, backend, args, work, opts):
-    """One sequence on one backend: (name, backend, problems, steps); steps is 0 when skipped."""
+    """One sequence on one backend: (name, backend, problems, steps, paths); steps is 0 when
+    skipped; paths holds the image side's front-end path of each request (`last_path`)."""
     d = os.path.join(work, f"{name}-{backend}")
     os.makedirs(d, exist_ok=True)
     drop = ("LUST_DAEMON_SOCKET", "LUST_CACHE_DIR", "LUST_NO_CACHE", "LUST_THREADS", "LUST_FRONT_STATE", "LUST_RELEASE_BACKEND",
@@ -542,7 +646,7 @@ def check_seq(name, srcs, backend, args, work, opts):
         gen.update(LUST_NO_CACHE="1", LUST_THREADS="4", LUST_PGO_GEN="1", LUST_PGO_CC=args.pgo["cc"])
         rg, eg = build([LUST, "build", "main.rs", *rel, "-o", "gen.bin"], gen, d)
         if rg != 0:
-            return f"{name} {backend}: the instrumented build failed ({rg}): {eg[:300]}"
+            return f"{name} {backend}: the instrumented build failed ({rg}): {head(eg)[:300]}"
         subprocess.run([os.path.join(d, "gen.bin")], cwd=d, env=dict(os.environ, LLVM_PROFILE_FILE=os.path.join(raw, "%p.profraw")),
                        capture_output=True, timeout=RUN_TIMEOUT)
         m = subprocess.run([args.pgo["profdata"], "merge", "-o", prof, raw], capture_output=True, text=True)
@@ -550,22 +654,24 @@ def check_seq(name, srcs, backend, args, work, opts):
 
     if opts.get("pgo"):
         if not args.pgo:
-            return name, backend, [], 0
+            return name, backend, [], 0, []
         err = train(srcs[0])
         if err:
-            return name, backend, [err], len(srcs)
+            return name, backend, [err], len(srcs), []
         base.update(LUST_PGO_USE=prof, LUST_PROFDATA=args.pgo["profdata"])
         # `copies`: release C copies chosen by the same profile (LUST_PGO_COPIES; every fn it saw
         # run is hot), in 1 KB units so most calls cross units.
         if opts.get("copies"):
             base.update(LUST_PGO_COPIES=prof, LUST_PGO_COPY_MIN="1", LUST_RELEASE_UNIT_KB="1")
-    img = dict(base, LUST_FRONT_STATE=os.path.join(d, "front"), LUST_FRONT_SAVE="background", LUST_CACHE_DIR=os.path.join(d, "cache"), LUST_THREADS="1")
+    visits = os.path.join(d, "visits.log")
+    img = dict(base, LUST_FRONT_STATE=os.path.join(d, "front"), LUST_FRONT_SAVE="background", LUST_CACHE_DIR=os.path.join(d, "cache"), LUST_THREADS="1",
+               LUST_VISITS_LOG=visits)
     # B1 (release C fn units a warm build does not assemble): the image side runs its oracle
     # (LUST_CHECK_UNIT_FP=1: every unit assembles, and one its recorded reads call clean must
     # have the same text), or with `b1` skip the skipping itself (LUST_B1=1).
     img.update({"LUST_B1": "1"} if opts.get("b1") == "skip" else {"LUST_CHECK_UNIT_FP": "1"})
     one = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4")
-    problems = []
+    problems, paths, seen = [], [], 0
     lock = os.path.join(d, "front", "lock")
 
     def saved():
@@ -584,17 +690,31 @@ def check_seq(name, srcs, backend, args, work, opts):
         # `retrain`: a profile of the second step replaces the first at the same path, so the
         # image side must see the new hot set (B1 keys units on it, not on the path).
         if opts.get("retrain") and step == 1:
-            err = train(srcs[step])
+            err = train(srcs[step][1] if isinstance(srcs[step], tuple) else srcs[step])
             if err:
                 problems.append(err)
                 break
+        # A ("check", src) step checks instead of building, on the same image.
+        cmd, src = srcs[step] if isinstance(srcs[step], tuple) else ("build", srcs[step])
         with open(os.path.join(d, "main.rs"), "w") as f:
-            f.write(srcs[step])
+            f.write(src)
         if snap:
             saved()
             for sub in ("front", "cache"):
                 shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
                 shutil.copytree(os.path.join(snap, sub), os.path.join(d, sub), symlinks=True)
+        if cmd == "check":
+            rw, ew = build([LUST, "check", "main.rs"], img, d)
+            rc, ec = build([LUST, "check", "main.rs"], one, d)
+            path, seen = last_path(visits, seen)
+            paths.append(path)
+            if rw != rc:
+                problems.append(f"{where} (check): status image {rw} vs one-shot {rc}: {head(ew if rw else ec)[:300]}")
+            elif ew != ec:
+                problems.append(f"{where} (check): stderr differs, {first_diff(ew, ec)}")
+            if problems:
+                break
+            continue
         emit = not opts.get("quiet") or step == order[-1]
         for side in ("ew", "ec"):
             shutil.rmtree(os.path.join(d, side), ignore_errors=True)
@@ -602,8 +722,16 @@ def check_seq(name, srcs, backend, args, work, opts):
         ce = lambda side: ["--emit-c", os.path.join(d, side, "t")] if emit else []
         rw, ew = build([LUST, "build", "main.rs", *rel, "-o", "image.bin", *ce("ew")], img, d)
         rc, ec = build([LUST, "build", "main.rs", *rel, "-o", "one.bin", *ce("ec")], one, d)
+        path, seen = last_path(visits, seen)
+        paths.append(path)
         if rw != rc:
-            problems.append(f"{where}: build status image {rw} vs one-shot {rc}: {(ew if rw else ec)[:300]}")
+            problems.append(f"{where}: build status image {rw} vs one-shot {rc}: {head(ew if rw else ec)[:300]}")
+            break
+        # Rejected and accepted builds alike: the same diagnostics, in the same order (the
+        # progress line names each side's own output file).
+        ew, ec = ew.replace("image.bin", "OUT"), ec.replace("one.bin", "OUT")
+        if ew != ec:
+            problems.append(f"{where}: stderr differs, {first_diff(ew, ec)}")
             break
         if opts.get("stale_after") == step:
             saved()
@@ -624,7 +752,7 @@ def check_seq(name, srcs, backend, args, work, opts):
     saved()
     if problems and args.keep:
         shutil.copytree(d, os.path.join(args.keep, f"{name}-{backend}"), dirs_exist_ok=True)
-    return name, backend, problems, len(srcs)
+    return name, backend, problems, len(srcs), paths
 
 
 def is_clang(cmd):
@@ -683,12 +811,18 @@ def main():
     jobs = [(n, srcs, b, o) for n, srcs, o in seqs for b in ("c", "llvm")]
     t0 = time.time()
     bad = steps = 0
+    cover = {}
     with ThreadPoolExecutor(max(1, args.jobs)) as pool:
-        for name, backend, problems, n in pool.map(lambda j: check_seq(j[0], j[1], j[2], args, work, j[3]), jobs):
+        for name, backend, problems, n, paths in pool.map(lambda j: check_seq(j[0], j[1], j[2], args, work, j[3]), jobs):
             steps += n
+            for p in paths:
+                cover[p] = cover.get(p, 0) + 1
             for p in problems:
                 bad += 1
                 print(f"front-check: DIFFERENT {p}")
+    # Path coverage (path/why/kept of each image request): a green run whose every
+    # interesting step refused to the full collect proves little about a fast path.
+    print("front-check: image paths: " + ", ".join(f"{k} {v}" for k, v in sorted(cover.items(), key=lambda kv: -kv[1])))
     shutil.rmtree(work, ignore_errors=True)
     print(f"front-check: {steps} steps, {bad} different ({len(seqs)} sequences, release C and LLVM, image vs one-shot, {time.time() - t0:.0f} s)")
     return 1 if bad else 0

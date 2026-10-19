@@ -16,6 +16,9 @@
 # the limit (the daemon side on a fresh daemon), a finished retry is reported
 # as "slow" and judged normally, and only a second timeout is the hang.
 # `--strict` also requires the full stderr text to match.
+# `--release-units N` (single-file crates) also builds release C every N edits, through a front
+# image only those builds use and as a fresh one-shot (no image, no cache): status, stderr, and
+# the emitted C units byte for byte must match, rejected builds too (Harness.release_compare).
 # `--sig-ops` adds a signature-edit pulse (sigops.py) on a fixed cadence from its own
 # RNG; it ends on the state it started from, so the main stream stays the same.
 # `--rustc` also judges the pulse's op states against rustc, and `--baseline LUST`
@@ -584,6 +587,38 @@ class Harness:
                 self._gstart += 1
             if "guard-check: done " in line:
                 self._gdone += 1
+
+    def release_compare(self):
+        """`--release-units`: a release C build of the current crate through a front image that
+        only these builds use (LUST_FRONT_STATE, as CI builds), and a one-shot release C build
+        with no image and no cache (a fresh session: fresh numbering, fresh caches). Both emit
+        their C units: status, stderr and the units byte for byte must be equal, rejected builds
+        too. Returns '' or what differed."""
+        import front_check  # noqa: E402  (scripts/front_check.py)
+        if not hasattr(self, "_rel_host"):
+            v = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
+            self._rel_host = next((l.split()[1] for l in v.splitlines() if l.startswith("host:")), "x86_64-unknown-linux-gnu")
+        keep = ("LUST_CHECK_ITEMPATCH", "LUST_ITEMPATCH_LOG", "LUST_DAEMON_SOCKET", "LUST_FRONT_STATE", "LUST_NO_CACHE")
+        base = {k: v for k, v in self.cold.items() if k not in keep}
+        base.update(LUST_RELEASE_C="1", LUST_NO_DAEMON="1")
+        img = dict(base, LUST_FRONT_STATE=os.path.join(self.work, "rel-front"), LUST_CACHE_DIR=os.path.join(self.work, "rel-cache"))
+        one = dict(base, LUST_NO_CACHE="1")
+        out = []
+        for side, env in (("rw", img), ("rc", one)):
+            d = os.path.join(self.work, side)
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d)
+            out.append(front_check.build([LUST, "build", self.crate, "--release", "--target", self._rel_host,
+                                          "-o", d + ".bin", "--emit-c", os.path.join(d, "t")], env, self.work))
+        # The progress line names each side's own output file.
+        (sw, ew), (sc, ec) = [(st, e.replace(os.path.join(self.work, side), "OUT")) for (st, e), side in zip(out, ("rw", "rc"))]
+        if sw != sc:
+            return f"release status image {sw} vs one-shot {sc}: {front_check.head(ew if sw else ec)[:300]}"
+        if ew != ec:
+            return f"release stderr differs, {front_check.first_diff(ew, ec)}"
+        if sw != 0:
+            return ""
+        return front_check.unit_diff(os.path.join(self.work, "rw"), os.path.join(self.work, "rc"))
 
     def oracle_count(self):
         """Patch oracle failures (LUST_CHECK_ITEMPATCH) the daemon logged so far."""
@@ -1388,6 +1423,16 @@ def cmd_run(a):
                 if a.stop_first:
                     break
                 continue
+            if a.release_units and it % a.release_units == 0:
+                ops["release-units"] += 1
+                rel = h.release_compare()
+                if rel:
+                    failures += 1
+                    bad_ops["release units"] += 1
+                    save_pair(a.out, f"relbad-{it}", prev, text)
+                    print(f"FAIL[release units] iter {it} op {op}: {rel[:600]}", flush=True)
+                    if a.stop_first:
+                        break
             if da[0] == 0:
                 rs.offer(text)
             if da[0] == 0 and len(snapshots) < 40 and rng.random() < 0.05:
@@ -2578,6 +2623,8 @@ def main():
     r.add_argument("--keep-work", action="store_true")
     r.add_argument("--record", default=None, help="dir to write every text as NNNN.rs")
     r.add_argument("--sig-ops", action="store_true", help="signature-edit pulses (sigops.py)")
+    r.add_argument("--release-units", type=int, default=0, metavar="N",
+                   help="single-file crates: every N edits, release C through a front image vs a fresh one-shot, units byte for byte")
     r.add_argument("--rustc", action="store_true", help="judge sigops states against rustc")
     r.add_argument("--baseline", default=None, help="baseline lust binary for --rustc")
     r.add_argument("--rustc-sample", type=int, default=0,

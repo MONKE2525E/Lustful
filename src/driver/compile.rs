@@ -5236,6 +5236,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // comes from the cache. Overlays do not exist here: every build emits
     // the base form of each unit.
     if req.cc {
+        // The release driver returns before the visits line at the end: its log line is here
+        // (front-check's path coverage).
+        front.last_visits.clear();
+        Visits { checked: work.len(), ..visits }.render(&mut front.last_visits);
+        log_visits(&front.last_visits);
         let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
         // Base-form units this build already made (all of them on a fresh
         // base) are taken, not made again. Release C made all of its units above.
