@@ -4408,6 +4408,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // context around every step that prints C.
     let rnames = release.then(|| super::release_c::names(&program, &front.fn_slot, front.slot_of.len().max(caches.out.len()), &inst_adt_ids(&program)));
     let rn = rnames.as_ref();
+    // A release C build to the release driver streams its cc step (`cc::Stream`): each unit the
+    // assembly makes compiles from the time its text exists. Not with --emit-c nor LLVM units.
+    // The stream starts on a thread of its own while codegen runs (its compiler check and warm
+    // profile spawn a process and read files), joined before the assembly: the image save forks
+    // after the assembly and must find no other thread.
+    let stream_start = (release && req.cc && req.emit_c.is_none() && !cgen::names::with(rn, || cgen::ll::on(&program))).then(|| {
+        let triple = if req.session.target_triple.is_empty() {
+            crate::protocol::host_triple().to_string()
+        } else {
+            req.session.target_triple.clone()
+        };
+        let (debug, cache, work) = (req.debug, crate::driver::cache::Cache::open(&req.file), caches.obj_dir.join("cc"));
+        std::thread::spawn(move || crate::cc::Stream::start(&triple, debug, cache, work))
+    });
     // Codegen reads derive lists (Copy layouts, comparison forms, default
     // variants): its notes join the slot's read set below, as the check's
     // do (check/derive_delta.rs), so a derive edit regenerates just the
@@ -4736,12 +4750,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
     };
     asm_ms[0] = t_asm.elapsed().as_secs_f64() * 1e3;
+    // The cc stream, started during codegen (above).
+    let stream = stream_start.and_then(|h| h.join().ok()).flatten();
     // Release C glue shards come after the fn units (`link_fn_units` counts both).
     let mut rshards: Vec<String> = match &rgroups {
         Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, &caches.out, super::release_c::unit_bytes())),
         None => Vec::new(),
     };
     let n_shards = rshards.len();
+    if let (Some(s), Some(rg)) = (&stream, &rgroups) {
+        let first = FIRST_FN_UNIT + rg.len();
+        par_map(&(0..n_shards).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first + j), &rshards[j]));
+    }
     asm_ms[1] = t_asm.elapsed().as_secs_f64() * 1e3;
     // B1 (below): the release C fn units cc takes with a fingerprint, by unit name, and whether
     // without text (a skipped assembly).
@@ -4811,11 +4831,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 None => None,
             };
             // A unit's identity: its registration name, fns and main slot, the switches every
-            // unit reads, every LUST_* knob but paths and B1's own, the copies profile's hot set
-            // (the copy choice reads it), and the compiler build.
+            // unit reads, every LUST_* knob but paths, B1's own and the cc stream's (`cc::Stream`
+            // changes no unit's text), the copies profile's hot set (the copy choice reads it),
+            // and the compiler build.
             let b1_switches = b1_record.then(|| {
                 let mut vars: Vec<(String, String)> = std::env::vars()
-                    .filter(|(k, _)| k.starts_with("LUST_") && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP"].iter().any(|x| k.contains(x)))
+                    .filter(|(k, _)| k.starts_with("LUST_") && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP", "CC_STREAM"].iter().any(|x| k.contains(x)))
                     .collect();
                 vars.sort();
                 let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -4895,6 +4916,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }));
                 if let Some(ms) = c_unit_ms.get(u) {
                     ms.store(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(s) = &stream {
+                    s.add(&format!("u{u}"), &c);
                 }
                 (base_obj(u), c, helpers)
             };
@@ -5340,7 +5364,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let _ = writeln!(resp.stderr, "b1: {l}");
         }
         let job = move || {
-            let built = crate::cc::build(&all, &spec, &out, debug, cache.as_ref(), &cc_dir).map_err(|e| e.to_string());
+            let built = crate::cc::build_with(&all, &spec, &out, debug, cache.as_ref(), &cc_dir, stream).map_err(|e| e.to_string());
             // A build that leaks at exit leaks the unit texts too (they moved out of `units`).
             if leak_at_exit {
                 std::mem::forget(all);

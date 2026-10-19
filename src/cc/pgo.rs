@@ -70,7 +70,8 @@ impl Mode {
     /// The mode `LUST_PGO_GEN` / `LUST_PGO_USE` ask for, or None. `units` are (file name
     /// the unit compiles as, C text).
     /// `defs`: what each unit defines (`unit_defs`), with a profile to use.
-    pub fn from_env(spec: &CcSpec, work: &Path, defs: Option<&UnitDefs>) -> Result<Option<Mode>, String> {
+    /// `warm`: a profile the streamed build loaded (`Warm`), whose index serves when it is this one.
+    pub fn from_env(spec: &CcSpec, work: &Path, defs: Option<&UnitDefs>, warm: Option<&Warm>) -> Result<Option<Mode>, String> {
         if std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1") {
             return Ok(Some(Mode::Gen));
         }
@@ -84,7 +85,7 @@ impl Mode {
         }
         let bits = std::env::var("LUST_PGO_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
         let defs = defs.ok_or("internal: a profile to use and no unit definitions")?;
-        Pgo::load(Path::new(&path), bits, work, &tool, defs).map(|p| Some(Mode::Use(p)))
+        Pgo::load(Path::new(&path), bits, work, &tool, defs, warm).map(|p| Some(Mode::Use(p)))
     }
 
     /// Extra link flags: the profile runtime of an instrumented build.
@@ -98,43 +99,17 @@ impl Mode {
     /// The compile flags of the unit compiled as `file`. With a profile it first writes
     /// that unit's own profile into the work dir (a unit with no records gets none).
     pub fn unit_flags(&self, file: &str) -> Result<Vec<String>, String> {
-        let nopre = no_preinline().then_some(["-mllvm".to_string(), "-disable-preinline".to_string()]).into_iter().flatten();
         match self {
-            Mode::Gen => Ok(std::iter::once("-fprofile-generate".to_string()).chain(nopre).collect()),
-            Mode::Use(p) => {
-                let mut flags = p.pins.clone();
-                flags.extend(nopre);
-                // A unit with records reads the whole profile: clang takes only the records of
-                // its module's fns, and the pins hold the summary to the whole profile's, so
-                // the object is the one its own records would give, with no per-unit profile
-                // to write and merge. Its key still holds only its own records (`key_part`).
-                if p.own.get(file).is_some_and(|r| !r.is_empty()) {
-                    flags.push(format!("-fprofile-use={}", p.all.display()));
-                    // zig cc caches a compile by its source and args, not by this file: the
-                    // profile's digest in the args keeps another profile at this path from
-                    // getting the object of the last one.
-                    flags.push(format!("-DLUST_PROFILE_DIGEST={}", p.key));
-                }
-                Ok(flags)
-            }
+            Mode::Gen => Ok(std::iter::once("-fprofile-generate".to_string()).chain(nopre_flags()).collect()),
+            Mode::Use(p) => Ok(use_flags(&p.pins, p.own.get(file).is_some_and(|r| !r.is_empty()), &p.all, &p.key)),
         }
     }
 
     /// The profile part of the cache key of the unit compiled as `file` (`cc::unit_key`).
     pub fn key_part(&self, file: &str) -> String {
-        let nopre = if no_preinline() { " nopre" } else { "" };
         match self {
-            Mode::Gen => format!("gen{nopre} {STATIC_FILE}"),
-            Mode::Use(p) => {
-                let pins = p.pins.join(" ");
-                let own: Vec<[u8; 16]> = p.own.get(file).into_iter().flatten().map(|d| d.to_le_bytes()).collect();
-                // One part with `nopre`: with the call graph profile kept, keys are those of
-                // builds before the flag.
-                let flags = format!("{nopre}{}", if cg_profile() { "" } else { " nocg" });
-                let mut parts: Vec<&[u8]> = vec![pins.as_bytes(), flags.as_bytes(), STATIC_FILE.as_bytes()];
-                parts.extend(own.iter().map(|b| b.as_slice()));
-                digest(&parts)
-            }
+            Mode::Gen => format!("gen{} {STATIC_FILE}", if no_preinline() { " nopre" } else { "" }),
+            Mode::Use(p) => use_key_part(&p.pins, p.own.get(file).map_or(&[][..], |v| &v[..])),
         }
     }
 
@@ -153,6 +128,151 @@ impl Mode {
             Mode::Gen => "pgo instrumented".into(),
             Mode::Use(p) => format!("pgo {} records{}, {} runtime helpers, {} of fns not in this build", p.records, if p.kept { " (kept)" } else { "" }, p.helpers, p.absent),
         }
+    }
+}
+
+fn nopre_flags() -> impl Iterator<Item = String> {
+    no_preinline().then_some(["-mllvm".to_string(), "-disable-preinline".to_string()]).into_iter().flatten()
+}
+
+/// A use build's compile flags of a unit (`Mode::unit_flags`, `Warm::unit_flags`).
+fn use_flags(pins: &[String], has_records: bool, all: &Path, key: &str) -> Vec<String> {
+    let mut flags = pins.to_vec();
+    flags.extend(nopre_flags());
+    // A unit with records reads the whole profile: clang takes only the records of
+    // its module's fns, and the pins hold the summary to the whole profile's, so
+    // the object is the one its own records would give, with no per-unit profile
+    // to write and merge. Its key still holds only its own records (`key_part`).
+    if has_records {
+        flags.push(format!("-fprofile-use={}", all.display()));
+        // zig cc caches a compile by its source and args, not by this file: the
+        // profile's digest in the args keeps another profile at this path from
+        // getting the object of the last one.
+        flags.push(format!("-DLUST_PROFILE_DIGEST={key}"));
+    }
+    flags
+}
+
+/// A use build's key part of a unit with records `own` (`Mode::key_part`, `Warm::key_part`).
+fn use_key_part(pins: &[String], own: &[u128]) -> String {
+    let nopre = if no_preinline() { " nopre" } else { "" };
+    let pins = pins.join(" ");
+    let own: Vec<[u8; 16]> = own.iter().map(|d| d.to_le_bytes()).collect();
+    // One part with `nopre`: with the call graph profile kept, keys are those of
+    // builds before the flag.
+    let flags = format!("{nopre}{}", if cg_profile() { "" } else { " nocg" });
+    let mut parts: Vec<&[u8]> = vec![pins.as_bytes(), flags.as_bytes(), STATIC_FILE.as_bytes()];
+    parts.extend(own.iter().map(|b| b.as_slice()));
+    digest(&parts)
+}
+
+/// A profile to use, loaded before a build's units exist (the streamed build, `stream.rs`):
+/// `Pgo::load`'s warm path, its records' index kept (`pgo-all.index`'s text), so each unit's
+/// own records are found when its text arrives (`own`), as `split` finds them for all units.
+pub(super) struct Warm {
+    text: String,
+    /// Per index entry, sorted by record name: the name's start and length in `text`, its
+    /// records' digest, and their number.
+    spans: Vec<(usize, usize, u128, usize)>,
+    pins: Vec<String>,
+    all: PathBuf,
+    key: String,
+}
+
+impl Warm {
+    /// The LUST_PGO_USE profile, when this work dir holds its quantized profile, pins and
+    /// index from an earlier build (else None: `build` loads it the cold way).
+    pub(super) fn load(spec: &CcSpec, work: &Path) -> Result<Option<Warm>, String> {
+        let Some(path) = std::env::var_os("LUST_PGO_USE") else { return Ok(None) };
+        let cc = clang_major(&spec.cmd)?;
+        let tool = tool_version(work)?;
+        let pd = major_after(&tool, "LLVM version ")?;
+        if pd != cc {
+            return Err(format!("LUST_PROFDATA ({}) is LLVM {pd}, the compiler ({}) LLVM {cc}", profdata(), spec.cmd.join(" ")));
+        }
+        let bits: u32 = std::env::var("LUST_PGO_BITS").ok().and_then(|b| b.parse().ok()).unwrap_or(0);
+        let (all, memo, idx) = (work.join("pgo-all.profdata"), work.join("pgo-all.memo"), work.join("pgo-all.index"));
+        let key = digest(&[profile_digest(Path::new(&path), work)?.as_bytes(), &bits.to_le_bytes(), tool.as_bytes()]);
+        let Some(pins) = std::fs::read_to_string(&memo)
+            .ok()
+            .and_then(|m| m.strip_prefix(&format!("{key}\n")).map(|p| p.split_whitespace().map(str::to_string).collect()))
+        else {
+            return Ok(None);
+        };
+        let Ok(text) = std::fs::read_to_string(&idx) else { return Ok(None) };
+        if !all.exists() {
+            return Ok(None);
+        }
+        Ok(Warm::of_index(text, pins, all, key))
+    }
+
+    /// A warm profile of an index file's `text` (`write_index`); None when it is not one.
+    fn of_index(text: String, pins: Vec<String>, all: PathBuf, key: String) -> Option<Warm> {
+        let base = text.as_ptr() as usize;
+        let spans = read_index(&text)?.iter().map(|&(n, d, k)| (n.as_ptr() as usize - base, n.len(), d, k)).collect();
+        Some(Warm { text, spans, pins, all, key })
+    }
+
+    fn name(&self, i: usize) -> &str {
+        let (at, len, _, _) = self.spans[i];
+        &self.text[at..at + len]
+    }
+
+    /// The index (`Index`), its names borrowed from this profile.
+    fn index(&self) -> Index<'_> {
+        (0..self.spans.len()).map(|i| (self.name(i), self.spans[i].2, self.spans[i].3)).collect()
+    }
+
+    /// The digests of the records the unit compiled as `file` owns, sorted, as `split` gives
+    /// them: an external fn's for each of `exts`, a static fn's (`STATIC_FILE;<fn>`) for each
+    /// of `statics`, and every static record of `file`'s own name.
+    pub(super) fn own(&self, file: &str, exts: &[&str], statics: &[&str]) -> Vec<u128> {
+        let n = self.spans.len();
+        let find = |prefix: &str, name: &str| {
+            let (mut lo, mut hi) = (0, n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                match cmp_joined(self.name(mid), prefix, name) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid,
+                    std::cmp::Ordering::Equal => return Some(mid),
+                }
+            }
+            None
+        };
+        // `unit_defs` gives `split` each unit's externs sorted, without repeats.
+        let mut ext: Vec<&str> = exts.to_vec();
+        ext.sort_unstable();
+        ext.dedup();
+        let static_prefix = format!("{STATIC_FILE};");
+        let mut ds: Vec<u128> = ext
+            .iter()
+            .filter_map(|e| find("", e))
+            .chain(statics.iter().filter_map(|e| find(&static_prefix, e)))
+            .map(|i| self.spans[i].2)
+            .collect();
+        if file != STATIC_FILE {
+            let (mut lo, mut hi) = (0, n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if cmp_joined(self.name(mid), file, ";").is_lt() { lo = mid + 1 } else { hi = mid }
+            }
+            ds.extend(
+                (lo..n).take_while(|&i| self.name(i).strip_prefix(file).is_some_and(|r| r.starts_with(';'))).map(|i| self.spans[i].2),
+            );
+        }
+        ds.sort_unstable();
+        ds
+    }
+
+    /// The compile flags of a unit with records `own` (`Mode::unit_flags`).
+    pub(super) fn unit_flags(&self, own: &[u128]) -> Vec<String> {
+        use_flags(&self.pins, !own.is_empty(), &self.all, &self.key)
+    }
+
+    /// The key part of a unit with records `own` (`Mode::key_part`).
+    pub(super) fn key_part(&self, own: &[u128]) -> String {
+        use_key_part(&self.pins, own)
     }
 }
 
@@ -398,7 +518,7 @@ impl Pgo {
     /// Reads `path` (an indexed profile), quantizes it to `bits`, pins the summary
     /// thresholds of the whole quantized profile, and splits the records by unit. `tool` is
     /// the `llvm-profdata --version` text.
-    fn load(path: &Path, bits: u32, work: &Path, tool: &str, defs: &UnitDefs) -> Result<Pgo, String> {
+    fn load(path: &Path, bits: u32, work: &Path, tool: &str, defs: &UnitDefs, warm: Option<&Warm>) -> Result<Pgo, String> {
         std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
         let (txt, all, memo) = (work.join("pgo-all.proftext"), work.join("pgo-all.profdata"), work.join("pgo-all.memo"));
         // The quantized profile and its pins depend only on the profile, `bits` and the
@@ -408,6 +528,21 @@ impl Pgo {
         // `memo` holds their digest and the pins, and is written last.
         let idx = work.join("pgo-all.index");
         let key = digest(&[profile_digest(path, work)?.as_bytes(), &bits.to_le_bytes(), tool.as_bytes()]);
+        // The streamed build loaded this profile's index already (`Warm`): no second read.
+        if let Some(w) = warm.filter(|w| w.key == key && all.exists()) {
+            let index = w.index();
+            let (own, helpers, absent) = split(&index, defs);
+            return Ok(Pgo {
+                own,
+                pins: w.pins.clone(),
+                records: index.iter().map(|(_, _, n)| n).sum(),
+                helpers,
+                absent,
+                kept: true,
+                all,
+                key,
+            });
+        }
         let pins_kept = std::fs::read_to_string(&memo)
             .ok()
             .and_then(|m| m.strip_prefix(&format!("{key}\n")).map(|pins| pins.split_whitespace().map(str::to_string).collect::<Vec<_>>()));
@@ -938,6 +1073,56 @@ mod tests {
         assert!(!own.contains_key("x1.ca"), "a file whose name starts with another's takes none of its records");
         assert_eq!(absent, 0);
         assert_eq!(defined_statics("static inline int lust_mix(int a) {\n}\nstatic int g;\nint f(void) {\n}\n"), vec!["lust_mix"]);
+    }
+
+    /// A warm profile (`Warm::own`, the streamed build's) gives each unit the records `split`
+    /// gives it: externs repeated or unsorted, statics repeated, a file's own static records.
+    #[test]
+    fn a_warm_profile_finds_each_units_records_as_split_does() {
+        let mut records: Records = HashMap::new();
+        for (n, r) in [
+            ("f_a", "1"),
+            ("f_b", "2"),
+            ("f_c", "3"),
+            ("lust.c;s1", "4"),
+            ("lust.c;s2", "5"),
+            ("x9.c;t", "6"),
+            ("x9.c;u", "7"),
+            ("x90.c;v", "8"),
+            ("f_a", "9"),
+        ] {
+            records.entry(n.to_string()).or_default().push(Arc::from(rec(n, r.parse().unwrap()).as_str()));
+        }
+        let ix = index(&records);
+        let dir = std::env::temp_dir().join(format!("lust-pgo-warm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_index(&dir.join("i"), &ix).unwrap();
+        let w = Warm::of_index(std::fs::read_to_string(dir.join("i")).unwrap(), Vec::new(), PathBuf::new(), String::new()).unwrap();
+        let units: [(&str, Vec<&str>, Vec<&str>); 3] = [
+            ("x9.c", vec!["f_b", "f_a", "f_a"], vec!["s1", "s1"]),
+            ("x90.c", vec!["f_c", "f_none"], vec!["s2", "s3"]),
+            ("lust.c", vec![], vec!["s1"]),
+        ];
+        let defs = UnitDefs {
+            units: units
+                .iter()
+                .map(|(f, e, _)| {
+                    (f.to_string(), {
+                        let mut e: Vec<String> = e.iter().map(|s| s.to_string()).collect();
+                        e.sort_unstable();
+                        e.dedup();
+                        e
+                    })
+                })
+                .collect(),
+            macro_made: Default::default(),
+            statics: units.iter().map(|(f, _, s)| (f.to_string(), s.iter().map(|s| s.to_string()).collect())).collect(),
+        };
+        let (own, _, _) = split(&ix, &defs);
+        for (f, e, st) in &units {
+            assert_eq!(w.own(f, e, st), own.get(*f).cloned().unwrap_or_default(), "unit {f}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A unit's key moves only with the records of the fns it defines (the runtime unit's

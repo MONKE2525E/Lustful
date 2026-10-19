@@ -25,8 +25,10 @@ use std::process::Command;
 mod memo;
 pub(crate) mod pgo;
 mod rtinl;
+mod stream;
 
 pub use memo::{CcError, UnitIn};
+pub use stream::Stream;
 
 /// One target's compiler setup: the command words, the flags every unit
 /// gets, and how the link differs from a host link.
@@ -295,6 +297,39 @@ fn ll_unit_key(c: &str, ll: &str, hc: &str, extra: &str, spec: &CcSpec, debug: b
         37,
     );
     format!("{a:016x}{b:016x}")
+}
+
+/// The command that compiles one C (or C++) unit `src` into `obj` (`build` and the streamed
+/// build, `stream.rs`, both run it): the compiler words, the flags of every unit, the unit's key
+/// for zig's cache, and with PGO the unit's flags, run from its own dir (`pgo::STATIC_FILE`).
+fn unit_command(
+    words: &[String],
+    flags: &[String],
+    obj: &Path,
+    key: Option<&str>,
+    pgo: Option<(Vec<String>, &Path)>,
+    src: &Path,
+) -> Command {
+    // A relative compiler path must not resolve against `work` (PGO compiles there).
+    let prog = if words[0].contains('/') {
+        std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0]))
+    } else {
+        PathBuf::from(&words[0])
+    };
+    let mut cmd = cc_command(prog);
+    cmd.args(&words[1..]).args(flags).arg("-o").arg(obj);
+    if let Some(k) = key {
+        cmd.arg(format!("-DLUST_UNIT_KEY={k}"));
+    }
+    match pgo {
+        Some((pf, dir)) => {
+            cmd.args(pf).current_dir(dir).arg("-c").arg(pgo::STATIC_FILE);
+        }
+        None => {
+            cmd.arg("-c").arg(src);
+        }
+    }
+    cmd
 }
 
 /// A command that runs the C compiler (or links through it). gcc 7+, clang 16+ and zig cc
@@ -586,6 +621,24 @@ pub fn memo_misses(units: &[UnitIn], spec: &CcSpec, debug: bool, cache: Option<&
 /// units to pass again with text (an LLVM unit's three parts come with text or without as
 /// one). Returns a one-line summary, or the compiler's error text.
 pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Option<&crate::driver::cache::Cache>, work: &Path) -> Result<String, CcError> {
+    build_with(units, spec, out, debug, cache, work, None)
+}
+
+/// `build`, with the units a `Stream` took while they assembled: for each, the stream's key,
+/// and its object once its compile exited (it is not compiled again).
+pub fn build_with(
+    units: &[UnitIn],
+    spec: &CcSpec,
+    out: &Path,
+    debug: bool,
+    cache: Option<&crate::driver::cache::Cache>,
+    work: &Path,
+    stream: Option<Stream>,
+) -> Result<String, CcError> {
+    // The streamed units compile on from here, `jobs` at once, while this prepares the rest.
+    if let Some(s) = &stream {
+        s.go();
+    }
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let flags: Vec<String> = cflags(debug).split_whitespace().map(str::to_string).collect();
     let cxx_flags: Vec<String> = cxxflags(debug).split_whitespace().map(str::to_string).collect();
@@ -653,7 +706,7 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
         defs.statics.extend((0..units.len()).filter_map(|i| entries[i].map(|e| (e.file.clone(), e.statics.clone()))));
         defs
     });
-    let pgo = pgo::Mode::from_env(spec, work, defs.as_ref())?;
+    let pgo = pgo::Mode::from_env(spec, work, defs.as_ref(), stream.as_ref().and_then(Stream::warm))?;
     let pgo_of = |i: usize| pgo.as_ref().filter(|_| !is_cxx(&names[i]));
     // An instrumented build needs a compiler with a profile runtime (`pgo::gen_spec`).
     let gen_spec = if matches!(pgo, Some(pgo::Mode::Gen)) { Some(pgo::gen_spec(spec)?) } else { None };
@@ -720,19 +773,32 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
         }
         None => String::new(),
     };
+    let oracle = std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
     let keys: Vec<Option<String>> = crate::pool::par_map(&idx, |&i| {
         if let Some(e) = entries[i] {
             return Some(e.key.clone());
         }
         let (unit, c) = (&units[i].name, text(i));
-        let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
-        keyed.then(|| match ll_of.get(unit.as_str()) {
-            Some(ll) => {
-                let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
-                ll_unit_key(c, ll, hc, &format!("{} {nopre} rtinl {rt_digest}", llflags(debug)), spec, debug, part.as_deref())
+        let mine = || {
+            let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
+            keyed.then(|| match ll_of.get(unit.as_str()) {
+                Some(ll) => {
+                    let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
+                    ll_unit_key(c, ll, hc, &format!("{} {nopre} rtinl {rt_digest}", llflags(debug)), spec, debug, part.as_deref())
+                }
+                None => unit_key(c, pre_of(i), spec, debug, part.as_deref(), is_cxx(&names[i])),
+            })
+        };
+        // A streamed unit has the stream's key: the same inputs. The oracle checks it.
+        match stream.as_ref().filter(|_| keyed).and_then(|s| s.key_of(unit)) {
+            Some(k) => {
+                if oracle && mine().as_deref() != Some(k.as_str()) {
+                    panic!("LUST_CHECK_UNIT_FP: the stream keyed unit {unit} {k}, build {:?}", mine());
+                }
+                Some(k)
             }
-            None => unit_key(c, pre_of(i), spec, debug, part.as_deref(), is_cxx(&names[i])),
-        })
+            None => mine(),
+        }
     });
     // The memo for the next build: this build's units with a fingerprint (not those whose
     // key reads a preprocessed text, so a header change is seen, nor the C++ unit). With
@@ -803,6 +869,27 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
                 }
                 let (name, c) = (&names[i], text(i));
                 let obj = &objs[i];
+                if let Some(done) = stream.as_ref().and_then(|s| s.finish(&units[i].name)) {
+                    match done {
+                        // Linked again here, so this build's cache notes it as used.
+                        Ok(true) => {
+                            if let (Some(cache), Some(key)) = (cache, &keys[i]) {
+                                cache.unit_object(key, obj);
+                            }
+                            hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok(false) => match pgo_of(i).map_or(Ok(()), |m| m.after_compile(obj)) {
+                            Ok(()) => {
+                                if let (Some(cache), Some(key)) = (cache, &keys[i]) {
+                                    cache.store_unit_object(key, obj);
+                                }
+                            }
+                            Err(e) => errors.lock().unwrap_or_else(|e| e.into_inner()).push_str(&format!("--- unit {name}: {e}\n")),
+                        },
+                        Err(e) => errors.lock().unwrap_or_else(|e| e.into_inner()).push_str(&e),
+                    }
+                    continue;
+                }
                 if let (Some(cache), Some(key)) = (cache, &keys[i])
                     && cache.unit_object(key, obj)
                 {
@@ -857,25 +944,15 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
                     continue;
                 }
                 let (words, unit_flags) = if cxx { (&spec.cxx, &cxx_flags) } else { (&spec.cmd, &flags) };
-                // A relative compiler path must not resolve against `work` (PGO compiles there).
-                let prog = if words[0].contains('/') { std::fs::canonicalize(&words[0]).unwrap_or_else(|_| PathBuf::from(&words[0])) } else { PathBuf::from(&words[0]) };
-                let mut cmd = cc_command(prog);
-                cmd.args(&words[1..]).args(unit_flags).arg("-o").arg(obj);
-                if let Some(k) = &keys[i] {
-                    cmd.arg(format!("-DLUST_UNIT_KEY={k}"));
-                }
-                match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
-                    Some(Ok(pf)) => {
-                        cmd.args(pf).current_dir(pgo_dir.as_deref().unwrap_or(work)).arg("-c").arg(pgo::STATIC_FILE);
-                    }
+                let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
+                    Some(Ok(pf)) => Some((pf, pgo_dir.as_deref().unwrap_or(work))),
                     Some(Err(e)) => {
                         fail(format!("--- unit {name}: {e}\n"));
                         continue;
                     }
-                    None => {
-                        cmd.arg("-c").arg(&src);
-                    }
-                }
+                    None => None,
+                };
+                let mut cmd = unit_command(words, unit_flags, obj, keys[i].as_deref(), pf, &src);
                 match cmd.output() {
                     Ok(o) if o.status.success() => {
                         if let Err(e) = pgo_of(i).map_or(Ok(()), |m| m.after_compile(obj)) {
@@ -971,6 +1048,35 @@ mod tests {
             Err(CcError::NeedText(n)) => assert_eq!(n, ["u0", "u1"], "a memo entry whose object left the cache needs its text"),
             r => panic!("{r:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A streamed build (`Stream`) links the binary a plain build links: a unit handed to the
+    /// stream before `build_with` compiles once (or comes from the cache) and is not compiled
+    /// again, and the binary is byte-identical.
+    #[test]
+    fn a_streamed_build_links_what_build_links() {
+        use super::UnitIn;
+        let Ok(spec) = super::spec_for(crate::protocol::host_triple()) else { return };
+        let root = std::env::temp_dir().join(format!("lust-cc-stream-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = "int f(void);\nint g(void);\nint main(void) {\n  return f() + g();\n}\n";
+        let (f, g) = ("int f(void) {\n  return 3;\n}\n", "int g(void) {\n  return 4;\n}\n");
+        let units = || vec![UnitIn::text("u0", main.into()), UnitIn::text("u1", f.into()), UnitIn::text("u2", g.into())];
+        let plain = crate::driver::cache::Cache::at(&root.join("c1"));
+        super::build(&units(), &spec, &root.join("a"), false, Some(&plain), &root.join("w1")).unwrap();
+        // The stream's cache already holds g's object (a build of another main and g): u2 is a
+        // hit, u1 a miss the stream compiles, u0 a miss build compiles.
+        let streamed = crate::driver::cache::Cache::at(&root.join("c2"));
+        let only_g = "int g(void);\nint main(void) {\n  return g();\n}\n";
+        super::build(&[UnitIn::text("u0", only_g.into()), UnitIn::text("u2", g.into())], &spec, &root.join("x"), false, Some(&streamed), &root.join("w0")).unwrap();
+        let Some(stream) = super::Stream::start(&spec.triple, false, Some(crate::driver::cache::Cache::at(&root.join("c2"))), root.join("w2")) else { return };
+        stream.add("u1", f);
+        stream.add("u2", g);
+        let r = super::build_with(&units(), &spec, &root.join("b"), false, Some(&streamed), &root.join("w2"), Some(stream)).unwrap();
+        assert!(r.contains("3 units (1 from cache"), "u2 hit, u1 compiled by the stream, u0 by build: {r}");
+        assert_eq!(std::fs::read(root.join("a")).unwrap(), std::fs::read(root.join("b")).unwrap(), "the same binary");
+        assert_eq!(std::process::Command::new(root.join("b")).status().ok().and_then(|s| s.code()), Some(7));
         let _ = std::fs::remove_dir_all(&root);
     }
 
