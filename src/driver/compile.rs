@@ -4786,8 +4786,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let (c_jobs, fn_jobs) = jobs.split_at(5);
             // The C units (the statics unit is the slow one) and the inline sets, together.
             // With a profile, the copies are of the fns it saw hot (`LUST_LL_COPY_MIN=<count>`,
-            // default 1000; 0: every callee the rule allows).
-            let copy_min: u64 = std::env::var("LUST_LL_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+            // default 100000; 0: every callee the rule allows). tsgo, warm merges 4-12 against
+            // release C: +11.5% at 1000, +3.7% at 100000, run speed the same.
+            let copy_min: u64 = std::env::var("LUST_LL_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
             let hot = (llvm_on && copy_min > 0).then(|| crate::cc::pgo::hot_ids(&dir.join("cc"), copy_min).ok().flatten()).flatten();
             let first: Vec<usize> = c_jobs.iter().copied().chain(0..rg.len()).collect();
             let mut made = Vec::with_capacity(jobs.len());
