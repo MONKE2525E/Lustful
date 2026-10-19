@@ -103,6 +103,82 @@ fn raise_stack_limit() {
 /// (470 KB) is even, and fmt40 (54 KB) and a trivial program lose.
 const BIG_FILE: u64 = 256 << 10;
 
+/// LUST_FRONT_CENSUS=1 (a probe of what a front image holds): after the restore, drops each
+/// owner of each session and the process tables in turn and prints the restored bytes each
+/// drop freed (`image::restored_freed`), largest first; the caller exits with no build and no save.
+fn census(mut sessions: Vec<Box<driver::Session>>) {
+    use std::mem::take;
+    let mut rows: Vec<(String, usize)> = Vec::new();
+    let mut row = |rows: &mut Vec<(String, usize)>, name: &str, f: &mut dyn FnMut()| {
+        let a = image::restored_freed();
+        f();
+        rows.push((name.to_string(), image::restored_freed() - a));
+    };
+    for s in sessions.iter_mut() {
+        let rc = &mut s.front.resolve_cache;
+        let (files, same, toks) = rc.same_streams();
+        eprintln!("census: resolve_cache: {same} of {files} files expand to their raw tokens ({toks} tokens)");
+        for (part, name) in ["raw tokens", "outlines", "expanded tokens", "parsed Asts", "final chunks", "std asks", "paths, seed, expander"].iter().enumerate() {
+            row(&mut rows, &format!("resolve_cache {name}"), &mut || rc.drop_part(part));
+        }
+        if let Some(pb) = s.front.patch.as_mut() {
+            for (part, name) in [(1, "file ranges, extras"), (2, "item scans"), (3, "dropped"), (4, "lists")] {
+                row(&mut rows, &format!("patch {name}"), &mut || pb.drop_part(part));
+            }
+        }
+        let c = &mut s.caches;
+        for (part, name) in [(8, "discovery reads"), (9, "discovery outputs"), (0, "templates"), (1, "closure templates"), (2, "discovery rest"), (3, "unstored"), (4, "held"), (5, "memo"), (6, "outputs"), (7, "readers index")] {
+            row(&mut rows, &format!("gen_reuse {name}"), &mut || c.gen_reuse.drop_part(part));
+        }
+        row(&mut rows, "caches.out code", &mut || c.out.iter_mut().for_each(|o| drop(take(&mut o.code))));
+        row(&mut rows, "caches.out", &mut || drop(take(&mut c.out)));
+        row(&mut rows, "caches.slot_reads", &mut || drop(take(&mut c.slot_reads)));
+        row(&mut rows, "caches.read_index", &mut || drop(take(&mut c.read_index)));
+        row(&mut rows, "caches.derive_tables", &mut || drop(take(&mut c.derive_tables)));
+        row(&mut rows, "caches.slot_ir", &mut || drop(take(&mut c.slot_ir)));
+        row(&mut rows, "caches.glue", &mut || drop(take(&mut c.glue)));
+        row(&mut rows, "caches.unit_records", &mut || drop(take(&mut c.unit_records)));
+        row(&mut rows, "caches.gen_reuse", &mut || drop(take(&mut c.gen_reuse)));
+        row(&mut rows, "caches.inst_ids", &mut || drop(take(&mut c.inst_ids)));
+        let f = &mut s.front;
+        for i in 0..f.kept.len() {
+            let Some(kp) = f.kept[i].as_mut() else { continue };
+            let p = &mut kp.program;
+            row(&mut rows, &format!("kept{i}.fns"), &mut || drop(take(&mut p.fns)));
+            row(&mut rows, &format!("kept{i}.adts"), &mut || drop(take(&mut p.adts)));
+            row(&mut rows, &format!("kept{i}.const_values"), &mut || drop(take(&mut p.const_values)));
+            row(&mut rows, &format!("kept{i}.body_items"), &mut || drop(take(&mut p.body_items)));
+            row(&mut rows, &format!("kept{i}.ast"), &mut || drop(take(&mut p.ast)));
+        }
+        row(&mut rows, "kept.rest", &mut || f.kept = Default::default());
+        row(&mut rows, "front.patch (tables, rest)", &mut || drop(f.patch.take()));
+        row(&mut rows, "front.resolve_cache", &mut || drop(take(&mut f.resolve_cache)));
+        row(&mut rows, "front.mdr", &mut || drop(take(&mut f.mdr)));
+        row(&mut rows, "front.chunks+src", &mut || {
+            drop(take(&mut f.chunks));
+            drop(take(&mut f.src));
+        });
+        row(&mut rows, "front.ast", &mut || drop(take(&mut f.ast)));
+        row(&mut rows, "front.map", &mut || drop(take(&mut f.map)));
+        row(&mut rows, "front.slot tables", &mut || {
+            drop(take(&mut f.fn_slot));
+            drop(take(&mut f.slot_hash));
+            drop(take(&mut f.slot_env));
+            drop(take(&mut f.slot_head));
+        });
+        row(&mut rows, "std_cache", &mut || drop(s.std_cache.take()));
+    }
+    row(&mut rows, "the rest of the sessions", &mut || drop(take(&mut sessions)));
+    row(&mut rows, "diag global tables", &mut || drop(diag::take_global_tables()));
+    row(&mut rows, "cargo graphs", &mut || drop(resolve::cargo::take_graph_cache()));
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: usize = rows.iter().map(|r| r.1).sum();
+    eprintln!("census: {} MB of restored blocks freed", total >> 20);
+    for (name, b) in rows {
+        eprintln!("census: {name:<28} {:>8.1} MB", b as f64 / 1048576.0);
+    }
+}
+
 /// Builds `reqs` in order with a front image (`LUST_FRONT_STATE`,
 /// src/image.rs). The image holds one session per crate selection, as a
 /// daemon keeps them: a request takes its own session from the image, or
@@ -147,6 +223,10 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
         Err(why) => (Vec::new(), Err(why)),
     };
     let load_ms = t.elapsed().as_secs_f64() * 1e3;
+    if std::env::var_os("LUST_FRONT_CENSUS").is_some_and(|v| v == "1") && loaded.is_ok() {
+        census(std::mem::take(&mut sessions));
+        std::process::exit(0);
+    }
     // `--timings` or LUST_FRONT_STATE_VERBOSE=1 report each load and the
     // save; a failed save is always reported.
     let verbose = reqs.iter().any(|r| r.timings) || std::env::var_os("LUST_FRONT_STATE_VERBOSE").is_some_and(|v| v != "0");
@@ -182,6 +262,9 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
                 if verbose {
                     use std::fmt::Write as _;
                     let _ = writeln!(resp.stderr, "lust: front state {how} in {load_ms:.0} ms");
+                    if let Some(n) = image::touched_note() {
+                        let _ = writeln!(resp.stderr, "lust: front state {n}");
+                    }
                 }
                 let stop = req.cc && resp.code != 0;
                 resps.push(resp);

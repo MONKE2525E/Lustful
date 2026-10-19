@@ -94,6 +94,32 @@ struct Stamp {
     len: u64,
 }
 
+impl PatchBase {
+    /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part
+    /// (1 file ranges and extras, 2 item scans, 3 dropped, 4 the rest of its lists; what is
+    /// left after them is mostly the tables).
+    pub(crate) fn drop_part(&mut self, part: usize) {
+        use std::mem::take;
+        match part {
+            1 => {
+                drop(self.ranges.take());
+                drop(self.extras.take());
+            }
+            2 => drop(take(&mut self.item_scans)),
+            3 => drop(take(&mut self.dropped)),
+            4 => {
+                drop(take(&mut self.fns_by_file));
+                drop(take(&mut self.body_hashes));
+                drop(take(&mut self.fn_lines));
+                drop(take(&mut self.live_slots));
+                drop(take(&mut self.root_unspliced));
+                drop(self.local_names.take());
+            }
+            _ => {}
+        }
+    }
+}
+
 /// What the last full resolve left for the next request's patch. The
 /// merged Ast, source map, item scans, and slot state live in `Front`.
 pub(crate) struct PatchBase {

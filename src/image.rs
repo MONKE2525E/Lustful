@@ -1265,6 +1265,38 @@ struct Loaded {
 
 static LOADED: std::sync::OnceLock<Loaded> = std::sync::OnceLock::new();
 
+/// Bytes of restored blocks freed so far in this process (their frees zero them), for
+/// `main::census`.
+pub fn restored_freed() -> usize {
+    OLD_FREED.load(Ordering::Relaxed)
+}
+
+/// With LUST_FRONT_TOUCHED=1 after a memfd restore (`LUST_FRONT_RESTORE=memfd`, where a page
+/// maps on its first touch): how much of the restored image this process has touched, for the
+/// build line. A probe for a lazy restore (an anonymous fill places every page).
+pub fn touched_note() -> Option<String> {
+    use std::os::unix::fs::FileExt;
+    if std::env::var_os("LUST_FRONT_TOUCHED").is_none_or(|v| v != "1") {
+        return None;
+    }
+    let l = LOADED.get().filter(|l| !l.anon)?;
+    let pagemap = std::fs::File::open("/proc/self/pagemap").ok()?;
+    let (mut touched, mut total) = (0usize, 0usize);
+    let mut buf = vec![0u8; 8 << 14];
+    for &(a, e) in &l.runs {
+        let mut x = a;
+        while x < e {
+            let n = ((e - x) / PAGE).min(buf.len() / 8);
+            pagemap.read_exact_at(&mut buf[..n * 8], (x / PAGE * 8) as u64).ok()?;
+            // Bit 63 of an entry: the page is present.
+            touched += buf[..n * 8].chunks_exact(8).filter(|w| w[7] & 0x80 != 0).count();
+            total += n;
+            x += n * PAGE;
+        }
+    }
+    Some(format!("touched {} of {} MB restored", (touched * PAGE) >> 20, (total * PAGE) >> 20))
+}
+
 /// The generation of this process's image (0 = written by a cold build).
 static GEN: AtomicUsize = AtomicUsize::new(0);
 

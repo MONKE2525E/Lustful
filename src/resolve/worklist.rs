@@ -754,6 +754,47 @@ pub struct ResolveCache {
     file_expander: Option<std::sync::Arc<FileExpander>>,
 }
 
+impl ResolveCache {
+    /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part of
+    /// every cached file (0 raw tokens, 1 outline, 2 expanded tokens, 3 parsed Ast, 4 final
+    /// chunk, 5 std asks), or with 6 the path table, the seed and the file expander.
+    /// For `main::census`: (cached files, files whose expanded stream has the raw stream's
+    /// tokens and strings, those files' raw token count).
+    pub(crate) fn same_streams(&self) -> (usize, usize, usize) {
+        let mut same = (0, 0);
+        for f in self.files.values() {
+            if let (Some(raw), Some((_, exp, _, _))) = (&f.raw, &f.expanded)
+                && raw.tokens.len() == exp.tokens.len()
+                && raw.strings == exp.strings
+                && raw.tokens.iter().zip(&exp.tokens).all(|(a, b)| a.tok == b.tok && a.span == b.span)
+            {
+                same.0 += 1;
+                same.1 += raw.tokens.len();
+            }
+        }
+        (self.files.len(), same.0, same.1)
+    }
+
+    pub(crate) fn drop_part(&mut self, part: usize) {
+        for f in self.files.values_mut() {
+            match part {
+                0 => drop(f.raw.take()),
+                1 => drop(f.outline.take()),
+                2 => drop(f.expanded.take()),
+                3 => drop(f.parsed.take()),
+                4 => drop(f.final_chunk.take()),
+                5 => drop(f.std_asks.take()),
+                _ => {}
+            }
+        }
+        if part == 6 {
+            drop(std::mem::take(&mut self.canon));
+            drop(self.seed.take());
+            drop(self.file_expander.take());
+        }
+    }
+}
+
 /// `lexed` without the inner tokens of each fn body range in `blank`
 /// (`{` through `}`, by bytes), for the body patch: only the body it
 /// edits needs its expansion, and what the expander does in one fn body

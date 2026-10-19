@@ -246,6 +246,38 @@ fn owned_str(p: &Program, t: &OwnedTy) -> String {
 /// vtable requests.
 pub(crate) type Discovered = (Vec<OwnedTy>, Vec<(LocalDefId, Vec<OwnedArg>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>);
 
+impl GenReuse {
+    /// For `main::census` (LUST_FRONT_CENSUS=1, a probe of a front image): drops one part
+    /// (0 templates, 1 closure templates, 2 discovery, 3 unstored, 4 held, 5 memo, 6 template
+    /// and closure outputs, 7 readers index; 8 the discovery entries' read sets, 9 their
+    /// outputs).
+    pub(crate) fn drop_part(&mut self, part: usize) {
+        use std::mem::take;
+        match part {
+            0 => drop(take(&mut self.templates)),
+            1 => drop(take(&mut self.closure_templates)),
+            2 => drop(take(&mut self.discovery)),
+            3 => drop(take(&mut self.unstored)),
+            4 => drop(self.held.take()),
+            5 => drop(take(&mut self.memo)),
+            6 => {
+                drop(take(&mut self.tpl_out));
+                drop(take(&mut self.closure_out));
+                drop(self.prev_outs.take());
+            }
+            7 => drop(take(&mut self.readers_index)),
+            8 => self.discovery.values_mut().for_each(|e| drop(take(&mut e.reads))),
+            9 => self.discovery.values_mut().for_each(|e| {
+                drop(take(&mut e.adt_tys));
+                drop(take(&mut e.requests));
+                drop(take(&mut e.closures));
+                drop(take(&mut e.vtables));
+            }),
+            _ => {}
+        }
+    }
+}
+
 /// The session's generic reuse cache. `collect_reuse` moves it into
 /// `GenTables::reuse` for one collect and back out after.
 #[derive(Default)]
