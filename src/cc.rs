@@ -241,15 +241,19 @@ fn compiler_id(cmd: &[String]) -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string())
         .unwrap_or_default();
-    let bin = std::env::var_os("PATH")
-        .and_then(|path| std::env::split_paths(&path).map(|d| d.join(&cmd[0])).find(|p| p.is_file()))
-        .unwrap_or_else(|| PathBuf::from(&cmd[0]));
-    let stamp = std::fs::metadata(std::fs::canonicalize(&bin).unwrap_or(bin))
-        .map(|m| format!("{} {:?}", m.len(), m.modified().ok()))
-        .unwrap_or_default();
+    let stamp = std::fs::metadata(resolve_bin(&cmd[0])).map(|m| format!("{} {:?}", m.len(), m.modified().ok())).unwrap_or_default();
     let id = format!("{} | {ver} | {stamp}", cmd.join(" "));
     map.lock().unwrap_or_else(|e| e.into_inner()).insert(cmd.to_vec(), id.clone());
     id
+}
+
+/// The file a command name runs: the first PATH entry that has it, links resolved (the name
+/// as given when none does).
+fn resolve_bin(prog: &str) -> PathBuf {
+    let bin = std::env::var_os("PATH")
+        .and_then(|path| std::env::split_paths(&path).map(|d| d.join(prog)).find(|p| p.is_file()))
+        .unwrap_or_else(|| PathBuf::from(prog));
+    std::fs::canonicalize(&bin).unwrap_or(bin)
 }
 
 /// The disk cache key of one unit's object under this backend: the C (or,
@@ -501,9 +505,9 @@ fn ll_profile_text(c: &str, ll: &str, hc: &str) -> String {
 
 /// What a unit key holds besides the unit's text (`unit_key`, `llflags`, the profile): a
 /// unit memo (`memo.rs`) written under another tag is dropped as a whole.
-fn memo_tag(spec: &CcSpec, debug: bool) -> String {
-    let profile = std::env::var_os("LUST_PGO_USE").map(|p| std::fs::read(&p).unwrap_or_default()).unwrap_or_default();
-    let pgo_env: Vec<String> = ["LUST_PGO_BITS", "LUST_PGO_PREINLINE", "LUST_PROFDATA"].iter().map(|v| std::env::var(v).unwrap_or_default()).collect();
+fn memo_tag(spec: &CcSpec, debug: bool, work: &Path) -> String {
+    let profile = std::env::var_os("LUST_PGO_USE").map(|p| pgo::profile_digest(Path::new(&p), work).unwrap_or_default()).unwrap_or_default();
+    let pgo_env: Vec<String> = ["LUST_PGO_BITS", "LUST_PGO_PREINLINE", "LUST_PGO_CGPROFILE", "LUST_PROFDATA"].iter().map(|v| std::env::var(v).unwrap_or_default()).collect();
     let (a, b) = crate::driver::cache::hash128(
         &[
             env!("LUST_BUILD_HASH").as_bytes(),
@@ -512,7 +516,7 @@ fn memo_tag(spec: &CcSpec, debug: bool) -> String {
             cflags(debug).as_bytes(),
             llflags(debug).as_bytes(),
             pgo_env.join(" ").as_bytes(),
-            &profile,
+            profile.as_bytes(),
         ],
         59,
     );
@@ -542,7 +546,7 @@ fn memo_state(
     // (`LUST_LL_RTINL`): LLVM unit keys hold its digest, known only after it compiles.
     let rt_max: usize = std::env::var("LUST_LL_RTINL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let instrumented = std::env::var_os("LUST_PGO_GEN").is_some_and(|v| v == "1");
-    let tag = (units.iter().any(|u| u.fp.is_some()) && rt_max == 0 && !instrumented).then(|| memo_tag(spec, debug));
+    let tag = (units.iter().any(|u| u.fp.is_some()) && rt_max == 0 && !instrumented).then(|| memo_tag(spec, debug, work));
     let memo = tag.as_deref().map(|t| memo::load(work, t)).unwrap_or_default();
     let entry_of = |u: &UnitIn| memo_entry(&memo, u);
     // A unit without text: its memo entry, with the object in the cache. An LLVM unit's
@@ -622,16 +626,17 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
             let name = units[i].name.as_str();
             ll_of.get(name).filter(|_| pgo_on).map(|ll| ll_profile_text(text(i), ll, hc_of.get(name).copied().unwrap_or("")))
         });
-    let names: Vec<String> = crate::pool::par_map(&idx, |&i| {
-        let name = &units[i].name;
-        match entries[i] {
-            // A PGO name is its text's (`pgo::stable_name`); else the unit's name now: its
-            // object goes there, whatever name the entry had in the last build.
-            Some(e) if pgo_on => e.file.rsplit_once('.').map_or(e.file.clone(), |(stem, _)| stem.to_string()),
-            Some(_) => name.clone(),
-            None if pgo_on && !is_cxx(name) => pgo::stable_name(ll_texts[i].as_deref().unwrap_or(text(i))).unwrap_or_else(|| name.clone()),
-            None => name.clone(),
-        }
+    // What each C or LLVM unit given text defines (`pgo::definitions_of`), one scan: its PGO
+    // file name and the split read it.
+    let scans: Vec<Option<pgo::Defs>> = crate::pool::par_map(&idx, |&i| {
+        (pgo_on && entries[i].is_none() && !is_cxx(&units[i].name)).then(|| pgo::definitions_of(ll_texts[i].as_deref().unwrap_or(text(i))))
+    });
+    let names: Vec<String> = crate::pool::par_map(&idx, |&i| match (entries[i], &scans[i]) {
+        // A PGO name is its text's (`pgo::stable_name`); else the unit's name now: its
+        // object goes there, whatever name the entry had in the last build.
+        (Some(e), _) if pgo_on => e.file.rsplit_once('.').map_or(e.file.clone(), |(stem, _)| stem.to_string()),
+        (None, Some(d)) => pgo::stable_name(&d.0).unwrap_or_else(|| units[i].name.clone()),
+        _ => units[i].name.clone(),
     });
     let cflags_text = cflags(debug);
     let pre: Vec<Option<Vec<u8>>> = crate::pool::par_map(&idx, |&i| {
@@ -642,10 +647,7 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
     let pfile = |i: usize| if is_ll[i] { format!("{}.ll", names[i]) } else { format!("{}.c", names[i]) };
     // What each unit defines, for a profile to use: from its text, or its memo entry.
     let defs = std::env::var_os("LUST_PGO_USE").filter(|_| !instrumented).map(|_| {
-        let files: Vec<(String, &str, Option<&[u8]>)> = (0..units.len())
-            .filter(|&i| !is_cxx(&names[i]) && entries[i].is_none())
-            .map(|i| (pfile(i), ll_texts[i].as_deref().unwrap_or(text(i)), pre[i].as_deref()))
-            .collect();
+        let files: Vec<(String, &pgo::Defs, Option<&[u8]>)> = (0..units.len()).filter_map(|i| Some((pfile(i), scans[i].as_ref()?, pre[i].as_deref()))).collect();
         let mut defs = pgo::unit_defs(&files);
         defs.units.extend((0..units.len()).filter_map(|i| entries[i].map(|e| (e.file.clone(), e.defs.clone()))));
         defs.statics.extend((0..units.len()).filter_map(|i| entries[i].map(|e| (e.file.clone(), e.statics.clone()))));
@@ -706,6 +708,7 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
                 let pf = pgo_of(r).map(|m| m.unit_flags(&pfile(r))).transpose()?;
                 compile_runtime_ir(spec, &flags, &src, &objs[r], &rt_inl, rt_max, pf.as_deref(), key.as_deref())
                     .map_err(|e| format!("the C compiler failed for target {} (runtime IR):\n{e}", spec.triple))?;
+                pgo_of(r).map_or(Ok(()), |m| m.after_compile(&objs[r]))?;
                 if let (Some(c), Some(k)) = (cache, &key) {
                     c.store_unit_object(k, &objs[r]);
                     c.store_unit_object(&format!("{k}-inl"), &rt_inl);
@@ -841,7 +844,9 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
                             continue;
                         }
                     };
-                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].name.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path()), nopre, keys[i].as_deref()) {
+                    match compile_pair(spec, &flags, debug, &src, ll, hc_of.get(units[i].name.as_str()).copied().unwrap_or(""), obj, pf.as_deref(), rt.map(|_| rt_inl.as_path()), nopre, keys[i].as_deref())
+                        .and_then(|()| pgo_of(i).map_or(Ok(()), |m| m.after_compile(obj)))
+                    {
                         Ok(()) => {
                             if let (Some(cache), Some(key)) = (cache, &keys[i]) {
                                 cache.store_unit_object(key, obj);
@@ -873,7 +878,9 @@ pub fn build(units: &[UnitIn], spec: &CcSpec, out: &Path, debug: bool, cache: Op
                 }
                 match cmd.output() {
                     Ok(o) if o.status.success() => {
-                        if let (Some(cache), Some(key)) = (cache, &keys[i]) {
+                        if let Err(e) = pgo_of(i).map_or(Ok(()), |m| m.after_compile(obj)) {
+                            fail(format!("--- unit {name}: {e}\n"));
+                        } else if let (Some(cache), Some(key)) = (cache, &keys[i]) {
                             cache.store_unit_object(key, obj);
                         }
                     }

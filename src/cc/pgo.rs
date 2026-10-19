@@ -25,6 +25,13 @@
 // preprocessed text. A record no unit defines is of a fn this build does not have (a
 // profile from an older state, or a `lust_*` fn only inline copies held) and goes to no
 // unit.
+//
+// The fixed cost of a warm build with an unchanged profile (rel-llvm round 2026-10-19): it
+// reads none of the profile's bytes (`profile_digest`: a stat record per profile), runs no
+// llvm-profdata (`tool_version`), reads the records' index and not the profile text
+// (`pgo-all.index`), and scans each unit's text once for its definitions
+// (`definitions_of`). Its objects keep no call graph profile for the link
+// (`drop_cg_profile`): lld would sort the link by it, for no run speed.
 use super::CcSpec;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -70,7 +77,7 @@ impl Mode {
         let Some(path) = std::env::var_os("LUST_PGO_USE") else { return Ok(None) };
         // The profile format and the fns' CFG hashes are those of one LLVM major.
         let cc = clang_major(&spec.cmd)?;
-        let tool = run(Command::new(profdata()).arg("--version"))?;
+        let tool = tool_version(work)?;
         let pd = major_after(&tool, "LLVM version ")?;
         if pd != cc {
             return Err(format!("LUST_PROFDATA ({}) is LLVM {pd}, the compiler ({}) LLVM {cc}", profdata(), spec.cmd.join(" ")));
@@ -121,10 +128,22 @@ impl Mode {
             Mode::Use(p) => {
                 let pins = p.pins.join(" ");
                 let own: Vec<[u8; 16]> = p.own.get(file).into_iter().flatten().map(|d| d.to_le_bytes()).collect();
-                let mut parts: Vec<&[u8]> = vec![pins.as_bytes(), nopre.as_bytes(), STATIC_FILE.as_bytes()];
+                // One part with `nopre`: with the call graph profile kept, keys are those of
+                // builds before the flag.
+                let flags = format!("{nopre}{}", if cg_profile() { "" } else { " nocg" });
+                let mut parts: Vec<&[u8]> = vec![pins.as_bytes(), flags.as_bytes(), STATIC_FILE.as_bytes()];
                 parts.extend(own.iter().map(|b| b.as_slice()));
                 digest(&parts)
             }
+        }
+    }
+
+    /// What a unit's object needs after its compile, before the cache stores it: with a
+    /// profile, its call graph profile out of the link (`cg_profile`).
+    pub fn after_compile(&self, obj: &Path) -> Result<(), String> {
+        match self {
+            Mode::Use(_) if !cg_profile() => drop_cg_profile(obj),
+            _ => Ok(()),
         }
     }
 
@@ -160,10 +179,14 @@ pub fn gen_spec(spec: &CcSpec) -> Result<CcSpec, String> {
 }
 
 /// The LLVM major version of a clang command; an error for another compiler (gcc writes
-/// its own profile format).
+/// its own profile format). It reads the `--version` line of `compiler_id`, which runs it
+/// once a process (the unit keys hold it).
 fn clang_major(cmd: &[String]) -> Result<u32, String> {
-    let out = run(Command::new(&cmd[0]).args(&cmd[1..]).arg("--version"))?;
-    let first = out.lines().next().unwrap_or("");
+    let id = super::compiler_id(cmd);
+    let first = id.split(" | ").nth(1).unwrap_or("");
+    if first.is_empty() {
+        return Err(format!("cannot run `{} --version`", cmd.join(" ")));
+    }
     if !first.contains("clang version ") {
         return Err(format!("PGO needs clang (LLVM IR profiles); `{}` says: {first}", cmd.join(" ")));
     }
@@ -189,10 +212,10 @@ pub fn hot_ids(work: &Path, min: u64) -> Result<Option<std::collections::HashSet
 }
 
 /// The ids of the fns (`fl_<id>`, release C `f_<id>`) whose record in the profile at `path`
-/// has a counter of at least `min`, memoized in `work` under `memo` by the profile's bytes.
+/// has a counter of at least `min`, memoized in `work` under `memo` by the profile's bytes
+/// (`profile_digest`).
 pub fn hot_ids_of(path: &Path, work: &Path, min: u64, memo: &str) -> Result<std::collections::HashSet<u64>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let key = digest(&[b"hot", &bytes, &min.to_le_bytes()]);
+    let key = digest(&[b"hot", profile_digest(path, work)?.as_bytes(), &min.to_le_bytes()]);
     let memo = work.join(memo);
     if let Some(ids) = std::fs::read_to_string(&memo).ok().and_then(|m| m.strip_prefix(&format!("{key}\n")).map(str::to_string)) {
         return Ok(ids.lines().filter_map(|l| u64::from_str_radix(l, 16).ok()).collect());
@@ -221,6 +244,36 @@ fn profdata() -> String {
     std::env::var("LUST_PROFDATA").unwrap_or_else(|_| "llvm-profdata".into())
 }
 
+/// `llvm-profdata --version` of the `LUST_PROFDATA` tool: the profile's memo key holds it,
+/// and its LLVM major must be the compiler's. A warm build runs no llvm-profdata (10-110 ms
+/// a run, libLLVM's load from a cold page cache the most): `work/pgo-tool` keeps the answer
+/// with the stamp (`file_stamp`) of the file PATH resolves the tool to.
+fn tool_version(work: &Path) -> Result<String, String> {
+    let tool = profdata();
+    let file = super::resolve_bin(&tool);
+    let stamp = file_stamp(&file).ok().flatten().filter(|(_, settled)| *settled).map(|(s, _)| format!("{} {s}", file.display()));
+    let rec = work.join("pgo-tool");
+    if let Some(s) = &stamp
+        && let Some(v) = std::fs::read_to_string(&rec).ok().and_then(|t| t.strip_prefix(&format!("{s}\n")).map(str::to_string))
+    {
+        return Ok(v);
+    }
+    let v = run(Command::new(&tool).arg("--version"))?;
+    if let Some(s) = stamp {
+        write_record(work, &rec, &format!("{s}\n{v}"));
+    }
+    Ok(v)
+}
+
+/// Writes a record file of this work dir whole (a reader sees the old one or the new one);
+/// a failed write only leaves the next build without it.
+fn write_record(work: &Path, rec: &Path, text: &str) {
+    let tmp = rec.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::create_dir_all(work).is_ok() && std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, rec);
+    }
+}
+
 fn run(cmd: &mut Command) -> Result<String, String> {
     let o = cmd.output().map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
     if !o.status.success() {
@@ -245,9 +298,100 @@ pub fn no_preinline() -> bool {
     std::env::var("LUST_PGO_PREINLINE").map_or(true, |v| v != "1")
 }
 
+/// The objects of a build with a profile keep no call graph profile for the link
+/// (`drop_cg_profile`; `LUST_PGO_CGPROFILE=1` keeps it). clang writes one under
+/// `-fprofile-use`, and lld sorts the link's sections by it: on a warm tsgo build that was
+/// 180 ms of a 430 ms link, for no run speed (TypeORM wall 0.530 s sorted, 0.534 s not;
+/// cycles 3-4% lower unsorted on TypeORM and the pgo-train set, within noise).
+pub fn cg_profile() -> bool {
+    std::env::var("LUST_PGO_CGPROFILE").is_ok_and(|v| v == "1")
+}
+
+/// ELF's section type of a call graph profile (`.llvm.call-graph-profile`).
+const SHT_LLVM_CALL_GRAPH_PROFILE: u32 = 0x6fff_4c09;
+
+/// Takes the call graph profile of the object `obj` out of its link: the section becomes a
+/// plain one (SHT_PROGBITS), which its SHF_EXCLUDE flag still keeps out of the binary, so lld
+/// has no call graph to sort the link by. Neither clang 20 nor zig cc has a flag that stops
+/// the section or the sort. A binary from such objects is byte for byte the one from objects
+/// with the section removed. An object that is not ELF64 little-endian, or has no such
+/// section, stays as it is.
+fn drop_cg_profile(obj: &Path) -> Result<(), String> {
+    let mut b = std::fs::read(obj).map_err(|e| format!("cannot read {}: {e}", obj.display()))?;
+    if b.len() < 64 || &b[..4] != b"\x7fELF" || b[4] != 2 || b[5] != 1 {
+        return Ok(());
+    }
+    let u16_at = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+    let u64_at = |b: &[u8], at: usize| b.get(at..at + 8).map(|x| u64::from_le_bytes(x.try_into().unwrap()) as usize);
+    let (Some(shoff), entsize) = (u64_at(&b, 0x28), u16_at(&b, 0x3a)) else { return Ok(()) };
+    // More than 0xff00 sections: the count is section 0's sh_size.
+    let count = match u16_at(&b, 0x3c) {
+        0 => u64_at(&b, shoff + 0x20).unwrap_or(0),
+        n => n,
+    };
+    let mut hit = false;
+    for i in 0..count {
+        let at = shoff + i * entsize + 4;
+        let Some(t) = b.get(at..at + 4) else { break };
+        if u32::from_le_bytes(t.try_into().unwrap()) == SHT_LLVM_CALL_GRAPH_PROFILE {
+            b[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+            hit = true;
+        }
+    }
+    if !hit {
+        return Ok(());
+    }
+    // A new file: the compiler's output may be a link to its own cache's entry.
+    let tmp = obj.with_extension("o.nocg");
+    std::fs::write(&tmp, &b).and_then(|_| std::fs::rename(&tmp, obj)).map_err(|e| format!("cannot write {}: {e}", obj.display()))
+}
+
 fn digest(parts: &[&[u8]]) -> String {
     let (a, b) = crate::driver::cache::hash128(parts, 41);
     format!("{a:016x}{b:016x}")
+}
+
+/// The digest of the bytes of the profile at `path`, which every key and memo of a profile
+/// holds. A build whose profile did not change reads none of it (tsgo's: 39-48 MB, from a
+/// CI disk mounted cold): `work/pgo-stat-<path digest>` records the digest with the file's
+/// size, inode, and modify and change times, and a file with the same four has the same
+/// bytes. Every write moves the change time, but within one clock tick it can stay: a
+/// record is made only for a file whose last change was over a second before it was read,
+/// with the same four after the read.
+pub(crate) fn profile_digest(path: &Path, work: &Path) -> Result<String, String> {
+    let read_err = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
+    let stamp = file_stamp(path).map_err(read_err)?;
+    let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let rec = work.join(format!("pgo-stat-{}", &digest(&[full.as_os_str().as_encoded_bytes()])[..16]));
+    if let Some((s, _)) = &stamp
+        && let Some(d) = std::fs::read_to_string(&rec).ok().and_then(|t| t.strip_prefix(&format!("{s} ")).map(|d| d.trim_end().to_string()))
+    {
+        return Ok(d);
+    }
+    let d = digest(&[&std::fs::read(path).map_err(read_err)?]);
+    if let Some((s, settled)) = stamp
+        && settled
+        && file_stamp(path).is_ok_and(|after| after.is_some_and(|(a, _)| a == s))
+    {
+        write_record(work, &rec, &format!("{s} {d}\n"));
+    }
+    Ok(d)
+}
+
+/// What `profile_digest` compares (size, inode, and modify and change times in ns), and
+/// whether the file's last change is over a second old. None where the platform has no
+/// inode or change time: the profile is read every build.
+#[cfg(unix)]
+fn file_stamp(path: &Path) -> std::io::Result<Option<(String, bool)>> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let s = format!("{} {} {}.{:09} {}.{:09}", m.len(), m.ino(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
+    Ok(Some((s, now - m.ctime() >= 2)))
+}
+#[cfg(not(unix))]
+fn file_stamp(path: &Path) -> std::io::Result<Option<(String, bool)>> {
+    std::fs::metadata(path).map(|_| None)
 }
 
 impl Pgo {
@@ -263,24 +407,24 @@ impl Pgo {
         // (~2.8 s for tsgo's), and the records' index (`Index`) instead of the profile text.
         // `memo` holds their digest and the pins, and is written last.
         let idx = work.join("pgo-all.index");
-        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let key = digest(&[&bytes, &bits.to_le_bytes(), tool.as_bytes()]);
-        let kept = std::fs::read_to_string(&memo)
+        let key = digest(&[profile_digest(path, work)?.as_bytes(), &bits.to_le_bytes(), tool.as_bytes()]);
+        let pins_kept = std::fs::read_to_string(&memo)
             .ok()
-            .and_then(|m| m.strip_prefix(&format!("{key}\n")).map(|pins| pins.split_whitespace().map(str::to_string).collect::<Vec<_>>()))
-            .and_then(|pins| read_index(&idx).map(|i| (i, pins)));
-        let hit = kept.is_some();
-        let (index, pins) = match kept {
-            Some(k) => k,
-            None => {
+            .and_then(|m| m.strip_prefix(&format!("{key}\n")).map(|pins| pins.split_whitespace().map(str::to_string).collect::<Vec<_>>()));
+        let index_text = pins_kept.as_ref().and_then(|_| std::fs::read_to_string(&idx).ok());
+        let records: Records;
+        let (index, pins, hit) = match (pins_kept, index_text.as_deref().and_then(read_index)) {
+            (Some(pins), Some(index)) => (index, pins, true),
+            _ => {
                 let _ = std::fs::remove_file(&memo);
                 let text = run(Command::new(profdata()).args(["merge", "--text", "-o", "-"]).arg(path))?;
-                let (head, mut records) = parse(&text);
+                let (head, mut recs) = parse(&text);
                 if bits > 0 {
-                    for r in records.values_mut().flatten() {
+                    for r in recs.values_mut().flatten() {
                         *r = Arc::from(quantize(r, bits));
                     }
                 }
+                records = recs;
                 let mut names: Vec<&String> = records.keys().collect();
                 names.sort();
                 let body: Vec<&str> = names.iter().flat_map(|n| records[*n].iter().map(|r| &**r)).collect();
@@ -290,7 +434,7 @@ impl Pgo {
                 let index = index(&records);
                 write_index(&idx, &index)?;
                 std::fs::write(&memo, format!("{key}\n{}\n", pins.join(" "))).map_err(|e| format!("cannot write {}: {e}", memo.display()))?;
-                (index, pins)
+                (index, pins, false)
             }
         };
         if hit && !all.exists() {
@@ -309,20 +453,26 @@ pub(super) struct UnitDefs {
     pub statics: Vec<(String, Vec<String>)>,
 }
 
-/// The definitions of each unit (`defined_externs`), on every thread: of its preprocessed
-/// text when the caller has one (a unit with `#include`s; `cc::preprocessed`, else its text
-/// as given), so the fns its macros make count as its own.
-pub(super) fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
-    let per: Vec<(String, Vec<String>, Vec<String>, Vec<String>)> = crate::pool::par_map(units, |(file, c, pre)| {
-        let raw: std::collections::HashSet<&str> = defined_externs(c).into_iter().collect();
-        let pre = pre.map(String::from_utf8_lossy);
-        let names: Vec<String> = match &pre {
-            Some(pre) => defined_externs(pre).into_iter().map(str::to_string).collect(),
-            None => raw.iter().map(|n| n.to_string()).collect(),
-        };
-        let made = names.iter().filter(|n| !raw.contains(n.as_str())).cloned().collect();
-        let statics = defined_statics(pre.as_deref().unwrap_or(c)).into_iter().map(str::to_string).collect();
-        (file.clone(), names, made, statics)
+/// The definitions of each unit, on every thread: those of its text, scanned once
+/// (`definitions_of`, which its PGO file name reads too), or of its preprocessed text when
+/// the caller has one (a unit with `#include`s; `cc::preprocessed`), so the fns its macros
+/// make count as its own.
+pub(super) fn unit_defs(units: &[(String, &Defs, Option<&[u8]>)]) -> UnitDefs {
+    let owned = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<String>>();
+    let per: Vec<(String, Vec<String>, Vec<String>, Vec<String>)> = crate::pool::par_map(units, |(file, raw, pre)| match pre {
+        None => {
+            let mut names = owned(&raw.0);
+            names.sort_unstable();
+            names.dedup();
+            (file.clone(), names, Vec::new(), owned(&raw.1))
+        }
+        Some(pre) => {
+            let pre = String::from_utf8_lossy(pre);
+            let (names, statics) = definitions_of(&pre);
+            let raw: std::collections::HashSet<&str> = raw.0.iter().copied().collect();
+            let made = names.iter().filter(|n| !raw.contains(*n)).map(|n| n.to_string()).collect();
+            (file.clone(), owned(&names), made, owned(&statics))
+        }
     });
     let mut macro_made = std::collections::HashSet::new();
     let mut units = Vec::with_capacity(per.len());
@@ -339,27 +489,13 @@ pub(super) fn unit_defs(units: &[(String, &str, Option<&[u8]>)]) -> UnitDefs {
 /// sorted; how many of those names are of macro-made fns; how many external ones no unit
 /// defines. An external fn's record goes to every unit that defines it, a static fn's
 /// (`STATIC_FILE;<fn>`) to every unit that defines a static fn of that name, a static record of
-/// another file to that file. Each unit looks up the names it defines, on every thread (tsgo's
-/// LLVM build: 728k records over ~4,300 units, each with the unit header's static fns).
-fn split(index: &Index, defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, usize, usize) {
+/// another file to the unit of that file. Each unit finds its names in the sorted index by
+/// binary search, on every thread, with no map of the index built first (tsgo's LLVM build:
+/// 728k records over ~4,300 units, each with the unit header's static fns).
+fn split(index: &[(&str, u128, usize)], defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, usize, usize) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    let entries: Vec<(&str, u128)> = index.iter().map(|(n, d, _)| (n.as_str(), *d)).collect();
-    let mut ext: crate::intern::FxMap<&str, usize> = Default::default();
-    let mut stat: crate::intern::FxMap<&str, usize> = Default::default();
-    ext.reserve(entries.len() / 4);
-    stat.reserve(entries.len());
-    let mut other: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, (n, _)) in entries.iter().enumerate() {
-        match n.split_once(';') {
-            Some((STATIC_FILE, f)) => {
-                stat.insert(f, i);
-            }
-            Some((file, _)) => other.entry(file).or_default().push(i),
-            None => {
-                ext.insert(*n, i);
-            }
-        }
-    }
+    debug_assert!(index.windows(2).all(|w| w[0].0 < w[1].0), "the index is sorted by name");
+    let find = |prefix: &str, name: &str| index.binary_search_by(|e| cmp_joined(e.0, prefix, name)).ok();
     let mut files: HashMap<&str, (&[String], &[String])> = HashMap::new();
     for (f, ns) in &defs.units {
         files.entry(f.as_str()).or_default().0 = ns;
@@ -367,25 +503,27 @@ fn split(index: &Index, defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, usize, 
     for (f, ns) in &defs.statics {
         files.entry(f.as_str()).or_default().1 = ns;
     }
-    for f in other.keys() {
-        files.entry(f).or_default();
-    }
     let files: Vec<(&str, &[String], &[String])> = files.into_iter().map(|(f, (e, s))| (f, e, s)).collect();
-    let claimed: Vec<AtomicBool> = entries.iter().map(|_| AtomicBool::new(false)).collect();
+    let claimed: Vec<AtomicBool> = index.iter().map(|_| AtomicBool::new(false)).collect();
+    let static_prefix = format!("{STATIC_FILE};");
     let own = crate::pool::par_map(&files, |&(f, exts, statics)| {
         let mut ds = Vec::with_capacity(exts.len() + statics.len());
         let mut take = |i: usize| {
-            ds.push(entries[i].1);
+            ds.push(index[i].1);
             claimed[i].store(true, Relaxed);
         };
-        exts.iter().filter_map(|n| ext.get(n.as_str())).for_each(|&i| take(i));
-        statics.iter().filter_map(|n| stat.get(n.as_str())).for_each(|&i| take(i));
-        other.get(f).into_iter().flatten().for_each(|&i| take(i));
+        exts.iter().filter_map(|n| find("", n)).for_each(&mut take);
+        statics.iter().filter_map(|n| find(&static_prefix, n)).for_each(&mut take);
+        // The static records of this file's own name: one run of the sorted index.
+        if f != STATIC_FILE {
+            let lo = index.partition_point(|e| cmp_joined(e.0, f, ";").is_lt());
+            (lo..index.len()).take_while(|&i| index[i].0.strip_prefix(f).is_some_and(|r| r.starts_with(';'))).for_each(&mut take);
+        }
         ds.sort_unstable();
         (f.to_string(), ds)
     });
     let (mut helpers, mut absent) = (0, 0);
-    for ((n, _), c) in entries.iter().zip(&claimed) {
+    for ((n, _, _), c) in index.iter().zip(&claimed) {
         if !n.contains(';') {
             match c.load(Relaxed) {
                 true => helpers += defs.macro_made.contains(*n) as usize,
@@ -396,26 +534,38 @@ fn split(index: &Index, defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, usize, 
     (own.into_iter().filter(|(_, d)| !d.is_empty()).collect(), helpers, absent)
 }
 
+/// `a` against `prefix` followed by `name`, in byte order, with no joined copy made.
+fn cmp_joined(a: &str, prefix: &str, name: &str) -> std::cmp::Ordering {
+    let (a, p) = (a.as_bytes(), prefix.as_bytes());
+    let k = a.len().min(p.len());
+    match a[..k].cmp(&p[..k]) {
+        std::cmp::Ordering::Equal if a.len() < p.len() => std::cmp::Ordering::Less,
+        std::cmp::Ordering::Equal => a[p.len()..].cmp(name.as_bytes()),
+        o => o,
+    }
+}
+
 /// A text profile's records by fn name: every record of the name (static fns of one source
 /// name can differ in body, so in hash, across units).
 type Records = HashMap<String, Vec<Arc<str>>>;
 
-/// Per record name, the digest of its records (sorted) and their number: all a unit's key
-/// reads of the profile (`key_part`), so a warm build of the same profile reads this file
-/// (`pgo-all.index`) and not the profile text (tsgo's LLVM profile: 731k records).
-type Index = Vec<(String, u128, usize)>;
+/// Per record name, sorted by name, the digest of its records (sorted) and their number: all
+/// a unit's key reads of the profile (`key_part`), so a warm build of the same profile reads
+/// this file (`pgo-all.index`) and not the profile text (tsgo's LLVM profile: 731k records).
+/// The names borrow the records' keys or the index file's text.
+type Index<'a> = Vec<(&'a str, u128, usize)>;
 
-fn index(records: &Records) -> Index {
+fn index(records: &Records) -> Index<'_> {
     let mut index: Index = records
         .iter()
         .map(|(n, rs)| {
             let mut rs: Vec<&[u8]> = rs.iter().map(|r| r.as_bytes()).collect();
             rs.sort_unstable();
             let (a, b) = crate::driver::cache::hash128(&rs, 41);
-            (n.clone(), ((a as u128) << 64) | b as u128, rs.len())
+            (n.as_str(), ((a as u128) << 64) | b as u128, rs.len())
         })
         .collect();
-    index.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    index.sort_unstable_by(|a, b| a.0.cmp(b.0));
     index
 }
 
@@ -427,29 +577,29 @@ fn write_index(path: &Path, index: &Index) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// None when the file is missing or not an index: the caller reads the profile again. Its
-/// lines are parsed on every thread, in chunks.
-fn read_index(path: &Path) -> Option<Index> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// The index in `text` (an index file's), names borrowed from it; None when it is not an
+/// index or not sorted: the caller reads the profile again. Its lines are parsed on every
+/// thread, in chunks.
+fn read_index(text: &str) -> Option<Index<'_>> {
     let mut chunks = Vec::new();
-    let mut rest = text.as_str();
+    let mut rest = text;
     while !rest.is_empty() {
         let cut = rest.get(1 << 20..).and_then(|r| r.find('\n')).map_or(rest.len(), |k| (1 << 20) + k + 1);
         let (chunk, tail) = rest.split_at(cut);
         chunks.push(chunk);
         rest = tail;
     }
-    let parse = |line: &str| {
+    fn parse(line: &str) -> Option<(&str, u128, usize)> {
         let mut f = line.rsplitn(3, '\t');
         let (k, d, n) = (f.next()?.parse().ok()?, u128::from_str_radix(f.next()?, 16).ok()?, f.next()?);
-        Some((n.to_string(), d, k))
-    };
+        Some((n, d, k))
+    }
     let parts = crate::pool::par_map(&chunks, |c| c.lines().map(parse).collect::<Option<Vec<_>>>());
     let mut index = Vec::with_capacity(text.len() / 64);
     for p in parts {
         index.extend(p?);
     }
-    Some(index)
+    index.windows(2).all(|w| w[0].0 < w[1].0).then_some(index)
 }
 
 /// An IR PGO text profile: the header (flag lines) and the records by name.
@@ -545,26 +695,33 @@ fn pins(show: &str) -> Result<Vec<String>, String> {
 /// a body. A prototype ends in `;` instead; a static function's record is owned by name
 /// (`defined_statics`), so it is not listed.
 pub fn defined_externs(c: &str) -> Vec<&str> {
-    definitions(c, false)
+    definitions_of(c).0
 }
 
 /// The static functions `c` defines, as `defined_externs` finds the external ones.
 pub fn defined_statics(c: &str) -> Vec<&str> {
-    definitions(c, true)
+    definitions_of(c).1
 }
 
-fn definitions(c: &str, statics: bool) -> Vec<&str> {
+/// What a unit's text defines: its external fns (`defined_externs`), then its static fns.
+pub(super) type Defs<'a> = (Vec<&'a str>, Vec<&'a str>);
+
+/// The external and the static functions `c` defines, in one pass over its lines (a warm
+/// tsgo build scans ~1 GB of unit text: its PGO file names and the split both read this).
+pub(super) fn definitions_of(c: &str) -> Defs<'_> {
     let b = c.as_bytes();
-    let mut out = Vec::new();
+    let (mut ext, mut stat) = (Vec::new(), Vec::new());
     let mut at = 0;
     while at < b.len() {
         let end = c[at..].find('\n').map_or(b.len(), |k| at + k);
         let line = &c[at..end];
         let first = line.bytes().next().unwrap_or(b' ');
-        let skip = ["static", "typedef", "struct", "union", "enum", "extern", "#"];
-        let wanted = if statics { line.starts_with("static ") } else { !skip.iter().any(|s| line.starts_with(s)) };
-        if (first.is_ascii_alphabetic() || first == b'_') && wanted {
-            if let Some((name, open)) = declarator_name(line) {
+        if first.is_ascii_alphabetic() || first == b'_' {
+            let is_static = line.starts_with("static ");
+            let skip = ["static", "typedef", "struct", "union", "enum", "extern", "#"];
+            if (is_static || !skip.iter().any(|s| line.starts_with(s)))
+                && let Some((name, open)) = declarator_name(line)
+            {
                 let mut depth = 0usize;
                 let mut i = at + open;
                 while i < b.len() {
@@ -581,13 +738,13 @@ fn definitions(c: &str, statics: bool) -> Vec<&str> {
                     i += 1;
                 }
                 if c.get(i + 1..).is_some_and(|rest| rest.trim_start().starts_with('{')) {
-                    out.push(name);
+                    if is_static { stat.push(name) } else { ext.push(name) }
                 }
             }
         }
         at = end + 1;
     }
-    out
+    (ext, stat)
 }
 
 /// The first identifier on `line` that is followed by `(` and is not an attribute or a
@@ -636,13 +793,13 @@ fn declarator_name(line: &str) -> Option<(&str, usize)> {
 }
 
 /// A content-derived file name for a unit (the record names of its static functions
-/// carry it): a hash of the external functions it defines, so it stays while its
-/// member set does. None for a unit that defines none.
-pub fn stable_name(c: &str) -> Option<String> {
-    let mut ext = defined_externs(c);
-    if ext.is_empty() {
+/// carry it): a hash of the external functions it defines (`defined_externs`), so it stays
+/// while its member set does. None for a unit that defines none.
+pub(super) fn stable_name(externs: &[&str]) -> Option<String> {
+    if externs.is_empty() {
         return None;
     }
+    let mut ext = externs.to_vec();
     ext.sort_unstable();
     let (a, _) = crate::driver::cache::hash128(&[ext.join(",").as_bytes()], 43);
     Some(format!("x{a:016x}"))
@@ -651,6 +808,57 @@ pub fn stable_name(c: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile's digest is that of its bytes. A file just written gets no stat record
+    /// (it could change again in the same clock tick); a record whose stat matches is taken
+    /// without reading the file, and a changed file no longer matches it.
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_digest_reads_the_file_only_when_its_stat_moved() {
+        let dir = std::env::temp_dir().join(format!("lust-pgo-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("use.profdata");
+        std::fs::write(&p, b"profile one").unwrap();
+        assert_eq!(profile_digest(&p, &dir).unwrap(), digest(&[b"profile one"]));
+        let stat_file = |e: &std::fs::DirEntry| e.file_name().to_string_lossy().starts_with("pgo-stat-");
+        let records = std::fs::read_dir(&dir).unwrap().flatten().filter(stat_file).count();
+        assert_eq!(records, 0, "a file changed within the last second gets no record");
+        let full = std::fs::canonicalize(&p).unwrap();
+        let name = format!("pgo-stat-{}", &digest(&[full.as_os_str().as_encoded_bytes()])[..16]);
+        let (stamp, _) = file_stamp(&p).unwrap().unwrap();
+        std::fs::write(dir.join(&name), format!("{stamp} recorded\n")).unwrap();
+        assert_eq!(profile_digest(&p, &dir).unwrap(), "recorded", "a matching stat is not read");
+        std::fs::write(&p, b"profile two!").unwrap();
+        assert_eq!(profile_digest(&p, &dir).unwrap(), digest(&[b"profile two!"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ELF object's call graph profile section becomes a plain section (lld then has no
+    /// call graph to sort by); its other sections and a file that is not ELF stay as they are.
+    #[test]
+    fn a_call_graph_profile_section_is_retyped() {
+        let mut elf = vec![0u8; 64 + 3 * 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[0x28..0x30].copy_from_slice(&64u64.to_le_bytes());
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&3u16.to_le_bytes());
+        let ty = |e: &[u8], i: usize| u32::from_le_bytes(e[64 + i * 64 + 4..64 + i * 64 + 8].try_into().unwrap());
+        elf[64 + 64 + 4..64 + 64 + 8].copy_from_slice(&SHT_LLVM_CALL_GRAPH_PROFILE.to_le_bytes());
+        elf[64 + 128 + 4..64 + 128 + 8].copy_from_slice(&9u32.to_le_bytes());
+        let dir = std::env::temp_dir().join(format!("lust-pgo-cg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (o, other) = (dir.join("u.o"), dir.join("v.o"));
+        std::fs::write(&o, &elf).unwrap();
+        std::fs::write(&other, b"not an object").unwrap();
+        drop_cg_profile(&o).unwrap();
+        drop_cg_profile(&other).unwrap();
+        let after = std::fs::read(&o).unwrap();
+        assert_eq!((ty(&after, 0), ty(&after, 1), ty(&after, 2)), (0, 1, 9));
+        assert_eq!(after.len(), elf.len());
+        assert_eq!(std::fs::read(&other).unwrap(), b"not an object");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn defined_externs_finds_definitions_not_prototypes() {
@@ -692,7 +900,7 @@ mod tests {
     }
 
     /// The index a warm build reads back gives each name the digest and count it was written
-    /// with; a missing file is no index (the profile is read again).
+    /// with; a text that is not a sorted index is no index (the profile is read again).
     #[test]
     fn an_index_reads_back_as_written() {
         let text = format!(":ir\n{}\n\n{}\n\n{}\n", rec("f", 3), rec("lust.c;h", 4), rec("lust.c;h", 5).replace("\n7\n", "\n8\n"));
@@ -700,11 +908,13 @@ mod tests {
         let ix = index(&recs);
         let p = std::env::temp_dir().join(format!("lust-pgo-index-{}", std::process::id()));
         write_index(&p, &ix).unwrap();
-        let back = read_index(&p);
+        let file = std::fs::read_to_string(&p).unwrap();
         let _ = std::fs::remove_file(&p);
-        assert_eq!(back.as_ref(), Some(&ix));
+        assert_eq!(read_index(&file).as_ref(), Some(&ix));
         assert_eq!(ix.iter().find(|e| e.0 == "lust.c;h").map(|e| e.2), Some(2));
-        assert!(read_index(&std::env::temp_dir().join("lust-pgo-no-such-index")).is_none());
+        let unsorted: String = file.lines().rev().map(|l| format!("{l}\n")).collect();
+        assert!(read_index(&unsorted).is_none());
+        assert!(read_index("not an index\n").is_none());
     }
 
     /// A static fn's record (`STATIC_FILE;<fn>`) goes to every unit that defines a static fn
@@ -714,13 +924,18 @@ mod tests {
         let recs: Records =
             [("lust.c;lh_aa_0", 5), ("lust.c;lust_mix", 2), ("x1.c;old", 3)].iter().map(|(n, c)| (n.to_string(), vec![Arc::from(rec(n, *c))])).collect();
         let st = |f: &str, ns: &[&str]| (f.to_string(), ns.iter().map(|n| n.to_string()).collect::<Vec<_>>());
-        let defs = UnitDefs { units: Vec::new(), macro_made: Default::default(), statics: vec![st("x9.ll", &["lh_aa_0", "lust_mix"]), st("x7.c", &["lust_mix"])] };
+        let defs = UnitDefs {
+            units: Vec::new(),
+            macro_made: Default::default(),
+            statics: vec![st("x9.ll", &["lh_aa_0", "lust_mix"]), st("x7.c", &["lust_mix"]), st("x1.c", &[]), st("x1.ca", &[])],
+        };
         let ix = index(&recs);
         let digest_of = |n: &str| ix.iter().find(|e| e.0 == n).map(|e| e.1).unwrap();
         let (own, _, absent) = split(&ix, &defs);
         assert_eq!(own["x9.ll"].len(), 2);
         assert_eq!(own["x7.c"], vec![digest_of("lust.c;lust_mix")]);
         assert_eq!(own["x1.c"], vec![digest_of("x1.c;old")], "another file's static record stays with that file");
+        assert!(!own.contains_key("x1.ca"), "a file whose name starts with another's takes none of its records");
         assert_eq!(absent, 0);
         assert_eq!(defined_statics("static inline int lust_mix(int a) {\n}\nstatic int g;\nint f(void) {\n}\n"), vec!["lust_mix"]);
     }
@@ -754,7 +969,7 @@ mod tests {
         let Ok(spec) = super::super::spec_for(crate::protocol::host_triple()) else { return };
         let c = "#include <stddef.h>\n#define MK(n) int lust_##n(void) { return 0; }\nMK(a)\nint visible(void) {\n  return 1;\n}\n";
         let pre = super::super::preprocessed(c, &spec.cmd, &super::super::cflags(false), false);
-        let d = unit_defs(&[("u2.c".to_string(), c, pre.as_deref())]);
+        let d = unit_defs(&[("u2.c".to_string(), &definitions_of(c), pre.as_deref())]);
         let mut names = d.units[0].1.clone();
         names.sort();
         assert_eq!(names, vec!["lust_a", "visible"]);
