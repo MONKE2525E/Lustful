@@ -37,11 +37,11 @@ pub enum Kind {
 /// One recorded piece: its kind, its item (a hash of the item's identity), and a hash and
 /// length of its text.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Piece {
-    pub kind: Kind,
-    pub key: u64,
-    pub hash: (u64, u64),
-    pub len: usize,
+struct Piece {
+    kind: Kind,
+    key: u64,
+    hash: (u64, u64),
+    len: usize,
 }
 
 /// What a unit read to choose and make its pieces (B1 step 2): the next build compares each
@@ -71,13 +71,14 @@ pub enum Read {
 }
 
 /// What the last build recorded of one unit (the driver's `Caches::unit_records`): its
-/// identity (registration name, fns, switches), its pieces, each read with the fingerprint it
-/// had (`cgen::read_fp`), and the unit's fingerprint over both (`new`), the key the unit memo
-/// (`cc::UnitIn::fp`) knows its object by.
+/// identity (registration name, fns, switches), one hash of its pieces (`close`: they only
+/// ever compare the same or not, and a front image kept ~1600 a unit), each read with the
+/// fingerprint it had (`cgen::read_fp`), and the unit's fingerprint over its identity and
+/// reads (`new`), the key the unit memo (`cc::UnitIn::fp`) knows its object by.
 #[derive(Clone, Debug)]
 pub struct UnitRecord {
     pub id: (u64, u64),
-    pub pieces: Vec<Piece>,
+    pub pieces: (u64, u64),
     pub reads: Vec<(Read, (u64, u64))>,
     pub fp: u128,
 }
@@ -87,7 +88,7 @@ impl UnitRecord {
     /// keeps its reads as they came): the identity's hash with the sum of one hash per read
     /// and its fingerprint, so the same identity and reads give the same fingerprint in any
     /// build. Units differ in identity (their registration names), so two units never share one.
-    pub fn new(id: (u64, u64), pieces: Vec<Piece>, reads: Vec<(Read, (u64, u64))>) -> UnitRecord {
+    pub fn new(id: (u64, u64), pieces: (u64, u64), reads: Vec<(Read, (u64, u64))>) -> UnitRecord {
         use std::hash::{Hash, Hasher};
         let sum = reads.iter().fold(0u128, |sum, (r, f)| {
             let mut h = crate::intern::FxHasher::default();
@@ -141,10 +142,24 @@ pub fn abandon() {
     OPEN.with(|r| *r.borrow_mut() = None);
 }
 
-/// Ends the record: its pieces and reads when the pieces make exactly `whole`, else none.
-pub fn close(whole: &str) -> Option<(Vec<Piece>, Vec<Read>)> {
+/// Ends the record: one hash of its pieces in order (kind, item key, text hash, length) and
+/// its reads, when the pieces make exactly `whole`, else none.
+pub fn close(whole: &str) -> Option<((u64, u64), Vec<Read>)> {
     let open = OPEN.with(|r| r.borrow_mut().take());
-    open.and_then(|(pieces, all, reads)| (all == whole).then(|| (pieces, reads.into_iter().collect())))
+    open.and_then(|(pieces, all, reads)| (all == whole).then(|| (pieces_hash(&pieces), reads.into_iter().collect())))
+}
+
+/// One hash of pieces in order: the same pieces give the same hash.
+fn pieces_hash(pieces: &[Piece]) -> (u64, u64) {
+    let mut bytes = Vec::with_capacity(pieces.len() * 33);
+    for p in pieces {
+        bytes.push(p.kind as u8);
+        bytes.extend_from_slice(&p.key.to_le_bytes());
+        bytes.extend_from_slice(&p.hash.0.to_le_bytes());
+        bytes.extend_from_slice(&p.hash.1.to_le_bytes());
+        bytes.extend_from_slice(&(p.len as u64).to_le_bytes());
+    }
+    crate::driver::cache::hash128(&[&bytes], 16)
 }
 
 /// A key for an item given by name or text (a type's mangled name, a fn's tag).
@@ -164,7 +179,15 @@ mod tests {
         piece(Kind::Fixed, 0, "head\n");
         piece(Kind::Body, key("f"), "int f(void) { return 1; }\n");
         let whole = "head\nint f(void) { return 1; }\n";
-        assert_eq!(close(whole).map(|(p, _)| p.len()), Some(2));
+        let two = close(whole).map(|(p, _)| p);
+        assert!(two.is_some());
+        open();
+        piece(Kind::Fixed, 0, "head\n");
+        piece(Kind::Body, key("f"), "int f(void) { return 1; }\n");
+        assert_eq!(close(whole).map(|(p, _)| p), two, "the same pieces, the same hash");
+        open();
+        piece(Kind::Fixed, 0, "head\nint f(void) { return 1; }\n");
+        assert!(close(whole).is_some_and(|(p, _)| Some(p) != two), "other pieces of the same text");
         open();
         piece(Kind::Fixed, 0, "head\n");
         assert_eq!(close(whole), None, "text outside the pieces");
@@ -179,11 +202,11 @@ mod tests {
         let reads = vec![(Read::Fn(3), (1, 2)), (Read::Static("lust_static_a".into()), (3, 4)), (Read::Main, (5, 6))];
         let mut turned = reads.clone();
         turned.reverse();
-        let a = UnitRecord::new((7, 8), Vec::new(), reads.clone());
-        assert_eq!(a.fp, UnitRecord::new((7, 8), Vec::new(), turned).fp);
+        let a = UnitRecord::new((7, 8), (0, 0), reads.clone());
+        assert_eq!(a.fp, UnitRecord::new((7, 8), (0, 0), turned).fp);
         let mut moved = reads.clone();
         moved[1].1 = (3, 5);
-        assert_ne!(a.fp, UnitRecord::new((7, 8), Vec::new(), moved).fp, "a read whose fingerprint moved");
-        assert_ne!(a.fp, UnitRecord::new((7, 9), Vec::new(), reads).fp, "another identity");
+        assert_ne!(a.fp, UnitRecord::new((7, 8), (0, 0), moved).fp, "a read whose fingerprint moved");
+        assert_ne!(a.fp, UnitRecord::new((7, 9), (0, 0), reads).fp, "another identity");
     }
 }

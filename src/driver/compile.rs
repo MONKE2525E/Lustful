@@ -4779,7 +4779,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 && req.emit_c.is_none()
                 && std::env::var_os("LUST_B1").is_none_or(|v| v != "0");
             let b1_record = b1_observe || b1_check || b1_skip;
-            type B1Rec = (usize, Option<(Vec<cgen::record::Piece>, Vec<cgen::record::Read>)>);
+            type B1Rec = (usize, Option<((u64, u64), Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
             // Release C copies from a pinned profile (`LUST_PGO_COPIES=<profdata>`, read by the
             // instrumented build and the use build alike, so both copy the same callees and a
@@ -5056,7 +5056,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     // by kind (Fn, SlotOf, Glue, Type, Static, Main, Pick).
                     let mut moved = [0usize; 7];
                     let mut unsound_names: Vec<String> = Vec::new();
-                    type Fresh = std::sync::Mutex<Option<(Vec<cgen::record::Piece>, Vec<(Read, (u64, u64))>)>>;
+                    type Fresh = std::sync::Mutex<Option<((u64, u64), Vec<(Read, (u64, u64))>)>>;
                     let mut fresh: Vec<(usize, Fresh)> = Vec::new();
                     for (g, rec) in recs {
                         let Some((pieces, reads)) = rec else {
