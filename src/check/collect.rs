@@ -5456,6 +5456,8 @@ pub fn collect_reuse(
         |&parent, name, disamb| crate::def::child_hash(parent, crate::def::DefKind::Fn, name, disamb),
         |seg, name| crate::def::free_fn_hash(krate, &[seg], name),
     );
+    // Each nested fn's enclosing fn, made once for the loop below.
+    let nest_parents = crate::def::nested_fn_parents(ast);
     for (idx, item) in ast.stmt_items.iter().enumerate() {
         match &item.kind {
             ItemKind::Fn(_) => {
@@ -5473,8 +5475,7 @@ pub fn collect_reuse(
                 // the generics parent stays empty (a nested fn may
                 // not use the outer fn's parameters).
                 {
-                    let parents = crate::def::nested_fn_parents(ast);
-                    let ph = match parents[idx].0 {
+                    let ph = match nest_parents[idx].0 {
                         crate::def::NestParent::Top(b) => top_hashes.get(&b).copied(),
                         crate::def::NestParent::Nested(k) => nested_hashes[k as usize],
                         crate::def::NestParent::Unknown => None,
