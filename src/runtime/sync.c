@@ -1240,7 +1240,9 @@ void lust_scope_wait(lust_Scope *sc) LUST_BODY({
    One lust_Chan per channel, shared by every Sender/SyncSender and the
    Receiver (each of those is a lust_Chan*). A futex mutex guards it; `seq`
    is a condition word (waiters sleep on its value, every change bumps it
-   and wakes all). Values move in and out by memcpy of `esize` bytes.
+   and wakes all, if `sleepers`, the threads that sleep on it, is not 0:
+   both change only under the lock). Values move in and out by memcpy of
+   `esize` bytes.
    `cap` is -1 for `channel()` and the bound for `sync_channel(n)`; a
    bound of 0 is a rendezvous: a sender places its value only while a
    receiver waits, then waits until that value is taken. A rendezvous
@@ -1253,6 +1255,7 @@ void lust_scope_wait(lust_Scope *sc) LUST_BODY({
 typedef struct lust_Chan {
     uint32_t lock;
     uint32_t seq;
+    uint32_t sleepers;
     uint64_t senders;
     uint32_t rx_alive;
     uint32_t rx_waiting;
@@ -1268,17 +1271,23 @@ typedef struct lust_Chan {
 } lust_Chan;
 
 #ifdef LUST_IMPL
+/* Lock held. Without a sleeper a change makes no futex call: each send and
+   recv woke all before, with no one to wake (tsgo: thousands per run). */
 static void lust_chan_changed(lust_Chan *c) {
     __atomic_add_fetch(&c->seq, 1, 5);
-    lust_futex_wake(&c->seq, 0x7fffffff);
+    if (c->sleepers) lust_futex_wake(&c->seq, 0x7fffffff);
 }
-/* Sleeps until the channel changes; the lock is dropped meanwhile. */
+/* Sleeps until the channel changes; the lock is dropped meanwhile. A change
+   between the unlock and the sleep sees this sleeper and bumps `seq`, so the
+   futex wait returns at once. */
 static void lust_chan_wait(lust_Chan *c) {
     uint32_t s;
+    c->sleepers++;
     __atomic_load(&c->seq, &s, 5);
     lust_mutex_unlock(&c->lock);
     lust_futex_wait(&c->seq, s);
     lust_mutex_lock(&c->lock);
+    c->sleepers--;
 }
 static void lust_chan_push(lust_Chan *c, const void *v) {
     if (c->esize == 0) { c->len++; return; }
@@ -1442,7 +1451,10 @@ void lust_chan_drop_receiver(lust_Chan *c) LUST_BODY({
    wakes one or all (spurious wakeups are allowed, as std documents).
    A Barrier is { lock, seq, count, generation, n }: the n-th arrival
    starts a new generation, wakes the others, and is the leader. A
-   OnceLock<T> is { state, T }: 0 empty, 1 being set, 2 set. */
+   OnceLock<T> is { state, T }: 0 empty, 1 being set, 2 set, 3 being set
+   with a thread waiting (std's QUEUED): only then does the end of the set
+   wake (it woke always before: one futex call per init, 23,380 on tsgo's
+   effect check). */
 void lust_cv_wait(uint32_t *cv, uint32_t *m) LUST_BODY({
     uint32_t s;
     __atomic_load(cv, &s, 5);
@@ -1593,10 +1605,12 @@ int lust_chan_recv_timeout(lust_Chan *c, void *out, uint64_t secs, uint32_t nano
             return 1;
         }
         uint32_t s;
+        c->sleepers++;
         __atomic_load(&c->seq, &s, 5);
         lust_mutex_unlock(&c->lock);
         lust_futex_wait_for(&c->seq, s, rs, rn);
         lust_mutex_lock(&c->lock);
+        c->sleepers--;
     }
 })
 
@@ -1634,26 +1648,29 @@ int lust_barrier_wait(lust_Barrier *b) LUST_BODY({
    set (after waiting out another thread's set). */
 int lust_once_begin(uint32_t *st) LUST_BODY({
     for (;;) {
-        uint32_t zero = 0, one = 1, s;
+        uint32_t zero = 0, one = 1, three = 3, s;
         if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 2)) return 1;
         __atomic_load(st, &s, 2);
         if (s == 2) return 0;
-        if (s == 1) lust_futex_wait(st, 1);
+        if (s == 0) continue;
+        /* Being set: say a thread waits (1 -> 3), then sleep while it is so. */
+        if (s == 1 && !__atomic_compare_exchange(st, &s, &three, 0, 2, 2)) continue;
+        lust_futex_wait(st, 3);
     }
 })
 
 void lust_once_finish(uint32_t *st) LUST_BODY({
-    uint32_t two = 2;
-    __atomic_store(st, &two, 3);
-    lust_futex_wake(st, 0x7fffffff);
+    uint32_t two = 2, old;
+    __atomic_exchange(st, &two, &old, 3);
+    if (old == 3) lust_futex_wake(st, 0x7fffffff);
 })
 
 /* A set whose init closure panicked (panic=unwind): the lock is empty
    again, and one waiting thread becomes the next setter, as in std. */
 void lust_once_abort(uint32_t *st) LUST_BODY({
-    uint32_t zero = 0;
-    __atomic_store(st, &zero, 3);
-    lust_futex_wake(st, 0x7fffffff);
+    uint32_t zero = 0, old;
+    __atomic_exchange(st, &zero, &old, 3);
+    if (old == 3) lust_futex_wake(st, 0x7fffffff);
 })
 
 /* `get_or_init` under unwind tables (runtime/panic.c mode 2): the init block's
