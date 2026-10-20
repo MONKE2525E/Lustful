@@ -82,13 +82,18 @@ pub fn shard_bytes() -> usize {
 }
 
 pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32]) -> Vec<(String, Vec<usize>)> {
+    group_fns(out, names, file, line, unit_bytes(), unit_cap())
+}
+
+/// `groups` for a unit target and cap (`unit_bytes`, `unit_cap`) of `target` and `cap` bytes.
+fn group_fns(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32], target: usize, cap: usize) -> Vec<(String, Vec<usize>)> {
     let live: Vec<usize> = (0..out.len()).filter(|&s| !out[s].code.is_empty()).collect();
     // A fn's size: its C; with the LLVM backend its statement count (`FnOut::ll_cost`) at
     // 200 bytes each, which no lowering, fact or ABI choice moves, so every such variant
     // gets the same units (and about as many as C).
     let llvm = live.iter().any(|&s| !out[s].ll.is_empty());
     let size = |s: usize| if llvm { out[s].ll_cost as usize * 200 } else { out[s].code.len() };
-    let target = unit_bytes().max(1) as u64;
+    let target = target.max(1) as u64;
     let id = |s: usize| names.fns.get(s).and_then(|x| x.clone()).unwrap_or_else(|| format!("dead{s}"));
     let mut by_file: std::collections::BTreeMap<&str, Vec<(u32, String, usize)>> = Default::default();
     for &s in &live {
@@ -110,6 +115,9 @@ pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: 
             groups.push(cur);
         }
     }
+    if cap > 0 {
+        groups = groups.into_iter().flat_map(|g| split_over(g, cap as u64, target / 2, &size)).collect();
+    }
     groups
         .into_iter()
         .map(|g| {
@@ -117,6 +125,37 @@ pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: 
             (format!("lust_register_g{:016x}", hash64(&ids.join(","))), g.into_iter().map(|(_, s)| s).collect())
         })
         .collect()
+}
+
+/// The cap on a release C fn unit's fn code (`LUST_RELEASE_UNIT_CAP_KB`, default 256; 0: none).
+/// The cuts at odds bytes / target leave a long tail of large units (tsgo: units of 1.3-1.9 MB of
+/// C at 3-4 s under load, the slowest compile of many small merges); 256 KB beat 512 and 128 KB
+/// on its replay.
+pub fn unit_cap() -> usize {
+    std::env::var("LUST_RELEASE_UNIT_CAP_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256) * 1024
+}
+
+/// A unit `g` over `cap` bytes of fn code, cut after each fn whose cut test meets `odds` (the
+/// unit target's halved: every cut the unit had meets them too), and each part still over the
+/// cap again at half those odds. The cuts follow from each fn's own id and size, so a unit
+/// splits the same way while it stays over the cap, and no other unit moves.
+fn split_over(g: Vec<(String, usize)>, cap: u64, odds: u64, size: &impl Fn(usize) -> usize) -> Vec<Vec<(String, usize)>> {
+    if g.len() < 2 || odds == 0 || g.iter().map(|(_, s)| size(*s) as u64).sum::<u64>() <= cap {
+        return vec![g];
+    }
+    let mut parts: Vec<Vec<(String, usize)>> = Vec::new();
+    let mut cur = Vec::new();
+    for (n, s) in g {
+        let cut = cgen::names::cut_after(&n, size(s), odds);
+        cur.push((n, s));
+        if cut {
+            parts.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts.into_iter().flat_map(|p| split_over(p, cap, odds / 2, size)).collect()
 }
 
 /// The table unit of release C: the fn tables stay declared (the runtime header names
@@ -153,9 +192,10 @@ mod tests {
         (out, names, vec!["src/a.rs".to_string(); n], (0..n as u32).map(|s| 10 * s).collect())
     }
 
-    /// The units as sets of fn ids, so two programs with other slot numbers compare.
+    /// The units as sets of fn ids, so two programs with other slot numbers compare: the cuts at
+    /// a 128 KB target, without a cap (`a_unit_over_the_cap_splits_where_its_fns_say` has one).
     fn unit_ids(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32]) -> Vec<Vec<String>> {
-        groups(out, names, file, line).into_iter().map(|(_, g)| g.into_iter().map(|s| names.fns[s].clone().unwrap()).collect()).collect()
+        group_fns(out, names, file, line, 128 * 1024, 0).into_iter().map(|(_, g)| g.into_iter().map(|s| names.fns[s].clone().unwrap()).collect()).collect()
     }
 
     /// A fn's unit follows from its own identity, size and source order: inserting a fn
@@ -177,5 +217,31 @@ mod tests {
         let new = after.iter().filter(|u| !before.contains(u)).count();
         assert_eq!(lost, 1, "only the unit the fn joins changes");
         assert!(new <= 2, "it comes back as one unit, or two when the new fn makes a cut: {new}");
+    }
+
+    /// With a cap, a unit over it splits at cuts that follow from its fns' own ids and sizes:
+    /// no part is over the cap unless it is one fn, every unit without the cap ends where a
+    /// part ends, and growing one fn changes only the parts of the unit that holds it.
+    #[test]
+    fn a_unit_over_the_cap_splits_where_its_fns_say() {
+        let (out, names, file, line) = program(1200, 2048);
+        let ids = |out: &[FnOut], cap: usize| -> Vec<Vec<String>> {
+            group_fns(out, &names, &file, &line, 128 * 1024, cap).into_iter().map(|(_, g)| g.into_iter().map(|s| names.fns[s].clone().unwrap()).collect()).collect()
+        };
+        let cap = 160 * 1024;
+        let (whole, parts) = (ids(&out, 0), ids(&out, cap));
+        assert!(whole.iter().any(|u| u.len() * 2048 > cap), "the program has a unit over the cap");
+        assert!(parts.len() > whole.len());
+        assert!(parts.iter().all(|u| u.len() == 1 || u.len() * 2048 <= cap), "no part over the cap");
+        let ends = |us: &[Vec<String>]| us.iter().map(|u| u.last().unwrap().clone()).collect::<std::collections::HashSet<_>>();
+        assert!(ends(&whole).is_subset(&ends(&parts)), "the cuts without the cap stay cuts");
+        // Grow a fn of the largest unit: only that unit's parts may change.
+        let big = whole.iter().max_by_key(|u| u.len()).unwrap();
+        let slot = (0..out.len()).find(|&s| names.fns[s].as_deref() == Some(big[big.len() / 2].as_str())).unwrap();
+        let mut out2 = program(1200, 2048).0;
+        out2[slot].code.push_str(&"z".repeat(3000));
+        let after = ids(&out2, cap);
+        let moved: Vec<&Vec<String>> = after.iter().filter(|u| !parts.contains(u)).collect();
+        assert!(moved.iter().all(|u| u.iter().all(|f| big.contains(f))), "only the grown unit's parts move");
     }
 }
