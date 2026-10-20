@@ -566,7 +566,9 @@ static void lust_range_bounds_check(uint64_t len, uint64_t s_tag, uint64_t s_val
 })
 
 /* `Vec::drain`: the Vec keeps its buffer and capacity; its length is the
-   drain start while the Drain lives (a leaked Drain leaves it so). */
+   drain start while the Drain lives (a leaked Drain leaves it so). This form is for
+   flag-mode unwinding (lust_unwind_mode 1), where a panic returns with the thread's
+   panic pending; codegen calls lust_vec_drain_t in every other build. */
 lust_VecDrain lust_vec_drain(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
     (void)loc; /* range panics report core's slice/index.rs sites */
     uint64_t start, end;
@@ -581,14 +583,27 @@ lust_VecDrain lust_vec_drain(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64
     return d;
 })
 
+/* `Vec::drain` where a panic never returns (panic=abort, or unwind tables: it throws):
+   no check of the thread's pending panic, which is a thread-local lookup per drain. */
+lust_VecDrain lust_vec_drain_t(lust_Vec *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
+    (void)loc;
+    uint64_t start, end;
+    lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, &start, &end);
+    lust_VecDrain d = {v, start, start, end, end, v->len - end};
+    v->len = start;
+    return d;
+})
+
 /* `String::drain`: the same range checks over the byte length, then the
    char boundary asserts. The String is unchanged while the Drain lives
-   (a leaked Drain leaves it whole); the drop glue removes the range. */
-lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
+   (a leaked Drain leaves it whole); the drop glue removes the range. `flag`: flag-mode
+   unwinding, where the range check's panic returns pending (lust_string_drain); 0 in
+   every other build (lust_string_drain_t), where it never returns. */
+static lust_VecDrain lust_string_drain_in(lust_String *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc, int flag) LUST_BODY({
     uint64_t start, end;
     lust_range_bounds_check(v->len, s_tag, s_val, e_tag, e_val, &start, &end);
     lust_VecDrain e = {v, v->len, v->len, v->len, v->len, 0}; /* after a panic: an empty Drain at the end */
-    if (lust_unwind_mode && lust_unw_mine()) return e;
+    if (flag && lust_unwind_mode && lust_unw_mine()) return e;
     if (!(start == v->len || (v->ptr[start] & 0xC0) != 0x80)) {
         lust_String s = lust_string_new();
         lust_string_push_cstr(&s, "assertion failed: self.is_char_boundary(start)");
@@ -603,6 +618,14 @@ lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, 
     }
     lust_VecDrain d = {v, start, start, end, end, v->len - end};
     return d;
+})
+
+lust_VecDrain lust_string_drain(lust_String *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
+    return lust_string_drain_in(v, s_tag, s_val, e_tag, e_val, loc, 1);
+})
+
+lust_VecDrain lust_string_drain_t(lust_String *v, uint64_t s_tag, uint64_t s_val, uint64_t e_tag, uint64_t e_val, lust_loc loc) LUST_BODY({
+    return lust_string_drain_in(v, s_tag, s_val, e_tag, e_val, loc, 0);
 })
 
 /* `slice::range(r, ..len)` for the callers outside this file

@@ -6916,8 +6916,13 @@ impl FnGen<'_, '_> {
             // runtime; `next` and `next_back` take from `front..back`
             // of the drained buffer (as `vec::Drain` and
             // `string::Drain`).
-            B::VecDrain => format!("lust_vec_drain({}, {}, {}, {}, {}, {loc})", vals[0], vals[1], vals[2], vals[3], vals[4]),
-            B::StringDrain => format!("lust_string_drain({}, {}, {}, {}, {}, {loc})", vals[0], vals[1], vals[2], vals[3], vals[4]),
+            // Only flag-mode unwinding (panic=unwind without unwind tables) needs the drains'
+            // check of a panic left pending by the range check; elsewhere a panic never returns.
+            B::VecDrain | B::StringDrain => {
+                let f = if matches!(b, B::VecDrain) { "lust_vec_drain" } else { "lust_string_drain" };
+                let t = if self.p.unwind && !self.p.unwind_tables { "" } else { "_t" };
+                format!("{f}{t}({}, {}, {}, {}, {}, {loc})", vals[0], vals[1], vals[2], vals[3], vals[4])
+            }
             B::VecDrainLen => format!("({0}->back - {0}->front)", vals[0]),
             B::VecDrainNext | B::VecDrainNextBack => {
                 let e = match &tys[0] {
