@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 /// Names a file that exists once the sources are checked out (`wait_ready`).
-pub const READY_ENV: &str = "LUST_SOURCES_READY";
+pub use crate::protocol::SOURCES_READY_ENV as READY_ENV;
 /// The list file in the state directory: one path per line.
 const LIST: &str = "sources";
 

@@ -123,6 +123,14 @@ fn main() {
         std::process::exit(2);
     }
     let core = std::env::current_exe().map(|p| p.with_file_name("lust-core")).unwrap_or_else(|_| "lust-core".into());
+    // A build that waits for its sources (`LUST_SOURCES_READY`, resolve/prefetch.rs) reads no
+    // workspace file before they are there, and parsing its request reads the manifest: the
+    // core takes the build at once and parses it after the wait, with no daemon.
+    if protocol::waits_for_sources(&args) {
+        let err = std::process::Command::new(&core).args(&args).exec();
+        eprintln!("error: cannot run {}: {err}", core.display());
+        std::process::exit(2);
+    }
     match protocol::parse_args(&args) {
         // Release builds and the rustc oracle run right here, streaming output.
         Some(Invocation::Release { file, out, profile, debug, net }) => {

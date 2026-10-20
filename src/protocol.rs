@@ -600,6 +600,16 @@ fn session_key_for(file: &Path, flags: CrateFlags, net: CargoNet) -> SessionKey 
     key
 }
 
+/// `LUST_SOURCES_READY=<file>` (resolve/prefetch.rs): a build reads no workspace file before
+/// <file> exists, as a CI job checks its sources out beside the front image restore.
+pub const SOURCES_READY_ENV: &str = "LUST_SOURCES_READY";
+
+/// True for a command that waits for its sources (`SOURCES_READY_ENV`): a build (check,
+/// build or run) with the variable set. Other commands (a daemon) do not wait.
+pub fn waits_for_sources(args: &[String]) -> bool {
+    std::env::var_os(SOURCES_READY_ENV).is_some_and(|v| !v.is_empty()) && matches!(args.first().map(String::as_str), Some("check" | "build" | "run"))
+}
+
 /// Parses the command line (without the program name). Paths become absolute.
 pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let mut it = args.iter();

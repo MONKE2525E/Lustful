@@ -383,7 +383,7 @@ fn main() {
     // (`LUST_SOURCES_READY`, resolve/prefetch.rs). The request reads the manifest, so an image
     // build goes into its image process at once, starts the load there, and only then waits
     // for the sources.
-    if std::env::var_os(resolve::prefetch::READY_ENV).is_some_and(|v| !v.is_empty()) {
+    if protocol::waits_for_sources(&args) {
         if let Some(dir) = image::state_dir().filter(|_| !image::compact_mode()) {
             if image::arena_on() {
                 image::lock(&dir);

@@ -37,6 +37,9 @@
 # (LUST_B1=1) in builds that emit no C. It also runs the generic reuse oracle
 # (LUST_CHECK_GENREUSE=1, src/driver/genreuse_oracle.rs): every body and stored entry the image's
 # session keeps must have clean reads, and every kept body made again without reuse the same C.
+# sources-late: each image build starts before its step's files are written, with
+# LUST_SOURCES_READY (a CI checkout beside the restore); the files come 0.3 s later, then the
+# ready file, so a build that read any file early answers for the step before.
 #
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: front_check.py [--jobs N] [--keep DIR] [--only NAME]
@@ -833,6 +836,15 @@ fn main() {{
 """
 
 
+def late_sources(v):
+    """Step `v` of sources-late: a crate of two files (main.rs, m.rs) whose answer changes at
+    every step (a body edit, a new fn, a removed one)."""
+    m = ["pub fn v() -> u64 { 1 }\n", "pub fn v() -> u64 { 2 }\n", "pub fn v() -> u64 { 2 }\npub fn w() -> u64 { 40 }\n",
+         "pub fn v() -> u64 { 3 }\n"][v]
+    call = "m::v() + m::w()" if v == 2 else "m::v()"
+    return {"main.rs": f"mod m;\n\nfn main() {{\n    println!(\"{{}}\", {call});\n}}\n", "m.rs": m}
+
+
 def corpus():
     """(name, [sources]) of every sequence."""
     seqs = [
@@ -914,6 +926,7 @@ def corpus():
     seqs.append(("agg-param-layout-all", lay, {"env": [{"LUST_RELEASE_AGG_PARAM": "all"}] * 3}))
     # Patches after a full resolve in an image chain (lazy patch base prep, 2026-10-20).
     seqs.append(("later-patch", [later_patch(v) for v in range(5)]))
+    seqs.append(("sources-late", [late_sources(v) for v in range(4)], {"late": True}))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))
@@ -968,15 +981,29 @@ def run_bin(path, cwd):
         return ("timeout", b"")
 
 
-def build(cmd, env, cwd):
+def build(cmd, env, cwd, late=None):
     """(exit status or 'hang', stderr). The image's own `lust: front state` lines are dropped:
-    the rest is the answer, which must equal the one-shot's."""
+    the rest is the answer, which must equal the one-shot's. `late` runs 0.3 s after the build
+    starts (sources-late: it writes the step's files, then the ready file)."""
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if late:
+        time.sleep(0.3)
+        late()
     try:
-        r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, timeout=BUILD_TIMEOUT)
+        _, err = p.communicate(timeout=BUILD_TIMEOUT)
     except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
         return ("hang", "")
-    err = r.stderr.decode(errors="replace")
-    return (r.returncode, "".join(l for l in err.splitlines(keepends=True) if not l.startswith("lust: front state")))
+    err = err.decode(errors="replace")
+    return (p.returncode, "".join(l for l in err.splitlines(keepends=True) if not l.startswith("lust: front state")))
+
+
+def put(d, src):
+    """Writes one step's sources into `d`: main.rs, or each file of a dict."""
+    for name, text in (src if isinstance(src, dict) else {"main.rs": src}).items():
+        with open(os.path.join(d, name), "w") as f:
+            f.write(text)
 
 
 def head(err):
@@ -1098,8 +1125,15 @@ def check_seq(name, srcs, backend, args, work, opts):
                 break
         # A ("check", src) step checks instead of building, on the same image.
         cmd, src = srcs[step] if isinstance(srcs[step], tuple) else ("build", srcs[step])
-        with open(os.path.join(d, "main.rs"), "w") as f:
-            f.write(src)
+        # `late`: the image build's files arrive after it starts (`build`), as a CI checkout's.
+        ready = os.path.join(d, "ready")
+        late = None
+        if opts.get("late") and cmd == "build":
+            if os.path.exists(ready):
+                os.remove(ready)
+            late = lambda: (put(d, src), open(ready, "w").close())
+        else:
+            put(d, src)
         if snap:
             saved()
             for sub in ("front", "cache", "front2", "cache2"):
@@ -1131,7 +1165,8 @@ def check_seq(name, srcs, backend, args, work, opts):
         ce = lambda side: ["--emit-c", os.path.join(d, side, "t")] if emit else []
         # `env`: this step's extra environment, on every side (both image chains and one-shot).
         extra = opts["env"][step] if opts.get("env") else {}
-        rw, ew = build([LUST, "build", "main.rs", *rel, "-o", "image.bin", *ce("ew")], dict(img, **extra), d)
+        knob = {"LUST_SOURCES_READY": ready} if late else {}
+        rw, ew = build([LUST, "build", "main.rs", *rel, "-o", "image.bin", *ce("ew")], dict(img, **extra, **knob), d, late)
         rc, ec = build([LUST, "build", "main.rs", *rel, "-o", "one.bin", *ce("ec")], dict(one, **extra), d)
         path, seen = last_path(visits, seen)
         paths.append(path)

@@ -56,7 +56,10 @@ def corpus(sample):
     for seq in front_check.corpus():
         name, srcs = seq[0], seq[1]
         for k, s in enumerate(srcs):
-            add(f"fc-{name}-{k}", s[1] if isinstance(s, tuple) else s)
+            src = s[1] if isinstance(s, tuple) else s
+            # A step of several files (a dict: front_check's sources-late) is no one-file program.
+            if isinstance(src, str):
+                add(f"fc-{name}-{k}", src)
     for kind in ("small", "small2", "small3", "realish"):
         add(f"fuzz-{kind}", fuzz.crate_text(kind, 40))
     pass_dir = os.path.join(ROOT, "tests/pass")
