@@ -14628,6 +14628,23 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate:
         })
     };
     let wanted: Vec<usize> = (0..n_fns).filter(|&i| fn_reaches(p, i)).collect();
+    // A collect (no derive delta) checks the fns' items as it builds them, after
+    // the default checks, as the loop below would: a fn item the memo would skip
+    // (`check_wf_item`) is then never built (`wf_fn_memo_hit`; 28k fns on tsgo).
+    let lazy = reach.is_none();
+    let adt_idx = adt_first_index(p);
+    let mut memo = WfMemo::default();
+    if lazy {
+        check_default_wf(p, &adt_idx, errs);
+        for &i in &wanted {
+            if !wf_fn_memo_hit(p, i, &memo)
+                && let Some(item) = wf_fn_item(p, i)
+            {
+                check_wf_item(p, &adt_idx, item, &mut memo, errs);
+            }
+        }
+    }
+    let wanted = if lazy { Vec::new() } else { wanted };
     // A derive delta checks the types as written (`written_projections`):
     // collect checked them before it normalized them, and a projection
     // owes its trait ref.
@@ -14733,12 +14750,33 @@ fn check_written_wf(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate:
     if let Some(x) = reach {
         items.retain(|(tys, _, generics, _)| tys.iter().any(|&(t, _)| x.ty(&p.tys, t)) || generics.predicates.iter().any(|q| x.pred(&p.tys, q)));
     }
-    let adt_idx = adt_first_index(p);
-    check_default_wf(p, &adt_idx, errs);
-    let mut memo = WfMemo::default();
+    if !lazy {
+        check_default_wf(p, &adt_idx, errs);
+    }
     for item in items {
         check_wf_item(p, &adt_idx, item, &mut memo, errs);
     }
+}
+
+/// True when the WF item of fn `i` (`wf_fn_item`) would be skipped by the memo
+/// (`check_wf_item`): no item (a stub or trait method), or one with no predicates
+/// whose types and value types all passed. Reads only, builds nothing.
+fn wf_fn_memo_hit(p: &Program, i: usize, memo: &WfMemo) -> bool {
+    if p.gx.fn_class.get(i) == Some(&FnClass::Stub) || p.gx.trait_methods.contains_key(&p.fn_defs[i]) {
+        return true;
+    }
+    let generics = match p.gx.fn_templates.get(i).and_then(Option::as_ref) {
+        Some(t) => Some(&t.generics),
+        None => p.defs.get(p.def_id(LocalDefId(i as u32))).map(|d| &d.generics),
+    };
+    // `own_trait_pred` adds a predicate for a trait default's signature.
+    let own_pred = p.gx.index.trait_of_method(p.def_id(LocalDefId(i as u32))).is_some_and(|td| p.gx.index.trait_record(td).is_some());
+    if own_pred || generics.is_some_and(|g| !g.predicates.is_empty()) {
+        return false;
+    }
+    let info = p.fn_info(LocalDefId(i as u32));
+    let has_body = info.def(&p.ast).body.is_some();
+    info.params.iter().chain([&info.ret]).all(|t| memo.wf_ok.contains_key(t) && (!has_body || memo.sized_ok.contains_key(t)))
 }
 
 /// The types that passed in an earlier WF item with no predicates: under
@@ -14770,8 +14808,8 @@ fn wf_fn_item(p: &mut Program, i: usize) -> Option<WfItem> {
     let values = if info.def(&p.ast).body.is_some() { tys.clone() } else { Vec::new() };
     // Plain fns keep their generics (with any where clause)
     // only in the def table, so read them from there.
-    let mut generics = match p.gx.fn_templates.get(i).cloned().flatten() {
-        Some(t) => t.generics,
+    let mut generics = match p.gx.fn_templates.get(i).and_then(Option::as_ref) {
+        Some(t) => t.generics.clone(),
         None => p.defs.get(p.def_id(LocalDefId(i as u32))).map_or_else(Generics::default, |d| d.generics.clone()),
     };
     let span = info.def(&p.ast).name_span;
