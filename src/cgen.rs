@@ -9167,7 +9167,7 @@ impl GlueSet {
     pub fn add<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
         self.slots = slots.to_vec();
         let roots: Vec<(Glue, CTy)> = keys.filter(|k| !self.protos.contains_key(k) || self.stale.contains(k)).cloned().collect();
-        self.regen(p, slots, roots, false).0
+        self.regen(p, slots, &roots.iter().collect::<Vec<_>>(), false)
     }
 
     /// Regenerates every reached key's definition from the current
@@ -9188,68 +9188,104 @@ impl GlueSet {
     /// not use the glue must still reach the version that uses it again.
     pub fn refresh<'k>(&mut self, p: &Program, slots: &[u32], keys: impl Iterator<Item = &'k (Glue, CTy)>) -> (bool, bool) {
         self.slots = slots.to_vec();
-        let (changed, seen) = self.regen(p, slots, keys.cloned().collect(), true);
-        self.stale = self.protos.keys().filter(|k| !seen.contains(*k)).cloned().collect();
-        changed
+        self.regen(p, slots, &keys.collect::<Vec<_>>(), true)
     }
 
-    /// The walk behind `add` and `refresh`: generates each pending key and its deps. With `all`
-    /// false, a key already stored and not stale is kept as is (and its deps are not walked).
-    /// Returns the change flags and the keys walked.
-    fn regen(&mut self, p: &Program, slots: &[u32], mut pending: Vec<(Glue, CTy)>, all: bool) -> ((bool, bool), HashSet<(Glue, CTy)>) {
-        let mut seen: HashSet<(Glue, CTy)> = HashSet::new();
-        let mut shared_changed = false;
-        let mut regenerated = false;
-        while let Some(g) = pending.pop() {
-            if !seen.insert(g.clone()) {
+    /// The walk behind `add` and `refresh`: makes each root and its deps. With `all` false, a key
+    /// already stored and not stale is kept as is (and its deps are not walked); with `all`, the
+    /// stored keys the walk does not reach become stale. Returns the change flags.
+    ///
+    /// The walk takes the roots from the last one back and a made key's deps before the roots
+    /// under them; that order decides where a new definition joins `defs`. What it does with
+    /// each key is worked out first (`plan`): a definition is a function of the program, the
+    /// slots and the key alone (`glue_def`), so each level of new keys is made on the pool and
+    /// compared with the stored entry there. The walk then runs over key indices and touches
+    /// the set only where an entry changed (a refresh walks about 0.5 M roots and 23k keys for
+    /// tsgo, and made all of them on one thread, 0.2-0.3 s).
+    fn regen(&mut self, p: &Program, slots: &[u32], roots: &[&(Glue, CTy)], all: bool) -> (bool, bool) {
+        let Plan { keys, index, roots, mut made } = self.plan(p, slots, roots, all);
+        let mut seen = vec![false; keys.len()];
+        let mut pending = roots;
+        let (mut shared_changed, mut regenerated) = (false, false);
+        while let Some(i) = pending.pop() {
+            let i = i as usize;
+            if std::mem::replace(&mut seen[i], true) {
                 continue;
             }
-            let is_new = !self.protos.contains_key(&g);
-            let was_stale = self.stale.remove(&g);
-            if !was_stale && !all && !is_new {
-                continue;
+            let Some(m) = made[i].take() else { continue };
+            let g = &keys[i];
+            if m.was_stale {
+                self.stale.remove(g);
+                // `glue_unit` leaves stale keys out, so a shared one coming back must rebuild it.
+                shared_changed |= self.is_shared(g);
             }
-            // `glue_unit` leaves stale keys out, so a shared one coming back must rebuild it.
-            shared_changed |= was_stale && self.is_shared(&g);
-            let mut more = Vec::new();
-            let mut proto = String::new();
-            let mut def = String::new();
-            let mut types = Vec::new();
-            let rec = Slots::new(slots);
-            glue_def(p, &rec, &g.0, &g.1, &mut proto, &mut def, &mut more, &mut types);
-            // The set keeps every entry (the front image saves it): no growth slack.
-            proto.shrink_to_fit();
-            def.shrink_to_fit();
-            more.shrink_to_fit();
-            types.shrink_to_fit();
-            let (mut used, externs) = rec.into_used();
-            used.shrink_to_fit();
-            self.used.insert(g.clone(), used);
-            self.externs.insert(g.clone(), externs);
-            let changed = is_new
-                || self.def_map.get(&g) != Some(&def)
-                || self.protos.get(&g) != Some(&proto)
-                || self.deps.get(&g) != Some(&more)
-                || self.types.get(&g) != Some(&types);
-            if changed {
-                regenerated |= !is_new;
-                shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(&g));
-                if is_new {
-                    self.defs.push_str(&def);
+            if !m.same_used {
+                self.used.insert(g.clone(), m.used);
+                self.externs.insert(g.clone(), m.externs);
+            }
+            if !m.same {
+                regenerated |= !m.is_new;
+                shared_changed |= self.shared.as_ref().is_none_or(|s| s.contains(g));
+                if m.is_new {
+                    self.defs.push_str(&m.def);
                 }
-                self.def_map.insert(g.clone(), def);
-                self.deps.insert(g.clone(), more.clone());
-                self.types.insert(g.clone(), types);
-                self.protos.insert(g, proto);
+                self.def_map.insert(g.clone(), m.def);
+                self.deps.insert(g.clone(), m.more);
+                self.types.insert(g.clone(), m.types);
+                self.protos.insert(g.clone(), m.proto);
             }
-            pending.extend(more);
+            pending.extend(m.more_ids);
         }
         if regenerated {
             // `defs` is the pre-hybrid concatenation; rebuild it from the
             // per-key map. Order does not matter: prototypes precede it.
             self.defs = self.def_map.values().cloned().collect();
         }
-        ((shared_changed, regenerated), seen)
+        if all {
+            self.stale = self.protos.keys().filter(|k| index.get(*k).is_none_or(|&i| !seen[i as usize])).cloned().collect();
+        }
+        (shared_changed, regenerated)
+    }
+
+    /// `regen`'s keys, numbered: the roots in order and every key the walk reaches (a made key's
+    /// deps), with the made definition and its verdicts for each key the walk makes (new,
+    /// stale, or with `all` any). Each level of new keys is made on the pool, under the
+    /// caller's release names and in one layout phase (the program is frozen meanwhile).
+    fn plan(&self, p: &Program, slots: &[u32], roots: &[&(Glue, CTy)], all: bool) -> Plan {
+        let makes = |g: &(Glue, CTy)| all || !self.protos.contains_key(g) || self.stale.contains(g);
+        let mut plan = Plan { keys: Vec::new(), index: crate::intern::FxMap::default(), roots: Vec::with_capacity(roots.len()), made: Vec::new() };
+        let mut level: Vec<u32> = Vec::new();
+        for g in roots {
+            let (i, new) = plan.id(g);
+            plan.roots.push(i);
+            if new && makes(g) {
+                level.push(i);
+            }
+        }
+        let (names, tag) = (names::current(), layout_phase());
+        while !level.is_empty() {
+            let make = |&i: &u32| in_layout_phase(tag, || names::with(names.as_ref(), || Made::of(p, slots, &plan.keys[i as usize], self)));
+            let outs: Vec<Made> = if level.len() >= 64 { crate::pool::par_map(&level, make) } else { level.iter().map(make).collect() };
+            let mut next = Vec::new();
+            for (&i, mut m) in level.iter().zip(outs) {
+                m.more_ids = m
+                    .more
+                    .iter()
+                    .map(|d| {
+                        let (j, new) = plan.id(d);
+                        if new && makes(d) {
+                            next.push(j);
+                        }
+                        j
+                    })
+                    .collect();
+                plan.made.resize_with(plan.keys.len(), || None);
+                plan.made[i as usize] = Some(m);
+            }
+            level = next;
+        }
+        plan.made.resize_with(plan.keys.len(), || None);
+        plan
     }
 
     /// True when a live definition (stale ones are emitted nowhere)
@@ -9326,6 +9362,73 @@ impl GlueSet {
         self.types.get(k).into_iter().flatten().for_each(|t| by_value_deps(t, &mut by_value));
         held.extend(by_value);
         self.def_types(k, named);
+    }
+}
+
+/// `GlueSet::regen`'s keys and what its walk does with each (`GlueSet::plan`).
+struct Plan {
+    /// Every key the walk reaches, by index.
+    keys: Vec<(Glue, CTy)>,
+    index: crate::intern::FxMap<(Glue, CTy), u32>,
+    /// The roots' indices, in order.
+    roots: Vec<u32>,
+    /// By index: the key's new definition, when the walk makes it.
+    made: Vec<Option<Made>>,
+}
+
+impl Plan {
+    /// The index of key `g`, and whether it is new.
+    fn id(&mut self, g: &(Glue, CTy)) -> (u32, bool) {
+        if let Some(&i) = self.index.get(g) {
+            return (i, false);
+        }
+        let i = self.keys.len() as u32;
+        self.keys.push(g.clone());
+        self.index.insert(g.clone(), i);
+        (i, true)
+    }
+}
+
+/// One glue key's definition and what it needs (`glue_def`), as `GlueSet` stores them, and how
+/// they compare with the stored entry.
+struct Made {
+    proto: String,
+    def: String,
+    more: Vec<(Glue, CTy)>,
+    /// `more` as `Plan` indices.
+    more_ids: Vec<u32>,
+    types: Vec<CTy>,
+    used: Vec<u32>,
+    externs: BTreeSet<String>,
+    /// No stored entry.
+    is_new: bool,
+    was_stale: bool,
+    /// The stored definition, prototype, deps and types are these.
+    same: bool,
+    /// The stored slots and extern declarations are these.
+    same_used: bool,
+}
+
+impl Made {
+    fn of(p: &Program, slots: &[u32], g: &(Glue, CTy), set: &GlueSet) -> Made {
+        let (mut proto, mut def, mut more, mut types) = (String::new(), String::new(), Vec::new(), Vec::new());
+        let rec = Slots::new(slots);
+        glue_def(p, &rec, &g.0, &g.1, &mut proto, &mut def, &mut more, &mut types);
+        // The set keeps every entry (the front image saves it): no growth slack.
+        proto.shrink_to_fit();
+        def.shrink_to_fit();
+        more.shrink_to_fit();
+        types.shrink_to_fit();
+        let (mut used, externs) = rec.into_used();
+        used.shrink_to_fit();
+        let is_new = !set.protos.contains_key(g);
+        let same = !is_new
+            && set.def_map.get(g) == Some(&def)
+            && set.protos.get(g) == Some(&proto)
+            && set.deps.get(g) == Some(&more)
+            && set.types.get(g) == Some(&types);
+        let same_used = set.used.get(g) == Some(&used) && set.externs.get(g) == Some(&externs);
+        Made { proto, def, more, more_ids: Vec::new(), types, used, externs, is_new, was_stale: set.stale.contains(g), same, same_used }
     }
 }
 

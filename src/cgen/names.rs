@@ -49,6 +49,11 @@ pub fn with<R>(names: Option<&Arc<Names>>, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// This thread's naming context (`with`), for work it hands to other threads.
+pub(crate) fn current() -> Option<Arc<Names>> {
+    CUR.with(|c| c.borrow().clone())
+}
+
 /// True while this thread emits release C.
 pub(crate) fn release() -> bool {
     CUR.with(|c| c.borrow().is_some())
