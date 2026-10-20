@@ -7,8 +7,8 @@
 //   table calls   (CAST lust_fns[slot]) -> (CAST f_<id>), with the callee's prototype
 //   fn pointers   lust_tramps[slot]     -> tramp_<id>
 //   Adts          A<id> (rank by hash)  -> A<def hash> or A<instance key hash>
-//   panic sites   slot << 40 | ...      -> lust_so_<id> << 40 | ..., the slot from the
-//                                          location unit's side table
+//   panic sites   slot << 40 | ...      -> lust_so_<id> | ..., the slot (shifted) from
+//                                          the location unit's side table
 //   vtables       vt<slot>_<vtable id>  -> vt_<id>_<n>, n counted in the fn
 // `<id>` is 16 hex digits of a hash of the fn's `DiskDefId` (def path plus instance
 // args). Every name that leaves its fn (a callee, a fn pointer, a location slot) is
@@ -132,17 +132,18 @@ pub(crate) fn fn_value(p: &Program, f: LocalDefId, slot: u32, externs: &mut BTre
 }
 
 /// A panic location of the fn in `slot`: the packed number numbered; in release C the
-/// slot comes from the location unit's `lust_so_<id>` (recorded in `externs`), so the
-/// text holds only the line within the fn and the column. The slot is read through
-/// `LUST_SO` (runtime.h), a volatile read: a panic site is cold, and a plain read of the
-/// extern constant was hoisted with its shift into the fn's hot path (0.28 G loads on the
-/// pgo-train set). A `#[track_caller]` call's argument takes `hot_loc` of this text.
+/// slot comes from the location unit's `lust_so_<id>` (recorded in `externs`), already
+/// shifted to its bits (`slot << 40`), so the text holds only the line within the fn and
+/// the column and the word is one load and one or. The slot is read through `LUST_SO`
+/// (runtime.h), a volatile read: a panic site is cold, and a plain read of the extern
+/// constant was hoisted into the fn's hot path (0.28 G loads on the pgo-train set). A
+/// `#[track_caller]` call's argument takes `hot_loc` of this text.
 pub(crate) fn loc(slot: u32, rel: u64, col: u64, externs: &mut BTreeSet<String>) -> String {
     match fn_id(slot) {
         None => format!("{}u", ((slot as u64) << 40) | (rel << 20) | col),
         Some(id) => {
-            externs.insert(format!("extern const uint32_t lust_so_{id};\n"));
-            format!("(((uint64_t)LUST_SO(lust_so_{id}) << 40) | {}ull)", (rel << 20) | col)
+            externs.insert(format!("extern const uint64_t lust_so_{id};\n"));
+            format!("(LUST_SO(lust_so_{id}) | {}ull)", (rel << 20) | col)
         }
     }
 }
@@ -151,8 +152,8 @@ pub(crate) fn loc(slot: u32, rel: u64, col: u64, externs: &mut BTreeSet<String>)
 /// `#[track_caller]` callee on every call: there the C compiler may keep one load for the
 /// whole fn.
 pub(crate) fn hot_loc(loc: &str) -> String {
-    match loc.strip_prefix("(((uint64_t)LUST_SO(").and_then(|r| r.split_once(") << 40) | ")) {
-        Some((sym, low)) => format!("(((uint64_t){sym} << 40) | {low}"),
+    match loc.strip_prefix("(LUST_SO(").and_then(|r| r.split_once(") | ")) {
+        Some((sym, low)) => format!("({sym} | {low}"),
         None => loc.to_string(),
     }
 }
@@ -176,7 +177,7 @@ pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> S
     let lines: Vec<u32> = fns.iter().map(|&(_, s)| slot_lines.get(s as usize).copied().unwrap_or(0)).collect();
     let mut c = super::loc_unit(&SlotFiles { paths: &paths, of_slot: &of_slot }, &lines);
     for (k, (id, _)) in fns.iter().enumerate() {
-        c.push_str(&format!("const uint32_t lust_so_{id} = {k};\n"));
+        c.push_str(&format!("const uint64_t lust_so_{id} = {}ull;\n", (k as u64) << 40));
     }
     c
 }

@@ -2971,9 +2971,9 @@ fn ll_loc_value(ll: &mut Ll, w: &LocWord, k: usize) -> String {
         }
         LocWord::Const(n) => n.to_string(),
         LocWord::Slot(id, low, cold) => {
-            ll.decls.insert(format!("@lust_so_{id} = external constant i32"));
+            ll.decls.insert(format!("@lust_so_{id} = external constant i64"));
             let v = if *cold { "volatile " } else { "" };
-            let _ = writeln!(ll.body, "  %ls{k} = load {v}i32, ptr @lust_so_{id}\n  %lz{k} = zext i32 %ls{k} to i64\n  %lh{k} = shl i64 %lz{k}, 40\n  %lc{k} = or i64 %lh{k}, {low}");
+            let _ = writeln!(ll.body, "  %ls{k} = load {v}i64, ptr @lust_so_{id}\n  %lc{k} = or i64 %ls{k}, {low}");
             format!("%lc{k}")
         }
     }
@@ -2985,9 +2985,10 @@ enum LocWord {
     /// The calling fn's own received location (`ltc`: it is `#[track_caller]` too).
     Ltc,
     Const(u64),
-    /// `(((uint64_t)LUST_SO(lust_so_<id>) << 40) | <low>ull)`: the fn's location slot (a
-    /// constant of the location unit) above the line and column bits; read volatile (`true`,
-    /// a panic site: kept on the cold path) or plain (`names::hot_loc`, a call's argument).
+    /// `(LUST_SO(lust_so_<id>) | <low>ull)`: the fn's location slot (a constant of the
+    /// location unit, already shifted above the line and column bits) or'd with them; read
+    /// volatile (`true`, a panic site: kept on the cold path) or plain (`names::hot_loc`,
+    /// `(lust_so_<id> | <low>ull)`, a call's argument).
     Slot(String, u64, bool),
 }
 
@@ -3001,11 +3002,11 @@ fn loc_word(c: &str) -> Option<LocWord> {
     {
         return Some(LocWord::Const(v));
     }
-    let (cold, rest) = match c.strip_prefix("(((uint64_t)LUST_SO(lust_so_") {
-        Some(r) => (true, r.replacen(") << 40) | ", " << 40) | ", 1)),
-        None => (false, c.strip_prefix("(((uint64_t)lust_so_")?.to_string()),
+    let (cold, rest) = match c.strip_prefix("(LUST_SO(lust_so_") {
+        Some(r) => (true, r.replacen(") | ", " | ", 1)),
+        None => (false, c.strip_prefix("(lust_so_")?.to_string()),
     };
-    let (id, low) = rest.split_once(" << 40) | ")?;
+    let (id, low) = rest.split_once(" | ")?;
     let low = low.strip_suffix("ull)")?.parse::<u64>().ok()?;
     id.bytes().all(|b| b.is_ascii_hexdigit()).then(|| LocWord::Slot(id.to_string(), low, cold))
 }
