@@ -61,11 +61,6 @@ pub(super) struct Entry {
     pub file: String,
     /// Its text length (largest units compile first).
     pub len: usize,
-    /// The external fns it defines (the PGO split); empty without a profile.
-    pub defs: Vec<String>,
-    /// The static fns it defines (the PGO split owns their records by name); empty without
-    /// a profile.
-    pub statics: Vec<String>,
 }
 
 fn path(work: &Path) -> std::path::PathBuf {
@@ -86,9 +81,7 @@ pub(super) fn load(work: &Path, tag: &str) -> HashMap<u128, Entry> {
             let fp = u128::from_str_radix(f.next()?, 16).ok()?;
             let (name, key, file) = (f.next()?.to_string(), f.next()?.to_string(), f.next()?.to_string());
             let len = f.next()?.parse().ok()?;
-            let defs = f.next()?.split_whitespace().map(str::to_string).collect();
-            let statics = f.next()?.split_whitespace().map(str::to_string).collect();
-            Some((fp, Entry { name, key, file, len, defs, statics }))
+            Some((fp, Entry { name, key, file, len }))
         })
         .collect()
 }
@@ -98,7 +91,7 @@ pub(super) fn load(work: &Path, tag: &str) -> HashMap<u128, Entry> {
 pub(super) fn save(work: &Path, tag: &str, entries: &[(u128, Entry)]) -> Result<(), String> {
     let mut text = format!("{tag}\n");
     for (fp, e) in entries {
-        text.push_str(&format!("{fp:032x}\t{}\t{}\t{}\t{}\t{}\t{}\n", e.name, e.key, e.file, e.len, e.defs.join(" "), e.statics.join(" ")));
+        text.push_str(&format!("{fp:032x}\t{}\t{}\t{}\t{}\n", e.name, e.key, e.file, e.len));
     }
     let tmp = work.join(format!("unit-memo.{}", std::process::id()));
     std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path(work))).map_err(|e| format!("cannot write {}: {e}", path(work).display()))
@@ -112,14 +105,7 @@ mod tests {
     fn a_memo_reads_back_only_under_its_tag() {
         let work = std::env::temp_dir().join(format!("lust-memo-test-{}", std::process::id()));
         std::fs::create_dir_all(&work).unwrap();
-        let e = Entry {
-            name: "u7".into(),
-            key: "ab".repeat(16),
-            file: "x0123.c".into(),
-            len: 42,
-            defs: vec!["f_1".into(), "tramp_2".into()],
-            statics: vec!["lh_1_0".into()],
-        };
+        let e = Entry { name: "u7".into(), key: "ab".repeat(16), file: "x0123.c".into(), len: 42 };
         save(&work, "tag-a", &[(7u128 << 100 | 5, e.clone())]).unwrap();
         assert_eq!(load(&work, "tag-a").get(&(7u128 << 100 | 5)), Some(&e));
         assert!(load(&work, "tag-b").is_empty(), "another compiler, flag set, profile or lust build drops the memo");

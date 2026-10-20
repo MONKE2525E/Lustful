@@ -555,7 +555,7 @@ fn memo_tag(spec: &CcSpec, debug: bool, work: &Path) -> String {
         ],
         59,
     );
-    format!("memo-v1 {a:016x}{b:016x}")
+    format!("memo-v2 {a:016x}{b:016x}")
 }
 
 /// The memo entry of a unit's fingerprint (`memo_state` and `build` both ask it). It serves
@@ -679,16 +679,22 @@ pub fn build_with(
             let name = units[i].name.as_str();
             ll_of.get(name).filter(|_| pgo_on).map(|ll| ll_profile_text(text(i), ll, hc_of.get(name).copied().unwrap_or("")))
         });
+    let oracle = std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
+    // The units the stream took: their key and the file name they compile as (it compiles them).
+    let took: Vec<Option<(String, String)>> = units.iter().map(|u| stream.as_ref().and_then(|s| s.key_and_file(&u.name))).collect();
     // What each C or LLVM unit given text defines (`pgo::definitions_of`), one scan: its PGO
-    // file name and the split read it.
+    // file name and the split read it. A unit the stream took is not compiled here, so it is
+    // scanned only for the oracle's own key.
     let scans: Vec<Option<pgo::Defs>> = crate::pool::par_map(&idx, |&i| {
-        (pgo_on && entries[i].is_none() && !is_cxx(&units[i].name)).then(|| pgo::definitions_of(ll_texts[i].as_deref().unwrap_or(text(i))))
+        (pgo_on && entries[i].is_none() && !is_cxx(&units[i].name) && (took[i].is_none() || oracle))
+            .then(|| pgo::definitions_of(ll_texts[i].as_deref().unwrap_or(text(i))))
     });
-    let names: Vec<String> = crate::pool::par_map(&idx, |&i| match (entries[i], &scans[i]) {
-        // A PGO name is its text's (`pgo::stable_name`); else the unit's name now: its
-        // object goes there, whatever name the entry had in the last build.
-        (Some(e), _) if pgo_on => e.file.rsplit_once('.').map_or(e.file.clone(), |(stem, _)| stem.to_string()),
-        (None, Some(d)) => pgo::stable_name(&d.0).unwrap_or_else(|| units[i].name.clone()),
+    let names: Vec<String> = crate::pool::par_map(&idx, |&i| match (entries[i], &took[i], &scans[i]) {
+        // A PGO name is its text's (`pgo::stable_name`, as the stream names it); else the
+        // unit's name now: its object goes there, whatever name the entry had in the last build.
+        (Some(e), _, _) if pgo_on => e.file.rsplit_once('.').map_or(e.file.clone(), |(stem, _)| stem.to_string()),
+        (None, Some((_, file)), _) => file.clone(),
+        (None, None, Some(d)) => pgo::stable_name(&d.0).unwrap_or_else(|| units[i].name.clone()),
         _ => units[i].name.clone(),
     });
     let cflags_text = cflags(debug);
@@ -698,13 +704,12 @@ pub fn build_with(
     // The LLVM units by their PGO names (`ll_of` and `hc_of` stay by unit name).
     let is_ll: Vec<bool> = (0..units.len()).map(|i| entries[i].map_or(ll_of.contains_key(units[i].name.as_str()), |e| e.file.ends_with(".ll"))).collect();
     let pfile = |i: usize| if is_ll[i] { format!("{}.ll", names[i]) } else { format!("{}.c", names[i]) };
-    // What each unit defines, for a profile to use: from its text, or its memo entry.
+    // What each unit scanned defines, for a profile to use. Memo units and those the stream
+    // took are not compiled here (their keys are kept), and a unit's records follow from its
+    // own definitions alone (`pgo::split`), so they are not split.
     let defs = std::env::var_os("LUST_PGO_USE").filter(|_| !instrumented).map(|_| {
         let files: Vec<(String, &pgo::Defs, Option<&[u8]>)> = (0..units.len()).filter_map(|i| Some((pfile(i), scans[i].as_ref()?, pre[i].as_deref()))).collect();
-        let mut defs = pgo::unit_defs(&files);
-        defs.units.extend((0..units.len()).filter_map(|i| entries[i].map(|e| (e.file.clone(), e.defs.clone()))));
-        defs.statics.extend((0..units.len()).filter_map(|i| entries[i].map(|e| (e.file.clone(), e.statics.clone()))));
-        defs
+        pgo::unit_defs(&files, (0..units.len()).all(|i| scans[i].is_some() || is_cxx(&units[i].name)))
     });
     let pgo = pgo::Mode::from_env(spec, work, defs.as_ref(), stream.as_ref().and_then(Stream::warm))?;
     let pgo_of = |i: usize| pgo.as_ref().filter(|_| !is_cxx(&names[i]));
@@ -773,7 +778,6 @@ pub fn build_with(
         }
         None => String::new(),
     };
-    let oracle = std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
     let keys: Vec<Option<String>> = crate::pool::par_map(&idx, |&i| {
         if let Some(e) = entries[i] {
             return Some(e.key.clone());
@@ -790,12 +794,12 @@ pub fn build_with(
             })
         };
         // A streamed unit has the stream's key: the same inputs. The oracle checks it.
-        match stream.as_ref().filter(|_| keyed).and_then(|s| s.key_of(unit)) {
-            Some(k) => {
+        match took[i].as_ref().filter(|_| keyed) {
+            Some((k, _)) => {
                 if oracle && mine().as_deref() != Some(k.as_str()) {
                     panic!("LUST_CHECK_UNIT_FP: the stream keyed unit {unit} {k}, build {:?}", mine());
                 }
-                Some(k)
+                Some(k.clone())
             }
             None => mine(),
         }
@@ -805,28 +809,17 @@ pub fn build_with(
     // LUST_CHECK_UNIT_FP=1 every unit comes with text, and a fingerprint the last build gave
     // another key is a stale fingerprint: the session missed an input.
     if let (Some(tag), true) = (&tag, keyed) {
-        let check = std::env::var_os("LUST_CHECK_UNIT_FP").is_some_and(|v| v == "1");
-        let def_of: std::collections::HashMap<&str, &Vec<String>> = defs.as_ref().map(|d| d.units.iter().map(|(f, v)| (f.as_str(), v)).collect()).unwrap_or_default();
-        let static_of: std::collections::HashMap<&str, &Vec<String>> =
-            defs.as_ref().map(|d| d.statics.iter().map(|(f, v)| (f.as_str(), v)).collect()).unwrap_or_default();
         let mut next = Vec::new();
         for i in 0..units.len() {
             let (Some(fp), Some(key)) = (units[i].fp, &keys[i]) else { continue };
             if pre[i].is_some() || is_cxx(&units[i].name) || text(i).contains("#include <") {
                 continue;
             }
-            if check && let Some(old) = memo.get(&fp).filter(|e| &e.key != key) {
+            if oracle && let Some(old) = memo.get(&fp).filter(|e| &e.key != key) {
                 panic!("LUST_CHECK_UNIT_FP: unit {} has the input fingerprint {fp:032x} of the last build, whose text had key {}; its text now has key {key}", units[i].name, old.key);
             }
-            let entry = entries[i].map(|e| memo::Entry { name: units[i].name.clone(), file: pfile(i), ..e.clone() }).unwrap_or_else(|| memo::Entry {
-                name: units[i].name.clone(),
-                key: key.clone(),
-                file: pfile(i),
-                len: len(i),
-                defs: def_of.get(pfile(i).as_str()).map(|d| (*d).clone()).unwrap_or_default(),
-                statics: static_of.get(pfile(i).as_str()).map(|d| (*d).clone()).unwrap_or_default(),
-            });
-            next.push((fp, entry));
+            // A memo unit's key, file and length are its entry's (`keys`, `names`, `len`).
+            next.push((fp, memo::Entry { name: units[i].name.clone(), key: key.clone(), file: pfile(i), len: len(i) }));
         }
         memo::save(work, tag, &next)?;
     }

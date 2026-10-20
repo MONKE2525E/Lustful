@@ -54,10 +54,10 @@ pub struct Pgo {
     /// The flags that pin the summary thresholds to the whole profile's.
     pins: Vec<String>,
     records: usize,
-    /// Records of macro-made fns: only a preprocessed text shows their definition.
-    helpers: usize,
-    /// Other records no unit defines (fns this build does not have): in no profile.
-    absent: usize,
+    /// When every unit was split (`UnitDefs::all`): the records of macro-made fns (only a
+    /// preprocessed text shows their definition), and the other records no unit defines (fns
+    /// this build does not have: in no profile).
+    counts: Option<(usize, usize)>,
     /// The quantized profile and pins came from the last build's work dir (`load`).
     kept: bool,
     /// The whole quantized profile (`pgo-all.profdata`) every unit with records compiles
@@ -126,7 +126,13 @@ impl Mode {
     pub fn describe(&self) -> String {
         match self {
             Mode::Gen => "pgo instrumented".into(),
-            Mode::Use(p) => format!("pgo {} records{}, {} runtime helpers, {} of fns not in this build", p.records, if p.kept { " (kept)" } else { "" }, p.helpers, p.absent),
+            Mode::Use(p) => {
+                let kept = if p.kept { " (kept)" } else { "" };
+                match p.counts {
+                    Some((helpers, absent)) => format!("pgo {} records{kept}, {helpers} runtime helpers, {absent} of fns not in this build", p.records),
+                    None => format!("pgo {} records{kept}", p.records),
+                }
+            }
         }
     }
 }
@@ -531,17 +537,8 @@ impl Pgo {
         // The streamed build loaded this profile's index already (`Warm`): no second read.
         if let Some(w) = warm.filter(|w| w.key == key && all.exists()) {
             let index = w.index();
-            let (own, helpers, absent) = split(&index, defs);
-            return Ok(Pgo {
-                own,
-                pins: w.pins.clone(),
-                records: index.iter().map(|(_, _, n)| n).sum(),
-                helpers,
-                absent,
-                kept: true,
-                all,
-                key,
-            });
+            let (own, counts) = split(&index, defs);
+            return Ok(Pgo { own, pins: w.pins.clone(), records: index.iter().map(|(_, _, n)| n).sum(), counts, kept: true, all, key });
         }
         let pins_kept = std::fs::read_to_string(&memo)
             .ok()
@@ -575,24 +572,27 @@ impl Pgo {
         if hit && !all.exists() {
             run(Command::new(profdata()).arg("merge").arg("-o").arg(&all).arg(&txt))?;
         }
-        let (own, helpers, absent) = split(&index, defs);
-        Ok(Pgo { own, pins, records: index.iter().map(|(_, _, n)| n).sum(), helpers, absent, kept: hit, all, key })
+        let (own, counts) = split(&index, defs);
+        Ok(Pgo { own, pins, records: index.iter().map(|(_, _, n)| n).sum(), counts, kept: hit, all, key })
     }
 }
 
 /// The external fns each unit defines, by the file name it compiles as, the names only a
-/// preprocessed text shows (macro-made), and the static fns each unit defines.
+/// preprocessed text shows (macro-made), and the static fns each unit defines. A unit's own
+/// records follow from its own definitions alone (`split`), so a build gives only the units it
+/// compiles; `all`: these are all of the build's units (the summary's counts need them all).
 pub(super) struct UnitDefs {
-    pub units: Vec<(String, Vec<String>)>,
+    units: Vec<(String, Vec<String>)>,
     macro_made: std::collections::HashSet<String>,
-    pub statics: Vec<(String, Vec<String>)>,
+    statics: Vec<(String, Vec<String>)>,
+    all: bool,
 }
 
 /// The definitions of each unit, on every thread: those of its text, scanned once
 /// (`definitions_of`, which its PGO file name reads too), or of its preprocessed text when
 /// the caller has one (a unit with `#include`s; `cc::preprocessed`), so the fns its macros
-/// make count as its own.
-pub(super) fn unit_defs(units: &[(String, &Defs, Option<&[u8]>)]) -> UnitDefs {
+/// make count as its own. `all`: as `UnitDefs::all`.
+pub(super) fn unit_defs(units: &[(String, &Defs, Option<&[u8]>)], all: bool) -> UnitDefs {
     let owned = |v: &[&str]| v.iter().map(|n| n.to_string()).collect::<Vec<String>>();
     let per: Vec<(String, Vec<String>, Vec<String>, Vec<String>)> = crate::pool::par_map(units, |(file, raw, pre)| match pre {
         None => {
@@ -617,17 +617,18 @@ pub(super) fn unit_defs(units: &[(String, &Defs, Option<&[u8]>)]) -> UnitDefs {
         statics.push((file.clone(), st));
         units.push((file, names));
     }
-    UnitDefs { units, macro_made, statics }
+    UnitDefs { units, macro_made, statics, all }
 }
 
 /// The digests (`Index`) of each unit's own record names, by the file name it compiles as,
-/// sorted; how many of those names are of macro-made fns; how many external ones no unit
-/// defines. An external fn's record goes to every unit that defines it, a static fn's
-/// (`STATIC_FILE;<fn>`) to every unit that defines a static fn of that name, a static record of
-/// another file to the unit of that file. Each unit finds its names in the sorted index by
+/// sorted; with all units (`UnitDefs::all`), how many of those names are of macro-made fns
+/// and how many external ones no unit defines. An external fn's record goes to every unit that
+/// defines it, a static fn's (`STATIC_FILE;<fn>`) to every unit that defines a static fn of
+/// that name, a static record of another file to the unit of that file: a unit's records
+/// depend on its own definitions only. Each unit finds its names in the sorted index by
 /// binary search, on every thread, with no map of the index built first (tsgo's LLVM build:
 /// 728k records over ~4,300 units, each with the unit header's static fns).
-fn split(index: &[(&str, u128, usize)], defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, usize, usize) {
+fn split(index: &[(&str, u128, usize)], defs: &UnitDefs) -> (HashMap<String, Vec<u128>>, Option<(usize, usize)>) {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     debug_assert!(index.windows(2).all(|w| w[0].0 < w[1].0), "the index is sorted by name");
     let find = |prefix: &str, name: &str| index.binary_search_by(|e| cmp_joined(e.0, prefix, name)).ok();
@@ -657,16 +658,19 @@ fn split(index: &[(&str, u128, usize)], defs: &UnitDefs) -> (HashMap<String, Vec
         ds.sort_unstable();
         (f.to_string(), ds)
     });
-    let (mut helpers, mut absent) = (0, 0);
-    for ((n, _, _), c) in index.iter().zip(&claimed) {
-        if !n.contains(';') {
-            match c.load(Relaxed) {
-                true => helpers += defs.macro_made.contains(*n) as usize,
-                false => absent += 1,
+    let counts = defs.all.then(|| {
+        let (mut helpers, mut absent) = (0, 0);
+        for ((n, _, _), c) in index.iter().zip(&claimed) {
+            if !n.contains(';') {
+                match c.load(Relaxed) {
+                    true => helpers += defs.macro_made.contains(*n) as usize,
+                    false => absent += 1,
+                }
             }
         }
-    }
-    (own.into_iter().filter(|(_, d)| !d.is_empty()).collect(), helpers, absent)
+        (helpers, absent)
+    });
+    (own.into_iter().filter(|(_, d)| !d.is_empty()).collect(), counts)
 }
 
 /// `a` against `prefix` followed by `name`, in byte order, with no joined copy made.
@@ -1013,9 +1017,10 @@ mod tests {
             units: defs.iter().map(|(f, ns)| (f.to_string(), ns.iter().map(|n| n.to_string()).collect())).collect(),
             macro_made: macro_made.iter().map(|n| n.to_string()).collect(),
             statics: Vec::new(),
+            all: true,
         };
-        let (own, helpers, absent) = split(&index(&recs), &defs);
-        Mode::Use(Pgo { own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), helpers, absent, kept: false, all: PathBuf::new(), key: String::new() })
+        let (own, counts) = split(&index(&recs), &defs);
+        Mode::Use(Pgo { own, pins: vec!["-mllvm".into(), "-x".into()], records: recs.len(), counts, kept: false, all: PathBuf::new(), key: String::new() })
     }
 
     /// Two static fns of one source name with different bodies are two records of one name:
@@ -1063,15 +1068,21 @@ mod tests {
             units: Vec::new(),
             macro_made: Default::default(),
             statics: vec![st("x9.ll", &["lh_aa_0", "lust_mix"]), st("x7.c", &["lust_mix"]), st("x1.c", &[]), st("x1.ca", &[])],
+            all: true,
         };
         let ix = index(&recs);
         let digest_of = |n: &str| ix.iter().find(|e| e.0 == n).map(|e| e.1).unwrap();
-        let (own, _, absent) = split(&ix, &defs);
+        let (own, counts) = split(&ix, &defs);
         assert_eq!(own["x9.ll"].len(), 2);
         assert_eq!(own["x7.c"], vec![digest_of("lust.c;lust_mix")]);
         assert_eq!(own["x1.c"], vec![digest_of("x1.c;old")], "another file's static record stays with that file");
         assert!(!own.contains_key("x1.ca"), "a file whose name starts with another's takes none of its records");
-        assert_eq!(absent, 0);
+        assert_eq!(counts, Some((0, 0)));
+        // A unit split alone (a warm build splits only the units it compiles) gets the same
+        // records; the counts need every unit.
+        let alone = UnitDefs { units: Vec::new(), macro_made: Default::default(), statics: vec![st("x7.c", &["lust_mix"])], all: false };
+        let (own7, counts) = split(&ix, &alone);
+        assert_eq!((own7.get("x7.c"), counts), (own.get("x7.c"), None));
         assert_eq!(defined_statics("static inline int lust_mix(int a) {\n}\nstatic int g;\nint f(void) {\n}\n"), vec!["lust_mix"]);
     }
 
@@ -1117,8 +1128,9 @@ mod tests {
                 .collect(),
             macro_made: Default::default(),
             statics: units.iter().map(|(f, _, s)| (f.to_string(), s.iter().map(|s| s.to_string()).collect())).collect(),
+            all: true,
         };
-        let (own, _, _) = split(&ix, &defs);
+        let (own, _) = split(&ix, &defs);
         for (f, e, st) in &units {
             assert_eq!(w.own(f, e, st), own.get(*f).cloned().unwrap_or_default(), "unit {f}");
         }
@@ -1144,7 +1156,7 @@ mod tests {
         assert_eq!(base.key_part("u3.c"), mk(&without, 1, 2, 3, 4).key_part("u3.c"), "an inline copy elsewhere comes or goes");
         // `f_gone` and, with no copy left, `lust_copy` (no unit defines them) go to no unit.
         let Mode::Use(p) = &mk(&without, 1, 2, 3, 4) else { unreachable!() };
-        assert_eq!((p.helpers, p.absent), (1, 2));
+        assert_eq!(p.counts, Some((1, 2)));
     }
 
     /// A unit with `#include`s is read through the preprocessor: the fns its macros make
@@ -1154,7 +1166,7 @@ mod tests {
         let Ok(spec) = super::super::spec_for(crate::protocol::host_triple()) else { return };
         let c = "#include <stddef.h>\n#define MK(n) int lust_##n(void) { return 0; }\nMK(a)\nint visible(void) {\n  return 1;\n}\n";
         let pre = super::super::preprocessed(c, &spec.cmd, &super::super::cflags(false), false);
-        let d = unit_defs(&[("u2.c".to_string(), &definitions_of(c), pre.as_deref())]);
+        let d = unit_defs(&[("u2.c".to_string(), &definitions_of(c), pre.as_deref())], true);
         let mut names = d.units[0].1.clone();
         names.sort();
         assert_eq!(names, vec!["lust_a", "visible"]);

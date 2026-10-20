@@ -2,9 +2,9 @@
 // hands over each plain C unit as soon as its text exists (`add`). The stream keys it as
 // `cc::build` does (`unit_key`, the same inputs), takes a cache hit at once, and starts a
 // miss's compile as a child process, the exact command `build` runs (`unit_command`), largest
-// unit first. `cc::build_with` then takes each unit the stream has (`finish`): its key, and
-// its object once its child exited; it never compiles that unit again, and it alone stores
-// objects in the cache, after their compile succeeded.
+// unit first. `cc::build_with` then takes each unit the stream has (`finish`): its key and file
+// name, and its object once its child exited; it never compiles or scans that unit again, and
+// it alone stores objects in the cache, after their compile succeeded.
 //
 // Two phases. While the units assemble, at most `early` children run (the assembly keeps the
 // cores busy), and every `add` reaps finished children and starts waiting ones: the stream has
@@ -177,9 +177,9 @@ impl Stream {
         self.0.warm.as_ref()
     }
 
-    /// The key of `name`, when the stream has it.
-    pub(super) fn key_of(&self, name: &str) -> Option<String> {
-        self.0.lock().units.get(name).map(|u| u.key.clone())
+    /// The key of `name` and the file name it compiles as, when the stream has it.
+    pub(super) fn key_and_file(&self, name: &str) -> Option<(String, String)> {
+        self.0.lock().units.get(name).map(|u| (u.key.clone(), u.file.clone()))
     }
 
     /// Waits for the object of `name` (after `go`): None when the stream does not have it,
