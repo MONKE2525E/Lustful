@@ -2001,7 +2001,11 @@ fn param_ctype(p: &Program, t: &CTy) -> String {
 /// `decl` its declarator (`l{i}` or `l{i} = init`). tcc never realigns
 /// the stack, so a frame slot is only 16-aligned: the value lives at the
 /// first aligned address in a char buffer, and `l{i}` is a macro for it
-/// up to the `#undef` after the function (fx-overalign).
+/// up to the `#undef` after the function (fx-overalign). Dev C only: the
+/// release C compilers (clang, gcc, zig cc) realign the frame, and a plain
+/// local stays visible to their copy and scalar optimizations, which a
+/// local behind integer pointer arithmetic is not (every copy of a
+/// `#[repr(align(64))]` struct was a real copy).
 fn overaligned_local(out: &mut String, i: usize, ct: &str, decl: &str) {
     let _ = writeln!(
         out,
@@ -2567,7 +2571,7 @@ impl FnGen<'_, '_> {
         // after a write. Drop flags start at 0, except for parameters, which own their values.
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
         let mut flags = Vec::new();
-        // Locals with alignment over 16 (see `overaligned_local`).
+        // Dev C's locals with alignment over 16 (see `overaligned_local`).
         let mut high: Vec<(usize, String, String)> = Vec::new();
         let mut frame_init: Vec<String> = Vec::new();
         // The compile-time promoted values' decls (`kstatic_decl`; it
@@ -2620,7 +2624,7 @@ impl FnGen<'_, '_> {
                     let d = self.kconst_decls(i);
                     self.out.push_str(&d);
                 }
-            } else if c_size_align(p, t).1 > 16 {
+            } else if c_size_align(p, t).1 > 16 && !names::release() {
                 high.push((i, ct, decl));
             } else {
                 match by_type.iter_mut().find(|(c, _)| *c == ct) {
@@ -13411,6 +13415,40 @@ mod tests {
             assert!(unit.contains(&format!("inline void drop_{e}_(")), "the enum's drop glue is inline:\n{unit}");
             assert!(!unit.contains(&format!("struct {big} {{")) && !unit.contains(&format!("sizeof({big})")), "the unit defines no {big}:\n{unit}");
         });
+    }
+
+    /// A local with alignment over 16 is a plain declaration in release C (the C compiler
+    /// realigns the frame) and an aligned spot in a char buffer in dev C (tcc does not).
+    #[test]
+    fn overaligned_local_is_plain_in_release_c() {
+        let src = "#[derive(Clone, Copy)]\n#[repr(align(64))]\nstruct Wide { a: u64, b: u64 }\n\
+                   #[inline(never)]\nfn twice(w: Wide) -> Wide { let v = w; Wide { a: v.a * 2, b: v.b } }\n\
+                   fn main() { println!(\"{}\", twice(Wide { a: 1, b: 2 }).a); }\n";
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let n = program.fns.len();
+        let slots: Vec<u32> = (0..n as u32).collect();
+        let names = std::sync::Arc::new(names::Names {
+            fns: (0..n).map(|s| Some(format!("{s:016x}"))).collect(),
+            adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
+            by_id: Default::default(),
+        });
+        let twice = program.fn_names[&interner.intern("twice")];
+        let code = || {
+            let (ck, errs) = check_fn(&program, twice);
+            assert!(errs.is_empty(), "{errs:?}");
+            gen_fn(&program, &crate::lower::lower(&program, twice, ck), &map, 1, &slots).code
+        };
+        let release = names::with(Some(&names), code);
+        assert!(!release.contains("_b[sizeof(") && !release.contains("#define l"), "release C declares it plainly:\n{release}");
+        let dev = names::with(None, code);
+        assert!(dev.contains("_b[sizeof(") && dev.contains("#undef l"), "dev C keeps the aligned buffer:\n{dev}");
     }
 
     /// Release C glue shards, one key each: the shard of a struct's drop glue holds the
