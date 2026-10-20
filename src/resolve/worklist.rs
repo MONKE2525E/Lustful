@@ -1261,16 +1261,19 @@ fn hash_tokens(tokens: &[crate::lexer::Token], strings: &[String]) -> u64 {
 }
 
 /// Hash of the expansion inputs every file of one round shares: the
-/// macro seeds, the crate's `$crate` magic, name, Cargo env, display
+/// seed facts every expansion reads (`expand::parser_name_facts`; the
+/// seeds themselves key each file, `expansion_input_hash`), the extern
+/// crate names, the crate's `$crate` magic, name, Cargo env, display
 /// root, and the client's shown root (`file!`). The cfg environment
 /// keys the whole `ResolveCache` already.
-fn expansion_env_hash(menv: &MacroEnv, job: &CrateJob, input: &OneInput, client: &crate::expand::ClientView) -> u64 {
+fn expansion_env_hash(menv: &MacroEnv, job: &CrateJob, input: &OneInput, client: &crate::expand::ClientView, interner: &Interner) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = crate::intern::FxHasher::default();
-    "expansion-env-v1".hash(&mut h);
-    for s in &menv.seeds {
-        seed_hash(&mut h, s);
-    }
+    "expansion-env-v2".hash(&mut h);
+    crate::expand::parser_name_facts(&menv.seeds, interner).hash(&mut h);
+    let mut externs: Vec<&String> = menv.dep_owned.keys().collect();
+    externs.sort_unstable();
+    externs.hash(&mut h);
     h.write_u64(job.magic.0 as u64);
     input.crate_name.hash(&mut h);
     input.cargo_env.hash(&mut h);
@@ -1289,13 +1292,22 @@ fn seed_hash(h: &mut crate::intern::FxHasher, s: &crate::expand::MacroSeed) {
 }
 
 /// Hash of everything one file's expansion reads besides its own text
-/// (`ResolveCache::expanded`): the round's shared inputs, the macro
-/// sources spliced into it (`MacroEnv::splice`), its extra glob seeds,
-/// its module path, and its path.
-fn expansion_input_hash(env_hash: u64, menv: &MacroEnv, owned_hashes: &[u64], di: usize, module_path: &[Sym], path: &std::path::Path) -> u64 {
+/// (`ResolveCache::expanded`): the round's shared inputs, the seeds and glob
+/// seeds it can reach (`MacroEnv::reach`, `expand::reach_seeds`: the
+/// expander seeds no other), the seed facts of its glob seeds
+/// (`expand::parser_name_facts`), the macro sources spliced into it
+/// (`MacroEnv::splice`), its module path, and its path.
+#[allow(clippy::too_many_arguments)]
+fn expansion_input_hash(env_hash: u64, menv: &MacroEnv, reach: &[Vec<usize>; 2], owned_hashes: &[u64], di: usize, module_path: &[Sym], path: &std::path::Path, interner: &Interner) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = crate::intern::FxHasher::default();
     h.write_u64(env_hash);
+    let globs = menv.glob_seeds.get(di).map(Vec::as_slice).unwrap_or(&[]);
+    for (list, reached) in [&menv.seeds[..], globs].into_iter().zip(reach) {
+        reached.iter().for_each(|&i| seed_hash(&mut h, &list[i]));
+        h.write_u64(u64::MAX);
+    }
+    crate::expand::parser_name_facts(globs, interner).hash(&mut h);
     for &i in menv.inherited.get(di).map(Vec::as_slice).unwrap_or(&[]) {
         h.write_u64(owned_hashes[i]);
     }
@@ -1305,13 +1317,36 @@ fn expansion_input_hash(env_hash: u64, menv: &MacroEnv, owned_hashes: &[u64], di
         srcs.iter().for_each(|&i| h.write_u64(owned_hashes[i]));
         ext.hash(&mut h);
     }
-    h.write_u64(u64::MAX);
-    for s in menv.glob_seeds.get(di).map(Vec::as_slice).unwrap_or(&[]) {
-        seed_hash(&mut h, s);
-    }
     module_path.iter().for_each(|p| h.write_u64(p.0 as u64));
     path.hash(&mut h);
     h.finish()
+}
+
+/// The expansion cache's oracle (`LUST_CHECK_EXPKEY=1`): a hit's stream and
+/// outside reads must equal a fresh expansion of the same file, contexts
+/// compared by what they stand for (`diag::ctxt_hash`). A difference means
+/// the key (`expansion_input_hash`) misses an input the expansion reads: it
+/// panics.
+fn check_expansion_hit(hit: &lexer::Lexed, deps: &[crate::expand::Dep], fresh: &Result<(lexer::Lexed, Vec<crate::expand::Dep>), Diag>, path: &std::path::Path) {
+    let what = match fresh {
+        Err(d) => Some(format!("the fresh expansion fails: {}", d.message)),
+        Ok((f, _)) if f.strings != hit.strings => Some("the string tables differ".to_string()),
+        Ok((f, _)) if f.tokens.len() != hit.tokens.len() => Some(format!("{} tokens, the hit has {}", f.tokens.len(), hit.tokens.len())),
+        Ok((f, fresh_deps)) => {
+            let mut memo = FxMap::default();
+            let mut ctxt = |c| crate::diag::ctxt_hash(c, &mut memo);
+            match f.tokens.iter().zip(&hit.tokens).position(|(a, b)| {
+                a.tok != b.tok || (a.span.file, a.span.lo, a.span.hi) != (b.span.file, b.span.lo, b.span.hi) || ctxt(a.span.ctxt) != ctxt(b.span.ctxt)
+            }) {
+                Some(i) => Some(format!("token {i} is {:?}, the hit's {:?}", f.tokens[i], hit.tokens[i])),
+                None if fresh_deps[..] != *deps => Some("the outside reads differ".to_string()),
+                None => None,
+            }
+        }
+    };
+    if let Some(what) = what {
+        panic!("expkey-check: {}: {what}", path.display());
+    }
 }
 
 /// Runs `f` for each item on all cores, results in input order, on the
@@ -3245,6 +3280,18 @@ impl MacroEnv {
         self.own.iter().zip(&self.own_exported).filter(|(_, e)| **e).map(|(s, _)| s.clone()).collect()
     }
 
+    /// The seeds of `seeds` and of its glob seeds that disc `di`'s expansion can reach
+    /// (`expand::reach_seeds`; `index` is `seeds`'), from what it reads: its own tokens and
+    /// the macro sources `splice` puts in them (`src_idents`: each source's identifiers, once
+    /// for all files).
+    fn reach(&self, di: usize, disc: &FileDisc, index: &crate::expand::SeedReach, src_idents: &[Option<Vec<Sym>>], interner: &Interner) -> [Vec<usize>; 2] {
+        let Some(lexed) = &disc.lexed else { return Default::default() };
+        let after = self.after_mods.get(di).map(Vec::as_slice).unwrap_or(&[]);
+        let srcs = self.inherited.get(di).into_iter().flatten().chain(after.iter().flat_map(|(_, s, _)| s));
+        let extra = crate::expand::SeedReach::new(self.glob_seeds.get(di).map_or(&[][..], Vec::as_slice), interner);
+        crate::expand::reach_seeds([index, &extra], &lexed.tokens, srcs.map(|&i| src_idents[i].as_deref()), interner)
+    }
+
     /// Splices the textual macro definitions visible in one file into
     /// its original token stream: inherited definitions just after
     /// any inner attributes (they are visible to the whole file), and
@@ -3422,18 +3469,26 @@ fn resolve_one(
         // the `include!` family) comes back only while each of those reads
         // reads the same (`expand::deps_stale_in`).
         let keep = !cache.one_shot;
-        let env_hash = if keep { expansion_env_hash(&menv, job, input, client) } else { 0 };
-        let owned_hashes: Vec<u64> = if keep { menv.owned_all.iter().map(|o| hash_tokens(&o.tokens, &o.strings) ^ o.magic.0 as u64).collect() } else { Vec::new() };
-        let exp_keys: Vec<Option<(String, u64, u64)>> = discs
-            .iter()
-            .enumerate()
-            .map(|(di, d)| {
-                (keep && d.lexed.is_some()).then(|| {
-                    let key = job.file_key(&cache.canon(&d.path), d.module);
-                    (key, hash_str(&d.text), expansion_input_hash(env_hash, &menv, &owned_hashes, di, &module_paths[di], &d.path))
-                })
-            })
-            .collect();
+        let env_hash = if keep { expansion_env_hash(&menv, job, input, client, interner) } else { 0 };
+        // Each macro source's hash and the seeds it names, and each file's reachable seeds
+        // (`MacroEnv::reach`) and key, on the pool.
+        let seed_index = keep.then(|| crate::expand::SeedReach::new(&menv.seeds, interner));
+        let (owned_hashes, src_idents): (Vec<u64>, Vec<Option<Vec<Sym>>>) = match &seed_index {
+            Some(_) => par_map(&menv.owned_all, |o| (hash_tokens(&o.tokens, &o.strings) ^ o.magic.0 as u64, crate::expand::stream_idents(&o.tokens, interner)))
+                .into_iter()
+                .unzip(),
+            None => Default::default(),
+        };
+        let file_keys: Vec<Option<String>> = discs.iter().map(|d| (keep && d.lexed.is_some()).then(|| job.file_key(&cache.canon(&d.path), d.module))).collect();
+        let (reaches, exp_keys): (Vec<[Vec<usize>; 2]>, Vec<Option<(String, u64, u64)>>) = par_map(&indices, |&di| {
+            let (Some(x), Some(key)) = (&seed_index, &file_keys[di]) else { return Default::default() };
+            let d = &discs[di];
+            let reach = menv.reach(di, d, x, &src_idents, interner);
+            let input_hash = expansion_input_hash(env_hash, &menv, &reach, &owned_hashes, di, &module_paths[di], &d.path, interner);
+            (reach, Some((key.clone(), hash_str(&d.text), input_hash)))
+        })
+        .into_iter()
+        .unzip();
         // Each stored expansion unpacks on the pool (`PackedLexed`).
         let exp_hits: Vec<std::sync::Mutex<Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>>> = {
             let cache: &ResolveCache = cache;
@@ -3445,10 +3500,13 @@ fn resolve_one(
         };
         exp_known.clear();
         exp_known.extend(exp_hits.iter().map(|h| h.lock().unwrap().as_ref().map(|x| x.2)));
+        // The cache's oracle: every hit also expands fresh (`check_expansion_hit`).
+        let check = keep && std::env::var_os("LUST_CHECK_EXPKEY").is_some_and(|v| v == "1");
         let results = par_map(&indices, |&di| -> Result<(Option<std::sync::Arc<lexer::Lexed>>, Vec<crate::expand::Dep>), Diag> {
-            if let Some((l, deps, _)) = exp_hits[di].lock().unwrap().take() {
-                return Ok((Some(l), deps));
-            }
+            let hit = match exp_hits[di].lock().unwrap().take() {
+                Some((l, deps, _)) if !check => return Ok((Some(l), deps)),
+                hit => hit,
+            };
             let (orig, text, path) = match &discs[di].lexed {
                 Some(l) => (l.clone(), discs[di].text.clone(), discs[di].path.clone()),
                 None => return Ok((None, Vec::new())),
@@ -3473,7 +3531,23 @@ fn resolve_one(
             // The crate's seeds, then this file's glob seeds, borrowed: a copy
             // of every seed per file cost more than the expansion of most files.
             let extra = menv.glob_seeds.get(di).map_or(&[][..], Vec::as_slice);
-            crate::expand::expand_lexed_seeded_extra(spliced, &ects, &menv.seeds, extra).map(|(l, deps)| (Some(std::sync::Arc::new(l)), deps))
+            if check {
+                // The seeds the expander takes, from the stream it reads, are among the key's.
+                let lists = [&crate::expand::SeedReach::new(&menv.seeds, interner), &crate::expand::SeedReach::new(extra, interner)];
+                let read = crate::expand::reach_seeds(lists, &spliced.tokens, std::iter::empty(), interner);
+                let key = &reaches[di];
+                assert!(
+                    read.iter().zip(key).all(|(r, k)| r.iter().all(|i| k.binary_search(i).is_ok())),
+                    "expkey-check: {}: the expander reaches seeds {read:?}, the key {key:?}",
+                    path.display()
+                );
+            }
+            let fresh = crate::expand::expand_lexed_seeded_extra(spliced, &ects, &menv.seeds, extra);
+            if let Some((l, deps, _)) = hit {
+                check_expansion_hit(&l, &deps, &fresh, &path);
+                return Ok((Some(l), deps));
+            }
+            fresh.map(|(l, deps)| (Some(std::sync::Arc::new(l)), deps))
         });
         file_deps.resize_with(discs.len(), Vec::new);
         // The new expansions the cache keeps (those before the first error, as a store in
@@ -8945,6 +9019,72 @@ mod tests {
         // A deleted module file is an error, never a cached stream.
         std::fs::remove_file(dir.join("b.rs")).unwrap();
         assert!(resolve_crate_cached(&input(&dir), interner, known, &mut cache).is_err(), "missing file errors");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The expansion cache keys a file on the macro seeds it reaches
+    /// (`expand::reach_seeds`): an edit of one macro re-expands the files
+    /// that call it (directly, through another macro's body, or through a
+    /// glob import) and a file that `include!`s; the others, a file whose
+    /// glob brings the macro but never calls it too, take their streams
+    /// back. Every step resolves as a fresh cache does.
+    #[test]
+    fn expansions_key_on_the_seeds_a_file_reaches() {
+        let dir = std::env::temp_dir().join(format!("lust-worklist-expkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let macros = |one: u8, inner: u8, hidden: u8| {
+            format!(
+                "#[macro_export]\nmacro_rules! one {{ () => {{ {one} }} }}\n#[macro_export]\nmacro_rules! outer {{ () => {{ $crate::inner!() }} }}\n#[macro_export]\nmacro_rules! inner {{ () => {{ {inner} }} }}\nmacro_rules! hidden {{ () => {{ {hidden} }} }}\npub(crate) use hidden;\n"
+            )
+        };
+        let files = [
+            ("main.rs", "mod m;\nmod a;\nmod b;\nmod c;\nmod d;\nmod e;\nmod f;\nfn main() { println!(\"{}\", a::v() + b::v() + c::v() + d::v() + e::v() + f::v()); }"),
+            ("a.rs", "pub fn v() -> i64 { crate::one!() }"),
+            ("b.rs", "pub fn v() -> i64 { crate::outer!() }"),
+            ("c.rs", "pub fn v() -> i64 { 3 }"),
+            ("d.rs", "include!(\"d.in\");"),
+            ("d.in", "pub fn v() -> i64 { crate::one!() }"),
+            ("e.rs", "use crate::m::*;\npub fn v() -> i64 { 4 }"),
+            ("f.rs", "use crate::m::*;\npub fn v() -> i64 { hidden!() }"),
+        ];
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        std::fs::write(dir.join("m.rs"), macros(1, 2, 7)).unwrap();
+        let interner: &'static Interner = Box::leak(Box::new(Interner::default()));
+        let known: &'static Known = Box::leak(Box::new(Known::new(interner)));
+        let input = CrateInput {
+            root_path: dir.join("main.rs"),
+            root_text: std::fs::read_to_string(dir.join("main.rs")).unwrap(),
+            env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
+            crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:expkey", "bin", "expkey", false) },
+            crate_name: "expkey".into(),
+            cargo_env: Vec::new(),
+            deps: Vec::new(),
+            client: Default::default(),
+            std_splice_lo: None,
+            display_root: None,
+        };
+        // Resolves with `cache`, checks the answer against a fresh cache's, and gives the
+        // number of files expanded again.
+        let step = |cache: &mut ResolveCache| {
+            let before = cache.expansions();
+            let warm = resolve_crate_cached(&input, interner, known, cache).ok().expect("resolves");
+            let cold = resolve_crate_cached(&input, interner, known, &mut ResolveCache::new(false)).ok().expect("resolves cold");
+            assert_eq!(warm.body_hashes, cold.body_hashes);
+            cache.expansions() - before
+        };
+        let mut cache = ResolveCache::new(false);
+        let mut counts = vec![step(&mut cache), step(&mut cache)];
+        // `one` edited: m, a, d. `inner` edited: m, b (through `outer`), d. `hidden` edited:
+        // m, f (through its glob), d. Every macro moved: m, a, b, d, f.
+        for text in [macros(5, 2, 7), macros(5, 6, 7), macros(5, 6, 8), format!("\n{}", macros(5, 6, 8))] {
+            std::fs::write(dir.join("m.rs"), text).unwrap();
+            counts.push(step(&mut cache));
+        }
+        assert!(counts[0] >= 8, "cold: every file");
+        assert_eq!(counts[1..], [0, 3, 3, 3, 5], "files expanded: no edit, then each m.rs edit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

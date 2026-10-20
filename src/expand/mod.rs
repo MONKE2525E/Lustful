@@ -1115,10 +1115,20 @@ fn seed_name(seed: &MacroSeed, interner: &Interner) -> Option<Sym> {
 /// a macro named like a parser macro (a seed defines one), or a
 /// worklist glob seed for this file does.
 fn seeds_bind_parser_name(tokens: &[Token], seeds: &[MacroSeed], extra: &[MacroSeed], interner: &Interner) -> bool {
-    let parser = |s: &MacroSeed| seed_name(s, interner).is_none_or(|n| builtin::is_passthrough(interner.get(n)));
     let glob_use = || tokens.iter().enumerate().any(|(i, t)| t.tok == Tok::Star && in_use_tree(tokens, i));
-    let all = || seeds.iter().chain(extra);
-    all().any(|s| s.import_into.is_some() && (s.ambiguous || parser(s))) || (all().any(parser) && glob_use())
+    let (imported, named) = parser_name_facts(seeds, interner);
+    let (x_imported, x_named) = parser_name_facts(extra, interner);
+    imported || x_imported || ((named || x_named) && glob_use())
+}
+
+/// The facts of `seeds` that `seeds_bind_parser_name` reads: some seed a
+/// glob brings is ambiguous or named like a parser macro, and some seed
+/// is named like one. They are the only reads of seeds a file does not
+/// reach (`reach_seeds`), so the resolve's expansion cache keys every
+/// file on them.
+pub fn parser_name_facts(seeds: &[MacroSeed], interner: &Interner) -> (bool, bool) {
+    let parser = |s: &MacroSeed| seed_name(s, interner).is_none_or(|n| builtin::is_passthrough(interner.get(n)));
+    (seeds.iter().any(|s| s.import_into.is_some() && (s.ambiguous || parser(s))), seeds.iter().any(parser))
 }
 
 /// Per-file expander state. One `expand_lexed` run builds one of these.
@@ -1679,6 +1689,103 @@ pub fn expand_lexed_seeded_extra(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSe
     Ok((lazy::hoist_static_closures(lexed, ctx.interner), deps))
 }
 
+/// One list of macro seeds indexed by name, for `reach_seeds`.
+pub struct SeedReach {
+    /// Each seed under every `macro_rules ! NAME` in its tokens (`seed_macro` compiles the
+    /// first one outside attributes; more names only take a seed more often).
+    by_name: FxMap<Sym, Vec<usize>>,
+    /// Each seed's distinct identifiers (`stream_idents`).
+    names: Vec<Option<Vec<Sym>>>,
+    /// The seeds named like a std macro.
+    always: Vec<usize>,
+}
+
+impl SeedReach {
+    pub fn new(seeds: &[MacroSeed], interner: &Interner) -> SeedReach {
+        let macro_rules = interner.intern("macro_rules");
+        let mut by_name: FxMap<Sym, Vec<usize>> = FxMap::default();
+        let mut always = Vec::new();
+        for (i, seed) in seeds.iter().enumerate() {
+            for w in seed.tokens.windows(3) {
+                if let (Tok::Ident(m), Tok::Bang, Tok::Ident(n)) = (w[0].tok, w[1].tok, w[2].tok)
+                    && m == macro_rules
+                {
+                    let text = interner.get(n);
+                    if (builtin::is_std_macro_name(text) || builtin::is_prelude_macro(text)) && always.last() != Some(&i) {
+                        always.push(i);
+                    }
+                    by_name.entry(n).or_default().push(i);
+                }
+            }
+        }
+        SeedReach { by_name, names: seeds.iter().map(|s| stream_idents(&s.tokens, interner)).collect(), always }
+    }
+}
+
+/// The distinct identifiers of `toks`, for `reach_seeds`; None when one is `include`.
+pub fn stream_idents(toks: &[Token], interner: &Interner) -> Option<Vec<Sym>> {
+    let include = interner.intern("include");
+    let mut out: Vec<Sym> = Vec::new();
+    for t in toks {
+        if let Tok::Ident(s) = t.tok {
+            if s == include {
+                return None;
+            }
+            out.push(s);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
+/// The seeds of `lists` (the crate's seeds, then one file's glob seeds) that one file's
+/// expansion can reach from its tokens `own` and the macro sources spliced into it
+/// (`sources`, each one's `stream_idents`): per list, indices in seed order. A macro call
+/// resolves by the macro's name among the seeds, and a seed's body can call others (by name,
+/// or by `$crate::name`), so every seed named by an identifier of the file or of a seed
+/// already in, to a fixpoint. Two more rules: a builtin's expansion can call a std macro by
+/// name, so a seed of such a name is always in; and `include!` brings tokens no scan here
+/// sees, so a file that names `include` reaches every seed. A seed outside the set cannot
+/// change the file's expansion, so the expander seeds only these, and the resolve's
+/// expansion cache keys a file on them (a moved seed re-expands only the files that reach it).
+pub fn reach_seeds<'s>(lists: [&SeedReach; 2], own: &[Token], sources: impl IntoIterator<Item = Option<&'s [Sym]>>, interner: &Interner) -> [Vec<usize>; 2] {
+    let every = || lists.map(|l| (0..l.names.len()).collect());
+    let include = interner.intern("include");
+    let mut taken = lists.map(|l| vec![false; l.names.len()]);
+    let mut seen: FxMap<Sym, ()> = FxMap::default();
+    let mut todo: Vec<Sym> = Vec::new();
+    for t in own {
+        if let Tok::Ident(s) = t.tok {
+            if s == include {
+                return every();
+            }
+            if lists.iter().any(|l| l.by_name.contains_key(&s)) && seen.insert(s, ()).is_none() {
+                todo.push(s);
+            }
+        }
+    }
+    for names in sources {
+        let Some(names) = names else { return every() };
+        todo.extend(names.iter().copied().filter(|&s| seen.insert(s, ()).is_none()));
+    }
+    let mut take: Vec<(usize, usize)> = lists.iter().enumerate().flat_map(|(l, x)| x.always.iter().map(move |&i| (l, i))).collect();
+    loop {
+        while let Some((l, i)) = take.pop() {
+            if std::mem::replace(&mut taken[l][i], true) {
+                continue;
+            }
+            let Some(names) = &lists[l].names[i] else { return every() };
+            todo.extend(names.iter().copied().filter(|&s| seen.insert(s, ()).is_none()));
+        }
+        let Some(s) = todo.pop() else { break };
+        for (l, x) in lists.iter().enumerate() {
+            take.extend(x.by_name.get(&s).into_iter().flatten().map(|&i| (l, i)));
+        }
+    }
+    taken.map(|t| (0..t.len()).filter(|&i| t[i]).collect())
+}
+
 /// Macro expansion proper, for `expand_lexed_seeded_extra`.
 fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed], extra: &[MacroSeed]) -> Result<(Lexed, Vec<Dep>), Diag> {
     // rustc's lexer rejects any unbalanced or mismatched delimiter in
@@ -1697,8 +1804,15 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed], extra: &[Ma
     st.root_file = lexed.tokens.first().map(|t| t.span.file);
     st.own_file = Some(eof.span.file);
     (st.shadowed_crates, st.alloc_extern) = crate_name_facts(&lexed.tokens, ctx, ctx.module_path.is_empty());
-    for seed in seeds.iter().chain(extra) {
-        st.seed_macro(seed)?;
+    // Only the seeds this file can reach (`reach_seeds`): a seed adds its strings to the
+    // expander's table, so each one seeded would also be in the output.
+    let lists = [&SeedReach::new(seeds, ctx.interner), &SeedReach::new(extra, ctx.interner)];
+    let [mine, globs] = reach_seeds(lists, &lexed.tokens, std::iter::empty(), ctx.interner);
+    for i in mine {
+        st.seed_macro(&seeds[i])?;
+    }
+    for i in globs {
+        st.seed_macro(&extra[i])?;
     }
     let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
     // Only the crate root's `#![recursion_limit]` counts, as in rustc,
