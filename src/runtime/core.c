@@ -69,7 +69,7 @@ void *lust_alloc(uint64_t size, uint64_t align) LUST_BODY({
     p = align <= 16 ? malloc(size) : _aligned_malloc((size_t)size, (size_t)align);
 #else
     if (align <= 16) p = malloc(size);
-    else if (size % align == 0) p = aligned_alloc(align, size);
+    else if ((size & (align - 1)) == 0) p = aligned_alloc(align, size);
     else if (posix_memalign(&p, align, size) != 0) p = 0;
 #endif
     if (!p) lust_oom_size(size);
@@ -352,7 +352,7 @@ void lust_exit(int32_t code) LUST_BODY({ lust_tls_exit(); lust_print_flush(); ex
    The typed layer owns the shrink_to length assert; this core clamps
    the target at len, which is the same end state. */
 void lust_vec_grow_to(lust_Vec *v, uint64_t new_cap, uint64_t elem, uint64_t align) LUST_BODY({
-    if (new_cap > (uint64_t)9223372036854775807ull / elem) { lust_vec_capacity_overflow(); return; }
+    if (!lust_vec_fits(new_cap, elem)) { lust_vec_capacity_overflow(); return; }
     v->ptr = lust_realloc(v->ptr, v->cap * elem, align, new_cap * elem);
     v->cap = new_cap;
 })
@@ -386,7 +386,7 @@ lust_Vec lust_vec_with_capacity(uint64_t n, uint64_t elem, uint64_t align) LUST_
     lust_Vec v = {(void *)(uintptr_t)(align ? align : 1), 0, 0};
     if (!elem) { lust_vec_set_zst(&v, align); return v; }
     if (n) {
-        if (n > (uint64_t)9223372036854775807ull / elem) { lust_vec_capacity_overflow(); return v; }
+        if (!lust_vec_fits(n, elem)) { lust_vec_capacity_overflow(); return v; }
         v.ptr = lust_alloc(n * elem, align);
         v.cap = n;
     }
@@ -400,7 +400,7 @@ lust_Vec lust_vec_with_capacity_zeroed(uint64_t n, uint64_t elem, uint64_t align
     lust_Vec v = {(void *)(uintptr_t)(align ? align : 1), 0, 0};
     if (!elem) { lust_vec_set_zst(&v, align); return v; }
     if (n) {
-        if (n > (uint64_t)9223372036854775807ull / elem) { lust_vec_capacity_overflow(); return v; }
+        if (!lust_vec_fits(n, elem)) { lust_vec_capacity_overflow(); return v; }
         v.ptr = lust_alloc_zeroed(n * elem, align);
         v.cap = n;
     }

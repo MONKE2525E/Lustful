@@ -94,6 +94,20 @@ static inline __attribute__((always_inline)) void lust_copy_small(void *d, const
 }
 #endif
 
+/* RawVec's size rule: `n` elements of `elem` bytes (elem != 0) fit when n * elem is at most
+   isize::MAX. One multiply with an overflow test: `n <= isize::MAX / elem` divides, a 64-bit
+   div of 10 or more cycles at every Vec allocation. An elem the compiler knows (a call site's
+   sizeof) folds to one compare. tcc units keep the division. */
+#ifdef __TINYC__
+#define lust_vec_fits(n, elem) ((uint64_t)(n) <= 9223372036854775807ull / (uint64_t)(elem))
+#else
+static inline __attribute__((always_inline)) int lust_vec_fits(uint64_t n, uint64_t elem) {
+    uint64_t bytes;
+    if (__builtin_constant_p(elem)) return n <= 9223372036854775807ull / elem;
+    return !__builtin_mul_overflow(n, elem, &bytes) && bytes <= 9223372036854775807ull;
+}
+#endif
+
 
 #if defined(_WIN32) && defined(LUST_IMPL)
 /* The Win32 thread layer (rel-win): the runtime names pthread calls
