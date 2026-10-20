@@ -171,8 +171,9 @@ fn split_over(g: Vec<(String, usize)>, cap: u64, odds: u64, size: &impl Fn(usize
 }
 
 /// The table unit of release C: the fn tables stay declared (the runtime header names
-/// them) but hold nothing, and `lust_base_init` runs each unit's registration (only
-/// main's unit sets anything).
+/// them) but hold nothing, and `lust_base_init` runs the `registers` it gets: main's unit's
+/// only, the one registration that sets anything. A call to each unit's empty one touched
+/// a page of code per unit at every process start.
 pub fn table_unit(registers: &[String]) -> String {
     let mut c = cgen::unit_header();
     c.push_str("lust_fnptr lust_fns[1];\nlust_fnptr lust_tramps[1];\nint (*lust_main_entry_p)(void);\n");

@@ -5014,7 +5014,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         }
                     },
                     2 => (cgen::runtime_unit(), String::new()),
-                    3 => (super::release_c::table_unit(&rg.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
+                    3 => (super::release_c::table_unit(&rg.iter().filter(|(_, s)| s.contains(&(main_slot as usize))).map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
                     LOC_UNIT => {
                         let live: Vec<u32> = (0..caches.out.len()).filter(|&s| !caches.out[s].code.is_empty()).map(|s| s as u32).collect();
                         (cgen::names::loc_unit(&live, &files, &slot_lines), String::new())
