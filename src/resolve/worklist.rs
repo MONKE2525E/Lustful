@@ -772,6 +772,12 @@ impl ResolveCache {
         self.merged = Some((ast, generation));
     }
 
+    /// Every path an earlier resolve read (`canon`'s keys): the next build's
+    /// source prefetch (`prefetch::write_list`).
+    pub fn source_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.canon.keys().map(PathBuf::as_path)
+    }
+
     /// Lets go of the merged Ast `set_merged` gave.
     pub fn clear_merged(&mut self) {
         self.merged = None;
@@ -1867,7 +1873,13 @@ pub fn resolve_crate_with(
     // out, and a new one is the walk's own read, as before.
     {
         let seen: Vec<(&PathBuf, &String)> = cache.canon.iter().collect();
-        for ((_, canon), text) in seen.iter().zip(par_map(&seen, |(path, _)| std::fs::read_to_string(path).ok())) {
+        // A front image build read most of them beside its load (`prefetch`).
+        let pre = std::sync::Mutex::new(crate::resolve::prefetch::take().unwrap_or_default());
+        let read = |path: &PathBuf| {
+            let hit = pre.lock().unwrap().remove(path);
+            hit.or_else(|| std::fs::read_to_string(path).ok())
+        };
+        for ((_, canon), text) in seen.iter().zip(par_map(&seen, |(path, _)| read(path))) {
             if let Some(text) = text {
                 shared.text_by_path.insert((*canon).clone(), text);
             }

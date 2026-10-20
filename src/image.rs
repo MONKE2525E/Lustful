@@ -416,6 +416,12 @@ pub fn arena_on() -> bool {
 /// `personality`, exec failed, the window is used up): the caller then
 /// builds without an image.
 pub fn reexec(dir: &Path) -> String {
+    // Once per process: a build that waits for its sources tries first (main.rs).
+    static WHY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WHY.get_or_init(|| reexec_now(dir)).clone()
+}
+
+fn reexec_now(dir: &Path) -> String {
     // The re-executed process itself, when its arena did not start: never
     // again (that would loop).
     if REEXECED.load(Ordering::Relaxed) {
@@ -1296,6 +1302,31 @@ fn window_taken(arena: usize) -> bool {
     })
 }
 
+/// A load started before the request was read (`preload`), for `image_run` to take.
+static PRELOAD: std::sync::Mutex<Option<std::thread::JoinHandle<Result<SendRoots, String>>>> = std::sync::Mutex::new(None);
+
+/// The roots a loading thread hands to the request thread.
+struct SendRoots(Box<Roots>);
+
+// SAFETY: the loading thread makes the roots and no longer touches them; the thread that
+// joins it is the only one that reads them, after the join.
+unsafe impl Send for SendRoots {}
+
+/// Starts `load` on a thread of its own, for a build that waits for its sources before it
+/// reads its request (`resolve::prefetch::READY_ENV`); `preloaded` takes the result.
+pub fn preload(dir: &Path) {
+    let dir = dir.to_path_buf();
+    if let Ok(run) = std::thread::Builder::new().name("lust-load".into()).spawn(move || load(&dir).map(SendRoots)) {
+        *PRELOAD.lock().unwrap() = Some(run);
+    }
+}
+
+/// The result of `preload`, once its load is done; None when none started.
+pub fn preloaded() -> Option<Result<Box<Roots>, String>> {
+    let run = PRELOAD.lock().unwrap().take()?;
+    Some(run.join().map_err(|_| "the image load panicked".to_string()).and_then(|r| r.map(|s| s.0)))
+}
+
 /// Maps the image's layers back and returns the top layer's roots, or why
 /// not. Call at the start of an image process: the regions lie below this
 /// process's arena (`reexec` placed it above them).
@@ -1958,6 +1989,10 @@ static COMPACT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// directory, no `flock`) the build still goes on.
 pub fn lock(dir: &Path) {
     use std::os::fd::IntoRawFd;
+    // Once per process: a second lock on another descriptor would wait for the first.
+    if LOCKED.load(Ordering::Relaxed) {
+        return;
+    }
     let _ = std::fs::create_dir_all(dir);
     let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(LOCK_FILE)) else { return };
     // Never closed: the lock lasts to exit. Close-on-exec, so compilers

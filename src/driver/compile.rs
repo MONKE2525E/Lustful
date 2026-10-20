@@ -4949,12 +4949,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             type B1Rec = (usize, Option<((u64, u64), Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
             // A unit's identity: its registration name, fns and main slot, the switches every
-            // unit reads, every LUST_* knob but paths, B1's own and the cc stream's (`cc::Stream`
-            // changes no unit's text), the copies profile's hot set (the copy choice reads it),
-            // and the compiler build.
+            // unit reads, every LUST_* knob but paths (the sources' ready file too), B1's own and
+            // the cc stream's (`cc::Stream` changes no unit's text), the copies profile's hot set
+            // (the copy choice reads it), and the compiler build.
             let b1_switches = b1_record.then(|| {
                 let mut vars: Vec<(String, String)> = std::env::vars()
-                    .filter(|(k, _)| k.starts_with("LUST_") && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP", "CC_STREAM"].iter().any(|x| k.contains(x)))
+                    .filter(|(k, _)| {
+                        k.starts_with("LUST_")
+                            && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP", "CC_STREAM", "SOURCES_READY"].iter().any(|x| k.contains(x))
+                    })
                     .collect();
                 vars.sort();
                 let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();

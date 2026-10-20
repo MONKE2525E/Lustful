@@ -9,6 +9,7 @@ pub mod macro_scope;
 pub mod mdr;
 pub mod modules;
 pub mod order;
+pub mod prefetch;
 pub mod probe;
 pub mod stdpaths;
 pub mod worklist;

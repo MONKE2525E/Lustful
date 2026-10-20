@@ -224,7 +224,11 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     if compact {
         image::wait_for_build();
     }
-    let loaded = if compact { Err("compacting the image".to_string()) } else { image::load(dir) };
+    // The crate's source files are read beside the load (`resolve::prefetch`).
+    if !compact {
+        resolve::prefetch::start(dir);
+    }
+    let loaded = if compact { Err("compacting the image".to_string()) } else { image::preloaded().unwrap_or_else(|| image::load(dir)) };
     let (mut sessions, loaded) = match loaded {
         Ok(roots) => {
             let image::Roots { mut sessions, tables, stamps, graphs } = *roots;
@@ -304,6 +308,10 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
         return resps;
     }
     sessions.iter_mut().for_each(|s| s.settle());
+    // A prefetch no resolve took ends here, so its texts stay out of the image; the list is
+    // the next build's.
+    drop(resolve::prefetch::take());
+    resolve::prefetch::write_list(dir, sessions.iter().flat_map(|s| s.front.resolve_cache.source_paths()));
     // The kept programs ride only when the next build may reuse them
     // (`Front::image_keeps_kept`).
     for s in sessions.iter_mut().filter(|s| !s.front.image_keeps_kept()) {
@@ -370,6 +378,23 @@ fn main() {
         Some("capabilities") => std::process::exit(capabilities::run(&args[1..])),
         Some("expand") => std::process::exit(expand::run_expand(&args[1..])),
         _ => {}
+    }
+    // A CI job may check its sources out while lust restores its front image
+    // (`LUST_SOURCES_READY`, resolve/prefetch.rs). The request reads the manifest, so an image
+    // build goes into its image process at once, starts the load there, and only then waits
+    // for the sources.
+    if std::env::var_os(resolve::prefetch::READY_ENV).is_some_and(|v| !v.is_empty()) {
+        if let Some(dir) = image::state_dir().filter(|_| !image::compact_mode()) {
+            if image::arena_on() {
+                image::lock(&dir);
+                resolve::prefetch::start(&dir);
+                image::preload(&dir);
+            } else {
+                // Returns only when it cannot; the request's own path says why.
+                let _ = image::reexec(&dir);
+            }
+        }
+        resolve::prefetch::wait_ready();
     }
     match protocol::parse_args(&args) {
         Some(Invocation::Daemon) => daemon::serve(&protocol::socket_path()),

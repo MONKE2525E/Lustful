@@ -154,6 +154,7 @@ fn env_key(vars: impl Iterator<Item = (String, String)>) -> String {
         "LUST_STATS",
         "LUST_VISITS_LOG",
         "LUST_TCC_HOME",
+        "LUST_SOURCES_READY",
     ];
     let mut set: Vec<(String, String)> = vars.filter(|(k, _)| k.starts_with("LUST_") && !STEERING.contains(&k.as_str())).collect();
     set.sort();
