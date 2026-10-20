@@ -343,13 +343,16 @@ struct Visits {
     /// Generic reuse for this request: `on`, else why it was off (a
     /// generic program then rechecks and regenerates every concrete body).
     generic: &'static str,
+    /// When collect started from the last program's type store (B1-PLAN.md):
+    /// the types this collect interned, and all the store holds.
+    pool: Option<(usize, usize)>,
 }
 
 impl Visits {
     fn render(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={} reads={} keyed={} generic={}",
+            "lust-visits: path={} why={} files={} nodes={} spans={} scanned={} slot_fns={} collect={} discovery={} checked={} kept={} prog_spans={} reads={} keyed={} generic={} pool={}",
             self.path,
             if self.why.is_empty() { "-".to_string() } else { self.why.replace(' ', "_") },
             self.files,
@@ -364,7 +367,8 @@ impl Visits {
             self.prog_spans,
             self.reads,
             self.keyed,
-            if self.generic.is_empty() { "-" } else { self.generic }
+            if self.generic.is_empty() { "-" } else { self.generic },
+            self.pool.map_or_else(|| "-".to_string(), |(m, t)| format!("{m}/{t}"))
         );
     }
 }
@@ -2669,7 +2673,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // The chunk path edits the Ast in place and never reuses a kept
     // program (only the body patch does).
     if !use_resolver {
-        front.kept = Default::default();
+        super::patch::drop_kept(front, caches);
     }
     t.lap("route");
     let mut visits = Visits { path: "chunks", files: 1, ..Default::default() };
@@ -3408,7 +3412,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Unchanged values do not write: a kept program may share the Ast.
     // A write is no body edit, so it drops the kept programs.
     if front.ast.shipped != std_ranges || front.ast.lang_methods != std_methods {
-        front.kept = Default::default();
+        super::patch::drop_kept(front, caches);
         let ast = Arc::make_mut(&mut front.ast);
         ast.shipped = std_ranges.clone();
         ast.lang_methods = std_methods;
@@ -3552,6 +3556,8 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // gives collect's answer (`Front::delta_errs`; the oracle compares it).
     let delta_errs = front.delta_errs.take();
     let delta_answered = delta_errs.is_some();
+    // A collect from a kept type store (B1-PLAN.md) runs under its oracle.
+    let pooled = kept.is_none() && delta_errs.is_none() && caches.gen_reuse.type_pool.is_some();
     let collected = match kept {
         Some(r) => r,
         None if delta_errs.is_some() => Err(delta_errs.unwrap_or_default()),
@@ -3569,6 +3575,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             c => c,
         },
     };
+    if pooled && super::item_oracle::pool_on() {
+        super::item_oracle::check_pool(front, crate_ids, req.cmd == Cmd::Build, resolved_tables.clone(), &std_routes, &collected);
+    }
     if let Ok(p) = &collected {
         front.prev_static_defs = Some(p.static_defs.clone());
     }
@@ -3827,6 +3836,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         visits.collect = front.ast.items.len() + front.ast.stmt_items.len() + program.fns.len();
     }
     visits.discovery = caches.gen_reuse.discovery_checked + caches.gen_reuse.discovery_reused;
+    visits.pool = program.tys.pool_counts();
     // A full-mode edit or a const fn edit can move what derived glue
     // was generated from. Record that now, for whatever build comes
     // next: this request may be check-only, and the build request

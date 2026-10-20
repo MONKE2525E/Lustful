@@ -464,6 +464,64 @@ fn pattern_read(p: &Program, front: &Front, i: usize, b: &crate::driver::graph::
     front.chunks.first().and_then(|c| c.scan.body_idents.get(i)).is_some_and(|ids| !ids.contains(&flat))
 }
 
+/// True when `LUST_CHECK_B1` is set (and not `0`): `check_pool` runs.
+pub(crate) fn pool_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LUST_CHECK_B1").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// The type pool oracle (`LUST_CHECK_B1=1`, B1-PLAN.md): a collect that
+/// started from the last program's type store (`ty::TypePool`) must give
+/// what a collect from a fresh store gives, with fresh reuse caches: the
+/// same errors, or the same program digest over every fn row (instances and
+/// closures too), Adt, trait, const and static, impl sets, hidden types and
+/// Adt instances. The digest reads structure (fingerprints, deep type
+/// hashes), never type ids, so the two stores compare. The fresh collect
+/// starts from a copy of the session's def order, as `check` does.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn check_pool(
+    front: &Front,
+    crate_ids: crate::def::CrateIds,
+    build: bool,
+    tables: Option<Arc<ResolvedTables>>,
+    std_routes: &[&'static crate::ty::lang::StdFnDef],
+    pooled: &Result<Program, Vec<Diag>>,
+) {
+    let o = &front.def_order;
+    let mut order = crate::check::collect::DefOrder { adts: o.adts.clone(), statics: o.statics.clone(), instances: o.instances.clone() };
+    let mut reuse = crate::driver::gen_reuse::GenReuse::default();
+    let fresh = crate::check::collect::collect_reuse(
+        front.ast.clone(),
+        front.interner.clone(),
+        front.known.clone(),
+        crate_ids,
+        build,
+        &mut order,
+        tables,
+        &mut reuse,
+        std_routes,
+    );
+    let _ = super::laps::take();
+    match (pooled, &fresh) {
+        (Err(w), Err(c)) => {
+            let (wk, ck) = (err_keys(w), err_keys(c));
+            if wk != ck {
+                fail("type pool collect errors differ from a fresh store", "pool", &format!("pool {:?}, fresh {:?}", wk.first(), ck.first()));
+            }
+        }
+        (Ok(_), Err(c)) => fail("type pool collect accepts, a fresh store rejects", "pool", &format!("{} {}", c[0].code, c[0].message)),
+        (Err(w), Ok(_)) => fail("type pool collect rejects, a fresh store accepts", "pool", &format!("{} {}", w[0].code, w[0].message)),
+        (Ok(p), Ok(f)) => {
+            let (dp, df) = (Digest::of(p, p.fns.len()), Digest::of(f, f.fns.len()));
+            let diff = dp.diff(&df);
+            if !diff.is_empty() || p.fns.len() != f.fns.len() {
+                fail("type pool program differs from a fresh store", "pool", &format!("fns {} vs {}; {}", p.fns.len(), f.fns.len(), diff.join("; ")));
+            }
+        }
+    }
+    log("itempatch oracle: ok pool");
+}
+
 /// Drops this request's facts unchecked (`driver::compile_background`).
 pub(crate) fn forget(session: &mut Session) {
     let mut st = session.front.oracle.lock().unwrap_or_else(|e| e.into_inner());

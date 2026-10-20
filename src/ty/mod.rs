@@ -40,6 +40,7 @@ pub struct AdtId(pub u32);
 /// Implemented by every interned id so one arena implementation serves all of them.
 trait Idx: Copy + Eq + Hash {
     fn from_u32(v: u32) -> Self;
+    fn to_u32(self) -> u32;
 }
 
 macro_rules! interned_id {
@@ -51,11 +52,17 @@ macro_rules! interned_id {
             fn from_u32(v: u32) -> Self {
                 $name(v)
             }
+            fn to_u32(self) -> u32 {
+                self.0
+            }
         }
     };
 }
 
 impl Idx for Ty {
+    fn to_u32(self) -> u32 {
+        self.0
+    }
     fn from_u32(v: u32) -> Self {
         Ty(v)
     }
@@ -1299,6 +1306,15 @@ fn compute_flags(s: &impl TyIntern, k: TyKind) -> TyFlags {
 
 /// One interned arena. The same value always gets the same id; ids start at `base`
 /// so a body overlay can continue the global arena's numbering (as `Ty` does today).
+///
+/// Membership is per collect (B1-PLAN.md): a global arena can outlive one collect (its
+/// entries are immutable structure), and `seen` holds, per entry, the collect epoch that
+/// last interned it. A lookup (`get_id`, `get_slice`) answers only for entries this epoch
+/// interned, and the first intern of an older entry in this epoch counts as a new entry
+/// (a window logs it as a write), so every membership answer is the one a fresh store
+/// gives; ids stay as they were. The first `pre` entries (`GlobalTys::new`'s constants,
+/// used without an intern call) are seen in every epoch. A body overlay's arenas start at
+/// epoch 0 and are always seen.
 #[derive(Clone)]
 struct Arena<T, I> {
     items: Vec<T>,
@@ -1306,11 +1322,16 @@ struct Arena<T, I> {
     /// The global store's arenas log misses and new entries for window
     /// checks (check/spec.rs); a body overlay's log nothing (`tab::NONE`).
     tab: u8,
+    seen: Vec<u32>,
+    epoch: u32,
+    pre: u32,
+    /// The id of `items[0]` (an overlay's arenas continue the global numbering).
+    base: u32,
 }
 
 impl<T, I> Default for Arena<T, I> {
     fn default() -> Arena<T, I> {
-        Arena { items: Vec::new(), map: FxMap::default(), tab: spec::tab::NONE }
+        Arena { items: Vec::new(), map: FxMap::default(), tab: spec::tab::NONE, seen: Vec::new(), epoch: 0, pre: 0, base: 0 }
     }
 }
 
@@ -1318,30 +1339,55 @@ impl<T: Clone + Eq + Hash, I: Idx> Arena<T, I> {
     fn len(&self) -> u32 {
         self.items.len() as u32
     }
+    /// True when this epoch interned the entry with id `id`.
+    fn seen_now(&self, id: u32) -> bool {
+        let i = id - self.base;
+        i < self.pre || self.seen.get(i as usize) == Some(&self.epoch)
+    }
+    /// Starts a collect epoch: no entry but the first `pre` is a member until interned.
+    fn next_epoch(&mut self) {
+        self.epoch += 1;
+    }
     fn get_id(&self, v: &T) -> Option<I> {
-        let id = self.map.get(v).copied();
+        let id = self.map.get(v).copied().filter(|id| self.seen_now(id.to_u32()));
         if id.is_none() && self.tab != spec::tab::NONE {
             spec::read(self.tab, v);
         }
         id
     }
+    /// Marks the entry with id `id` interned in this epoch; true when it was not yet.
+    fn see(&mut self, id: u32) -> bool {
+        let i = id - self.base;
+        match self.seen.get_mut(i as usize) {
+            Some(e) if *e != self.epoch && i >= self.pre => {
+                *e = self.epoch;
+                true
+            }
+            _ => false,
+        }
+    }
     fn intern(&mut self, v: T, base: u32) -> I {
         if let Some(&id) = self.map.get(&v) {
+            if self.see(id.to_u32()) && self.tab != spec::tab::NONE {
+                spec::wrote(self.tab, &v);
+            }
             return id;
         }
         if self.tab != spec::tab::NONE {
             spec::wrote(self.tab, &v);
         }
+        self.base = base;
         let id = I::from_u32(base + self.items.len() as u32);
         self.map.insert(v.clone(), id);
         self.items.push(v);
+        self.seen.push(self.epoch);
         id
     }
 }
 
 impl<X: Clone + Eq + Hash, I: Idx> Arena<Box<[X]>, I> {
     fn get_slice(&self, s: &[X]) -> Option<I> {
-        let id = self.map.get(s).copied();
+        let id = self.map.get(s).copied().filter(|id| self.seen_now(id.to_u32()));
         if id.is_none() && self.tab != spec::tab::NONE {
             spec::read(self.tab, s);
         }
@@ -1349,16 +1395,54 @@ impl<X: Clone + Eq + Hash, I: Idx> Arena<Box<[X]>, I> {
     }
     fn intern_slice(&mut self, s: &[X], base: u32) -> I {
         if let Some(&id) = self.map.get(s) {
+            if self.see(id.to_u32()) && self.tab != spec::tab::NONE {
+                spec::wrote(self.tab, s);
+            }
             return id;
         }
         if self.tab != spec::tab::NONE {
             spec::wrote(self.tab, s);
         }
         let boxed: Box<[X]> = s.into();
+        self.base = base;
         let id = I::from_u32(base + self.items.len() as u32);
         self.map.insert(boxed.clone(), id);
         self.items.push(boxed);
+        self.seen.push(self.epoch);
         id
+    }
+}
+
+/// The type store a session keeps from its last collect for the next one (B1-PLAN.md):
+/// the interned structure only (`GlobalTys::begin_collect` drops every registration and
+/// makes membership per collect). It serves a collect of the same crate identity and the
+/// same string interner (a fn item type of a primitive keeps a `Sym` inside its
+/// `ConstKind::Int`). It is not kept when the store holds more than twice the types its last
+/// collect interned, so it stays within twice a fresh store. `LUST_TYPE_POOL=0` keeps none.
+pub struct TypePool {
+    tys: GlobalTys,
+    krate: crate::def::CrateId,
+    stable: crate::def::StableCrateHash,
+    interner: usize,
+}
+
+impl TypePool {
+    /// The pool of a program's store, when it may serve again.
+    pub fn of(tys: GlobalTys, krate: crate::def::CrateId, stable: crate::def::StableCrateHash, interner: &std::sync::Arc<crate::intern::Interner>) -> Option<TypePool> {
+        if std::env::var_os("LUST_TYPE_POOL").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (members, total) = tys.member_counts();
+        (total <= 2 * members.max(1)).then(|| TypePool { tys, krate, stable, interner: std::sync::Arc::as_ptr(interner) as usize })
+    }
+    /// The store for a new collect of crate `krate`/`stable` with `interner`, or None.
+    pub fn take(self, krate: crate::def::CrateId, stable: crate::def::StableCrateHash, interner: &std::sync::Arc<crate::intern::Interner>) -> Option<GlobalTys> {
+        let same = self.krate == krate && self.stable == stable && self.interner == std::sync::Arc::as_ptr(interner) as usize;
+        same.then(|| {
+            let mut tys = self.tys;
+            tys.begin_collect();
+            tys
+        })
     }
 }
 
@@ -1474,7 +1558,71 @@ impl GlobalTys {
         }
         let chars = g.intern(TyKind::Adt(builtins.chars, EMPTY_ARGS));
         debug_assert_eq!(chars, CHARS);
+        // The constants above are used without an intern call: members in every epoch.
+        g.kinds.pre = g.kinds.len();
+        g.args_a.pre = g.args_a.len();
+        g.tys_a.pre = g.tys_a.len();
+        g.consts.pre = g.consts.len();
+        g.sigs.pre = g.sigs.len();
+        g.bounds.pre = g.bounds.len();
+        g.bindings_a.pre = g.bindings_a.len();
         g
+    }
+    /// Starts a new collect on this store (B1-PLAN.md): the interned structure stays, ids
+    /// included, but no entry is a member until this collect interns it (`Arena`), and
+    /// every live registration (the Adt rows' tables, instances, C keys, unsized fields,
+    /// the one-argument Adt cache) starts empty, as in a fresh store.
+    pub fn begin_collect(&mut self) {
+        self.kinds.next_epoch();
+        self.args_a.next_epoch();
+        self.tys_a.next_epoch();
+        self.consts.next_epoch();
+        self.sigs.next_epoch();
+        self.bounds.next_epoch();
+        self.bindings_a.next_epoch();
+        let GlobalTys {
+            kinds: _,
+            flags: _,
+            args_a: _,
+            tys_a: _,
+            consts: _,
+            sigs: _,
+            bounds: _,
+            bindings_a: _,
+            builtins: _,
+            adt1,
+            adt_locals,
+            adt_defs,
+            adt_instances,
+            adt_c_keys,
+            adt_c_canon,
+            adt_full_tys,
+            unsized_adts,
+            unsized_insts,
+        } = self;
+        *adt1 = Default::default();
+        *adt_locals = Default::default();
+        *adt_defs = Vec::new();
+        *adt_instances = Default::default();
+        *adt_c_keys = Default::default();
+        *adt_c_canon = Default::default();
+        *adt_full_tys = Vec::new();
+        *unsized_adts = Default::default();
+        *unsized_insts = Default::default();
+    }
+    /// True when this collect interned type `t` (always, without `begin_collect`).
+    pub fn is_member(&self, t: Ty) -> bool {
+        self.kinds.seen_now(t.0)
+    }
+    /// When this collect started from a kept store (`TypePool`): `member_counts`.
+    pub fn pool_counts(&self) -> Option<(usize, usize)> {
+        (self.kinds.epoch > 0).then(|| self.member_counts())
+    }
+    /// The types this collect interned, and all the store holds.
+    pub fn member_counts(&self) -> (usize, usize) {
+        let k = &self.kinds;
+        let members = k.seen.iter().enumerate().filter(|&(i, &e)| (i as u32) < k.pre || e == k.epoch).count();
+        (members, k.items.len())
     }
     /// Records the def of one user Adt, so `Adt(def, ..)` types can reach the local
     /// `AdtDef` compat data. Collection calls this once per struct and enum, in order.
@@ -1600,10 +1748,13 @@ impl TyIntern for GlobalTys {
         if let Some(t) = self.kinds.get_id(&k) {
             return t;
         }
+        // An entry an earlier collect interned (not a member yet, `Arena`) keeps its id
+        // and flags; only a new entry gets flags.
         let f = compute_flags(&*self, k);
         let t = self.kinds.intern(k, 0);
-        debug_assert_eq!(self.flags.len(), t.0 as usize);
-        self.flags.push(f);
+        if t.0 as usize == self.flags.len() {
+            self.flags.push(f);
+        }
         t
     }
     fn kind(&self, t: Ty) -> TyKind {
@@ -1885,7 +2036,7 @@ impl TyIntern for Tys<'_> {
         self.global.unsized_inst_field(def, args)
     }
     fn is_global_ty(&self, t: Ty) -> bool {
-        t.0 < self.global.kinds.len()
+        t.0 < self.global.kinds.len() && self.global.is_member(t)
     }
     fn def_of_local_adt(&self, local: AdtId) -> Option<DefId> {
         self.global.def_of_local_adt(local)

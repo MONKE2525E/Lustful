@@ -3450,7 +3450,7 @@ pub fn collect_reuse(
         ast: ast.clone(),
         interner: interner.clone(),
         known: known.clone(),
-        tys: GlobalTys::new(),
+        tys: reuse.type_pool.take().and_then(|pool| pool.take(crate_ids.local, crate_ids.stable, &interner)).unwrap_or_else(GlobalTys::new),
         defs: Defs::new(),
         adts: Vec::new(),
         fns: Vec::new(),

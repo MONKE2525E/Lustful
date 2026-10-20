@@ -27,6 +27,7 @@ mod release_c;
 pub use crate::protocol::{Cmd, Request, Response, SessionKey};
 pub use compile::{Stamps, defer_cc, drop_parked_cc, finish_parked_cc, parked_cc_result, release_bases, sweep_bases};
 pub(crate) use item_oracle::failure as oracle_failure;
+pub(crate) use patch::drop_kept;
 
 /// Compiles one request in `session` (`compile::compile`). Under the
 /// patch oracle (`item_oracle.rs`) a daemon check request then compares

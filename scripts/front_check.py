@@ -488,6 +488,117 @@ fn main() {{
 '''
 
 
+def b1_case(case, v):
+    """Sol's review cases for a type store kept across collects (B1-PLAN.md), version `v`:
+    each edit keeps old interned types around while their meaning changes, so a build from
+    the kept store must still equal a fresh one-shot. A helper fn's body moves in every
+    version too, so each step is a full collect, not a body patch."""
+    tail = f"\nfn helper() -> u32 {{\n    {40 + v}\n}}\n"
+    if case == "rename":
+        name = ["Old", "New", "Old"][v]
+        return f"""struct {name} {{
+    n: u32,
+}}
+
+fn first(v: &[{name}]) -> Option<&{name}> {{
+    v.first()
+}}
+
+fn main() {{
+    let v = vec![{name} {{ n: 7 }}];
+    println!("{{}} {{}}", first(&v).map(|x| x.n).unwrap_or(0), helper());
+}}
+""" + tail
+    if case == "params":
+        sig = ["fn pick<T, U>(x: T, _y: U) -> T", "fn pick<U, T>(x: T, _y: U) -> T", "fn pick<T, U>(x: T, _y: U) -> T"][v]
+        return f"""{sig} {{
+    x
+}}
+
+fn main() {{
+    println!("{{}} {{}}", pick(5u8, "s"), helper());
+}}
+""" + tail
+    if case == "lifetimes":
+        sig = ["fn longer<'a, 'b>(x: &'a str, _y: &'b str) -> &'a str", "fn longer<'b, 'a>(x: &'a str, _y: &'b str) -> &'a str",
+               "fn longer<'a, 'b>(_x: &'a str, _y: &'b str) -> &'static str"][v]
+        body = ["x", "x", '"fixed"'][v]
+        return f"""{sig} {{
+    {body}
+}}
+
+fn main() {{
+    let a = String::from("abc");
+    println!("{{}} {{}}", longer(&a, "z"), helper());
+}}
+""" + tail
+    if case == "closure":
+        ret = ["1u8", "1u16", "1u8"][v]
+        return f"""fn run() -> u64 {{
+    let f = || {ret};
+    f() as u64 + 2
+}}
+
+fn main() {{
+    println!("{{}} {{}}", run(), helper());
+}}
+""" + tail
+    if case == "hidden":
+        ty = ["u8", "u16", "u8"][v]
+        return f"""fn make() -> {ty} {{
+    200
+}}
+
+fn hidden() -> impl std::fmt::Debug {{
+    make()
+}}
+
+fn main() {{
+    println!("{{:?}} {{}} {{}}", hidden(), std::mem::size_of_val(&hidden()), helper());
+}}
+""" + tail
+    if case == "array":
+        n = [3, 5, 3][v]
+        return f"""const N: usize = {n};
+
+fn total(a: [u8; N]) -> usize {{
+    a.len() + a[0] as usize
+}}
+
+fn main() {{
+    println!("{{}} {{}}", total([1; N]), helper());
+}}
+""" + tail
+    if case == "layout":
+        ty = ["u8", "u64", "u8"][v]
+        return f"""struct S {{
+    x: {ty},
+    y: u32,
+}}
+
+fn read(s: &S) -> u64 {{
+    s.x as u64 + s.y as u64
+}}
+
+fn main() {{
+    let s = S {{ x: 3, y: 4 }};
+    println!("{{}} {{}} {{}}", read(&s), std::mem::size_of::<S>(), helper());
+}}
+""" + tail
+    if case == "instance":
+        use = ["let g = G { t: 1u8 }; println!(\"{} {}\", g.t, helper());", "println!(\"{}\", helper());",
+               "let g = G { t: 2u8 }; println!(\"{} {}\", g.t, helper());"][v]
+        return f"""struct G<T> {{
+    t: T,
+}}
+
+fn main() {{
+    {use}
+}}
+""" + tail
+    raise ValueError(case)
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -631,6 +742,9 @@ def corpus():
     dv = [open(os.path.join(disc, f"v{k}.rs")).read() for k in (1, 2, 3)]
     seqs.append(("const-fn-discovery", dv))
     seqs.append(("const-fn-discovery-jump", dv, {"steps": [0, 2]}))
+    # Sol's review cases for a kept type store (B1-PLAN.md), each through three versions.
+    for case in ("rename", "params", "lifetimes", "closure", "hidden", "array", "layout", "instance"):
+        seqs.append((f"b1-{case}", [b1_case(case, v) for v in range(3)]))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))
@@ -708,7 +822,7 @@ def first_diff(a, b):
     return f"line {n + 1}: image {x[n][:200] if n < len(x) else ''!r} vs one-shot {y[n][:200] if n < len(y) else ''!r}"
 
 
-VISIT = re.compile(r"\b(path|why|kept)=(\S+)")
+VISIT = re.compile(r"\b(path|why|kept|pool)=(\S+)")
 
 
 def last_path(log, seen):
@@ -723,7 +837,8 @@ def last_path(log, seen):
     if not lines:
         return "-", seen + len(new)
     v = dict(VISIT.findall(lines[-1]))
-    return f"{v.get('path', '-')}/{v.get('why', '-')}/{v.get('kept', '-')}", seen + len(new)
+    pool = "/pool" if v.get("pool", "-") != "-" else ""
+    return f"{v.get('path', '-')}/{v.get('why', '-')}/{v.get('kept', '-')}{pool}", seen + len(new)
 
 
 def check_seq(name, srcs, backend, args, work, opts):
@@ -778,6 +893,9 @@ def check_seq(name, srcs, backend, args, work, opts):
     # have the same text), or with `b1` skip the skipping itself (LUST_B1=1).
     img.update({"LUST_B1": "1"} if opts.get("b1") == "skip" else {"LUST_CHECK_UNIT_FP": "1"})
     img["LUST_CHECK_GENREUSE"] = "1"
+    # A collect that starts from a kept type store must equal one from a fresh store
+    # (LUST_CHECK_B1, B1-PLAN.md).
+    img["LUST_CHECK_B1"] = "1"
     one = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4")
     # --chains: a second image chain of the same history at 16 threads, with its own image and
     # caches (the determinism gate): its builds must equal the first chain's unit for unit (names

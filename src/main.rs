@@ -306,7 +306,8 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     // The kept programs ride only when the next build may reuse them
     // (`Front::image_keeps_kept`).
     for s in sessions.iter_mut().filter(|s| !s.front.image_keeps_kept()) {
-        s.front.kept = Default::default();
+        let s = &mut **s;
+        driver::drop_kept(&mut s.front, &mut s.caches);
     }
     let roots = Box::new(image::Roots {
         sessions,

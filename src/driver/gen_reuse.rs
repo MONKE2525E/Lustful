@@ -324,6 +324,9 @@ pub struct GenReuse {
     /// False: every lookup misses and nothing is stored (one-shot
     /// sessions, and `collect` callers outside the driver).
     pub on: bool,
+    /// The type store of the last program a full collect replaced, for the
+    /// next collect to start from (B1-PLAN.md, `ty::TypePool`).
+    pub(crate) type_pool: Option<crate::ty::TypePool>,
     /// True when the process exits after this compile (no daemon): no
     /// later request replays a read set, so collect's body checks
     /// (template checks, mono discovery) record no reads and compute no

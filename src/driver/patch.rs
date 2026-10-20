@@ -609,6 +609,24 @@ impl KeptProgram {
     }
 }
 
+/// Drops the kept programs. The type store of the build mode's (else the
+/// check mode's) seeds the next collect (`ty::TypePool`, B1-PLAN.md): every
+/// place that drops kept programs comes here, so a session whose programs
+/// do not ride to the next request (the chunk path, an image save that keeps
+/// none) still starts its next collect from the last store.
+pub(crate) fn drop_kept(front: &mut Front, caches: &mut Caches) {
+    let [check, build] = std::mem::take(&mut front.kept);
+    if let Some(k) = build.or(check) {
+        pool_from(caches, k.program);
+    }
+}
+
+/// `program`'s type store as the session's type pool (`ty::TypePool::of`).
+fn pool_from(caches: &mut Caches, program: crate::check::collect::Program) {
+    let interner = program.interner.clone();
+    caches.gen_reuse.type_pool = crate::ty::TypePool::of(program.tys, program.krate, program.stable_crate, &interner);
+}
+
 /// Keeps `program` for later requests, in its mode's slot.
 pub(crate) fn keep(front: &mut Front, mut program: crate::check::collect::Program) {
     let slot = usize::from(program.gx.walk_instances);
@@ -2483,7 +2501,12 @@ pub(super) fn reuse_kept(
     let mut edits = match k.edits {
         Some(e) => e,
         None if Arc::ptr_eq(&k.program.ast, &front.ast) => Vec::new(),
-        None => return Err("ast"),
+        None => {
+            // The full collect that replaces the program starts from its type store
+            // (B1-PLAN.md, `ty::TypePool`).
+            pool_from(caches, k.program);
+            return Err("ast");
+        }
     };
     // A build's instances and glue would keep the old derive lists.
     if walk_instances && edits.iter().any(|e| e.derive.is_some()) {
