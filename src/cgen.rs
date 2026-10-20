@@ -11405,8 +11405,9 @@ pub fn fn_unit_parts(
         collect_types(&cty(&p.tys, p.statics[i].ty), &mut types);
     }
     named.retain(|t| !types.contains(t));
-    // Inline glue reads through pointers as a glue shard does: its types are declared one
-    // step deep, as the shards do; the rest of the unit only by value.
+    // Inline glue declares its types as a glue shard declares the same glue
+    // (`names::glue_shard_texts`): one step deep only for glue that reads through pointers;
+    // the rest of the unit only by value.
     let decls = if names::release() { Decls::ByValue { blocks: !llvm && blocks_on() } } else { Decls::Full };
     named.retain(|t| !glue_types.contains(t));
     type_decls_with(p, &mut c, &types, &named, decls, &glue_types);

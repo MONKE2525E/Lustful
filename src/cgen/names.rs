@@ -233,7 +233,8 @@ fn shard_inline_glue<'g>(g: &'g GlueSet, keys: &[&'g (Glue, CTy)]) -> Vec<&'g (G
 /// only prototypes (`GlueSet::shared` holds every key). Shards are content-defined
 /// chunks of the keys in prototype order, cut by each key's prototype and definition size
 /// (`cut_after`), so new glue changes only the shard it lands in. Each shard declares the
-/// types (`Decls::OneStep`, with blocks), prototypes (its keys' and their callees') and
+/// types its definitions read (by value with blocks, one step deep only for glue that reads
+/// through pointers, as fn units declare their inline glue), prototypes (its keys' and their callees') and
 /// externs its definitions need, and holds inline definitions of the small glue its keys
 /// call from other shards (`shard_inline_glue`). Only the keys the fns in `out` reach (a dead slot's `FnOut`
 /// is empty), as a cold build has them: a session's set also keeps keys no fn reaches now
@@ -300,7 +301,11 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>], 
                 c.push_str(noreturn_decls());
                 record::piece(record::Kind::Fixed, 1, noreturn_decls());
             }
-            let mut types = HashSet::new();
+            // What each definition reads, as a fn unit's inline copy of it does (`fn_unit_parts`):
+            // glue that passes its fields on holds its types by value and only names the rest; a
+            // pointer's drop or clone holds the block it reads in place; other glue (Debug, hash)
+            // reads through pointers, one step deep. A dep's prototype takes its type by pointer.
+            let (mut types, mut named, mut deep) = (HashSet::new(), HashSet::new(), HashSet::new());
             let mut protos: BTreeSet<&str> = BTreeSet::new();
             let mut externs: BTreeSet<&str> = BTreeSet::new();
             let inl = shard_inline_glue(g, keys);
@@ -311,11 +316,18 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>], 
             };
             for k in keys.iter().chain(&inl) {
                 read(k);
-                g.def_types(k, &mut types);
+                if GlueSet::passes_fields(k) {
+                    g.held_types(k, &mut types, &mut named);
+                } else if let Some(block) = GlueSet::pointer_block(k) {
+                    types.insert(block);
+                    g.held_types(k, &mut types, &mut named);
+                } else {
+                    g.def_types(k, &mut deep);
+                }
                 protos.insert(&g.protos[*k]);
                 for d in g.deps.get(*k).into_iter().flatten() {
                     read(d);
-                    collect_types(&d.1, &mut types);
+                    collect_types(&d.1, &mut named);
                     protos.insert(&g.protos[d]);
                 }
                 externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
@@ -325,7 +337,8 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>], 
             for k in &inl {
                 protos.remove(g.protos[*k].as_str());
             }
-            type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep { blocks: super::blocks_on() }, &HashSet::new());
+            named.retain(|t| !types.contains(t) && !deep.contains(t));
+            type_decls_with(p, &mut c, &types, &named, Decls::ByValue { blocks: super::blocks_on() }, &deep);
             let m = c.len();
             externs.into_iter().for_each(|e| c.push_str(e));
             record::piece(record::Kind::Externs, 0, &c[m..]);
