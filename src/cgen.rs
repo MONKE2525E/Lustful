@@ -10612,6 +10612,27 @@ fn inline_limit(a: InlineAttr) -> usize {
     }
 }
 
+/// Release C with a copies profile: a fn the profile did not see hot keeps its cleanup fn out
+/// of line (`unwind::frame_inline`) from this frame cost on; a hot fn keeps it inlined up to
+/// `LUST_RELEASE_FRAME_INLINE`. An inlined cleanup is specialized at each unwinding call;
+/// in a cold fn with ~1,000 of them (decode_payload, a macro's match over every node kind)
+/// that took clang's register coalescer 9 of the unit's 11 s, for code that does not run.
+const COLD_FRAME_INLINE: usize = 40_000;
+
+/// `code` (a fn's C) with its cleanup fn out of line when its frame costs more than
+/// `COLD_FRAME_INLINE`: its flags (the frame struct's `uint8_t` members) plus one, times its
+/// unwind points (the ladder entries it stores before a call or statement that may unwind).
+fn cold_cleanup(code: &str, id: &str) -> String {
+    let inlined = format!("static inline __attribute__((always_inline)) void cl{id}(");
+    let Some(fr) = code.find(&format!("struct fr{id} {{\n")).filter(|_| code.contains(&inlined)) else { return code.to_string() };
+    let flags = code[fr..].lines().skip(1).take_while(|l| *l != "};").filter(|l| l.starts_with("  uint8_t ")).count();
+    let points = code.matches("L.st = ").count() - code.matches("L.st = 0;").count();
+    if (flags + 1) * points <= COLD_FRAME_INLINE {
+        return code.to_string();
+    }
+    code.replace(&inlined, &format!("static void cl{id}("))
+}
+
 /// Release C: the bytes of glue definitions a unit copies below the glue its own code calls
 /// (`fn_unit_parts`); `LUST_RELEASE_INLINE_GLUE_KB` sets it (0: one level, as before).
 fn inline_glue_budget() -> usize {
@@ -11074,6 +11095,7 @@ pub fn fn_unit_parts(
         // An LLVM fn's C is its C ABI wrapper and trampoline: kept only when a text names them.
         match (c_refs, f.ll.is_empty(), names::fn_tag_opt(s as u32)) {
             (Some(r), false, Some(id)) => c.push_str(&r.c_body(&f.code, &id)),
+            (_, _, Some(id)) if copy_hot.is_some_and(|h| !is_hot(h, &id)) => c.push_str(&cold_cleanup(&f.code, &id)),
             _ => c.push_str(&f.code),
         }
         record::piece(record::Kind::Body, s as u64, &c[m..]);
@@ -12947,6 +12969,27 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cold fn's cleanup goes out of line past `COLD_FRAME_INLINE` (flags plus one, times
+    /// the nonzero ladder stores), in its prototype and its definition; under it, as it was.
+    #[test]
+    fn cold_cleanup_moves_a_costly_frame_out_of_line() {
+        let id = "00000000000000aa";
+        let fn_with = |flags: usize, points: usize| {
+            let members: String = (0..flags).map(|k| format!("  uint8_t d{k};\n")).collect();
+            let stores: String = (1..=points).map(|k| format!("  L.st = {k};\n  f_00000000000000bb();\n")).collect();
+            format!(
+                "struct fr{id} {{\n  int32_t st;\n{members}}};\nstatic inline __attribute__((always_inline)) void cl{id}(struct fr{id} *Lc);\n/* f */\nvoid f_{id}(void) {{\n  L.st = 0;\n{stores}  L.st = 0;\n  return;\n}}\nstatic inline __attribute__((always_inline)) void cl{id}(struct fr{id} *Lc) {{\n}}\n"
+            )
+        };
+        let small = fn_with(3, 100);
+        assert_eq!(cold_cleanup(&small, id), small);
+        let big = fn_with(99, 401);
+        let out = cold_cleanup(&big, id);
+        assert_eq!(out.matches(&format!("static void cl{id}(")).count(), 2);
+        assert!(!out.contains("always_inline)) void cl"));
+        assert_eq!(out.replace(&format!("static void cl{id}("), &format!("static inline __attribute__((always_inline)) void cl{id}(")), big);
+    }
 
     /// A copy's code size counts the head and the blocks, not the declarations and kconst
     /// setup before `bb0:;`, nor a block that only jumps; a jump that ends a block counts.
