@@ -222,6 +222,10 @@ fn shard_inline_glue<'g>(g: &'g GlueSet, keys: &[&'g (Glue, CTy)]) -> Vec<&'g (G
         out.extend(next.iter().copied());
         level = next;
     }
+    // B1 (`record`): the pick read the entry of every key it looked at.
+    if record::on() {
+        seen.iter().for_each(|k| record::read(record::Read::Glue(k.0, k.1.clone())));
+    }
     out
 }
 
@@ -235,7 +239,7 @@ fn shard_inline_glue<'g>(g: &'g GlueSet, keys: &[&'g (Glue, CTy)]) -> Vec<&'g (G
 /// is empty), as a cold build has them: a session's set also keeps keys no fn reaches now
 /// (stale since a refresh, or left by a removed fn).
 pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Vec<String> {
-    glue_shard_texts(p, g, &glue_shard_keys(g, out, target))
+    glue_shard_texts(p, g, &glue_shard_keys(g, out, target), &[], false).into_iter().map(|(c, _)| c).collect()
 }
 
 /// The keys of each of `glue_shards`' shards, in order: the cut, cheap next to the texts
@@ -266,8 +270,14 @@ pub fn glue_shard_keys<'a>(g: &'a GlueSet, out: &'a [FnOut], target: usize) -> V
     shards
 }
 
-/// The texts of `glue_shards`' shards, from their keys (`glue_shard_keys`).
-pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>]) -> Vec<String> {
+/// A shard's B1 record (`record::close`): one hash of its pieces, and its reads.
+pub type ShardRecord = Option<((u64, u64), Vec<record::Read>)>;
+
+/// The texts of `glue_shards`' shards, from their keys (`glue_shard_keys`). A shard that `skip`
+/// marks is not made (its text is empty: B1 found it clean). With `rec`, each shard made comes
+/// with its record (B1, `record`): every byte of its text is a piece, and every glue entry and
+/// type it read a read, so the next build can tell it is the same without making it.
+pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>], skip: &[bool], rec: bool) -> Vec<(String, ShardRecord)> {
     // Each shard is its own unit: built in parallel (in order), each worker
     // under this thread's naming context, in one layout phase (the program is
     // frozen: a worker keeps its `c_layout` answers across its shards).
@@ -275,20 +285,36 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>]) 
     let tag = super::layout_phase();
     // One definition of each type for all of them (`DeclCache`).
     let decls = std::sync::Arc::new(super::DeclCache::default());
-    crate::pool::par_map(shards, |keys| {
-        super::in_layout_phase(tag, || with(names.as_ref(), || super::with_decl_cache(&decls, || {
+    crate::pool::par_map(&(0..shards.len()).collect::<Vec<_>>(), |&j| {
+        if skip.get(j).copied().unwrap_or(false) {
+            return (String::new(), None);
+        }
+        let keys = &shards[j];
+        if rec {
+            record::open();
+        }
+        let c = super::in_layout_phase(tag, || with(names.as_ref(), || super::with_decl_cache(&decls, || {
             let mut c = unit_header();
+            record::piece(record::Kind::Fixed, 0, &c);
             if p.unwind_tables {
                 c.push_str(noreturn_decls());
+                record::piece(record::Kind::Fixed, 1, noreturn_decls());
             }
             let mut types = HashSet::new();
             let mut protos: BTreeSet<&str> = BTreeSet::new();
             let mut externs: BTreeSet<&str> = BTreeSet::new();
             let inl = shard_inline_glue(g, keys);
+            let read = |k: &(Glue, CTy)| {
+                if record::on() {
+                    record::read(record::Read::Glue(k.0, k.1.clone()));
+                }
+            };
             for k in keys.iter().chain(&inl) {
+                read(k);
                 g.def_types(k, &mut types);
                 protos.insert(&g.protos[*k]);
                 for d in g.deps.get(*k).into_iter().flatten() {
+                    read(d);
                     collect_types(&d.1, &mut types);
                     protos.insert(&g.protos[d]);
                 }
@@ -300,21 +326,35 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>]) 
                 protos.remove(g.protos[*k].as_str());
             }
             type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep { blocks: super::blocks_on() }, &HashSet::new());
+            let m = c.len();
             externs.into_iter().for_each(|e| c.push_str(e));
-            protos.into_iter().for_each(|x| c.push_str(x));
+            record::piece(record::Kind::Externs, 0, &c[m..]);
+            for x in protos {
+                let m = c.len();
+                c.push_str(x);
+                record::piece(record::Kind::GlueProto, record::key(x), &c[m..]);
+            }
             for k in &inl {
+                let m = c.len();
                 c.push_str("inline ");
                 c.push_str(&g.protos[*k]);
+                record::piece(record::Kind::GlueProto, record::key(&g.protos[*k]), &c[m..]);
             }
             for k in &inl {
+                let m = c.len();
                 c.push_str("inline ");
                 c.push_str(&g.def_map[*k]);
+                record::piece(record::Kind::GlueDef, record::key(&g.protos[*k]), &c[m..]);
             }
             for k in keys {
+                let m = c.len();
                 c.push_str(&g.def_map[*k]);
+                record::piece(record::Kind::GlueDef, record::key(&g.protos[*k]), &c[m..]);
             }
             c
-        })))
+        })));
+        let r = if rec { record::close(&c) } else { None };
+        (c, r)
     })
 }
 

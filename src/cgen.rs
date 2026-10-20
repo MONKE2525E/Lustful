@@ -13789,7 +13789,9 @@ mod tests {
 
     /// Release C glue shards, one key each: the shard of a struct's drop glue holds the
     /// small glue it calls from other shards (an `Option<Rc<dyn Fn>>` field's drop) as an
-    /// inline definition, and every declaration of it there says `inline`.
+    /// inline definition, and every declaration of it there says `inline`. B1 records each
+    /// shard whole, with a read of every glue entry it holds or inlines, and does not make a
+    /// shard it found clean.
     #[test]
     fn glue_shard_inlines_small_glue_from_other_shards() {
         let src = "use std::rc::Rc;\ntrait Hook { fn run(&self) -> u32; }\nstruct One;\nimpl Hook for One { fn run(&self) -> u32 { 1 } }\n\
@@ -13828,6 +13830,19 @@ mod tests {
             assert!(shard.contains("inline void drop_O_Rcdyn_(O_O_Rcdyn_ *p) {"), "the field's drop is inline there:\n{shard}");
             assert!(shard.lines().all(|l| !l.starts_with("void drop_O_Rcdyn_(")), "no declaration of it without inline:\n{shard}");
             assert_eq!(shards.iter().filter(|s| s.lines().any(|l| l.starts_with("void drop_O_Rcdyn_(O_O_Rcdyn_ *p) {"))).count(), 1, "one external definition");
+            let keys = names::glue_shard_keys(&glue, &outs, 1);
+            let made = names::glue_shard_texts(&program, &glue, &keys, &[], true);
+            assert_eq!(made.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), shards, "a record does not change a shard");
+            let glue_read = |k: &(Glue, CTy)| record::Read::Glue(k.0, k.1.clone());
+            for ((_, rec), ks) in made.iter().zip(&keys) {
+                let (_, reads) = rec.as_ref().expect("every byte of a shard is a piece");
+                assert!(ks.iter().all(|k| reads.contains(&glue_read(k))), "a shard reads each key it holds");
+            }
+            let at = shards.iter().position(|s| s == shard).unwrap();
+            let field_drop = glue.protos.iter().find(|(_, p)| p.starts_with("void drop_O_Rcdyn_(")).map(|(k, _)| k).unwrap();
+            assert!(made[at].1.as_ref().is_some_and(|(_, reads)| reads.contains(&glue_read(field_drop))), "and each one it inlines");
+            let skipped = names::glue_shard_texts(&program, &glue, &keys, &vec![true; keys.len()], true);
+            assert!(skipped.iter().all(|(c, rec)| c.is_empty() && rec.is_none()), "a shard B1 found clean is not made");
         });
     }
 
