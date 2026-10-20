@@ -2318,7 +2318,11 @@ fn resolved_setup(
             std_splice_lo: std_ranges.first().map(|r| r.0),
             display_root: front.display_root.clone(),
         };
+        // The cache's final chunks are parts of the session's merged Ast: the resolve takes
+        // its hits out of it, and lets go of it before any patch writes it.
+        front.resolve_cache.set_merged(front.ast.clone(), front.ast_gen);
         let out = worklist::resolve_crate_with(&input, &front.interner, &front.known, &mut front.resolve_cache, plan.platform);
+        front.resolve_cache.clear_merged();
         if super::item_oracle::on() || super::resolve_oracle::on() {
             oracle_input = Some(super::item_oracle::ColdInput { input: input.clone(), platform: plan.platform });
         }
@@ -2350,7 +2354,7 @@ fn resolved_setup(
         }
     };
     let worklist::ResolvedCrate {
-        ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, scans, mdr, ..
+        ast, map, tables, fn_lines, body_hashes: _, structure_hash, expand_deps, timings: resolve_timings, scans, mdr, generation, ..
     } =
         resolved;
     // B3 step 2 (`LUST_B3_OBSERVE=1`): what a warm resolve would have had to
@@ -2374,6 +2378,7 @@ fn resolved_setup(
     front.patch = None;
     let old_kept = std::mem::take(&mut front.kept);
     let old_ast = std::mem::replace(&mut front.ast, Arc::new(ast));
+    front.ast_gen = generation;
     front.fresh_exprs = front.ast.exprs.len();
     if (old_ast.exprs.len() > 20_000 || old_kept.iter().any(Option::is_some)) && caches.persistent {
         // Nested token trees in the Ast drop recursively; use the
@@ -2649,6 +2654,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let route_std_mods = req.session.krate.manifest_path.is_none().then_some(std_mods);
     if front.resolved_crate && !wants_resolver {
         front.ast = Arc::default();
+        front.ast_gen = 0;
         front.env_hash = None;
         front.walk_after_reject = false;
         front.walk_pending.clear();
@@ -3241,6 +3247,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         };
         front.ast = Arc::new(ast);
+        front.ast_gen = 0;
         front.fresh_exprs = front.ast.exprs.len();
         match slot_update(front, caches, item_scans, env, None, &fn_at, crate_ids, &scan_of, &mut t, None) {
             Ok(c) => c,

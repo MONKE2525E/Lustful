@@ -127,6 +127,9 @@ pub struct ResolvedCrate {
     pub scans: crate::driver::ast_hash::AstScans,
     /// The module dependency record, under `LUST_B3_OBSERVE=1` (resolve/mdr.rs).
     pub mdr: Option<crate::resolve::mdr::Mdr>,
+    /// Which resolve of the cache made `ast` (`ResolveCache::set_merged`): the cache's
+    /// final chunks are parts of it.
+    pub generation: u64,
 }
 
 /// A failed resolution: the source map and combined text for rendering,
@@ -755,9 +758,33 @@ pub struct ResolveCache {
     /// file at a time (`unpack_raw`, `raw`): key, text hash, file id, stream. Empty between
     /// requests.
     unpacked: FxMap<String, (u64, FileId, lexer::Lexed)>,
+    /// During a resolve: the session's merged Ast and the resolve that made it
+    /// (`set_merged`), which a stored final chunk is taken back out of
+    /// (`FinalChunk::at`).
+    merged: Option<(std::sync::Arc<Ast>, u64)>,
 }
 
 impl ResolveCache {
+    /// Hands the cache the session's merged Ast and its `ResolvedCrate::generation` before a resolve:
+    /// the final chunks it stores are parts of that Ast (`FinalChunk::at`), not copies. The
+    /// resolve lets go of it at its end, so the session can patch the Ast in place.
+    pub fn set_merged(&mut self, ast: std::sync::Arc<Ast>, generation: u64) {
+        self.merged = Some((ast, generation));
+    }
+
+    /// Lets go of the merged Ast `set_merged` gave.
+    pub fn clear_merged(&mut self) {
+        self.merged = None;
+    }
+
+    /// Drops the final chunks a patch of `file` changes in the session's merged Ast: the
+    /// file's own, or every chunk when nodes of other files hold its spans (`others`).
+    pub fn forget_final(&mut self, file: FileId, others: bool) {
+        for f in self.files.values_mut().filter(|f| others || f.file_id == file) {
+            f.final_chunk = None;
+        }
+    }
+
     /// For `main::census`: (cached files, files whose expanded stream has the raw stream's
     /// tokens and strings, those files' raw token count).
     pub(crate) fn same_streams(&self) -> (usize, usize, usize) {
@@ -965,7 +992,12 @@ struct CachedFile {
 struct FinalChunk {
     epoch: u64,
     exp_hash: u64,
-    ast: Ast,
+    /// Where the chunk sits in the merged Ast resolve number `generation` made (`resolves`),
+    /// which a hit takes it back out of (`Ast::chunk_at`, `ResolveCache::merged`): the
+    /// session keeps that Ast anyway, so the cache keeps no copy. A chunk stored by a resolve
+    /// that did not finish has `generation` 0 and is no hit.
+    at: crate::ast::ChunkSpan,
+    generation: u64,
     fn_lines: Vec<u32>,
     body_hashes: Vec<u64>,
     nested_lines: Vec<u32>,
@@ -992,11 +1024,13 @@ struct FinalChunk {
 impl FinalChunk {
     /// A copy for a cache hit; the recorded reads only when `deps` (the
     /// observation reads them), as a hit stores nothing back.
-    fn clone_for_hit(&self, deps: bool) -> FinalChunk {
-        FinalChunk {
+    /// The chunk's Ast, out of the merged Ast `merged`, and a copy of the rest.
+    fn clone_for_hit(&self, deps: bool, merged: &Ast) -> (Ast, FinalChunk) {
+        let rest = FinalChunk {
             epoch: self.epoch,
             exp_hash: self.exp_hash,
-            ast: self.ast.clone(),
+            at: self.at,
+            generation: self.generation,
             fn_lines: self.fn_lines.clone(),
             body_hashes: self.body_hashes.clone(),
             nested_lines: self.nested_lines.clone(),
@@ -1008,7 +1042,8 @@ impl FinalChunk {
             scan_bodies: self.scan_bodies.clone(),
             nested_bodies: self.nested_bodies.clone(),
             deps: if deps { self.deps.clone() } else { None },
-        }
+        };
+        (merged.chunk_at(&self.at), rest)
     }
 }
 
@@ -1444,6 +1479,9 @@ struct CrateOut {
     /// chunks at once: a crate's own concat was copied whole again, its
     /// shift on one thread.
     chunks: Vec<Ast>,
+    /// Per chunk, its cache entry (key, text hash, file id) when the cache
+    /// holds it, so the caller records where the chunk sits in the merged Ast.
+    chunk_keys: Vec<Option<(String, u64, FileId)>>,
     fn_lines: Vec<u32>,
     body_hashes: Vec<u64>,
     fn_module: Vec<ModuleId>,
@@ -1851,6 +1889,7 @@ pub fn resolve_crate_with(
         _ => std_asks = std_asks.or(asks),
     };
     let mut chunks: Vec<Ast> = Vec::new();
+    let mut chunk_keys: Vec<Option<(String, u64, FileId)>> = Vec::new();
     let mut mdr_parts: Vec<crate::resolve::mdr::CratePart> = Vec::new();
     let mut fn_lines: Vec<u32> = Vec::new();
     let mut body_hashes: Vec<u64> = Vec::new();
@@ -1927,6 +1966,7 @@ pub fn resolve_crate_with(
                     }
                 }
                 chunks.extend(out.chunks);
+                chunk_keys.extend(out.chunk_keys);
             }
             Err(e) => {
                 add_asks(j, e.std_asks);
@@ -1943,15 +1983,24 @@ pub fn resolve_crate_with(
     // Streams of files no job took this request do not stay.
     cache.unpacked.clear();
     // The source map builds beside the merged Ast (each 10-70 ms on tsgo).
-    let ((map, all_text), ast) = std::thread::scope(|s| {
+    let ((map, all_text), (ast, spans)) = std::thread::scope(|s| {
         let map = s.spawn(|| make_map(&all_seen));
-        let ast = Ast::concat(chunks);
+        let ast = Ast::concat_spans(chunks);
         (map.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), ast)
     });
+    // Each chunk the cache holds is a part of the merged Ast now: the cache keeps where.
+    let generation = cache.resolves;
+    for (key, at) in chunk_keys.into_iter().zip(spans) {
+        if let Some((key, text_hash, file_id)) = key
+            && let Some(c) = cache.files.get_mut(&key).filter(|e| e.text_hash == text_hash && e.file_id == file_id).and_then(|e| e.final_chunk.as_mut())
+        {
+            (c.at, c.generation) = (at, generation);
+        }
+    }
     scan_bodies.extend(nested_scan_bodies);
     let scans = crate::driver::ast_hash::AstScans { items: scan_items, bodies: scan_bodies };
     let mdr = crate::resolve::mdr::on().then(|| crate::resolve::mdr::build(&tables, &map, mdr_parts));
-    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, std_asks, platform_asks, expand_deps, timings, scans, mdr })
+    Ok(ResolvedCrate { ast, map, tables, fn_lines, body_hashes, structure_hash, all_text, std_asks, platform_asks, expand_deps, timings, scans, mdr, generation })
 }
 
 /// Creates (or reuses) the job for one source dependency, recursively.
@@ -3840,11 +3889,14 @@ fn resolve_one(
     // The hit decisions share one answer memo, so they run in order, after
     // the answers they read are computed on the pool; the chunks they take
     // are copied out in parallel.
+    // A stored chunk is a part of the session's merged Ast, of the resolve that made it.
+    let merged = cache.merged.as_ref().filter(|m| m.1 != 0);
+    let placed = |c: &FinalChunk| merged.is_some_and(|m| m.1 == c.generation);
     if let Some(s) = structure {
         answers.prefill(
             works.iter().filter_map(|w| {
                 let c = cache.peek(&w.key, w.text_hash, w.file_id)?.final_chunk.as_ref()?;
-                (c.exp_hash == w.exp_hash).then_some(c.deps.as_ref()?)
+                (c.exp_hash == w.exp_hash && placed(c)).then_some(c.deps.as_ref()?)
             }),
             s,
         );
@@ -3853,6 +3905,7 @@ fn resolve_one(
     for w in works.iter() {
         let hit = cache.peek(&w.key, w.text_hash, w.file_id).and_then(|e| e.final_chunk.as_ref()).filter(|c| {
             c.exp_hash == w.exp_hash
+                && placed(c)
                 && match structure {
                     Some(s) => c.deps.as_ref().is_some_and(|d| crate::resolve::mdr::still_valid(d, &mut answers, &local_names, s)),
                     None => !cache.one_shot && c.epoch == epoch,
@@ -3861,7 +3914,10 @@ fn resolve_one(
         hit_refs.push(hit);
     }
     let observe = crate::resolve::mdr::on();
-    let final_hits: Vec<Option<FinalChunk>> = par_map(&hit_refs, |c| c.map(|c| c.clone_for_hit(observe)));
+    let final_hits: Vec<Option<(Ast, FinalChunk)>> = match merged {
+        Some((ast, _)) => par_map(&hit_refs, |c| c.map(|c| c.clone_for_hit(observe, ast))),
+        None => hit_refs.iter().map(|_| None).collect(),
+    };
     drop(hit_refs);
     lap!("resolve: epoch");
     // Rewrite paths to flat names, checking visibility. The tables
@@ -3940,6 +3996,9 @@ fn resolve_one(
         exp_hash: u64,
         file_id: FileId,
         cacheable: bool,
+        /// The cache holds this chunk (a hit, or stored below): its place in the
+        /// merged Ast is recorded there after the concat.
+        stored: bool,
         ast: Ast,
         fn_lines: Vec<u32>,
         body_hashes: Vec<u64>,
@@ -3986,7 +4045,7 @@ fn resolve_one(
     // they are freed off this thread, where their frees cost more than the rest of flatten.
     let mut unused: Vec<Ast> = Vec::new();
     for ((fi, mut w), hit) in works.into_iter().enumerate().zip(final_hits) {
-        if let Some(c) = hit {
+        if let Some((ast, c)) = hit {
             unused.push(std::mem::take(&mut w.ast));
             pendings.push(Pending {
                 key: w.key,
@@ -3994,7 +4053,8 @@ fn resolve_one(
                 exp_hash: w.exp_hash,
                 file_id: w.file_id,
                 cacheable: false,
-                ast: c.ast,
+                stored: true,
+                ast,
                 fn_lines: c.fn_lines,
                 body_hashes: c.body_hashes,
                 nested_lines: c.nested_lines,
@@ -4051,6 +4111,7 @@ fn resolve_one(
         w.ast.items = flat_items;
         pendings.push(Pending {
             cacheable: keep,
+            stored: false,
             key: w.key,
             text_hash: w.text_hash,
             exp_hash: w.exp_hash,
@@ -4084,8 +4145,9 @@ fn resolve_one(
     // bodies; split at the top-level count for storage.
     // (Segments exist only in one-shot resolves, which store nothing: a
     // stored chunk is always a whole file with its own structure hash.)
-    for pd in pendings.iter().filter(|pd| pd.cacheable) {
+    for pd in pendings.iter_mut().filter(|pd| pd.cacheable) {
         let Some(structure) = pd.structure else { continue };
+        pd.stored = true;
         let scan = pd.scan.as_ref().expect("every pending chunk is scanned");
         let top = pd.fn_lines.len().min(scan.bodies.len());
         cache.put_final(
@@ -4095,7 +4157,8 @@ fn resolve_one(
             FinalChunk {
                 epoch,
                 exp_hash: pd.exp_hash,
-                ast: pd.ast.clone(),
+                at: crate::ast::ChunkSpan::default(),
+                generation: 0,
                 fn_lines: pd.fn_lines.clone(),
                 body_hashes: pd.body_hashes.clone(),
                 nested_lines: pd.nested_lines.clone(),
@@ -4132,6 +4195,7 @@ fn resolve_one(
         .map(|(i, m)| (m.path.clone(), ModuleId(i as u32)))
         .collect();
     let mut chunks = Vec::with_capacity(pendings.len());
+    let mut chunk_keys = Vec::with_capacity(pendings.len());
     let mut fn_lines = Vec::new();
     let mut body_hashes = Vec::new();
     let mut nested_lines: Vec<u32> = Vec::new();
@@ -4161,6 +4225,7 @@ fn resolve_one(
         nested_bodies.extend(scan.bodies.drain(top.min(scan.bodies.len())..));
         scan_bodies.extend(scan.bodies);
         chunks.push(pd.ast);
+        chunk_keys.push(pd.stored.then_some((pd.key, pd.text_hash, pd.file_id)));
     }
     let structure_hash = {
         use std::hash::Hasher;
@@ -4186,6 +4251,7 @@ fn resolve_one(
     lap!("resolve: chunk scan+concat");
     Ok(CrateOut {
         chunks,
+        chunk_keys,
         fn_lines,
         body_hashes,
         fn_module,

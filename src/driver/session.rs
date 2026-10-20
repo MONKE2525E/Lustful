@@ -22,6 +22,9 @@ pub(crate) struct Front {
     /// The merged Ast. A collected `Program` holds another reference;
     /// writers (`Arc::make_mut`) run when none does.
     pub(crate) ast: Arc<Ast>,
+    /// The resolve of `resolve_cache` that made `ast` (`ResolvedCrate::generation`), whose final
+    /// chunks are parts of it; 0 when `ast` came from elsewhere.
+    pub(crate) ast_gen: u64,
     /// `None` until the first successful parse.
     pub(crate) env_hash: Option<u64>,
     /// Session-stable Adt and static numbering state, kept across
@@ -459,6 +462,7 @@ impl Session {
                 interner: Arc::new(interner),
                 known: Arc::new(known),
                 ast: Arc::default(),
+                ast_gen: 0,
                 env_hash: None,
                 def_order: crate::check::collect::DefOrder::default(),
                 client: crate::expand::ClientView::default(),

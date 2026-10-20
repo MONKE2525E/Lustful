@@ -207,7 +207,7 @@ impl Tok {
     /// the token moved to a table whose strings start `offset` later.
     pub fn shift_strings(&mut self, offset: u32) {
         for i in self.string_indices_mut().into_iter().flatten() {
-            *i += offset;
+            *i = i.wrapping_add(offset);
         }
     }
 }

@@ -1960,6 +1960,9 @@ fn apply(front: &mut Front, caches: &mut Caches, mut edits: Vec<BodyEdit>, reads
         // because some passes scan whole arenas (closures, `dyn`, `Cow`).
         let ranges = base.ranges.as_ref().and_then(|r| r.get(e.file.0 as usize));
         let extras = base.extras.as_ref().and_then(|x| x.get(e.file.0 as usize)).unwrap_or(&no_extras);
+        // The resolve cache's final chunks are parts of this Ast: the ones these writes
+        // change go (the file's, and every one when other files' nodes hold its spans).
+        front.resolve_cache.forget_final(e.file, !extras.is_empty());
         if let Some(body) = &e.body {
             span_shift::blank_nodes_extras(Arc::make_mut(&mut front.ast), e.file, body.old_body, ranges, extras);
         }
