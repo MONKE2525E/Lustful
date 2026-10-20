@@ -99,6 +99,56 @@ uint64_t lust_memmem(const uint8_t *h, uint64_t hlen, const uint8_t *n, uint64_t
     return UINT64_MAX;
 }
 
+/* The first (memchr3) or last (memrchr3) index of a byte equal to one of three needles,
+   or UINT64_MAX: the memchr port's 2- and 3-needle searches and their iterators. A clang
+   or gcc build for x86_64 tests 16 bytes a step (three compares, one mask), and the bytes
+   left are one more block that ends at the slice's end (memrchr3: starts at its start),
+   which may test bytes again: they hold no match, so the answer is the same. Other builds
+   loop over the bytes. It never reads outside the n bytes. */
+uint64_t lust_memchr3(uint32_t a, uint32_t b, uint32_t c, const uint8_t *p, uint64_t n) {
+    uint64_t i = 0;
+#if !defined(__TINYC__) && defined(__x86_64__) && defined(__SSE2__)
+    if (n >= 16) {
+        lust_mm_v16 va = (lust_mm_v16){0} + (char)a, vb = (lust_mm_v16){0} + (char)b, vc = (lust_mm_v16){0} + (char)c;
+        for (; i + 16 <= n; i += 16) {
+            lust_mm_v16 x = *(const lust_mm_v16u *)(const void *)(p + i);
+            unsigned m = (unsigned)__builtin_ia32_pmovmskb128((x == va) | (x == vb) | (x == vc));
+            if (m) return i + (uint64_t)__builtin_ctz(m);
+        }
+        if (i == n) return UINT64_MAX;
+        lust_mm_v16 x = *(const lust_mm_v16u *)(const void *)(p + n - 16);
+        unsigned m = (unsigned)__builtin_ia32_pmovmskb128((x == va) | (x == vb) | (x == vc));
+        return m ? n - 16 + (uint64_t)__builtin_ctz(m) : UINT64_MAX;
+    }
+#endif
+    for (; i < n; i++)
+        if (p[i] == (uint8_t)a || p[i] == (uint8_t)b || p[i] == (uint8_t)c) return i;
+    return UINT64_MAX;
+}
+
+uint64_t lust_memrchr3(uint32_t a, uint32_t b, uint32_t c, const uint8_t *p, uint64_t n) {
+#if !defined(__TINYC__) && defined(__x86_64__) && defined(__SSE2__)
+    if (n >= 16) {
+        lust_mm_v16 va = (lust_mm_v16){0} + (char)a, vb = (lust_mm_v16){0} + (char)b, vc = (lust_mm_v16){0} + (char)c;
+        uint64_t e = n;
+        for (; e >= 16; e -= 16) {
+            lust_mm_v16 x = *(const lust_mm_v16u *)(const void *)(p + e - 16);
+            unsigned m = (unsigned)__builtin_ia32_pmovmskb128((x == va) | (x == vb) | (x == vc));
+            if (m) return e - 16 + (uint64_t)(31 - __builtin_clz(m));
+        }
+        if (e == 0) return UINT64_MAX;
+        lust_mm_v16 x = *(const lust_mm_v16u *)(const void *)p;
+        unsigned m = (unsigned)__builtin_ia32_pmovmskb128((x == va) | (x == vb) | (x == vc));
+        return m ? (uint64_t)(31 - __builtin_clz(m)) : UINT64_MAX;
+    }
+#endif
+    while (n) {
+        n--;
+        if (p[n] == (uint8_t)a || p[n] == (uint8_t)b || p[n] == (uint8_t)c) return n;
+    }
+    return UINT64_MAX;
+}
+
 /* XXH3 one-shot hashes for the xxhash-rust 0.8.15 adapter. A scalar
    port of xxhash-rust's src/xxh3.rs (the default secret, seeded and
    unseeded forms); its SIMD paths compute the same values. No

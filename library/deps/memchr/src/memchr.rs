@@ -1,7 +1,7 @@
 // Single-byte searches: one, two, or three needle bytes, forward and
 // reverse, plus the iterators over all matches. One needle goes through
-// the memchr and memrchr intrinsics (libc, src/runtime/deps.c); two and
-// three needles are loops here.
+// the memchr and memrchr intrinsics (libc, src/runtime/deps.c), two and
+// three through memchr3 and memrchr3 (the runtime's vector loops).
 
 /// The first index of `needle` in `haystack`.
 pub fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
@@ -54,37 +54,21 @@ pub fn memchr3_iter<'h>(needle1: u8, needle2: u8, needle3: u8, haystack: &'h [u8
 }
 
 /// The first index in `start..end` holding one of the needles. Callers
-/// keep `start <= end <= haystack.len()`: one range check, then a scan
-/// to the sub-slice's length, so each byte's check is the loop condition
-/// the C compiler already proves (upstream reads through raw pointers).
+/// keep `start <= end <= haystack.len()`: one range check, then the
+/// runtime's search of the sub-slice (the memchr3 intrinsic, 16 bytes a
+/// step where it can, as upstream's vector searches).
 fn memchr3_in(n1: u8, n2: u8, n3: u8, haystack: &[u8], start: usize, end: usize) -> Option<usize> {
     debug_assert!(start <= end && end <= haystack.len());
-    let h = &haystack[start..end];
-    let mut i = 0;
-    while i < h.len() {
-        let b = h[i];
-        if b == n1 || b == n2 || b == n3 {
-            return Some(start + i);
-        }
-        i += 1;
-    }
-    None
+    let i = found(core::intrinsics::memchr3(n1 as u32, n2 as u32, n3 as u32, &haystack[start..end]))?;
+    Some(start + i)
 }
 
 /// The last index in `start..end` holding one of the needles (as
 /// `memchr3_in`, from the back).
 fn memrchr3_in(n1: u8, n2: u8, n3: u8, haystack: &[u8], start: usize, end: usize) -> Option<usize> {
     debug_assert!(start <= end && end <= haystack.len());
-    let h = &haystack[start..end];
-    let mut i = h.len();
-    while i > 0 {
-        i -= 1;
-        let b = h[i];
-        if b == n1 || b == n2 || b == n3 {
-            return Some(start + i);
-        }
-    }
-    None
+    let i = found(core::intrinsics::memrchr3(n1 as u32, n2 as u32, n3 as u32, &haystack[start..end]))?;
+    Some(start + i)
 }
 
 /// Every index of one needle byte. The unsearched range is `start..end`,

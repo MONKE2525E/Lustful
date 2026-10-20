@@ -3,7 +3,8 @@
    outside a given range fails. memfast.c (memcpy, memmove, memcmp, bcmp, memchr): every length
    0..300 and some large ones, every source and destination offset 0..15, memmove overlaps
    -80..80, memcmp with the difference at each index, memchr hits at each index and misses.
-   deps.c lust_memmem: 240,000 random cases against a naive search. -DMF_NO_V16 tests the
+   deps.c lust_memmem: 240,000 random cases against a naive search; lust_memchr3 and
+   lust_memrchr3: 60,000 against byte loops. -DMF_NO_V16 tests the
    word path that non-x86_64 targets take. */
 #include <stdint.h>
 typedef struct { uint64_t lo, hi; } lust_u128;
@@ -119,9 +120,32 @@ static int mm_run(uint64_t hmax, uint64_t nmax, int iters) {
     return fails;
 }
 
+/* lust_memchr3 / lust_memrchr3 against byte loops: lengths 0-200 and some long ones, the
+   needles (two of them equal, as memchr2 passes) at random spots, every start offset. */
+static int m3_run(int iters) {
+    int fails = 0;
+    for (int it = 0; it < iters; it++) {
+        uint64_t n = it < 4000 ? (uint64_t)(it % 200) : 200 + rnd() % 3000, off = rnd() % 16;
+        uint8_t *buf = malloc(n + off + 1), *h = buf + off;
+        for (uint64_t i = 0; i < n; i++) h[i] = (uint8_t)("abcdefgh"[rnd() % 8]);
+        uint8_t a = (uint8_t)"\n\r\xe2x"[rnd() % 4], b = (uint8_t)"\n\r\xe2y"[rnd() % 4], c = rnd() % 3 ? b : (uint8_t)'z';
+        for (int k = rnd() % 4; k > 0 && n; k--) h[rnd() % n] = (uint8_t)"\n\r\xe2xyz"[rnd() % 6];
+        uint64_t want = UINT64_MAX, rwant = UINT64_MAX;
+        for (uint64_t i = 0; i < n; i++)
+            if (h[i] == a || h[i] == b || h[i] == c) { if (want == UINT64_MAX) want = i; rwant = i; }
+        uint64_t got = lust_memchr3(a, b, c, h, n), rgot = lust_memrchr3(a, b, c, h, n);
+        if ((got != want || rgot != rwant) && fails++ < 10)
+            printf("memchr3 n=%lu: got %lu/%lu want %lu/%lu\n", (unsigned long)n, (unsigned long)got, (unsigned long)rgot, (unsigned long)want, (unsigned long)rwant);
+        free(buf);
+    }
+    return fails;
+}
+
 int main(void) {
     int f = mf_main();
     int m = mm_run(200, 12, 200000) + mm_run(3000, 48, 40000);
     printf("memmem: %d failures\n", m);
-    return f || m;
+    int m3 = m3_run(60000);
+    printf("memchr3: %d failures\n", m3);
+    return f || m || m3;
 }

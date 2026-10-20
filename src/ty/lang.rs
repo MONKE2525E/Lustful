@@ -728,6 +728,24 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         allowed: &[C::Memchr],
         implemented: true,
     },
+    // The first or last index of a byte equal to one of three needles (two needles repeat
+    // one): the port's memchr2/memchr3 searches.
+    IntrinsicDef {
+        name: "memchr3",
+        c_symbol: "lust_memchr3",
+        params: &[S::U32, S::U32, S::U32, S::Bytes],
+        ret: S::Usize,
+        allowed: &[C::Memchr],
+        implemented: true,
+    },
+    IntrinsicDef {
+        name: "memrchr3",
+        c_symbol: "lust_memrchr3",
+        params: &[S::U32, S::U32, S::U32, S::Bytes],
+        ret: S::Usize,
+        allowed: &[C::Memchr],
+        implemented: true,
+    },
     IntrinsicDef {
         name: "memmem",
         c_symbol: "lust_memmem",
