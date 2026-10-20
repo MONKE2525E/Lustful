@@ -1,0 +1,8 @@
+round 0: len 160 cap>=len true first Some((781, 299)) last Some((881, 199))
+round 1: len 320 cap>=len true first Some((781, 299)) last Some((882, 199))
+round 2: len 480 cap>=len true first Some((781, 299)) last Some((883, 199))
+round 3: len 499 cap>=len true first Some((781, 262)) last Some((878, 125))
+retain: len 333 sum 167555 get None None
+small: {0: 0, 1: 1, 2: 4, 3: 9, 4: 16} Some(16)
+tiny: {"b": 2, "c": 3} false
+missing key panics: true

@@ -118,12 +118,24 @@ impl Indices {
         self.ctrl[index2] = c;
     }
 
+    /// The group of `WIDTH` control bytes at `pos`. Every probe position
+    /// is masked by `bucket_mask`, and the control bytes are `buckets +
+    /// WIDTH` long, so the group is always in range: one range check per
+    /// group. The scans loop to `g.len()`, so each byte's check is the
+    /// loop condition the C compiler already proves (indexing `ctrl` at
+    /// `pos + i` checked all `WIDTH`; hashbrown loads through a pointer).
+    fn group(&self, pos: usize) -> &[u8] {
+        debug_assert!(pos <= self.bucket_mask && pos + WIDTH <= self.ctrl.len());
+        &self.ctrl[pos..pos + WIDTH]
+    }
+
     /// Bit i set when control byte `pos + i` is `c`.
     fn match_byte(&self, pos: usize, c: u8) -> u32 {
+        let g = self.group(pos);
         let mut bits: u32 = 0;
         let mut i = 0;
-        while i < WIDTH {
-            if self.ctrl[pos + i] == c {
+        while i < g.len() {
+            if g[i] == c {
                 bits |= 1 << i;
             }
             i += 1;
@@ -133,10 +145,11 @@ impl Indices {
 
     /// Bit i set when control byte `pos + i` is EMPTY or DELETED.
     fn match_empty_or_deleted(&self, pos: usize) -> u32 {
+        let g = self.group(pos);
         let mut bits: u32 = 0;
         let mut i = 0;
-        while i < WIDTH {
-            if self.ctrl[pos + i] & 0x80 != 0 {
+        while i < g.len() {
+            if g[i] & 0x80 != 0 {
                 bits |= 1 << i;
             }
             i += 1;
@@ -316,16 +329,15 @@ impl Indices {
     /// Moves every item, in bucket order, into a new table.
     fn resize<H: Fn(usize) -> u64>(&mut self, capacity: usize, hasher: H) {
         let mut nt = Indices::with_capacity(capacity);
-        let mut i = 0;
-        while i < self.num_buckets() && !self.is_singleton() {
-            if is_full(self.ctrl[i]) {
-                let v = self.slots[i];
+        // The control bytes and the slots side by side: no check per bucket
+        // (the singleton has no slots, so the zip is empty there).
+        for (&c, &v) in self.ctrl.iter().zip(self.slots.iter()) {
+            if is_full(c) {
                 let h = hasher(v);
                 let ni = nt.find_insert_index(h);
                 nt.set_ctrl(ni, tag(h));
                 nt.slots[ni] = v;
             }
-            i += 1;
         }
         nt.growth_left -= self.items;
         nt.items = self.items;
@@ -385,15 +397,10 @@ impl Indices {
     /// Visits every full bucket in bucket order (hashbrown's iteration
     /// order); `f` may change the entry index stored there.
     pub(crate) fn for_each_mut<F: FnMut(&mut usize)>(&mut self, mut f: F) {
-        if self.is_singleton() {
-            return;
-        }
-        let mut i = 0;
-        while i < self.num_buckets() {
-            if is_full(self.ctrl[i]) {
-                f(&mut self.slots[i]);
+        for (&c, slot) in self.ctrl.iter().zip(self.slots.iter_mut()) {
+            if is_full(c) {
+                f(slot);
             }
-            i += 1;
         }
     }
 

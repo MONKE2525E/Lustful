@@ -1,0 +1,15 @@
+None None None None
+  0 [] [] true
+  ends []
+None None None None
+  0 [] [] true
+  ends []
+Some(0) Some(5) Some(1) Some(5)
+  4 [0, 1, 3, 4] [4, 3, 1, 0] true
+  ends [(Some(0), Some(3))]
+Some(21) Some(21) None None
+  1 [21] [21] true
+  ends [(Some(21), None)]
+Some(76) Some(4845) Some(65) Some(4926)
+  60 [76, 157, 170, 327] [4939, 4926, 4845, 4688] true
+  ends [(Some(65), Some(4845)), (Some(76), Some(4834)), (Some(316), Some(4594))]

@@ -53,27 +53,35 @@ pub fn memchr3_iter<'h>(needle1: u8, needle2: u8, needle3: u8, haystack: &'h [u8
     Memchr3::new(needle1, needle2, needle3, haystack)
 }
 
-/// The first index in `start..end` holding one of the needles.
+/// The first index in `start..end` holding one of the needles. Callers
+/// keep `start <= end <= haystack.len()`: one range check, then a scan
+/// to the sub-slice's length, so each byte's check is the loop condition
+/// the C compiler already proves (upstream reads through raw pointers).
 fn memchr3_in(n1: u8, n2: u8, n3: u8, haystack: &[u8], start: usize, end: usize) -> Option<usize> {
-    let mut i = start;
-    while i < end {
-        let b = haystack[i];
+    debug_assert!(start <= end && end <= haystack.len());
+    let h = &haystack[start..end];
+    let mut i = 0;
+    while i < h.len() {
+        let b = h[i];
         if b == n1 || b == n2 || b == n3 {
-            return Some(i);
+            return Some(start + i);
         }
         i += 1;
     }
     None
 }
 
-/// The last index in `start..end` holding one of the needles.
+/// The last index in `start..end` holding one of the needles (as
+/// `memchr3_in`, from the back).
 fn memrchr3_in(n1: u8, n2: u8, n3: u8, haystack: &[u8], start: usize, end: usize) -> Option<usize> {
-    let mut i = end;
-    while i > start {
+    debug_assert!(start <= end && end <= haystack.len());
+    let h = &haystack[start..end];
+    let mut i = h.len();
+    while i > 0 {
         i -= 1;
-        let b = haystack[i];
+        let b = h[i];
         if b == n1 || b == n2 || b == n3 {
-            return Some(i);
+            return Some(start + i);
         }
     }
     None
