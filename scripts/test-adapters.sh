@@ -96,7 +96,7 @@ corpus_crate_fail_one() {
   local f=$1 proj=$2 pkg=$3 name=$4 code
   code=$(grep -m1 '// expect:' "$f" | sed 's|.*expect: *||; s/[[:space:]]*$//')
   if [ -z "$code" ]; then
-    corpus_report bad "$name" "fail case has no // expect: L#### line"
+    corpus_report bad "$pkg/$name" "fail case has no // expect: L#### line"
     return
   fi
   cp "$f" "$proj/src/bin/$name.rs"
@@ -104,30 +104,30 @@ corpus_crate_fail_one() {
   local cst=$?
   if [ $cst -eq 0 ]; then
     rm -f "$proj/src/bin/$name.rs"
-    corpus_report bad "$name" "the real crate builds this fail case"
+    corpus_report bad "$pkg/$name" "the real crate builds this fail case"
     return
   fi
   if ! grep -q "could not compile \`adapter-$pkg\`" "$proj/$name.cargo.out"; then
     rm -f "$proj/src/bin/$name.rs"
-    corpus_report bad "$name" "cargo failed outside the case: $(grep -m2 -E '^error' "$proj/$name.cargo.out" | tr '\n' ' ')"
+    corpus_report bad "$pkg/$name" "cargo failed outside the case: $(grep -m2 -E '^error' "$proj/$name.cargo.out" | tr '\n' ' ')"
     return
   fi
-  corpus_report ok "$name"
+  corpus_report ok "$pkg/$name"
   if [ -n "${LUST:-}" ]; then
     lust_cc env CARGO_NET_OFFLINE=true "$LUST" build "$proj/src/bin/$name.rs" -o "$proj/$name.lust" --manifest-path "$proj/Cargo.toml" \
       --bin "$name" >/dev/null 2>"$proj/$name.lust.err"
     local st=$?
     if is_timeout "$st"; then
-      corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+      corpus_lust_note hang "$pkg/$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
     elif [ "$st" -eq 0 ]; then
-      corpus_slow_note "$name" "lust build"
-      corpus_lust_note wrong "$name" "lust accepted a case the real crate rejects (want $code)"
+      corpus_slow_note "$pkg/$name" "lust build"
+      corpus_lust_note wrong "$pkg/$name" "lust accepted a case the real crate rejects (want $code)"
     elif grep -q "$code" "$proj/$name.lust.err"; then
-      corpus_slow_note "$name" "lust build"
-      corpus_lust_note match "$name" ""
+      corpus_slow_note "$pkg/$name" "lust build"
+      corpus_lust_note match "$pkg/$name" ""
     else
-      corpus_slow_note "$name" "lust build"
-      corpus_lust_note wrong "$name" "lust rejected without $code: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
+      corpus_slow_note "$pkg/$name" "lust build"
+      corpus_lust_note wrong "$pkg/$name" "lust rejected without $code: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
     fi
   fi
   rm -f "$proj/src/bin/$name.rs"
@@ -135,26 +135,28 @@ corpus_crate_fail_one() {
 
 corpus_crate_one() {
   local dir=$1 proj=$2 name=$3
+  # Reports name the case as <crate>/<case>: two crates can both have a `handle` case.
+  local pkg=${dir##*/}
   local expected=$dir/$name.stdout reject
   reject=$(grep -m1 'lust-reject:' "$dir/$name.rs" | sed 's|.*lust-reject: *||; s/[[:space:]]*$//')
   if [ -z "$reject" ] && [ ! -f "$expected" ]; then
-    corpus_report bad "$name" "missing expected stdout file ${expected##*/}"
+    corpus_report bad "$pkg/$name" "missing expected stdout file ${expected##*/}"
     return
   fi
   if [ -z "$reject" ]; then
     timeout "$run_timeout" "$proj/target/debug/$name" >"$proj/$name.out" 2>"$proj/$name.err"
     local status=$?
     if [ $status -ne 0 ]; then
-      corpus_report bad "$name" "the Cargo build exited with status $status"
+      corpus_report bad "$pkg/$name" "the Cargo build exited with status $status"
       return
     fi
     if ! cmp -s "$expected" "$proj/$name.out"; then
-      corpus_report bad "$name" "stdout of the real crate differs from ${expected##*/}:"
+      corpus_report bad "$pkg/$name" "stdout of the real crate differs from ${expected##*/}:"
       diff "$expected" "$proj/$name.out" | head -10
       return
     fi
   fi
-  corpus_report ok "$name"
+  corpus_report ok "$pkg/$name"
   [ -n "${LUST:-}" ] || return
   local build=(build "$proj/src/bin/$name.rs" -o "$proj/$name.lust" --manifest-path "$proj/Cargo.toml" --bin "$name")
   if [ -n "$reject" ]; then
@@ -162,59 +164,59 @@ corpus_crate_one() {
     local st=$?
     if is_timeout "$st"; then
       # A timeout is never the expected reject.
-      corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+      corpus_lust_note hang "$pkg/$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
     elif [ "$st" -eq 0 ]; then
-      corpus_slow_note "$name" "lust build"
-      corpus_lust_note wrong "$name" "lust accepted a case it must reject with $reject"
+      corpus_slow_note "$pkg/$name" "lust build"
+      corpus_lust_note wrong "$pkg/$name" "lust accepted a case it must reject with $reject"
     elif grep -q "$reject" "$proj/$name.lust.err"; then
-      corpus_slow_note "$name" "lust build"
-      corpus_lust_note match "$name" ""
+      corpus_slow_note "$pkg/$name" "lust build"
+      corpus_lust_note match "$pkg/$name" ""
     else
-      corpus_slow_note "$name" "lust build"
-      corpus_lust_note wrong "$name" "lust rejected without $reject: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
+      corpus_slow_note "$pkg/$name" "lust build"
+      corpus_lust_note wrong "$pkg/$name" "lust rejected without $reject: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
     fi
     return
   fi
   lust_cc env CARGO_NET_OFFLINE=true "$LUST" "${build[@]}" 2>"$proj/$name.lust.err"
   local st=$?
   if is_timeout "$st"; then
-    corpus_lust_note hang "$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+    corpus_lust_note hang "$pkg/$name" "lust build timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
     return
   fi
-  corpus_slow_note "$name" "lust build"
+  corpus_slow_note "$pkg/$name" "lust build"
   if [ "$st" -ne 0 ]; then
-    corpus_lust_note unsupported "$name" "lust rejected a case the real crate builds: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
+    corpus_lust_note unsupported "$pkg/$name" "lust rejected a case the real crate builds: $(head -2 "$proj/$name.lust.err" | tr '\n' ' ')"
     return
   fi
   timeout "$run_timeout" "$proj/$name.lust" >"$proj/$name.lust.out" 2>/dev/null
   status=$?
   if [ $status -ne 0 ] || ! cmp -s "$expected" "$proj/$name.lust.out"; then
-    corpus_lust_note wrong "$name" "lust output differs from the real crate (exit $status)"
+    corpus_lust_note wrong "$pkg/$name" "lust output differs from the real crate (exit $status)"
     return
   fi
   if [ "${SANITIZE:-0}" = 1 ]; then
     lust_cc env CARGO_NET_OFFLINE=true "$LUST" "${build[@]}" --emit-c "$proj/$name.san" >/dev/null 2>&1
     st=$?
     if is_timeout "$st"; then
-      corpus_lust_note hang "$name" "lust build --emit-c timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
+      corpus_lust_note hang "$pkg/$name" "lust build --emit-c timed out alone at ${retry_timeout}s (first at ${case_timeout}s)"
       return
     fi
-    corpus_slow_note "$name" "lust build --emit-c"
+    corpus_slow_note "$pkg/$name" "lust build --emit-c"
     if [ "$st" -ne 0 ]; then
-      corpus_lust_note wrong "$name" "lust build --emit-c failed on a case the plain build passed"
+      corpus_lust_note wrong "$pkg/$name" "lust build --emit-c failed on a case the plain build passed"
       return
     fi
     if ! gcc -O1 -w -fno-sanitize-recover=undefined -fsanitize=address,undefined -o "$proj/$name.sanbin" "$proj/$name.san".*.c 2>"$proj/$name.san.err"; then
-      corpus_lust_note wrong "$name" "gcc could not build the generated C"
+      corpus_lust_note wrong "$pkg/$name" "gcc could not build the generated C"
       return
     fi
     timeout "$run_timeout" "$proj/$name.sanbin" >"$proj/$name.san.out" 2>"$proj/$name.san.run.err"
     if grep -q "runtime error\|Sanitizer" "$proj/$name.san.run.err" || ! cmp -s "$expected" "$proj/$name.san.out"; then
-      corpus_lust_note wrong "$name" "sanitized build failed or output differs"
+      corpus_lust_note wrong "$pkg/$name" "sanitized build failed or output differs"
       return
     fi
   fi
-  corpus_lust_note match "$name" ""
+  corpus_lust_note match "$pkg/$name" ""
 }
 
 for d in "$corpus_root"/tests/adapters/crates/*/; do

@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
 fn main() {
-    let dir = std::env::temp_dir().join("lust_same_file_handle");
+    // Per process: the oracle and lust runs, or two gates on one box, must not share it.
+    let dir = std::env::temp_dir().join(format!("lust_same_file_handle_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let a = dir.join("a.txt");

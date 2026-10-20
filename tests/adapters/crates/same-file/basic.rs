@@ -4,7 +4,8 @@
 use same_file::is_same_file;
 
 fn main() {
-    let dir = std::env::temp_dir().join("lust_same_file_basic");
+    // Per process: the oracle and lust runs, or two gates on one box, must not share it.
+    let dir = std::env::temp_dir().join(format!("lust_same_file_basic_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     let a = dir.join("a.txt");
