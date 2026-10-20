@@ -759,6 +759,52 @@ fn main() {{
 """
 
 
+def auto_shape(v):
+    """A generic Adt's auto trait answer (2026-10-20: a closure template reads the Adt's auto
+    shape, not its deep Structure). `Service<P>` holds `Holder`, which holds `Inner`; a closure
+    template needs `Arc<Service<P>>: Send`, so `Service<P>: Sync`. v1 adds a `Cell` inside
+    `Inner` (Service is no longer Sync: the template must reject), v2 restores it, v3 adds a
+    `Cell` inside the argument `Mid` (the caller must reject), v4 restores it."""
+    inner = "    n: u32,\n    c: std::cell::Cell<u32>," if v == 1 else "    n: u32,"
+    inner_init = "Inner { n: 1, c: std::cell::Cell::new(0) }" if v == 1 else "Inner { n: 1 }"
+    mid = "    m: u32,\n    c: std::cell::Cell<u32>," if v == 3 else "    m: u32,"
+    mid_init = "Mid { m: 3, c: std::cell::Cell::new(0) }" if v == 3 else "Mid { m: 3 }"
+    return f"""use std::sync::Arc;
+
+struct Inner {{
+{inner}
+}}
+
+struct Holder {{
+    inner: Inner,
+}}
+
+struct Mid {{
+{mid}
+}}
+
+struct Service<P = Mid> {{
+    p: P,
+    holder: Holder,
+    k: u32,
+}}
+
+fn run<F: FnOnce() -> u32 + Send + 'static>(f: F) -> u32 {{
+    std::thread::spawn(f).join().unwrap()
+}}
+
+fn handler<P: Send + Sync + 'static>(s: Arc<Service<P>>) -> u32 {{
+    let t = s.clone();
+    run(move || t.k + t.holder.inner.n + {v})
+}}
+
+fn main() {{
+    let s = Arc::new(Service {{ p: {mid_init}, holder: Holder {{ inner: {inner_init} }}, k: 2 }});
+    println!("{{}} {{}}", handler(s.clone()), s.p.m);
+}}
+"""
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -927,6 +973,7 @@ def corpus():
     # Patches after a full resolve in an image chain (lazy patch base prep, 2026-10-20).
     seqs.append(("later-patch", [later_patch(v) for v in range(5)]))
     seqs.append(("sources-late", [late_sources(v) for v in range(4)], {"late": True}))
+    seqs.append(("auto-shape", [auto_shape(v) for v in range(5)]))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))

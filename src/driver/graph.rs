@@ -1534,6 +1534,8 @@ fn answer_fingerprint(p: &Program, def: DefId, kind: u8) -> Fingerprint {
                 _ => c::has_default(p, &tys, t).hash(&mut h),
             }
         });
+    } else if let Some(shape) = (kind == answer::AUTO).then(|| auto_shape(p, def)).flatten() {
+        ("auto-shape", shape).hash(&mut h);
     } else {
         structure_fingerprint(p, def).0.hash(&mut h);
     }
@@ -1542,6 +1544,114 @@ fn answer_fingerprint(p: &Program, def: DefId, kind: u8) -> Fingerprint {
         let _ = s.set(v);
     }
     Fingerprint(v)
+}
+
+/// The auto shape of a user Adt with type or lifetime params: what its auto
+/// trait answers (`Send`, `Sync`, `Unpin`) for any instance are a function of,
+/// with the auto answers of the instance's args (which a reader records
+/// itself: `record_structure_reads` walks the instance type). Auto traits are
+/// structural, so an instance's answer comes from its field types: the shape
+/// folds the Adt's identity, its written auto trait impls, and every field type of
+/// the template, params kept and regions left out, where a closed user Adt
+/// counts by its own auto answer (`answer_fingerprint`), a generic one by its
+/// shape (a back-reference inside a cycle), a std Adt by its def and args, and a
+/// raw pointer, which answers nothing of its target, by itself. None when a
+/// field holds a type the shape does not cover (a closure, an opaque type, a
+/// projection): its `Answer` fingerprint is then the deep `Structure` one.
+pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
+    fn adt(p: &Program, def: DefId, visiting: &mut Vec<DefId>) -> Option<u64> {
+        if let Some(k) = visiting.iter().position(|&d| d == def) {
+            let mut h = FxHasher::default();
+            ("auto-shape-back", k).hash(&mut h);
+            return Some(h.finish());
+        }
+        let a = p.adt_by_def(def)?;
+        visiting.push(def);
+        let mut h = FxHasher::default();
+        "auto-shape-v2".hash(&mut h);
+        hash_def_pub(&mut h, p, def);
+        // The written impls of auto traits on the Adt (an `unsafe impl Send`):
+        // the only impls an auto answer reads. Mono adds synthetic impls (glue,
+        // `Drop` of instances) while it runs, which must not move the shape.
+        let lang = &p.gx.lang;
+        let mut impls: Vec<u64> = p
+            .gx
+            .index
+            .impls_naming(def)
+            .map(|id| p.gx.index.peek(id))
+            .filter(|rec| lang.is_auto(rec.trait_def) && rec.synthetic == crate::traits::index::Synthetic::None)
+            .map(|rec| {
+                let mut h = FxHasher::default();
+                hash_trait_ref(&mut h, p, &p.tys, &rec.trait_ref);
+                hash_generics(&mut h, p, &rec.generics);
+                h.finish()
+            })
+            .collect();
+        impls.sort_unstable();
+        impls.hash(&mut h);
+        let mut ok = true;
+        for v in &p.adts[a.0 as usize].variants {
+            v.fields.len().hash(&mut h);
+            for f in &v.fields {
+                if ty(p, f.ty, visiting, &mut h).is_none() {
+                    ok = false;
+                }
+            }
+        }
+        visiting.pop();
+        ok.then(|| h.finish())
+    }
+    fn ty(p: &Program, t: Ty, visiting: &mut Vec<DefId>, h: &mut FxHasher) -> Option<()> {
+        let tys = &p.tys;
+        match tys.kind(t) {
+            TyKind::Adt(d, args) => {
+                if p.user_adt(d) {
+                    if closed_adt(p, d) {
+                        ("closed", answer_fingerprint(p, d, answer::AUTO).0).hash(h);
+                    } else {
+                        ("generic", adt(p, d, visiting)?).hash(h);
+                    }
+                } else {
+                    "std".hash(h);
+                    hash_def_pub(h, p, d);
+                }
+                for g in tys.args(args) {
+                    match *g {
+                        GenericArg::Ty(e) => ty(p, e, visiting, h)?,
+                        GenericArg::Const(c) => ("const", tys.const_kind(c)).hash(h),
+                        GenericArg::Lifetime(_) => {}
+                    }
+                }
+            }
+            TyKind::RawPtr(m, _) => ("raw", m.is_mut()).hash(h),
+            TyKind::Ref(_, m, e) => {
+                ("ref", m.is_mut()).hash(h);
+                ty(p, e, visiting, h)?;
+            }
+            TyKind::Slice(e) => {
+                "slice".hash(h);
+                ty(p, e, visiting, h)?;
+            }
+            TyKind::Array(e, n) => {
+                ("array", tys.const_kind(n)).hash(h);
+                ty(p, e, visiting, h)?;
+            }
+            TyKind::Tuple(ts) => {
+                ("tuple", tys.tys_of(ts).len()).hash(h);
+                for &e in tys.tys_of(ts) {
+                    ty(p, e, visiting, h)?;
+                }
+            }
+            TyKind::Param(i) => ("param", i.0).hash(h),
+            TyKind::Closure(..) | TyKind::Opaque(..) | TyKind::Projection(..) | TyKind::Infer(_) | TyKind::Error => return None,
+            _ => hash_ty(h, p, tys, t),
+        }
+        Some(())
+    }
+    if !p.user_adt(def) || closed_adt(p, def) {
+        return None;
+    }
+    adt(p, def, &mut Vec::new())
 }
 
 /// `ReadKey::Answer` kinds per Adt in the program memo.
@@ -2696,7 +2806,10 @@ impl<'a> Program {
         defs.sort_unstable_by_key(|d| (d.krate.0, d.hash.0));
         defs.dedup();
         for def in defs {
-            if self.user_adt(def) && closed_adt(self, def) {
+            // A generic (or lifetime-generic) Adt's auto trait answer reads its
+            // auto shape (`auto_shape`, through `answer_fingerprint`) in place of
+            // its whole deep `Structure`.
+            if self.user_adt(def) && (closed_adt(self, def) || kind == answer::AUTO) {
                 reads.record_with(ReadKey::Answer(def, kind), false, || answer_fingerprint(self, def, kind));
             } else {
                 let known = self.adt_by_def(def).is_some() || self.defs.get(def).is_some();
