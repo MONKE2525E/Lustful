@@ -3581,16 +3581,19 @@ fn resolve_one(
         // Only the outline's mods and macros are read here; a
         // stream with no `mod` token and no `macro_rules`
         // identifier has neither, so the outline is the default.
+        // The outlines are made on the pool, then read in disc order.
         let before = discs.len();
         let mut new_queue: Vec<usize> = Vec::new();
         let macro_rules = interner.intern("macro_rules");
-        for di in 0..before {
-            let Some(exp) = expanded[di].as_ref() else { continue };
-            let outline = if exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Mod || t.tok == crate::lexer::Tok::Ident(macro_rules)) {
-                scan::outline(exp, interner)
-            } else {
-                scan::Outline::default()
-            };
+        let outlines = par_map(&indices, |&di| {
+            let exp = expanded[di].as_ref()?;
+            Some(match exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Mod || t.tok == crate::lexer::Tok::Ident(macro_rules)) {
+                true => scan::outline(exp, interner),
+                false => scan::Outline::default(),
+            })
+        });
+        for (di, outline) in outlines.into_iter().enumerate() {
+            let (Some(exp), Some(outline)) = (expanded[di].as_ref(), outline) else { continue };
             let disc_module = discs[di].module;
             let inline = outline_mods(di, &outline, &exp.strings, &mut discs, &mut new_queue, tables, shared, job, interner, &mut diags);
             bind_outline_macros(&outline, disc_module, &inline, job, tables, interner);
@@ -3644,7 +3647,6 @@ fn resolve_one(
     for (di, scope) in menv.scopes.iter().enumerate() {
         tables.macro_scopes.insert(discs[di].file_id, (discs[di].module, scope.map(|i| def_of[i])));
     }
-    let seen = seen_of(&discs);
     // Parse the expanded files in parallel, in FileId order. Every file
     // parses again from its expanded stream: a cache of parsed Asts held
     // a copy of the crate's Ast (240 MB of a tsgo front image) to save
@@ -3722,6 +3724,9 @@ fn resolve_one(
             })
             .collect())
     });
+    // No step reads the discs after the parse: their paths and texts move to the session's
+    // map (a copy cost milliseconds of the crate's text).
+    let seen: Vec<(PathBuf, String, FileId)> = discs.into_iter().map(|d| (d.path, d.text, d.file_id)).collect();
     let mut works: Vec<FileWork> = Vec::with_capacity(order.len());
     for r in parsed {
         match r {
