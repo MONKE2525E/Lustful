@@ -3275,6 +3275,16 @@ impl FnGen<'_, '_> {
                         let el = (**el).clone();
                         self.note_held(&el)
                     }
+                    // A guard's deref reads the value in its cell (a RefCell's `f1`, a lock's
+                    // `v`): the cell's definition, not what the value points at.
+                    (Proj::Deref, CTy::Guard(inner, _)) => {
+                        let cell = CTy::RefCell(inner.clone());
+                        self.note_held(&cell)
+                    }
+                    (Proj::Deref, CTy::Sync(k, inner)) if let Some((lock, _)) = k.guard() => {
+                        let cell = CTy::Sync(lock, inner.clone());
+                        self.note_held(&cell)
+                    }
                     // A field of a value (`l1.u.v1.f0`) needs the container's definition, not
                     // what its fields point at. A kind with no struct of its own keeps the
                     // whole closure.
@@ -9421,16 +9431,44 @@ impl GlueSet {
         self.types.get(k).into_iter().flatten().for_each(|t| collect_types(t, out));
     }
 
-    /// True for drop glue of a struct, enum, Option, Result, tuple, array or RefCell: it
-    /// passes each field's address to the field's own glue and reads through none of the
-    /// pointers it holds (an Rc's glue reads the counts, a Vec's its elements).
+    /// True for the glue of a struct, enum, Option, Result, tuple, array or RefCell that
+    /// copies its fields or passes each field's address to the field's own glue: drop,
+    /// clone, eq, the comparisons, default, and a thread-local cell's init and destructor;
+    /// and for a Mutex's or RwLock's drop and default, which do that with the value. It
+    /// reads through none of the pointers it holds (an Rc's glue reads the counts, a Vec's
+    /// its elements). Debug and hash glue expand a pointer field's value in place.
     fn passes_fields(k: &(Glue, CTy)) -> bool {
-        k.0 == Glue::Drop && matches!(k.1, CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::RefCell(_))
+        match &k.1 {
+            CTy::Adt(_) | CTy::Option(_) | CTy::Result(..) | CTy::Tuple(_) | CTy::Array(..) | CTy::RefCell(_) => {
+                matches!(k.0, Glue::Drop | Glue::Clone | Glue::Eq | Glue::Cmp | Glue::PCmp | Glue::Default | Glue::TlsInit | Glue::TlsDtor)
+            }
+            CTy::Sync(s, _) => s.is_lock() && matches!(k.0, Glue::Drop | Glue::Default),
+            _ => false,
+        }
     }
 
-    /// `def_types` for a definition that `passes_fields`: the types it holds by value
-    /// (its key type, whose fields it reads) go to `held`, and every type it names to
-    /// `named`, which a unit only declares.
+    /// The block that a pointer's drop or clone glue reads in place: the count block
+    /// (`RcI_T`) of an Rc, Weak, Arc or Arc's Weak; the element of a Box, Vec, boxed slice
+    /// or Vec iterator; the cell a RefCell guard gives its borrow back to; the lock a lock
+    /// guard unlocks. The glue holds it by value and passes the value in it to the value's
+    /// own glue by pointer, so it reads none of the value's fields.
+    fn pointer_block(k: &(Glue, CTy)) -> Option<CTy> {
+        use crate::ty::sync::SyncTy;
+        if !matches!(k.0, Glue::Drop | Glue::Clone) {
+            return None;
+        }
+        match &k.1 {
+            CTy::Rc(e) | CTy::Weak(e) | CTy::Sync(SyncTy::Arc | SyncTy::ArcWeak, e) => Some(CTy::Rc(e.clone())),
+            CTy::Boxed(e) | CTy::Vec(e) | CTy::BoxSlice(e) | CTy::VecIter(e) | CTy::VecDrain(e) => Some((**e).clone()),
+            CTy::Guard(e, _) => Some(CTy::RefCell(e.clone())),
+            CTy::Sync(s, e) => s.guard().map(|(lock, _)| CTy::Sync(lock, e.clone())),
+            _ => None,
+        }
+    }
+
+    /// `def_types` for a definition that `passes_fields` or reads only its `pointer_block`:
+    /// the types it holds by value (its key type, whose fields it reads) go to `held`, and
+    /// every type it names to `named`, which a unit only declares.
     fn held_types(&self, k: &(Glue, CTy), held: &mut HashSet<CTy>, named: &mut HashSet<CTy>) {
         let mut by_value = Vec::new();
         by_value_deps(&k.1, &mut by_value);
@@ -10950,9 +10988,12 @@ pub fn fn_unit_parts(
     // through its helpers' C (`cc` links it into the IR).
     let mut inl_glue: HashSet<&(Glue, CTy)> = HashSet::new();
     // What the inline glue reads, one step through pointers (`type_decls_with`'s `deep`).
-    // Drop glue that only passes its fields on (`GlueSet::passes_fields`) holds its types as
-    // the unit's own code does: an Option of an Rc then needs no layout of the Rc's value,
-    // so the unit does not change when that value's struct does.
+    // Glue that only copies its fields or passes them on (`GlueSet::passes_fields`: an
+    // aggregate's drop, clone, eq, default...) holds its types as the unit's own code does:
+    // an Option of an Rc then needs no layout of the Rc's value, so the unit does not change
+    // when that value's struct does. A pointer's drop or clone glue holds the block it
+    // reads in place (`GlueSet::pointer_block`) and no more: the step from an `Arc<T>`
+    // key's `T` defined the count blocks of what `T` points at, with their values' sizes.
     let mut glue_types: HashSet<CTy> = HashSet::new();
     if inline {
         let plain = |k: &(Glue, CTy)| {
@@ -10978,6 +11019,9 @@ pub fn fn_unit_parts(
                 }
                 inl_glue.insert(k);
                 if GlueSet::passes_fields(k) {
+                    g.held_types(k, &mut types, &mut named);
+                } else if let Some(block) = GlueSet::pointer_block(k) {
+                    types.insert(block);
                     g.held_types(k, &mut types, &mut named);
                 } else {
                     g.def_types(k, &mut glue_types);
@@ -13372,16 +13416,10 @@ mod tests {
         assert_ne!(text2, text1, "regenerated glue text differs");
     }
 
-    /// Release C with unwind tables: a fn that drops an enum through `&mut` gets the enum's
-    /// one-arm drop glue inline, and that glue only passes its `Rc` field to the Rc's own glue
-    /// (a call: dropping `Big` can panic, so it keeps its cleanup frame). The unit defines the
-    /// enum, but neither the Rc's counted block nor `Big`: holding `Big`'s size made every
-    /// unit that dropped such an enum change with `Big` (tsgo's merges 9 and 11).
-    #[test]
-    fn inline_drop_glue_defines_no_type_behind_a_field() {
-        let src = "use std::rc::Rc;\nstruct D;\nimpl Drop for D { fn drop(&mut self) {} }\nstruct Big { a: u64, d: D }\n\
-                   enum E { A, B(Rc<Big>) }\nfn clear(e: &mut E) { *e = E::A; }\n\
-                   fn main() { let mut e = E::B(Rc::new(Big { a: 1, d: D })); clear(&mut e); }\n";
+    /// The release C unit of fn `root` alone (`fn_unit`, its small callees and glue inline), of
+    /// one-file program `src` with unwind tables, given to `check` inside the release names,
+    /// with a lookup of the program's Adts by name.
+    fn with_release_unit(src: &str, root: &str, check: impl FnOnce(&str, &dyn Fn(&str) -> CTy)) {
         let interner = std::sync::Arc::new(Interner::default());
         let known = std::sync::Arc::new(Known::new(&interner));
         let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
@@ -13398,8 +13436,7 @@ mod tests {
             adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
             by_id: Default::default(),
         });
-        let clear = program.fn_names[&interner.intern("clear")];
-        let (big, e) = (program.type_names[&interner.intern("Big")], program.type_names[&interner.intern("E")]);
+        let f = program.fn_names[&interner.intern(root)];
         names::with(Some(&names), || {
             let outs: Vec<FnOut> = (0..n)
                 .map(|i| {
@@ -13410,8 +13447,23 @@ mod tests {
                 .collect();
             let mut glue = GlueSet::default();
             glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
-            let unit = fn_unit(&program, &outs, &[clear.0 as usize], &glue, "lust_register_t", None);
-            let (big, e) = (ctype(&CTy::Adt(big)), ctype(&CTy::Adt(e)));
+            let unit = fn_unit(&program, &outs, &[f.0 as usize], &glue, "lust_register_t", None);
+            check(&unit, &|name| CTy::Adt(program.type_names[&interner.intern(name)]));
+        });
+    }
+
+    /// Release C with unwind tables: a fn that drops an enum through `&mut` gets the enum's
+    /// one-arm drop glue inline, and that glue only passes its `Rc` field to the Rc's own glue
+    /// (a call: dropping `Big` can panic, so it keeps its cleanup frame). The unit defines the
+    /// enum, but neither the Rc's counted block nor `Big`: holding `Big`'s size made every
+    /// unit that dropped such an enum change with `Big` (tsgo's merges 9 and 11).
+    #[test]
+    fn inline_drop_glue_defines_no_type_behind_a_field() {
+        let src = "use std::rc::Rc;\nstruct D;\nimpl Drop for D { fn drop(&mut self) {} }\nstruct Big { a: u64, d: D }\n\
+                   enum E { A, B(Rc<Big>) }\nfn clear(e: &mut E) { *e = E::A; }\n\
+                   fn main() { let mut e = E::B(Rc::new(Big { a: 1, d: D })); clear(&mut e); }\n";
+        with_release_unit(src, "clear", |unit, adt| {
+            let (big, e) = (ctype(&adt("Big")), ctype(&adt("E")));
             assert!(unit.contains(&format!("inline void drop_{e}_(")), "the enum's drop glue is inline:\n{unit}");
             assert!(!unit.contains(&format!("struct {big} {{")) && !unit.contains(&format!("sizeof({big})")), "the unit defines no {big}:\n{unit}");
         });
@@ -13449,6 +13501,37 @@ mod tests {
         assert!(!release.contains("_b[sizeof(") && !release.contains("#define l"), "release C declares it plainly:\n{release}");
         let dev = names::with(None, code);
         assert!(dev.contains("_b[sizeof(") && dev.contains("#undef l"), "dev C keeps the aligned buffer:\n{dev}");
+    }
+
+    /// Inline clone glue of a struct copies its reference field and passes its String to the
+    /// String's own glue: the unit defines the struct, but not `Big` behind the reference.
+    #[test]
+    fn inline_clone_glue_defines_no_type_behind_a_field() {
+        let src = "struct Big { a: u64, b: u64, c: u64 }\n#[derive(Clone)]\nstruct S<'a> { r: &'a Big, n: String }\n\
+                   fn dup<'a>(s: &S<'a>) -> S<'a> { s.clone() }\n\
+                   fn main() { let b = Big { a: 1, b: 2, c: 3 }; let s = S { r: &b, n: String::new() }; let _t = dup(&s); }\n";
+        with_release_unit(src, "dup", |unit, adt| {
+            let (big, s) = (ctype(&adt("Big")), adt("S"));
+            assert!(unit.contains(&format!("inline {} clone_{}(", ctype(&s), mangle(&s))), "the struct's clone glue is inline:\n{unit}");
+            assert!(!unit.contains(&format!("struct {big} {{")), "the unit defines no {big}:\n{unit}");
+        });
+    }
+
+    /// A fn that borrows a RefCell of `Option<Rc<Rc<Big>>>` (tsgo's FileVersion behind a cache
+    /// cell) reads the cell's flag and takes its value's address: through the guard's deref and
+    /// its inline drop glue the unit defines the cell, but neither `Big` nor its count block.
+    #[test]
+    fn guard_borrow_defines_only_the_cell() {
+        let src = "use std::cell::RefCell;\nuse std::rc::Rc;\nstruct Big { a: u64, b: u64, c: u64 }\n\
+                   fn look(o: &Option<Rc<Rc<Big>>>) -> bool { match o { Some(_) => true, None => false } }\n\
+                   fn peek(c: &RefCell<Option<Rc<Rc<Big>>>>) -> bool { let b = c.borrow(); look(&*b) }\n\
+                   fn main() { let c = RefCell::new(Some(Rc::new(Rc::new(Big { a: 1, b: 2, c: 3 })))); let _p = peek(&c); }\n";
+        with_release_unit(src, "peek", |unit, adt| {
+            let big = adt("Big");
+            assert!(unit.contains("inline void drop_Gd_"), "the guard's drop glue is inline:\n{unit}");
+            assert!(!unit.contains(&format!("struct {} {{", ctype(&big))), "the unit defines no {}:\n{unit}", ctype(&big));
+            assert!(!unit.contains(&format!("RcI_{} {{", mangle(&big))), "the unit defines no count block of {}:\n{unit}", ctype(&big));
+        });
     }
 
     /// Release C glue shards, one key each: the shard of a struct's drop glue holds the
