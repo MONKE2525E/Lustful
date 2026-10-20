@@ -1628,9 +1628,10 @@ impl Shift {
     }
 }
 
-/// Where one chunk sits in a merged Ast (`Ast::concat_spans`): the start and
+/// Where one chunk sits in a merged Ast (`Ast::concat_parts`): the start and
 /// length of its part of each list. The resolve's cache keeps this instead of
-/// a copy of the chunk, and takes the chunk back out (`Ast::chunk_at`).
+/// a copy of the chunk, and the next merge copies the chunk from there
+/// (`ChunkPart::Old`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChunkSpan {
     exprs: (u32, u32),
@@ -1648,6 +1649,51 @@ pub struct ChunkSpan {
     anon_consts: (u32, u32),
 }
 
+impl ChunkSpan {
+    /// The place right after `self` of a chunk of lengths `lens` (its `.1`s).
+    fn after(&self, lens: &ChunkSpan) -> ChunkSpan {
+        let next = |a: (u32, u32), l: (u32, u32)| (a.0 + a.1, l.1);
+        ChunkSpan {
+            exprs: next(self.exprs, lens.exprs),
+            pats: next(self.pats, lens.pats),
+            tys: next(self.tys, lens.tys),
+            blocks: next(self.blocks, lens.blocks),
+            strings: next(self.strings, lens.strings),
+            blobs: next(self.blobs, lens.blobs),
+            stmt_items: next(self.stmt_items, lens.stmt_items),
+            items: next(self.items, lens.items),
+            inner_attrs: next(self.inner_attrs, lens.inner_attrs),
+            use_traits: next(self.use_traits, lens.use_traits),
+            paren_exprs: next(self.paren_exprs, lens.paren_exprs),
+            paren_tys: next(self.paren_tys, lens.paren_tys),
+            anon_consts: next(self.anon_consts, lens.anon_consts),
+        }
+    }
+}
+
+impl Shift {
+    /// The shift that moves a chunk's indexes from place `from` to place `to`.
+    fn between(from: &ChunkSpan, to: &ChunkSpan) -> Shift {
+        let d = |f: (u32, u32), t: (u32, u32)| t.0.wrapping_sub(f.0);
+        Shift {
+            e: d(from.exprs, to.exprs),
+            p: d(from.pats, to.pats),
+            t: d(from.tys, to.tys),
+            b: d(from.blocks, to.blocks),
+            s: d(from.strings, to.strings),
+            bl: d(from.blobs, to.blobs),
+            si: d(from.stmt_items, to.stmt_items),
+        }
+    }
+}
+
+/// One chunk for `Ast::concat_parts`: an Ast of its own, or the chunk at a place in an older
+/// merged Ast.
+pub enum ChunkPart {
+    Own(Ast),
+    Old(ChunkSpan),
+}
+
 impl Ast {
     /// Merges chunk ASTs in order. Index shifting runs in parallel, one chunk per task.
     pub fn concat(chunks: Vec<Ast>) -> Ast {
@@ -1655,47 +1701,41 @@ impl Ast {
     }
 
     /// `concat`, with where each chunk sits in the merged Ast.
-    pub fn concat_spans(mut chunks: Vec<Ast>) -> (Ast, Vec<ChunkSpan>) {
-        let mut spans = Vec::with_capacity(chunks.len());
+    pub fn concat_spans(chunks: Vec<Ast>) -> (Ast, Vec<ChunkSpan>) {
+        Ast::concat_parts(chunks.into_iter().map(ChunkPart::Own).collect(), None)
+    }
+
+    /// `concat_spans` of chunks that are Asts of their own or parts of the
+    /// merged Ast `old` (`ChunkPart::Old`): an old part is copied from there
+    /// straight to its new place, its indexes shifted once.
+    pub fn concat_parts(parts: Vec<ChunkPart>, old: Option<&Ast>) -> (Ast, Vec<ChunkSpan>) {
+        let mut spans = Vec::with_capacity(parts.len());
         let mut at = ChunkSpan::default();
-        fn put(at: &mut (u32, u32), n: usize) {
-            *at = (at.0 + at.1, n as u32);
-        }
-        for c in &chunks {
-            put(&mut at.exprs, c.exprs.len());
-            put(&mut at.pats, c.pats.len());
-            put(&mut at.tys, c.tys.len());
-            put(&mut at.blocks, c.blocks.len());
-            put(&mut at.strings, c.strings.len());
-            put(&mut at.blobs, c.blobs.len());
-            put(&mut at.stmt_items, c.stmt_items.len());
-            put(&mut at.items, c.items.len());
-            put(&mut at.inner_attrs, c.inner_attrs.len());
-            put(&mut at.use_traits, c.use_traits.len());
-            put(&mut at.paren_exprs, c.paren_exprs.len());
-            put(&mut at.paren_tys, c.paren_tys.len());
-            put(&mut at.anon_consts, c.anon_consts.len());
+        for p in &parts {
+            at = at.after(&match p {
+                ChunkPart::Own(c) => c.lens(),
+                ChunkPart::Old(from) => *from,
+            });
             spans.push(at);
         }
-        let mut sh = Shift { e: 0, p: 0, t: 0, b: 0, s: 0, bl: 0, si: 0 };
-        let mut shifts = Vec::with_capacity(chunks.len());
-        for c in &chunks {
-            shifts.push(sh);
-            sh = Shift {
-                e: sh.e + c.exprs.len() as u32,
-                p: sh.p + c.pats.len() as u32,
-                t: sh.t + c.tys.len() as u32,
-                b: sh.b + c.blocks.len() as u32,
-                s: sh.s + c.strings.len() as u32,
-                bl: sh.bl + c.blobs.len() as u32,
-                si: sh.si + c.stmt_items.len() as u32,
-            };
-        }
-        // Each chunk shifts on the compiler's thread pool; a chunk sits
-        // behind its own lock, taken once, so one task can own it mutably.
-        let cells: Vec<(std::sync::Mutex<&mut Ast>, Shift)> =
-            chunks.iter_mut().zip(&shifts).skip(1).map(|(c, &s)| (std::sync::Mutex::new(c), s)).collect();
-        crate::pool::par_map(&cells, |(c, s)| c.lock().unwrap().shift(*s));
+        // Each part takes its place on the compiler's thread pool: an own chunk shifts by its
+        // place, an old one is copied out of `old` with its shift from the old place to the
+        // new. A part sits behind its own lock, taken once, so one task can own it.
+        let cells: Vec<std::sync::Mutex<Option<ChunkPart>>> = parts.into_iter().map(|p| std::sync::Mutex::new(Some(p))).collect();
+        let order: Vec<usize> = (0..cells.len()).collect();
+        let mut chunks: Vec<Ast> = crate::pool::par_map(&order, |&i| match cells[i].lock().unwrap().take() {
+            Some(ChunkPart::Own(mut c)) => {
+                if i > 0 {
+                    c.shift(Shift::between(&ChunkSpan::default(), &spans[i]));
+                }
+                c
+            }
+            Some(ChunkPart::Old(from)) => old.expect("an old chunk part needs the old merged Ast").moved_chunk(&from, &spans[i]),
+            None => Ast::default(),
+        });
+        // The merged sizes: the end of the last place.
+        let end = |a: (u32, u32)| a.0 + a.1;
+        let sh = Shift { e: end(at.exprs), p: end(at.pats), t: end(at.tys), b: end(at.blocks), s: end(at.strings), bl: end(at.blobs), si: end(at.stmt_items) };
         // Room past the merged size: the daemon's body and item patches
         // append nodes, and an exact fit copied every arena on the first
         // patch after each full resolve (sigedit P1.2). Untouched
@@ -1783,10 +1823,30 @@ impl Ast {
         (out, spans)
     }
 
-    /// A copy of the chunk at `at` (`concat_spans`), as it was before the merge:
-    /// its part of each list, with the indexes shifted back. Only a chunk's own
-    /// lists come back (`concat` keeps no chunk's `shipped` or `lang_methods`).
-    pub fn chunk_at(&self, at: &ChunkSpan) -> Ast {
+    /// The lengths of this Ast's lists, as a chunk at place 0 (`ChunkSpan`).
+    fn lens(&self) -> ChunkSpan {
+        let n = |l: usize| (0, l as u32);
+        ChunkSpan {
+            exprs: n(self.exprs.len()),
+            pats: n(self.pats.len()),
+            tys: n(self.tys.len()),
+            blocks: n(self.blocks.len()),
+            strings: n(self.strings.len()),
+            blobs: n(self.blobs.len()),
+            stmt_items: n(self.stmt_items.len()),
+            items: n(self.items.len()),
+            inner_attrs: n(self.inner_attrs.len()),
+            use_traits: n(self.use_traits.len()),
+            paren_exprs: n(self.paren_exprs.len()),
+            paren_tys: n(self.paren_tys.len()),
+            anon_consts: n(self.anon_consts.len()),
+        }
+    }
+
+    /// A copy of the chunk at place `at` (`concat_parts`), its indexes shifted as for place
+    /// `to` (place 0: the chunk as it was before the merge). Only a chunk's own lists come
+    /// (`concat` keeps no chunk's `shipped` or `lang_methods`).
+    fn moved_chunk(&self, at: &ChunkSpan, to: &ChunkSpan) -> Ast {
         fn part<T: Clone>(xs: &[T], at: (u32, u32)) -> Vec<T> {
             xs[at.0 as usize..(at.0 + at.1) as usize].to_vec()
         }
@@ -1810,15 +1870,7 @@ impl Ast {
             paren_tys: part(&self.paren_tys, at.paren_tys),
             anon_consts: part(&self.anon_consts, at.anon_consts),
         };
-        c.shift(Shift {
-            e: at.exprs.0.wrapping_neg(),
-            p: at.pats.0.wrapping_neg(),
-            t: at.tys.0.wrapping_neg(),
-            b: at.blocks.0.wrapping_neg(),
-            s: at.strings.0.wrapping_neg(),
-            bl: at.blobs.0.wrapping_neg(),
-            si: at.stmt_items.0.wrapping_neg(),
-        });
+        c.shift(Shift::between(at, to));
         c
     }
 
@@ -2135,12 +2187,16 @@ mod tests {
         assert!(matches!(&out.tys[2], TyExpr::Tuple(ts) if ts == &vec![TyId(1)]));
         assert!(matches!(&out.exprs[1], Expr::Tuple(es) if es == &vec![ExprId(1)]));
         assert!(matches!(&out.exprs[2], Expr::Closure { ret: Some(TyId(2)), body: ExprId(1), .. }));
-        // Each chunk comes back out of the merged Ast as it went in (`chunk_at`), its
-        // indexes shifted back.
+        // Each chunk comes back out of the merged Ast as it went in, its indexes
+        // shifted back, and a merge of old parts in another order equals a merge
+        // of the chunks in that order.
         let (merged, spans) = Ast::concat_spans(vec![a_copy.clone(), b_copy.clone()]);
-        for (chunk, at) in [a_copy, b_copy].iter().zip(&spans) {
-            assert_eq!(format!("{:?}", merged.chunk_at(at)), format!("{chunk:?}"));
+        for (chunk, at) in [&a_copy, &b_copy].into_iter().zip(&spans) {
+            assert_eq!(format!("{:?}", merged.moved_chunk(at, &ChunkSpan::default())), format!("{chunk:?}"));
         }
+        let parts = vec![ChunkPart::Old(spans[1]), ChunkPart::Own(a_copy.clone())];
+        let (again, _) = Ast::concat_parts(parts, Some(&merged));
+        assert_eq!(format!("{:?}", again), format!("{:?}", Ast::concat(vec![b_copy, a_copy])));
     }
 
     /// `append_chunk` merges only the id arenas: the chunk's items, body
