@@ -514,7 +514,7 @@ pub(super) fn fn_text_hash(ast: &Ast, map: &SourceMap, def: &crate::ast::FnDef, 
 
 /// Empties one slot like a dead fn: no C, no reads, no IR.
 fn wipe_slot(caches: &mut Caches, s: usize) {
-    if !caches.out[s].code.is_empty() {
+    if caches.out[s].has_code() {
         caches.wiped_slots.push(s as u32);
     }
     caches.out[s] = FnOut::default();
@@ -1696,7 +1696,7 @@ fn slot_update(
     // Instance slots are not AST fns: the generic block in `compile`
     // decides after collect which are live.
     for slot in (0..n_slots).filter(|&s| !live[s] && !front.inst_slot[s]) {
-        if !caches.out[slot].code.is_empty() {
+        if caches.out[slot].has_code() {
             caches.wiped_slots.push(slot as u32);
         }
         caches.out[slot] = FnOut::default();
@@ -4565,11 +4565,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let out = cgen::in_layout_phase(layout_tag, || {
                 cgen::names::with(rn, || cgen::gen_fn(&program, &body, &map, line_base_of(front, i), &front.fn_slot))
             });
-            Ok([out.code, out.ll, out.ll_c])
+            Ok([out.code_text().into_owned(), out.ll, out.ll_c])
         });
         super::genreuse_oracle::compare_bodies(&program, visits.path, &kept, fresh, |i| {
             let o = &caches.out[slot(i)];
-            [o.code.clone(), o.ll.clone(), o.ll_c.clone()]
+            [o.code_text().into_owned(), o.ll.clone(), o.ll_c.clone()]
         });
     }
     // The phase is over: the pool's tables and its references would otherwise stay until the
@@ -4588,7 +4588,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // edit recompiles little code.
     let covered = caches.groups.last().map_or(0, |g| g.end);
     if caches.groups.is_empty() || covered > n_slots || caches.objects != Some(req.debug) || !caches.persistent {
-        let sizes: Vec<usize> = caches.out.iter().map(|o| o.code.len()).collect();
+        let sizes: Vec<usize> = caches.out.iter().map(FnOut::code_len).collect();
         if caches.unit_bytes == 0 {
             let cores = crate::pool::threads().max(1);
             let total: usize = sizes.iter().sum();
@@ -4600,7 +4600,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         caches.groups = cgen::group_fns_by_bytes(&sizes, caches.unit_bytes);
     } else if covered < n_slots {
-        let sizes: Vec<usize> = caches.out[covered..].iter().map(|o| o.code.len()).collect();
+        let sizes: Vec<usize> = caches.out[covered..].iter().map(FnOut::code_len).collect();
         let target = if caches.unit_bytes == 0 { 128 * 1024 } else { caches.unit_bytes };
         caches.groups.extend(cgen::group_fns_by_bytes(&sizes, target).into_iter().map(|r| (r.start + covered)..(r.end + covered)));
     }
@@ -5016,7 +5016,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     2 => (cgen::runtime_unit(), String::new()),
                     3 => (super::release_c::table_unit(&rg.iter().filter(|(_, s)| s.contains(&(main_slot as usize))).map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
                     LOC_UNIT => {
-                        let live: Vec<u32> = (0..caches.out.len()).filter(|&s| !caches.out[s].code.is_empty()).map(|s| s as u32).collect();
+                        let live: Vec<u32> = (0..caches.out.len()).filter(|&s| caches.out[s].has_code()).map(|s| s as u32).collect();
                         (cgen::names::loc_unit(&live, &files, &slot_lines), String::new())
                     }
                     g => {
@@ -5192,7 +5192,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 asm_ms[2] = t_asm.elapsed().as_secs_f64() * 1e3;
                 let c_refs = cgen::names::with(rn, || cgen::ll::on(&program)).then(|| {
                     // The C units, glue shards and statics parts are made this build; each fn's C was read when
-                    // its FnOut was made (`FnOut::ll_c_refs`; a C body's `code` is read here).
+                    // its FnOut was made (`FnOut::ll_c_refs`; a C body's `text` is read here).
                     let statics_now = statics_out.lock().unwrap_or_else(|e| e.into_inner());
                     let texts: Vec<&str> =
                         made.iter().map(|(_, c, _)| c.as_str()).chain(rshards.iter().map(String::as_str)).chain(statics_now.iter().map(String::as_str)).collect();
@@ -5206,7 +5206,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     }
                     for f in caches.out.iter() {
                         if f.ll.is_empty() {
-                            r.scan(&f.code);
+                            r.scan(&f.code_text());
                         } else {
                             r.extend(&f.ll_c_refs);
                         }

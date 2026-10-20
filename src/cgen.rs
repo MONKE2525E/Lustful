@@ -1041,18 +1041,19 @@ fn bytes_array_lit(p: &Program, t: &CTy, bytes: &[u8]) -> String {
 /// The generated code for one function, plus the glue it needs.
 #[derive(Default)]
 pub struct FnOut {
-    pub code: String,
+    /// The fn's C text (`code_text`, `code_len`, `has_code`).
+    pub text: CText,
     pub glue: HashSet<(Glue, CTy)>,
     /// Named C types (structs, enums, Options) this function's code needs declared.
     pub types: HashSet<CTy>,
     /// A code generation failure the driver must report instead of
-    /// using `code` (see `FnGen::bad_move`).
+    /// using `text` (see `FnGen::bad_move`).
     pub error: Option<String>,
-    /// Every fn slot `code` prints (`lust_fns[slot]`, `lust_tramps[slot]`,
+    /// Every fn slot `text` prints (`lust_fns[slot]`, `lust_tramps[slot]`,
     /// names built from a slot), its own included. Sorted, deduplicated.
     /// The daemon's slot-moved re-emit and dead-callee checks read it.
     pub used: Vec<u32>,
-    /// Release C (`names`): the extern declarations `code` needs (callee and
+    /// Release C (`names`): the extern declarations `text` needs (callee and
     /// trampoline prototypes, location slots). Empty for numbered names.
     pub externs: BTreeSet<std::sync::Arc<str>>,
     /// Release C: types the code only points at (a `&T` local it never derefs):
@@ -1060,7 +1061,7 @@ pub struct FnOut {
     pub named: HashSet<CTy>,
     /// The LLVM backend (cgen/ll.rs): the fn's LLVM IR definition and the declarations it
     /// names; `ll_c` holds its helpers' C (with the prelude and statics they read), and
-    /// `code` only the C ABI wrapper and the trampoline. Empty for C bodies.
+    /// `text` only the C ABI wrapper and the trampoline. Empty for C bodies.
     pub ll: String,
     pub ll_decls: BTreeSet<String>,
     pub ll_c: String,
@@ -1071,16 +1072,146 @@ pub struct FnOut {
     pub ll_c_refs: ll::CRefs,
     /// The fn's `#[inline]` attribute, which release C inline definitions follow.
     pub inline: InlineAttr,
-    /// The digest of `code`, `ll` and `ll_c` (`FnOut::text_fp`), made on first use. B1 reads it
+    /// The digest of `text`, `ll` and `ll_c` (`FnOut::text_fp`), made on first use. B1 reads it
     /// instead of the texts, as a release build fingerprints every fn of the last build's units
     /// (`read_fp`); a front image keeps it with the fn. No text changes after `gen_fn` makes it.
     pub text_digest: std::sync::OnceLock<(u64, u64)>,
+    /// `plain_fn_def`'s answer about the C text for inline copies (`FnOut::pick_info`), made on
+    /// first use: `inline_pick` and B1's pick reads read it, not the text.
+    pub pick: std::sync::OnceLock<Option<PickInfo>>,
+}
+
+/// What `inline_pick` and `inline_pick_hot` read of a fn's `plain_fn_def` (`FnOut::pick`).
+#[derive(Clone, Copy)]
+pub struct PickInfo {
+    len: usize,
+    code: usize,
+    statics: bool,
+}
+
+/// A fn's C text: plain, as `gen_fn` makes it, or packed with other fns' texts in one zstd
+/// frame (`pack_texts`). A front image save packs the plain ones, so a restore places far fewer
+/// bytes, and a release build unpacks only the frames that hold the texts of the units it
+/// assembles and of their inline copies (B1 reads `FnOut::text_fp`, inline picks
+/// `FnOut::pick_info`).
+pub enum CText {
+    Plain(String),
+    Packed { frame: std::sync::Arc<TextFrame>, at: u32, len: u32 },
+}
+
+impl Default for CText {
+    fn default() -> CText {
+        CText::Plain(String::new())
+    }
+}
+
+/// Many fns' C texts, one after another, as one zstd frame (`CText::Packed`), with the text
+/// unpacked on first use; `pack_texts` drops that before an image save.
+pub struct TextFrame {
+    z: Box<[u8]>,
+    raw_len: u32,
+    unpacked: std::sync::Mutex<Option<std::sync::Arc<String>>>,
+}
+
+impl TextFrame {
+    /// The frame's text, unpacked once.
+    fn text(&self) -> std::sync::Arc<String> {
+        let mut u = self.unpacked.lock().unwrap_or_else(|e| e.into_inner());
+        u.get_or_insert_with(|| {
+            let raw = crate::image::unpack_bytes(&self.z, self.raw_len as usize);
+            std::sync::Arc::new(String::from_utf8(raw).expect("a packed C text frame holds UTF-8"))
+        })
+        .clone()
+    }
 }
 
 impl FnOut {
-    /// The digest of the fn's texts (`code`, `ll`, `ll_c`), made once (`text_digest`).
+    /// The digest of the fn's texts (`text`, `ll`, `ll_c`), made once (`text_digest`).
     pub fn text_fp(&self) -> (u64, u64) {
-        *self.text_digest.get_or_init(|| crate::driver::cache::hash128(&[self.code.as_bytes(), self.ll.as_bytes(), self.ll_c.as_bytes()], 12))
+        *self.text_digest.get_or_init(|| crate::driver::cache::hash128(&[self.code_text().as_bytes(), self.ll.as_bytes(), self.ll_c.as_bytes()], 12))
+    }
+
+    /// The fn's C text; a packed one is copied out of its unpacked frame.
+    pub fn code_text(&self) -> std::borrow::Cow<'_, str> {
+        match &self.text {
+            CText::Plain(s) => std::borrow::Cow::Borrowed(s),
+            CText::Packed { frame, at, len } => std::borrow::Cow::Owned(frame.text()[*at as usize..(*at + *len) as usize].to_string()),
+        }
+    }
+
+    /// The length of the fn's C text.
+    pub fn code_len(&self) -> usize {
+        match &self.text {
+            CText::Plain(s) => s.len(),
+            CText::Packed { len, .. } => *len as usize,
+        }
+    }
+
+    /// True when the fn has C text (a fn with none failed or has no body).
+    pub fn has_code(&self) -> bool {
+        self.code_len() > 0
+    }
+
+    /// `plain_fn_def`'s answer about the C text, made once (`pick`).
+    pub fn pick_info(&self) -> Option<PickInfo> {
+        *self.pick.get_or_init(|| plain_fn_def(&self.code_text()).map(|d| PickInfo { len: d.len, code: d.code, statics: d.statics }))
+    }
+}
+
+/// The text of a frame (`TextFrame`) before packing: about 256 KB of C, so zstd finds the
+/// repeats across fns, and a read of one fn unpacks no more than that.
+const TEXT_FRAME: usize = 256 << 10;
+
+/// Packs the plain C texts of `out` (indexed by slot) into zstd frames in slot order, and a frame
+/// again with the plain texts when less than half of its text is still in use (the old texts of
+/// changed fns stay in a frame until then). Then drops every frame's unpacked text. Run by a
+/// front image save (`image::write_image`), in the saving process. Saves that do not pack (no
+/// libzstd, `LUST_FRONT_ZSTD=0`) pack no texts.
+pub fn pack_texts(out: &mut [FnOut]) {
+    use std::sync::Arc;
+    let packs = crate::image::packs();
+    // The bytes of each frame that fns still use.
+    let mut live: crate::intern::FxMap<*const TextFrame, u64> = Default::default();
+    for f in out.iter() {
+        if let CText::Packed { frame, len, .. } = &f.text {
+            *live.entry(Arc::as_ptr(frame)).or_insert(0) += *len as u64;
+        }
+    }
+    // The next frame's text, and its fns: (slot, offset, length).
+    let mut all = String::new();
+    let mut group: Vec<(usize, u32, u32)> = Vec::new();
+    let flush = |out: &mut [FnOut], all: &mut String, group: &mut Vec<(usize, u32, u32)>| {
+        // When libzstd fails, the texts stay as they are.
+        if let Some(z) = crate::image::pack_bytes(all.as_bytes(), 3) {
+            let frame = Arc::new(TextFrame { z, raw_len: all.len() as u32, unpacked: Default::default() });
+            for &(slot, at, len) in group.iter() {
+                out[slot].text = CText::Packed { frame: frame.clone(), at, len };
+            }
+        }
+        all.clear();
+        group.clear();
+    };
+    for slot in (0..out.len()).filter(|_| packs) {
+        let take = match &out[slot].text {
+            CText::Plain(s) => !s.is_empty(),
+            CText::Packed { frame, .. } => live[&Arc::as_ptr(frame)] * 2 < frame.raw_len as u64,
+        };
+        if take {
+            let at = all.len() as u32;
+            all.push_str(&out[slot].code_text());
+            group.push((slot, at, all.len() as u32 - at));
+            if all.len() >= TEXT_FRAME {
+                flush(out, &mut all, &mut group);
+            }
+        }
+    }
+    if !group.is_empty() {
+        flush(out, &mut all, &mut group);
+    }
+    for f in out.iter() {
+        if let CText::Packed { frame, .. } = &f.text {
+            *frame.unpacked.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 }
 
@@ -2291,7 +2422,23 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     ll.shrink_to_fit();
     ll_c.shrink_to_fit();
     let externs = externs.into_iter().map(shared_extern).collect();
-    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, ll_c_refs, inline, text_digest: Default::default() }
+    FnOut {
+        text: CText::Plain(code),
+        glue,
+        types,
+        error: None,
+        used,
+        externs,
+        named,
+        ll,
+        ll_decls,
+        ll_c,
+        ll_cost,
+        ll_c_refs,
+        inline,
+        text_digest: Default::default(),
+        pick: Default::default(),
+    }
 }
 
 /// The extern declarations of the codegen phase running now, each kept once
@@ -11020,7 +11167,7 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, ski
 /// Whether `inline_callees` copies `f` (a callee another unit holds), at a `deep` level or not.
 fn inline_pick(f: &FnOut, deep: bool) -> bool {
     f.error.is_none()
-        && plain_fn_def(&f.code).is_some_and(|d| {
+        && f.pick_info().is_some_and(|d| {
             !d.statics && d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
         })
 }
@@ -11030,7 +11177,7 @@ fn inline_pick(f: &FnOut, deep: bool) -> bool {
 /// static locals and all. Code, not text (`PlainDef::code`): a match over a parameter that
 /// each caller passes as a constant has many one-jump blocks, which fold away.
 fn inline_pick_hot(f: &FnOut) -> bool {
-    f.error.is_none() && f.inline != InlineAttr::Never && plain_fn_def(&f.code).is_some_and(|d| d.code <= inline_limit(f.inline).max(HOT_COPY_BYTES))
+    f.error.is_none() && f.inline != InlineAttr::Never && f.pick_info().is_some_and(|d| d.code <= inline_limit(f.inline).max(HOT_COPY_BYTES))
 }
 
 /// The deeper copy levels below `frontier` (`fn_unit_parts`): the callees of each level's
@@ -11186,7 +11333,7 @@ pub fn fn_unit_parts(
     // Declare it in this unit even when main's cached `FnOut` predates
     // the return-type edit (a warm unit must not name an undeclared
     // `Result` struct).
-    let main_in_unit = main_slot.filter(|&s| slots.contains(&(s as usize)) && fns.get(s as usize).is_some_and(|f| !f.code.is_empty()));
+    let main_in_unit = main_slot.filter(|&s| slots.contains(&(s as usize)) && fns.get(s as usize).is_some_and(FnOut::has_code));
     let term_main = main_in_unit.and_then(|s| p.main.map(|m| (m, s))).filter(|&(m, _)| {
         let ret = p.fn_info(m).ret;
         p.tys.is_exit_code(ret) || p.tys.result_args(ret).is_some()
@@ -11243,13 +11390,15 @@ pub fn fn_unit_parts(
     // Only the statics this unit's code (and its local glue) names:
     // their types and their extern declarations. Every static in
     // every unit was pure repetition in a program with many statics.
+    // The texts this unit prints: its own fns' and its inline copies'.
+    let texts: Vec<(usize, std::borrow::Cow<str>)> = slots.iter().chain(&inl).chain(ll_inl).map(|&s| (s, fns[s].code_text())).collect();
+    let at: crate::intern::FxMap<usize, usize> = texts.iter().enumerate().map(|(i, t)| (t.0, i)).collect();
+    let text_of = |s: usize| at.get(&s).map_or("", |&i| texts[i].1.as_ref());
     let used = used_statics(
         p,
-        slots
+        texts
             .iter()
-            .chain(&inl)
-            .chain(ll_inl)
-            .flat_map(|&s| [fns[s].code.as_str(), fns[s].ll_c.as_str()])
+            .flat_map(|(s, t)| [t.as_ref(), fns[*s].ll_c.as_str()])
             .chain(seen.iter().filter(|k| hybrid && !g.is_shared(k)).map(|k| g.def_map[*k].as_str())),
     );
     for &i in &used {
@@ -11281,7 +11430,7 @@ pub fn fn_unit_parts(
     externs.into_iter().for_each(|e| c.push_str(e));
     record::piece(record::Kind::Externs, 0, &c[m..]);
     // Inline fn definitions: declared before any glue or body can call them.
-    let defs: Vec<PlainDef> = inl.iter().filter_map(|&s| plain_fn_def(&fns[s].code)).collect();
+    let defs: Vec<PlainDef> = inl.iter().filter_map(|&s| plain_fn_def(text_of(s))).collect();
     for d in &defs {
         let m = c.len();
         for pk in &d.pks {
@@ -11339,9 +11488,9 @@ pub fn fn_unit_parts(
         let m = c.len();
         // An LLVM fn's C is its C ABI wrapper and trampoline: kept only when a text names them.
         match (c_refs, f.ll.is_empty(), names::fn_tag_opt(s as u32)) {
-            (Some(r), false, Some(id)) => c.push_str(&r.c_body(&f.code, &id)),
-            (_, _, Some(id)) if copy_hot.is_some_and(|h| !is_hot(h, &id)) => c.push_str(&cold_cleanup(&f.code, &id)),
-            _ => c.push_str(&f.code),
+            (Some(r), false, Some(id)) => c.push_str(&r.c_body(text_of(s), &id)),
+            (_, _, Some(id)) if copy_hot.is_some_and(|h| !is_hot(h, &id)) => c.push_str(&cold_cleanup(text_of(s), &id)),
+            _ => c.push_str(text_of(s)),
         }
         record::piece(record::Kind::Body, s as u64, &c[m..]);
     }
@@ -11395,7 +11544,7 @@ pub fn fn_unit_parts(
     let register_at = c.len();
     let _ = writeln!(c, "void {register}(void) {{");
     // Release C calls bodies by name: no table to fill.
-    for &i in slots.iter().filter(|&&i| !fns[i].code.is_empty() && !names::release()) {
+    for &i in slots.iter().filter(|&&i| fns[i].has_code() && !names::release()) {
         let _ = writeln!(c, "  lust_fns[{i}] = (lust_fnptr)f{i};");
         let _ = writeln!(c, "  lust_tramps[{i}] = (lust_fnptr)tramp{i};");
     }
@@ -13463,9 +13612,42 @@ mod tests {
             term_span: span,
         }];
         let out = gen_fn(&program, &body, &map, 1, &slots);
+        assert!(!out.has_code(), "no code is emitted for a bad move body");
         let err = out.error.expect("a deref part move is a code generation error");
         assert!(err.contains("drop elaboration cannot track"), "{err}");
-        assert!(out.code.is_empty(), "no code is emitted for a bad move body");
+    }
+
+    /// `pack_texts` packs the C texts into frames that read back the same, packs a changed fn's
+    /// new text into a new frame, and packs a frame again once less than half of it is in use.
+    #[test]
+    fn packed_texts_read_back() {
+        if !crate::image::packs() {
+            return;
+        }
+        let text = |i: usize| format!("/* m::f{i} */\nvoid f{i}(void) {{\n  g({i});\n}}\n");
+        let fresh = |t: String| FnOut { text: CText::Plain(t), ..Default::default() };
+        let frame = |f: &FnOut| match &f.text {
+            CText::Packed { frame, .. } => Some(frame.clone()),
+            CText::Plain(_) => None,
+        };
+        let same = |a: &FnOut, b: &FnOut| frame(a).zip(frame(b)).is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a, &b));
+        let mut out: Vec<FnOut> = (0..4).map(|i| fresh(if i == 2 { String::new() } else { text(i) })).collect();
+        pack_texts(&mut out);
+        assert!(same(&out[0], &out[1]) && same(&out[1], &out[3]) && frame(&out[2]).is_none(), "one frame, no text for no code");
+        for i in [0, 1, 3] {
+            assert_eq!(out[i].code_text(), text(i));
+            assert_eq!(out[i].text_fp(), fresh(text(i)).text_fp());
+        }
+        let first = frame(&out[1]).unwrap();
+        out[0] = fresh(text(10));
+        pack_texts(&mut out);
+        assert!(!same(&out[0], &out[1]) && same(&out[1], &out[3]), "a new frame for the changed text; 2/3 of the old one is in use");
+        out[1] = fresh(text(11));
+        pack_texts(&mut out);
+        assert!(same(&out[1], &out[3]) && !std::sync::Arc::ptr_eq(&frame(&out[3]).unwrap(), &first), "the old frame is packed again");
+        for (i, t) in [(0, 10), (1, 11), (3, 3)] {
+            assert_eq!(out[i].code_text(), text(t));
+        }
     }
 
     /// A trait method stub and a template are never generated, so
@@ -13512,9 +13694,9 @@ mod tests {
             }
             assert_eq!(calls, 1, "main calls `go` once");
             let out = gen_fn(&program, &bad, &map, 1, &slots);
+            assert!(!out.has_code(), "no code is emitted for the caller");
             let err = out.error.expect("a call to a fn without a body is a code generation error");
             assert!(err.starts_with("internal:") && err.contains("has no generated body"), "{err}");
-            assert!(out.code.is_empty(), "no code is emitted for the caller");
         }
         let mut own = lowered();
         own.fn_id = stub;
@@ -13669,7 +13851,7 @@ mod tests {
         let code = || {
             let (ck, errs) = check_fn(&program, twice);
             assert!(errs.is_empty(), "{errs:?}");
-            gen_fn(&program, &crate::lower::lower(&program, twice, ck), &map, 1, &slots).code
+            gen_fn(&program, &crate::lower::lower(&program, twice, ck), &map, 1, &slots).code_text().into_owned()
         };
         let release = names::with(Some(&names), code);
         assert!(!release.contains("_b[sizeof(") && !release.contains("#define l"), "release C declares it plainly:\n{release}");
@@ -13710,11 +13892,12 @@ mod tests {
         };
         let (a, b, f) = (out("a"), out("b"), out("f"));
         let defs = |o: &FnOut| o.externs.iter().filter(|e| e.contains("LUST_KDATA")).map(|e| e.to_string()).collect::<Vec<_>>();
-        assert!(!a.code.contains("lks_ok") && !a.code.contains("lust_kintern"), "no run-time interning:\n{}", a.code);
+        let (ac, bc, fc) = (a.code_text(), b.code_text(), f.code_text());
+        assert!(!ac.contains("lks_ok") && !ac.contains("lust_kintern"), "no run-time interning:\n{ac}");
         assert_eq!(defs(&a).len(), 2, "the str and the tuple are named data:\n{:?}", a.externs);
-        let name = b.code.split("&lust_kc").nth(1).map(|s| &s[..32]).expect("b reads its tuple by name");
+        let name = bc.split("&lust_kc").nth(1).map(|s| &s[..32]).expect("b reads its tuple by name");
         assert!(defs(&a).iter().any(|d| d.contains(&format!("lust_kc{name} "))), "equal content, one name:\n{:?}", a.externs);
-        assert!(f.code.contains("lust_kintern") && defs(&f).is_empty(), "a float constant keeps run-time interning:\n{}", f.code);
+        assert!(fc.contains("lust_kintern") && defs(&f).is_empty(), "a float constant keeps run-time interning:\n{fc}");
     }
 
     /// Inline clone glue of a struct copies its reference field and passes its String to the
@@ -13779,7 +13962,7 @@ mod tests {
             let code = |f: LocalDefId| {
                 let (ck, errs) = check_fn(&program, f);
                 assert!(errs.is_empty(), "{errs:?}");
-                gen_fn(&program, &crate::lower::lower(&program, f, ck), &map, 1, &slots).code
+                gen_fn(&program, &crate::lower::lower(&program, f, ck), &map, 1, &slots).code_text().into_owned()
             };
             let (kc, sc) = (code(keep), code(sum));
             assert!(!kc.contains("l2 = *p2") && kc.contains("L.pl2 = &(*p2);"), "keep uses its parameter in place:\n{kc}");

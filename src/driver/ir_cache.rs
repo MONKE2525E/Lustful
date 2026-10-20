@@ -1252,14 +1252,14 @@ fn main() {
                         assert_eq!(ir_fingerprint(p2, &rebuilt, map2, 1), fp, "fn {i} fingerprint survives the round trip");
                         let a = crate::cgen::gen_fn(p, body, map, 1, &slots);
                         let b = crate::cgen::gen_fn(p2, &rebuilt, map2, 1, &slots);
-                        assert_eq!(a.code, b.code, "fn {i} C is identical under the same slots");
+                        assert_eq!(a.code_text(), b.code_text(), "fn {i} C is identical under the same slots");
                         // Renumbered slots: same fingerprint, C differs
                         // only where slot numbers print.
                         let shifted: Vec<u32> = slots.iter().map(|s| s + 10).collect();
                         let c = crate::cgen::gen_fn(p2, &rebuilt, map2, 1, &shifted);
                         assert_eq!(ir_fingerprint(p2, &rebuilt, map2, 1), fp, "fingerprint is slot-free");
-                        if a.code.contains("lust_fns[") || a.code.contains("lust_tramps[") {
-                            assert_ne!(a.code, c.code, "fn {i} slot prints move under a renumber");
+                        if a.code_text().contains("lust_fns[") || a.code_text().contains("lust_tramps[") {
+                            assert_ne!(a.code_text(), c.code_text(), "fn {i} slot prints move under a renumber");
                         }
                     });
                 }
@@ -1421,8 +1421,9 @@ fn main() {
         assert_eq!(r.code, 0, "{}", r.stderr);
         for (slot, out) in s.caches.out.iter().enumerate() {
             for table in ["lust_fns[", "lust_tramps["] {
-                for (at, _) in out.code.match_indices(table) {
-                    let digits: String = out.code[at + table.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                let code = out.code_text();
+                for (at, _) in code.match_indices(table) {
+                    let digits: String = code[at + table.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
                     let printed: u32 = digits.parse().unwrap();
                     assert!(out.used.binary_search(&printed).is_ok(), "slot {slot} prints {table}{printed}] but its used list is {:?}", out.used);
                 }

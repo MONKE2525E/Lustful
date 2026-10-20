@@ -3279,25 +3279,26 @@ impl CRefs {
 /// are (`fn_unit_parts`): clang inlines it, so the call goes straight to `fl_<id>`. The fn's
 /// own unit keeps the external wrapper while some text names it (`CRefs`), for its address
 /// and for calls that stay calls. `LUST_LL_ADAPT=0`: off (measurement).
-pub struct Adapters<'a> {
-    by_id: HashMap<u64, (&'a str, &'a str)>,
+pub struct Adapters {
+    by_id: HashMap<u64, (String, String)>,
 }
 
-impl<'a> Adapters<'a> {
+impl Adapters {
     /// The wrappers of the LLVM fns in `fns`; None when off.
-    pub fn new(fns: &'a [FnOut]) -> Option<Adapters<'a>> {
+    pub fn new(fns: &[FnOut]) -> Option<Adapters> {
         if std::env::var("LUST_LL_ADAPT").is_ok_and(|v| v == "0") {
             return None;
         }
         let mut by_id = HashMap::new();
         for f in fns.iter().filter(|f| !f.ll.is_empty()) {
             // `code`: the fn's comment line, the `fl_` prototype, the wrapper, the trampoline.
-            let mut lines = f.code.lines().skip(1);
+            let code = f.code_text();
+            let mut lines = code.lines().skip(1);
             let (Some(proto), Some(def)) = (lines.next(), lines.next()) else { continue };
             let Some(at) = proto.find(" fl_") else { continue };
             let Some(id) = proto.get(at + 4..at + 20).and_then(|h| u64::from_str_radix(h, 16).ok()) else { continue };
             if proto.ends_with(");") && def.ends_with(" }") && def.contains(&format!("f_{id:016x}(")) {
-                by_id.insert(id, (proto, def));
+                by_id.insert(id, (proto.to_string(), def.to_string()));
             }
         }
         Some(Adapters { by_id })
@@ -3319,11 +3320,11 @@ impl<'a> Adapters<'a> {
                 continue;
             }
             let Some(id) = text.get(at + 2..at + 18).and_then(|h| u64::from_str_radix(h, 16).ok()) else { continue };
-            let Some(&(proto, def)) = self.by_id.get(&id) else { continue };
+            let Some((proto, def)) = self.by_id.get(&id) else { continue };
             let start = text[..at].rfind('\n').map_or(0, |k| k + 1);
             let end = text[at..].find('\n').map_or(text.len(), |k| at + k);
             let line = &text[start..end];
-            let head = def.split_once(" {").map_or(def, |(h, _)| h);
+            let head = def.split_once(" {").map_or(def.as_str(), |(h, _)| h);
             if line.strip_suffix(';') != Some(head) || own(id) {
                 continue;
             }
@@ -3434,10 +3435,16 @@ mod tests {
         let fns = [
             FnOut {
                 ll: "define".into(),
-                code: format!("/* m::a */\nll_pair fl_{a}(uint64_t);\nP f_{a}(uint64_t p1) {{ ll_pair rb = fl_{a}(p1); P r; memcpy(&r, &rb, 16); return r; }}\nP tramp_{a}(uint64_t p1) {{ return f_{a}(p1); }}\n"),
+                text: crate::cgen::CText::Plain(format!(
+                    "/* m::a */\nll_pair fl_{a}(uint64_t);\nP f_{a}(uint64_t p1) {{ ll_pair rb = fl_{a}(p1); P r; memcpy(&r, &rb, 16); return r; }}\nP tramp_{a}(uint64_t p1) {{ return f_{a}(p1); }}\n"
+                )),
                 ..Default::default()
             },
-            FnOut { ll: "define".into(), code: format!("/* m::b */\nvoid fl_{b}(void);\nvoid f_{b}(void) {{ fl_{b}(); }}\n"), ..Default::default() },
+            FnOut {
+                ll: "define".into(),
+                text: crate::cgen::CText::Plain(format!("/* m::b */\nvoid fl_{b}(void);\nvoid f_{b}(void) {{ fl_{b}(); }}\n")),
+                ..Default::default()
+            },
         ];
         let ad = Adapters::new(&fns).unwrap();
         let text = format!("int x;\nP f_{a}(uint64_t p1);\nvoid f_{b}(void);\nP f_{a}(uint64_t p1);\nvoid g(void) {{ f_{b}(); }}\n");

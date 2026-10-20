@@ -33,7 +33,9 @@
 //      `LUST_FRONT_ZSTD=0`) a layer is written packed (`pack`): its raw form in 8 MB
 //      zstd sections, which the next run reads in one pass and unpacks in
 //      parallel: on a CI disk, page faults on a raw tsgo chain (13.2 GB)
-//      cost a fresh merge 12.8 s, and the chain packs to 1.1 GB. Arena pages hold the live blocks mimalloc
+//      cost a fresh merge 12.8 s, and the chain packs to 1.1 GB. Such a save first
+//      packs the fns' C texts into zstd frames that stay in the heap
+//      (`cgen::pack_texts`): a build unpacks only the frames it reads. Arena pages hold the live blocks mimalloc
 //      reports (`mi_heap_visit_blocks`), with the bytes of free blocks
 //      written as zeros; pages with no live block are left out. The
 //      process-wide tables the session's spans index into
@@ -664,6 +666,37 @@ fn zstd() -> Option<&'static Zstd> {
 /// libzstd does not load (then `raw_why` says which).
 fn packer() -> Option<&'static Zstd> {
     zstd().filter(|_| std::env::var_os(PACK_ENV).is_none_or(|v| v != "0"))
+}
+
+/// True when saves pack (`packer`): a save then packs the C texts too (`cgen::pack_texts`).
+pub fn packs() -> bool {
+    packer().is_some()
+}
+
+/// `src` as one zstd frame at `level` (`cgen::TextFrame`); None when saves do not pack or
+/// libzstd fails.
+pub fn pack_bytes(src: &[u8], level: i32) -> Option<Box<[u8]>> {
+    let z = packer()?;
+    // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
+    let bound = unsafe { (z.bound)(src.len()) };
+    let mut out = vec![0u8; bound];
+    let n = unsafe { (z.compress)(out.as_mut_ptr() as *mut c_void, bound, src.as_ptr() as *const c_void, src.len(), level) };
+    if unsafe { (z.is_error)(n) } != 0 {
+        return None;
+    }
+    out.truncate(n);
+    Some(out.into_boxed_slice())
+}
+
+/// A `pack_bytes` frame back as its `raw_len` bytes. A process that holds a frame restored it
+/// from a packed image, so libzstd is loaded.
+pub fn unpack_bytes(frame: &[u8], raw_len: usize) -> Vec<u8> {
+    let z = zstd().expect("libzstd for a packed frame");
+    let mut out = vec![0u8; raw_len];
+    // SAFETY: libzstd's documented contract; both buffers are valid for the lengths passed.
+    let n = unsafe { (z.decompress)(out.as_mut_ptr() as *mut c_void, raw_len, frame.as_ptr() as *const c_void, frame.len()) };
+    assert!(unsafe { (z.is_error)(n) } == 0 && n == raw_len, "a packed frame did not unpack");
+    out
 }
 
 /// Why saves stay raw, for the save line (None when they pack).
@@ -2214,10 +2247,12 @@ pub fn save(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
 }
 
 /// `save` once no other thread runs.
-fn write_image(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
+fn write_image(dir: &Path, mut roots: Box<Roots>) -> Result<String, String> {
     use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
     let t = std::time::Instant::now();
+    // The fns' C texts as zstd frames: the image holds and a restore places ~9x fewer bytes.
+    roots.sessions.iter_mut().for_each(|s| crate::cgen::pack_texts(&mut s.caches.out));
     std::fs::create_dir_all(dir).map_err(|e| format!("state dir: {e}"))?;
     // Under the lock, a temp layer is that of a save that died (a killed
     // background child): it would ride along in a cached directory.

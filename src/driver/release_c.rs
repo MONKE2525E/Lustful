@@ -88,7 +88,7 @@ pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: 
 
 /// `groups` for a unit target and cap (`unit_bytes`, `unit_cap`) of `target` and `cap` bytes.
 fn group_fns(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32], target: usize, cap: usize) -> Vec<(String, Vec<usize>)> {
-    let live: Vec<usize> = (0..out.len()).filter(|&s| !out[s].code.is_empty()).collect();
+    let live: Vec<usize> = (0..out.len()).filter(|&s| out[s].has_code()).collect();
     // A fn's size: its C; with the LLVM backend its statement count (`FnOut::ll_cost`) at
     // 200 bytes each, which no lowering, fact or ABI choice moves, so every such variant
     // gets the same units (and about as many as C).
@@ -96,7 +96,7 @@ fn group_fns(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &
     // A C fn's named constants count too: their definitions travel in its externs (cgen's
     // kdata), where its literals were part of its code before.
     let kdata = |s: usize| out[s].externs.iter().filter(|e| e.starts_with('#')).map(|e| e.len()).sum::<usize>();
-    let size = |s: usize| if llvm { out[s].ll_cost as usize * 200 } else { out[s].code.len() + kdata(s) };
+    let size = |s: usize| if llvm { out[s].ll_cost as usize * 200 } else { out[s].code_len() + kdata(s) };
     let target = target.max(1) as u64;
     let id = |s: usize| names.fns.get(s).and_then(|x| x.clone()).unwrap_or_else(|| format!("dead{s}"));
     let mut by_file: std::collections::BTreeMap<&str, Vec<(u32, String, usize)>> = Default::default();
@@ -196,7 +196,7 @@ mod tests {
 
     /// `n` fns in one file, slot `s` on line `10 * s` with `size` bytes of code each.
     fn program(n: usize, size: usize) -> (Vec<FnOut>, cgen::names::Names, Vec<String>, Vec<u32>) {
-        let out = (0..n).map(|_| FnOut { code: "x".repeat(size), ..Default::default() }).collect();
+        let out = (0..n).map(|_| FnOut { text: cgen::CText::Plain("x".repeat(size)), ..Default::default() }).collect();
         let names = cgen::names::Names {
             fns: (0..n).map(|s| Some(format!("{:016x}", hash64(&format!("fn{s}"))))).collect(),
             adts: Vec::new(),
@@ -221,7 +221,7 @@ mod tests {
         assert!(before.len() > 4, "a 1.6 MB file splits into several units: {}", before.len());
         // A new fn (slot 400) on line 1995, between slots 199 and 200.
         let (mut out2, mut names2, mut file2, mut line2) = (out, names, file, line);
-        out2.push(FnOut { code: "y".repeat(50_000), ..Default::default() });
+        out2.push(FnOut { text: cgen::CText::Plain("y".repeat(50_000)), ..Default::default() });
         names2.fns.push(Some(format!("{:016x}", hash64("new fn"))));
         file2.push("src/a.rs".to_string());
         line2.push(1995);
@@ -240,8 +240,13 @@ mod tests {
         let (out, names, file, line) = program(400, 4096);
         let before = unit_ids(&out, &names, &file, &line);
         let def: std::sync::Arc<str> = format!("#{}", "d".repeat(999)).into();
-        let moved: Vec<FnOut> =
-            (0..400).map(|_| FnOut { code: "x".repeat(3096), externs: [def.clone()].into_iter().collect(), ..Default::default() }).collect();
+        let moved: Vec<FnOut> = (0..400)
+            .map(|_| FnOut {
+                text: cgen::CText::Plain("x".repeat(3096)),
+                externs: [def.clone()].into_iter().collect(),
+                ..Default::default()
+            })
+            .collect();
         assert_eq!(unit_ids(&moved, &names, &file, &line), before);
     }
 
@@ -265,7 +270,7 @@ mod tests {
         let big = whole.iter().max_by_key(|u| u.len()).unwrap();
         let slot = (0..out.len()).find(|&s| names.fns[s].as_deref() == Some(big[big.len() / 2].as_str())).unwrap();
         let mut out2 = program(1200, 2048).0;
-        out2[slot].code.push_str(&"z".repeat(3000));
+        out2[slot].text = cgen::CText::Plain(out2[slot].code_text().into_owned() + &"z".repeat(3000));
         let after = ids(&out2, cap);
         let moved: Vec<&Vec<String>> = after.iter().filter(|u| !parts.contains(u)).collect();
         assert!(moved.iter().all(|u| u.iter().all(|f| big.contains(f))), "only the grown unit's parts move");
