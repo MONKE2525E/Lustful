@@ -73,7 +73,26 @@
 #define lust_memmove(...) ((void)__builtin_memmove(__VA_ARGS__))
 
 /* A push or reserve that fits the capacity; growth (and zero-sized elements) take the
-   function. */
+   function. A reserve_exact on an empty Vec (most of them: the first buffer of a collect or
+   an extend) is one malloc here, as the function would do it: the element size is the call
+   site's constant, so the size check (lust_vec_fits) folds. Any other case (an alignment
+   over 16, an overflow, a failed malloc) is one call of the function. */
+#define lust_vec_reserve_exact(v, extra, elem, align)                                                  \
+    __extension__({                                                                                    \
+        lust_Vec *lust_rv_ = (v);                                                                      \
+        uint64_t lust_rx_ = (extra), lust_re_ = (elem), lust_ra_ = (align);                            \
+        void *lust_rp_;                                                                                \
+        if (lust_re_ == 0 || lust_rv_->cap - lust_rv_->len < lust_rx_) {                               \
+            if (lust_re_ != 0 && lust_rv_->cap == 0 && lust_ra_ <= 16 && lust_vec_fits(lust_rx_, lust_re_) \
+                && (lust_rp_ = __builtin_malloc(lust_rx_ * lust_re_)) != 0) {                          \
+                lust_rv_->ptr = lust_rp_;                                                              \
+                lust_rv_->cap = lust_rx_;                                                              \
+            } else {                                                                                   \
+                lust_vec_reserve_exact(lust_rv_, lust_rx_, lust_re_, lust_ra_);                        \
+            }                                                                                          \
+        }                                                                                              \
+        (void)0;                                                                                       \
+    })
 #define lust_vec_push_slot(v, elem, align)                                                             \
     __extension__({                                                                                    \
         lust_Vec *lust_v_ = (v);                                                                       \

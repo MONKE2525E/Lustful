@@ -13495,6 +13495,20 @@ mod tests {
         });
     }
 
+    /// The unit header compiles, and defines each macro once: units build with -w, so a second
+    /// `#define` of a name (an inl.h fast path written twice) would replace the first in
+    /// silence, as a duplicate lust_vec_with_capacity once did.
+    #[test]
+    fn unit_header_defines_each_macro_once() {
+        let dir = std::env::temp_dir().join(format!("lust-unit-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("h.c");
+        std::fs::write(&f, unit_header()).unwrap();
+        let cc = std::process::Command::new("cc").args(["-fsyntax-only", "-std=gnu11"]).arg(&f).output().unwrap();
+        let err = String::from_utf8_lossy(&cc.stderr);
+        assert!(cc.status.success() && !err.contains("redefined"), "{err}");
+    }
+
     /// Release C statics in parts, one static a part (a 1-byte target): a merge that changes one
     /// static's value changes its part and nothing else (the index keeps every registration),
     /// though the statics share pointees across parts (one "hello", one trampoline), and every
