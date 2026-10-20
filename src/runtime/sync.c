@@ -356,15 +356,45 @@ void lust_poison_leave(uint8_t *f) LUST_BODY({
     if (!(*f & 2) && lust_unw_panicking()) *f |= 1;
 })
 
+/* A spin-wait hint for the lock loops below (as kconst.c's). */
+static void lust_lock_pause(void) {
+#if !defined(__TINYC__) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_ia32_pause();
+#elif !defined(__TINYC__) && defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+/* The lock word after up to 100 relaxed loads while it reads `busy` (std's
+   futex locks `spin`): a lock held for a short time is then taken without
+   a futex wait and wake, two syscalls and two context switches. */
+static uint32_t lust_lock_spin(uint32_t *st, uint32_t busy) {
+    uint32_t s;
+    for (int i = 0; i < 100; i++) {
+        __atomic_load(st, &s, 0);
+        if (s != busy) return s;
+        lust_lock_pause();
+    }
+    __atomic_load(st, &s, 0);
+    return s;
+}
+
 /* Mutex states: 0 unlocked, 1 locked, 2 locked with waiters (Drepper's
-   futex mutex, as std's). */
+   futex mutex, as std's: spin first, then mark waiters and sleep). */
 void lust_mutex_lock(uint32_t *st) LUST_BODY({
     uint32_t zero = 0, one = 1, two = 2, old;
     if (__atomic_compare_exchange(st, &zero, &one, 0, 2, 0)) return;
+    uint32_t s = lust_lock_spin(st, 1);
+    if (s == 0) {
+        if (__atomic_compare_exchange(st, &s, &one, 0, 2, 0)) return;
+    }
     for (;;) {
-        __atomic_exchange(st, &two, &old, 2);
-        if (old == 0) return;
+        if (s != 2) {
+            __atomic_exchange(st, &two, &old, 2);
+            if (old == 0) return;
+        }
         lust_futex_wait(st, 2);
+        s = lust_lock_spin(st, 1);
     }
 })
 
@@ -386,7 +416,7 @@ void lust_mutex_unlock(uint32_t *st) LUST_BODY({
    wait then sees the changed state and returns at once. */
 #define LUST_RW_WRITER 0xffffffffu
 void lust_rw_read(uint32_t *st) LUST_BODY({
-    for (;;) {
+    for (int spun = 0;;) {
         uint32_t s;
         __atomic_load(st, &s, 5);
         if (s < LUST_RW_WRITER - 1) {
@@ -394,9 +424,15 @@ void lust_rw_read(uint32_t *st) LUST_BODY({
             if (__atomic_compare_exchange(st, &s, &n, 0, 5, 5)) return;
             continue;
         }
+        /* Written: spin once (as std's spin_read) before sleeping. */
+        if (!spun) {
+            spun = 1;
+            if (lust_lock_spin(st, LUST_RW_WRITER) != LUST_RW_WRITER) continue;
+        }
         __atomic_fetch_add(&st[1], 1, 5);
         lust_futex_wait(st, s);
         __atomic_fetch_sub(&st[1], 1, 5);
+        spun = 0;
     }
 })
 
@@ -419,12 +455,24 @@ void lust_rw_read_unlock(uint32_t *st) LUST_BODY({
 })
 
 void lust_rw_write(uint32_t *st) LUST_BODY({
-    for (;;) {
+    for (int spun = 0;;) {
         uint32_t s = 0, wr = LUST_RW_WRITER;
         if (__atomic_compare_exchange(st, &s, &wr, 0, 5, 5)) return;
+        /* Held: spin once (as std's spin_write) until it is free, then try again. */
+        if (!spun) {
+            spun = 1;
+            uint32_t t;
+            for (int i = 0; i < 100; i++) {
+                __atomic_load(st, &t, 0);
+                if (t == 0) break;
+                lust_lock_pause();
+            }
+            continue;
+        }
         __atomic_fetch_add(&st[1], 1, 5);
         lust_futex_wait(st, s);
         __atomic_fetch_sub(&st[1], 1, 5);
+        spun = 0;
     }
 })
 
