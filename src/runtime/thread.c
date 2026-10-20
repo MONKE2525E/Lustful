@@ -70,6 +70,11 @@ static int lust_tls_ready;
    TLS, so its builds keep the pthread lookup). External: the release
    units' inline lust_tls_cell (runtime/inl.h) reads it too. */
 __thread lust_tls_block *lust_tls_cur;
+/* The calling thread's cell of slot s for s < LUST_TLS_FAST (runtime.h), as the block's
+   cells[s - 1]: the release units' inline lust_tls_cell reads it with one indexed
+   thread-local load. Only a cache of the block's cell pointers, so every access of a
+   slot (tcc or not, inline or not) reaches the same cell. */
+__thread void *lust_tls_fast[LUST_TLS_FAST];
 #endif
 
 static int lust_tls_is_ready(void) {
@@ -112,6 +117,9 @@ static void lust_tls_thread_end(void *p) {
     lust_tls_cur = 0;
 #endif
     for (uint64_t i = 0; i < b->cap; i++) free(b->cells[i]);
+#ifndef __TINYC__
+    memset(lust_tls_fast, 0, sizeof lust_tls_fast);
+#endif
     free(b->cells);
     free(b->dtors);
     free(b);
@@ -156,6 +164,9 @@ static void *lust_tls_cell_slow(uint64_t s, uint64_t size, uint64_t align) {
         c = lust_alloc_zeroed(size ? size : 1, align);
         b->cells[s - 1] = c;
     }
+#ifndef __TINYC__
+    if (s < LUST_TLS_FAST) lust_tls_fast[s] = c;
+#endif
     return c;
 }
 #endif

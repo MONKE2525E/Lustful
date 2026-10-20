@@ -249,16 +249,15 @@
                   && (lust_x_.a.len == 0 || __builtin_memcmp(lust_x_.a.ptr, lust_x_.b.ptr, lust_x_.a.len) == 0)); \
     })
 
-/* A thread-local's cell once the thread made it: thread.c's block (its first fields). */
-typedef struct { void **cells; uint64_t cap; } lust_inl_tls_block_;
-extern __thread lust_inl_tls_block_ *lust_tls_cur;
+/* A thread-local's cell once the thread made it: thread.c's lust_tls_fast holds the cell
+   pointers of the slots below LUST_TLS_FAST (one indexed thread-local load); a slot past it,
+   or a cell this thread has not made yet, takes the function. */
+extern __thread void *lust_tls_fast[];
 #define lust_tls_cell(key, size, align)                                                                \
     __extension__({                                                                                    \
         uint64_t *lust_k_ = (key), lust_s_ = *lust_k_;                                                 \
-        lust_inl_tls_block_ *lust_b_ = lust_tls_cur;                                                   \
-        __builtin_expect(lust_b_ && lust_s_ <= lust_b_->cap && lust_b_->cells[lust_s_ - 1], 1)          \
-            ? lust_b_->cells[lust_s_ - 1]                                                              \
-            : lust_tls_cell(lust_k_, (size), (align));                                                 \
+        void *lust_c_ = __builtin_expect(lust_s_ < LUST_TLS_FAST, 1) ? lust_tls_fast[lust_s_] : (void *)0; \
+        __builtin_expect(lust_c_ != 0, 1) ? lust_c_ : lust_tls_cell(lust_k_, (size), (align));         \
     })
 
 /* Checked add, sub and mul of 64-bit and narrower integers (op 0, 1, 2) with the

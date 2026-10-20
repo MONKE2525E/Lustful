@@ -243,6 +243,9 @@ typedef uint64_t lust_loc;
    call's location argument reads the slot plainly (cgen/names.rs `loc`, `hot_loc`). */
 #define LUST_SO(x) (*(const volatile uint64_t *)&(x))
 extern const uint32_t *lust_fn_line;
+/* thread_local! slots below this have their cell pointer in thread.c's native
+   lust_tls_fast array, for the inline access (inl.h `lust_tls_cell`). */
+#define LUST_TLS_FAST 512
 #ifdef LUST_IMPL
 int lust_argc;
 char **lust_argv;
