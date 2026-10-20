@@ -554,21 +554,29 @@ pub fn stringify_trees(st: &Expander, trees: &[Tt]) -> String {
     text
 }
 
+/// The message `assert_message` gives an `assert!(cond)` whose panic text
+/// lust cannot print as rustc does (rustc breaks it over lines, or the
+/// condition holds an item). In a const context the text is never printed
+/// (a true condition passes, a false one is a compile error either way),
+/// so only lowering a runtime body rejects it (`lower`, L0809).
+pub const ASSERT_TEXT_UNKNOWN: &str = "\u{1}lust: an assert! text rustc prints over lines\u{1}";
+
 /// For `assert!(cond)` with no message: the trees `, "{}", "assertion
 /// failed: <cond>"` to append to its expanded arguments, so the panic
 /// prints rustc's text (see `assert_msg`). The text goes in as an
 /// argument, never as the format string, so braces in it stay literal.
-/// Empty when the call has a message of its own. An error when rustc
-/// prints the condition over several lines (`assert_msg::cond_text`).
+/// Empty when the call has a message of its own. When rustc prints the
+/// condition over several lines (`assert_msg::cond_text`), the argument
+/// is `ASSERT_TEXT_UNKNOWN`.
 pub fn assert_message(st: &mut Expander, inner: &[Tt], span: Span) -> Result<Vec<Tt>, Diag> {
     let args = split_args(inner);
     if args.len() != 1 {
         return Ok(Vec::new());
     }
-    let Some(cond) = super::assert_msg::assert_cond_text(st, &args[0]) else {
-        return Err(assert_text_too_long(span));
+    let text = match super::assert_msg::assert_cond_text(st, &args[0]) {
+        Some(cond) => format!("assertion failed: {cond}"),
+        None => ASSERT_TEXT_UNKNOWN.to_string(),
     };
-    let text = format!("assertion failed: {cond}");
     let comma = Tt::Tok(Token { tok: Tok::Comma, span });
     Ok(vec![comma.clone(), st.str_tree("{}", span), comma, st.str_tree(&text, span)])
 }

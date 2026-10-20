@@ -7321,6 +7321,15 @@ impl<'p> Lower<'p> {
         changed.then_some((args, fmt))
     }
 
+    /// True when an `assert!`'s message is `ASSERT_TEXT_UNKNOWN`: the format
+    /// string itself (the parser's form) or its one `{}` argument (the
+    /// expander's form).
+    fn assert_text_unknown(&self, args: &[ExprId], fmt: &[FmtPiece]) -> bool {
+        let marker = crate::expand::builtin::ASSERT_TEXT_UNKNOWN;
+        fmt.iter().any(|f| matches!(f, FmtPiece::Lit(s) if s == marker))
+            || args.iter().skip(1).any(|&a| matches!(self.p.ast.expr(a), Expr::Str(i) if self.p.ast.strings[*i as usize] == marker))
+    }
+
     fn fmt_parts(&mut self, args: &[ExprId], fmt: &[FmtPiece]) -> Vec<FmtPart> {
         let flat = self.flatten_fmt(args, fmt);
         let (args, fmt) = flat.as_ref().map_or((args, fmt), |(a, f)| (&a[..], &f[..]));
@@ -7583,6 +7592,13 @@ impl<'p> Lower<'p> {
                 self.set_or_temp(dest, rv, ty, span);
             }
             MacroKind::Assert => {
+                // A no-message assert whose text lust cannot print as rustc
+                // does (expand/builtin.rs ASSERT_TEXT_UNKNOWN): a const
+                // context never prints it (a body only borrowck reads,
+                // `check_only`), runtime code would.
+                if !self.check_only() && self.assert_text_unknown(args, fmt) {
+                    self.body.lower_errs.push(crate::expand::builtin::assert_text_too_long(span));
+                }
                 let c = self.operand(args[0]);
                 let (ok, fail) = (self.new_block(), self.new_block());
                 let b = &mut self.body.blocks[self.cur.0 as usize];

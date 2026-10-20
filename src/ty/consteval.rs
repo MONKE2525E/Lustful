@@ -5265,6 +5265,7 @@ impl Evaluator {
                     // "assertion failed: <cond>" text as its format string.
                     let msg = fmt_text(fmt).unwrap_or_else(|| "assertion failed".into());
                     let msg = msg.strip_prefix("assertion failed: ").unwrap_or(&msg);
+                    let msg = if msg == crate::expand::builtin::ASSERT_TEXT_UNKNOWN { "the condition is false" } else { msg };
                     Err(Diag::new(C_OUTSIDE, span, format!("const assertion failed: {msg}"), "Fix the asserted condition."))
                 }
             }
