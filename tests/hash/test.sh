@@ -55,6 +55,24 @@ else
   echo "FAIL: fxvals"; diff <("$oracle" fxvals) <("$work/harness" fxvals) | head -10; fail=1
 fi
 
+# hash.h's inline lookups (a caller's unit, an optimizing compiler) against hash.c's
+# functions (tests/hash/inl.c): both group widths, and on x86_64 the SWAR group at width 16.
+echo "inline lookups against the functions..."
+inl_variants="w16: w8:-DLUST_HASH_GROUP_WIDTH=8"
+[ "$(uname -m)" = x86_64 ] && inl_variants="$inl_variants w16swar:-mno-sse2"
+for v in $inl_variants; do
+  n=${v%%:*} f=${v#*:}
+  if cc -O2 -w $f -DINL_IMPL -c "$root/tests/hash/inl.c" -o "$work/inl-impl-$n.o" &&
+    cc -O2 -w $f -c "$root/tests/hash/inl.c" -o "$work/inl-$n.o" &&
+    cc "$work/inl-$n.o" "$work/inl-impl-$n.o" -o "$work/inl-$n"; then
+    for seed in $(seq 1 "$seeds"); do
+      out=$("$work/inl-$n" "$seed" $((ops * 5))) && echo "  $n $out" || { echo "FAIL: inl-$n seed=$seed: $out"; fail=1; }
+    done
+  else
+    echo "FAIL: inl-$n (build)"; fail=1
+  fi
+done
+
 total_ops=0
 check() {
   # name, stream-kind, oracle-bin, harness-bin, mode, seed

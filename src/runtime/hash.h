@@ -452,30 +452,36 @@ void lust_index_rebuild(lust_index_table *t);
    h1 = hash & mask, a triangular stride of one group, matches in bit order, stop at a group
    with an EMPTY byte. The group test is hash.c's: one SSE2 load on x86_64 (vector builtins:
    units read no system header), its SWAR otherwise (a SWAR tag test may also flag the byte
-   above a match, a candidate eq rejects). */
+   above a match, a candidate eq rejects). It returns the tag matches and sets the EMPTY and
+   the EMPTY-or-DELETED masks (a caller that does not read a mask costs nothing for it). */
 #if LUST_HASH_GROUP_WIDTH == 16 && defined(__SSE2__)
 typedef char lust_hash_v16_ __attribute__((vector_size(16)));
-static inline uint32_t lust_hash_group_(const uint8_t *ctrl, uint8_t tag, uint32_t *empty) {
+static inline uint32_t lust_hash_group_(const uint8_t *ctrl, uint8_t tag, uint32_t *empty, uint32_t *eod) {
     lust_hash_v16_ g, zero = {0};
     __builtin_memcpy(&g, ctrl, 16);
     *empty = (uint32_t)__builtin_ia32_pmovmskb128((lust_hash_v16_)(g == zero + (char)LUST_HASH_EMPTY));
+    *eod = (uint32_t)__builtin_ia32_pmovmskb128(g);
     return (uint32_t)__builtin_ia32_pmovmskb128((lust_hash_v16_)(g == zero + (char)tag));
 }
 #else
-static inline uint32_t lust_hash_bytes_(uint64_t w, uint8_t b) {
-    uint64_t x = w ^ (b * 0x0101010101010101ull);
-    uint64_t spread = (x - 0x0101010101010101ull) & ~x & 0x8080808080808080ull;
+static inline uint32_t lust_hash_spread_bits_(uint64_t spread) {
     return (uint32_t)((((spread >> 7) & 0x0101010101010101ull) * 0x0102040810204080ull) >> 56);
 }
-static inline uint32_t lust_hash_group_(const uint8_t *ctrl, uint8_t tag, uint32_t *empty) {
-    uint32_t tb = 0, eb = 0;
+static inline uint32_t lust_hash_bytes_(uint64_t w, uint8_t b) {
+    uint64_t x = w ^ (b * 0x0101010101010101ull);
+    return lust_hash_spread_bits_((x - 0x0101010101010101ull) & ~x & 0x8080808080808080ull);
+}
+static inline uint32_t lust_hash_group_(const uint8_t *ctrl, uint8_t tag, uint32_t *empty, uint32_t *eod) {
+    uint32_t tb = 0, eb = 0, db = 0;
     for (uint32_t off = 0; off < LUST_HASH_GROUP_WIDTH; off += 8) {
         uint64_t w;
         __builtin_memcpy(&w, ctrl + off, 8);
         tb |= lust_hash_bytes_(w, tag) << off;
         eb |= lust_hash_bytes_(w, LUST_HASH_EMPTY) << off;
+        db |= lust_hash_spread_bits_(w & 0x8080808080808080ull) << off;
     }
     *empty = eb;
+    *eod = db;
     return tb;
 }
 #endif
@@ -483,7 +489,7 @@ static inline void *lust_hash_find_inl_(const lust_hash_table *t, uint64_t hash,
     uint8_t tag = lust_hash_tag(hash);
     uint64_t mask = t->bucket_mask, pos = hash & mask, stride = 0;
     for (;;) {
-        uint32_t empty, m = lust_hash_group_(t->ctrl + pos, tag, &empty);
+        uint32_t empty, eod, m = lust_hash_group_(t->ctrl + pos, tag, &empty, &eod);
         while (m) {
             uint64_t index = (pos + (uint64_t)__builtin_ctz(m)) & mask;
             m &= m - 1;
@@ -499,24 +505,61 @@ static inline void *lust_hash_find_inl_(const lust_hash_table *t, uint64_t hash,
     }
 }
 /* The function reserves room for one first, which may move every element; with room that is
-   a no-op, so a hit is found here. A miss or a full table calls it (it finds the insert
-   index). */
+   a no-op, so the whole search runs here: lh_find_or_insert_inner's single pass, which notes
+   the first EMPTY or DELETED bucket on its way and stops at a group with an EMPTY byte. A
+   miss returns that insert index (fix_insert_index: in a table smaller than a group, a
+   mirror byte can name a full bucket; then it is group 0's first EMPTY or DELETED). A full
+   table calls the function (it grows first). */
 static inline int lust_hash_find_or_insert_inl_(lust_hash_table *t, uint64_t hash, lust_hash_eq_fn eq, void *ctx,
                                                 lust_hash_of_fn hash_of, void *hash_ctx, void **out_slot, uint64_t *out_index) {
-    if (t->growth_left != 0) {
-        uint64_t index;
-        void *slot = lust_hash_find_inl_(t, hash, eq, ctx, &index);
-        if (slot) {
-            if (out_slot) *out_slot = slot;
-            if (out_index) *out_index = index;
-            return 1;
+    if (__builtin_expect(t->growth_left == 0, 0))
+        return lust_hash_find_or_insert(t, hash, eq, ctx, hash_of, hash_ctx, out_slot, out_index);
+    uint8_t tag = lust_hash_tag(hash);
+    uint64_t mask = t->bucket_mask, pos = hash & mask, stride = 0, insert = 0;
+    int have_insert = 0;
+    for (;;) {
+        uint32_t empty, eod, m = lust_hash_group_(t->ctrl + pos, tag, &empty, &eod);
+        while (m) {
+            uint64_t index = (pos + (uint64_t)__builtin_ctz(m)) & mask;
+            m &= m - 1;
+            void *slot = (void *)(t->data + index * t->elem_size);
+            if (eq(ctx, slot)) {
+                if (out_slot) *out_slot = slot;
+                if (out_index) *out_index = index;
+                return 1;
+            }
         }
+        if (!have_insert && eod) {
+            insert = (pos + (uint64_t)__builtin_ctz(eod)) & mask;
+            have_insert = 1;
+        }
+        if (have_insert && empty) {
+            if (__builtin_expect((t->ctrl[insert] & 0x80u) == 0, 0)) {
+                uint32_t e0, d0;
+                (void)lust_hash_group_(t->ctrl, 0, &e0, &d0);
+                insert = d0 ? (uint64_t)__builtin_ctz(d0) : 0;
+            }
+            if (out_index) *out_index = insert;
+            return 0;
+        }
+        stride += LUST_HASH_GROUP_WIDTH;
+        pos = (pos + stride) & mask;
     }
-    return lust_hash_find_or_insert(t, hash, eq, ctx, hash_of, hash_ctx, out_slot, out_index);
+}
+/* lust_hash_insert_at (RawTable::record_item_insert_at): the tag in the bucket's control
+   byte and in its mirror, one more item, one less room when the byte was EMPTY. */
+static inline void *lust_hash_insert_at_inl_(lust_hash_table *t, uint64_t hash, uint64_t index) {
+    uint8_t tag = lust_hash_tag(hash);
+    if (t->ctrl[index] == LUST_HASH_EMPTY) t->growth_left -= 1;
+    t->ctrl[index] = tag;
+    t->ctrl[((index - LUST_HASH_GROUP_WIDTH) & t->bucket_mask) + LUST_HASH_GROUP_WIDTH] = tag;
+    t->items += 1;
+    return (void *)(t->data + index * t->elem_size);
 }
 #define lust_hash_find(t, hash, eq, ctx, out) lust_hash_find_inl_((t), (hash), (eq), (ctx), (out))
 #define lust_hash_find_or_insert(t, hash, eq, ctx, hash_of, hash_ctx, out_slot, out_index) \
     lust_hash_find_or_insert_inl_((t), (hash), (eq), (ctx), (hash_of), (hash_ctx), (out_slot), (out_index))
+#define lust_hash_insert_at(t, hash, index) lust_hash_insert_at_inl_((t), (hash), (index))
 #endif
 
 #ifdef LUST_IMPL
