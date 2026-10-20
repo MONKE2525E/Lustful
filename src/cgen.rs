@@ -2052,9 +2052,9 @@ fn fn_ptr_cast(p: &Program, f: LocalDefId) -> String {
         params.push(format!("{ret}*"));
     }
     params.extend(info.params.iter().map(|&t| cty(&p.tys, t)).filter(|t| !param_dropped(p, t)).map(|t| param_ctype(p, &t)));
-    // `#[track_caller]`: the caller's location (check/caller.rs).
+    // `#[track_caller]`: the caller's location (check/caller.rs, `names::hot_loc`).
     if crate::check::caller::is_track_caller(p, f) {
-        params.push("lust_loc".to_string());
+        params.push("const uint64_t *, uint64_t".to_string());
     }
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
     if ret_is_large(p, f) { format!("(void (*)({params}))") } else { format!("({ret} (*)({params}))") }
@@ -2083,9 +2083,10 @@ fn fn_sig_named(p: &Program, f: LocalDefId, name: &str) -> String {
             .map(|(i, t)| format!("{} p{}", param_ctype(p, &t), i + 1)),
     );
     // `#[track_caller]`: the caller's location, which `FnGen::loc`
-    // reports for every panic in the body (check/caller.rs).
+    // reports for every panic in the body (check/caller.rs): the address
+    // of its slot constant and its line and column bits (`names::hot_loc`).
     if crate::check::caller::is_track_caller(p, f) {
-        params.push("lust_loc ltc".to_string());
+        params.push("const uint64_t *ltc_so, uint64_t ltc_low".to_string());
     }
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
     if ret_is_large(p, f) { format!("void {name}({params})") } else { format!("{ret} {name}({params})") }
@@ -2146,7 +2147,7 @@ fn trampoline(p: &Program, f: LocalDefId, slot: u32) -> String {
     // Check never lets a `#[track_caller]` fn become a value; this keeps
     // the trampoline well formed all the same.
     if crate::check::caller::is_track_caller(p, f) {
-        names.push("0".to_string());
+        names.push("&lust_so_none, 0".to_string());
     }
     if ret_is_large(p, f) {
         let mut params = vec![format!("{ret} *out")];
@@ -2509,7 +2510,7 @@ impl FnGen<'_, '_> {
         // In a `#[track_caller]` fn every panic reports the caller's
         // location, as rustc does (check/caller.rs).
         if crate::check::caller::is_track_caller(self.p, self.body.fn_id) {
-            return "ltc".to_string();
+            return names::LTC_WORD.to_string();
         }
         let span = self.map.call_site(span);
         // A panic site in shipped std source reports std's own file and

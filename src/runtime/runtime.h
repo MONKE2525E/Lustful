@@ -242,11 +242,15 @@ typedef uint64_t lust_loc;
    the cold panic path instead of hoisting it into the fn's hot path. A #[track_caller]
    call's location argument reads the slot plainly (cgen/names.rs `loc`, `hot_loc`). */
 #define LUST_SO(x) (*(const volatile uint64_t *)&(x))
+/* The slot of a location word with no fn slot (a numbered or std word): a #[track_caller]
+   callee gets &lust_so_none and the whole word (cgen/names.rs `hot_loc`). */
+extern const uint64_t lust_so_none;
 extern const uint32_t *lust_fn_line;
 /* thread_local! slots below this have their cell pointer in thread.c's native
    lust_tls_fast array, for the inline access (inl.h `lust_tls_cell`). */
 #define LUST_TLS_FAST 512
 #ifdef LUST_IMPL
+const uint64_t lust_so_none = 0;
 int lust_argc;
 char **lust_argv;
 const char *lust_file;

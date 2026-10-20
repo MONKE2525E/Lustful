@@ -148,13 +148,24 @@ pub(crate) fn loc(slot: u32, rel: u64, col: u64, externs: &mut BTreeSet<String>)
     }
 }
 
-/// `loc`'s text with a plain read of the slot, for a location passed to a
-/// `#[track_caller]` callee on every call: there the C compiler may keep one load for the
-/// whole fn.
+/// A `#[track_caller]` fn's location word, built where one of its panics reports it from
+/// the two parameters its caller passes (`ltc_so`, `ltc_low`; `cgen::fn_sig`): read volatile,
+/// so each panic path keeps its own read, as `loc`'s.
+pub(crate) const LTC_WORD: &str = "(LUST_SO(*ltc_so) | ltc_low)";
+
+/// The two arguments that pass `loc`'s location to a `#[track_caller]` callee: the address
+/// of the slot constant and the line and column bits. Both are constants of the call site,
+/// so where the C compiler inlines the callee they cost nothing until a panic path uses
+/// them (a loaded word was built at the site and held in a register for the whole fn). A
+/// fn that is itself `#[track_caller]` passes its own on; a constant word goes with
+/// `lust_so_none` (runtime.h, 0).
 pub(crate) fn hot_loc(loc: &str) -> String {
+    if loc == LTC_WORD {
+        return "ltc_so, ltc_low".to_string();
+    }
     match loc.strip_prefix("(LUST_SO(").and_then(|r| r.split_once(") | ")) {
-        Some((sym, low)) => format!("({sym} | {low}"),
-        None => loc.to_string(),
+        Some((sym, low)) => format!("&{sym}, {}", low.strip_suffix(')').unwrap_or(low)),
+        None => format!("&lust_so_none, {loc}"),
     }
 }
 

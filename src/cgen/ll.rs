@@ -301,7 +301,7 @@ impl FnGen<'_, '_> {
                         if ok { s.parse::<usize>().ok().filter(|&k| k < bound) } else { None }
                     };
                     let name = match w.as_bytes()[0] {
-                        _ if w == "ltc" => Some(Name::Ltc),
+                        _ if w == "ltc_so" || w == "ltc_low" => Some(Name::Ltc),
                         _ if w == "ex" => Some(Name::Ex),
                         b'l' => num(&w[1..], n).map(Name::Local),
                         b'd' => num(&w[1..], n).filter(|&k| self.local_drop[k] && self.dflags.keeps(k as Local)).map(Name::Drop),
@@ -361,8 +361,8 @@ impl FnGen<'_, '_> {
                     args.push(format!("ptr %m{l}_{k}"));
                 }
                 Name::Ltc => {
-                    params.push("lust_loc *qltc".to_string());
-                    args.push("ptr %ltc".to_string());
+                    params.push("const uint64_t **qltc_so, uint64_t *qltc_low".to_string());
+                    args.push("ptr %ltc_so, ptr %ltc_low".to_string());
                 }
                 Name::Ex => ex = true,
             }
@@ -758,8 +758,8 @@ impl FnGen<'_, '_> {
             }
         }
         if crate::check::caller::is_track_caller(p, fid) {
-            params.push("i64 noundef %ltc.v".into());
-            entry.push_str("  %ltc = alloca i64, align 8\n  store i64 %ltc.v, ptr %ltc\n");
+            params.push("ptr noundef %ltc_so.v, i64 noundef %ltc_low.v".into());
+            entry.push_str("  %ltc_so = alloca ptr, align 8\n  store ptr %ltc_so.v, ptr %ltc_so\n  %ltc_low = alloca i64, align 8\n  store i64 %ltc_low.v, ptr %ltc_low\n");
         }
         let mut allocas = String::new();
         for (i, t) in self.local_cty.iter().enumerate() {
@@ -890,7 +890,8 @@ impl FnGen<'_, '_> {
             }
         }
         if crate::check::caller::is_track_caller(p, fid) {
-            def(&mut self.out, "ltc".into(), "(*qltc)".into());
+            def(&mut self.out, "ltc_so".into(), "(*qltc_so)".into());
+            def(&mut self.out, "ltc_low".into(), "(*qltc_low)".into());
         }
         if kstr_init.is_some() {
             if !self.kstrs.is_empty() {
@@ -979,7 +980,8 @@ impl FnGen<'_, '_> {
             }
         }
         if crate::check::caller::is_track_caller(p, f) {
-            args.push("ltc".into());
+            args.push("ltc_so".into());
+            args.push("ltc_low".into());
         }
         let call = format!("fl_{id}({})", args.join(", "));
         let body = match (rp, large) {
@@ -1057,7 +1059,7 @@ impl FnGen<'_, '_> {
             }
         }
         if crate::check::caller::is_track_caller(p, f) {
-            all.push(loc.to_string());
+            all.push(super::names::hot_loc(loc));
         }
         let call = format!("fl_{id}({})", all.join(", "));
         match rp {
@@ -1655,10 +1657,11 @@ impl FnGen<'_, '_> {
         if !has_generated_body(p, f) {
             return false;
         }
-        // A `#[track_caller]` callee takes this call's location word last (`fl_` has an i64
-        // parameter for it, as the C wrapper has `lust_loc`).
+        // A `#[track_caller]` callee takes this call's location last, as the address of its
+        // slot constant and its line and column bits (`fl_` has a ptr and an i64 parameter
+        // for them, as the C wrapper has; `names::hot_loc`).
         let loc = if crate::check::caller::is_track_caller(p, f) {
-            match loc_word(&super::names::hot_loc(&self.loc(span))) {
+            match loc_word(&self.loc(span)) {
                 Some(w) => Some(w),
                 None => return false,
             }
@@ -1809,8 +1812,7 @@ impl FnGen<'_, '_> {
             }
         }
         if let Some(w) = loc {
-            let v = ll_loc_value(ll, &w, k);
-            vals.push(format!("i64 {v}"));
+            vals.push(ll_loc_args(ll, &w, k));
         }
         for flag in &clears {
             let _ = writeln!(ll.body, "  store i8 0, ptr {flag}");
@@ -2955,11 +2957,34 @@ fn source_fn_attrs(p: &Program, f: LocalDefId) -> String {
     out
 }
 
+/// The two arguments that pass location word `w` to a `#[track_caller]` callee (names
+/// numbered `k`): the slot constant's address and the line and column bits, as cgen's
+/// `names::hot_loc` passes them; the calling fn's own pair when it is `#[track_caller]` too.
+fn ll_loc_args(ll: &mut Ll, w: &LocWord, k: usize) -> String {
+    match w {
+        LocWord::Ltc => {
+            let _ = writeln!(ll.body, "  %las{k} = load ptr, ptr %ltc_so\n  %lal{k} = load i64, ptr %ltc_low");
+            format!("ptr %las{k}, i64 %lal{k}")
+        }
+        LocWord::Const(n) => {
+            ll.decls.insert("@lust_so_none = external constant i64".to_string());
+            format!("ptr @lust_so_none, i64 {n}")
+        }
+        LocWord::Slot(id, low, _) => {
+            ll.decls.insert(format!("@lust_so_{id} = external constant i64"));
+            format!("ptr @lust_so_{id}, i64 {low}")
+        }
+    }
+}
+
 /// Emits location word `w` as an LLVM `i64` value (names numbered `k`).
 fn ll_loc_value(ll: &mut Ll, w: &LocWord, k: usize) -> String {
     match w {
         LocWord::Ltc => {
-            let _ = writeln!(ll.body, "  %lc{k} = load i64, ptr %ltc");
+            let _ = writeln!(
+                ll.body,
+                "  %lcs{k} = load ptr, ptr %ltc_so\n  %lcw{k} = load volatile i64, ptr %lcs{k}\n  %lcl{k} = load i64, ptr %ltc_low\n  %lc{k} = or i64 %lcw{k}, %lcl{k}"
+            );
             format!("%lc{k}")
         }
         LocWord::Const(n) => n.to_string(),
@@ -2980,14 +3005,15 @@ enum LocWord {
     Const(u64),
     /// `(LUST_SO(lust_so_<id>) | <low>ull)`: the fn's location slot (a constant of the
     /// location unit, already shifted above the line and column bits) or'd with them; read
-    /// volatile (`true`, a panic site: kept on the cold path) or plain (`names::hot_loc`,
-    /// `(lust_so_<id> | <low>ull)`, a call's argument).
+    /// volatile (`true`, a panic site: kept on the cold path) or plain (`(lust_so_<id> |
+    /// <low>ull)`). A `#[track_caller]` call passes the slot's address and the bits instead
+    /// (`ll_loc_args`).
     Slot(String, u64, bool),
 }
 
 /// Parses cgen's C text for a location word (`FnGen::loc`); None for another form.
 fn loc_word(c: &str) -> Option<LocWord> {
-    if c == "ltc" {
+    if c == super::names::LTC_WORD {
         return Some(LocWord::Ltc);
     }
     if let Some(n) = c.strip_suffix("ull").or_else(|| c.strip_suffix('u'))
@@ -3026,7 +3052,7 @@ fn ll_proto(p: &Program, f: LocalDefId, id: &str) -> String {
         }
     }
     if crate::check::caller::is_track_caller(p, f) {
-        params.push("lust_loc".into());
+        params.push("const uint64_t *, uint64_t".into());
     }
     let fret = match rp {
         Pass::Scalar(..) => rt,
@@ -3070,7 +3096,7 @@ fn ll_decl(p: &Program, f: LocalDefId, id: &str) -> String {
         }
     }
     if crate::check::caller::is_track_caller(p, f) {
-        params.push("i64".into());
+        params.push("ptr, i64".into());
     }
     format!("declare {ret} @fl_{id}({})", params.join(", "))
 }
