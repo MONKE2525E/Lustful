@@ -2536,6 +2536,21 @@ fn resolved_setup(
     Ok((map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines, body_hashes, Some(tables)))
 }
 
+/// Source file `p` as a binary's panic locations name it (the location unit): lust's own
+/// library files (adapter and shim crates, the std platform crate) as `library/<path>`, as
+/// lust's messages name them, so a binary does not depend on where lust is installed; under
+/// Cargo, relative to the workspace root, as rustc prints it; else as the user typed the root
+/// path (`client_view`).
+fn location_path(p: &str, library: &Path, display_root: Option<&Path>, client: &expand::ClientView) -> String {
+    if let Ok(rel) = Path::new(p).strip_prefix(library) {
+        return format!("library/{}", rel.to_string_lossy());
+    }
+    match display_root.and_then(|r| Path::new(p).strip_prefix(r).ok()) {
+        Some(rel) => rel.to_string_lossy().into_owned(),
+        None => client.shown(p),
+    }
+}
+
 pub fn compile(req: &Request, session: &mut Session) -> Response {
     let mut t = Timer::new();
     crate::driver::cache::begin_build(&req.file);
@@ -4705,17 +4720,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         slot_lines[slot(i)] = line_base_of(front, i);
         slot_files[slot(i)] = fn_files[i];
     }
-    // Paths as rustc prints them: under Cargo, relative to the workspace root.
-    let file_paths: Vec<String> = (0..map.file_count())
-        .map(|f| {
-            let p = map.path(FileId(f as u32));
-            // Else as the user typed the root path (`client_view`).
-            match front.display_root.as_deref().and_then(|r| Path::new(p).strip_prefix(r).ok()) {
-                Some(rel) => rel.to_string_lossy().into_owned(),
-                None => front.client.shown(p),
-            }
-        })
-        .collect();
+    let library = crate::resolve::adapters::library_root();
+    let file_paths: Vec<String> =
+        (0..map.file_count()).map(|f| location_path(map.path(FileId(f as u32)), &library, front.display_root.as_deref(), &front.client)).collect();
     let file_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
     let files = cgen::SlotFiles { paths: &file_refs, of_slot: &slot_files };
     // The location unit rebuilds only when its tables change (see
@@ -5776,6 +5783,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
 mod tests {
     use super::*;
     use crate::intern::Known;
+
+    /// A binary names lust's own library files by their path under `library/`, wherever lust
+    /// is installed, and a workspace file relative to the workspace root.
+    #[test]
+    fn location_paths_do_not_hold_the_install_path() {
+        let client = expand::ClientView { env: None, shown_root: None };
+        let at = |lust: &str, p: &str| location_path(&format!("{lust}{p}"), &Path::new(lust).join("library"), Some(Path::new("/ws")), &client);
+        for lust in ["/opt/lust", "/home/u/tools/lust-0.2"] {
+            assert_eq!(at(lust, "/library/deps/bumpalo/src/lib.rs"), "library/deps/bumpalo/src/lib.rs");
+            assert_eq!(at(lust, "/library/std/src/platform.rs"), "library/std/src/platform.rs");
+        }
+        assert_eq!(location_path("/ws/crates/a/src/lib.rs", Path::new("/opt/lust/library"), Some(Path::new("/ws")), &client), "crates/a/src/lib.rs");
+        assert_eq!(location_path("/elsewhere/x.rs", Path::new("/opt/lust/library"), Some(Path::new("/ws")), &client), "/elsewhere/x.rs");
+    }
 
     /// The output of a binary just built. libtcc writes it without O_CLOEXEC, so a child
     /// another test thread spawns meanwhile can hold it open for writing (ETXTBSY): retry
