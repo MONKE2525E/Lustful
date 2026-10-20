@@ -2566,7 +2566,20 @@ impl FnGen<'_, '_> {
         }
         // Release C bodies are extern: other units call them directly (`names`).
         let linkage = if names::release() { "" } else { "static " };
+        // The fn's own text starts here: the in-place rename below stays inside it (not the
+        // frame struct before it, nor the cleanup fn after it).
+        let body_start = self.out.len();
         let _ = writeln!(self.out, "/* {} */\n{linkage}{} {{", p.display_path(p.fn_info(fid).name), fn_sig(p, fid, slot));
+        // Release C: a by-pointer parameter whose local the unwind frame holds lives in memory
+        // anyway (the cleanup's drop takes its address, so the C compiler keeps it there), and
+        // its copy-in was a real copy. The body uses the caller's fresh copy (`spill_by_ptr`)
+        // in place, `(*p{i})` (the rename below): the callee owns it until it returns.
+        let in_place: Vec<usize> = (1..=self.body.arg_count)
+            .filter(|&i| {
+                let t = &self.local_cty[i];
+                members.get(i).is_some_and(|m| !m.is_empty()) && param_by_ptr(p, t) && !param_dropped(p, t) && names::release() && !ll::on(p)
+            })
+            .collect();
         // Locals grouped by C type. No initializers: the borrow checker proves every read is
         // after a write. Drop flags start at 0, except for parameters, which own their values.
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
@@ -2596,6 +2609,10 @@ impl FnGen<'_, '_> {
                 for k in 0..self.move_paths[i].len() {
                     frame_init.push(format!("L.m{i}_{k} = 1;"));
                 }
+            }
+            if in_place.contains(&i) {
+                // No local: it is the pointee, `(*p{i})`.
+                continue;
             }
             // A dropped parameter (see `param_dropped`) has no `p{i}`; its
             // local is the one possible value of a zero-sized type.
@@ -2699,6 +2716,12 @@ impl FnGen<'_, '_> {
         self.blocks(&order);
         self.kstr_finish();
         self.out.push_str("}\n");
+        if !in_place.is_empty() {
+            let map: Vec<(String, String)> = in_place.iter().map(|i| (format!("l{i}"), format!("(*p{i})"))).collect();
+            let text = rename_idents(&self.out[body_start..], &map);
+            self.out.truncate(body_start);
+            self.out.push_str(&text);
+        }
         for (i, ..) in &high {
             let _ = writeln!(self.out, "#undef l{i}");
         }
@@ -10116,6 +10139,51 @@ pub fn glue_unit(p: &Program, g: &GlueSet) -> String {
     c
 }
 
+/// `text` with each identifier token that `map` names replaced, outside comments and string
+/// and character literals: an in-place parameter's local `l{i}` becomes `(*p{i})` in its body
+/// (`FnGen::function`). Whole identifiers only, so `l1` leaves `l10` alone.
+fn rename_idents(text: &str, map: &[(String, String)]) -> String {
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            b'"' | b'\'' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                out.push_str(&text[start..i]);
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = text[i + 2..].find("*/").map_or(b.len(), |k| i + 2 + k + 2);
+                out.push_str(&text[start..i]);
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(b.len(), |k| i + k);
+                out.push_str(&text[start..i]);
+            }
+            c if ident(c) => {
+                while i < b.len() && ident(b[i]) {
+                    i += 1;
+                }
+                let w = &text[start..i];
+                out.push_str(map.iter().find(|(f, _)| f == w).map_or(w, |(_, t)| t.as_str()));
+            }
+            _ => {
+                let ch = text[i..].chars().next().unwrap_or(' ');
+                i += ch.len_utf8().max(1);
+                out.push_str(&text[start..i.min(b.len())]);
+            }
+        }
+    }
+    out
+}
+
 /// One enum or Option value as a compound literal from its field value
 /// texts, in field order. Shared by function codegen (`make_variant`)
 /// and constant initializers (`const_init`), whose file-scope globals
@@ -13531,6 +13599,45 @@ mod tests {
             assert!(unit.contains("inline void drop_Gd_"), "the guard's drop glue is inline:\n{unit}");
             assert!(!unit.contains(&format!("struct {} {{", ctype(&big))), "the unit defines no {}:\n{unit}", ctype(&big));
             assert!(!unit.contains(&format!("RcI_{} {{", mangle(&big))), "the unit defines no count block of {}:\n{unit}", ctype(&big));
+        });
+    }
+
+    /// Release C with unwind tables: a by-pointer parameter whose drop the cleanup can run is
+    /// used in place, `(*p2)`, with no copy-in, and the frame points at the pointee; one with
+    /// nothing to drop (no frame) keeps its copy-in.
+    #[test]
+    fn frame_held_param_is_used_in_place() {
+        let src = "struct Big { s: String, a: u64, b: u64 }\nstruct Plain { a: u64, b: u64, c: u64 }\n\
+                   #[inline(never)]\nfn check(n: usize) { if n > 1000 { panic!(\"too many\"); } }\n\
+                   #[inline(never)]\nfn keep(v: &mut Vec<Big>, b: Big) { check(v.len()); v.push(b); }\n\
+                   #[inline(never)]\nfn sum(b: Plain) -> u64 { b.a ^ b.c }\n\
+                   fn main() { let mut v = Vec::new(); keep(&mut v, Big { s: String::new(), a: 1, b: 2 }); println!(\"{}\", sum(Plain { a: 3, b: 4, c: 5 }) + v.len() as u64); }\n";
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let mut program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        (program.unwind, program.unwind_tables) = (true, true);
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let n = program.fns.len();
+        let slots: Vec<u32> = (0..n as u32).collect();
+        let names = std::sync::Arc::new(names::Names {
+            fns: (0..n).map(|s| Some(format!("{s:016x}"))).collect(),
+            adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
+            by_id: Default::default(),
+        });
+        let [keep, sum] = ["keep", "sum"].map(|f| program.fn_names[&interner.intern(f)]);
+        names::with(Some(&names), || {
+            let code = |f: LocalDefId| {
+                let (ck, errs) = check_fn(&program, f);
+                assert!(errs.is_empty(), "{errs:?}");
+                gen_fn(&program, &crate::lower::lower(&program, f, ck), &map, 1, &slots).code
+            };
+            let (kc, sc) = (code(keep), code(sum));
+            assert!(!kc.contains("l2 = *p2") && kc.contains("L.pl2 = &(*p2);"), "keep uses its parameter in place:\n{kc}");
+            assert!(sc.contains("l1 = *p1"), "sum, whose parameter has nothing to drop (no frame), copies it in:\n{sc}");
         });
     }
 
