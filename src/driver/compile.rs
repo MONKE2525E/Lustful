@@ -5067,28 +5067,58 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // the glue shards and every other part of the assembly below, not before the fn units.
             let late_statics = !llvm_on;
             let early: Vec<usize> = c_jobs.iter().copied().filter(|&u| !(late_statics && u == 1)).collect();
-            let first: Vec<usize> = early.iter().copied().chain(0..rg.len()).collect();
+            // With C units only, the early C units are a pass of their own (below), and the first
+            // pass makes the inline sets alone.
+            let n_early = if late_statics { 0 } else { early.len() };
+            let first: Vec<usize> = early[..n_early].iter().copied().chain(0..rg.len()).collect();
+            // The last build's records name their reads by index in the session's table: the
+            // pass below fingerprints each distinct one once (many units read one type).
+            let old_ids: Vec<u32> = if !b1_record || caches.unit_records.is_empty() {
+                Vec::new()
+            } else {
+                let mut used = vec![false; caches.unit_reads.len()];
+                caches.unit_records.values().flat_map(|u| &u.reads).for_each(|&(i, _)| used[i as usize] = true);
+                (0..caches.unit_reads.len() as u32).filter(|&i| used[i as usize]).collect()
+            };
+            b1_ms[1] = t_b1.elapsed().as_secs_f64() * 1e3 - b1_ms[0];
+            // B1's shards of the last build's reads, a pass of their own: `par_map` hands out a
+            // pass's jobs in batches, so behind thousands of cheap jobs a few workers took them all.
+            let id_parts: Vec<&[u32]> = if old_ids.is_empty() { Vec::new() } else { old_ids.chunks(old_ids.len().div_ceil(b1_shards)).collect() };
             std::thread::scope(|sc| {
                 let statics = late_statics.then(|| sc.spawn(|| assemble(1, &[], None)));
-                // The glue shards, beside the statics unit: after them it was the critical path
-                // of a build with few changes.
-                rshards = cgen::names::with(rn, || cgen::names::glue_shard_texts(&program, &caches.glue, &shard_keys));
-                if let Some(a) = &adapters {
-                    let new = par_map(&rshards, |t| a.adapt(t, |_| false));
-                    for (t, n) in rshards.iter_mut().zip(new) {
-                        if let Some(n) = n {
-                            *t = n;
+                // Beside the glue shards: the statics unit, the C units (with C units only) and B1's
+                // fingerprints of the last build's reads, each a pass of its own on the pool. None
+                // reads the shards, and on a build with few changes each in turn ended the assembly.
+                // (B1's records change after these, so its pass has a scope of its own.)
+                let reads = &caches.unit_reads;
+                let (early_made, parts) = std::thread::scope(|inner| {
+                    let early_c = late_statics.then(|| inner.spawn(|| par_map(&early, |&u| assemble(u, &[], None))));
+                    let fps = inner.spawn(|| {
+                        par_map(&(0..id_parts.len()).collect::<Vec<_>>(), |&t| -> Vec<(u32, (u64, u64))> {
+                            id_parts[t].iter().map(|&i| (i, read_fp(reads.get(i)))).collect()
+                        })
+                    });
+                    rshards = cgen::names::with(rn, || cgen::names::glue_shard_texts(&program, &caches.glue, &shard_keys));
+                    if let Some(a) = &adapters {
+                        let new = par_map(&rshards, |t| a.adapt(t, |_| false));
+                        for (t, n) in rshards.iter_mut().zip(new) {
+                            if let Some(n) = n {
+                                *t = n;
+                            }
                         }
                     }
-                }
-                if let Some(s) = &stream {
-                    let first = FIRST_FN_UNIT + rg.len();
-                    par_map(&(0..n_shards).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first + j), &rshards[j]));
-                }
+                    if let Some(s) = &stream {
+                        let first = FIRST_FN_UNIT + rg.len();
+                        par_map(&(0..n_shards).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first + j), &rshards[j]));
+                    }
+                    let early_made = early_c.map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).unwrap_or_default();
+                    (early_made, fps.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                });
                 let mut made = Vec::with_capacity(jobs.len());
+                made.extend(early_made);
                 let mut inl: Vec<Vec<usize>> = Vec::with_capacity(rg.len());
                 for (k, r) in par_map(&(0..first.len()).collect::<Vec<_>>(), |&k| {
-                    if k < early.len() {
+                    if k < n_early {
                         Ok(assemble(first[k], &[], None))
                     } else {
                         Err(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of, hot.as_ref()))
@@ -5100,28 +5130,13 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     match r {
                         Ok(m) => made.push(m),
                         Err(set) => {
-                            debug_assert!(k >= early.len());
+                            debug_assert!(k >= n_early);
                             inl.push(set)
                         }
                     }
                 }
-                // The last build's records name their reads by index in the session's table: the
-                // pass below fingerprints each distinct one once (many units read one type).
                 let table = &caches.unit_reads;
-                let old_ids: Vec<u32> = if !b1_record || caches.unit_records.is_empty() {
-                    Vec::new()
-                } else {
-                    let mut used = vec![false; table.len()];
-                    caches.unit_records.values().flat_map(|u| &u.reads).for_each(|&(i, _)| used[i as usize] = true);
-                    (0..table.len() as u32).filter(|&i| used[i as usize]).collect()
-                };
-                let id_parts: Vec<&[u32]> = if old_ids.is_empty() { Vec::new() } else { old_ids.chunks(old_ids.len().div_ceil(b1_shards)).collect() };
-                let shard_jobs = id_parts.len();
-                let fingerprint_shard = |t: usize| -> Vec<(u32, (u64, u64))> { id_parts[t].iter().map(|&i| (i, read_fp(table.get(i)))).collect() };
-                b1_ms[1] = t_b1.elapsed().as_secs_f64() * 1e3 - b1_ms[0];
-                // B1's shards of the last build's reads, a pass of their own: `par_map` hands out a
-                // pass's jobs in batches, so behind thousands of cheap jobs a few workers took them all.
-                let parts: Vec<Vec<(u32, (u64, u64))>> = par_map(&(0..shard_jobs).collect::<Vec<_>>(), |&t| fingerprint_shard(t));
+                let parts: Vec<Vec<(u32, (u64, u64))>> = parts;
                 let mut now: Vec<Option<(u64, u64)>> = vec![None; if parts.is_empty() { 0 } else { table.len() }];
                 parts.into_iter().flatten().for_each(|(i, f)| now[i as usize] = Some(f));
                 // B1: each unit still clean by its last record keeps its old fingerprint; skipped
