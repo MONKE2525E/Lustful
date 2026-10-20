@@ -805,6 +805,46 @@ fn main() {{
 """
 
 
+def glue_shape(v):
+    """A generic Adt's derive glue answer (2026-10-20: a template reads the Adt's glue shape, not
+    its deep Structure). `#[derive(Clone)] Slot<T>` holds a `Holder` and a `Cell<Flag>`; a generic
+    fn clones a `Slot<T>` inside a closure. v1: `Holder` loses `Clone` (rejected), v2 restores it,
+    v3: `Flag` loses `Copy` (a `Cell<Flag>` no longer clones: rejected), v4 restores it."""
+    holder = "#[derive(Clone)]\n" if v != 1 else ""
+    flag = "#[derive(Clone, Copy)]" if v != 3 else "#[derive(Clone)]"
+    return f"""use std::cell::Cell;
+
+{holder}struct Holder {{
+    n: u32,
+}}
+
+{flag}
+struct Flag {{
+    on: bool,
+}}
+
+#[derive(Clone)]
+struct Slot<T> {{
+    t: T,
+    holder: Holder,
+    flag: Cell<Flag>,
+}}
+
+fn twice<T: Clone>(s: &Slot<T>) -> (Slot<T>, u32) {{
+    let make = || s.clone();
+    let a = make();
+    let n = a.holder.n + {v};
+    (a, n)
+}}
+
+fn main() {{
+    let s = Slot {{ t: 7u64, holder: Holder {{ n: 2 }}, flag: Cell::new(Flag {{ on: true }}) }};
+    let (c, n) = twice(&s);
+    println!("{{}} {{}} {{}}", c.t, n, c.flag.get().on);
+}}
+"""
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -974,6 +1014,7 @@ def corpus():
     seqs.append(("later-patch", [later_patch(v) for v in range(5)]))
     seqs.append(("sources-late", [late_sources(v) for v in range(4)], {"late": True}))
     seqs.append(("auto-shape", [auto_shape(v) for v in range(5)]))
+    seqs.append(("glue-shape", [glue_shape(v) for v in range(5)]))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))

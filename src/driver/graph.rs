@@ -1534,8 +1534,8 @@ fn answer_fingerprint(p: &Program, def: DefId, kind: u8) -> Fingerprint {
                 _ => c::has_default(p, &tys, t).hash(&mut h),
             }
         });
-    } else if let Some(shape) = (kind == answer::AUTO).then(|| auto_shape(p, def)).flatten() {
-        ("auto-shape", shape).hash(&mut h);
+    } else if let Some(shape) = adt_shape(p, def, kind != answer::AUTO) {
+        ("shape", kind != answer::AUTO, shape).hash(&mut h);
     } else {
         structure_fingerprint(p, def).0.hash(&mut h);
     }
@@ -1546,7 +1546,7 @@ fn answer_fingerprint(p: &Program, def: DefId, kind: u8) -> Fingerprint {
     Fingerprint(v)
 }
 
-/// The auto shape of a user Adt with type or lifetime params: what its auto
+/// The auto shape of a user Adt with type or lifetime params (`glue` false): what its auto
 /// trait answers (`Send`, `Sync`, `Unpin`) for any instance are a function of,
 /// with the auto answers of the instance's args (which a reader records
 /// itself: `record_structure_reads` walks the instance type). Auto traits are
@@ -1558,8 +1558,14 @@ fn answer_fingerprint(p: &Program, def: DefId, kind: u8) -> Fingerprint {
 /// raw pointer, which answers nothing of its target, by itself. None when a
 /// field holds a type the shape does not cover (a closure, an opaque type, a
 /// projection): its `Answer` fingerprint is then the deep `Structure` one.
-pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
-    fn adt(p: &Program, def: DefId, visiting: &mut Vec<DefId>) -> Option<u64> {
+///
+/// With `glue` it is the glue shape instead, for the derive glue answers
+/// (`Clone`, `PartialEq`, `Eq`, `PartialOrd`, `Default`; `record_glue_reads`):
+/// the Adt's derive list and its written std and lang trait impls in place of
+/// its auto impls, and a closed user Adt counting by all five glue answers and
+/// whether it is `Copy` (a `Cell<T>` clones when `T` is).
+pub(crate) fn adt_shape(p: &Program, def: DefId, glue: bool) -> Option<u64> {
+    fn adt(p: &Program, def: DefId, glue: bool, visiting: &mut Vec<DefId>) -> Option<u64> {
         if let Some(k) = visiting.iter().position(|&d| d == def) {
             let mut h = FxHasher::default();
             ("auto-shape-back", k).hash(&mut h);
@@ -1568,8 +1574,12 @@ pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
         let a = p.adt_by_def(def)?;
         visiting.push(def);
         let mut h = FxHasher::default();
-        "auto-shape-v2".hash(&mut h);
+        ("adt-shape-v3", glue).hash(&mut h);
         hash_def_pub(&mut h, p, def);
+        if glue {
+            derives_fingerprint(p, def).0.hash(&mut h);
+            lang_impls_fingerprint(p, def).0.hash(&mut h);
+        }
         // The written impls of auto traits on the Adt (an `unsafe impl Send`):
         // the only impls an auto answer reads. Mono adds synthetic impls (glue,
         // `Drop` of instances) while it runs, which must not move the shape.
@@ -1579,7 +1589,7 @@ pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
             .index
             .impls_naming(def)
             .map(|id| p.gx.index.peek(id))
-            .filter(|rec| lang.is_auto(rec.trait_def) && rec.synthetic == crate::traits::index::Synthetic::None)
+            .filter(|rec| !glue && lang.is_auto(rec.trait_def) && rec.synthetic == crate::traits::index::Synthetic::None)
             .map(|rec| {
                 let mut h = FxHasher::default();
                 hash_trait_ref(&mut h, p, &p.tys, &rec.trait_ref);
@@ -1593,7 +1603,7 @@ pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
         for v in &p.adts[a.0 as usize].variants {
             v.fields.len().hash(&mut h);
             for f in &v.fields {
-                if ty(p, f.ty, visiting, &mut h).is_none() {
+                if ty(p, f.ty, glue, visiting, &mut h).is_none() {
                     ok = false;
                 }
             }
@@ -1601,15 +1611,23 @@ pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
         visiting.pop();
         ok.then(|| h.finish())
     }
-    fn ty(p: &Program, t: Ty, visiting: &mut Vec<DefId>, h: &mut FxHasher) -> Option<()> {
+    fn ty(p: &Program, t: Ty, glue: bool, visiting: &mut Vec<DefId>, h: &mut FxHasher) -> Option<()> {
         let tys = &p.tys;
         match tys.kind(t) {
             TyKind::Adt(d, args) => {
                 if p.user_adt(d) {
-                    if closed_adt(p, d) {
+                    if closed_adt(p, d) && !glue {
                         ("closed", answer_fingerprint(p, d, answer::AUTO).0).hash(h);
+                    } else if closed_adt(p, d) {
+                        "closed-glue".hash(h);
+                        for k in [answer::CLONE, answer::PARTIAL_EQ, answer::EQ, answer::PARTIAL_ORD, answer::DEFAULT] {
+                            answer_fingerprint(p, d, k).0.hash(h);
+                        }
+                        let mut tys = crate::ty::Tys::new(&p.tys);
+                        let t = tys.mk_adt(d, &[]);
+                        crate::check::collect::is_copy(p, &tys, t).hash(h);
                     } else {
-                        ("generic", adt(p, d, visiting)?).hash(h);
+                        ("generic", adt(p, d, glue, visiting)?).hash(h);
                     }
                 } else {
                     "std".hash(h);
@@ -1617,7 +1635,7 @@ pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
                 }
                 for g in tys.args(args) {
                     match *g {
-                        GenericArg::Ty(e) => ty(p, e, visiting, h)?,
+                        GenericArg::Ty(e) => ty(p, e, glue, visiting, h)?,
                         GenericArg::Const(c) => ("const", tys.const_kind(c)).hash(h),
                         GenericArg::Lifetime(_) => {}
                     }
@@ -1626,20 +1644,20 @@ pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
             TyKind::RawPtr(m, _) => ("raw", m.is_mut()).hash(h),
             TyKind::Ref(_, m, e) => {
                 ("ref", m.is_mut()).hash(h);
-                ty(p, e, visiting, h)?;
+                ty(p, e, glue, visiting, h)?;
             }
             TyKind::Slice(e) => {
                 "slice".hash(h);
-                ty(p, e, visiting, h)?;
+                ty(p, e, glue, visiting, h)?;
             }
             TyKind::Array(e, n) => {
                 ("array", tys.const_kind(n)).hash(h);
-                ty(p, e, visiting, h)?;
+                ty(p, e, glue, visiting, h)?;
             }
             TyKind::Tuple(ts) => {
                 ("tuple", tys.tys_of(ts).len()).hash(h);
                 for &e in tys.tys_of(ts) {
-                    ty(p, e, visiting, h)?;
+                    ty(p, e, glue, visiting, h)?;
                 }
             }
             TyKind::Param(i) => ("param", i.0).hash(h),
@@ -1651,7 +1669,9 @@ pub(crate) fn auto_shape(p: &Program, def: DefId) -> Option<u64> {
     if !p.user_adt(def) || closed_adt(p, def) {
         return None;
     }
-    adt(p, def, &mut Vec::new())
+    // The walk reads derive lists and asks `Copy` of closed Adts: it must note
+    // nothing into a body check that records this read.
+    crate::check::derive_delta::unlogged(|| adt(p, def, glue, &mut Vec::new()))
 }
 
 /// `ReadKey::Answer` kinds per Adt in the program memo.
@@ -2795,8 +2815,8 @@ impl<'a> Program {
     /// glue walk, `kind` of `answer`) about one type: for every Adt inside
     /// it that the walk looks at (not behind the pointers whose answer is
     /// fixed, `Behind`: `Rc<Checker>: Clone` reads nothing of `Checker`),
-    /// the `Answer` of a user Adt with no generic params, else its
-    /// `Structure`.
+    /// the `Answer` of a user Adt (for one with params, its shape:
+    /// `adt_shape`), else its `Structure`.
     pub(crate) fn record_structure_reads(&self, reads: &mut Reads, tys: &impl TyIntern, t: Ty, behind: Behind, kind: u8) {
         if reads.off {
             return;
@@ -2806,10 +2826,10 @@ impl<'a> Program {
         defs.sort_unstable_by_key(|d| (d.krate.0, d.hash.0));
         defs.dedup();
         for def in defs {
-            // A generic (or lifetime-generic) Adt's auto trait answer reads its
-            // auto shape (`auto_shape`, through `answer_fingerprint`) in place of
-            // its whole deep `Structure`.
-            if self.user_adt(def) && (closed_adt(self, def) || kind == answer::AUTO) {
+            // A generic (or lifetime-generic) Adt's answer reads its shape
+            // (`adt_shape`, through `answer_fingerprint`) in place of its whole
+            // deep `Structure`.
+            if self.user_adt(def) {
                 reads.record_with(ReadKey::Answer(def, kind), false, || answer_fingerprint(self, def, kind));
             } else {
                 let known = self.adt_by_def(def).is_some() || self.defs.get(def).is_some();
