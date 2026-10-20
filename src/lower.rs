@@ -752,12 +752,92 @@ impl<'p> Lower<'p> {
     /// section 7.2). The path comes from the shared ladder
     /// (`unwind_block`), never from a fresh copy per call.
     fn call_into(&mut self, target: CallTarget, args: Vec<Operand>, dest: Place, span: Span) {
+        // A call owns its moved arguments from its start (codegen clears their flags there), so
+        // reading an argument must not panic inside it: an argument read through an index (a
+        // bounds check) is read into a temporary first, by a statement whose cleanup still drops
+        // what the earlier arguments moved (`take(b, a[i])` drops `b`).
+        let args = args.into_iter().map(|a| self.unindexed(a, span)).collect();
         let next = self.new_block();
         let unwind = Some(self.unwind_block(span));
         let b = &mut self.body.blocks[self.cur.0 as usize];
         b.term = Terminator::Call { target, args, dest, next, unwind };
         b.term_span = span;
         self.cur = next;
+    }
+
+    /// Call argument `a` (`call_into`), or, when it reads a place through an index, a
+    /// temporary of the current scope that holds the value it reads.
+    fn unindexed(&mut self, a: Operand, span: Span) -> Operand {
+        let (Operand::Copy(pl) | Operand::Move(pl)) = &a else { return a };
+        if !pl.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
+            return a;
+        }
+        let Some(ty) = self.place_ty(pl) else { return a };
+        let t = self.temp(ty);
+        // The read is one of the arguments, which run between a two-phase reservation and the
+        // `FakeRead` and `&mut` pairs that end the block before the call (`call_arg_operands`;
+        // borrowck's `two_phase_loans` finds them at the end): it goes before those pairs, and
+        // their statement-unwind entries move up by one.
+        let b = self.cur.0 as usize;
+        let stmts = &self.body.blocks[b].stmts;
+        let mut k = stmts.len();
+        while k >= 2 && matches!((&stmts[k - 2].kind, &stmts[k - 1].kind), (StmtKind::FakeRead(_), StmtKind::Assign(_, Rvalue::Ref(true, _)))) {
+            k -= 2;
+        }
+        let tail = self.body.blocks[b].stmts.split_off(k);
+        let cur = self.cur;
+        for e in self.body.stmt_unwind.iter_mut().filter(|e| e.0 == cur && e.1 >= k as u32) {
+            e.1 += 1;
+        }
+        self.assign(Place::local(t), Rvalue::Use(a), span);
+        self.body.blocks[b].stmts.extend(tail);
+        self.operand_from(Place::local(t), ty)
+    }
+
+    /// The type of an operand place: its local's type through derefs, fields (of tuples,
+    /// closures, Options, Results and Adts, substituted) and indexes. None for a shape it does
+    /// not know.
+    fn place_ty(&mut self, pl: &Place) -> Option<Ty> {
+        let mut t = self.body.locals[pl.local as usize].ty;
+        let mut variant: Option<u32> = None;
+        for pr in &pl.proj {
+            t = match *pr {
+                Proj::Deref => match self.kind(t) {
+                    TyKind::Ref(_, _, i) => i,
+                    _ => self.body.tys.smart_elem(t)?,
+                },
+                Proj::Downcast(v) => {
+                    variant = Some(v);
+                    continue;
+                }
+                Proj::Field(i) => {
+                    let v = variant.take();
+                    if let Some(e) = self.body.tys.option_elem(t) {
+                        e
+                    } else if let Some((ok, err)) = self.body.tys.result_args(t) {
+                        if v == Some(1) { err } else { ok }
+                    } else if let TyKind::Tuple(ts) = self.kind(t) {
+                        *self.body.tys.tys_of(ts).get(i as usize)?
+                    } else if let TyKind::Closure(_, a) = self.kind(t) {
+                        *crate::check::collect::closure_fields(&mut self.body.tys, a).get(i as usize)?
+                    } else if let Some(a) = self.body.tys.local_adt(t) {
+                        let args: Vec<GenericArg> = match self.kind(t) {
+                            TyKind::Adt(_, g) => self.body.tys.args(g).to_vec(),
+                            _ => Vec::new(),
+                        };
+                        let f = self.p.adt(a).variants.get(v.unwrap_or(0) as usize)?.fields.get(i as usize)?.ty;
+                        subst(&mut self.body.tys, f, &args)
+                    } else {
+                        return None;
+                    }
+                }
+                Proj::Index(_) => match self.kind(t) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => e,
+                    _ => self.body.tys.vec_elem(t)?,
+                },
+            };
+        }
+        Some(t)
     }
 
     /// The entry block of the cleanup path for a call at the current
