@@ -2503,7 +2503,11 @@ fn resolved_setup(
                 _ => tables.crate_cfgs.get(&r).map(|c| (r, c.clone())),
             })
             .collect();
-        let reach = super::const_reach::ConstReach::build(front);
+        // The span probe and the const reach serve the next request's patch: a
+        // one-shot image build leaves them to that patch (patch.rs makes both
+        // when it needs them), since the next build may never patch.
+        let eager = !caches.image_one_shot;
+        let reach = eager.then(|| super::const_reach::ConstReach::build(front));
         front.patch = Some(super::patch::PatchBase::new(
             front,
             inputs,
@@ -2522,12 +2526,13 @@ fn resolved_setup(
             // the new Ast is not shared yet, and the const reach, not on the
             // first patch (ts_goport: about 60 and 24 ms of the first header
             // edit after a full resolve). Later patches update the reach.
-            if let Some(ast) = Arc::get_mut(&mut front.ast) {
+            if eager && let Some(ast) = Arc::get_mut(&mut front.ast) {
                 b.probe(ast, front.map.file_count());
             }
-            b.reach = Some(reach);
+            b.reach = reach;
         }
     }
+    t.lap("patch base");
     Ok((map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines, body_hashes, Some(tables)))
 }
 

@@ -397,6 +397,11 @@ pub(crate) struct Caches {
     /// one-shots set it): compile leaks the program and IR instead of freeing them. A
     /// non-persistent session inside a daemon (the patch oracle's fresh compile) frees them.
     pub(crate) leak_at_exit: bool,
+    /// The session is a front image's in a one-shot process (main.rs): it saves and the
+    /// process exits, so the next request is a new process that may never patch (a CI
+    /// build). A full resolve then leaves the patch base's span probe and const reach to
+    /// the patch that needs them (`resolved_setup`; patch.rs builds both lazily).
+    pub(crate) image_one_shot: bool,
     /// Generic reuse (driver/gen_reuse.rs): template check and instance
     /// discovery results of a generic program, valid while `gen_key`
     /// (the item-level environment and AST fn count they were made
@@ -553,6 +558,7 @@ impl Session {
                 objects: None,
                 persistent,
                 leak_at_exit: false,
+                image_one_shot: false,
                 overlays: Default::default(),
                 gen_reuse: Default::default(),
                 inst_ids: FxMap::default(),

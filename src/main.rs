@@ -263,6 +263,7 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
             eprintln!("lust: release build for {triple} -> {}", req.out.display());
         }
         let session = &mut sessions[i];
+        session.caches.image_one_shot = true;
         // The last release build parks its cc step (`driver::defer_cc`), so the background
         // save below forks first and writes the image while clang runs.
         driver::defer_cc(if compact { req.cc } else { background && req.cc && k + 1 == reqs.len() });

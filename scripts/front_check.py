@@ -717,6 +717,45 @@ fn main() {{
 '''
 
 
+def later_patch(v):
+    """A program on the resolver path (std imports) whose first image build is a full resolve and
+    whose later builds patch: a body edit (v1), a header edit (v2, the item patch), a const fn
+    body edit (v3), then a new item again (v4, a full resolve). A one-shot image build leaves the
+    patch base's span probe and const reach to the first patch that needs them (resolved_setup);
+    each later answer must still equal a fresh one-shot's."""
+    body = ["a + b", "a * 2 + b", "a * 2 + b", "a * 2 + b", "a * 2 + b"][v]
+    sig = ["fn mix(a: u64, b: u64) -> u64", "fn mix(a: u64, b: u64) -> u64", "fn mix(a: u64, b: u32) -> u64",
+           "fn mix(a: u64, b: u32) -> u64", "fn mix(a: u64, b: u32) -> u64"][v]
+    b = "b" if v < 2 else "b as u64"
+    body = body.replace("b", b) if v >= 2 else body
+    seed = ["3", "3", "3", "7", "7"][v]
+    extra = "" if v < 4 else "\nfn added() -> u64 {\n    11\n}\n"
+    call = "mix(10, 4)" if v < 4 else "mix(10, 4) + added()"
+    return f"""use std::collections::HashMap;
+
+const fn seed() -> u64 {{
+    {seed}
+}}
+
+const SEED: u64 = seed();
+
+{sig} {{
+    {body} + SEED
+}}
+
+fn table() -> HashMap<u64, u64> {{
+    let mut m = HashMap::new();
+    m.insert(1, {call});
+    m
+}}
+{extra}
+fn main() {{
+    let t = table();
+    println!("{{}} {{}}", t[&1], SEED);
+}}
+"""
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -873,6 +912,8 @@ def corpus():
     lay = [agg_layout(False), agg_layout(True), agg_layout(False)]
     seqs.append(("agg-param-layout", lay))
     seqs.append(("agg-param-layout-all", lay, {"env": [{"LUST_RELEASE_AGG_PARAM": "all"}] * 3}))
+    # Patches after a full resolve in an image chain (lazy patch base prep, 2026-10-20).
+    seqs.append(("later-patch", [later_patch(v) for v in range(5)]))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))
