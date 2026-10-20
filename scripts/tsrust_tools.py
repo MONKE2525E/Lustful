@@ -208,7 +208,12 @@ def make_ref(dest):
 
 def tsgo_rows(lust, timeout, out):
     """lust build of tsgo, then its parity rows vs the Cargo reference (docstring "tsgo"):
-    (ok count, failure lines)."""
+    (ok count, failure lines). Off a boat box (no REF_ROOT's parent: a local gate slot) the
+    rows are skipped with a printed reason, not failed: the reference's test bins only run
+    from the path they were built at, and boat gates run them."""
+    if not REF_ROOT.parent.is_dir():
+        print(f"tsrust-tools: skip tsgo: {REF_ROOT.parent} is not here (the tsgo rows run on a boat gate box)", flush=True)
+        return 0, []
     fork, why = ref_tree(with_ref=True)
     if fork is None:
         return 0, [f"tsgo: {why}"]

@@ -32,6 +32,27 @@ def run(cmd, cwd, env, timeout=60):
     return r.returncode, r.stdout, r.stderr
 
 
+# A Unix socket path holds at most 107 bytes (sun_path). A work dir under a long TMPDIR (a local
+# gate slot's /home/theo/lust-scratch/gate-tmp/<pkg>/lane-<x>) plus a scenario's name in its
+# prefix passes that, and the daemon cannot bind: "daemon start failed".
+SUN_PATH_MAX = 107
+
+
+def sock_path(work):
+    """`work`/d.sock, or d.sock in a new short dir under /tmp when that path is too long for a
+    Unix socket (`sock_dir_of` gives the dir to remove)."""
+    p = os.path.join(work, "d.sock")
+    if len(os.fsencode(p)) <= SUN_PATH_MAX:
+        return p
+    return os.path.join(tempfile.mkdtemp(prefix="lsd-", dir="/tmp"), "d.sock")
+
+
+def sock_dir_of(sock, work):
+    """The dir `sock_path` made for `sock`, or None when the socket is in `work`."""
+    d = os.path.dirname(sock)
+    return None if d == work else d
+
+
 def cold_of(env):
     """The env of a cold request: no daemon, and no front image."""
     cold = dict(env, LUST_NO_DAEMON="1")
@@ -203,7 +224,7 @@ def scenario(srcdir):
     scenario; versions are applied in order with strictly rising mtimes."""
     name = os.path.basename(srcdir.rstrip("/"))
     work = tempfile.mkdtemp(prefix=f"lust-scen-{name}-")
-    sock = os.path.join(work, "d.sock")
+    sock = sock_path(work)
     env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
     env.pop("LUST_NO_DAEMON", None)
     oracle_path = oracle_log.setup(env, work)
@@ -343,6 +364,8 @@ def scenario(srcdir):
         problems.extend(oracle_log.problems(*oracle_log.collect(oracle_path), name))
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(work + "-cargo-target", ignore_errors=True)
+        if sock_dir_of(sock, work):
+            shutil.rmtree(sock_dir_of(sock, work), ignore_errors=True)
     return name, problems, notes
 
 
@@ -354,7 +377,7 @@ def rebuilt_binary():
     again: the answer must be cold and right, the old daemon gone."""
     name = "binary01_rebuilt_daemon"
     work = tempfile.mkdtemp(prefix=f"lust-scen-{name}-")
-    problems = []
+    problems, sock = [], None
     try:
         for b in ("lust", "lust-core"):
             shutil.copy2(os.path.join(os.path.dirname(LUST), b), os.path.join(work, b))
@@ -362,7 +385,8 @@ def rebuilt_binary():
         main = os.path.join(work, "main.rs")
         with open(main, "w") as f:
             f.write("fn main() {\n    let x: u8 = true;\n}\n")
-        env = dict(os.environ, LUST_DAEMON_SOCKET=os.path.join(work, "d.sock"), LUST_NO_CACHE="1")
+        sock = sock_path(work)
+        env = dict(os.environ, LUST_DAEMON_SOCKET=sock, LUST_NO_CACHE="1")
         env.pop("LUST_NO_DAEMON", None)
         log = open(os.path.join(work, "daemon.log"), "w")
         daemon = subprocess.Popen([lust, "daemon"], cwd=work, env=env, stderr=log, start_new_session=True)
@@ -390,6 +414,8 @@ def rebuilt_binary():
             problems.append(f"{name}: the old daemon compiled the rebuilt client's request")
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        if sock is not None and sock_dir_of(sock, work):
+            shutil.rmtree(sock_dir_of(sock, work), ignore_errors=True)
     return name, problems, []
 
 
