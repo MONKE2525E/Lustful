@@ -170,7 +170,7 @@ pub fn cflags(debug: bool) -> String {
     // -O2: zig cc gives clang -O2 for -O1, -O2 and -O3 alike.
     // -g0: zig cc emits DWARF by default, which the release link strips
     // (`ldflags`); on a fn of 400 KB of C it was 7/8 of the compile.
-    let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fexceptions -fno-asynchronous-unwind-tables -fomit-frame-pointer";
+    let base = "-O2 -std=gnu11 -w -fsigned-char -fno-strict-aliasing -fwrapv -fexceptions -fno-asynchronous-unwind-tables -fomit-frame-pointer";
     if debug { format!("{base} -g") } else { format!("{base} -g0") }
 }
 

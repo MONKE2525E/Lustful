@@ -187,7 +187,7 @@ eh_build() {
       flock 9
       local cc=clang
       [[ "$c" == *.cc ]] && cc=clang++
-      [ -f "$o" ] || { $cc -O1 -fexceptions -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -w -Wno-error=implicit-function-declaration -c -o "$o.tmp" "$c" && mv "$o.tmp" "$o"; }
+      [ -f "$o" ] || { $cc -O1 -fexceptions -fno-strict-aliasing -fwrapv -w -Wno-error=implicit-function-declaration -c -o "$o.tmp" "$c" && mv "$o.tmp" "$o"; }
     ) 9>"$o.lock" || return 1
   done
   clang++ -o "$name.lust" "${objs[@]}" -lm -lpthread

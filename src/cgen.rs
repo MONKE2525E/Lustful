@@ -4984,7 +4984,7 @@ impl FnGen<'_, '_> {
                     CTy::Rc(e) | CTy::Sync(crate::ty::sync::SyncTy::Arc, e) => {
                         collect_types(&ct, &mut self.sig_types);
                         let rc = format!("RcI_{}", mangle(e));
-                        format!("(({rc} *)((char *)({v}).data - (uintptr_t)&(({rc} *)0)->v))")
+                        format!("(({rc} *)((char *)({v}).data - __builtin_offsetof({rc}, v)))")
                     }
                     _ => format!("(({})({v}).data)", ctype(&ct)),
                 }

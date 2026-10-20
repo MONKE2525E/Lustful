@@ -841,13 +841,6 @@ impl FnGen<'_, '_> {
         } else {
             attrs.push_str(" nounwind");
         }
-        // The C halves' null pointer rule (`-fno-delete-null-pointer-checks`): LLVM inlines no
-        // fn into one with another rule, and every helper and runtime fn has this one, so a fn
-        // without helpers would otherwise neither inline them nor be inlined into their callers.
-        attrs = attrs.replacen(" personality", " null_pointer_is_valid personality", 1);
-        if !attrs.contains("null_pointer_is_valid") {
-            attrs.push_str(" null_pointer_is_valid");
-        }
         let id = names::fn_tag(self.slots.of(fid));
         let mut d = String::new();
         let _ = writeln!(d, "; {}", p.display_path(info.name).replace('\n', " "));
