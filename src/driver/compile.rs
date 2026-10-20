@@ -2394,13 +2394,11 @@ fn resolved_setup(
     }
     // Each fn's own text joins its structural body hash, for the
     // same reason as `fold_fn_text` on the chunk path: the structural
-    // hash has no positions, and a reused body's C embeds them.
-    let body_hashes: Vec<u64> = fn_locations(&front.ast)
-        .iter()
-        .zip(&scans.bodies)
-        .zip(&fn_lines)
-        .map(|((&(item, sub), b), &line)| fn_text_hash(&front.ast, &map, fn_def_at(&front.ast, item, sub), line, b.0))
-        .collect();
+    // hash has no positions, and a reused body's C embeds them. On the
+    // pool: every fn's text is hashed (28 MB on tsgo).
+    let fn_at: Vec<((usize, Option<usize>), u64, u32)> =
+        fn_locations(&front.ast).into_iter().zip(&scans.bodies).zip(&fn_lines).map(|((at, b), &line)| (at, b.0, line)).collect();
+    let body_hashes: Vec<u64> = par_map(&fn_at, |&((item, sub), body, line)| fn_text_hash(&front.ast, &map, fn_def_at(&front.ast, item, sub), line, body));
     let mut item_scans = scans.items;
     item_scans.push(scan::ItemScan { hash: structure_hash, fn_name: None });
     t.lap("ast scan");

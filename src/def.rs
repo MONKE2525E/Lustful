@@ -314,40 +314,50 @@ pub struct ImplIds {
 /// their instances: a positional number here once renamed every method of a type when an
 /// impl of it was added, and every caller and inline copy recompiled (rel-cache, merge 1
 /// of the tsgo replay: 285 units). The driver's `fn_keys` and `collect` both use this.
+///
+/// The header texts and the paths are made on the pool (tsgo: a few ms a call, several
+/// calls a build); only the ordinals count in item order, here.
 pub fn impl_ids(krate: StableCrateHash, ast: &crate::ast::Ast, interner: &crate::intern::Interner) -> Vec<Option<ImplIds>> {
-    let mut impl_ordinals: crate::intern::FxMap<String, u32> = Default::default();
-    let mut method_ordinals: crate::intern::FxMap<(String, String), u32> = Default::default();
-    ast.items
-        .iter()
-        .map(|item| {
-            let crate::ast::ItemKind::Impl(imp) = &item.kind else { return None };
-            let mut header = String::new();
-            if let Some(t) = &imp.trait_ref {
-                if imp.is_negative {
-                    header.push('!');
-                }
-                path_text(ast, interner, &t.path, &mut header);
-                header.push_str(" for ");
+    let headers: Vec<Option<String>> = crate::pool::par_map(&ast.items, |item| {
+        let crate::ast::ItemKind::Impl(imp) = &item.kind else { return None };
+        let mut header = String::new();
+        if let Some(t) = &imp.trait_ref {
+            if imp.is_negative {
+                header.push('!');
             }
-            header_ty_text(ast, interner, imp.self_ty, &mut header);
-            let ordinal = impl_ordinals.entry(header.clone()).or_insert(0);
-            let path = impl_path(krate, &[], &header, *ordinal);
-            *ordinal += 1;
-            let (parent, parent_text) = impl_path(krate, &[], &header, 0);
-            let methods = imp
-                .fns
-                .iter()
-                .map(|f| {
-                    let name = interner.get(f.name);
-                    let n = method_ordinals.entry((header.clone(), name.to_string())).or_insert(0);
-                    let m = child_path(parent, &parent_text, DefKind::Method, name, *n);
-                    *n += 1;
-                    m
-                })
-                .collect();
-            Some(ImplIds { path, methods })
+            path_text(ast, interner, &t.path, &mut header);
+            header.push_str(" for ");
+        }
+        header_ty_text(ast, interner, imp.self_ty, &mut header);
+        Some(header)
+    });
+    let mut impl_ordinals: crate::intern::FxMap<&str, u32> = Default::default();
+    let mut method_ordinals: crate::intern::FxMap<(&str, &str), u32> = Default::default();
+    let ordinals: Vec<Option<(u32, Vec<u32>)>> = ast
+        .items
+        .iter()
+        .zip(&headers)
+        .map(|(item, header)| {
+            let (crate::ast::ItemKind::Impl(imp), Some(header)) = (&item.kind, header) else { return None };
+            let next = |n: &mut u32| {
+                *n += 1;
+                *n - 1
+            };
+            let ordinal = next(impl_ordinals.entry(header.as_str()).or_insert(0));
+            let methods = imp.fns.iter().map(|f| next(method_ordinals.entry((header.as_str(), interner.get(f.name))).or_insert(0))).collect();
+            Some((ordinal, methods))
         })
-        .collect()
+        .collect();
+    let at: Vec<usize> = (0..ast.items.len()).collect();
+    crate::pool::par_map(&at, |&i| {
+        let (crate::ast::ItemKind::Impl(imp), Some(header), Some((ordinal, method_ordinals))) = (&ast.items[i].kind, &headers[i], &ordinals[i]) else {
+            return None;
+        };
+        let path = impl_path(krate, &[], header, *ordinal);
+        let (parent, parent_text) = impl_path(krate, &[], header, 0);
+        let methods = imp.fns.iter().zip(method_ordinals).map(|(f, &n)| child_path(parent, &parent_text, DefKind::Method, interner.get(f.name), n)).collect();
+        Some(ImplIds { path, methods })
+    })
 }
 
 /// The canonical text of a type in an impl header (`impl_ids`): paths with their generic
