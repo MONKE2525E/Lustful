@@ -252,6 +252,41 @@ impl FnGen<'_, '_> {
         Some(format!("  static {} l{i};\n", ctype(&ct)))
     }
 
+    /// Release C with the C backend and statics in parts: true when every constant local
+    /// has its value at compile time (`kbatch_local`) and an alignment of at most `KALIGN`.
+    /// Then the fn interns nothing at run time: its constants and str literals are data
+    /// named by content (`kdata_local`, `kstr`), as a static's pointees are
+    /// (`content_name`), so equal content keeps one address with no first-run test.
+    pub(super) fn kdata_ok(&self) -> bool {
+        names::release()
+            && !ll::on(self.p)
+            && crate::driver::release_c::statics_bytes() > 0
+            && (0..self.local_cty.len())
+                .all(|i| !self.kconst_local(i) || (self.kbatch_local(i) && c_size_align(self.p, &self.local_cty[i]).1 <= KALIGN))
+    }
+
+    /// The content name of constant local `i` in a `kdata` fn, with its definition (and
+    /// those of the strs its value holds) added to the fn's externs (`kdata_def`).
+    pub(super) fn kdata_local(&mut self, i: usize) -> String {
+        let ct = self.local_cty[i].clone();
+        let c = ctype(&ct);
+        let mut pre = String::new();
+        let (init, key) = match self.byte_blobs.get(i).and_then(|b| b.as_ref()) {
+            Some(b) => (format!("{{ .v = {} }}", c_bytes_lit(b.as_slice())), image_key(b.as_slice().to_vec(), vec![1; b.len()])),
+            None => {
+                let cv = self.kstatic[&(i as Local)].clone();
+                let mut cx = StaticCx { weak: true, ..Default::default() };
+                let init = const_init(self.p, &cv, &ct, &mut pre, &mut cx, self.slots.as_slice(), None);
+                let key = static_key(self.p, &cx, &cv, &ct, &c, &init);
+                (init, key)
+            }
+        };
+        let name = content_sym(&key);
+        pre.push_str(&kdata_def(&name, &format!("const {c} {name}"), &init));
+        self.slots.externs.borrow_mut().insert(pre);
+        name
+    }
+
     /// The call that interns constant local `i` into its slot `lk{i}`.
     fn kintern_call(&self, i: usize) -> String {
         let lt = &self.local_cty[i];
@@ -302,6 +337,12 @@ impl FnGen<'_, '_> {
         if bytes.is_empty() || self.kdecl_at.is_none() {
             return str_lit_c(bytes);
         }
+        if self.kdata {
+            let (mut pre, mut cx) = (String::new(), StaticCx { weak: true, ..Default::default() });
+            let s = kstatic_str(&mut cx, &mut pre, bytes);
+            self.slots.externs.borrow_mut().insert(pre);
+            return s;
+        }
         let n = self.kstrs.len();
         let id = *self.kstrs.entry(bytes.to_vec()).or_insert(n);
         format!("((lust_str){{(uint8_t*)lks[{id}], {}}})", bytes.len())
@@ -322,6 +363,9 @@ impl FnGen<'_, '_> {
     /// helper): the literal slots `lks`, the `lks_ok` flag, and one
     /// intern call per literal and batched local. Empty when it has none.
     pub(super) fn kintern_block(&self, ind: &str) -> String {
+        if self.kdata {
+            return String::new();
+        }
         let batch: Vec<usize> = (0..self.local_cty.len()).filter(|&i| self.kbatch_local(i)).collect();
         if self.kstrs.is_empty() && batch.is_empty() {
             return String::new();
@@ -370,6 +414,24 @@ pub(super) struct StaticCx {
     /// the C type the declaration names.
     pub parts: bool,
     pub decls: Vec<(String, String, Option<CTy>)>,
+    /// A `kdata` fn's constant (`FnGen::kdata_local`): each str it holds is a definition
+    /// in `pre` by content name (`kdata_def`), and nothing is registered.
+    pub weak: bool,
+}
+
+/// The symbol of constant data with content key `key` (`static_key`): a static's pointee or
+/// str array in parts, or a `kdata` fn's constant. One name per content, whatever the C type.
+pub(super) fn content_sym(key: &[u8]) -> String {
+    let (a, b) = crate::driver::cache::hash128(&[key], 0);
+    format!("lust_kc{a:016x}{b:016x}")
+}
+
+/// The definition of `kdata` constant `name` (`decl` names its C type): each unit that uses
+/// it defines it (`LUST_KDATA`, runtime/inl.h: weak, or selectany on Windows), so the link
+/// keeps one and equal content keeps one address; the guard keeps one per unit, where
+/// copies and the fns of a unit may share it.
+fn kdata_def(name: &str, decl: &str, init: &str) -> String {
+    format!("#ifndef K{name}\n#define K{name}\nLUST_KDATA {decl} __attribute__((aligned({KALIGN}))) = {init};\n#endif\n")
 }
 
 /// Every static pointee is at least 16-aligned, so a site of a stricter
@@ -396,6 +458,15 @@ pub(super) fn kdef(p: &Program, cx: &mut StaticCx, pre: &mut String, name: &str,
         return;
     }
     let key = static_key(p, cx, v, ct, &c, init);
+    // Statics in parts: the data has its content's name (`content_sym`), as an equal
+    // constant of a `kdata` fn does, and a path name (`promoted_name`) is a macro for it.
+    if cx.parts && !cx.defs.contains_key(&key) {
+        let cname = content_sym(&key);
+        let _ = writeln!(pre, "const {c} {cname} __attribute__((aligned({}))) = {init};", KALIGN.max(a));
+        cx.regs.push((cname.clone(), n, KALIGN.max(a), kdesc(p, ct)));
+        cx.decls.push((cname.clone(), format!("extern const {c} {cname};\n"), Some(ct.clone())));
+        cx.defs.insert(key.clone(), cname);
+    }
     if let Some(prev) = cx.defs.get(&key) {
         if prev == name {
             return;
@@ -419,9 +490,7 @@ pub(super) fn kdef(p: &Program, cx: &mut StaticCx, pre: &mut String, name: &str,
 /// The name of an unnamed pointee in release C statics in parts (`StaticCx::parts`): its content
 /// key's (`static_key`), so it does not move when a pointee before it in the pass comes or goes.
 pub(super) fn content_name(p: &Program, cx: &StaticCx, v: &crate::ty::consteval::ConstValue, ct: &CTy, init: &str) -> String {
-    let key = static_key(p, cx, v, ct, &ctype(ct), init);
-    let (a, b) = crate::driver::cache::hash128(&[&key], 0);
-    format!("lust_kp{a:016x}{b:016x}")
+    content_sym(&static_key(p, cx, v, ct, &ctype(ct), init))
 }
 
 /// A `&str` in static data: its bytes in one registered array per
@@ -436,15 +505,15 @@ pub(super) fn kstatic_str(cx: &mut StaticCx, pre: &mut String, bytes: &[u8]) -> 
         return format!("((lust_str){{(uint8_t*)lks[{id}], {}}})", bytes.len());
     }
     let key = image_key(bytes.to_vec(), vec![1; bytes.len()]);
+    if cx.weak {
+        let name = content_sym(&key);
+        pre.push_str(&kdata_def(&name, &format!("const uint8_t {name}[{}]", bytes.len()), &c_string_lit(bytes)));
+        return format!("((lust_str){{(uint8_t*)&{name}, {}}})", bytes.len());
+    }
     let name = match cx.defs.get(&key) {
         Some(n) => n.clone(),
         None => {
-            let name = if cx.parts {
-                let (a, b) = crate::driver::cache::hash128(&[&key], 0);
-                format!("lust_ks{a:016x}{b:016x}")
-            } else {
-                format!("lust_ks{}", cx.regs.len())
-            };
+            let name = if cx.parts { content_sym(&key) } else { format!("lust_ks{}", cx.regs.len()) };
             let link = if cx.parts { "" } else { "static " };
             let _ = writeln!(pre, "{link}const uint8_t {name}[{}] __attribute__((aligned({KALIGN}))) = {};", bytes.len(), c_string_lit(bytes));
             cx.regs.push((name.clone(), bytes.len() as u64, KALIGN, None));

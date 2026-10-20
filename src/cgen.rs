@@ -1247,6 +1247,11 @@ struct FnGen<'b, 'p> {
     /// The C value the fn's entry writes into each `kstatic` local that
     /// holds strs (`kstatic_decl`).
     kentry: HashMap<Local, String>,
+    /// The fn's constants are data named by content, with no run-time interning
+    /// (`kconst::kdata_ok`); `knames` holds each constant local's name (a place
+    /// reads it in place of the local).
+    kdata: bool,
+    knames: HashMap<Local, String>,
     /// Release C: the place being emitted is only borrowed (`Rvalue::Ref`), so its
     /// type needs no definition (`place`).
     addr_only: bool,
@@ -2405,6 +2410,8 @@ impl<'b, 'p> FnGen<'b, 'p> {
             kstatic,
             kcx: kconst::StaticCx::default(),
             kentry: HashMap::new(),
+            kdata: false,
+            knames: HashMap::new(),
             stmt_unw: body.stmt_unwind.iter().map(|&(b, i, u)| ((b.0, i), u.0)).collect(),
             unw: None,
             unw_call: false,
@@ -2587,10 +2594,19 @@ impl FnGen<'_, '_> {
         // Dev C's locals with alignment over 16 (see `overaligned_local`).
         let mut high: Vec<(usize, String, String)> = Vec::new();
         let mut frame_init: Vec<String> = Vec::new();
-        // The compile-time promoted values' decls (`kstatic_decl`; it
-        // needs `self` mutably, so ahead of the loop).
+        // A `kdata` fn's constants are named data with no local (`kdata_local`); else the
+        // compile-time promoted values' decls (`kstatic_decl`; both need `self` mutably,
+        // so ahead of the loop).
+        self.kdata = self.kdata_ok();
+        if self.kdata {
+            let ks: Vec<usize> = (0..self.local_cty.len()).filter(|&i| self.kconst_local(i)).collect();
+            for i in ks {
+                let name = self.kdata_local(i);
+                self.knames.insert(i as Local, name);
+            }
+        }
         let kdecls: Vec<Option<String>> = (0..self.local_cty.len())
-            .map(|i| if self.body.promoted.contains(&(i as Local)) { self.kstatic_decl(i) } else { None })
+            .map(|i| if self.body.promoted.contains(&(i as Local)) && !self.knames.contains_key(&(i as Local)) { self.kstatic_decl(i) } else { None })
             .collect();
         for (i, t) in self.local_cty.iter().enumerate() {
             // A byte string temp gets static storage below, not a frame local.
@@ -2626,7 +2642,9 @@ impl FnGen<'_, '_> {
                 format!("l{i}")
             };
             let ct = ctype(t);
-            if self.body.promoted.contains(&(i as Local)) {
+            if self.knames.contains_key(&(i as Local)) {
+                // A `kdata` constant: named data, no local (`kdata_local`).
+            } else if self.body.promoted.contains(&(i as Local)) {
                 // A promoted constant (`&5` borrowed for `'static`): static
                 // storage, written with the same value each time it runs.
                 // In release builds a value codegen computed at compile time
@@ -2675,7 +2693,9 @@ impl FnGen<'_, '_> {
         // Byte string temps: static storage, initialized once, never
         // assigned (the matching assignments are skipped in `stmt`).
         for (i, b) in self.byte_blobs.iter().enumerate() {
-            if let Some(b) = b {
+            if let Some(b) = b
+                && !self.knames.contains_key(&(i as Local))
+            {
                 let ct = ctype(&self.local_cty[i]);
                 let init = if b.is_empty() { "{0}".to_string() } else { format!("{{ .v = {} }}", c_bytes_lit(b.as_slice())) };
                 let _ = writeln!(self.out, "  static {ct} l{i} = {init};");
@@ -3247,7 +3267,10 @@ impl FnGen<'_, '_> {
     }
 
     fn place(&mut self, pl: &Place, loc: &str) -> (String, CTy) {
-        let mut e = format!("l{}", pl.local);
+        let mut e = match self.knames.get(&pl.local) {
+            Some(n) => format!("(*({} *)&{n})", ctype(&self.local_cty[pl.local as usize])),
+            None => format!("l{}", pl.local),
+        };
         let mut t = self.local_cty[pl.local as usize].clone();
         let mut variant: Option<u32> = None;
         let release = names::release();
@@ -10842,6 +10865,10 @@ fn blocks_on() -> bool {
 
 /// The id in a release C prototype of a fn body (`T f_<id>(...);`).
 fn proto_body_id(e: &str) -> Option<&str> {
+    // A `kdata` constant's guarded definition (cgen/kconst.rs), whose bytes may read as one.
+    if e.starts_with('#') {
+        return None;
+    }
     let i = e.find(" f_").or_else(|| e.find("*f_"))? + 3;
     let id = e.get(i..i + 16)?;
     (e.as_bytes().get(i + 16) == Some(&b'(') && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
@@ -13574,6 +13601,46 @@ mod tests {
         assert!(!release.contains("_b[sizeof(") && !release.contains("#define l"), "release C declares it plainly:\n{release}");
         let dev = names::with(None, code);
         assert!(dev.contains("_b[sizeof(") && dev.contains("#undef l"), "dev C keeps the aligned buffer:\n{dev}");
+    }
+
+    /// Release C: a fn whose constants all have compile-time values names them by content
+    /// (`kconst::kdata_ok`): each is a guarded weak definition among its externs, read in
+    /// place, with no first-run test, and equal content in two fns has one name. A float
+    /// constant keeps run-time interning.
+    #[test]
+    fn compile_time_constants_are_named_data_in_release_c() {
+        let src = "#[inline(never)]\nfn a() -> (&'static str, &'static (u32, u32)) { (\"hi\", &(7, 9)) }\n\
+                   #[inline(never)]\nfn b() -> &'static (u32, u32) { &(7, 9) }\n\
+                   #[inline(never)]\nfn f() -> &'static f64 { &1.5 }\n\
+                   fn main() { println!(\"{:?} {:?} {}\", a(), b(), f()); }\n";
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let n = program.fns.len();
+        let slots: Vec<u32> = (0..n as u32).collect();
+        let names = std::sync::Arc::new(names::Names {
+            fns: (0..n).map(|s| Some(format!("{s:016x}"))).collect(),
+            adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
+            by_id: Default::default(),
+        });
+        let out = |name: &str| {
+            let f = program.fn_names[&interner.intern(name)];
+            let (ck, errs) = check_fn(&program, f);
+            assert!(errs.is_empty(), "{errs:?}");
+            names::with(Some(&names), || gen_fn(&program, &crate::lower::lower(&program, f, ck), &map, 1, &slots))
+        };
+        let (a, b, f) = (out("a"), out("b"), out("f"));
+        let defs = |o: &FnOut| o.externs.iter().filter(|e| e.contains("LUST_KDATA")).map(|e| e.to_string()).collect::<Vec<_>>();
+        assert!(!a.code.contains("lks_ok") && !a.code.contains("lust_kintern"), "no run-time interning:\n{}", a.code);
+        assert_eq!(defs(&a).len(), 2, "the str and the tuple are named data:\n{:?}", a.externs);
+        let name = b.code.split("&lust_kc").nth(1).map(|s| &s[..32]).expect("b reads its tuple by name");
+        assert!(defs(&a).iter().any(|d| d.contains(&format!("lust_kc{name} "))), "equal content, one name:\n{:?}", a.externs);
+        assert!(f.code.contains("lust_kintern") && defs(&f).is_empty(), "a float constant keeps run-time interning:\n{}", f.code);
     }
 
     /// Inline clone glue of a struct copies its reference field and passes its String to the

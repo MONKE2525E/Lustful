@@ -540,3 +540,12 @@ static inline float lust_inl_f32_max_(float a, float b) { return a > b ? a : b >
 #else
 #define lust_ref_nn(p) ((void)0)
 #endif
+
+/* A release fn's constant data named by its content (cgen/kconst.rs `kdata_def`): each unit
+   that uses it defines it, and the link keeps one definition, so equal constants share one
+   address program-wide with no run-time interning. */
+#if defined(_WIN32)
+#define LUST_KDATA __declspec(selectany)
+#else
+#define LUST_KDATA __attribute__((weak, visibility("hidden")))
+#endif
