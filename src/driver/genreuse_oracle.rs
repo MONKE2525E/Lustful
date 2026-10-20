@@ -28,17 +28,41 @@ pub(crate) fn on() -> bool {
 /// otherwise in this program, naming the first. `Checked` reads have no
 /// fingerprint to compare (every replay counts them moved); the walks follow
 /// them by the callee's slot, and the C compare below covers them.
+///
+/// A key whose answer can move while mono runs (an `Answer` key, or one whose
+/// answer read state mono still writes: `Program::read_fingerprint_stable`) is
+/// answered fresh, as the check that stored it answered it at its turn: `memo`
+/// holds the answer of the key's first use in this collect, which can come
+/// from before mono (an auto trait answer the instances decide later reads as
+/// undetermined there).
 pub(super) fn kept_reads(what: &str, p: &Program, f: LocalDefId, reads: &Reads, keys: &ReadKeys, memo: &mut FxMap<ReadKey, Read>) {
-    let mut moved = reads
-        .iter(keys)
-        .filter(|(k, _)| !matches!(k, ReadKey::Checked(_)))
-        .filter(|(k, stored)| *memo.entry(**k).or_insert_with(|| p.read_fingerprint(k)) != *stored);
-    if let Some((k, stored)) = moved.next() {
-        let n = 1 + moved.count();
+    let mut now = |k: &ReadKey| -> Read {
+        if !matches!(k, ReadKey::Answer(..))
+            && let Some(&r) = memo.get(k)
+        {
+            return r;
+        }
+        let (r, stable) = p.read_fingerprint_stable(k);
+        if stable && !matches!(k, ReadKey::Answer(..)) {
+            memo.insert(*k, r);
+        }
+        r
+    };
+    let mut moved: Vec<(ReadKey, Read, Read)> = Vec::new();
+    for (k, stored) in reads.iter(keys) {
+        if matches!(k, ReadKey::Checked(_)) {
+            continue;
+        }
+        let r = now(k);
+        if r != stored {
+            moved.push((*k, stored, r));
+        }
+    }
+    if let Some(&(k, stored, r)) = moved.first() {
         super::item_oracle::fail(
             &format!("generic reuse kept {what} whose reads moved"),
             "-",
-            &format!("{}: {n} reads, first {k:?}: stored {stored:?}, now {:?}", fn_name(p, f), memo[k]),
+            &format!("{}: {} reads, first {k:?}: stored {stored:?}, now {r:?}", fn_name(p, f), moved.len()),
         );
     }
 }
