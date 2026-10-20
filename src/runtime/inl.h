@@ -543,9 +543,14 @@ static inline float lust_inl_f32_max_(float a, float b) { return a > b ? a : b >
 
 /* A release fn's constant data named by its content (cgen/kconst.rs `kdata_def`): each unit
    that uses it defines it, and the link keeps one definition, so equal constants share one
-   address program-wide with no run-time interning. */
+   address program-wide with no run-time interning. clang's selectany is a comdat (weak_odr):
+   its value folds into the code that reads it, as a constant's does (a compare with a
+   promoted enum constant is a compare with an immediate). A plain weak definition (gcc)
+   keeps the identity but not the folding. */
 #if defined(_WIN32)
 #define LUST_KDATA __declspec(selectany)
+#elif defined(__clang__)
+#define LUST_KDATA __attribute__((selectany, visibility("hidden")))
 #else
 #define LUST_KDATA __attribute__((weak, visibility("hidden")))
 #endif
