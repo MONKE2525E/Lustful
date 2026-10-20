@@ -194,7 +194,7 @@ fn shard_inline_glue<'g>(g: &'g GlueSet, keys: &[&'g (Glue, CTy)]) -> Vec<&'g (G
     let plain = |k: &(Glue, CTy)| {
         g.def_map.get(k).is_some_and(|d| d.len() <= INLINE_BYTES && !d.contains("static ") && !d.contains("__attribute__") && !d.contains("#define"))
     };
-    let mut seen: HashSet<&(Glue, CTy)> = keys.iter().copied().collect();
+    let mut seen: crate::intern::FxSet<&(Glue, CTy)> = keys.iter().copied().collect();
     let mut out = Vec::new();
     let mut budget = inline_glue_budget();
     let mut level: Vec<&(Glue, CTy)> = keys.to_vec();

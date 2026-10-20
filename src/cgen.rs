@@ -9267,30 +9267,34 @@ pub fn group_fns_by_bytes(sizes: &[usize], target: usize) -> Vec<std::ops::Range
 // static copy in each function unit that reaches it, so an edit that needs new glue does not
 // rebuild the glue unit. `shared` is None until the first `compute_shared`; before that, all
 // glue lives in the glue unit, as before.
+//
+// The maps hash with FxHash: a key is a C type tree, and every glue lookup hashes it (SipHash
+// made the release C shard cut and the glue refresh pay for each one). Only `defs` follows
+// map order, where order does not matter (see `regen`); every other reader sorts.
 #[derive(Default)]
 pub struct GlueSet {
-    pub protos: HashMap<(Glue, CTy), String>,
+    pub protos: crate::intern::FxMap<(Glue, CTy), String>,
     defs: String,
     /// Each key's definition on its own, so units can carry static copies of just what they reach.
-    def_map: HashMap<(Glue, CTy), String>,
+    def_map: crate::intern::FxMap<(Glue, CTy), String>,
     /// The glue keys each key's definition calls.
-    deps: HashMap<(Glue, CTy), Vec<(Glue, CTy)>>,
+    deps: crate::intern::FxMap<(Glue, CTy), Vec<(Glue, CTy)>>,
     /// C types each key's definition names beyond its key type: the signature of a written
     /// method it calls (`glue_callee`). A unit that defines the key must declare them.
-    types: HashMap<(Glue, CTy), Vec<CTy>>,
+    types: crate::intern::FxMap<(Glue, CTy), Vec<CTy>>,
     /// Keys that live in the shared glue unit. Frozen until the next `compute_shared`.
-    pub shared: Option<HashSet<(Glue, CTy)>>,
+    pub shared: Option<crate::intern::FxSet<(Glue, CTy)>>,
     /// Keys the last `refresh` did not reach: their text may predate a type edit. `add`
     /// regenerates one when a body reaches it again.
-    stale: HashSet<(Glue, CTy)>,
+    stale: crate::intern::FxSet<(Glue, CTy)>,
     /// Fn slots as of the last `add` or `refresh`: fn pointers in static
     /// data (`ConstValue::FnPtr`) name their slot's trampoline.
     slots: Vec<u32>,
     /// The fn slots each key's definition prints (a written method it
     /// calls, see `glue_callee`), as `FnOut::used`.
-    used: HashMap<(Glue, CTy), Vec<u32>>,
+    used: crate::intern::FxMap<(Glue, CTy), Vec<u32>>,
     /// Release C: the extern declarations each key's definition needs (`FnOut::externs`).
-    externs: HashMap<(Glue, CTy), BTreeSet<String>>,
+    externs: crate::intern::FxMap<(Glue, CTy), BTreeSet<String>>,
 }
 
 impl GlueSet {
@@ -9450,13 +9454,13 @@ impl GlueSet {
     /// definitions only call each other. Call this only on a fresh base, then keep it frozen:
     /// a key that turned shared later would need the base glue unit rebuilt.
     pub fn compute_shared(&mut self, fns: &[FnOut], groups: &[std::ops::Range<usize>], k: usize) {
-        let mut count: HashMap<&(Glue, CTy), usize> = HashMap::new();
+        let mut count: crate::intern::FxMap<&(Glue, CTy), usize> = crate::intern::FxMap::default();
         for range in groups {
             for key in self.closure(fns[range.clone()].iter().flat_map(|f| f.glue.iter())) {
                 *count.entry(key).or_default() += 1;
             }
         }
-        let mut shared: HashSet<(Glue, CTy)> = count.into_iter().filter(|&(_, n)| n >= k).map(|(key, _)| key.clone()).collect();
+        let mut shared: crate::intern::FxSet<(Glue, CTy)> = count.into_iter().filter(|&(_, n)| n >= k).map(|(key, _)| key.clone()).collect();
         // Close over deps (the count already implies this, but keep the glue unit self-contained).
         let mut stack: Vec<(Glue, CTy)> = shared.iter().cloned().collect();
         while let Some(key) = stack.pop() {
@@ -11065,7 +11069,7 @@ pub fn fn_unit_parts(
     }
     let mut types = HashSet::new();
     let mut named = HashSet::new();
-    let mut seen: HashSet<&(Glue, CTy)> = HashSet::new();
+    let mut seen: crate::intern::FxSet<&(Glue, CTy)> = crate::intern::FxSet::default();
     // Release C: small callees held by other units, as inline definitions here. The LLVM
     // backend calls fns through `fl_<id>` and gets their copies from `ll_inl` instead.
     let own: HashSet<usize> = slots.iter().copied().collect();
@@ -11086,7 +11090,7 @@ pub fn fn_unit_parts(
     // field's default), within `inline_glue_budget` bytes per unit; the glue left out gets
     // its prototype, which takes its types by pointer. The LLVM backend gets the same set
     // through its helpers' C (`cc` links it into the IR).
-    let mut inl_glue: HashSet<&(Glue, CTy)> = HashSet::new();
+    let mut inl_glue: crate::intern::FxSet<&(Glue, CTy)> = crate::intern::FxSet::default();
     // What the inline glue reads, one step through pointers (`type_decls_with`'s `deep`).
     // Glue that only copies its fields or passes them on (`GlueSet::passes_fields`: an
     // aggregate's drop, clone, eq, default...) holds its types as the unit's own code does:
