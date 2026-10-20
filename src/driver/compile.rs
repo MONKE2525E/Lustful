@@ -798,44 +798,21 @@ fn dep_macros_shut(front: &Front, tables: &crate::resolve::imports::ResolvedTabl
 /// for a slot with no stored reads), the answers
 /// `Program::reads_dirty_memo` gives one set at a time (sigedit P4.4).
 /// Many reads (a full-mode walk, every instance after an item-level
-/// edit) go in parallel: the distinct keys split into one shard per
-/// thread by key hash, each shard computes its keys' fingerprints once,
-/// then each set compares against them. Few stay on this thread.
-fn reads_dirty_par(p: &collect::Program, sets: &[Option<&crate::driver::graph::Reads>], keys: &crate::driver::graph::ReadKeys) -> Vec<Option<usize>> {
-    use crate::driver::graph::{Read, ReadKey};
-    use std::hash::{Hash, Hasher};
+/// edit) go in parallel through `answers` (`KeyAnswers`), which the
+/// request's walks share: a key's fingerprint is computed once for all of
+/// them. Few stay on this thread.
+fn reads_dirty_par(
+    p: &collect::Program,
+    sets: &[Option<&crate::driver::graph::Reads>],
+    keys: &crate::driver::graph::ReadKeys,
+    answers: &mut crate::driver::graph::KeyAnswers,
+) -> Vec<Option<usize>> {
     let total: usize = sets.iter().flatten().map(|r| r.len()).sum();
-    let n = crate::pool::threads();
-    if total < 4096 || n < 2 {
+    if total < 4096 || crate::pool::threads() < 2 {
         let mut memo = FxMap::default();
         return sets.iter().map(|r| r.map(|r| p.reads_dirty_memo(r, keys, &mut memo))).collect();
     }
-    let shard_of = |k: &ReadKey| {
-        let mut h = crate::intern::FxHasher::default();
-        k.hash(&mut h);
-        (h.finish() >> 32) as usize % n
-    };
-    // Each thread sorts the keys of its share of the sets into shards, so a
-    // key is hashed once here, not once per thread.
-    let parts: Vec<&[Option<&crate::driver::graph::Reads>]> = sets.chunks(sets.len().div_ceil(n).max(1)).collect();
-    let buckets: Vec<Vec<Vec<&ReadKey>>> = par_map(&parts, |part| {
-        let mut b: Vec<Vec<&ReadKey>> = vec![Vec::new(); n];
-        for r in part.iter().flatten() {
-            for (k, _) in r.iter(keys) {
-                b[shard_of(k)].push(k);
-            }
-        }
-        b
-    });
-    let ids: Vec<usize> = (0..n).collect();
-    let shards: Vec<FxMap<ReadKey, Read>> = par_map(&ids, |&t| {
-        let mut now = FxMap::default();
-        for &k in buckets.iter().flat_map(|b| &b[t]) {
-            now.entry(*k).or_insert_with(|| p.read_fingerprint(k));
-        }
-        now
-    });
-    par_map(sets, |r| r.map(|r| r.iter(keys).filter(|(k, stored)| shards[shard_of(k)].get(*k) != Some(stored)).count()))
+    answers.dirty_counts(p, sets, keys)
 }
 
 static NEXT_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -3912,6 +3889,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // set and lose their stored C, exactly as before this walk existed.
     let mut reads_reused = 0usize;
     let mut reads_invalidated = 0usize;
+    // The node answers of this walk and of the generic reuse walk below, by
+    // key index: they read the same program, and most instance bodies read
+    // keys the plain bodies read too.
+    let mut walk_answers = crate::driver::graph::KeyAnswers::default();
     // The keyed dirty walk (sigedit P3.2): after a derive delta only the
     // read keys it can move (`Program::derive_key_moves`) may have moved;
     // the delta found the slots that read one with a new fingerprint
@@ -3983,7 +3964,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         // no stored reads), with the read sets borrowed in place; then
         // the results land back in the caches.
         let sets: Vec<_> = mention_only.iter().map(|&i| caches.slot_reads.get(slot_at(i)).and_then(Option::as_ref)).collect();
-        let dirty = reads_dirty_par(&program, &sets, &caches.read_keys);
+        let dirty = reads_dirty_par(&program, &sets, &caches.read_keys, &mut walk_answers);
         // A mask, not a list: full mode makes every passing body a
         // candidate, and `changed` holds them all.
         let mut reused = vec![false; mention_only.iter().max().map_or(0, |&m| m + 1)];
@@ -4226,7 +4207,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             recheck_of[i] = recheck;
         }
         let sets: Vec<_> = by_reads.iter().map(|&i| caches.slot_reads[front.fn_slot[i] as usize].as_ref()).collect();
-        for (&i, d) in by_reads.iter().zip(reads_dirty_par(&program, &sets, &caches.read_keys)) {
+        for (&i, d) in by_reads.iter().zip(reads_dirty_par(&program, &sets, &caches.read_keys, &mut walk_answers)) {
             recheck_of[i] = d != Some(0);
             if !recheck_of[i] {
                 front.slot_env[front.fn_slot[i] as usize] = env;

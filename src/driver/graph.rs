@@ -2970,6 +2970,70 @@ impl<'a> Program {
     }
 }
 
+/// One request's node answers for one program, by key index of one
+/// `ReadKeys` table: the parallel form of `reads_dirty_memo`'s memo, which
+/// the driver's walks over many sets share (the dirty walk over the plain
+/// bodies, then the generic reuse walk over the instance bodies, which reads
+/// ~60% of the same keys). A frozen read finds its answer by index, so a
+/// walk hashes no key. The program must not change while one is in use.
+#[derive(Default)]
+pub(crate) struct KeyAnswers {
+    /// The `ReadKeys::id` the answers index.
+    table: u64,
+    now: Vec<Option<Read>>,
+}
+
+impl KeyAnswers {
+    /// How many reads of each set no longer match `p` (None: no set), as
+    /// `Program::reads_dirty_memo` counts them. The keys the sets read that
+    /// have no answer yet get one first, in parallel.
+    pub(crate) fn dirty_counts(&mut self, p: &Program, sets: &[Option<&Reads>], keys: &ReadKeys) -> Vec<Option<usize>> {
+        use crate::driver::compile::par_map;
+        if self.table != keys.id {
+            self.table = keys.id;
+            self.now.clear();
+        }
+        self.now.resize(keys.len(), None);
+        // The keys still to answer, as one bit set per share of the sets.
+        let n = crate::pool::threads().max(1);
+        let words = keys.len().div_ceil(64);
+        let parts: Vec<&[Option<&Reads>]> = sets.chunks(sets.len().div_ceil(n).max(1)).collect();
+        let now = &self.now;
+        let marks: Vec<Vec<u64>> = par_map(&parts, |part| {
+            let mut m = vec![0u64; words];
+            for r in part.iter().flatten() {
+                r.check_table(keys);
+                for f in r.frozen.iter() {
+                    let k = f.key as usize;
+                    if now[k].is_none() {
+                        m[k / 64] |= 1 << (k % 64);
+                    }
+                }
+            }
+            m
+        });
+        let mut need: Vec<u32> = Vec::new();
+        for w in 0..words {
+            let mut bits = marks.iter().fold(0u64, |a, m| a | m[w]);
+            while bits != 0 {
+                need.push((w * 64) as u32 + bits.trailing_zeros());
+                bits &= bits - 1;
+            }
+        }
+        let got = par_map(&need, |&k| p.read_fingerprint(&keys.keys[k as usize]));
+        for (&k, r) in need.iter().zip(got) {
+            self.now[k as usize] = Some(r);
+        }
+        let now = &self.now;
+        par_map(sets, |r| {
+            r.map(|r| {
+                let frozen = r.frozen.iter().filter(|f| now[f.key as usize] != Some(Read { fingerprint: f.fingerprint, failed: f.failed })).count();
+                frozen + r.map.iter().filter(|(k, stored)| p.read_fingerprint(k) != **stored).count()
+            })
+        })
+    }
+}
+
 // ---------- The keyed dirty walk (sigedit P3.2) ----------
 
 /// The slots whose stored reads (`Caches::slot_reads`) hold a key that
@@ -4053,6 +4117,34 @@ fn main() {}
         assert_eq!(dirty_in(&interner, &known, "fn main() { println!(\"{}\", nosuch()); }\n", &failing), 0, "still missing");
         let fixed = "fn nosuch() -> i64 { 1 }\nfn main() { println!(\"{}\", nosuch()); }\n";
         assert!(dirty_in(&interner, &known, fixed, &failing) >= 1, "added def dirties the failed lookup");
+    }
+
+    /// `KeyAnswers` (the driver's parallel walks) counts what `reads_dirty`
+    /// counts, for frozen sets of one table, also when a second walk takes
+    /// the first walk's answers.
+    #[test]
+    fn key_answers_count_as_the_plain_walk() {
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let missing = "fn main() { println!(\"{}\", nosuch()); }\n";
+        let (plain_a, plain_b) = (main_reads(&interner, &known, SAMPLE), main_reads(&interner, &known, missing));
+        let mut keys = ReadKeys::default();
+        let (mut a, mut b) = (plain_a.clone(), plain_b.clone());
+        a.freeze(&mut keys);
+        b.freeze(&mut keys);
+        let sig_edit = SAMPLE.replace("fn helper() -> i64 { 40 }", "fn helper() -> bool { true }");
+        let fixed = format!("fn nosuch() -> i64 {{ 1 }}\n{SAMPLE}");
+        for src in [SAMPLE, &sig_edit, &fixed] {
+            let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+            let p = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+            let none = ReadKeys::default();
+            let want = vec![Some(p.reads_dirty(&plain_a, &none)), None, Some(p.reads_dirty(&plain_b, &none))];
+            let mut answers = KeyAnswers::default();
+            assert_eq!(answers.dirty_counts(&p, &[Some(&a), None, Some(&b)], &keys), want, "{src}");
+            assert_eq!(answers.dirty_counts(&p, &[Some(&b)], &keys), vec![want[2]], "a second walk, {src}");
+        }
     }
 
     /// Type edits dirty through a body's own reads: a body that only
