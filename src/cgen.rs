@@ -7363,13 +7363,22 @@ impl FnGen<'_, '_> {
                 );
                 "((lust_Unit){})".into()
             }
+            // The length assert, then one memcpy (T is Copy, and a `&mut` and a `&` slice
+            // cannot overlap), as core's `copy_nonoverlapping`. An element loop made a
+            // `[u8; 8]` copy 8 byte stores, and the next 8-byte read of the bytes stalled on
+            // store forwarding; the C compiler makes a memcpy of a known length one move.
+            // A zero-sized T copies nothing.
             B::SliceCopyFromSlice => {
-                let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let (_, sptr, slen) = slice_like(&tys[1], &vals[1]);
-                let i = self.tmp();
+                let copy = if c_size_align(self.p, &e).0 == 0 {
+                    String::new()
+                } else {
+                    format!("\n    lust_memcpy({ptr}, {sptr}, {len} * sizeof({}));", ctype(&e))
+                };
                 let _ = writeln!(
                     self.out,
-                    "    if ({slen} != {len}) lust_panic_nn(\"copy_from_slice: source slice length (\", {slen}, \") does not match destination slice length (\", {len}, \")\", {loc});\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) {ptr}[{i}] = {sptr}[{i}];"
+                    "    if ({slen} != {len}) lust_panic_nn(\"copy_from_slice: source slice length (\", {slen}, \") does not match destination slice length (\", {len}, \")\", {loc});{copy}"
                 );
                 "((lust_Unit){})".into()
             }
