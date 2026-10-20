@@ -107,6 +107,8 @@ const PACK_ENV: &str = "LUST_FRONT_ZSTD";
 const RESTORE_ENV: &str = "LUST_FRONT_RESTORE";
 /// Raw bytes per packed section; sections pack and unpack in parallel.
 const SECTION: usize = 8 << 20;
+/// The span of runs one restore mapping covers at most (`load`).
+const GROUP_SPAN: usize = 64 << 20;
 const RTLD_NOW: c_int = 2;
 const MFD_CLOEXEC: std::ffi::c_uint = 1;
 const MADV_NOHUGEPAGE: c_int = 15;
@@ -1373,19 +1375,31 @@ pub fn load(dir: &Path) -> Result<Box<Roots>, String> {
     let mut sections = Vec::new();
     if anon {
         let z = zstd().ok_or("a packed image, and no libzstd")?;
+        // One mapping per group of runs within 64 MB of span, the gaps between them included:
+        // a tsgo image has 17-27k runs, and a mapping each cost 30-80 ms of the restore and
+        // made the save's fork slower. A gap is never touched, so it takes no memory
+        // (MAP_NORESERVE). Groups, not one mapping: the workers that place pages then
+        // fault in different mappings, not all on one mapping's lock.
+        let mut groups: Vec<(usize, usize)> = Vec::new();
         for &(a, e) in &runs {
+            match groups.last_mut() {
+                Some((lo, hi)) if e - *lo <= GROUP_SPAN => *hi = e,
+                _ => groups.push((a, e)),
+            }
+        }
+        for &(a, e) in &groups {
             // SAFETY: a private anonymous mapping in the image window, which
             // holds nothing else (`window_taken`).
             let p = unsafe { mmap(a as *mut c_void, e - a, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) };
             if p as usize != a {
                 unmap_all(&mapped);
-                return Err(format!("cannot map image run {a:#x}"));
+                return Err(format!("cannot map image runs at {a:#x}"));
             }
             mapped.push((a, e - a));
             // Small pages only: memory for the pages placed, not for the
             // zero pages around them. (No THP in the kernel: nothing to
             // turn off.)
-            // SAFETY: the run just mapped.
+            // SAFETY: the group just mapped.
             unsafe { madvise(p, e - a, MADV_NOHUGEPAGE) };
         }
         let t3 = std::time::Instant::now();
