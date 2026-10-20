@@ -272,6 +272,138 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     c
 }
 
+/// The C types the data of `statics` reads: what it holds by value and the promoted values it
+/// points at (`held`), and what it only points at (`pointed`), with the types of the
+/// trampolines of its fn pointers (their bodies' parameters and results).
+fn statics_types(p: &Program, statics: impl Iterator<Item = usize>) -> (HashSet<CTy>, HashSet<CTy>) {
+    let (mut by_value, mut held, mut pointed, mut fns) = (Vec::new(), HashSet::new(), HashSet::new(), Vec::new());
+    for i in statics {
+        let st = &p.statics[i];
+        let t = cty(&p.tys, st.ty);
+        by_value_deps(&t, &mut by_value);
+        collect_types(&t, &mut pointed);
+        collect_promoted(p, &st.value, &t, &mut held);
+        const_fns(&st.value, &mut fns);
+    }
+    held.extend(by_value);
+    for f in fns {
+        let info = p.fn_info(LocalDefId(f));
+        for &t in info.params.iter().chain([&info.ret]) {
+            collect_types(&cty(&p.tys, t), &mut held);
+        }
+    }
+    (held, pointed)
+}
+
+/// Release C statics in parts (`LUST_RELEASE_STATICS_KB`): the statics in emission order, cut
+/// where a static's own bytes say (`cut_after` at odds bytes / `target`; a static of `target`
+/// bytes or more alone), so a merge that changes one static recompiles its part only, and a
+/// program's giant tables sit in parts of their own. One pass makes them all (`statics_outs`,
+/// as `static_defs`), so each pointee, str array and trampoline has one definition, global, in
+/// the part of the static whose value made it first, and equal content keeps one address
+/// across parts as in one unit. A part declares each such name it uses (its own too: a static's
+/// data can point into a later one's). Returns the index (unit 1), which registers every
+/// pointee in the pass's order (`lust_kstatics_init`), and the parts.
+pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<String>) {
+    let (outs, cx) = statics_outs(p, &g.slots);
+    let target = target.max(1);
+    let mut cuts: Vec<Vec<usize>> = Vec::new();
+    let mut cur = Vec::new();
+    for (k, o) in outs.iter().enumerate() {
+        let bytes = o.data.len() + o.made.len();
+        if bytes >= target && !cur.is_empty() {
+            cuts.push(std::mem::take(&mut cur));
+        }
+        cur.push(k);
+        if cut_after(&o.sym, bytes, target as u64) {
+            cuts.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        cuts.push(cur);
+    }
+    // Each name the pass defined: its declaration, its place in the pass, and its static.
+    let mut decl_of: HashMap<&str, (&str, usize, usize)> = HashMap::new();
+    for (k, o) in outs.iter().enumerate() {
+        for d in o.decls.clone() {
+            let (name, decl, _) = &cx.decls[d];
+            decl_of.insert(name, (decl, d, k));
+        }
+    }
+    let by_sym: HashMap<&str, usize> = outs.iter().enumerate().map(|(k, o)| (o.sym.as_str(), k)).collect();
+    let wanted: Vec<&str> = decl_of.keys().chain(by_sym.keys()).copied().collect();
+    let names = CUR.with(|c| c.borrow().clone());
+    let tag = super::layout_phase();
+    let parts = crate::pool::par_map(&cuts, |ks| {
+        super::in_layout_phase(tag, || {
+            with(names.as_ref(), || {
+                let body: String = ks.iter().map(|&k| outs[k].made.as_str()).chain(ks.iter().map(|&k| outs[k].data.as_str())).collect();
+                // The names it uses, and the names the alias macros among them use.
+                let mut used = names_in(&body, wanted.iter().copied());
+                let mut stack: Vec<&str> = used.iter().copied().collect();
+                while let Some(n) = stack.pop() {
+                    if let Some((d, _, _)) = decl_of.get(n).filter(|(d, _, _)| d.starts_with("#define")) {
+                        stack.extend(names_in(d, wanted.iter().copied()).into_iter().filter(|m| used.insert(m)));
+                    }
+                }
+                // The statics whose types it reads: its own, and those whose data or pointees it names.
+                let mut statics: std::collections::BTreeSet<usize> = ks.iter().map(|&k| outs[k].idx).collect();
+                for n in &used {
+                    if let Some(&k) = by_sym.get(n) {
+                        statics.insert(outs[k].idx);
+                    }
+                    if let Some(&(_, _, k)) = decl_of.get(n) {
+                        statics.insert(outs[k].idx);
+                    }
+                }
+                let (types, mut pointed) = statics_types(p, statics.iter().copied());
+                // Only the glue the data names (a vtable's drop entry, say).
+                let glue = names_in(&body, g.protos.values().map(|proto| proto_name(proto)));
+                let mut protos: Vec<&String> = Vec::new();
+                for (k, proto) in &g.protos {
+                    if glue.contains(proto_name(proto)) {
+                        collect_types(&k.1, &mut pointed);
+                        protos.push(proto);
+                    }
+                }
+                protos.sort();
+                pointed.retain(|t| !types.contains(t));
+                let mut c = unit_header();
+                // No blocks: an initializer names the fields of every type its value holds.
+                type_decls_with(p, &mut c, &types, &pointed, Decls::ByValue { blocks: false }, &HashSet::new());
+                protos.into_iter().for_each(|x| c.push_str(x));
+                let named: HashSet<usize> = used.iter().filter_map(|n| by_sym.get(n)).map(|&k| outs[k].idx).collect();
+                c.push_str(&static_decls_for(p, &named));
+                // The declarations, in the pass's order: externs and prototypes, then the macros.
+                let mut decls: Vec<(usize, &str)> = used.iter().filter_map(|n| decl_of.get(n)).map(|&(d, at, _)| (at, d)).collect();
+                decls.sort_unstable();
+                decls.iter().filter(|(_, d)| !d.starts_with("#define")).for_each(|(_, d)| c.push_str(d));
+                decls.iter().filter(|(_, d)| d.starts_with("#define")).for_each(|(_, d)| c.push_str(d));
+                c.push_str(&body);
+                c
+            })
+        })
+    });
+    // The index: every pointee, declared, then registered in the pass's order.
+    let mut index = unit_header();
+    let regs: Vec<&str> = kconst::kstatics_regs(&cx).collect();
+    let type_of: HashMap<&str, &CTy> = cx.decls.iter().filter_map(|(n, _, t)| Some((n.as_str(), t.as_ref()?))).collect();
+    let mut named = HashSet::new();
+    for r in &regs {
+        if let Some(t) = type_of.get(r) {
+            collect_types(t, &mut named);
+        }
+    }
+    type_decls_with(p, &mut index, &HashSet::new(), &named, Decls::ByValue { blocks: false }, &HashSet::new());
+    for r in &regs {
+        if let Some((d, _, _)) = decl_of.get(r) {
+            index.push_str(d);
+        }
+    }
+    index.push_str(&kconst::kstatics_init(&cx));
+    (index, parts)
+}
+
 /// The fn a glue prototype declares: the last name before its parameter list.
 fn proto_name(proto: &str) -> &str {
     proto.split('(').next().and_then(|h| h.rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).next()).unwrap_or("")

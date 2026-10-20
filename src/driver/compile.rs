@@ -4890,9 +4890,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // without text (a skipped assembly).
     let mut b1_units: FxMap<String, (u128, bool)> = FxMap::default();
     let mut b1_line: Option<String> = None;
+    // Release C statics in parts (`cgen::names::statics_parts`): unit 1 is their index, and the
+    // parts come after the glue shards.
+    let mut n_statics = 0usize;
     let mut units: Vec<(PathBuf, String)> = match &rgroups {
         None => par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay))),
         Some(rg) => {
+            let statics_out: std::sync::Mutex<Vec<String>> = Default::default();
+            let first_statics = FIRST_FN_UNIT + rg.len() + n_shards;
             let mut jobs: Vec<usize> = vec![0, 1, 2, 3, LOC_UNIT];
             jobs.extend((0..rg.len()).map(|g| g + FIRST_FN_UNIT));
             // Cross-unit inlining for the LLVM backend (cgen/ll.rs `ll_inline_set`): per fn
@@ -4979,7 +4984,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 let t = Instant::now();
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
-                    1 => (adapt(cgen::names::statics_unit(&program, &caches.glue), &Default::default()), String::new()),
+                    1 => match super::release_c::statics_bytes() {
+                        0 => (adapt(cgen::names::statics_unit(&program, &caches.glue), &Default::default()), String::new()),
+                        target => {
+                            let (index, parts) = cgen::names::statics_parts(&program, &caches.glue, target);
+                            let parts: Vec<String> = parts.into_iter().map(|t| adapt(t, &Default::default())).collect();
+                            if let Some(s) = &stream {
+                                parts.iter().enumerate().for_each(|(j, t)| s.add(&format!("u{}", first_statics + j), t));
+                            }
+                            *statics_out.lock().unwrap_or_else(|e| e.into_inner()) = parts;
+                            (adapt(index, &Default::default()), String::new())
+                        }
+                    },
                     2 => (cgen::runtime_unit(), String::new()),
                     3 => (super::release_c::table_unit(&rg.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
                     LOC_UNIT => {
@@ -5102,9 +5118,11 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 b1_ms[3] = t_clean.elapsed().as_secs_f64() * 1e3 - b1_ms[2];
                 asm_ms[2] = t_asm.elapsed().as_secs_f64() * 1e3;
                 let c_refs = cgen::names::with(rn, || cgen::ll::on(&program)).then(|| {
-                    // The C units and glue shards are made this build; each fn's C was read when
+                    // The C units, glue shards and statics parts are made this build; each fn's C was read when
                     // its FnOut was made (`FnOut::ll_c_refs`; a C body's `code` is read here).
-                    let texts: Vec<&str> = made.iter().map(|(_, c, _)| c.as_str()).chain(rshards.iter().map(String::as_str)).collect();
+                    let statics_now = statics_out.lock().unwrap_or_else(|e| e.into_inner());
+                    let texts: Vec<&str> =
+                        made.iter().map(|(_, c, _)| c.as_str()).chain(rshards.iter().map(String::as_str)).chain(statics_now.iter().map(String::as_str)).collect();
                     let mut r = cgen::ll::CRefs::default();
                     for p in par_map(&texts, |t| {
                         let mut r = cgen::ll::CRefs::default();
@@ -5295,6 +5313,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 }
                 let first = FIRST_FN_UNIT + rg.len();
                 units.extend(rshards.drain(..).enumerate().map(|(j, c)| (base_obj(first + j), c)));
+                let statics = std::mem::take(&mut *statics_out.lock().unwrap_or_else(|e| e.into_inner()));
+                n_statics = statics.len();
+                units.extend(statics.into_iter().enumerate().map(|(j, c)| (base_obj(first + n_shards + j), c)));
                 let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.session.target_triple };
                 let lls = par_map(&(0..rg.len()).collect::<Vec<_>>(), |&g| cgen::ll::ll_unit(&caches.out, &rg[g].1, &inl[g], triple));
                 for (g, text) in lls.into_iter().enumerate() {
@@ -5318,9 +5339,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     };
     // The LLVM backend (cgen/ll.rs) wrote `.ll` companions: only cc.rs builds them.
     let llvm = rgroups.is_some() && cgen::names::with(rn, || cgen::ll::on(&program));
-    // The units the link takes after 1..4: release C has its own fn units and glue shards.
+    // The units the link takes after 1..4: release C has its own fn units, glue shards and
+    // statics parts.
     let link_fn_units: Vec<usize> = match &rgroups {
-        Some(rg) => (0..rg.len() + n_shards).map(|g| g + FIRST_FN_UNIT).collect(),
+        Some(rg) => (0..rg.len() + n_shards + n_statics).map(|g| g + FIRST_FN_UNIT).collect(),
         None => fn_units.clone(),
     };
     if let Some(p) = &req.emit_c {

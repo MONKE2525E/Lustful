@@ -10138,9 +10138,15 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                 let tr = trampoline(p, f, slot).replacen(&format!(" {}(", names::tramp(slot)), &format!(" {name}("), 1);
                 if names::release() {
                     // Release C: the copy calls the body by name, so it needs the
-                    // body's prototype, and it stays local to this unit.
+                    // body's prototype, and it stays local to this unit (statics in parts:
+                    // global, so another part points at the same copy).
                     let _ = writeln!(pre, "{};", fn_sig(p, f, slot));
-                    pre.push_str("static ");
+                    if cx.parts {
+                        let proto = tr.split_once(" {").map_or(tr.as_str(), |(h, _)| h);
+                        cx.decls.push((name.clone(), format!("{proto};\n"), None));
+                    } else {
+                        pre.push_str("static ");
+                    }
                 }
                 pre.push_str(&tr);
             }
@@ -10162,6 +10168,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                     let at = CTy::Array(el.clone(), vals.len() as u64);
                     let name = promoted_name(cx, pos);
                     let init = const_init(p, inner, &at, pre, cx, slots, pos.map(|_| name.as_str()));
+                    let name = content_named(p, cx, pos, name, inner, &at, &init);
                     kconst::kdef(p, cx, pre, &name, inner, &at, &init);
                     format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
                 }
@@ -10169,6 +10176,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
                     let at = CTy::Array(el.clone(), b.len() as u64);
                     let init = const_init(p, inner, &at, pre, cx, slots, None);
                     let name = promoted_name(cx, pos);
+                    let name = content_named(p, cx, pos, name, inner, &at, &init);
                     kconst::kdef(p, cx, pre, &name, inner, &at, &init);
                     format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
                 }
@@ -10183,6 +10191,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
         (CV::Ref(inner), CTy::Ref(inner_ct)) => {
             let name = promoted_name(cx, pos);
             let init = const_init(p, inner, inner_ct, pre, cx, slots, pos.map(|_| name.as_str()));
+            let name = content_named(p, cx, pos, name, inner, inner_ct, &init);
             kconst::kdef(p, cx, pre, &name, inner, inner_ct, &init);
             format!("(&{name})")
         }
@@ -10249,6 +10258,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let at = CTy::Array(e.clone(), vals.len() as u64);
             let name = promoted_name(cx, pos);
             let init = const_init(p, v, &at, pre, cx, slots, pos.map(|_| name.as_str()));
+            let name = content_named(p, cx, pos, name, v, &at, &init);
             kconst::kdef(p, cx, pre, &name, v, &at, &init);
             format!("(({}){{ {name}.v, {} }})", ctype(t), vals.len())
         }
@@ -10260,6 +10270,7 @@ fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &
             let at = CTy::Array(e.clone(), b.len() as u64);
             let init = const_init(p, v, &at, pre, cx, slots, None);
             let name = promoted_name(cx, pos);
+            let name = content_named(p, cx, pos, name, v, &at, &init);
             kconst::kdef(p, cx, pre, &name, v, &at, &init);
             format!("(({}){{ {name}.v, {} }})", ctype(t), b.len())
         }
@@ -10279,6 +10290,12 @@ fn promoted_name(cx: &mut kconst::StaticCx, pos: Option<&str>) -> String {
             format!("lust_promoted_{}", cx.counter)
         }
     }
+}
+
+/// `name` from `promoted_name` once the value's initializer is made: an unnamed pointee of release
+/// C statics in parts gets its content's name instead (`kconst::content_name`).
+fn content_named(p: &Program, cx: &kconst::StaticCx, pos: Option<&str>, name: String, v: &crate::ty::consteval::ConstValue, ct: &CTy, init: &str) -> String {
+    if pos.is_none() && cx.parts { kconst::content_name(p, cx, v, ct, init) } else { name }
 }
 
 /// The position name of field or element `i` below position `pos`.
@@ -10471,6 +10488,45 @@ fn static_defs(p: &Program, slots: &[u32]) -> String {
     }
     let pre: String = pre.lines().filter(|l| !l.starts_with("#define lust_sp_")).flat_map(|l| [l, "\n"]).collect();
     format!("{fwd}{pre}{out}{}", kconst::kstatics_init(&cx))
+}
+
+/// One static of release C statics in parts (`statics_outs`).
+pub(crate) struct StaticOut {
+    /// Its index in `Program::statics`.
+    pub idx: usize,
+    pub sym: String,
+    /// Its definition, `T sym = init;`.
+    pub data: String,
+    /// What its value defined first, in `static_defs`' order: pointees, alias macros, str arrays,
+    /// and trampolines with their bodies' prototypes.
+    pub made: String,
+    /// The names `made` defines, as indices into `StaticCx::decls`.
+    pub decls: std::ops::Range<usize>,
+}
+
+/// `static_defs`' pass for release C statics in parts (`names::statics_parts`): every live
+/// static in emission order with what its value defined first, and the pass's context (the
+/// pointees to register and each defined name's declaration). The pass defines its pointees,
+/// str arrays and trampolines global and names an unnamed pointee by its content
+/// (`StaticCx::parts`).
+fn statics_outs(p: &Program, slots: &[u32]) -> (Vec<StaticOut>, kconst::StaticCx) {
+    let mut cx = kconst::StaticCx::default();
+    cx.parts = true;
+    let order = statics_in_order(p);
+    // The `thread_local!` keys' slot words, numbered over every static as `static_defs` does.
+    let tls_word: HashMap<usize, crate::ty::consteval::ConstValue> =
+        order.iter().filter(|&&i| p.statics[i].tls.is_some()).enumerate().map(|(n, &i)| (i, crate::ty::consteval::ConstValue::Int(n as i128 + 1))).collect();
+    let mut outs = Vec::with_capacity(order.len());
+    for i in order {
+        let st = &p.statics[i];
+        let ct = cty(&p.tys, st.ty);
+        let value = tls_word.get(&i).unwrap_or(&st.value);
+        let (mut made, first) = (String::new(), cx.decls.len());
+        let init = const_init(p, value, &ct, &mut made, &mut cx, slots, Some(&static_pos(p, i as u32)));
+        let sym = static_sym(p, i as u32);
+        outs.push(StaticOut { idx: i, data: format!("{} {sym} = {init};\n", ctype(&ct)), sym, made, decls: first..cx.decls.len() });
+    }
+    (outs, cx)
 }
 
 /// Extern declarations of the statics, for function units.
@@ -13217,6 +13273,67 @@ mod tests {
             assert!(unit.contains(&format!("inline void drop_{e}_(")), "the enum's drop glue is inline:\n{unit}");
             assert!(!unit.contains(&format!("struct {big} {{")) && !unit.contains(&format!("sizeof({big})")), "the unit defines no {big}:\n{unit}");
         });
+    }
+
+    /// Release C statics in parts, one static a part (a 1-byte target): a merge that changes one
+    /// static's value changes its part and nothing else (the index keeps every registration),
+    /// though the statics share pointees across parts (one "hello", one trampoline), and every
+    /// part and the index compile on their own declarations.
+    #[test]
+    fn statics_parts_change_only_where_the_static_is() {
+        let src = |a: i64| {
+            format!(
+                "static A: i64 = {a};\nstatic B: &str = \"hello\";\nstatic C: &[u8] = b\"hello\";\nstatic D: [u32; 4] = [1, 2, 3, 4];\n\
+                 static E: &[i64] = &[10, 20, 30];\nstatic F: Option<&str> = Some(\"hello\");\nstatic G: fn() -> i64 = f;\n\
+                 static H: &[&str] = &[\"x\", \"hello\"];\nfn f() -> i64 {{ 7 }}\nfn main() {{}}\n"
+            )
+        };
+        let parts_of = |a: i64| -> (String, Vec<String>) {
+            let src = src(a);
+            let interner = std::sync::Arc::new(Interner::default());
+            let known = std::sync::Arc::new(Known::new(&interner));
+            let lexed = lexer::lex(&src, FileId(0), 0, &interner).unwrap();
+            let ast = parser::parse(&lexed, &interner, &known).unwrap();
+            let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+            let program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+            let mut map = SourceMap::default();
+            map.add_file("test.rs", &src);
+            let n = program.fns.len();
+            let slots: Vec<u32> = (0..n as u32).collect();
+            let names = std::sync::Arc::new(names::Names {
+                fns: (0..n).map(|s| Some(format!("{s:016x}"))).collect(),
+                adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
+                by_id: Default::default(),
+            });
+            names::with(Some(&names), || {
+                let outs: Vec<FnOut> = (0..n)
+                    .map(|i| {
+                        let (ck, errs) = check_fn(&program, LocalDefId(i as u32));
+                        assert!(errs.is_empty(), "{errs:?}");
+                        gen_fn(&program, &crate::lower::lower(&program, LocalDefId(i as u32), ck), &map, 1, &slots)
+                    })
+                    .collect();
+                let mut glue = GlueSet::default();
+                glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
+                names::statics_parts(&program, &glue, 1)
+            })
+        };
+        let ((index, parts), (index2, parts2)) = (parts_of(5), parts_of(6));
+        assert_eq!(parts.len(), 8, "a part per static");
+        assert_eq!(index, index2, "the same registrations");
+        let changed: Vec<usize> = (0..parts.len()).filter(|&j| parts[j] != parts2[j]).collect();
+        assert_eq!(changed.len(), 1, "only A's part changes");
+        assert!(parts2[changed[0]].contains("6") && !parts2[changed[0]].contains("hello"), "the part is A's:\n{}", parts2[changed[0]]);
+        let hello = parts.iter().filter(|t| t.contains("\"hello")).count();
+        assert_eq!(hello, 1, "one definition of the shared bytes");
+        let dir = std::env::temp_dir().join(format!("lust-statics-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (k, t) in parts.iter().chain([&index]).enumerate() {
+            let f = dir.join(format!("p{k}.c"));
+            std::fs::write(&f, t).unwrap();
+            let cc = std::process::Command::new("cc").args(["-fsyntax-only", "-w", "-std=gnu11"]).arg(&f).output().unwrap();
+            assert!(cc.status.success(), "part {k} compiles:\n{}\n{t}", String::from_utf8_lossy(&cc.stderr));
+        }
     }
 
     /// Replaces `main` with a hand-built body: an indirect call

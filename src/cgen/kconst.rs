@@ -363,6 +363,13 @@ pub(super) struct StaticCx {
     /// The fn pointer trampolines (`stramp<tag>`) this pass's prelude defines.
     pub stramps: std::collections::HashSet<String>,
     regs: Vec<(String, u64, u64, Option<Vec<u64>>)>,
+    /// Release C statics in parts (`names::statics_parts`): the pass defines its pointees, str
+    /// arrays and trampolines global, so another part can name them, names an unnamed pointee
+    /// by its content key (`content_name`), and keeps here, in order, each name it defines
+    /// with its declaration (an extern declaration, a prototype, or the alias macro itself) and
+    /// the C type the declaration names.
+    pub parts: bool,
+    pub decls: Vec<(String, String, Option<CTy>)>,
 }
 
 /// Every static pointee is at least 16-aligned, so a site of a stricter
@@ -376,19 +383,45 @@ const KALIGN: u64 = 16;
 pub(super) fn kdef(p: &Program, cx: &mut StaticCx, pre: &mut String, name: &str, v: &crate::ty::consteval::ConstValue, ct: &CTy, init: &str) {
     let c = ctype(ct);
     let (n, a) = c_size_align(p, ct);
+    let link = if cx.parts { "" } else { "static " };
     if n == 0 {
-        let _ = writeln!(pre, "static const {c} {name} = {init};");
+        // A content name may come again (`content_name`): one definition.
+        if cx.parts && cx.decls.iter().any(|(d, _, _)| d == name) {
+            return;
+        }
+        let _ = writeln!(pre, "{link}const {c} {name} = {init};");
+        if cx.parts {
+            cx.decls.push((name.to_string(), format!("extern const {c} {name};\n"), Some(ct.clone())));
+        }
         return;
     }
     let key = static_key(p, cx, v, ct, &c, init);
     if let Some(prev) = cx.defs.get(&key) {
-        let _ = writeln!(pre, "#define {name} (*({c} *)&{prev})");
+        if prev == name {
+            return;
+        }
+        let line = format!("#define {name} (*({c} *)&{prev})\n");
+        pre.push_str(&line);
         cx.alias.insert(name.to_string(), prev.clone());
+        if cx.parts {
+            cx.decls.push((name.to_string(), line, Some(ct.clone())));
+        }
         return;
     }
     cx.defs.insert(key, name.to_string());
-    let _ = writeln!(pre, "static const {c} {name} __attribute__((aligned({}))) = {init};", KALIGN.max(a));
+    let _ = writeln!(pre, "{link}const {c} {name} __attribute__((aligned({}))) = {init};", KALIGN.max(a));
     cx.regs.push((name.to_string(), n, KALIGN.max(a), kdesc(p, ct)));
+    if cx.parts {
+        cx.decls.push((name.to_string(), format!("extern const {c} {name};\n"), Some(ct.clone())));
+    }
+}
+
+/// The name of an unnamed pointee in release C statics in parts (`StaticCx::parts`): its content
+/// key's (`static_key`), so it does not move when a pointee before it in the pass comes or goes.
+pub(super) fn content_name(p: &Program, cx: &StaticCx, v: &crate::ty::consteval::ConstValue, ct: &CTy, init: &str) -> String {
+    let key = static_key(p, cx, v, ct, &ctype(ct), init);
+    let (a, b) = crate::driver::cache::hash128(&[&key], 0);
+    format!("lust_kp{a:016x}{b:016x}")
 }
 
 /// A `&str` in static data: its bytes in one registered array per
@@ -406,10 +439,19 @@ pub(super) fn kstatic_str(cx: &mut StaticCx, pre: &mut String, bytes: &[u8]) -> 
     let name = match cx.defs.get(&key) {
         Some(n) => n.clone(),
         None => {
-            let name = format!("lust_ks{}", cx.regs.len());
-            let _ = writeln!(pre, "static const uint8_t {name}[{}] __attribute__((aligned({KALIGN}))) = {};", bytes.len(), c_string_lit(bytes));
+            let name = if cx.parts {
+                let (a, b) = crate::driver::cache::hash128(&[&key], 0);
+                format!("lust_ks{a:016x}{b:016x}")
+            } else {
+                format!("lust_ks{}", cx.regs.len())
+            };
+            let link = if cx.parts { "" } else { "static " };
+            let _ = writeln!(pre, "{link}const uint8_t {name}[{}] __attribute__((aligned({KALIGN}))) = {};", bytes.len(), c_string_lit(bytes));
             cx.regs.push((name.clone(), bytes.len() as u64, KALIGN, None));
             cx.defs.insert(key, name.clone());
+            if cx.parts {
+                cx.decls.push((name.clone(), format!("extern const uint8_t {name}[{}];\n", bytes.len()), None));
+            }
             name
         }
     };
@@ -520,6 +562,11 @@ fn put(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, off: usize, b
         }
         _ => None,
     }
+}
+
+/// The pointees `kstatics_init` registers, in its order.
+pub(super) fn kstatics_regs(cx: &StaticCx) -> impl Iterator<Item = &str> {
+    cx.regs.iter().map(|(name, ..)| name.as_str())
 }
 
 /// `lust_kstatics_init`, which registers the static pointees in

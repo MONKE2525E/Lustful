@@ -127,6 +127,14 @@ fn group_fns(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &
         .collect()
 }
 
+/// The target size of a part of the release C statics in bytes of their C (`LUST_RELEASE_STATICS_KB`,
+/// default 128; 0: one statics unit), `cgen::names::statics_parts`. tsgo's statics were one
+/// 15.6 MB unit (2-4 s under load) that 7 of 12 merges of its replay recompiled for a few
+/// changed statics; 128 KB beat 256 KB and one unit there.
+pub fn statics_bytes() -> usize {
+    std::env::var("LUST_RELEASE_STATICS_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(128) * 1024
+}
+
 /// The cap on a release C fn unit's fn code (`LUST_RELEASE_UNIT_CAP_KB`, default 256; 0: none).
 /// The cuts at odds bytes / target leave a long tail of large units (tsgo: units of 1.3-1.9 MB of
 /// C at 3-4 s under load, the slowest compile of many small merges); 256 KB beat 512 and 128 KB
