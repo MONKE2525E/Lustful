@@ -6419,7 +6419,7 @@ impl FnGen<'_, '_> {
             | B::TlsCloneRc => {
                 unreachable!("lower/tls.rs expands LocalKey calls before codegen")
             }
-            B::TlsAccess | B::TlsTryAccess | B::TlsInitWith => self.tls_builtin(b, &vals, &tys, loc),
+            B::TlsAccess | B::TlsTryAccess | B::TlsInitWith => self.tls_builtin(b, &vals, &tys, loc, &ops[0]),
             B::RcTryUnwrap => {
                 let elem = match &tys[0] { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
                 let res = CTy::Result(Box::new(elem.clone()), Box::new(CTy::Rc(Box::new(elem.clone()))));
@@ -10681,6 +10681,10 @@ fn static_defs(p: &Program, slots: &[u32]) -> String {
     };
     for i in order {
         let st = &p.statics[i];
+        if let Some(cell) = native_tls_cell(p, i) {
+            out.push_str(&native_tls_def(p, i, &cell));
+            continue;
+        }
         let ct = cty(&p.tys, st.ty);
         let value = tls_word.get(&i).unwrap_or(&st.value);
         let init = const_init(p, value, &ct, &mut pre, &mut cx, slots, Some(&static_pos(p, i as u32)));
@@ -10733,6 +10737,12 @@ fn statics_outs(p: &Program, slots: &[u32]) -> (Vec<StaticOut>, kconst::StaticCx
     let mut outs = Vec::with_capacity(order.len());
     for i in order {
         let st = &p.statics[i];
+        if let Some(cell) = native_tls_cell(p, i) {
+            let first = cx.decls.len();
+            let sym = static_sym(p, i as u32);
+            outs.push(StaticOut { idx: i, data: native_tls_def(p, i, &cell), sym, made: String::new(), decls: first..first });
+            continue;
+        }
         let ct = cty(&p.tys, st.ty);
         let value = tls_word.get(&i).unwrap_or(&st.value);
         let (mut made, first) = (String::new(), cx.decls.len());
@@ -13965,6 +13975,31 @@ fn tls_cell(t: &CTy) -> CTy {
     CTy::Tuple(vec![CTy::Int(IntTy::U8), t.clone()])
 }
 
+/// Release C: the native cell of `thread_local!` static `i` (its `tls_cell` type). Every
+/// thread_local of a release program has one, so every access reaches the same storage:
+/// the static's unit defines the cell (`__thread`, zeroed: state 0), a getter of this
+/// thread's cell, and the key as the getter's address (`native_tls_def`); a body whose key
+/// traces to the static takes the cell's address, any other calls the getter through the
+/// key (`tls_builtin`). None outside release C (tcc has no native TLS: the runtime's slots).
+pub(crate) fn native_tls_cell(p: &Program, i: usize) -> Option<CTy> {
+    let st = &p.statics[i];
+    if !names::release() || st.tls.is_none() {
+        return None;
+    }
+    Some(tls_cell(&cty(&p.tys, p.tys.local_key_elem(st.ty)?)))
+}
+
+/// `native_tls_cell`'s definitions for static `i` named `sym`: the cell, its getter, the key.
+pub(crate) fn native_tls_def(p: &Program, i: usize, cell: &CTy) -> String {
+    let sym = static_sym(p, i as u32);
+    let h = sym.strip_prefix("lust_static_").unwrap_or(&sym);
+    format!(
+        "__thread {ct} lust_tlc_{h};\nstatic void *lust_tlg_{h}(void) {{ return &lust_tlc_{h}; }}\n{key} {sym} = ({key})(uintptr_t)lust_tlg_{h};\n",
+        ct = ctype(cell),
+        key = ctype(&cty(&p.tys, p.statics[i].ty))
+    )
+}
+
 /// The `TlsInit` and `TlsDtor` glue of the cell type `c` (see `Glue`).
 /// Rust's `LazyStorage` order: a value made while the init fn ran (a
 /// recursive access) is replaced and dropped; else the cell turns alive
@@ -14002,12 +14037,49 @@ fn tls_glue(p: &Program, g: &Glue, c: &CTy, protos: &mut String, defs: &mut Stri
 }
 
 impl FnGen<'_, '_> {
+    /// The static a TLS key operand names. Lowering makes the key a temp assigned once from
+    /// the static's address (`StaticRef`), maybe through a reborrow (`&*t`); any other shape,
+    /// or a temp assigned twice, gives None (`tls_builtin` then reads the key).
+    fn tls_key_static(&self, key: &Operand) -> Option<u32> {
+        let mut l = match key {
+            Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => p.local,
+            _ => return None,
+        };
+        for _ in 0..4 {
+            let mut def = None;
+            for bb in &self.body.blocks {
+                if let Terminator::Call { dest, .. } = &bb.term
+                    && dest.local == l
+                {
+                    return None;
+                }
+                for st in &bb.stmts {
+                    if let StmtKind::Assign(pl, rv) = &st.kind
+                        && pl.local == l
+                    {
+                        if def.is_some() || !pl.proj.is_empty() {
+                            return None;
+                        }
+                        def = Some(rv);
+                    }
+                }
+            }
+            match def? {
+                Rvalue::StaticRef(i) => return Some(*i),
+                Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) if p.proj.is_empty() => l = p.local,
+                Rvalue::Ref(_, p) if p.proj == [Proj::Deref] => l = p.local,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// `TlsAccess(key, init) -> &T`, `TlsTryAccess(key, init) ->
     /// Option<&T>`, and `TlsInitWith(key, value) -> Option<T>`
-    /// (lower/tls.rs), over the runtime's per-thread cells. The common
-    /// access builds no `Option`: tcc zero-fills each compound literal
-    /// with a memset call.
-    fn tls_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy], loc: &str) -> String {
+    /// (lower/tls.rs), over per-thread cells: release C's native cells
+    /// (`native_tls_cell`), else the runtime's. The common access builds no
+    /// `Option`: tcc zero-fills each compound literal with a memset call.
+    fn tls_builtin(&mut self, b: Builtin, vals: &[String], tys: &[CTy], loc: &str, key: &Operand) -> String {
         let t = match b {
             Builtin::TlsAccess | Builtin::TlsTryAccess => match &tys[1] {
                 CTy::FnPtr(_, r) => (**r).clone(),
@@ -14019,7 +14091,21 @@ impl FnGen<'_, '_> {
         self.note_held(&cell);
         let (m, ct) = (mangle(&cell), ctype(&cell));
         let c = self.tmp();
-        let _ = writeln!(self.out, "    {ct} *{c} = ({ct} *)lust_tls_cell((uint64_t *){}, sizeof({ct}), _Alignof({ct}));", vals[0]);
+        if names::release() {
+            // The static's native cell (`native_tls_cell`): by name when the key traces to
+            // its static, else through the getter the key holds.
+            match self.tls_key_static(key).filter(|&i| native_tls_cell(self.p, i as usize).is_some()) {
+                Some(i) => {
+                    let sym = static_sym(self.p, i).replacen("lust_static_", "lust_tlc_", 1);
+                    let _ = writeln!(self.out, "    extern __thread {ct} {sym};\n    {ct} *{c} = &{sym};");
+                }
+                None => {
+                    let _ = writeln!(self.out, "    {ct} *{c} = ({ct} *)((void *(*)(void))(uintptr_t)*(uint64_t *){})();", vals[0]);
+                }
+            }
+        } else {
+            let _ = writeln!(self.out, "    {ct} *{c} = ({ct} *)lust_tls_cell((uint64_t *){}, sizeof({ct}), _Alignof({ct}));", vals[0]);
+        }
         if b != Builtin::TlsInitWith {
             self.want(Glue::TlsInit, &cell);
             let _ = writeln!(self.out, "    if ({c}->f0 != 1) {c} = tlsinit_{m}({c}, (void *){});", vals[1]);

@@ -329,12 +329,16 @@ pub fn statics_unit(p: &Program, g: &GlueSet) -> String {
     let mut types = HashSet::new();
     let mut pointed = HashSet::new();
     let mut fns = Vec::new();
-    for (_, st) in p.statics.iter().enumerate().filter(|&(i, _)| p.static_live(i)) {
+    for (i, st) in p.statics.iter().enumerate().filter(|&(i, _)| p.static_live(i)) {
         let t = cty(&p.tys, st.ty);
         by_value_deps(&t, &mut held);
         collect_types(&t, &mut pointed);
         collect_promoted(p, &st.value, &t, &mut types);
         const_fns(&st.value, &mut fns);
+        // A thread_local's native cell is defined here, by value.
+        if let Some(cell) = super::native_tls_cell(p, i) {
+            by_value_deps(&cell, &mut held);
+        }
     }
     types.extend(held);
     // The data's fn pointers point at this unit's own copies of their trampolines
@@ -377,6 +381,10 @@ fn statics_types(p: &Program, statics: impl Iterator<Item = usize>) -> (HashSet<
         collect_types(&t, &mut pointed);
         collect_promoted(p, &st.value, &t, &mut held);
         const_fns(&st.value, &mut fns);
+        // A thread_local's native cell is defined in its part, by value.
+        if let Some(cell) = super::native_tls_cell(p, i) {
+            by_value_deps(&cell, &mut by_value);
+        }
     }
     held.extend(by_value);
     for f in fns {
