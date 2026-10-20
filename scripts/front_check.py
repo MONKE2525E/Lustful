@@ -666,6 +666,17 @@ def unit_diff(dw, dc):
     return msg
 
 
+def exact_units(da, db):
+    """'' when two unit directories hold the same files, names and bytes, else the first difference."""
+    a, b = sorted(os.listdir(da)), sorted(os.listdir(db))
+    if a != b:
+        return f"unit names differ: {sorted(set(a) ^ set(b))[:4]}"
+    for f in a:
+        if open(os.path.join(da, f), "rb").read() != open(os.path.join(db, f), "rb").read():
+            return f"unit {f} differs"
+    return ""
+
+
 def run_bin(path, cwd):
     try:
         r = subprocess.run([path], cwd=cwd, capture_output=True, timeout=RUN_TIMEOUT)
@@ -768,13 +779,20 @@ def check_seq(name, srcs, backend, args, work, opts):
     img.update({"LUST_B1": "1"} if opts.get("b1") == "skip" else {"LUST_CHECK_UNIT_FP": "1"})
     img["LUST_CHECK_GENREUSE"] = "1"
     one = dict(base, LUST_NO_CACHE="1", LUST_THREADS="4")
-    problems, paths, seen = [], [], 0
-    lock = os.path.join(d, "front", "lock")
+    # --chains: a second image chain of the same history at 16 threads, with its own image and
+    # caches (the determinism gate): its builds must equal the first chain's unit for unit (names
+    # and bytes) and the one-shot reference like the first chain does.
+    visits2 = os.path.join(d, "visits2.log")
+    img2 = dict(img, LUST_FRONT_STATE=os.path.join(d, "front2"), LUST_CACHE_DIR=os.path.join(d, "cache2"), LUST_THREADS="16",
+                LUST_VISITS_LOG=visits2) if args.chains else None
+    problems, paths, seen, seen2 = [], [], 0, 0
+    locks = [os.path.join(d, "front", "lock"), os.path.join(d, "front2", "lock")]
 
     def saved():
-        """Waits for the last background image save."""
-        if os.path.exists(lock):
-            subprocess.run(["flock", lock, "true"], timeout=BUILD_TIMEOUT)
+        """Waits for the last background image saves."""
+        for lock in locks:
+            if os.path.exists(lock):
+                subprocess.run(["flock", lock, "true"], timeout=BUILD_TIMEOUT)
 
     # CI job shapes (opts): `steps`, the steps the image side builds (a jump skips the rest);
     # `quiet`, emitted C only at the last step (a CI job's builds emit none); `stale_after`, a
@@ -797,9 +815,10 @@ def check_seq(name, srcs, backend, args, work, opts):
             f.write(src)
         if snap:
             saved()
-            for sub in ("front", "cache"):
+            for sub in ("front", "cache", "front2", "cache2"):
                 shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
-                shutil.copytree(os.path.join(snap, sub), os.path.join(d, sub), symlinks=True)
+                if os.path.exists(os.path.join(snap, sub)):
+                    shutil.copytree(os.path.join(snap, sub), os.path.join(d, sub), symlinks=True)
         if cmd == "check":
             rw, ew = build([LUST, "check", "main.rs"], img, d)
             rc, ec = build([LUST, "check", "main.rs"], one, d)
@@ -809,11 +828,17 @@ def check_seq(name, srcs, backend, args, work, opts):
                 problems.append(f"{where} (check): status image {rw} vs one-shot {rc}: {head(ew if rw else ec)[:300]}")
             elif ew != ec:
                 problems.append(f"{where} (check): stderr differs, {first_diff(ew, ec)}")
+            if img2:
+                r2, e2 = build([LUST, "check", "main.rs"], img2, d)
+                path2, seen2 = last_path(visits2, seen2)
+                paths.append("chain2 " + path2)
+                if (r2, e2) != (rc, ec):
+                    problems.append(f"{where} (check): chain 2 status {r2} vs one-shot {rc}, stderr {first_diff(e2, ec)}")
             if problems:
                 break
             continue
         emit = not opts.get("quiet") or step == order[-1]
-        for side in ("ew", "ec"):
+        for side in ("ew", "ec", "ew2"):
             shutil.rmtree(os.path.join(d, side), ignore_errors=True)
             os.makedirs(os.path.join(d, side))
         ce = lambda side: ["--emit-c", os.path.join(d, side, "t")] if emit else []
@@ -830,19 +855,35 @@ def check_seq(name, srcs, backend, args, work, opts):
         if ew != ec:
             problems.append(f"{where}: stderr differs, {first_diff(ew, ec)}")
             break
+        if img2:
+            r2, e2 = build([LUST, "build", "main.rs", *rel, "-o", "image2.bin", *ce("ew2")], img2, d)
+            path2, seen2 = last_path(visits2, seen2)
+            paths.append("chain2 " + path2)
+            e2 = e2.replace("image2.bin", "OUT")
+            if (r2, e2) != (rc, ec):
+                problems.append(f"{where}: chain 2 status {r2} vs one-shot {rc}, stderr {first_diff(e2, ec)}")
+                break
         if opts.get("stale_after") == step:
             saved()
             snap = os.path.join(d, "snap")
-            for sub in ("front", "cache"):
-                shutil.copytree(os.path.join(d, sub), os.path.join(snap, sub), symlinks=True)
+            for sub in ("front", "cache", "front2", "cache2"):
+                if os.path.exists(os.path.join(d, sub)):
+                    shutil.copytree(os.path.join(d, sub), os.path.join(snap, sub), symlinks=True)
         if rw != 0:
             continue
         diff = unit_diff(os.path.join(d, "ew"), os.path.join(d, "ec")) if emit else ""
         if diff:
             problems.append(f"{where}: {diff}")
+        if img2 and emit:
+            # Two chains of one history: the same unit files, names and bytes.
+            same = exact_units(os.path.join(d, "ew"), os.path.join(d, "ew2"))
+            if same:
+                problems.append(f"{where}: chain 1 vs chain 2: {same}")
         ow, oc = run_bin(os.path.join(d, "image.bin"), d), run_bin(os.path.join(d, "one.bin"), d)
         if ow != oc:
             problems.append(f"{where}: output image {ow!r} vs one-shot {oc!r}"[:600])
+        if img2 and run_bin(os.path.join(d, "image2.bin"), d) != oc:
+            problems.append(f"{where}: output of chain 2 differs from the one-shot")
         if problems:
             break
     # The last background image save ends before the directory goes.
@@ -887,6 +928,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=min(14, os.cpu_count() or 4))
     ap.add_argument("--keep", help="copy each failing sequence's directory here")
     ap.add_argument("--only", help="run only the sequences whose name has this text")
+    ap.add_argument("--chains", action="store_true", help="a second image chain at 16 threads (the determinism gate)")
     args = ap.parse_args()
     if not os.access(LUST, os.X_OK):
         print(f"error: {LUST} not built. Run scripts/build.sh first.")

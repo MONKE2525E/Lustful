@@ -12439,7 +12439,7 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         }
         let mut next_queue: Vec<LocalDefId> = Vec::new();
         let mut recheck: Vec<LocalDefId> = Vec::new();
-        let round = std::mem::take(&mut queue);
+        let round = order_fuzz(std::mem::take(&mut queue), rounds);
         ahead.start(round.len());
         // The round's stored discovery entries, judged on the pool before
         // their turns (`GenReuse::prejudge`; the same verdicts).
@@ -12660,6 +12660,30 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
         errs.extend(crate::check::platform::io_copy_instance(p, f));
     }
     errs
+}
+
+/// `LUST_ORDER_FUZZ=<seed>` (a test knob, scripts/determinism_check.py
+/// `--order-fuzz`): each materialize round takes its bodies in a shuffled
+/// order, fixed by the seed and the round. Fn instances, Adt rows and types
+/// are then made in another order, while the program means the same: an
+/// output that changes is one that reads creation order (the order audit
+/// for parallel apply). Off when unset.
+fn order_fuzz(mut round: Vec<LocalDefId>, n: usize) -> Vec<LocalDefId> {
+    static SEED: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(seed) = *SEED.get_or_init(|| std::env::var("LUST_ORDER_FUZZ").ok().and_then(|v| v.parse().ok())) else { return round };
+    // A splitmix64 stream: no dependency, the same on every platform.
+    let mut x = seed ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut next = || {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..round.len()).rev() {
+        round.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    round
 }
 
 /// The global args of one discovery request: each type built and
