@@ -41,6 +41,11 @@
 # LUST_SOURCES_READY (a CI checkout beside the restore); the files come 0.3 s later, then the
 # ready file, so a build that read any file early answers for the step before.
 #
+# env-in-image: two image builds with an unread marker var in the env and raw image layers
+# (LUST_FRONT_ZSTD=0); no file of the state or cache directory may hold the marker (a front image
+# save writes every live heap block), and each must hold the value of a var `env!` read (the scan
+# sees heap strings).
+#
 # LUST_BIN overrides the lust binary (default target/release/lust).
 # Usage: front_check.py [--jobs N] [--keep DIR] [--only NAME]
 # Exit 0 = all same, 1 = a difference or a build failure on one side, 2 = setup error.
@@ -1125,6 +1130,40 @@ def last_path(log, seen):
     return f"{v.get('path', '-')}/{v.get('why', '-')}/{v.get('kept', '-')}{pool}", seen + len(new)
 
 
+def env_check(args, work):
+    """env-in-image (see the header): the problems found, as lines."""
+    d = os.path.join(work, "env-in-image")
+    os.makedirs(d, exist_ok=True)
+    secret, read = "lust-secret-" + os.urandom(8).hex(), "lust-read-" + os.urandom(8).hex()
+    drop = ("LUST_DAEMON_SOCKET", "LUST_CACHE_DIR", "LUST_NO_CACHE", "LUST_FRONT_STATE", "LUST_RELEASE_BACKEND", "LUST_FRONT_ZSTD")
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    env.update(LUST_RELEASE_C="1", LUST_NO_DAEMON="1", LUST_FRONT_STATE=os.path.join(d, "front"), LUST_FRONT_SAVE="background",
+               LUST_CACHE_DIR=os.path.join(d, "cache"), LUST_FRONT_ZSTD="0", FRONT_CHECK_SECRET=secret, FRONT_CHECK_READ=read)
+    problems = []
+    for k, tail in enumerate(["", " + 1"]):
+        put(d, 'fn main() {\n    println!("{}", env!("FRONT_CHECK_READ").len()' + tail + ');\n}\n')
+        rc, err = build([LUST, "build", "main.rs", "--release", "--target", args.host, "-o", "app.bin"], env, d)
+        if rc != 0:
+            return [f"env-in-image: build {k + 1} failed ({rc}): {head(err)}"]
+        lock = os.path.join(d, "front", "lock")
+        if os.path.exists(lock):
+            subprocess.run(["flock", lock, "true"], timeout=BUILD_TIMEOUT)
+        found = {secret: [], read: []}
+        for top in ("front", "cache"):
+            for root, _, files in os.walk(os.path.join(d, top)):
+                for f in files:
+                    with open(os.path.join(root, f), "rb") as fh:
+                        data = fh.read()
+                    for m in found:
+                        if m.encode() in data:
+                            found[m].append(os.path.relpath(os.path.join(root, f), d))
+        if found[secret]:
+            problems.append(f"env-in-image: after build {k + 1} an env var no expansion reads is in {', '.join(found[secret])}")
+        if not found[read]:
+            problems.append(f"env-in-image: after build {k + 1} no file holds the value env! read: the scan cannot see the image")
+    return problems
+
+
 def check_seq(name, srcs, backend, args, work, opts):
     """One sequence on one backend: (name, backend, problems, steps, paths); steps is 0 when
     skipped; paths holds the image side's front-end path of each request (`last_path`)."""
@@ -1371,6 +1410,11 @@ def main():
             for p in problems:
                 bad += 1
                 print(f"front-check: DIFFERENT {p}")
+    if not args.only or args.only in "env-in-image":
+        steps += 2
+        for p in env_check(args, work):
+            bad += 1
+            print(f"front-check: DIFFERENT {p}")
     # Path coverage (path/why/kept of each image request): a green run whose every
     # interesting step refused to the full collect proves little about a fast path.
     print("front-check: image paths: " + ", ".join(f"{k} {v}" for k, v in sorted(cover.items(), key=lambda kv: -kv[1])))

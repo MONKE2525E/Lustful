@@ -97,6 +97,14 @@ fn raise_stack_limit() {
     }
 }
 
+/// A request this process parsed itself: this process is its client, so its env is the
+/// request's, and the request reads it (`env: None`, `expand::builtin::compile_env`) instead of
+/// a copy of the whole env, which a front image save would write into the image (it writes
+/// every live heap block), secrets and all. A daemon request still carries its client's env.
+fn own_env(req: &mut driver::Request) {
+    req.client.env = None;
+}
+
 /// The root file size from which a one-shot compile keeps transparent
 /// huge pages in its serial phases (see `main`). On boat, realish40
 /// (940 KB) and plain1600 (1.2 MB) gain from them there, realish20
@@ -405,10 +413,11 @@ fn main() {
         // The release driver: one cold compile per target, in this process,
         // in order. A failed target stops the run with its code.
         Some(Invocation::ReleaseCc { reqs }) => {
-            let reqs = reqs.unwrap_or_else(|e| {
+            let mut reqs = reqs.unwrap_or_else(|e| {
                 eprintln!("error: {e}");
                 std::process::exit(2)
             });
+            reqs.iter_mut().for_each(own_env);
             // With a front image, every target's session comes from it
             // (in the re-executed image process).
             if let Some(dir) = image::state_dir() {
@@ -444,7 +453,8 @@ fn main() {
             std::process::exit(code);
         }
         Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
-        Some(Invocation::Compile { req, run, args }) => {
+        Some(Invocation::Compile { mut req, run, args }) => {
+            own_env(&mut req);
             // Whole-request disk cache (cold runs only; the daemon path keeps its own
             // in-memory state). `--emit-c` writes side files, so it always compiles. A `run`
             // request is also never cached: its response can be the program's own output and

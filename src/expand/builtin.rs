@@ -377,15 +377,6 @@ fn read_include(st: &mut Expander, rel: &str, span: Span) -> Result<(std::path::
     }
 }
 
-/// The process environment at first use (ARCH 6.4): what `env!` reads
-/// when the request carries no client env (`ClientView::PROCESS`). A
-/// daemon request carries the client's env, so this snapshot only
-/// serves one-shot compiles, std loading, and tests.
-fn env_snapshot() -> &'static std::collections::HashMap<String, String> {
-    static SNAP: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
-    SNAP.get_or_init(|| std::env::vars().collect())
-}
-
 /// The text of one token for `stringify!`. Written tokens print as
 /// written. Literals carry their written text (`lexer::lit_text`), in
 /// any file. Raw identifiers and lifetimes keep `r#`: the source slice at
@@ -418,12 +409,17 @@ pub(super) fn stringify_tok_text(st: &Expander, t: &Token) -> String {
     }
 }
 
-/// The value of `name` in this process's env snapshot. `ClientView::env_var`
-/// falls back to it, and both the builtin and the stale-deps check read
-/// through that view, so a recorded env dependency is judged against the
-/// same env it was expanded under.
+/// The value of `name` in this process's env (ARCH 6.4): what `env!` reads when the request
+/// carries no client env (`ClientView::PROCESS`: one-shot and front image builds, std loading,
+/// tests). Each var is read once and kept: this process never sets its env, so the answers are
+/// those of a snapshot at start, and only the vars read are held (a front image save writes
+/// every live heap block, so no copy of the whole env may live in the process). The builtin and
+/// the stale-deps check both read through `ClientView::env_var`, so a recorded env dependency is
+/// judged against the same env it was expanded under.
 pub fn compile_env(name: &str) -> Option<String> {
-    env_snapshot().get(name).cloned()
+    static READ: std::sync::OnceLock<std::sync::Mutex<crate::intern::FxMap<String, Option<String>>>> = std::sync::OnceLock::new();
+    let mut read = READ.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    read.entry(name.to_string()).or_insert_with(|| std::env::var(name).ok()).clone()
 }
 
 /// Renders trees the way `stringify!` does. Spacing follows rustc's

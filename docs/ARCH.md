@@ -3556,9 +3556,12 @@ INVENTORY Q2
   the dep graph. A missing file is `L0803`.
 - `env!` (3) and `option_env!` (4) read from a driver
   provided env map: Cargo's build env (`CARGO_PKG_*`,
-  `OUT_DIR`) plus the daemon's environment snapshot at
-  session start. The read keys enter the cache key.
-  Reading live env per request breaks cache soundness.
+  `OUT_DIR`) plus the client's env: a daemon request
+  carries its client's; a one-shot or front image build
+  reads its own process env, each var once, and keeps
+  only the vars read (no whole copy reaches an image).
+  The read keys enter the cache key. Reading live env
+  per request breaks cache soundness.
 - `thread_local!` (73) desugars to a static marked
   `#[thread_local!]` (collect types it `LocalKey<T>`)
   plus an init fn `NAME#init`. Both spellings are
