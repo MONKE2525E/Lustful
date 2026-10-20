@@ -1472,7 +1472,10 @@ impl Ex<'_, '_> {
             // does, then `f`; call temps of a plain array aggregate
             // would drop back to front. The pops cannot panic (the
             // length is known), and the emptied `Vec` then drops
-            // only its buffer.
+            // only its buffer. An element with no drop glue has no
+            // drop order to keep: each `f(i)` goes to a temp and the
+            // temps form the aggregate (no `Vec`, as core writes in
+            // place).
             B::ArrayFromFn => {
                 let f = arg()?;
                 let f_ty = self.op_ty(&f)?;
@@ -1488,6 +1491,14 @@ impl Ex<'_, '_> {
                 };
                 if n == 0 {
                     self.assign(dest.clone(), Rvalue::ArrayAgg(dest_ty, Vec::new()));
+                } else if !crate::check::collect::needs_drop(self.p, &self.body.tys, elem) {
+                    let mut ops = Vec::with_capacity(n as usize);
+                    for i in 0..n {
+                        let t = self.local(elem);
+                        self.call_fn(f_ty, f_place.clone(), vec![Self::usize_c(i)], Place::local(t))?;
+                        ops.push(self.take(Place::local(t), elem));
+                    }
+                    self.assign(dest.clone(), Rvalue::ArrayAgg(dest_ty, ops));
                 } else {
                     let vec_ty = self.body.tys.mk_vec(elem);
                     let v = self.local(vec_ty);
