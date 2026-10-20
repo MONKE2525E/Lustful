@@ -223,6 +223,11 @@ void lust_unw_reraise(void *ux);
    above it moves. A function id at or above 0xFFFF00 instead names a std source line
    (panic.c LUST_STD_SLOT), with absolute line and column. */
 typedef uint64_t lust_loc;
+/* A fn's location slot (`lust_so_<id>`, release C) read at a panic site: a volatile read,
+   so the C compiler keeps the load, and the shift that packs it, in the cold panic path
+   instead of hoisting them into the fn's hot path. A #[track_caller] call's location
+   argument reads the slot plainly (cgen/names.rs `loc`, `hot_loc`). */
+#define LUST_SO(x) (*(const volatile uint32_t *)&(x))
 extern const uint32_t *lust_fn_line;
 #ifdef LUST_IMPL
 int lust_argc;

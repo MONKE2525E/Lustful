@@ -1665,7 +1665,7 @@ impl FnGen<'_, '_> {
         // A `#[track_caller]` callee takes this call's location word last (`fl_` has an i64
         // parameter for it, as the C wrapper has `lust_loc`).
         let loc = if crate::check::caller::is_track_caller(p, f) {
-            match loc_word(&self.loc(span)) {
+            match loc_word(&super::names::hot_loc(&self.loc(span))) {
                 Some(w) => Some(w),
                 None => return false,
             }
@@ -2970,9 +2970,10 @@ fn ll_loc_value(ll: &mut Ll, w: &LocWord, k: usize) -> String {
             format!("%lc{k}")
         }
         LocWord::Const(n) => n.to_string(),
-        LocWord::Slot(id, low) => {
+        LocWord::Slot(id, low, cold) => {
             ll.decls.insert(format!("@lust_so_{id} = external constant i32"));
-            let _ = writeln!(ll.body, "  %ls{k} = load i32, ptr @lust_so_{id}\n  %lz{k} = zext i32 %ls{k} to i64\n  %lh{k} = shl i64 %lz{k}, 40\n  %lc{k} = or i64 %lh{k}, {low}");
+            let v = if *cold { "volatile " } else { "" };
+            let _ = writeln!(ll.body, "  %ls{k} = load {v}i32, ptr @lust_so_{id}\n  %lz{k} = zext i32 %ls{k} to i64\n  %lh{k} = shl i64 %lz{k}, 40\n  %lc{k} = or i64 %lh{k}, {low}");
             format!("%lc{k}")
         }
     }
@@ -2984,9 +2985,10 @@ enum LocWord {
     /// The calling fn's own received location (`ltc`: it is `#[track_caller]` too).
     Ltc,
     Const(u64),
-    /// `(((uint64_t)lust_so_<id> << 40) | <low>ull)`: the fn's location slot (a constant of
-    /// the location unit) above the line and column bits.
-    Slot(String, u64),
+    /// `(((uint64_t)LUST_SO(lust_so_<id>) << 40) | <low>ull)`: the fn's location slot (a
+    /// constant of the location unit) above the line and column bits; read volatile (`true`,
+    /// a panic site: kept on the cold path) or plain (`names::hot_loc`, a call's argument).
+    Slot(String, u64, bool),
 }
 
 /// Parses cgen's C text for a location word (`FnGen::loc`); None for another form.
@@ -2999,9 +3001,13 @@ fn loc_word(c: &str) -> Option<LocWord> {
     {
         return Some(LocWord::Const(v));
     }
-    let (id, low) = c.strip_prefix("(((uint64_t)lust_so_")?.split_once(" << 40) | ")?;
+    let (cold, rest) = match c.strip_prefix("(((uint64_t)LUST_SO(lust_so_") {
+        Some(r) => (true, r.replacen(") << 40) | ", " << 40) | ", 1)),
+        None => (false, c.strip_prefix("(((uint64_t)lust_so_")?.to_string()),
+    };
+    let (id, low) = rest.split_once(" << 40) | ")?;
     let low = low.strip_suffix("ull)")?.parse::<u64>().ok()?;
-    id.bytes().all(|b| b.is_ascii_hexdigit()).then(|| LocWord::Slot(id.to_string(), low))
+    id.bytes().all(|b| b.is_ascii_hexdigit()).then(|| LocWord::Slot(id.to_string(), low, cold))
 }
 
 /// The C prototype of written fn `f`'s internal ABI entry `fl_<id>` (`pass_of` per

@@ -4081,9 +4081,10 @@ impl FnGen<'_, '_> {
                     keep
                 });
                 // `#[track_caller]`: this call's location, or the one this
-                // fn received when it is itself `#[track_caller]` (`loc`).
+                // fn received when it is itself `#[track_caller]` (`loc`), with a
+                // plain read of the location slot (`names::hot_loc`).
                 if crate::check::caller::is_track_caller(self.p, f) {
-                    args.push(loc.to_string());
+                    args.push(names::hot_loc(loc));
                 }
                 if let Some(v) = self.unwrap_inline(f, ops, &args) {
                     return v;

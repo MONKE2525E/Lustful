@@ -133,14 +133,27 @@ pub(crate) fn fn_value(p: &Program, f: LocalDefId, slot: u32, externs: &mut BTre
 
 /// A panic location of the fn in `slot`: the packed number numbered; in release C the
 /// slot comes from the location unit's `lust_so_<id>` (recorded in `externs`), so the
-/// text holds only the line within the fn and the column.
+/// text holds only the line within the fn and the column. The slot is read through
+/// `LUST_SO` (runtime.h), a volatile read: a panic site is cold, and a plain read of the
+/// extern constant was hoisted with its shift into the fn's hot path (0.28 G loads on the
+/// pgo-train set). A `#[track_caller]` call's argument takes `hot_loc` of this text.
 pub(crate) fn loc(slot: u32, rel: u64, col: u64, externs: &mut BTreeSet<String>) -> String {
     match fn_id(slot) {
         None => format!("{}u", ((slot as u64) << 40) | (rel << 20) | col),
         Some(id) => {
             externs.insert(format!("extern const uint32_t lust_so_{id};\n"));
-            format!("(((uint64_t)lust_so_{id} << 40) | {}ull)", (rel << 20) | col)
+            format!("(((uint64_t)LUST_SO(lust_so_{id}) << 40) | {}ull)", (rel << 20) | col)
         }
+    }
+}
+
+/// `loc`'s text with a plain read of the slot, for a location passed to a
+/// `#[track_caller]` callee on every call: there the C compiler may keep one load for the
+/// whole fn.
+pub(crate) fn hot_loc(loc: &str) -> String {
+    match loc.strip_prefix("(((uint64_t)LUST_SO(").and_then(|r| r.split_once(") << 40) | ")) {
+        Some((sym, low)) => format!("(((uint64_t){sym} << 40) | {low}"),
+        None => loc.to_string(),
     }
 }
 
