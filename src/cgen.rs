@@ -1071,6 +1071,17 @@ pub struct FnOut {
     pub ll_c_refs: ll::CRefs,
     /// The fn's `#[inline]` attribute, which release C inline definitions follow.
     pub inline: InlineAttr,
+    /// The digest of `code`, `ll` and `ll_c` (`FnOut::text_fp`), made on first use. B1 reads it
+    /// instead of the texts, as a release build fingerprints every fn of the last build's units
+    /// (`read_fp`); a front image keeps it with the fn. No text changes after `gen_fn` makes it.
+    pub text_digest: std::sync::OnceLock<(u64, u64)>,
+}
+
+impl FnOut {
+    /// The digest of the fn's texts (`code`, `ll`, `ll_c`), made once (`text_digest`).
+    pub fn text_fp(&self) -> (u64, u64) {
+        *self.text_digest.get_or_init(|| crate::driver::cache::hash128(&[self.code.as_bytes(), self.ll.as_bytes(), self.ll_c.as_bytes()], 12))
+    }
 }
 
 /// A fn's `#[inline]` attribute (`inline_attr`). rustc inlines a `#[inline]` fn into other
@@ -2280,7 +2291,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
     ll.shrink_to_fit();
     ll_c.shrink_to_fit();
     let externs = externs.into_iter().map(shared_extern).collect();
-    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, ll_c_refs, inline }
+    FnOut { code, glue, types, error: None, used, externs, named, ll, ll_decls, ll_c, ll_cost, ll_c_refs, inline, text_digest: Default::default() }
 }
 
 /// The extern declarations of the codegen phase running now, each kept once
@@ -12053,7 +12064,9 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
                 let externs: Vec<&str> = f.externs.iter().map(|e| &**e).collect();
                 let tag = names::fn_tag_opt(*s as u32).unwrap_or_default();
                 let flags = format!("{:?} {}", f.inline, f.error.is_some());
-                h(&[f.code.as_bytes(), externs.join("\n").as_bytes(), types.as_bytes(), named.as_bytes(), glue.as_bytes(), f.ll.as_bytes(), f.ll_c.as_bytes(), flags.as_bytes(), tag.as_bytes()])
+                let (a, b) = f.text_fp();
+                let texts = [a.to_le_bytes(), b.to_le_bytes()].concat();
+                h(&[&texts, externs.join("\n").as_bytes(), types.as_bytes(), named.as_bytes(), glue.as_bytes(), flags.as_bytes(), tag.as_bytes()])
             }
         },
         Read::SlotOf(id) => names::slot_of_id(id).map_or((0, 2), |s| h(&[&s.to_le_bytes()])),
