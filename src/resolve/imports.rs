@@ -2379,10 +2379,10 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
             if let (Some(src), Some((was, ls, lm))) = (src, last_copy[i])
                 && src == was
             {
+                // In log order, repeats and all: a repeat copies again as an unchanged name,
+                // which costs less than sorting every list (a tenth of the import worklist).
                 let mut names: Vec<Sym> = tables.glob_log.get(src.0 as usize).map_or(&[][..], |l| &l[ls..]).to_vec();
                 names.extend_from_slice(tables.glob_log.get(imp.module.0 as usize).map_or(&[][..], |l| &l[lm..]));
-                names.sort_unstable();
-                names.dedup();
                 if !names.is_empty() {
                     changed |= copy_glob(tables, imp, src, Some(&names), interner);
                 }
@@ -2519,13 +2519,12 @@ fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only
 
 /// Copies the names of module `src` that importer `imp.module` can
 /// see into it (a module glob, `use src::*`): bindings, ambiguous
-/// names, and std aliases. `only` limits the copy to those names
-/// (`run_imports` passes the names changed since the last copy). Each
-/// name's copy reads and writes that name alone, so the names go in the
-/// source map's order, or `only`'s. Returns true on a change.
+/// names, and std aliases. `only` limits the copy to those names, in any
+/// order and with repeats (`run_imports` passes the names changed since
+/// the last copy). Each name's copy reads and writes that name alone, so
+/// the names go in the source map's order, or `only`'s. Returns true on a
+/// change.
 fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Option<&[Sym]>, interner: &Interner) -> bool {
-    // `only` is sorted by symbol (`run_imports`).
-    let want = |name: &Sym| only.is_none_or(|o| o.binary_search(name).is_ok());
     let mut changed = false;
     let mut entries: Vec<(Namespace, Sym, Bind)> = Vec::new();
     // The source's ambiguous names per namespace, read in the same pass: the copies write
@@ -2551,25 +2550,26 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
             }
         }
     }
-    // A full copy brings a source's whole namespace at once (a prelude: thousands of names):
-    // the importer's maps get room for the names they lack in one step, where growing by
-    // doubling rehashed them again and again (a quarter of the copy's time on tsgo).
-    if only.is_none() {
-        let mut new = [0usize; 3];
-        for (ns, name, _) in &entries {
-            let i = ns_index(*ns);
-            new[i] += usize::from(!tables.maps[imp.module.0 as usize][i].contains_key(name));
-        }
-        for (i, &n) in new.iter().enumerate() {
-            tables.maps[imp.module.0 as usize][i].reserve(n);
-        }
-        tables.glob_src.reserve(imp.module, new.iter().sum());
-    }
     // The importer's first glob copy (most of the millions of names copied on tsgo): with no
     // glob source and no std alias in the module yet (each std glob alias is a std alias too),
     // a name it does not hold takes the copy as `insert_glob` would, in one table probe.
     let m = imp.module;
     let first = tables.glob_src.none_in(m) && tables.std_aliases.range((m, 0, Sym(0))..=(m, u8::MAX, Sym(u32::MAX))).next().is_none();
+    // A full copy brings a source's whole namespace at once (a prelude: thousands of names):
+    // the importer's maps get room for the names they lack in one step, where growing by
+    // doubling rehashed them again and again (a quarter of the copy's time on tsgo). A first
+    // copy meets only the importer's own names (a few), so it counts every name.
+    if only.is_none() {
+        let mut new = [0usize; 3];
+        for (ns, name, _) in &entries {
+            let i = ns_index(*ns);
+            new[i] += usize::from(first || !tables.maps[m.0 as usize][i].contains_key(name));
+        }
+        for (i, &n) in new.iter().enumerate() {
+            tables.maps[m.0 as usize][i].reserve(n);
+        }
+        tables.glob_src.reserve(m, new.iter().sum());
+    }
     for (ns, name, bind) in entries {
         let took = first
             && match tables.maps[m.0 as usize][ns_index(ns)].entry(name) {
@@ -2628,9 +2628,18 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
         }
     }
     // The std imports of the source module
-    // (`pub use std::rc::Rc;`) bind like its other names.
-    for (ns, name, vis, def_module, path) in tables.visible_std_aliases(src, imp.module, interner) {
-        if !want(&name) || (tables.pending_single.contains_key(&(src, name)) && tables.std_glob_aliases.contains_key(&(src, ns, name))) {
+    // (`pub use std::rc::Rc;`) bind like its other names. `only` is sorted
+    // for them (a few sources have std aliases).
+    let aliases = tables.visible_std_aliases(src, imp.module, interner);
+    let only_sorted: Option<Vec<Sym>> = only.filter(|_| !aliases.is_empty()).map(|o| {
+        let mut v = o.to_vec();
+        v.sort_unstable();
+        v
+    });
+    for (ns, name, vis, def_module, path) in aliases {
+        if only_sorted.as_ref().is_some_and(|o| o.binary_search(&name).is_err())
+            || (tables.pending_single.contains_key(&(src, name)) && tables.std_glob_aliases.contains_key(&(src, ns, name)))
+        {
             continue;
         }
         let (vis, def_module) = tables.glob_vis(imp, &vis, def_module, interner);
