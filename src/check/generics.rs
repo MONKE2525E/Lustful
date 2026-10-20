@@ -13819,15 +13819,18 @@ fn check_supertrait_cycles(p: &Program, errs: &mut Vec<Diag>) {
 fn check_copy_impls(p: &mut Program, errs: &mut Vec<Diag>, reach: Option<&crate::check::derive_delta::Reach>) {
     use crate::traits::index::Synthetic;
     let lang = p.gx.lang;
-    let records: Vec<crate::traits::index::ImplRecord> = p.gx.index.all_impls().map(|(_, r)| r.clone()).collect();
     let mut copy_adts: Vec<DefId> = Vec::new();
-    for rec in &records {
+    for (_, rec) in p.gx.index.all_impls() {
         if rec.trait_def == lang.copy
             && let TyKind::Adt(d, _) = p.tys.kind(rec.self_ty(&p.tys))
         {
             copy_adts.push(d);
         }
     }
+    // Only `Drop` and `Copy` impls take part below: copy those alone (the
+    // index holds every impl, derived ones included).
+    let records: Vec<crate::traits::index::ImplRecord> =
+        p.gx.index.all_impls().filter(|(_, r)| r.trait_def == lang.drop || r.trait_def == lang.copy).map(|(_, r)| r.clone()).collect();
     for rec in &records {
         // A derive delta: only impls whose types reach the edited Adt.
         if reach.is_some_and(|x| !x.record(&p.tys, rec)) {
