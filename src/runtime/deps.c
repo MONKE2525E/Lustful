@@ -41,14 +41,28 @@ static const uint8_t lust_mm_rank[256] = {
 };
 typedef char lust_mm_v16 __attribute__((vector_size(16)));
 typedef char lust_mm_v16u __attribute__((vector_size(16), aligned(1)));
+/* lust_memmem's block: starts i..i+15, the pair bytes compared at their offsets, then the
+   needle at each start where both match (in order); the first match or UINT64_MAX. A
+   2-byte needle's pair is the whole needle: a pair match is a match. */
+static inline uint64_t lust_mm_block(const uint8_t *h, uint64_t i, uint64_t i1, uint64_t i2, lust_mm_v16 b1,
+                                     lust_mm_v16 b2, const uint8_t *n, uint64_t nlen) {
+    lust_mm_v16 e1 = *(const lust_mm_v16u *)(const void *)(h + i + i1) == b1;
+    lust_mm_v16 e2 = *(const lust_mm_v16u *)(const void *)(h + i + i2) == b2;
+    for (unsigned m = (unsigned)__builtin_ia32_pmovmskb128(e1 & e2); m; m &= m - 1) {
+        uint64_t j = i + (uint64_t)__builtin_ctz(m);
+        if (nlen == 2 || memcmp(h + j, n, (size_t)nlen) == 0) return j;
+    }
+    return UINT64_MAX;
+}
 #endif
 
 /* memmem is a GNU extension too. The first match is the answer: candidates are tried in
    order. A clang or gcc build for x86_64 prefilters 16 candidate starts at a time on two
-   rare bytes of the needle (the memchr crate's packed-pair idea: the bytes of the needle
-   with the lowest `lust_mm_rank`, at their offsets), so the compare runs only where both
-   match; it never reads past the haystack. Other builds take libc memchr for the first
-   byte and memcmp to confirm. */
+   bytes of the needle (the memchr crate's packed-pair idea: for a needle longer than 2,
+   the bytes with the lowest `lust_mm_rank`, at their offsets), so the compare runs only
+   where both match; the last block ends at the last start (it can overlap the block
+   before: a start tried twice fails twice). It never reads past the haystack. Other builds
+   take libc memchr for the first byte and memcmp to confirm. */
 uint64_t lust_memmem(const uint8_t *h, uint64_t hlen, const uint8_t *n, uint64_t nlen) {
     if (nlen == 0) return 0;
     if (nlen > hlen) return UINT64_MAX;
@@ -57,29 +71,22 @@ uint64_t lust_memmem(const uint8_t *h, uint64_t hlen, const uint8_t *n, uint64_t
     if (nlen >= 2 && last >= 16) {
         /* i1: the rarest byte; i2: the rarest other byte value (any other offset when
            the needle repeats one byte). */
-        uint64_t i1 = 0;
-        for (uint64_t k = 1; k < nlen; k++)
-            if (lust_mm_rank[n[k]] < lust_mm_rank[n[i1]]) i1 = k;
-        uint64_t i2 = i1 == 0 ? 1 : 0;
-        int other = 0;
-        for (uint64_t k = 0; k < nlen; k++)
-            if (n[k] != n[i1] && (!other || lust_mm_rank[n[k]] < lust_mm_rank[n[i2]])) i2 = k, other = 1;
-        lust_mm_v16 b1 = (lust_mm_v16){0} + (char)n[i1], b2 = (lust_mm_v16){0} + (char)n[i2];
-        /* Starts i..i+15 are all candidates while i + 15 <= last; the loads end at
-           h + i + 15 + max(i1, i2) <= h + last + nlen - 1 = h + hlen - 1. */
-        for (; i + 15 <= last; i += 16) {
-            lust_mm_v16 e1 = *(const lust_mm_v16u *)(const void *)(h + i + i1) == b1;
-            lust_mm_v16 e2 = *(const lust_mm_v16u *)(const void *)(h + i + i2) == b2;
-            unsigned m = (unsigned)__builtin_ia32_pmovmskb128(e1 & e2);
-            while (m) {
-                uint64_t j = i + (uint64_t)__builtin_ctz(m);
-                if (memcmp(h + j, n, (size_t)nlen) == 0) return j;
-                m &= m - 1;
-            }
+        uint64_t i1 = 0, i2 = 1;
+        if (nlen > 2) {
+            for (uint64_t k = 1; k < nlen; k++)
+                if (lust_mm_rank[n[k]] < lust_mm_rank[n[i1]]) i1 = k;
+            i2 = i1 == 0 ? 1 : 0;
+            int other = 0;
+            for (uint64_t k = 0; k < nlen; k++)
+                if (n[k] != n[i1] && (!other || lust_mm_rank[n[k]] < lust_mm_rank[n[i2]])) i2 = k, other = 1;
         }
-        for (; i <= last; i++)
-            if (h[i + i1] == n[i1] && h[i + i2] == n[i2] && memcmp(h + i, n, (size_t)nlen) == 0) return i;
-        return UINT64_MAX;
+        lust_mm_v16 b1 = (lust_mm_v16){0} + (char)n[i1], b2 = (lust_mm_v16){0} + (char)n[i2];
+        /* Blocks at i < end, then the last one at end. The loads end at
+           h + end + 15 + max(i1, i2) <= h + last + nlen - 1 = h + hlen - 1. */
+        uint64_t end = last - 15, r;
+        for (; i < end; i += 16)
+            if ((r = lust_mm_block(h, i, i1, i2, b1, b2, n, nlen)) != UINT64_MAX) return r;
+        return lust_mm_block(h, end, i1, i2, b1, b2, n, nlen);
     }
 #endif
     while (i <= last) {
