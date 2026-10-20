@@ -850,6 +850,91 @@ fn main() {{
 """
 
 
+
+def hole_lang(v, generic=False):
+    """Sol blocker 1 in fn-body form: `k::<_>()` infers T = i32 from i32's one PartialEq impl;
+    v1 adds `impl PartialEq<G> for i32` (the call is ambiguous now) with f unchanged."""
+    imp = "impl PartialEq<G> for i32 {\n    fn eq(&self, _: &G) -> bool {\n        true\n    }\n}\n" if v == 1 else ""
+    f = "fn f<U>() -> u8 {\n    k::<_>()\n}\n" if generic else "fn f() -> u8 {\n    k::<_>()\n}\n"
+    call = "f::<u8>()" if generic else "f()"
+    return f"""struct G;
+
+fn k<T>() -> u8
+where
+    i32: PartialEq<T>,
+{{
+    7
+}}
+
+{f}
+{imp}
+fn main() {{
+    let _g = G;
+    println!("{{}}", {call});
+}}
+"""
+
+
+def hole_module(v, kind):
+    """Sol blocker 2 in fn-body form: m's fn needs an import (a trait for a method, or a const
+    binding); v1 inserts `mod n` with that import before m and removes it from m, so m's old
+    module id may name n now. A cold check rejects f; v2 restores v0."""
+    use = {"method": "use crate::defs::T;", "binding": "use crate::defs::K;", "generic": "use crate::defs::T;"}[kind]
+    body = {"method": "crate::S.k()", "binding": "K", "generic": "crate::S.k()"}[kind]
+    sig = "pub fn f<U>() -> u8" if kind == "generic" else "pub fn f() -> u8"
+    call = "m::f::<u8>()" if kind == "generic" else "m::f()"
+    n = f"mod n {{\n    #[allow(unused_imports)]\n    {use}\n}}\n\n" if v == 1 else ""
+    m_use = "" if v == 1 else f"    {use}\n"
+    return f"""mod defs {{
+    pub trait T {{
+        fn k(&self) -> u8;
+    }}
+    pub const K: u8 = 3;
+}}
+
+pub struct S;
+
+impl defs::T for S {{
+    fn k(&self) -> u8 {{
+        1
+    }}
+}}
+
+{n}mod m {{
+{m_use}    {sig} {{
+        {body}
+    }}
+}}
+
+fn main() {{
+    println!("{{}}", {call});
+}}
+"""
+
+
+def hole_limit(limit):
+    """Sol blocker 4 in fn-body form: a local of 128 nested Options under a recursion limit."""
+    return f"""#![recursion_limit = "{limit}"]
+
+type O2<T> = Option<Option<T>>;
+type O4<T> = O2<O2<T>>;
+type O8<T> = O4<O4<T>>;
+type O16<T> = O8<O8<T>>;
+type O32<T> = O16<O16<T>>;
+type O64<T> = O32<O32<T>>;
+type O128<T> = O64<O64<T>>;
+
+fn f() -> u8 {{
+    let _x: O128<u8> = None;
+    5
+}}
+
+fn main() {{
+    println!("{{}}", f());
+}}
+"""
+
+
 LIFETIME_HEAD = """use std::rc::Rc;
 
 trait Tr {
@@ -1020,6 +1105,14 @@ def corpus():
     seqs.append(("sources-late", [late_sources(v) for v in range(4)], {"late": True}))
     seqs.append(("auto-shape", [auto_shape(v) for v in range(5)]))
     seqs.append(("glue-shape", [glue_shape(v) for v in range(5)]))
+    # Stale reuse in fn-body and generic reuse (Sol's const-body review blockers in fn-body
+    # form, 2026-10-20; all but the binding and check-then-build ones were false accepts).
+    seqs.append(("hole-lang", [hole_lang(v) for v in (0, 1, 0)]))
+    seqs.append(("hole-lang-generic", [hole_lang(v, True) for v in (0, 1, 0)]))
+    for kind in ("method", "binding", "generic"):
+        seqs.append((f"hole-module-{kind}", [hole_module(v, kind) for v in (0, 1, 0)]))
+    seqs.append(("hole-limit", [hole_limit(256), hole_limit(128), hole_limit(256)]))
+    seqs.append(("hole-check-then-build", [("check", hole_limit(128)), hole_limit(128)]))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))

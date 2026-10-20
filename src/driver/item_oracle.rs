@@ -456,7 +456,7 @@ fn dirty_check(
 /// but not that answer, which only an item kind change moves (an outline
 /// change, so full mode). Signatures mode walks only mentioning bodies.
 fn pattern_read(p: &Program, front: &Front, i: usize, b: &crate::driver::graph::BindingKey) -> bool {
-    let crate::driver::graph::BindingRes::Def(d) = p.binding(&mut crate::driver::graph::Reads::off(), b.module, b.ns, b.name) else {
+    let crate::driver::graph::BindingRes::Def(d) = p.binding_res_at(b) else {
         return false;
     };
     let Some(f) = p.local_def(d.hash).filter(|l| p.def_id(*l) == d) else { return false };

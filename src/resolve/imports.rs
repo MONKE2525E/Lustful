@@ -416,6 +416,17 @@ pub struct ResolvedTables {
     /// one appears a cold resolve rejects that module (L0502); the body
     /// patch checks them (driver/patch.rs `find_edits`).
     pub module_alts: Vec<std::path::PathBuf>,
+    /// Each module's key (`module_key`) and the module of each key, made on
+    /// first use; `add_module` and `add_crate_root` drop it.
+    module_index: std::sync::OnceLock<ModuleIndex>,
+}
+
+/// `ResolvedTables::module_index`: keys by module id, and ids by key (a key
+/// two modules share answers no module).
+#[derive(Default)]
+struct ModuleIndex {
+    keys: Vec<u64>,
+    ids: FxMap<u64, ModuleId>,
 }
 
 /// The std modules whose items can come from the shipped platform
@@ -515,12 +526,14 @@ impl ResolvedTables {
             std_ranges: Vec::new(),
             alloc_roots: Vec::new(),
             module_alts: Vec::new(),
+            module_index: std::sync::OnceLock::new(),
         }
     }
 
     /// Adds a detached crate root module for one more crate in the
     /// workspace session and returns its id.
     pub fn add_crate_root(&mut self, name: Sym) -> ModuleId {
+        self.module_index = std::sync::OnceLock::new();
         let id = ModuleId(self.modules.len() as u32);
         self.modules.push(ModuleInfo {
             parent: None,
@@ -632,6 +645,7 @@ impl ResolvedTables {
 
     /// Adds a module under a parent and returns its id.
     pub fn add_module(&mut self, parent: ModuleId, name: Sym, vis: VisKind, span: Span) -> ModuleId {
+        self.module_index = std::sync::OnceLock::new();
         let mut path = self.modules[parent.0 as usize].path.clone();
         path.push(name);
         let no_prelude = self.modules[parent.0 as usize].no_prelude;
@@ -641,6 +655,43 @@ impl ResolvedTables {
         self.maps.push(Default::default());
         self.module_defs.push(DefId::PLACEHOLDER);
         id
+    }
+
+    /// A module's identity across the resolves of one session: its crate
+    /// root (the local root, a dependency by its stable crate hash through
+    /// `crate_magic`, std by name) and its name path. Module ids follow
+    /// insertion order, so a module inserted before another takes the
+    /// other's old id; read keys name modules by this instead
+    /// (driver/graph.rs `ModKey`). Never has the top bit set.
+    pub fn module_key(&self, m: ModuleId) -> u64 {
+        self.module_index().keys.get(m.0 as usize).copied().unwrap_or(u64::MAX >> 1)
+    }
+
+    /// The module with key `key` (`module_key`) in these tables.
+    pub fn module_by_key(&self, key: u64) -> Option<ModuleId> {
+        self.module_index().ids.get(&key).copied().filter(|m| m.0 != u32::MAX)
+    }
+
+    fn module_index(&self) -> &ModuleIndex {
+        use std::hash::{Hash, Hasher};
+        self.module_index.get_or_init(|| {
+            let magic: FxMap<ModuleId, Sym> = self.crate_magic.iter().map(|(&s, &m)| (m, s)).collect();
+            let mut index = ModuleIndex::default();
+            for (i, info) in self.modules.iter().enumerate() {
+                let mut h = crate::intern::FxHasher::default();
+                "module-key-v1".hash(&mut h);
+                match (info.krate_root, magic.get(&info.krate_root)) {
+                    (ModuleId(0), _) => 0u8.hash(&mut h),
+                    (_, Some(s)) => (1u8, s.0).hash(&mut h),
+                    (root, None) => (2u8, self.modules[root.0 as usize].name.0).hash(&mut h),
+                }
+                info.path.iter().for_each(|s| s.0.hash(&mut h));
+                let key = h.finish() >> 1;
+                index.keys.push(key);
+                index.ids.entry(key).and_modify(|m| *m = ModuleId(u32::MAX)).or_insert(ModuleId(i as u32));
+            }
+            index
+        })
     }
 
     /// The module at a name path from a crate root, if it exists.

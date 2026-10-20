@@ -42,11 +42,27 @@ pub enum Namespace {
     Macro,
 }
 
+/// A module as a read key names it: by `ResolvedTables::module_key` (crate
+/// root and name path), which stands across the resolves of a session. A
+/// `ModuleId` does not: ids follow insertion order, so a module inserted
+/// before another takes the other's old id, and a stored key would ask that
+/// module (Sol's const-body review, blocker 2). Without resolver tables, the
+/// id itself (`bare`, top bit set).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModKey(pub u64);
+
+impl ModKey {
+    /// The key of module `m` of a program with no resolver tables.
+    pub fn bare(m: ModuleId) -> ModKey {
+        ModKey(1 << 63 | m.0 as u64)
+    }
+}
+
 /// The key of one `Binding` node: one name in one module and namespace.
 /// Reads are per name, never per scope (section 8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BindingKey {
-    pub module: ModuleId,
+    pub module: ModKey,
     pub ns: Namespace,
     pub name: Sym,
 }
@@ -191,7 +207,7 @@ pub enum ReadKey {
     /// under any name (`as _` included): method probes ask it for each
     /// candidate trait. A `use` edit flips it without touching any
     /// binding the body names. The fingerprint is the answer.
-    TraitInScope(ModuleId, DefId),
+    TraitInScope(ModKey, DefId),
     /// The derive list of one local Adt template (PLAN R12): every
     /// `Program::derives_of` call inside a body check, and every selection
     /// of a derivable trait whose Self head is the Adt (a derived impl is a
@@ -2451,8 +2467,32 @@ impl<'a> Program {
     /// The signature is the frozen S7 one; no caller changed.
     pub fn binding(&self, reads: &mut Reads, module: ModuleId, ns: Namespace, name: Sym) -> BindingRes {
         let res = self.binding_res(module, ns, name);
-        reads.record_with(ReadKey::Binding(BindingKey { module, ns, name }), res == BindingRes::Absent, || binding_fingerprint(self, res));
+        reads.record_with(ReadKey::Binding(BindingKey { module: self.mod_key(module), ns, name }), res == BindingRes::Absent, || binding_fingerprint(self, res));
         res
+    }
+
+    /// The read key of module `m` (`ModKey`).
+    pub(crate) fn mod_key(&self, m: ModuleId) -> ModKey {
+        match &self.resolved {
+            Some(t) => ModKey(t.module_key(m)),
+            None => ModKey::bare(m),
+        }
+    }
+
+    /// The module a read key names in this program, if it has one.
+    pub(crate) fn mod_of_key(&self, k: ModKey) -> Option<ModuleId> {
+        match &self.resolved {
+            Some(t) => t.module_by_key(k.0),
+            None => (k.0 >> 63 == 1).then_some(ModuleId(k.0 as u32)),
+        }
+    }
+
+    /// `binding_res` for a stored key: Absent when its module is gone.
+    pub(crate) fn binding_res_at(&self, k: &BindingKey) -> BindingRes {
+        match self.mod_of_key(k.module) {
+            Some(m) => self.binding_res(m, k.ns, k.name),
+            None => BindingRes::Absent,
+        }
     }
 
     /// The binding answer without recording. The dirty walk replays old
@@ -2742,14 +2782,20 @@ impl<'a> Program {
     /// The impls of trait `trait_` that a Self type with this head can
     /// select: the same head after `Head::of` peels references, or a Self
     /// pattern with no head (a blanket impl). An `Unknown` head takes every
-    /// impl. Empty unless `impls_read_covered` (see `ImplSet`).
+    /// impl. For a trait `impls_read_covered` does not take (a std or lang
+    /// trait, a user trait with an associated const), only its written
+    /// impls: the trait-system key leaves out a std or lang trait impl that
+    /// names a user Adt (`impl PartialEq<G> for i32`), and one added under
+    /// an unchanged body can make its call ambiguous (Sol's const-body
+    /// review, blocker 1). Derived impls are read through derive lists.
     fn impl_bucket(&self, trait_: DefId, head: Head) -> ImplSet {
         let mut set = ImplSet::default();
-        if !self.impls_read_covered(trait_) {
-            return set;
-        }
+        let covered = self.impls_read_covered(trait_);
         for &id in self.gx.index.impls_of_trait(trait_) {
-            let rec = self.gx.index.get(id);
+            let rec = if covered { self.gx.index.get(id) } else { self.gx.index.peek(id) };
+            if !covered && rec.synthetic != crate::traits::index::Synthetic::None {
+                continue;
+            }
             let h = Head::of(&self.tys, rec.self_ty(&self.tys));
             if head == Head::Unknown || h == Head::Unknown || h == head {
                 set.impls.push(rec.def);
@@ -2857,7 +2903,7 @@ impl<'a> Program {
     /// not know, every local trait counts as in scope.
     pub fn trait_in_module(&self, reads: &mut Reads, module: ModuleId, trait_def: DefId) -> bool {
         let ans = self.trait_in_module_answer(module, trait_def);
-        reads.record_with(ReadKey::TraitInScope(module, trait_def), !ans, || trait_in_scope_fingerprint(ans));
+        reads.record_with(ReadKey::TraitInScope(self.mod_key(module), trait_def), !ans, || trait_in_scope_fingerprint(ans));
         ans
     }
 
@@ -2905,7 +2951,7 @@ impl<'a> Program {
     pub fn read_fingerprint(&self, key: &ReadKey) -> Read {
         match key {
             ReadKey::Binding(k) => {
-                let res = self.binding_res(k.module, k.ns, k.name);
+                let res = self.binding_res_at(k);
                 Read { fingerprint: binding_fingerprint(self, res), failed: res == BindingRes::Absent }
             }
             ReadKey::MethodSet(k) => {
@@ -2928,7 +2974,7 @@ impl<'a> Program {
             }
             ReadKey::Checked(_) => Read { fingerprint: Fingerprint(u64::MAX), failed: true },
             ReadKey::TraitInScope(module, trait_def) => {
-                let ans = self.trait_in_module_answer(*module, *trait_def);
+                let ans = self.mod_of_key(*module).is_some_and(|m| self.trait_in_module_answer(m, *trait_def));
                 Read { fingerprint: trait_in_scope_fingerprint(ans), failed: !ans }
             }
             ReadKey::Derives(def) => Read { fingerprint: derives_fingerprint(self, *def), failed: self.adt_by_def(*def).is_none() },
@@ -3250,7 +3296,7 @@ impl Program {
             // Impl shapes fold types shallow: no derive list.
             ReadKey::LangImpls(_) => false,
             ReadKey::Sig(def) => self.sig_moves(m, *def),
-            ReadKey::Binding(k) => match self.binding_res(k.module, k.ns, k.name) {
+            ReadKey::Binding(k) => match self.binding_res_at(k) {
                 BindingRes::Def(def) => self.sig_moves(m, def),
                 _ => false,
             },
@@ -3335,7 +3381,7 @@ impl Program {
         let row = |d: DefId| self.adt_by_def(d).is_some_and(|a| self.derive_def(a).is_some_and(|x| m.defs.contains_key(&x)));
         match key {
             ReadKey::Sig(def) => m.sig.get(def).copied(),
-            ReadKey::Binding(k) => match self.binding_res(k.module, k.ns, k.name) {
+            ReadKey::Binding(k) => match self.binding_res_at(k) {
                 BindingRes::Def(def) => m.sig.get(&def).copied(),
                 _ => Some(false),
             },
@@ -3808,12 +3854,12 @@ fn main() {
             assert!(errs.is_empty(), "{errs:?}");
             let reads = &ck.reads;
             let value =
-                |name: &str| ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern(name) });
+                |name: &str| ReadKey::Binding(BindingKey { module: ModKey::bare(ROOT_MODULE), ns: Namespace::Value, name: interner.intern(name) });
             // The `helper()` call reads one value binding, by that name only.
             let helper = reads.recorded(&value("helper")).expect("helper binding read");
             assert!(!helper.failed);
             // The `let f: Foo` annotation reads one type binding.
-            let foo_ty = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Type, name: interner.intern("Foo") });
+            let foo_ty = ReadKey::Binding(BindingKey { module: ModKey::bare(ROOT_MODULE), ns: Namespace::Type, name: interner.intern("Foo") });
             assert_eq!(reads.recorded(&foo_ty).map(|r| r.failed), Some(false));
             // A name the body never mentions has no read: reads are per name,
             // never per scope.
@@ -3839,13 +3885,13 @@ fn main() {
         with_program("fn main() { nosuch(); }\n", |interner, p| {
             let (ck, errs) = check_fn(p, p.main.unwrap());
             assert!(!errs.is_empty(), "the call must also be an error");
-            let key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern("nosuch") });
+            let key = ReadKey::Binding(BindingKey { module: ModKey::bare(ROOT_MODULE), ns: Namespace::Value, name: interner.intern("nosuch") });
             assert_eq!(ck.reads.recorded(&key).map(|r| r.failed), Some(true));
             // The same key in a program that defines the name is a hit with a
             // different fingerprint.
             let mut reads = Reads::new();
             assert_eq!(p.binding(&mut reads, ROOT_MODULE, Namespace::Macro, interner.intern("nosuch")), BindingRes::Absent);
-            let macro_key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Macro, name: interner.intern("nosuch") });
+            let macro_key = ReadKey::Binding(BindingKey { module: ModKey::bare(ROOT_MODULE), ns: Namespace::Macro, name: interner.intern("nosuch") });
             assert_eq!(reads.recorded(&macro_key).map(|r| r.failed), Some(true));
             // Different keys, same fingerprint: the fingerprint covers the
             // node's answer ("absent"), not which node was asked.
@@ -4046,7 +4092,7 @@ fn main() {}
             let (ck, errs) = check_fn(p, main);
             assert!(errs.is_empty(), "{errs:?}");
             let body = crate::lower::lower(p, main, ck);
-            let key = ReadKey::Binding(BindingKey { module: ROOT_MODULE, ns: Namespace::Value, name: interner.intern("helper") });
+            let key = ReadKey::Binding(BindingKey { module: ModKey::bare(ROOT_MODULE), ns: Namespace::Value, name: interner.intern("helper") });
             assert!(body.reads.recorded(&key).is_some(), "the read set rides with the body result");
             let (mut fn_calls, mut builtin_calls) = (0, 0);
             for b in &body.blocks {

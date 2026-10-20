@@ -511,7 +511,7 @@ impl Touched {
         match k {
             ReadKey::Sig(d) => defs.contains(d),
             ReadKey::MethodSet(m) => matches!(m.head, Head::Adt(a) if methods.contains(&(a, m.name))),
-            ReadKey::Binding(b) => matches!(p.binding_res(b.module, b.ns, b.name), BindingRes::Def(d) if defs.contains(&d)),
+            ReadKey::Binding(b) => matches!(p.binding_res_at(b), BindingRes::Def(d) if defs.contains(&d)),
             ReadKey::Checked(_) => true,
             ReadKey::ImplSet(s) => traits.contains(&s.trait_),
             ReadKey::AssocVis(a, name) => methods.contains(&(*a, *name)),

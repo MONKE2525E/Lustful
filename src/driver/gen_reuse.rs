@@ -1033,7 +1033,7 @@ impl GenReuse {
                         }
                     }
                     ReadKey::Binding(b) => {
-                        if let crate::driver::graph::BindingRes::Def(d) = p.binding_res(b.module, b.ns, b.name) {
+                        if let crate::driver::graph::BindingRes::Def(d) = p.binding_res_at(b) {
                             add(ReaderKey::Def(d));
                         }
                     }
@@ -1349,6 +1349,10 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool, DefId)>) 
     };
     let mut h = FxHasher::default();
     "trait-system-v3".hash(&mut h);
+    // The crate's `#![recursion_limit]`: every body check reads it with no
+    // recorded read (check/where_overflow.rs `recursion_limit`), so a change
+    // checks every body again.
+    crate::check::where_overflow::recursion_limit(p).hash(&mut h);
     let mut dh = FxHasher::default();
     "derives-v1".hash(&mut dh);
     let mut lh = FxHasher::default();
