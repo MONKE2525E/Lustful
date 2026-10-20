@@ -182,11 +182,10 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    uint8_t {t} = lust_bytes_eq_ignore_ascii_case({ptr}, {len}, {optr}, {olen});");
                 t
             }
+            // The runtime's word-at-a-time test (str::is_ascii's), not a byte loop here.
             B::SliceIsAscii => {
                 let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
-                let (t, i) = (self.tmp(), self.tmp());
-                let _ = writeln!(self.out, "    uint8_t {t} = 1;\n    for (uint64_t {i} = 0; {i} < {len}; {i}++) if ({ptr}[{i}] >= 0x80) {{ {t} = 0; break; }}");
-                t
+                format!("lust_bytes_is_ascii((const uint8_t *){ptr}, {len})")
             }
             B::SliceRotateLeft | B::SliceRotateRight => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);

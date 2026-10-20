@@ -7379,6 +7379,11 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    if ({cond}) {{ {field} = {r}{ptr}[{idx}];{nn}{some} }}");
                 t
             }
+            // A byte (u8 or i8) is memchr's search, as std's SliceContains specialization.
+            B::VecContains if matches!(slice_like(&tys[0], &vals[0]).0, CTy::Int(IntTy::U8 | IntTy::I8)) => {
+                let (_, ptr, len) = slice_like(&tys[0], &vals[0]);
+                format!("(lust_memchr((uint32_t)*(const uint8_t *){}, (const uint8_t *){ptr}, {len}) != 18446744073709551615ull)", vals[1])
+            }
             B::VecContains => {
                 let (e, ptr, len) = slice_like(&tys[0], &vals[0]);
                 let (t, i) = (self.tmp(), self.tmp());

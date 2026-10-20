@@ -648,9 +648,37 @@ uint8_t lust_bytes_eq_ignore_ascii_case(const uint8_t *a, uint64_t an, const uin
     return 1;
 })
 
-/* `[u8]::is_ascii` and `str::is_ascii`: no byte at or above 0x80. */
+/* `[u8]::is_ascii` and `str::is_ascii`: no byte at or above 0x80. A clang or gcc build for
+   x86_64 tests 32 bytes a step (two 16-byte loads, one sign-bit mask) and ends with one
+   16-byte load at the last byte (it may test some bytes twice); other builds test 8 bytes a
+   word. It never reads outside the n bytes. */
+#if !defined(__TINYC__) && defined(__x86_64__) && defined(__SSE2__)
+typedef char lust_v16_ __attribute__((vector_size(16)));
+typedef char lust_v16u_ __attribute__((vector_size(16), aligned(1)));
+#endif
 uint8_t lust_bytes_is_ascii(const uint8_t *p, uint64_t n) LUST_BODY({
-    for (uint64_t i = 0; i < n; i++)
+#if !defined(__TINYC__) && defined(__x86_64__) && defined(__SSE2__)
+    if (n >= 16) {
+        const uint8_t *q = p, *last = p + n - 16;
+        for (; q + 16 < last; q += 32) {
+            lust_v16_ a = *(const lust_v16u_ *)(const void *)q, b = *(const lust_v16u_ *)(const void *)(q + 16);
+            if (__builtin_ia32_pmovmskb128(a | b)) return 0;
+        }
+        if (q < last) {
+            lust_v16_ a = *(const lust_v16u_ *)(const void *)q;
+            if (__builtin_ia32_pmovmskb128(a)) return 0;
+        }
+        lust_v16_ z = *(const lust_v16u_ *)(const void *)last;
+        return !__builtin_ia32_pmovmskb128(z);
+    }
+#endif
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        if (w & 0x8080808080808080ull) return 0;
+    }
+    for (; i < n; i++)
         if (p[i] >= 0x80) return 0;
     return 1;
 })
