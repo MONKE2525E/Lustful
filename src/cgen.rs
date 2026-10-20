@@ -10495,8 +10495,29 @@ struct PlainDef<'a> {
     pks: Vec<&'a str>,
     /// The definition's size in bytes (not its comment, panic fns or trampoline).
     len: usize,
+    /// The bytes of it that make instructions (`code_len`): the hot copy limit reads this.
+    code: usize,
     /// It holds kconst's static locals (`kconst_static`): only a hot copy may.
     statics: bool,
+}
+
+/// The bytes of fn definition `def` (first line `head`) that make instructions: its head,
+/// then its blocks from `bb0:;` on, without the blocks that only jump (`bbN:;` then
+/// `goto bbM;`, which the C compiler folds away). Before the first block are only the
+/// locals' declarations and kconst's static data and first-run setup.
+fn code_len(def: &str, head: &str) -> usize {
+    let Some(at) = def.find("\nbb0:;\n") else { return def.len() };
+    let mut lines = def[at + 1..].split_inclusive('\n').peekable();
+    let mut n = head.len();
+    while let Some(l) = lines.next() {
+        let jump = |g: &&str| g.starts_with("  goto bb") && g.ends_with(";\n");
+        if l.starts_with("bb") && l.ends_with(":;\n") && lines.peek().is_some_and(jump) {
+            lines.next();
+        } else {
+            n += l.len();
+        }
+    }
+    n
 }
 
 /// Whether `line` declares one of kconst's static locals: a constant local `lN`, its slot
@@ -10535,7 +10556,7 @@ fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
     let statics = def.lines().any(kconst_static);
     let other_static = def.matches("static ").count() != def.lines().filter(|l| kconst_static(l)).count();
     (!other_static && !def.contains("__attribute__") && !def.contains("#define") && !head.contains('\n'))
-        .then_some(PlainDef { head, def, pks, len: def.len(), statics })
+        .then_some(PlainDef { head, def, pks, len: def.len(), code: code_len(def, head), statics })
 }
 
 /// Release C: the small fns that the fns in `slots` call and another unit holds; this
@@ -10586,10 +10607,11 @@ fn inline_pick(f: &FnOut, deep: bool) -> bool {
 }
 
 /// Whether `inline_callees` copies `f`, a callee a copies profile saw hot: up to
-/// `HOT_COPY_BYTES` (or its `#[inline]` limit when larger) at every level, kconst's static
-/// locals and all.
+/// `HOT_COPY_BYTES` of code (or its `#[inline]` limit when larger) at every level, kconst's
+/// static locals and all. Code, not text (`PlainDef::code`): a match over a parameter that
+/// each caller passes as a constant has many one-jump blocks, which fold away.
 fn inline_pick_hot(f: &FnOut) -> bool {
-    f.error.is_none() && f.inline != InlineAttr::Never && plain_fn_def(&f.code).is_some_and(|d| d.len <= inline_limit(f.inline).max(HOT_COPY_BYTES))
+    f.error.is_none() && f.inline != InlineAttr::Never && plain_fn_def(&f.code).is_some_and(|d| d.code <= inline_limit(f.inline).max(HOT_COPY_BYTES))
 }
 
 /// The deeper copy levels below `frontier` (`fn_unit_parts`): the callees of each level's
@@ -12766,6 +12788,23 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copy's code size counts the head and the blocks, not the declarations and kconst
+    /// setup before `bb0:;`, nor a block that only jumps; a jump that ends a block counts.
+    #[test]
+    fn code_len_counts_what_makes_instructions() {
+        let head = "uint32_t f_0000000000000001(uint32_t p1)";
+        let blocks = "bb0:;\n  l1 = p1;\n  if (l1) goto bb1; else goto bb2;\nbb1:;\n  goto bb3;\nbb2:;\n  l1 = 7;\n  goto bb3;\nbb3:;\n  return l1;\n}\n";
+        let def = format!("{head} {{\n  uint32_t l1;\n  static int32_t lks_ok;\n  if (!lks_ok) {{\n    lks_ok = 1;\n  }}\n{blocks}");
+        let jump_only = "bb1:;\n  goto bb3;\n".len();
+        assert_eq!(code_len(&def, head), head.len() + blocks.len() - jump_only);
+        let code = format!("/* f */\n{def}");
+        let d = plain_fn_def(&code).expect("plain");
+        assert_eq!((d.len, d.code), (def.len(), code_len(&def, head)));
+        assert!(d.statics);
+        // No blocks (no `bb0:;`): all of it.
+        assert_eq!(code_len("void f(void) {\n}\n", "void f(void)"), "void f(void) {\n}\n".len());
+    }
 
     /// Byte grouping: groups fill to the target, an over-target slot
     /// stands alone, empty input gives no groups, and every slot is
