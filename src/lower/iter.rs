@@ -3202,6 +3202,29 @@ impl Ex<'_, '_> {
             let want = self.local(USIZE);
             self.assign(Place::local(want), Rvalue::Bin(Sub, Operand::Copy(f(3)), Operand::Copy(f(2))));
             self.assign(f(3), Rvalue::Bin(Sub, Operand::Copy(f(3)), Self::usize_c(1)));
+            // Two slice sides: core's indexed read of each at `len - 1`, in place. A slice side
+            // has no side effects and owns nothing, and its front is at the zip's index (the
+            // forward arm pulls it once a step), so that element is its `want - 1`; the trim
+            // and the pull of the general form only move its back.
+            if [a[0], a[1]].iter().all(|&t| matches!(self.kind_args(t), Some((IterKind::SliceIter | IterKind::SliceIterMut, _)))) {
+                let k = self.local(USIZE);
+                self.assign(Place::local(k), Rvalue::Bin(Sub, Operand::Copy(Place::local(want)), Self::usize_c(1)));
+                let mut xs = Vec::new();
+                for i in 0..2 {
+                    let (sk, sa) = self.kind_args(a[i]).ok_or("iterator expansion: bad Zip side")?;
+                    // A slice iterator's field 0 is its slice (`next`).
+                    let r = self.ref_to(sk == IterKind::SliceIterMut, f(i as u32).project(Proj::Field(0)).deref().project(Proj::Index(k)), sa[0]);
+                    xs.push(Operand::Move(Place::local(r)));
+                }
+                let ts = self.body.tys.intern_tys(&[ia, ib]);
+                let item = self.body.tys.intern(TyKind::Tuple(ts));
+                let tup = self.local(item);
+                self.assign(Place::local(tup), Rvalue::TupleAgg(item, xs));
+                let at = self.take(Place::local(tup), item);
+                self.some(dest, opt, at);
+                self.goto(join);
+                return Ok(());
+            }
             for i in 0..2 {
                 let sz = self.size(f(i), a[i as usize])?;
                 let n = self.local(USIZE);
