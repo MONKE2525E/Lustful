@@ -1608,22 +1608,19 @@ void lust_vec_remove_at(lust_Vec *v, uint64_t i, uint64_t elem) LUST_BODY({
 
 uint8_t lust_str_starts_with(lust_str s, lust_str p) LUST_BODY({ return p.len <= s.len && (p.len == 0 || memcmp(s.ptr, p.ptr, p.len) == 0); })
 uint8_t lust_str_ends_with(lust_str s, lust_str p) LUST_BODY({ return p.len <= s.len && (p.len == 0 || memcmp(s.ptr + s.len - p.len, p.ptr, p.len) == 0); })
-uint8_t lust_str_contains(lust_str s, lust_str p) LUST_BODY({
-    if (p.len == 0) return 1;
-    for (uint64_t i = 0; i + p.len <= s.len; i++)
-        if (s.ptr[i] == p.ptr[0] && memcmp(s.ptr + i, p.ptr, p.len) == 0) return 1;
-    return 0;
-})
+/* str::contains and str::find with a &str pattern are lust_memmem (deps.c, declared here
+   ahead of deps.h): its SSE2 path tries 16 starts at a time and gives the leftmost match, and
+   0 for an empty pattern. */
+uint64_t lust_memmem(const uint8_t *h, uint64_t hlen, const uint8_t *n, uint64_t nlen);
+uint8_t lust_str_contains(lust_str s, lust_str p) LUST_BODY({ return lust_memmem(s.ptr, s.len, p.ptr, p.len) != UINT64_MAX; })
 
 /* The byte index of the first (or last) match of `p` in `s`, or -1.
    An empty pattern matches at 0 for find and at s.len for rfind, as
    Rust's str::find and str::rfind do. A match of a UTF-8 pattern in
    a valid UTF-8 haystack always starts on a char boundary. */
 int64_t lust_str_find(lust_str s, lust_str p) LUST_BODY({
-    if (p.len == 0) return 0;
-    for (uint64_t i = 0; i + p.len <= s.len; i++)
-        if (s.ptr[i] == p.ptr[0] && memcmp(s.ptr + i, p.ptr, p.len) == 0) return (int64_t)i;
-    return -1;
+    uint64_t i = lust_memmem(s.ptr, s.len, p.ptr, p.len);
+    return i == UINT64_MAX ? -1 : (int64_t)i;
 })
 int64_t lust_str_rfind(lust_str s, lust_str p) LUST_BODY({
     if (p.len == 0) return (int64_t)s.len;
