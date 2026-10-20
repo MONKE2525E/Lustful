@@ -11715,6 +11715,47 @@ fn decl_forward(t: &CTy, out: &mut String) {
     }
 }
 
+/// The type definitions of one pass over units of a frozen program (`with_decl_cache`): each
+/// type's `decl_own` text, by type and form (in full, as a block), made once and shared by the
+/// threads that make the units. A glue shard declares much the same types as the others (tsgo:
+/// 118 shards, about 0.55 CPU-s of definitions a build).
+#[derive(Default)]
+pub struct DeclCache(std::sync::RwLock<crate::intern::FxMap<CTy, [Option<std::sync::Arc<str>>; 2]>>);
+
+impl DeclCache {
+    /// `decl_own` of `t`, from the cache when a unit of the pass made it already.
+    fn decl(&self, p: &Program, t: &CTy, block: Option<Layout>, out: &mut String) {
+        let form = block.is_some() as usize;
+        if let Some(s) = self.0.read().unwrap_or_else(|e| e.into_inner()).get(t).and_then(|v| v[form].clone()) {
+            out.push_str(&s);
+            return;
+        }
+        let m = out.len();
+        decl_own(p, t, block, out);
+        self.0.write().unwrap_or_else(|e| e.into_inner()).entry(t.clone()).or_default()[form] = Some(std::sync::Arc::from(&out[m..]));
+    }
+}
+
+thread_local! {
+    /// The pass's `DeclCache` this thread uses (`with_decl_cache`), if any.
+    static DECL_CACHE: std::cell::RefCell<Option<std::sync::Arc<DeclCache>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `cache` as this thread's type definitions (`type_decls_with`), in a codegen
+/// phase (`in_layout_phase`), where the program is frozen: a definition depends on the
+/// program and the type alone.
+pub fn with_decl_cache<R>(cache: &std::sync::Arc<DeclCache>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<std::sync::Arc<DeclCache>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            DECL_CACHE.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(DECL_CACHE.with(|c| c.borrow_mut().replace(cache.clone())));
+    f()
+}
+
 /// One type's own definition (its block form, for `block`), after its deps (`type_decls_with`).
 fn decl_own(p: &Program, t: &CTy, block: Option<Layout>, out: &mut String) {
     if let (CTy::Adt(a), Some(l)) = (t, block) {
@@ -12143,26 +12184,31 @@ fn type_decls_with(p: &Program, out: &mut String, roots: &HashSet<CTy>, named: &
             record::piece(record::Kind::TypeDecl, record::key(&format!("fwd {}", mangle(t))), &out[m..]);
         }
     }
-    // Each definition comes after the types it holds by value.
-    fn emit(p: &Program, t: &CTy, blocks: &HashSet<CTy>, emitted: &mut HashSet<CTy>, out: &mut String, rec: bool) {
+    // Each definition comes after the types it holds by value; from the pass's definitions
+    // (`with_decl_cache`) in a codegen phase.
+    let cache = DECL_CACHE.with(|c| c.borrow().clone()).filter(|_| phase_tag() != 0);
+    fn emit(p: &Program, t: &CTy, blocks: &HashSet<CTy>, emitted: &mut HashSet<CTy>, out: &mut String, rec: bool, cache: Option<&DeclCache>) {
         if !emitted.insert(t.clone()) {
             return;
         }
         let block = if blocks.contains(t) { nested_block(p, t).filter(|_| matches!(t, CTy::Adt(_))) } else { None };
         if block.is_none() {
             for d in &def_deps(p, t) {
-                emit(p, d, blocks, emitted, out, rec);
+                emit(p, d, blocks, emitted, out, rec, cache);
             }
         }
         let m = out.len();
-        decl_own(p, t, block, out);
+        match cache {
+            Some(c) => c.decl(p, t, block, out),
+            None => decl_own(p, t, block, out),
+        }
         if rec {
             record::piece(record::Kind::TypeDecl, record::key(&mangle(t)), &out[m..]);
         }
     }
     let mut emitted = HashSet::new();
     for t in list.iter().filter(|t| defined.as_ref().is_none_or(|d| d.contains(*t))) {
-        emit(p, t, &blocks, &mut emitted, out, rec);
+        emit(p, t, &blocks, &mut emitted, out, rec, cache.as_deref());
     }
     out.push('\n');
     record::piece(record::Kind::Fixed, 3, "\n");

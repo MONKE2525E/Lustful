@@ -262,8 +262,10 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>]) 
     // frozen: a worker keeps its `c_layout` answers across its shards).
     let names = CUR.with(|c| c.borrow().clone());
     let tag = super::layout_phase();
+    // One definition of each type for all of them (`DeclCache`).
+    let decls = std::sync::Arc::new(super::DeclCache::default());
     crate::pool::par_map(shards, |keys| {
-        super::in_layout_phase(tag, || with(names.as_ref(), || {
+        super::in_layout_phase(tag, || with(names.as_ref(), || super::with_decl_cache(&decls, || {
             let mut c = unit_header();
             if p.unwind_tables {
                 c.push_str(noreturn_decls());
@@ -301,7 +303,7 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>]) 
                 c.push_str(&g.def_map[*k]);
             }
             c
-        }))
+        })))
     })
 }
 
@@ -421,9 +423,10 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
     let glue_names: crate::intern::FxSet<&str> = glue.keys().copied().collect();
     let names = CUR.with(|c| c.borrow().clone());
     let tag = super::layout_phase();
+    let decls = std::sync::Arc::new(super::DeclCache::default());
     let parts = crate::pool::par_map(&cuts, |ks| {
         super::in_layout_phase(tag, || {
-            with(names.as_ref(), || {
+            with(names.as_ref(), || super::with_decl_cache(&decls, || {
                 let body: String = ks.iter().map(|&k| outs[k].made.as_str()).chain(ks.iter().map(|&k| outs[k].data.as_str())).collect();
                 // The names it uses, and the names the alias macros among them use.
                 let mut used = names_found(&body, &wanted);
@@ -467,7 +470,7 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
                 decls.iter().filter(|(_, d)| d.starts_with("#define")).for_each(|(_, d)| c.push_str(d));
                 c.push_str(&body);
                 c
-            })
+            }))
         })
     });
     // The index: every pointee, declared, then registered in the pass's order.
