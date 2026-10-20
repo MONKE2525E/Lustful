@@ -256,14 +256,18 @@ impl Bump {
         let (chunk, ptr) = (self.allocated.get(), self.ptr.get());
         self.try_alloc_layout(bytes, core::mem::align_of::<T>())?;
         let mut guard = Rewind { bump: self, chunk, ptr, after_chunk: self.allocated.get(), after: self.ptr.get(), active: true };
-        let mut items = core::mem::ManuallyDrop::new(Vec::with_capacity(len));
+        // The Vec is made in place and its buffer leaked as the slice (`Vec::leak`, no shrink
+        // call): its 24-byte header is never copied whole right after a runtime call wrote
+        // its fields, which stalls the copy's 16-byte load (most of this fn's cycles).
+        let mut items = core::mem::ManuallyDrop::new(Vec::new());
+        items.reserve_exact(len);
         let mut i = 0;
         while i < len {
             items.push(f(i));
             i += 1;
         }
         guard.active = false;
-        Ok(Box::leak(core::mem::ManuallyDrop::into_inner(items).into_boxed_slice()))
+        Ok(core::mem::ManuallyDrop::into_inner(items).leak())
     }
 }
 
