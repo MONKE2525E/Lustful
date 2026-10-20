@@ -5,7 +5,8 @@
 // on the site's first run, then read from its slot); a function's str
 // literals intern once, on its first call. The pointees of statics are the canonical storage of
 // their content: the glue unit registers them before main
-// (`lust_kstatics_init`). Comparing equal constants used from different
+// (`lust_kstatics_init`), most by a hash computed here (`khash`), so startup does not read
+// them. Comparing equal constants used from different
 // fns gives a config-dependent answer in rustc (docs/ARCH.md, rule
 // zero), so tests compare them only inside one fn.
 use super::*;
@@ -406,7 +407,8 @@ pub(super) struct StaticCx {
     alias: HashMap<String, String>,
     /// The fn pointer trampolines (`stramp<tag>`) this pass's prelude defines.
     pub stramps: std::collections::HashSet<String>,
-    regs: Vec<(String, u64, u64, Option<Vec<u64>>)>,
+    /// The pointees to register (`kstatics_init`), in order: name, size, alignment, and how.
+    regs: Vec<(String, u64, u64, KReg)>,
     /// Release C statics in parts (`names::statics_parts`): the pass defines its pointees, str
     /// arrays and trampolines global, so another part can name them, names an unnamed pointee
     /// by its content key (`content_name`), and keeps here, in order, each name it defines
@@ -417,6 +419,51 @@ pub(super) struct StaticCx {
     /// A `kdata` fn's constant (`FnGen::kdata_local`): each str it holds is a definition
     /// in `pre` by content name (`kdata_def`), and nothing is registered.
     pub weak: bool,
+}
+
+/// How `lust_kstatics_init` registers a static pointee. `Hash`: its bytes are all init and hold
+/// no pointer, and codegen knows them, so the call gives the run-time table's kind and hash of
+/// its key (`khash`) and startup reads none of its bytes (`lust_kreg_h`). `Desc`: the table
+/// reads the pointee for its key, by its layout descriptor (`kdesc`; None: every byte init).
+enum KReg {
+    Hash(u8, u64),
+    Desc(Option<Vec<u64>>),
+}
+
+/// The registration of a pointee of type `ct` with byte image `img` (`image`).
+fn kreg(p: &Program, ct: &CTy, img: Option<&(Vec<u8>, Vec<u8>)>) -> KReg {
+    let desc = kdesc(p, ct);
+    match img {
+        Some((b, cls)) if desc.is_none() && cls.iter().all(|&c| c == 1) => khash(b),
+        _ => KReg::Desc(desc),
+    }
+}
+
+/// The registration of a pointee whose bytes `b` are all init and hold no pointer: the
+/// run-time table's kind and hash of its key, as runtime/kconst.c computes them (`lust_kkey`
+/// with no descriptor, the seed in `lust_kfind`, `lust_khash`). A 4, 8, 16 or 32 byte image
+/// that is not a C string is kind 1, keyed by its bytes; any other is kind 0, keyed by its
+/// bytes and then one init class (1) per byte.
+fn khash(b: &[u8]) -> KReg {
+    let n = b.len();
+    let cstr = b.iter().position(|&x| x == 0) == Some(n - 1);
+    let kind = !cstr && matches!(n, 4 | 8 | 16 | 32);
+    let mut key = b.to_vec();
+    if !kind {
+        key.resize(2 * n, 1);
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325 ^ n as u64 ^ (u64::from(kind) << 63);
+    let mut words = key.chunks_exact(8);
+    for w in &mut words {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h ^= h >> 32;
+    }
+    for &x in words.remainder() {
+        h = (h ^ u64::from(x)).wrapping_mul(0x1_0000_0001_b3);
+    }
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    KReg::Hash(u8::from(kind), h ^ (h >> 32))
 }
 
 /// The symbol of constant data with content key `key` (`static_key`): a static's pointee or
@@ -457,13 +504,17 @@ pub(super) fn kdef(p: &Program, cx: &mut StaticCx, pre: &mut String, name: &str,
         }
         return;
     }
-    let key = static_key(p, cx, v, ct, &c, init);
+    let img = image(p, v, ct);
+    let key = match &img {
+        Some((b, cls)) => image_key(b.clone(), cls.clone()),
+        None => init_key(cx, &c, init),
+    };
     // Statics in parts: the data has its content's name (`content_sym`), as an equal
     // constant of a `kdata` fn does, and a path name (`promoted_name`) is a macro for it.
     if cx.parts && !cx.defs.contains_key(&key) {
         let cname = content_sym(&key);
         let _ = writeln!(pre, "const {c} {cname} __attribute__((aligned({}))) = {init};", KALIGN.max(a));
-        cx.regs.push((cname.clone(), n, KALIGN.max(a), kdesc(p, ct)));
+        cx.regs.push((cname.clone(), n, KALIGN.max(a), kreg(p, ct, img.as_ref())));
         cx.decls.push((cname.clone(), format!("extern const {c} {cname};\n"), Some(ct.clone())));
         cx.defs.insert(key.clone(), cname);
     }
@@ -481,7 +532,7 @@ pub(super) fn kdef(p: &Program, cx: &mut StaticCx, pre: &mut String, name: &str,
     }
     cx.defs.insert(key, name.to_string());
     let _ = writeln!(pre, "{link}const {c} {name} __attribute__((aligned({}))) = {init};", KALIGN.max(a));
-    cx.regs.push((name.to_string(), n, KALIGN.max(a), kdesc(p, ct)));
+    cx.regs.push((name.to_string(), n, KALIGN.max(a), kreg(p, ct, img.as_ref())));
     if cx.parts {
         cx.decls.push((name.to_string(), format!("extern const {c} {name};\n"), Some(ct.clone())));
     }
@@ -516,7 +567,7 @@ pub(super) fn kstatic_str(cx: &mut StaticCx, pre: &mut String, bytes: &[u8]) -> 
             let name = if cx.parts { content_sym(&key) } else { format!("lust_ks{}", cx.regs.len()) };
             let link = if cx.parts { "" } else { "static " };
             let _ = writeln!(pre, "{link}const uint8_t {name}[{}] __attribute__((aligned({KALIGN}))) = {};", bytes.len(), c_string_lit(bytes));
-            cx.regs.push((name.clone(), bytes.len() as u64, KALIGN, None));
+            cx.regs.push((name.clone(), bytes.len() as u64, KALIGN, khash(bytes)));
             cx.defs.insert(key, name.clone());
             if cx.parts {
                 cx.decls.push((name.clone(), format!("extern const uint8_t {name}[{}];\n", bytes.len()), None));
@@ -531,11 +582,23 @@ pub(super) fn kstatic_str(cx: &mut StaticCx, pre: &mut String, bytes: &[u8]) -> 
 /// rule (`image_key`) when the value holds no pointer, else its C type
 /// and initializer, with alias names read as the names they stand for.
 fn static_key(p: &Program, cx: &StaticCx, v: &crate::ty::consteval::ConstValue, ct: &CTy, c: &str, init: &str) -> Vec<u8> {
+    match image(p, v, ct) {
+        Some((b, cls)) => image_key(b, cls),
+        None => init_key(cx, c, init),
+    }
+}
+
+/// The byte image of const value `v` at type `ct` (`put`): its bytes and their init classes.
+fn image(p: &Program, v: &crate::ty::consteval::ConstValue, ct: &CTy) -> Option<(Vec<u8>, Vec<u8>)> {
     let n = c_size_align(p, ct).0 as usize;
     let (mut b, mut cls) = (vec![0u8; n], vec![0u8; n]);
-    if put(p, v, ct, 0, &mut b, &mut cls).is_some() {
-        return image_key(b, cls);
-    }
+    put(p, v, ct, 0, &mut b, &mut cls)?;
+    Some((b, cls))
+}
+
+/// The content key of a value with no byte image (`static_key`): its C type `c` and
+/// initializer, with alias names read as the names they stand for.
+fn init_key(cx: &StaticCx, c: &str, init: &str) -> Vec<u8> {
     let mut key = format!("T{c}=");
     let mut word = String::new();
     for ch in init.chars().chain(std::iter::once(' ')) {
@@ -640,18 +703,21 @@ pub(super) fn kstatics_regs(cx: &StaticCx) -> impl Iterator<Item = &str> {
 
 /// `lust_kstatics_init`, which registers the static pointees in
 /// definition order (an inner pointee before the values that point at
-/// it, so their pointer words read as relocs).
+/// it, so their pointer words read as relocs), each as its `KReg` says.
 pub(super) fn kstatics_init(cx: &StaticCx) -> String {
     let mut out = String::new();
-    for (i, (_, _, _, d)) in cx.regs.iter().enumerate() {
-        if let Some(d) = d {
+    for (i, (_, _, _, r)) in cx.regs.iter().enumerate() {
+        if let KReg::Desc(Some(d)) = r {
             let _ = writeln!(out, "static const uint64_t lust_ksd{i}[] = {};", kdesc_init(d));
         }
     }
     out.push_str("void lust_kstatics_init(void) {\n");
-    for (i, (name, n, a, d)) in cx.regs.iter().enumerate() {
-        let desc = if d.is_some() { format!("lust_ksd{i}") } else { "0".into() };
-        let _ = writeln!(out, "  lust_kreg(&{name}, {n}, {a}, {desc});");
+    for (i, (name, n, a, r)) in cx.regs.iter().enumerate() {
+        let _ = match r {
+            KReg::Hash(kind, h) => writeln!(out, "  lust_kreg_h(&{name}, {n}, {a}, {kind}, {h:#x}ull);"),
+            KReg::Desc(Some(_)) => writeln!(out, "  lust_kreg(&{name}, {n}, {a}, lust_ksd{i});"),
+            KReg::Desc(None) => writeln!(out, "  lust_kreg(&{name}, {n}, {a}, 0);"),
+        };
     }
     out.push_str("}\n");
     out

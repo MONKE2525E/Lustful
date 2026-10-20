@@ -11,9 +11,10 @@
    not in that set. lust gives every constant of the program that address:
    each site interns its bytes here at its first run and keeps the
    canonical address in a slot of its own (cgen/kconst.rs), and the glue
-   unit registers the pointees
-   of statics at startup (lust_kreg). Zero-sized constants never come
-   here: their address is their alignment (cgen `const_zst_addr`).
+   unit registers the pointees of statics at startup (lust_kreg, or
+   lust_kreg_h with a hash codegen computed, which reads no byte of the
+   pointee). Zero-sized constants never come here: their address is
+   their alignment (cgen `const_zst_addr`).
 
    A site's layout descriptor (cgen `kdesc`) says which bytes of its
    value are init. Word 0 is the word count that follows; then ops:
@@ -36,17 +37,20 @@
 
 const void *lust_kintern(const void **cache, const void *p, uint64_t n, uint64_t align, const uint64_t *desc);
 void lust_kreg(const void *p, uint64_t n, uint64_t align, const uint64_t *desc);
+void lust_kreg_h(const void *p, uint64_t n, uint64_t align, uint64_t kind, uint64_t hash);
 
 #ifdef LUST_IMPL
 /* One interned constant: `kind` 1 is a mergeable 4/8/16/32 byte constant
    with no pointer that is not a C string (the key is its bytes), 0 any
    other (the key is its
    bytes, then its byte classes: 0 uninit, 1 init, 2 pointer). `align`
-   is the alignment its storage guarantees. */
+   is the alignment its storage guarantees. `at_addr`: the entry holds no
+   copy of its key, which is the n bytes at `addr`, every one init (a
+   static's pointee registered by lust_kreg_h). */
 typedef struct lust_kent {
     uint64_t hash, n, align;
     const void *addr;
-    uint8_t kind;
+    uint8_t kind, at_addr;
     uint8_t key[];
 } lust_kent;
 
@@ -57,13 +61,17 @@ static uintptr_t *lust_kaddr;
 static uint64_t lust_kaddr_cap;
 static int32_t lust_klock;
 
-/* The table's hash of a key: 8 bytes per step (startup registers megabytes of static
-   pointees), mixed so the low bits (the table index) see every byte. */
+/* The table's hash of a key: 8 bytes per step, read little-endian, mixed so the low bits
+   (the table index) see every byte. cgen/kconst.rs `khash` computes the same for the
+   static pointees it registers by hash (lust_kreg_h): the two must agree. */
 static uint64_t lust_khash(const uint8_t *b, uint64_t n, uint64_t h) {
     uint64_t i = 0;
     for (; i + 8 <= n; i += 8) {
         uint64_t w;
         memcpy(&w, b + i, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        w = __builtin_bswap64(w);
+#endif
         h = (h ^ w) * 0x9e3779b97f4a7c15ull;
         h ^= h >> 32;
     }
@@ -203,15 +211,22 @@ static uint8_t lust_kkey(const void *p, uint64_t n, const uint64_t *desc, uint8_
     return 0;
 }
 
-/* The entry for the constant at `p`, added when there is none that fits
-   `align`: a copy (`copy`) or `p` itself (a static's pointee). */
-static const void *lust_kfind(const void *p, uint64_t n, uint64_t align, const uint64_t *desc, int copy) {
-    uint8_t small[256];
-    uint8_t *key = 2 * n <= sizeof small ? small : (uint8_t *)malloc(2 * n);
-    if (!key) lust_oom();
-    uint8_t kind = lust_kkey(p, n, desc, key);
-    uint64_t klen = kind ? n : 2 * n;
-    uint64_t h = lust_khash(key, klen, 0xcbf29ce484222325ull ^ n ^ ((uint64_t)kind << 63));
+/* True when entry `e` (of size n and kind) holds the key of the n bytes `b` with init classes
+   `cls` (kind 0 only; null: every byte init). */
+static int lust_keq(const lust_kent *e, const uint8_t *b, const uint8_t *cls) {
+    if (memcmp(e->at_addr ? (const uint8_t *)e->addr : e->key, b, e->n)) return 0;
+    if (e->kind) return 1;
+    const uint8_t *ec = e->at_addr ? 0 : e->key + e->n;
+    if (ec && cls) return !memcmp(ec, cls, e->n);
+    const uint8_t *c = ec ? ec : cls;
+    for (uint64_t i = 0; c && i < e->n; i++)
+        if (c[i] != 1) return 0;
+    return 1;
+}
+
+/* The entry with hash h, size n and kind `kind` that fits `align` and holds the key (b, cls)
+   (lust_keq), or null with `*slot` the free slot for a new one. Grows the table first. */
+static lust_kent *lust_kprobe(uint64_t h, uint64_t n, uint8_t kind, uint64_t align, const uint8_t *b, const uint8_t *cls, uint64_t *slot) {
     if ((lust_ktab_len + 1) * 2 > lust_ktab_cap) {
         uint64_t cap = lust_ktab_cap ? lust_ktab_cap * 2 : 64;
         lust_kent **t = (lust_kent **)calloc(cap, sizeof *t);
@@ -228,17 +243,40 @@ static const void *lust_kfind(const void *p, uint64_t n, uint64_t align, const u
         lust_ktab_cap = cap;
     }
     uint64_t i = h & (lust_ktab_cap - 1);
-    for (lust_kent *e; (e = lust_ktab[i]); i = (i + 1) & (lust_ktab_cap - 1)) {
-        if (e->hash == h && e->n == n && e->kind == kind && e->align >= align && !memcmp(e->key, key, klen)) {
-            if (key != small) free(key);
-            return e->addr;
-        }
+    for (lust_kent *e; (e = lust_ktab[i]); i = (i + 1) & (lust_ktab_cap - 1))
+        if (e->hash == h && e->n == n && e->kind == kind && e->align >= align && lust_keq(e, b, cls)) return e;
+    *slot = i;
+    return 0;
+}
+
+/* Puts the new entry `e` in the free slot `i` (lust_kprobe). */
+static void lust_kput(lust_kent *e, uint64_t i) {
+    lust_ktab[i] = e;
+    lust_ktab_len++;
+    lust_kaddr_add((uintptr_t)e->addr);
+}
+
+/* The entry for the constant at `p`, added when there is none that fits
+   `align`: a copy (`copy`) or `p` itself (a static's pointee). */
+static const void *lust_kfind(const void *p, uint64_t n, uint64_t align, const uint64_t *desc, int copy) {
+    uint8_t small[256];
+    uint8_t *key = 2 * n <= sizeof small ? small : (uint8_t *)malloc(2 * n);
+    if (!key) lust_oom();
+    uint8_t kind = lust_kkey(p, n, desc, key);
+    uint64_t klen = kind ? n : 2 * n;
+    uint64_t h = lust_khash(key, klen, 0xcbf29ce484222325ull ^ n ^ ((uint64_t)kind << 63));
+    uint64_t i;
+    lust_kent *e = lust_kprobe(h, n, kind, align, key, key + n, &i);
+    if (e) {
+        if (key != small) free(key);
+        return e->addr;
     }
-    lust_kent *e = (lust_kent *)malloc(sizeof *e + klen);
+    e = (lust_kent *)malloc(sizeof *e + klen);
     if (!e) lust_oom();
     e->hash = h;
     e->n = n;
     e->kind = kind;
+    e->at_addr = 0;
     memcpy(e->key, key, klen);
     if (copy) {
         /* At least 16-aligned, so a later site of a stricter type (up to
@@ -259,9 +297,7 @@ static const void *lust_kfind(const void *p, uint64_t n, uint64_t align, const u
         e->align = align;
     }
     if (key != small) free(key);
-    lust_ktab[i] = e;
-    lust_ktab_len++;
-    lust_kaddr_add((uintptr_t)e->addr);
+    lust_kput(e, i);
     return e->addr;
 }
 
@@ -331,5 +367,25 @@ const void *lust_kintern(const void **cache, const void *p, uint64_t n, uint64_t
 void lust_kreg(const void *p, uint64_t n, uint64_t align, const uint64_t *desc) LUST_BODY({
     (void)lust_klock_take(0, 0);
     (void)lust_kfind(p, n, align, desc, 0);
+    lust_klock_give();
+})
+
+/* As lust_kreg for a pointee whose bytes are all init and hold no pointer, by the kind and
+   hash of its key that codegen computed (cgen/kconst.rs `khash`): the entry keeps no copy of
+   the key, and its bytes are read only to compare with an entry of an equal hash. */
+void lust_kreg_h(const void *p, uint64_t n, uint64_t align, uint64_t kind, uint64_t hash) LUST_BODY({
+    (void)lust_klock_take(0, 0);
+    uint64_t i;
+    if (!lust_kprobe(hash, n, (uint8_t)kind, align, (const uint8_t *)p, 0, &i)) {
+        lust_kent *e = (lust_kent *)malloc(sizeof *e);
+        if (!e) lust_oom();
+        e->hash = hash;
+        e->n = n;
+        e->align = align;
+        e->addr = p;
+        e->kind = (uint8_t)kind;
+        e->at_addr = 1;
+        lust_kput(e, i);
+    }
     lust_klock_give();
 })
