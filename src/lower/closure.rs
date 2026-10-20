@@ -323,7 +323,7 @@ impl<'p> Lower<'p> {
                 Terminator::If(o, ..) | Terminator::Switch(o, ..) => rewrite_operand(&up, o),
                 Terminator::Call { args, dest, .. } => args.iter_mut().fold(rewrite_place(&up, dest, false), |acc, o| acc & rewrite_operand(&up, o)),
                 Terminator::Panic(parts) => rewrite_parts(&up, parts),
-                Terminator::Goto(_) | Terminator::Return | Terminator::Unreachable => true,
+                Terminator::Goto(_) | Terminator::Return | Terminator::Unreachable | Terminator::MatchExhausted => true,
             };
             if !ok {
                 errs.push(span);

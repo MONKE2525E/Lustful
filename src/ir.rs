@@ -261,6 +261,12 @@ pub enum Terminator {
     },
     Return,
     Unreachable,
+    /// The otherwise edge of an exhaustive `match`, after every arm's test failed: no
+    /// value reaches it in a correct program, and rustc emits `unreachable` there. Every
+    /// pass treats it as `Unreachable`; release C without debug assertions or overflow
+    /// checks lets the C compiler assume it is never reached (`__builtin_unreachable`,
+    /// LUST_RELEASE_UNREACHABLE=abort keeps the abort), every other build aborts.
+    MatchExhausted,
     Panic(Vec<FmtPart>),
 }
 
@@ -506,6 +512,6 @@ pub fn succ(t: &Terminator) -> Vec<Bb> {
         Terminator::If(_, a, b) => vec![*a, *b],
         Terminator::Switch(_, cases, other) => cases.iter().map(|c| c.1).chain(std::iter::once(*other)).collect(),
         Terminator::Call { next, unwind, .. } => std::iter::once(*next).chain(*unwind).collect(),
-        Terminator::Return | Terminator::Unreachable | Terminator::Panic(_) => Vec::new(),
+        Terminator::Return | Terminator::Unreachable | Terminator::MatchExhausted | Terminator::Panic(_) => Vec::new(),
     }
 }

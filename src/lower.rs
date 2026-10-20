@@ -6170,7 +6170,8 @@ impl<'p> Lower<'p> {
             self.goto(end, span);
             self.cur = next;
         }
-        self.terminate(Terminator::Unreachable, span);
+        // Every arm's test failed: an exhaustive match ends here (rustc: unreachable).
+        self.terminate(Terminator::MatchExhausted, span);
         self.cur = end;
     }
 

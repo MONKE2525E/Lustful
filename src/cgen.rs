@@ -1902,6 +1902,18 @@ fn ret_is_large(p: &Program, f: LocalDefId) -> bool {
 /// tcc 0.9.28 returns such a struct in a register, and the caller
 /// stores a byte of it over its own frame (see `param_dropped` for the
 /// same bug on parameters, and `zst_out_glue` for glue).
+/// True when codegen may tell the C compiler that an exhaustive match's otherwise edge
+/// (`Terminator::MatchExhausted`) never runs: release C of a build with neither debug
+/// assertions nor overflow checks, unless LUST_RELEASE_UNREACHABLE=abort (a test switch; as
+/// every LUST_RELEASE_ variable it is part of `release_c::codegen_key`).
+fn assume_unreachable(p: &Program) -> bool {
+    static ABORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    names::release()
+        && !p.debug_assertions
+        && !p.overflow_checks
+        && !*ABORT.get_or_init(|| std::env::var("LUST_RELEASE_UNREACHABLE").is_ok_and(|v| v == "abort"))
+}
+
 fn ret_by_out(p: &Program, t: &CTy) -> bool {
     let size = c_size_align(p, t).0;
     size > 32 || (size == 0 && zst_holds_array(p, t))
@@ -2923,7 +2935,7 @@ impl FnGen<'_, '_> {
                 // Copy fn pointer local: neither moves a place.
                 Terminator::Call { args, .. } => args.iter().for_each(|o| operand_moves(o, &mut moved)),
                 Terminator::Panic(parts) => parts_moves(parts, &mut moved),
-                Terminator::Goto(_) | Terminator::Return | Terminator::Unreachable => {}
+                Terminator::Goto(_) | Terminator::Return | Terminator::Unreachable | Terminator::MatchExhausted => {}
             }
         }
         for pl in moved {
@@ -3820,6 +3832,13 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "  lust_unw_resume(&ex);\n  {}", self.unwind_return());
             }
             Terminator::Unreachable => self.out.push_str("  abort();\n"),
+            // An exhaustive match's otherwise edge: as rustc, release C lets the C compiler
+            // assume it never runs, so a tag test that only guarded it folds away. Dev C and
+            // any build with debug assertions or overflow checks abort, as `Unreachable` does.
+            Terminator::MatchExhausted if self.unw != Some(Unw::Abort) && assume_unreachable(self.p) => {
+                self.out.push_str("  __builtin_unreachable();\n")
+            }
+            Terminator::MatchExhausted => self.term(&Terminator::Unreachable, span, next_block),
             Terminator::Panic(parts)
                 if self.p.unwind
                     && self.p.unwind_tables

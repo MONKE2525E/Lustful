@@ -65,6 +65,7 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         record_reads: _,
         unwind: _,
         overflow_checks: _,
+        debug_assertions: _,
         unwind_tables: _,
         regions: _,
         fp_memo: _,

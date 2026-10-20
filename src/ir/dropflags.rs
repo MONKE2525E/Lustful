@@ -241,7 +241,7 @@ pub fn analyze(body: &Body, flagged: &[bool], fine: bool) -> DropFlags {
                 }
                 outs.push((next.0 as usize, s));
             }
-            Terminator::Panic(_) | Terminator::Return | Terminator::Unreachable => {}
+            Terminator::Panic(_) | Terminator::Return | Terminator::Unreachable | Terminator::MatchExhausted => {}
         }
         for (t, st) in outs {
             let grew = match &mut entry[t] {
@@ -424,7 +424,7 @@ fn liveness(
                     }
                 }
             }
-            Terminator::Panic(_) | Terminator::Return | Terminator::Unreachable => {}
+            Terminator::Panic(_) | Terminator::Return | Terminator::Unreachable | Terminator::MatchExhausted => {}
         }
         if !matches!(block.term, Terminator::Call { .. })
             && let Some(c) = edge(nst)

@@ -644,11 +644,13 @@ impl FnGen<'_, '_> {
                 }
                 _ => ll.body.push_str("  ret void\n"),
             },
-            Terminator::Unreachable if cleanup && self.p.unwind => {
+            Terminator::Unreachable | Terminator::MatchExhausted if cleanup && self.p.unwind => {
                 ll.conts += 1;
                 let _ = writeln!(ll.body, "  %v{0} = load {{ ptr, i32 }}, ptr %exn\n  resume {{ ptr, i32 }} %v{0}", ll.conts);
             }
-            Terminator::Unreachable => {
+            // An exhaustive match's otherwise edge (see `assume_unreachable`).
+            Terminator::MatchExhausted if super::assume_unreachable(self.p) => ll.body.push_str("  unreachable\n"),
+            Terminator::Unreachable | Terminator::MatchExhausted => {
                 ll.decls.insert("declare void @abort() noreturn nounwind".into());
                 ll.body.push_str("  call void @abort()\n  unreachable\n");
             }
@@ -1987,7 +1989,7 @@ impl FnGen<'_, '_> {
                     }
                     join(&mut entry, &mut work, *other, &st);
                 }
-                Terminator::Return | Terminator::Unreachable | Terminator::Panic(_) => {}
+                Terminator::Return | Terminator::Unreachable | Terminator::MatchExhausted | Terminator::Panic(_) => {}
             }
         }
         at_term

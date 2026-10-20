@@ -428,6 +428,7 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
             }
             Terminator::Return => 4u8.hash(&mut h),
             Terminator::Unreachable => 5u8.hash(&mut h),
+            Terminator::MatchExhausted => 7u8.hash(&mut h),
             Terminator::Panic(parts) => {
                 6u8.hash(&mut h);
                 hash_fmt(&mut h, p, &body.tys, parts, &mut seen);
@@ -600,6 +601,7 @@ enum CachedTerm {
     Call { target: CachedTarget, args: Vec<CachedOperand>, dest: Place, next: Bb, unwind: Option<Bb> },
     Return,
     Unreachable,
+    MatchExhausted,
     Panic(Vec<CachedFmt>),
 }
 
@@ -966,6 +968,7 @@ pub(crate) fn cache_body(p: &Program, body: &Body, file_hash: u64, slot: u32, us
                 },
                 Terminator::Return => CachedTerm::Return,
                 Terminator::Unreachable => CachedTerm::Unreachable,
+                Terminator::MatchExhausted => CachedTerm::MatchExhausted,
                 Terminator::Panic(parts) => CachedTerm::Panic(cache_fmt(&mut b, p, parts)),
             },
             term_span: blk.term_span,
@@ -1157,6 +1160,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
             },
             CachedTerm::Return => Terminator::Return,
             CachedTerm::Unreachable => Terminator::Unreachable,
+            CachedTerm::MatchExhausted => Terminator::MatchExhausted,
             CachedTerm::Panic(parts) => Terminator::Panic(fmt(&mut intern, &mut tys, &strings, parts)?),
         };
         blocks.push(BlockData { stmts, term, term_span: blk.term_span });
