@@ -73,6 +73,14 @@ pub fn unit_bytes() -> usize {
     std::env::var("LUST_RELEASE_UNIT_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(128) * 1024
 }
 
+/// The target size of a release C glue shard in bytes of glue definitions
+/// (`LUST_RELEASE_SHARD_KB`, default 64). A shard declares the types of all its glue, so a
+/// merge that edits a central type recompiles many shards, and the slowest one bounded the cc
+/// step of a small merge. On tsgo's replay 64 KB beat 128, 32 and 16 KB.
+pub fn shard_bytes() -> usize {
+    std::env::var("LUST_RELEASE_SHARD_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64) * 1024
+}
+
 pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32]) -> Vec<(String, Vec<usize>)> {
     let live: Vec<usize> = (0..out.len()).filter(|&s| !out[s].code.is_empty()).collect();
     // A fn's size: its C; with the LLVM backend its statement count (`FnOut::ll_cost`) at

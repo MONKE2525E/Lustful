@@ -4877,7 +4877,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let stream = stream_start.and_then(|h| h.join().ok()).flatten();
     // Release C glue shards come after the fn units (`link_fn_units` counts both).
     let mut rshards: Vec<String> = match &rgroups {
-        Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, &caches.out, super::release_c::unit_bytes())),
+        Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, &caches.out, super::release_c::shard_bytes())),
         None => Vec::new(),
     };
     let n_shards = rshards.len();
