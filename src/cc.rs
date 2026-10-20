@@ -68,6 +68,36 @@ fn is_zig(prog: &str) -> bool {
     Path::new(prog).file_stem().is_some_and(|s| s == "zig")
 }
 
+/// The clang flags that give zig cc's code for a zig target when zig's clang runs directly
+/// (`unit_words`): the triple, no libc headers, and what zig cc adds (static relocation,
+/// NDEBUG, sync unwind tables, the CPU's tuning), from zig 0.15's `ZIG_VERBOSE_CC=1` child
+/// command. `direct_clang_gives_zig_cc_code` checks the code. Other targets keep zig cc.
+fn direct_flags(zig_target: &str) -> Option<&'static [&'static str]> {
+    match zig_target {
+        "x86_64-linux-musl" => Some(&["--target=x86_64-linux-musl", "-nostdinc", "-fno-pic", "-fno-pie", "-DNDEBUG", "-funwind-tables", "-mtune=x86-64"]),
+        _ => None,
+    }
+}
+
+/// The command words that compile a C unit: `spec.cmd`, or for a release build through zig
+/// cc to a target `direct_flags` lists, zig's clang run directly. zig cc runs three processes
+/// a compile (itself, with its object cache and a thread pool; a clang child; an `ld.lld -r`
+/// child that relinks the one object): 10-20% of the CPU of a warm merge's missed units
+/// (tsgo replay m9, m11). The direct clang is one process with the same code. A unit that
+/// includes a system header keeps zig cc, which supplies libc's; LUST_CC's words after the
+/// target carry over.
+fn unit_words(spec: &CcSpec, debug: bool, sys_headers: bool) -> std::borrow::Cow<'_, [String]> {
+    let cmd = &spec.cmd;
+    let direct = match cmd.as_slice() {
+        [zig, cc, t, zt, ..] if !debug && !sys_headers && is_zig(zig) && cc == "cc" && t == "-target" => direct_flags(zt),
+        _ => None,
+    };
+    match direct {
+        Some(flags) => [cmd[0].clone(), "clang".into()].into_iter().chain(flags.iter().map(|f| f.to_string())).chain(cmd[4..].iter().cloned()).collect(),
+        None => cmd.as_slice().into(),
+    }
+}
+
 /// The C++ driver that goes with a C compiler command: `zig cc` -> `zig c++`,
 /// `clang[-N]` -> `clang++[-N]`, `[prefix-]gcc[-N]` -> `[prefix-]g++[-N]`, `cc` ->
 /// `c++`; other names stay (they must take C++ themselves). `LUST_CXX` (words)
@@ -265,9 +295,10 @@ fn resolve_bin(prog: &str) -> PathBuf {
 /// unit, the C++ unit) keys on its preprocessed text instead, so a header or
 /// sysroot change moves its key; the other units include nothing.
 pub fn unit_key(c_text: &str, pre: Option<&[u8]>, spec: &CcSpec, debug: bool, profile: Option<&str>, cxx: bool) -> String {
-    let (words, flags) = if cxx { (&spec.cxx, cxxflags(debug)) } else { (&spec.cmd, cflags(debug)) };
-    let id = compiler_id(words);
-    let own = pre.is_none().then(|| c_text.contains("#include <").then(|| preprocessed(c_text, words, &flags, cxx)).flatten()).flatten();
+    let sys_headers = pre.is_some() || c_text.contains("#include <");
+    let (words, flags) = if cxx { (spec.cxx.as_slice().into(), cxxflags(debug)) } else { (unit_words(spec, debug, sys_headers), cflags(debug)) };
+    let id = compiler_id(&words);
+    let own = pre.is_none().then(|| sys_headers.then(|| preprocessed(c_text, &words, &flags, cxx)).flatten()).flatten();
     let text = pre.or(own.as_deref()).unwrap_or(c_text.as_bytes());
     let (a, b) = crate::driver::cache::hash128(
         &[b"cc-v2", spec.triple.as_bytes(), id.as_bytes(), flags.as_bytes(), &[debug as u8, cxx as u8], profile.unwrap_or("").as_bytes(), text],
@@ -936,7 +967,11 @@ pub fn build_with(
                     }
                     continue;
                 }
-                let (words, unit_flags) = if cxx { (&spec.cxx, &cxx_flags) } else { (&spec.cmd, &flags) };
+                let (words, unit_flags) = if cxx {
+                    (spec.cxx.as_slice().into(), &cxx_flags)
+                } else {
+                    (unit_words(spec, debug, pre_of(i).is_some() || c.contains("#include <")), &flags)
+                };
                 let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
                     Some(Ok(pf)) => Some((pf, pgo_dir.as_deref().unwrap_or(work))),
                     Some(Err(e)) => {
@@ -945,7 +980,7 @@ pub fn build_with(
                     }
                     None => None,
                 };
-                let mut cmd = unit_command(words, unit_flags, obj, keys[i].as_deref(), pf, &src);
+                let mut cmd = unit_command(&words, unit_flags, obj, keys[i].as_deref(), pf, &src);
                 match cmd.output() {
                     Ok(o) if o.status.success() => {
                         if let Err(e) = pgo_of(i).map_or(Ok(()), |m| m.after_compile(obj)) {
@@ -1160,6 +1195,59 @@ mod tests {
         assert_eq!(super::zig_target("x86_64-pc-windows-msvc"), Some("x86_64-windows-gnu"));
         assert_eq!(super::zig_target("aarch64-apple-darwin"), Some("aarch64-macos"));
         assert_eq!(super::zig_target("riscv64gc-unknown-linux-gnu"), None);
+    }
+
+    fn zig_spec(target: &str) -> super::CcSpec {
+        let cmd: Vec<String> = ["zig", "cc", "-target", target].into_iter().map(str::to_string).collect();
+        super::CcSpec { triple: String::new(), cxx: super::cxx_for(&cmd), cmd, statik: true, exe_suffix: "" }
+    }
+
+    #[test]
+    fn unit_words_run_zig_clang_only_for_a_listed_target_in_a_release_build() {
+        let spec = zig_spec("x86_64-linux-musl");
+        let direct = super::unit_words(&spec, false, false);
+        assert_eq!(direct[..3], ["zig", "clang", "--target=x86_64-linux-musl"].map(String::from));
+        assert_eq!(super::unit_words(&spec, true, false)[..], spec.cmd[..], "a debug build keeps zig cc");
+        assert_eq!(super::unit_words(&spec, false, true)[..], spec.cmd[..], "a unit with system headers keeps zig cc");
+        let arm = zig_spec("aarch64-linux-musl");
+        assert_eq!(super::unit_words(&arm, false, false)[..], arm.cmd[..], "an unlisted target keeps zig cc");
+        let mut extra = zig_spec("x86_64-linux-musl");
+        extra.cmd.extend(["-mllvm".to_string(), "-x".to_string()]);
+        assert_eq!(super::unit_words(&extra, false, false)[direct.len()..], ["-mllvm", "-x"].map(String::from), "LUST_CC's extra words carry over");
+    }
+
+    /// The direct clang gives zig cc's code: the same assembly for C that shows each flag
+    /// (the CPU's tuning in a loop and a switch, unwind tables in a leaf, a global, a cleanup).
+    #[test]
+    fn direct_clang_gives_zig_cc_code() {
+        if !super::on_path("zig") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lust-direct-cc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("u.c");
+        std::fs::write(
+            &src,
+            "typedef unsigned long u64;\nstruct P { u64 a, b, c; };\nextern void g(struct P *);\nextern void drop(void *);\nextern int counter;\n\
+             static const char *names[] = { \"one\", \"two\", \"three\" };\n\
+             u64 f(struct P *p, u64 n, double x) {\n  struct P q __attribute__((cleanup(drop))) = *p;\n  u64 s = 0;\n\
+               for (u64 i = 0; i < n; i++) s += p->a * i + (u64)(x * i);\n\
+               switch (n & 3) { case 0: s ^= 7; break; case 1: s += names[1][0]; break; case 2: g(&q); break; default: s -= 1; }\n\
+               g(&q);\n  return s + q.b;\n}\nint leaf(int x) { counter++; return x * 3; }\n",
+        )
+        .unwrap();
+        let spec = zig_spec("x86_64-linux-musl");
+        let asm = |words: &[String], out: &str| {
+            let out = dir.join(out);
+            let st = std::process::Command::new(&words[0]).args(&words[1..]).args(super::cflags(false).split_whitespace()).arg("-S").arg(&src).arg("-o").arg(&out).status().unwrap();
+            assert!(st.success(), "{} failed", words.join(" "));
+            std::fs::read_to_string(out).unwrap()
+        };
+        let direct = super::unit_words(&spec, false, false);
+        assert_ne!(direct[..], spec.cmd[..]);
+        assert_eq!(asm(&direct, "direct.s"), asm(&spec.cmd, "zig-cc.s"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

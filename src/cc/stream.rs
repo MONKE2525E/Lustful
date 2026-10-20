@@ -231,12 +231,14 @@ impl Inner {
         let err =
             std::fs::File::create(self.err_file(name)).map_err(|e| format!("cannot write {}: {e}\n", self.err_file(name).display()))?;
         let dir = src.parent().map(PathBuf::from).unwrap_or_default();
-        super::unit_command(&self.spec.cmd, &self.flags, &obj, Some(&u.key), u.pgo.clone().map(|f| (f, dir.as_path())), &src)
+        // A streamed unit includes no system header (`add` keeps those for `build`).
+        let words = super::unit_words(&self.spec, self.debug, false);
+        super::unit_command(&words, &self.flags, &obj, Some(&u.key), u.pgo.clone().map(|f| (f, dir.as_path())), &src)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(err)
             .spawn()
-            .map_err(|e| format!("cannot run {}: {e}\n", self.spec.cmd.join(" ")))
+            .map_err(|e| format!("cannot run {}: {e}\n", words.join(" ")))
     }
 
     /// Reaps finished children and starts waiting units, largest first: up to `early`
