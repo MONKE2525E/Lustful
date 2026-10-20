@@ -93,7 +93,10 @@ fn group_fns(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &
     // 200 bytes each, which no lowering, fact or ABI choice moves, so every such variant
     // gets the same units (and about as many as C).
     let llvm = live.iter().any(|&s| !out[s].ll.is_empty());
-    let size = |s: usize| if llvm { out[s].ll_cost as usize * 200 } else { out[s].code.len() };
+    // A C fn's named constants count too: their definitions travel in its externs (cgen's
+    // kdata), where its literals were part of its code before.
+    let kdata = |s: usize| out[s].externs.iter().filter(|e| e.starts_with('#')).map(|e| e.len()).sum::<usize>();
+    let size = |s: usize| if llvm { out[s].ll_cost as usize * 200 } else { out[s].code.len() + kdata(s) };
     let target = target.max(1) as u64;
     let id = |s: usize| names.fns.get(s).and_then(|x| x.clone()).unwrap_or_else(|| format!("dead{s}"));
     let mut by_file: std::collections::BTreeMap<&str, Vec<(u32, String, usize)>> = Default::default();
@@ -226,6 +229,19 @@ mod tests {
         let new = after.iter().filter(|u| !before.contains(u)).count();
         assert_eq!(lost, 1, "only the unit the fn joins changes");
         assert!(new <= 2, "it comes back as one unit, or two when the new fn makes a cut: {new}");
+    }
+
+    /// A fn's named constants count in its cut size as its code does (cgen's kdata moves its
+    /// literals from its code into guarded definitions among its externs), so moving bytes
+    /// from the one to the other moves no cut.
+    #[test]
+    fn named_data_counts_in_the_cut_size() {
+        let (out, names, file, line) = program(400, 4096);
+        let before = unit_ids(&out, &names, &file, &line);
+        let def: std::sync::Arc<str> = format!("#{}", "d".repeat(999)).into();
+        let moved: Vec<FnOut> =
+            (0..400).map(|_| FnOut { code: "x".repeat(3096), externs: [def.clone()].into_iter().collect(), ..Default::default() }).collect();
+        assert_eq!(unit_ids(&moved, &names, &file, &line), before);
     }
 
     /// With a cap, a unit over it splits at cuts that follow from its fns' own ids and sizes:
