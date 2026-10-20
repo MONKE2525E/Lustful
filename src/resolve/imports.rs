@@ -52,6 +52,15 @@ impl GlobSrc {
         self.0.get_mut(k.0.0 as usize)?.remove(&(k.1, k.2))
     }
 
+    /// Room for `n` more entries of module `m`.
+    pub fn reserve(&mut self, m: ModuleId, n: usize) {
+        let m = m.0 as usize;
+        if self.0.len() <= m {
+            self.0.resize_with(m + 1, FxMap::default);
+        }
+        self.0[m].reserve(n);
+    }
+
     /// Every entry, module by module.
     pub fn iter(&self) -> impl Iterator<Item = ((ModuleId, u8, Sym), ModuleId)> + '_ {
         self.0.iter().enumerate().flat_map(|(m, map)| map.iter().map(move |(&(ns, name), &src)| ((ModuleId(m as u32), ns, name), src)))
@@ -2537,6 +2546,20 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
                 BindState::One(_) => {}
             }
         }
+    }
+    // A full copy brings a source's whole namespace at once (a prelude: thousands of names):
+    // the importer's maps get room for the names they lack in one step, where growing by
+    // doubling rehashed them again and again (a quarter of the copy's time on tsgo).
+    if only.is_none() {
+        let mut new = [0usize; 3];
+        for (ns, name, _) in &entries {
+            let i = ns_index(*ns);
+            new[i] += usize::from(!tables.maps[imp.module.0 as usize][i].contains_key(name));
+        }
+        for (i, &n) in new.iter().enumerate() {
+            tables.maps[imp.module.0 as usize][i].reserve(n);
+        }
+        tables.glob_src.reserve(imp.module, new.iter().sum());
     }
     for (ns, name, bind) in entries {
         if tables.insert_glob(imp.module, ns, name, bind, src) == InsertOut::Changed {
