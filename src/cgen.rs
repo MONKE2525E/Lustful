@@ -13408,6 +13408,50 @@ mod tests {
         });
     }
 
+    /// Release C glue shards, one key each: the shard of a struct's drop glue holds the
+    /// small glue it calls from other shards (an `Option<Rc<dyn Fn>>` field's drop) as an
+    /// inline definition, and every declaration of it there says `inline`.
+    #[test]
+    fn glue_shard_inlines_small_glue_from_other_shards() {
+        let src = "use std::rc::Rc;\ntrait Hook { fn run(&self) -> u32; }\nstruct One;\nimpl Hook for One { fn run(&self) -> u32 { 1 } }\n\
+                   struct Hooks { a: Option<Rc<dyn Hook>>, b: Option<Rc<dyn Hook>>, n: u32 }\n\
+                   fn main() { let r: Rc<dyn Hook> = Rc::new(One); let h = Hooks { a: Some(r), b: None, n: 2 }; println!(\"{}\", h.n); }\n";
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let mut program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        (program.unwind, program.unwind_tables) = (true, true);
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let n = program.fns.len();
+        let slots: Vec<u32> = (0..n as u32).collect();
+        let names = std::sync::Arc::new(names::Names {
+            fns: (0..n).map(|s| Some(format!("{s:016x}"))).collect(),
+            adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
+            by_id: Default::default(),
+        });
+        let hooks = program.type_names[&interner.intern("Hooks")];
+        names::with(Some(&names), || {
+            let outs: Vec<FnOut> = (0..n)
+                .map(|i| {
+                    let (ck, errs) = check_fn(&program, LocalDefId(i as u32));
+                    assert!(errs.is_empty(), "{errs:?}");
+                    gen_fn(&program, &crate::lower::lower(&program, LocalDefId(i as u32), ck), &map, 1, &slots)
+                })
+                .collect();
+            let mut glue = GlueSet::default();
+            glue.add(&program, &slots, outs.iter().flat_map(|o| o.glue.iter()));
+            let shards = names::glue_shards(&program, &glue, &outs, 1);
+            let drop_hooks = format!("void drop_{}_(", ctype(&CTy::Adt(hooks)));
+            let shard = shards.iter().find(|s| s.lines().any(|l| l.starts_with(&drop_hooks) && l.ends_with('{'))).expect("a shard defines the struct's drop glue");
+            assert!(shard.contains("inline void drop_O_Rcdyn_(O_O_Rcdyn_ *p) {"), "the field's drop is inline there:\n{shard}");
+            assert!(shard.lines().all(|l| !l.starts_with("void drop_O_Rcdyn_(")), "no declaration of it without inline:\n{shard}");
+            assert_eq!(shards.iter().filter(|s| s.lines().any(|l| l.starts_with("void drop_O_Rcdyn_(O_O_Rcdyn_ *p) {"))).count(), 1, "one external definition");
+        });
+    }
+
     /// Release C statics in parts, one static a part (a 1-byte target): a merge that changes one
     /// static's value changes its part and nothing else (the index keeps every registration),
     /// though the statics share pointees across parts (one "hello", one trampoline), and every

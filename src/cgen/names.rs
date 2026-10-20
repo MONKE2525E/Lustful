@@ -181,12 +181,45 @@ pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> S
     c
 }
 
+/// The glue in other shards that a shard's `keys` call, as inline definitions in the shard:
+/// small plain glue (`INLINE_BYTES`, no statics, attributes or macros, as `fn_unit_parts`
+/// picks for fn units), level by level in prototype order within `inline_glue_budget`.
+/// A struct's drop glue then inlines its fields' drops (an `Option<Rc<dyn>>`'s test), and
+/// a hash table's equality glue its key's `eq`, instead of calling across shards.
+fn shard_inline_glue<'g>(g: &'g GlueSet, keys: &[&'g (Glue, CTy)]) -> Vec<&'g (Glue, CTy)> {
+    if !inline_on() {
+        return Vec::new();
+    }
+    let plain = |k: &(Glue, CTy)| {
+        g.def_map.get(k).is_some_and(|d| d.len() <= INLINE_BYTES && !d.contains("static ") && !d.contains("__attribute__") && !d.contains("#define"))
+    };
+    let mut seen: HashSet<&(Glue, CTy)> = keys.iter().copied().collect();
+    let mut out = Vec::new();
+    let mut budget = inline_glue_budget();
+    let mut level: Vec<&(Glue, CTy)> = keys.to_vec();
+    while !level.is_empty() {
+        let mut next: Vec<&(Glue, CTy)> = level.iter().flat_map(|k| g.deps.get(*k).into_iter().flatten()).filter(|d| seen.insert(*d)).collect();
+        next.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
+        next.retain(|d| {
+            let n = g.def_map.get(*d).map_or(usize::MAX, |s| s.len());
+            plain(d) && n <= budget && {
+                budget -= n;
+                true
+            }
+        });
+        out.extend(next.iter().copied());
+        level = next;
+    }
+    out
+}
+
 /// Release C glue: every glue definition lives in exactly one shard, and fn units hold
 /// only prototypes (`GlueSet::shared` holds every key). Shards are content-defined
 /// chunks of the keys in prototype order, cut by each key's prototype and definition size
 /// (`cut_after`), so new glue changes only the shard it lands in. Each shard declares the
 /// types (`Decls::OneStep`, with blocks), prototypes (its keys' and their callees') and
-/// externs its definitions need. Only the keys the fns in `out` reach (a dead slot's `FnOut`
+/// externs its definitions need, and holds inline definitions of the small glue its keys
+/// call from other shards (`shard_inline_glue`). Only the keys the fns in `out` reach (a dead slot's `FnOut`
 /// is empty), as a cold build has them: a session's set also keeps keys no fn reaches now
 /// (stale since a refresh, or left by a removed fn).
 pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Vec<String> {
@@ -226,7 +259,8 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
             let mut types = HashSet::new();
             let mut protos: BTreeSet<&str> = BTreeSet::new();
             let mut externs: BTreeSet<&str> = BTreeSet::new();
-            for k in keys {
+            let inl = shard_inline_glue(g, keys);
+            for k in keys.iter().chain(&inl) {
                 g.def_types(k, &mut types);
                 protos.insert(&g.protos[*k]);
                 for d in g.deps.get(*k).into_iter().flatten() {
@@ -235,9 +269,22 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
                 }
                 externs.extend(g.externs.get(*k).into_iter().flatten().map(String::as_str));
             }
+            // Every declaration of an inline definition says `inline` (C99: one that does
+            // not makes it a second external definition).
+            for k in &inl {
+                protos.remove(g.protos[*k].as_str());
+            }
             type_decls_with(p, &mut c, &types, &HashSet::new(), Decls::OneStep { blocks: super::blocks_on() }, &HashSet::new());
             externs.into_iter().for_each(|e| c.push_str(e));
             protos.into_iter().for_each(|x| c.push_str(x));
+            for k in &inl {
+                c.push_str("inline ");
+                c.push_str(&g.protos[*k]);
+            }
+            for k in &inl {
+                c.push_str("inline ");
+                c.push_str(&g.def_map[*k]);
+            }
             for k in keys {
                 c.push_str(&g.def_map[*k]);
             }
