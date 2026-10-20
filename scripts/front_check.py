@@ -28,6 +28,8 @@
 # step (an instrumented one-shot build, run once) and needs zig plus a clang and llvm-profdata
 # of zig's LLVM major (LUST_PGO_CC, LUST_PROFDATA, or clang-<N> and llvm-profdata-<N> on PATH);
 # without them it is skipped and says so.
+# lang-hasher-edit: a written `Hasher` impl gains and loses a method while generic bodies over a
+# struct that holds a map with that hasher are kept (fx-coldmono's LangImpls finding, 2026-10-19).
 # Three dt01 sequences take the shapes of CI jobs (rel-cache's merge 12 replay, 2026-10-18): image
 # builds that emit no C before the compared build, a jump over versions no build saw, and builds
 # that each start again from an older state (a CI disk whose commits did not land).
@@ -515,6 +517,54 @@ impl<T> M<T> {
 """
 
 
+def lang_hasher(write_u32):
+    """A written `Hasher` impl gains and loses a method while generic bodies (`Option`'s
+    methods over a struct that holds a map with that hasher) are kept: the hasher's impl
+    reaches them through the struct's layout fingerprint (fx-coldmono 10:39, the `LangImpls`
+    reads of tsgo's hashers). The map's order follows the hasher."""
+    extra = """
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (n % 7) as u64;
+    }""" if write_u32 else ""
+    return f"""use std::collections::HashMap;
+use std::hash::{{BuildHasherDefault, Hasher}};
+
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {{
+    fn finish(&self) -> u64 {{
+        self.0
+    }}
+    fn write(&mut self, b: &[u8]) {{
+        for &x in b {{
+            self.0 = self.0.wrapping_mul(31).wrapping_add(x as u64);
+        }}
+    }}{extra}
+}}
+
+struct Table {{
+    m: HashMap<u32, u32, BuildHasherDefault<KeyHasher>>,
+    n: u32,
+}}
+
+#[inline(never)]
+fn keys(t: &Table) -> Vec<u32> {{
+    t.m.keys().copied().collect()
+}}
+
+fn main() {{
+    let mut t = Table {{ m: HashMap::default(), n: 2 }};
+    for i in 0..12u32 {{
+        t.m.insert(i * 5, i);
+    }}
+    let o = Some(t);
+    let n = o.as_ref().map(|t| t.m.len() as u32 + t.n).unwrap_or(0);
+    println!("{{}} {{}} {{:?}}", o.is_some(), n, o.as_ref().map(keys));
+}}
+"""
+
+
 def corpus():
     """(name, [sources]) of every sequence."""
     seqs = [
@@ -551,6 +601,7 @@ def corpus():
                     "    A.with(|a| a.set(a.get() + 5));\n    AA.with(|a| a.set(a.get() * 3));\n    println!(\"{} {}\", A.with(|a| a.get()), AA.with(|a| a.get()));"),
         ]),
     ]
+    seqs.append(("lang-hasher-edit", [lang_hasher(False), lang_hasher(True), lang_hasher(False)]))
     seqs.append(("lifetime-variant-order", [lifetime_variants(False), lifetime_variants(True), lifetime_variants(False)]))
     seqs.append(("llvm-helper-only-edit", [helper_edit("v1", 1), helper_edit("v2-label", 1), helper_edit("v2-label", 3)]))
     seqs.append(("remove-impl-pgo", [shapes(True), shapes(False), shapes(True)], {"pgo": True}))

@@ -1238,9 +1238,13 @@ fn hash_adt_layout(h: &mut FxHasher, p: &Program, def: DefId, by_value: bool, r:
     p.gx.dyn_keys.get(&a).map(|k| (k.eq, k.hash, k.borrow)).hash(h);
     // The written `Hasher` and `BuildHasher` impls the hash glue calls
     // into: which methods they write, and the `Hasher` type (W-STD-B).
+    // Read with no note (`peek`), as fingerprints read: this runs while a
+    // body's read scope is open, and a note charged that body a
+    // `LangImpls` read of every hasher the scan skips, or of none when the
+    // fingerprint memo held this layout already.
     for tr in [p.gx.lang.hasher, p.gx.lang.build_hasher] {
         for &id in p.gx.index.impls_of_trait(tr) {
-            let rec = p.gx.index.get(id);
+            let rec = p.gx.index.peek(id);
             if rec.synthetic != crate::traits::index::Synthetic::None || rec.head != crate::traits::index::SelfHead::Adt(def) {
                 continue;
             }
@@ -3521,6 +3525,40 @@ fn main() {
     println!(\"{}\", y);
 }
 ";
+
+    /// A layout fingerprint notes no impl read into the read scope open
+    /// while it runs (a body's check): it hashes the type's own written
+    /// `Hasher` impl itself. Its scan of every `Hasher` impl once noted a
+    /// `LangImpls` read of each, so a body checked with the fingerprint memo
+    /// cold read every hasher of the program, and the same body checked
+    /// with it warm read none (fx-coldmono, 2026-10-19 10:39).
+    #[test]
+    fn a_layout_fingerprint_notes_no_impl_read() {
+        let src = "\
+struct H1(u64);
+impl std::hash::Hasher for H1 {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, b: &[u8]) { self.0 += b.len() as u64; }
+}
+struct H2(u64);
+impl std::hash::Hasher for H2 {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, b: &[u8]) { self.0 ^= b.len() as u64; }
+}
+struct Foo { x: i64 }
+fn main() {
+    let f = Foo { x: 1 };
+    println!(\"{}\", f.x + H1(2).0 as i64 + H2(3).0 as i64);
+}
+";
+        with_program(src, |interner, p| {
+            let def = |name: &str| (0..p.adts.len()).find(|&i| interner.get(p.adts[i].name) == name).map(|i| p.def_of_adt(crate::ty::AdtId(i as u32))).unwrap();
+            for name in ["Foo", "H1"] {
+                let ((), noted) = crate::check::derive_delta::scoped(true, || hash_adt_layout(&mut FxHasher::default(), p, def(name), true, &mut |_, _| {}));
+                assert!(noted.is_empty(), "{name}: {noted:?}");
+            }
+        });
+    }
 
     /// A primitive builtin method's item type (`ty::prim_fn_def`) holds the method name's
     /// symbol as a const. A symbol's number is its place in its interner shard, so two
