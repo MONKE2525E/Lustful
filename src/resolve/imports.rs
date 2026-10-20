@@ -61,6 +61,11 @@ impl GlobSrc {
         self.0[m].reserve(n);
     }
 
+    /// True when module `m` has no entry.
+    pub fn none_in(&self, m: ModuleId) -> bool {
+        self.0.get(m.0 as usize).is_none_or(FxMap::is_empty)
+    }
+
     /// Every entry, module by module.
     pub fn iter(&self) -> impl Iterator<Item = ((ModuleId, u8, Sym), ModuleId)> + '_ {
         self.0.iter().enumerate().flat_map(|(m, map)| map.iter().map(move |(&(ns, name), &src)| ((ModuleId(m as u32), ns, name), src)))
@@ -2503,14 +2508,13 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     Ok(diags)
 }
 
-/// The bindings of module `src` in one namespace, all or those `only`
-/// names, borrowed (`copy_glob` copies only the ones it takes).
-fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only: Option<&[Sym]>) -> Vec<(Sym, &'t BindState)> {
+/// The (name, binding) pairs of module `src`'s namespace `ns`, in its map's order, or
+/// `only`'s names in their order when given (`copy_glob`).
+fn glob_names<'t>(tables: &'t ResolvedTables, src: ModuleId, ns: Namespace, only: Option<&'t [Sym]>) -> impl Iterator<Item = (Sym, &'t BindState)> + 't {
     let map = &tables.maps[src.0 as usize][ns_index(ns)];
-    match only {
-        None => map.iter().map(|(n, b)| (*n, b)).collect(),
-        Some(o) => o.iter().filter_map(|n| map.get(n).map(|b| (*n, b))).collect(),
-    }
+    let all = only.is_none().then(|| map.iter().map(|(n, b)| (*n, b)));
+    let some = only.map(|o| o.iter().filter_map(move |n| map.get(n).map(|b| (*n, b))));
+    all.into_iter().flatten().chain(some.into_iter().flatten())
 }
 
 /// Copies the names of module `src` that importer `imp.module` can
@@ -2561,8 +2565,25 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
         }
         tables.glob_src.reserve(imp.module, new.iter().sum());
     }
+    // The importer's first glob copy (most of the millions of names copied on tsgo): with no
+    // glob source and no std alias in the module yet (each std glob alias is a std alias too),
+    // a name it does not hold takes the copy as `insert_glob` would, in one table probe.
+    let m = imp.module;
+    let first = tables.glob_src.none_in(m) && tables.std_aliases.range((m, 0, Sym(0))..=(m, u8::MAX, Sym(u32::MAX))).next().is_none();
     for (ns, name, bind) in entries {
-        if tables.insert_glob(imp.module, ns, name, bind, src) == InsertOut::Changed {
+        let took = first
+            && match tables.maps[m.0 as usize][ns_index(ns)].entry(name) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(BindState::One(bind.clone()));
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            };
+        if took {
+            tables.touch(m, name);
+            tables.glob_src.insert((m, ns_index(ns) as u8, name), src);
+            changed = true;
+        } else if tables.insert_glob(m, ns, name, bind, src) == InsertOut::Changed {
             changed = true;
         }
     }
@@ -2582,7 +2603,7 @@ fn copy_glob(tables: &mut ResolvedTables, imp: &Import, src: ModuleId, only: Opt
         // A glob of the importer itself (only a std overlay's could be) wrote the source: its
         // ambiguous names are read again, after the copies.
         if src == imp.module {
-            names = glob_names(tables, src, ns, only).into_iter().filter_map(|(name, state)| matches!(state, BindState::Ambiguous).then_some(name)).collect();
+            names = glob_names(tables, src, ns, only).filter_map(|(name, state)| matches!(state, BindState::Ambiguous).then_some(name)).collect();
         }
         names.retain(|name| !tables.pending_single.contains_key(&(src, *name)) && tables.ambiguous_visible(src, ns, *name, imp.module, interner));
         for name in names {
