@@ -4905,16 +4905,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     asm_ms[0] = t_asm.elapsed().as_secs_f64() * 1e3;
     // The cc stream, started during codegen (above).
     let stream = stream_start.and_then(|h| h.join().ok()).flatten();
-    // Release C glue shards come after the fn units (`link_fn_units` counts both).
-    let mut rshards: Vec<String> = match &rgroups {
-        Some(_) => cgen::names::with(rn, || cgen::names::glue_shards(&program, &caches.glue, &caches.out, super::release_c::shard_bytes())),
+    // Release C glue shards come after the fn units (`link_fn_units` counts both). Their cut is
+    // made here, their texts beside the statics unit (below).
+    let shard_keys = match &rgroups {
+        Some(_) => cgen::names::with(rn, || cgen::names::glue_shard_keys(&caches.glue, &caches.out, super::release_c::shard_bytes())),
         None => Vec::new(),
     };
-    let n_shards = rshards.len();
-    if let (Some(s), Some(rg)) = (&stream, &rgroups) {
-        let first = FIRST_FN_UNIT + rg.len();
-        par_map(&(0..n_shards).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first + j), &rshards[j]));
-    }
+    let n_shards = shard_keys.len();
+    let mut rshards: Vec<String> = Vec::new();
     asm_ms[1] = t_asm.elapsed().as_secs_f64() * 1e3;
     // B1 (below): the release C fn units cc takes with a fingerprint, by unit name, and whether
     // without text (a skipped assembly).
@@ -4945,14 +4943,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 Some(t) => t,
                 None => text,
             };
-            if let Some(a) = &adapters {
-                let new = par_map(&rshards, |t| a.adapt(t, |_| false));
-                for (t, n) in rshards.iter_mut().zip(new) {
-                    if let Some(n) = n {
-                        *t = n;
-                    }
-                }
-            }
             type B1Rec = (usize, Option<((u64, u64), Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
             // A unit's identity: its registration name, fns and main slot, the switches every
@@ -5074,12 +5064,27 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let hot = (llvm_on && copy_min > 0).then(|| crate::cc::pgo::hot_ids(&dir.join("cc"), copy_min).ok().flatten()).flatten();
             // The statics unit is one long job (~300 ms for tsgo). With C units only (no copy
             // sets, and no C refs read from its text) it assembles on a thread of its own, beside
-            // every other part of the assembly below, not before the fn units.
+            // the glue shards and every other part of the assembly below, not before the fn units.
             let late_statics = !llvm_on;
             let early: Vec<usize> = c_jobs.iter().copied().filter(|&u| !(late_statics && u == 1)).collect();
             let first: Vec<usize> = early.iter().copied().chain(0..rg.len()).collect();
             std::thread::scope(|sc| {
                 let statics = late_statics.then(|| sc.spawn(|| assemble(1, &[], None)));
+                // The glue shards, beside the statics unit: after them it was the critical path
+                // of a build with few changes.
+                rshards = cgen::names::with(rn, || cgen::names::glue_shard_texts(&program, &caches.glue, &shard_keys));
+                if let Some(a) = &adapters {
+                    let new = par_map(&rshards, |t| a.adapt(t, |_| false));
+                    for (t, n) in rshards.iter_mut().zip(new) {
+                        if let Some(n) = n {
+                            *t = n;
+                        }
+                    }
+                }
+                if let Some(s) = &stream {
+                    let first = FIRST_FN_UNIT + rg.len();
+                    par_map(&(0..n_shards).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first + j), &rshards[j]));
+                }
                 let mut made = Vec::with_capacity(jobs.len());
                 let mut inl: Vec<Vec<usize>> = Vec::with_capacity(rg.len());
                 for (k, r) in par_map(&(0..first.len()).collect::<Vec<_>>(), |&k| {
@@ -5362,7 +5367,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     let d: Vec<String> = (0..7).map(|i| format!("{:.0}", asm_ms[i] - if i > 0 { asm_ms[i - 1] } else { 0.0 })).collect();
                     let c: Vec<u64> = c_unit_ms.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) / 1000).collect();
                     eprintln!(
-                        "b1-observe asm parts ms: groups {}, glue shards {}, B1 before + C units + inline sets {} (main {}, statics {}, runtime {}, table {}, locations {}), C refs {}, fn units {}, B1 after {}, the rest {}",
+                        "b1-observe asm parts ms: groups {}, glue shard cut {}, B1 before + glue shards + C units + inline sets {} (main {}, statics {}, runtime {}, table {}, locations {}), C refs {}, fn units {}, B1 after {}, the rest {}",
                         d[0], d[1], d[2], c[0], c[1], c[2], c[3], c[4], d[3], d[4], d[5], d[6]
                     );
                 }

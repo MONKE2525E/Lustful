@@ -223,6 +223,12 @@ fn shard_inline_glue<'g>(g: &'g GlueSet, keys: &[&'g (Glue, CTy)]) -> Vec<&'g (G
 /// is empty), as a cold build has them: a session's set also keeps keys no fn reaches now
 /// (stale since a refresh, or left by a removed fn).
 pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Vec<String> {
+    glue_shard_texts(p, g, &glue_shard_keys(g, out, target))
+}
+
+/// The keys of each of `glue_shards`' shards, in order: the cut, cheap next to the texts
+/// (`glue_shard_texts`), so a caller knows how many shards there are before it makes them.
+pub fn glue_shard_keys<'a>(g: &'a GlueSet, out: &'a [FnOut], target: usize) -> Vec<Vec<&'a (Glue, CTy)>> {
     let live = g.closure(out.iter().flat_map(|o| o.glue.iter()));
     // Each key with a definition, with its prototype and definition size, looked up once: the
     // sort compares strings (tsgo: 23k keys, a lookup hashes a CTy tree).
@@ -245,12 +251,17 @@ pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Ve
     if !cur.is_empty() {
         shards.push(cur);
     }
+    shards
+}
+
+/// The texts of `glue_shards`' shards, from their keys (`glue_shard_keys`).
+pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>]) -> Vec<String> {
     // Each shard is its own unit: built in parallel (in order), each worker
     // under this thread's naming context, in one layout phase (the program is
     // frozen: a worker keeps its `c_layout` answers across its shards).
     let names = CUR.with(|c| c.borrow().clone());
     let tag = super::layout_phase();
-    crate::pool::par_map(&shards, |keys| {
+    crate::pool::par_map(shards, |keys| {
         super::in_layout_phase(tag, || with(names.as_ref(), || {
             let mut c = unit_header();
             if p.unwind_tables {
