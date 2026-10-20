@@ -42,6 +42,7 @@ impl FxHasher {
 }
 
 pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type FxSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Sym(pub u32);

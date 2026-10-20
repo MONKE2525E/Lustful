@@ -5000,7 +5000,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                             let (index, parts) = cgen::names::statics_parts(&program, &caches.glue, target);
                             let parts: Vec<String> = parts.into_iter().map(|t| adapt(t, &Default::default())).collect();
                             if let Some(s) = &stream {
-                                parts.iter().enumerate().for_each(|(j, t)| s.add(&format!("u{}", first_statics + j), t));
+                                par_map(&(0..parts.len()).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first_statics + j), &parts[j]));
                             }
                             *statics_out.lock().unwrap_or_else(|e| e.into_inner()) = parts;
                             (adapt(index, &Default::default()), String::new())

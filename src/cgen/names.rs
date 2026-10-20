@@ -178,13 +178,21 @@ pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> S
 /// (stale since a refresh, or left by a removed fn).
 pub fn glue_shards(p: &Program, g: &GlueSet, out: &[FnOut], target: usize) -> Vec<String> {
     let live = g.closure(out.iter().flat_map(|o| o.glue.iter()));
-    let mut keys: Vec<&(Glue, CTy)> = live.into_iter().filter(|k| g.def_map.contains_key(*k)).collect();
-    keys.sort_by(|a, b| g.protos[*a].cmp(&g.protos[*b]));
+    // Each key with a definition, with its prototype and definition size, looked up once: the
+    // sort compares strings (tsgo: 23k keys, a lookup hashes a CTy tree).
+    let mut keys: Vec<(&str, usize, &(Glue, CTy))> = live
+        .into_iter()
+        .filter_map(|k| {
+            let len = g.def_map.get(k)?.len();
+            Some((g.protos[k].as_str(), len, k))
+        })
+        .collect();
+    keys.sort_by(|a, b| a.0.cmp(b.0));
     let mut shards: Vec<Vec<&(Glue, CTy)>> = Vec::new();
     let mut cur = Vec::new();
-    for k in keys {
+    for (proto, len, k) in keys {
         cur.push(k);
-        if cut_after(&g.protos[k], g.def_map[k].len(), target.max(1) as u64) {
+        if cut_after(proto, len, target.max(1) as u64) {
             shards.push(std::mem::take(&mut cur));
         }
     }
@@ -331,7 +339,14 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
         }
     }
     let by_sym: HashMap<&str, usize> = outs.iter().enumerate().map(|(k, o)| (o.sym.as_str(), k)).collect();
-    let wanted: Vec<&str> = decl_of.keys().chain(by_sym.keys()).copied().collect();
+    // The names a part may use, in sets built once: the pass's names and the statics' symbols,
+    // and the glue fns (by name, with their keys and prototypes).
+    let wanted: crate::intern::FxSet<&str> = decl_of.keys().chain(by_sym.keys()).copied().collect();
+    let mut glue: crate::intern::FxMap<&str, Vec<(&(Glue, CTy), &String)>> = crate::intern::FxMap::default();
+    for (k, proto) in &g.protos {
+        glue.entry(proto_name(proto)).or_default().push((k, proto));
+    }
+    let glue_names: crate::intern::FxSet<&str> = glue.keys().copied().collect();
     let names = CUR.with(|c| c.borrow().clone());
     let tag = super::layout_phase();
     let parts = crate::pool::par_map(&cuts, |ks| {
@@ -339,11 +354,11 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
             with(names.as_ref(), || {
                 let body: String = ks.iter().map(|&k| outs[k].made.as_str()).chain(ks.iter().map(|&k| outs[k].data.as_str())).collect();
                 // The names it uses, and the names the alias macros among them use.
-                let mut used = names_in(&body, wanted.iter().copied());
+                let mut used = names_found(&body, &wanted);
                 let mut stack: Vec<&str> = used.iter().copied().collect();
                 while let Some(n) = stack.pop() {
                     if let Some((d, _, _)) = decl_of.get(n).filter(|(d, _, _)| d.starts_with("#define")) {
-                        stack.extend(names_in(d, wanted.iter().copied()).into_iter().filter(|m| used.insert(m)));
+                        stack.extend(names_found(d, &wanted).into_iter().filter(|m| used.insert(m)));
                     }
                 }
                 // The statics whose types it reads: its own, and those whose data or pointees it names.
@@ -358,10 +373,9 @@ pub fn statics_parts(p: &Program, g: &GlueSet, target: usize) -> (String, Vec<St
                 }
                 let (types, mut pointed) = statics_types(p, statics.iter().copied());
                 // Only the glue the data names (a vtable's drop entry, say).
-                let glue = names_in(&body, g.protos.values().map(|proto| proto_name(proto)));
                 let mut protos: Vec<&String> = Vec::new();
-                for (k, proto) in &g.protos {
-                    if glue.contains(proto_name(proto)) {
+                for n in names_found(&body, &glue_names) {
+                    for &(k, proto) in &glue[n] {
                         collect_types(&k.1, &mut pointed);
                         protos.push(proto);
                     }
@@ -414,7 +428,7 @@ fn proto_name(proto: &str) -> &str {
 /// The statics unit asks it for the glue names of 20k+ prototypes over its 15 MB of data
 /// (tsgo): the text is scanned on all cores, in pieces cut at ASCII bytes outside names.
 fn names_in<'a>(text: &str, wanted: impl Iterator<Item = &'a str>) -> HashSet<&'a str> {
-    let wanted: HashSet<&str, std::hash::BuildHasherDefault<crate::intern::FxHasher>> = wanted.collect();
+    let wanted: crate::intern::FxSet<&str> = wanted.collect();
     let sep = |ch: char| !(ch.is_ascii_alphanumeric() || ch == '_');
     let mut found: HashSet<&str> = HashSet::new();
     if wanted.contains("") && text.split(sep).any(str::is_empty) {
@@ -433,10 +447,16 @@ fn names_in<'a>(text: &str, wanted: impl Iterator<Item = &'a str>) -> HashSet<&'
         }
     }
     let pieces: Vec<&str> = cuts.windows(2).map(|w| &text[w[0]..w[1]]).collect();
-    for part in crate::pool::par_map(&pieces, |piece| piece.split(sep).filter_map(|w| wanted.get(w).copied()).collect::<Vec<&str>>()) {
+    for part in crate::pool::par_map(&pieces, |piece| names_found(piece, &wanted)) {
         found.extend(part);
     }
     found
+}
+
+/// `names_in` on this thread, for a caller that is one of many jobs on the pool (a statics
+/// part): a nested `par_map` on a busy pool spawns threads of its own.
+fn names_found<'a>(text: &str, wanted: &crate::intern::FxSet<&'a str>) -> HashSet<&'a str> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).filter_map(|w| wanted.get(w).copied()).collect()
 }
 
 /// The fns whose pointers the constant `v` holds.

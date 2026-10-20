@@ -9295,9 +9295,10 @@ impl GlueSet {
         self.used.iter().any(|(k, used)| !self.stale.contains(k) && used.iter().any(|&s| dead(s)))
     }
 
-    /// The glue keys a set of direct needs reaches, deps included.
-    fn closure<'a>(&'a self, roots: impl Iterator<Item = &'a (Glue, CTy)>) -> HashSet<&'a (Glue, CTy)> {
-        let mut seen = HashSet::new();
+    /// The glue keys a set of direct needs reaches, deps included (FxHash: tsgo's fns name
+    /// 126k roots).
+    fn closure<'a>(&'a self, roots: impl Iterator<Item = &'a (Glue, CTy)>) -> crate::intern::FxSet<&'a (Glue, CTy)> {
+        let mut seen = crate::intern::FxSet::default();
         let mut stack: Vec<&(Glue, CTy)> = roots.collect();
         while let Some(k) = stack.pop() {
             if seen.insert(k) {
