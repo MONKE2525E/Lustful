@@ -319,14 +319,13 @@ impl PatchBase {
         let needs = super::compile::par_map(&texts, |&(k, t)| {
             if k > 0 && std::path::Path::new(map.path(FileId(k as u32))).starts_with(platform) { Default::default() } else { file_needs(t) }
         });
-        let stamps = (0..n)
-            .map(|k| {
-                let path = map.path(FileId(k as u32));
-                if path.is_empty() { None } else { stamp_of(path, request_start) }
-            })
-            .collect();
+        // The stamps (a stat per file) and the shadow scan (every file's text) on the pool.
+        let stamps = super::compile::par_map(&texts, |&(k, _)| {
+            let path = map.path(FileId(k as u32));
+            if path.is_empty() { None } else { stamp_of(path, request_start) }
+        });
         let user_macros = texts.iter().any(|(_, t)| t.contains("macro_rules"));
-        let shadowed = user_macros && texts.iter().any(|(_, t)| shadows_parser_macro(t));
+        let shadowed = user_macros && super::compile::par_map(&texts, |(_, t)| shadows_parser_macro(t)).into_iter().any(|s| s);
         let includes = front.chunks.iter().any(|c| c.expand_deps.iter().any(|d| matches!(d, crate::expand::Dep::File { .. })));
         let ranges = (!user_macros && !includes).then(|| span_shift::ranges_by_file(&front.ast, n));
         let mut fns_by_file: Vec<Vec<u32>> = vec![Vec::new(); n];
