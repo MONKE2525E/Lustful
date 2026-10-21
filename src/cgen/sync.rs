@@ -140,7 +140,7 @@ pub(super) fn sync_glue_def(
     let t = CTy::Sync(k, Box::new(e.clone()));
     let (m, ct) = (mangle(&t), ctype(&t));
     let it = format!("RcI_{}", mangle(e));
-    let dealloc = format!("lust_dealloc((void*)*p, sizeof({it}), _Alignof({it}))");
+    let dealloc = format!("lust_rc_free(*p, _Alignof({it}))");
     // `Arc`'s value glue (Eq, Cmp, Debug, Display, Default) is `Rc`'s:
     // the same header, read the same way.
     let forward = |g: Glue, rc: &CTy, need: &mut dyn FnMut(Glue, &CTy), protos: &mut String, defs: &mut String| {
@@ -180,7 +180,7 @@ pub(super) fn sync_glue_def(
         (Glue::Drop, SyncTy::Arc) => {
             let inner = if needs_drop_c(p, e) {
                 need(Glue::Drop, e);
-                format!("drop_{}(&(*p)->v); ", mangle(e))
+                format!("drop_{}({}); ", mangle(e), super::rc_ptr("*p", e))
             } else {
                 String::new()
             };
@@ -937,7 +937,8 @@ impl FnGen<'_, '_> {
         let (h, ev, w) = (self.tmp(), self.tmp(), self.tmp());
         let _ = writeln!(
             self.out,
-            "    {it} *{h} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {h}->strong = 0; {h}->weak = 1;{} {} {ev} = {env}; {it} *{w} = {h};",
+            "    {it} *{h} = ({it}*)lust_alloc({}, _Alignof({it})); {h}->strong = 0; {h}->weak = 1;{} {} {ev} = {env}; {it} *{w} = {h};",
+            super::rc_size(&it, &ret),
             if atomic { format!(" lust_arc_downgrade((uint64_t*){h});") } else { String::new() },
             ctype(&env_ty)
         );
@@ -948,10 +949,11 @@ impl FnGen<'_, '_> {
             self.want(Glue::Drop, &env_ty);
             let _ = writeln!(self.out, "    drop_{}(&{ev});", mangle(&env_ty));
         }
+        let hv = super::rc_value(&h, &ret);
         if atomic {
-            let _ = writeln!(self.out, "    {h}->v = {v}; lust_arc_inc(&({h})->strong); (void)lust_arc_dec(&({h})->weak);");
+            let _ = writeln!(self.out, "    {hv} = {v}; lust_arc_inc(&({h})->strong); (void)lust_arc_dec(&({h})->weak);");
         } else {
-            let _ = writeln!(self.out, "    {h}->v = {v}; {h}->strong = 1;");
+            let _ = writeln!(self.out, "    {hv} = {v}; {h}->strong = 1;");
         }
         let _ = loc;
         format!("({h})")
@@ -1713,7 +1715,8 @@ impl FnGen<'_, '_> {
         let arc = CTy::Sync(SyncTy::Arc, Box::new(elem.clone()));
         self.note_held(&arc);
         let h = |v: &str| format!("((uint64_t*){v})");
-        let free = |v: &str| format!("if (lust_arc_dec(&{v}->weak)) lust_dealloc((void*){v}, sizeof({it}), _Alignof({it}));");
+        let free = |v: &str| format!("if (lust_arc_dec(&{v}->weak)) lust_rc_free({v}, _Alignof({it}));");
+        let val = |v: &str| super::rc_value(v, &elem);
         let clone_of = |this: &mut Self, src: &str| -> String {
             if is_copy_c(this.p, &elem) {
                 src.to_string()
@@ -1725,14 +1728,14 @@ impl FnGen<'_, '_> {
         match op {
             S::ArcNew => {
                 let t = self.tmp();
-                let _ = writeln!(self.out, "    {it} *{t} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {t}->v = {};", vals[0]);
+                let _ = writeln!(self.out, "    {it} *{t} = ({it}*)lust_alloc({}, _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {} = {};", super::rc_size(&it, &elem), val(&t), vals[0]);
                 t
             }
             S::ArcStrongCount => format!("lust_arc_load(&(*{})->strong)", vals[0]),
             S::ArcWeakCount => format!("lust_arc_weak_count({})", h(&format!("*{}", vals[0]))),
             S::ArcPtrEq | S::ArcWeakPtrEq => format!("(*{} == *{})", vals[0], vals[1]),
             // `Arc::as_ptr` (w-cinterop): the payload address.
-            S::ArcAsPtr => format!("(&(*{})->v)", vals[0]),
+            S::ArcAsPtr => super::rc_ptr(&format!("(*{})", vals[0]), &elem),
             S::ArcDowngrade => {
                 let t = self.tmp();
                 let _ = writeln!(self.out, "    {it} *{t} = *{}; lust_arc_downgrade({});", vals[0], h(&t));
@@ -1746,7 +1749,7 @@ impl FnGen<'_, '_> {
                 let some = disc_set(self.p, &opt, &t, 1);
                 let v = &vals[0];
                 let _ = writeln!(self.out, "    {} {t}; {}", ctype(&opt), disc_set(self.p, &opt, &t, 0));
-                let _ = writeln!(self.out, "    if (lust_arc_is_unique({})) {{ {field} = &(*{v})->v; {some} }}", h(&format!("*{v}")));
+                let _ = writeln!(self.out, "    if (lust_arc_is_unique({})) {{ {field} = {}; {some} }}", h(&format!("*{v}")), super::rc_ptr(&format!("(*{v})"), &elem));
                 t
             }
             S::ArcMakeMut => {
@@ -1755,17 +1758,20 @@ impl FnGen<'_, '_> {
                 // give up the implicit weak; 2: unique already.
                 let v = &vals[0];
                 let (st, n, old) = (self.tmp(), self.tmp(), self.tmp());
-                let cloned = clone_of(self, &format!("(*{v})->v"));
+                // A fresh block's size, and the value moved or cloned into it.
+                self.note_held(&elem);
+                let cloned = clone_of(self, &val(&format!("(*{v})")));
                 self.want(Glue::Drop, &arc);
                 let am = mangle(&arc);
                 let _ = writeln!(self.out, "    int {st} = lust_arc_make_mut_state({});", h(&format!("*{v}")));
                 let _ = writeln!(
                     self.out,
-                    "    if ({st} != 2) {{ {it} *{n} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {n}->strong = 1; {n}->weak = 1; {it} *{old} = *{v};"
+                    "    if ({st} != 2) {{ {it} *{n} = ({it}*)lust_alloc({}, _Alignof({it})); {n}->strong = 1; {n}->weak = 1; {it} *{old} = *{v};",
+                    super::rc_size(&it, &elem)
                 );
-                let _ = writeln!(self.out, "      if ({st} == 0) {{ {n}->v = {cloned}; drop_{am}(&{old}); }} else {{ {n}->v = {old}->v; {} }}", free(&old));
+                let _ = writeln!(self.out, "      if ({st} == 0) {{ {} = {cloned}; drop_{am}(&{old}); }} else {{ {} = {}; {} }}", val(&n), val(&n), val(&old), free(&old));
                 let _ = writeln!(self.out, "      *{v} = {n}; }}");
-                format!("&(*{v})->v")
+                super::rc_ptr(&format!("(*{v})"), &elem)
             }
             S::ArcTryUnwrap => {
                 let res = CTy::Result(Box::new(elem.clone()), Box::new(arc.clone()));
@@ -1779,8 +1785,9 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    {} {t};", ctype(&res));
                 let _ = writeln!(
                     self.out,
-                    "    if (lust_arc_take_unique({})) {{ {set_ok} {ok_f} = {v}->v; {} }} else {{ {set_err} {err_f} = {v}; }}",
+                    "    if (lust_arc_take_unique({})) {{ {set_ok} {ok_f} = {}; {} }} else {{ {set_err} {err_f} = {v}; }}",
                     h(v),
+                    val(v),
                     free(v)
                 );
                 t
@@ -1798,19 +1805,22 @@ impl FnGen<'_, '_> {
                     let (f, some, none) = (variant_field(self.p, &opt, &t, 1, 0), disc_set(self.p, &opt, &t, 1), disc_set(self.p, &opt, &t, 0));
                     let _ = writeln!(
                         self.out,
-                        "    {} {t}; if (lust_arc_dec(&{v}->strong)) {{ {f} = {v}->v; {some} {} }} else {{ {none} }}",
+                        "    {} {t}; if (lust_arc_dec(&{v}->strong)) {{ {f} = {}; {some} {} }} else {{ {none} }}",
                         ctype(&opt),
+                        val(&v),
                         free(&v)
                     );
                 } else {
-                    let c = clone_of(self, &format!("{v}->v"));
+                    self.note_held(&elem);
+                    let c = clone_of(self, &val(&v));
                     self.want(Glue::Drop, &arc);
                     let am = mangle(&arc);
                     let _ = writeln!(
                         self.out,
-                        "    {} {t}; if (lust_arc_take_unique({})) {{ {t} = {v}->v; {} }} else {{ {t} = {c}; drop_{am}(&{v}); }}",
+                        "    {} {t}; if (lust_arc_take_unique({})) {{ {t} = {}; {} }} else {{ {t} = {c}; drop_{am}(&{v}); }}",
                         ctype(&elem),
                         h(&v),
+                        val(&v),
                         free(&v)
                     );
                 }

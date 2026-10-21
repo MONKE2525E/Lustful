@@ -108,6 +108,11 @@ void lust_dealloc(void *ptr, uint64_t size, uint64_t align) LUST_BODY({
     free(ptr);
 })
 
+/* An Rc/Arc count block's free (cgen `rc_head`): a unit that frees one may not know its
+   value's size, and lust_dealloc reads no size but zero, which a count block never is. The
+   same one call as lust_dealloc with the size. */
+#define lust_rc_free(ptr, align) lust_dealloc((void *)(ptr), 1, (align))
+
 /* realloc(ptr, old_size, align, new_size): the Rust GlobalAlloc argument
    order with Layout flattened. Always moves when the alignment exceeds
    what plain realloc promises; the copy is the smaller size. */

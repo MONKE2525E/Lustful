@@ -6489,7 +6489,9 @@ impl FnGen<'_, '_> {
                 let t = self.tmp();
                 let _ = writeln!(
                     self.out,
-                    "    {it} *{t} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {t}->v = {};",
+                    "    {it} *{t} = ({it}*)lust_alloc({}, _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {} = {};",
+                    rc_size(&it, &tys[0]),
+                    rc_value(&t, &tys[0]),
                     vals[0]
                 );
                 t
@@ -6718,7 +6720,7 @@ impl FnGen<'_, '_> {
             B::RcGetMut => {
                 let inner = match &tys[0] { CTy::Ref(r) => (**r).clone(), _ => unreachable!() };
                 let elem = match &inner { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
-                let opt = CTy::Option(Box::new(CTy::Ref(Box::new(elem))));
+                let opt = CTy::Option(Box::new(CTy::Ref(Box::new(elem.clone()))));
                 let ot = ctype(&opt);
                 let t = self.tmp();
                 let field = variant_field(self.p, &opt, &t, 1, 0);
@@ -6726,7 +6728,7 @@ impl FnGen<'_, '_> {
                 let some = if some.is_empty() { String::new() } else { format!(" {some}") };
                 let v = &vals[0];
                 let _ = writeln!(self.out, "    {ot} {t}; {}", disc_set(self.p, &opt, &t, 0));
-                let _ = writeln!(self.out, "    if ((*{v})->strong == 1 && (*{v})->weak == 1) {{ {field} = &(*{v})->v;{some} }}");
+                let _ = writeln!(self.out, "    if ((*{v})->strong == 1 && (*{v})->weak == 1) {{ {field} = {};{some} }}", rc_ptr(&format!("(*{v})"), &elem));
                 t
             }
             B::RcMakeMut => {
@@ -6734,11 +6736,15 @@ impl FnGen<'_, '_> {
                 let elem = match &inner { CTy::Rc(e) => (**e).clone(), _ => unreachable!() };
                 let it = format!("RcI_{}", mangle(&elem));
                 let v = &vals[0];
+                // A fresh block's size, and the value moved or cloned into it.
+                self.note_held(&elem);
+                let (val, size) = (rc_value(&format!("(*{v})"), &elem), rc_size(&it, &elem));
+                let n_val = rc_value("n", &elem);
                 let cloned = if is_copy_c(self.p, &elem) {
-                    format!("(*{v})->v")
+                    val.clone()
                 } else {
                     self.want(Glue::Clone, &elem);
-                    format!("clone_{}(&(*{v})->v)", mangle(&elem))
+                    format!("clone_{}(&{val})", mangle(&elem))
                 };
                 // Shared: clone the value into a fresh header and leave
                 // the old count one lower. Unique but Weak-held: move
@@ -6746,9 +6752,9 @@ impl FnGen<'_, '_> {
                 // (strong 0, its implicit weak ref gone), as in Rust.
                 let _ = writeln!(
                     self.out,
-                    "    if ((*{v})->strong > 1) {{ {it} *n = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); n->strong = 1; n->weak = 1; n->v = {cloned}; (*{v})->strong--; *{v} = n; }}\n    else if ((*{v})->weak > 1) {{ {it} *n = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); n->strong = 1; n->weak = 1; n->v = (*{v})->v; (*{v})->strong = 0; (*{v})->weak--; *{v} = n; }}"
+                    "    if ((*{v})->strong > 1) {{ {it} *n = ({it}*)lust_alloc({size}, _Alignof({it})); n->strong = 1; n->weak = 1; {n_val} = {cloned}; (*{v})->strong--; *{v} = n; }}\n    else if ((*{v})->weak > 1) {{ {it} *n = ({it}*)lust_alloc({size}, _Alignof({it})); n->strong = 1; n->weak = 1; {n_val} = {val}; (*{v})->strong = 0; (*{v})->weak--; *{v} = n; }}"
                 );
-                format!("&(*{v})->v")
+                rc_ptr(&format!("(*{v})"), &elem)
             }
             B::DefaultGlue => unreachable!("the default glue call is emitted at its call terminator"),
             B::SliceTryInto => unreachable!("the slice-to-array call is emitted at its call terminator"),
@@ -6781,7 +6787,8 @@ impl FnGen<'_, '_> {
                 let _ = writeln!(self.out, "    {rt} {t};");
                 let _ = writeln!(
                     self.out,
-                    "    if ({v}->strong == 1) {{ {set_ok} {ok_f} = {v}->v; {v}->strong = 0; if (--{v}->weak == 0) lust_dealloc((void*){v}, sizeof({it}), _Alignof({it})); }} else {{ {set_err} {err_f} = {v}; }}"
+                    "    if ({v}->strong == 1) {{ {set_ok} {ok_f} = {}; {v}->strong = 0; if (--{v}->weak == 0) lust_rc_free({v}, _Alignof({it})); }} else {{ {set_err} {err_f} = {v}; }}",
+                    rc_value(v, &elem)
                 );
                 let _ = et;
                 t
@@ -6795,26 +6802,28 @@ impl FnGen<'_, '_> {
                 let it = format!("RcI_{}", mangle(&elem));
                 let v = self.tmp();
                 let _ = writeln!(self.out, "    {it}* {v} = {};", vals[0]);
-                let free = format!("{v}->strong = 0; if (--{v}->weak == 0) lust_dealloc((void*){v}, sizeof({it}), _Alignof({it}));");
+                let free = format!("{v}->strong = 0; if (--{v}->weak == 0) lust_rc_free({v}, _Alignof({it}));");
+                let val = rc_value(&v, &elem);
                 if b == B::RcIntoInner {
                     let opt = CTy::Option(Box::new(elem.clone()));
                     let t = self.tmp();
                     let (f, some, none) = (variant_field(self.p, &opt, &t, 1, 0), disc_set(self.p, &opt, &t, 1), disc_set(self.p, &opt, &t, 0));
                     let _ = writeln!(
                         self.out,
-                        "    {} {t}; if ({v}->strong == 1) {{ {f} = {v}->v; {some} {free} }} else {{ {v}->strong--; {none} }}",
+                        "    {} {t}; if ({v}->strong == 1) {{ {f} = {val}; {some} {free} }} else {{ {v}->strong--; {none} }}",
                         ctype(&opt)
                     );
                     t
                 } else {
+                    self.note_held(&elem);
                     let c = if is_copy_c(self.p, &elem) {
-                        format!("{v}->v")
+                        val.clone()
                     } else {
                         self.want(Glue::Clone, &elem);
-                        format!("clone_{}(&{v}->v)", mangle(&elem))
+                        format!("clone_{}(&{val})", mangle(&elem))
                     };
                     let t = self.tmp();
-                    let _ = writeln!(self.out, "    {} {t}; if ({v}->strong == 1) {{ {t} = {v}->v; {free} }} else {{ {t} = {c}; {v}->strong--; }}", ctype(&elem));
+                    let _ = writeln!(self.out, "    {} {t}; if ({v}->strong == 1) {{ {t} = {val}; {free} }} else {{ {t} = {c}; {v}->strong--; }}", ctype(&elem));
                     t
                 }
             }
@@ -8391,7 +8400,10 @@ impl FnGen<'_, '_> {
             // `Rc::as_ptr`: the payload behind the counts. An `Rc<dyn
             // Tr>`, `Rc<str>` or `Rc<[T]>` is already the fat view of it.
             B::SmartAsPtr if owning_fat_ref(&tys[0]) => format!("(*{})", vals[0]),
-            B::SmartAsPtr => format!("(&(*{})->v)", vals[0]),
+            B::SmartAsPtr => match deref_cty(&tys[0]) {
+                CTy::Rc(e) | CTy::Sync(crate::ty::sync::SyncTy::Arc, e) => rc_ptr(&format!("(*{})", vals[0]), &e),
+                _ => format!("(&(*{})->v)", vals[0]),
+            },
             B::SeqAsPtr => slice_like(&tys[0], &vals[0]).1,
             B::StrAsPtr => match &tys[0] {
                 CTy::Ref(inner) if **inner == CTy::String => format!("({})->ptr", vals[0]),
@@ -12178,6 +12190,8 @@ fn def_deps(p: &Program, t: &CTy) -> Vec<CTy> {
         // order (ADT ids, which follow the file name) then decided
         // which side was incomplete.
         CTy::Slice(e) => by_value_deps(&CTy::Ref(e.clone()), &mut deps),
+        // Release C's count block holds no value (`rc_head`).
+        CTy::Rc(e) if rc_head(p, e).is_some() => {}
         CTy::Rc(e) | CTy::RefCell(e) => by_value_deps(e, &mut deps),
         CTy::Sync(k, e) if k.is_cell_struct() => by_value_deps(e, &mut deps),
         // A fn pointer typedef is a declarator: its parameter and
@@ -12292,6 +12306,35 @@ fn may_hold_float(p: &Program, t: &CTy, seen: &mut HashSet<CTy>) -> bool {
         CTy::Result(a, b) => may_hold_float(p, a, seen) || may_hold_float(p, b, seen),
         _ => true,
     }
+}
+
+/// Release C declares an `Rc`/`Arc` count block (`RcI_T`) with no `T` in it: the two counts,
+/// then the value's place as a byte array at `T`'s alignment, which this gives (release C,
+/// `T`'s layout known; else the block holds `T`). Value accesses cast that place to `T`
+/// (`rc_value`, `rc_ptr`), and allocations size the block from the value's offset
+/// (`rc_size`), so a unit that only reads the counts or the value's address declares no `T`
+/// and does not change with `T`'s size. The value's offset and the block's size and
+/// alignment are the ones of the block that holds `T`, and the same texts read both.
+fn rc_head(p: &Program, e: &CTy) -> Option<u64> {
+    names::release().then(|| c_layout(p, e)).flatten().map(|l| l.align.max(1))
+}
+
+/// The value in the count block `b` points at (C of type `RcI_T*`), as a C lvalue of `T`:
+/// either form of the block (`rc_head`). Only a read or write of it needs `T` defined.
+fn rc_value(b: &str, e: &CTy) -> String {
+    format!("(*{})", rc_ptr(b, e))
+}
+
+/// The address of that value, a `T*`.
+fn rc_ptr(b: &str, e: &CTy) -> String {
+    format!("(({}*)&({b})->v)", ctype(e))
+}
+
+/// The allocation size of count block `it` (`RcI_T`): the value's offset and `T`'s size,
+/// rounded up to the block's alignment, which is the size of the block that holds `T` with
+/// either form (`rc_head`). Needs `T` defined.
+fn rc_size(it: &str, e: &CTy) -> String {
+    format!("((__builtin_offsetof({it}, v) + sizeof({}) + _Alignof({it}) - 1) & ~(uint64_t)(_Alignof({it}) - 1))", ctype(e))
 }
 
 /// A type's forward typedefs (`type_decls_with`): what lets other declarations name it
@@ -12476,9 +12519,14 @@ fn decl_own(p: &Program, t: &CTy, block: Option<Layout>, out: &mut String) {
                 layout_assert(out, &ctype(t), &l);
             }
         }
-        CTy::Rc(e) => {
-            let _ = writeln!(out, "typedef struct RcI_{0} {{ uint64_t strong; uint64_t weak; {1} v; }} RcI_{0};", mangle(e), ctype(e));
-        }
+        CTy::Rc(e) => match rc_head(p, e) {
+            Some(align) => {
+                let _ = writeln!(out, "typedef struct RcI_{0} {{ uint64_t strong; uint64_t weak; _Alignas({align}) unsigned char v[]; }} RcI_{0};", mangle(e));
+            }
+            None => {
+                let _ = writeln!(out, "typedef struct RcI_{0} {{ uint64_t strong; uint64_t weak; {1} v; }} RcI_{0};", mangle(e), ctype(e));
+            }
+        },
         CTy::RefCell(e) => {
             let _ = writeln!(out, "typedef struct RCL_{0} {{ int64_t f0; {1} f1; }} RCL_{0};", mangle(e), ctype(e));
         }
@@ -13074,18 +13122,18 @@ fn glue_def_value(
                     let it = format!("RcI_{}", mangle(e));
                     let inner = if needs_drop_c(p, e) {
                         need(Glue::Drop, e);
-                        format!("drop_{}(&(*p)->v); ", mangle(e))
+                        format!("drop_{}({}); ", mangle(e), rc_ptr("*p", e))
                     } else {
                         String::new()
                     };
                     // The strong refs together hold one implicit weak ref
                     // (Rust's RcInner): the header outlives the value
                     // drop while any Weak remains.
-                    let _ = writeln!(body, "  if (--(*p)->strong == 0) {{ {inner}if (--(*p)->weak == 0) lust_dealloc((void*)*p, sizeof({it}), _Alignof({it})); }}");
+                    let _ = writeln!(body, "  if (--(*p)->strong == 0) {{ {inner}if (--(*p)->weak == 0) lust_rc_free(*p, _Alignof({it})); }}");
                 }
                 CTy::Weak(e) => {
                     let it = format!("RcI_{}", mangle(e));
-                    let _ = writeln!(body, "  if (*p != ({it}*)~(uint64_t)0 && --(*p)->weak == 0) lust_dealloc((void*)*p, sizeof({it}), _Alignof({it}));");
+                    let _ = writeln!(body, "  if (*p != ({it}*)~(uint64_t)0 && --(*p)->weak == 0) lust_rc_free(*p, _Alignof({it}));");
                 }
                 CTy::RefCell(e) => {
                     if needs_drop_c(p, e) {
@@ -13480,7 +13528,7 @@ fn glue_def_value(
                     let _ = writeln!(body, "  return {e};");
                 }
                 CTy::Rc(inner) => {
-                    let e = eq_of(inner, "(*a)->v", "(*b)->v", &mut need);
+                    let e = eq_of(inner, &rc_value("*a", inner), &rc_value("*b", inner), &mut need);
                     let _ = writeln!(body, "  return {e};");
                 }
                 CTy::Vec(e) => {
@@ -13658,7 +13706,7 @@ fn glue_def_value(
                     let _ = writeln!(body, "  return {c};");
                 }
                 CTy::Rc(inner) => {
-                    let c = cmp_of(inner, "(*a)->v", "(*b)->v", &mut need);
+                    let c = cmp_of(inner, &rc_value("*a", inner), &rc_value("*b", inner), &mut need);
                     let _ = writeln!(body, "  return {c};");
                 }
                 CTy::Adt(adt_id) => {
@@ -13796,7 +13844,7 @@ fn glue_def_value(
                     // The header as `Rc::new` builds it: one implicit weak ref.
                     let it = format!("RcI_{}", mangle(e));
                     let d = def_of(e, &mut need);
-                    let _ = writeln!(body, "  {it} *r = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); r->strong = 1; r->weak = 1; r->v = {d};\n  return r;");
+                    let _ = writeln!(body, "  {it} *r = ({it}*)lust_alloc({}, _Alignof({it})); r->strong = 1; r->weak = 1; {} = {d};\n  return r;", rc_size(&it, e), rc_value("r", e));
                 }
                 // `Cow<B>` defaults to `Owned(Owned::default())`.
                 CTy::Adt(adt_id) if p.gx.adt_instance_of.get(adt_id.0 as usize).copied().flatten().is_some_and(|(d, _)| d == crate::check::generics::cow_def()) => {
@@ -14441,6 +14489,26 @@ mod tests {
         assert_eq!(GlueSet::pointer_block(&vec_of(CTy::Rc(Box::new(s.clone())))), Some(vec![]));
         assert_eq!(GlueSet::pointer_block(&vec_of(s.clone())), Some(vec![s.clone()]));
         assert_eq!(GlueSet::pointer_block(&(Glue::Clone, CTy::Rc(Box::new(s.clone())))), Some(vec![CTy::Rc(Box::new(s))]));
+    }
+
+    /// Release C's count block holds no value (`rc_head`): a fn that clones an `Rc<Big>`,
+    /// passes `&Big` on (to a fn of another unit) and drops the clone, with the Rc's clone and
+    /// drop glue inline, defines the block as its two counts and a byte array at Big's
+    /// alignment, frees it with no size of Big, and defines no Big (the block that held Big
+    /// defined it as a block of its size).
+    #[test]
+    fn rc_glue_defines_no_value_in_the_count_block() {
+        let src = "use std::rc::Rc;\nstruct Big { a: u64, b: u64, c: u64, d: [u64; 4] }\n\
+                   #[inline(never)]\nfn look(b: &Big) -> u64 { b.a + b.d[1] }\n\
+                   fn pass(r: &Rc<Big>) -> u64 { let k = r.clone(); let n = look(&k); drop(k); n }\n\
+                   fn main() { let r = Rc::new(Big { a: 1, b: 2, c: 3, d: [4; 4] }); let _n = pass(&r); }\n";
+        with_release_unit(src, "pass", |unit, adt| {
+            let big = adt("Big");
+            let (m, ct) = (mangle(&big), ctype(&big));
+            assert!(unit.contains(&format!("typedef struct RcI_{m} {{ uint64_t strong; uint64_t weak; _Alignas(8) unsigned char v[]; }} RcI_{m};")), "the block holds no Big:\n{unit}");
+            assert!(unit.contains(&format!("lust_rc_free(*p, _Alignof(RcI_{m}))")), "the drop glue frees the block with no size of Big:\n{unit}");
+            assert!(!unit.contains(&format!("struct {ct} {{")), "the unit defines no Big:\n{unit}");
+        });
     }
 
     /// A fn that borrows a RefCell of `Option<Rc<Rc<Big>>>` (tsgo's FileVersion behind a cache

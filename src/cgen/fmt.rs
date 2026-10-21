@@ -45,7 +45,7 @@ pub(super) fn fmt_expr(t: &CTy, kind: FmtKind, f: &str, v: &str, need: &mut dyn 
         CTy::Ref(inner) | CTy::Boxed(inner) => fmt_expr(inner, kind, f, &format!("(*{v})"), need),
         // An owning fat pointer formats its pointee through the same fat value (cgen/own.rs).
         CTy::Own(_, inner) => fmt_expr(inner, kind, f, v, need),
-        CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => fmt_expr(inner, kind, f, &format!("(&(*{v})->v)"), need),
+        CTy::Rc(inner) | CTy::Sync(crate::ty::sync::SyncTy::Arc, inner) => fmt_expr(inner, kind, f, &super::rc_ptr(&format!("(*{v})"), inner), need),
         // A `RefCell` guard formats its value (W-STD-A).
         CTy::Guard(inner, _) => fmt_expr(inner, kind, f, &format!("(&(*{v})->f1)"), need),
         // A lock guard formats its value (W-THREADS).

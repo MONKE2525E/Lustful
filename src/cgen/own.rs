@@ -629,9 +629,11 @@ impl FnGen<'_, '_> {
         match src {
             CTy::Boxed(e) => {
                 let (it, et, b) = (format!("RcI_{}", mangle(e)), ctype(e), self.tmp());
+                self.note_held(e);
+                let (size, val) = (super::rc_size(&it, e), super::rc_value(&t, e));
                 let _ = writeln!(
                     self.out,
-                    "    {et} *{b} = {v}; {it} *{t} = ({it}*)lust_alloc(sizeof({it}), _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {t}->v = *{b}; lust_dealloc((void*){b}, sizeof({et}), _Alignof({et}));"
+                    "    {et} *{b} = {v}; {it} *{t} = ({it}*)lust_alloc({size}, _Alignof({it})); {t}->strong = 1; {t}->weak = 1; {val} = *{b}; lust_dealloc((void*){b}, sizeof({et}), _Alignof({et}));"
                 );
             }
             CTy::BoxDyn => {
