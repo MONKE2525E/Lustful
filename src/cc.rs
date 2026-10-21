@@ -379,9 +379,17 @@ fn cc_command(prog: impl AsRef<std::ffi::OsStr>) -> Command {
 /// `words` with `flags`, or None when it cannot run (the key then holds the
 /// raw text, and a failed compile reports the real error).
 fn preprocessed(c_text: &str, words: &[String], flags: &str, cxx: bool) -> Option<Vec<u8>> {
+    preprocessed_into(c_text, words, flags, cxx, None)
+}
+
+/// `preprocessed`, and with `deps` the headers it read, as a make rule in that file (`-MD`).
+fn preprocessed_into(c_text: &str, words: &[String], flags: &str, cxx: bool, deps: Option<&Path>) -> Option<Vec<u8>> {
     use std::io::Write as _;
     let mut cmd = cc_command(&words[0]);
     cmd.args(&words[1..]).args(flags.split_whitespace()).args(["-E", "-P", "-x", if cxx { "c++" } else { "c" }, "-", "-o", "-"]);
+    if let Some(d) = deps {
+        cmd.arg("-MD").arg("-MF").arg(d);
+    }
     let mut child = cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
     let mut stdin = child.stdin.take()?;
     let text = c_text.to_string();
@@ -389,6 +397,84 @@ fn preprocessed(c_text: &str, words: &[String], flags: &str, cxx: bool) -> Optio
     let out = child.wait_with_output().ok()?;
     writer.join().ok()?.ok()?;
     out.status.success().then_some(out.stdout)
+}
+
+/// `preprocessed`, kept in `work` for the next build, one file per unit `name` and command.
+/// A release build has 2-3 units with system headers (the runtime, mimalloc, the C++ unit),
+/// and their keys read their preprocessed text: ~100-150 ms of `zig cc -E` before the first
+/// key, every build. The kept text is used again only when everything it follows from is
+/// the same: the -E command (the compiler words with their target, defines and -I order,
+/// the flags, the language), the compiler's identity (`compiler_id`: its version line and
+/// binary), what -E reads from the environment (`preprocess_env`: the build time __DATE__ and
+/// __TIME__ give, header search paths, zig's settings), the text's digest, and the content
+/// digest of every header the preprocessor read (its `-MD` list). Headers are compared by
+/// content, not by stamps: a restored disk or a checkout can give a changed header an old
+/// mtime, and reading the ~100 headers costs about a millisecond. A header that shadows a
+/// listed one from an earlier include dir is not seen (as in make); for zig those dirs are
+/// zig's own, which the binary's identity covers. A text that uses `__TIMESTAMP__` (its
+/// input file's mtime, a temp file under zig) is not kept.
+fn preprocessed_kept(work: &Path, name: &str, c_text: &str, words: &[String], flags: &str, cxx: bool) -> Option<Vec<u8>> {
+    preprocessed_kept_in(work, name, c_text, words, flags, cxx, &preprocess_env())
+}
+
+/// What a preprocessor run reads from the environment, besides its argv: SOURCE_DATE_EPOCH
+/// (__DATE__ and __TIME__; `cc_command` sets 0 when it is unset), the header search paths the
+/// C drivers take from it, the clang driver's own overrides, and zig's settings (its lib dir,
+/// a libc file), not zig's cache dirs, where a run caches, not what it reads.
+fn preprocess_env() -> String {
+    let mut vars: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| {
+            matches!(k.as_str(), "CPATH" | "C_INCLUDE_PATH" | "CPLUS_INCLUDE_PATH" | "OBJC_INCLUDE_PATH" | "OBJCPLUS_INCLUDE_PATH" | "SDKROOT" | "COMPILER_PATH" | "GCC_EXEC_PREFIX")
+                || k.ends_with("_DEPLOYMENT_TARGET")
+                || k.starts_with("CCC_")
+                || (k.starts_with("ZIG_") && !matches!(k.as_str(), "ZIG_GLOBAL_CACHE_DIR" | "ZIG_LOCAL_CACHE_DIR") && !k.starts_with("ZIG_VERBOSE"))
+        })
+        .collect();
+    vars.sort();
+    let epoch = std::env::var("SOURCE_DATE_EPOCH").unwrap_or_else(|_| "0".into());
+    format!("SOURCE_DATE_EPOCH={epoch} {vars:?}")
+}
+
+/// `preprocessed_kept` under the environment `env` (`preprocess_env`).
+fn preprocessed_kept_in(work: &Path, name: &str, c_text: &str, words: &[String], flags: &str, cxx: bool, env: &str) -> Option<Vec<u8>> {
+    if c_text.contains("__TIMESTAMP__") {
+        return preprocessed(c_text, words, flags, cxx);
+    }
+    let hex = |parts: &[&[u8]], seed| {
+        let (a, b) = crate::driver::cache::hash128(parts, seed);
+        format!("{a:016x}{b:016x}")
+    };
+    let slot = hex(&[b"pre-v2", name.as_bytes(), words.join(" ").as_bytes(), flags.as_bytes(), &[cxx as u8]], 41);
+    let inputs = hex(&[compiler_id(words).as_bytes(), env.as_bytes(), c_text.as_bytes()], 43);
+    let (out, deps) = (work.join(format!("pre-{slot}.i")), work.join(format!("pre-{slot}.deps")));
+    let header = |p: &str| std::fs::read(p).ok().map(|b| hex(&[&b], 47));
+    if let Ok(rec) = std::fs::read_to_string(&deps)
+        && let Some((first, headers)) = rec.split_once('\n')
+        && first == inputs
+        && headers.lines().all(|l| l.split_once('\t').is_some_and(|(d, p)| header(p).as_deref() == Some(d)))
+        && let Ok(bytes) = std::fs::read(&out)
+    {
+        return Some(bytes);
+    }
+    let rule_file = work.join(format!("pre-{slot}.d.{}", std::process::id()));
+    let bytes = preprocessed_into(c_text, words, flags, cxx, Some(&rule_file));
+    let rule = std::fs::read_to_string(&rule_file).unwrap_or_default();
+    let _ = std::fs::remove_file(&rule_file);
+    let bytes = bytes?;
+    // The rule's prerequisites: the headers, and the input itself ("<stdin>", or zig's temp
+    // copy of stdin), which is not one. A header that cannot be read keeps nothing.
+    let mut rec = format!("{inputs}\n");
+    for h in rule.split_once(": ").map_or("", |(_, r)| r).replace("\\\n", " ").split_whitespace().filter(|h| !h.contains("stdin")) {
+        match header(h) {
+            Some(d) => rec.push_str(&format!("{d}\t{h}\n")),
+            None => return Some(bytes),
+        }
+    }
+    let tmp = |p: &Path| PathBuf::from(format!("{}.tmp{}", p.display(), std::process::id()));
+    if std::fs::write(tmp(&out), &bytes).and_then(|_| std::fs::rename(tmp(&out), &out)).is_ok() {
+        let _ = std::fs::write(tmp(&deps), rec).and_then(|_| std::fs::rename(tmp(&deps), &deps));
+    }
+    Some(bytes)
 }
 
 /// The flags of an LLVM unit's own compile (its IR plus its C half's bitcode).
@@ -728,9 +814,13 @@ pub fn build_with(
         (None, None, Some(d)) => pgo::stable_name(&d.0).unwrap_or_else(|| units[i].name.clone()),
         _ => units[i].name.clone(),
     });
-    let cflags_text = cflags(debug);
+    // The text a unit with system headers keys on (`unit_key`), kept for the next build
+    // (`preprocessed_kept`); the C++ unit's with its own driver and flags, as `unit_key` makes it.
+    let (cflags_text, cxxflags_text) = (cflags(debug), cxxflags(debug));
     let pre: Vec<Option<Vec<u8>>> = crate::pool::par_map(&idx, |&i| {
-        (!is_cxx(&units[i].name) && text(i).contains("#include <")).then(|| preprocessed(text(i), &spec.cmd, &cflags_text, false)).flatten()
+        let (name, cxx) = (&units[i].name, is_cxx(&units[i].name));
+        let (words, flags) = if cxx { (&spec.cxx, &cxxflags_text) } else { (&spec.cmd, &cflags_text) };
+        text(i).contains("#include <").then(|| preprocessed_kept(work, name, text(i), words, flags, cxx)).flatten()
     });
     // The LLVM units by their PGO names (`ll_of` and `hc_of` stay by unit name).
     let is_ll: Vec<bool> = (0..units.len()).map(|i| entries[i].map_or(ll_of.contains_key(units[i].name.as_str()), |e| e.file.ends_with(".ll"))).collect();
@@ -841,8 +931,10 @@ pub fn build_with(
     // The memo for the next build: this build's units with a fingerprint (not those whose
     // key reads a preprocessed text, so a header change is seen, nor the C++ unit). With
     // LUST_CHECK_UNIT_FP=1 every unit comes with text, and a fingerprint the last build gave
-    // another key is a stale fingerprint: the session missed an input.
-    if let (Some(tag), true) = (&tag, keyed) {
+    // another key is a stale fingerprint: the session missed an input. A thread writes it
+    // while the units compile (joined before the link; the write is atomic, so a build that
+    // fails first keeps the last memo).
+    let memo_saved = if let (Some(tag), true) = (&tag, keyed) {
         let mut next = Vec::new();
         for i in 0..units.len() {
             let (Some(fp), Some(key)) = (units[i].fp, &keys[i]) else { continue };
@@ -855,8 +947,11 @@ pub fn build_with(
             // A memo unit's key, file and length are its entry's (`keys`, `names`, `len`).
             next.push((fp, memo::Entry { name: units[i].name.clone(), key: key.clone(), file: pfile(i), len: len(i) }));
         }
-        memo::save(work, tag, &next)?;
-    }
+        let (work, tag) = (work.to_path_buf(), tag.clone());
+        Some(std::thread::spawn(move || memo::save(&work, &tag, &next)))
+    } else {
+        None
+    };
     // While the misses compile, read the objects the cache holds for this build, 16 at once, so
     // the link finds them in the page cache: lld page-faults its inputs in with few reads in
     // flight, slow from a cold page cache (a CI job's freshly mounted disk). The link waits for
@@ -1016,6 +1111,9 @@ pub fn build_with(
         lost.extend(ll);
         lost.sort();
         return Err(CcError::NeedText(lost));
+    }
+    if let Some(saving) = memo_saved {
+        saving.join().map_err(|_| "the unit memo's writer panicked".to_string())??;
     }
     let compile_s = t_compile.elapsed().as_secs_f64();
     let prefetch_s = prefetch.map(|h| h.join().unwrap_or(0.0));
@@ -1250,6 +1348,59 @@ mod tests {
         let direct = super::unit_words(&spec, false, false);
         assert_ne!(direct[..], spec.cmd[..]);
         assert_eq!(asm(&direct, "direct.s"), asm(&spec.cmd, "zig-cc.s"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kept preprocessed text comes back only for the same inputs: another define, or one
+    /// changed byte in a header it read, runs the preprocessor again.
+    #[test]
+    fn a_kept_preprocessed_text_misses_on_a_changed_define_or_header() {
+        if !super::on_path("cc") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lust-pre-kept-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inc = dir.join("inc");
+        std::fs::create_dir_all(&inc).unwrap();
+        std::fs::write(inc.join("t.h"), "#define T 1\n").unwrap();
+        let text = "#include <t.h>\nint t = T + X;\n";
+        let words = |x: &str| vec!["cc".to_string(), format!("-I{}", inc.display()), format!("-DX={x}")];
+        let kept = |w: &[String]| String::from_utf8(super::preprocessed_kept(&dir, "u1", text, w, "-O2", false).expect("cc preprocesses")).unwrap();
+        assert!(kept(&words("2")).contains("int t = 1 + 2;"));
+        // Mark the kept text, to see when a call reads it back.
+        let out = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "i")).expect("a kept text");
+        std::fs::write(&out, "kept\n").unwrap();
+        assert_eq!(kept(&words("2")), "kept\n", "the same inputs read the kept text");
+        assert!(kept(&words("3")).contains("int t = 1 + 3;"), "another define runs the preprocessor");
+        std::fs::write(inc.join("t.h"), "#define T 7\n").unwrap();
+        assert!(kept(&words("2")).contains("int t = 7 + 2;"), "a changed header byte runs the preprocessor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another build time (SOURCE_DATE_EPOCH, which __DATE__ reads) is another input: the
+    /// text kept under one epoch is not used under another (tsgo's mimalloc unit holds
+    /// __DATE__). A text with __TIMESTAMP__ is never kept.
+    #[test]
+    fn a_kept_preprocessed_text_misses_under_another_build_time() {
+        if !super::on_path("cc") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lust-pre-epoch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = "#include <stddef.h>\nconst char *built = __DATE__;\n";
+        let words = vec!["cc".to_string()];
+        let kept = |t: &str, env: &str| String::from_utf8(super::preprocessed_kept_in(&dir, "u2", t, &words, "-O2", false, env).expect("cc preprocesses")).unwrap();
+        kept(text, "SOURCE_DATE_EPOCH=100000 []");
+        let out = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "i")).expect("a kept text");
+        std::fs::write(&out, "kept\n").unwrap();
+        assert_eq!(kept(text, "SOURCE_DATE_EPOCH=100000 []"), "kept\n", "the same build time reads the kept text");
+        assert_ne!(kept(text, "SOURCE_DATE_EPOCH=200000 []"), "kept\n", "another build time runs the preprocessor");
+        let stamped = "#include <stddef.h>\nconst char *built = __TIMESTAMP__;\n";
+        kept(stamped, "SOURCE_DATE_EPOCH=100000 []");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "i")).count(), 1, "a __TIMESTAMP__ text is not kept");
+        let env = std::env::var("SOURCE_DATE_EPOCH").unwrap_or_else(|_| "0".into());
+        assert!(super::preprocess_env().starts_with(&format!("SOURCE_DATE_EPOCH={env} ")), "the build time cc_command gives is in the key");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
