@@ -990,6 +990,10 @@ struct CachedFile {
     /// tables and the epoch, but the rewrite walk, the flatten,
     /// and the Ast scan for this file are skipped on a hit.
     final_chunk: Option<FinalChunk>,
+    /// The `use` sites of `raw` (`MacroEnv::build`) and the module path they were scanned
+    /// under: a function of the tokens and that path alone (`scan_use_sites` reads no cfg and
+    /// no macro).
+    use_sites: Option<(Vec<Sym>, std::sync::Arc<[UseSite]>)>,
 }
 
 /// One file's post-rewrite, post-flatten chunk, as cached in
@@ -1141,7 +1145,7 @@ impl ResolveCache {
 
     fn entry(&mut self, key: &str, text_hash: u64, file_id: FileId) -> &mut CachedFile {
         let fresh =
-            || CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None, std_asks: None, final_chunk: None };
+            || CachedFile { text_hash, file_id, raw: None, outline: None, expanded: None, std_asks: None, final_chunk: None, use_sites: None };
         let e = self.files.entry(key.to_string()).or_insert_with(fresh);
         if e.text_hash != text_hash || e.file_id != file_id {
             *e = fresh();
@@ -1208,6 +1212,21 @@ impl ResolveCache {
     fn put_outline(&mut self, key: &str, text_hash: u64, file_id: FileId, outline: &scan::Outline) {
         if !self.one_shot {
             self.entry(key, text_hash, file_id).outline = Some(outline.clone());
+        }
+    }
+
+    /// The cached `use` sites of one file's raw stream, when its text and file id stand and
+    /// they were scanned under module path `path`.
+    fn use_sites(&self, key: &str, text_hash: u64, file_id: FileId, path: &[Sym]) -> Option<std::sync::Arc<[UseSite]>> {
+        match &self.peek(key, text_hash, file_id)?.use_sites {
+            Some((p, sites)) if p.as_slice() == path => Some(sites.clone()),
+            _ => None,
+        }
+    }
+
+    fn put_use_sites(&mut self, key: &str, text_hash: u64, file_id: FileId, path: Vec<Sym>, sites: std::sync::Arc<[UseSite]>) {
+        if !self.one_shot {
+            self.entry(key, text_hash, file_id).use_sites = Some((path, sites));
         }
     }
 
@@ -2111,6 +2130,8 @@ struct FileDisc {
     parent: Option<ParentDecl>,
     lexed: Option<lexer::Lexed>,
     outline: scan::Outline,
+    /// The `use` sites of `lexed`, once the cache or a round's `MacroEnv::build` has them.
+    use_sites: Option<std::sync::Arc<[UseSite]>>,
 }
 
 /// The `mod` declaration that loaded a file: where it sits, which is
@@ -2271,6 +2292,7 @@ fn outline_mods(
                         }),
                         lexed: None,
                         outline: scan::Outline::default(),
+                        use_sites: None,
                     });
                     queue.push(discs.len() - 1);
                 }
@@ -2374,6 +2396,7 @@ fn process_disc_orig(
     };
     let inline = outline_mods(di, &outline, &lexed.strings.clone(), discs, queue, tables, shared, job, interner, diags);
     bind_outline_macros(&outline, module, &inline, job, tables, interner);
+    discs[di].use_sites = cache.use_sites(&file_key, text_hash, file_id, &tables.modules[module.0 as usize].path);
     discs[di].outline = outline;
     discs[di].lexed = Some(lexed);
 }
@@ -2819,6 +2842,9 @@ struct MacroEnv {
     /// Per disc: the textual macro scope for `use name;` imports, by
     /// owned source index.
     scopes: Vec<FileMacroScope<usize>>,
+    /// The raw streams' `use` sites `build` scanned, by disc: the files keep them
+    /// (`FileDisc::use_sites`, `ResolveCache::put_use_sites`).
+    scanned: Vec<(usize, std::sync::Arc<[UseSite]>)>,
 }
 
 impl MacroEnv {
@@ -2938,33 +2964,41 @@ impl MacroEnv {
         // the token trees (the expensive part) are not built.
         let no_sources = srcs.is_empty() && dep_exports.iter().all(|(_, s)| s.is_empty());
         // Each file's sites on the pool (its token trees are the cost: about
-        // 1000 files a tsgo resolve), then in disc order.
-        let file_sites = |di: &usize| {
-            let (di, disc) = (*di, &discs[*di]);
+        // 1000 files a tsgo resolve), then in disc order: its raw stream's, which
+        // the file keeps (`FileDisc::use_sites`: a warm resolve scans only the
+        // files that changed), and its expanded stream's. The flag marks a raw
+        // stream scanned now.
+        let scan = |tokens: &[crate::lexer::Token], base: &[Sym]| {
             let mut mine: Vec<UseSite> = Vec::new();
-            let base = &tables.modules[disc.module.0 as usize].path;
-            if let Some(orig) = &disc.lexed
-                && orig.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
-            {
-                let (trees, _) = crate::lexer::build_trees(&orig.tokens);
-                scan_use_sites(&trees, base, interner, &mut mine);
-            }
-            if let Some(Some(exp)) = expanded.get(di)
-                && exp.tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use)
-            {
-                let (trees, _) = crate::lexer::build_trees(&exp.tokens);
+            if tokens.iter().any(|t| t.tok == crate::lexer::Tok::Use) {
+                let (trees, _) = crate::lexer::build_trees(tokens);
                 scan_use_sites(&trees, base, interner, &mut mine);
             }
             mine
         };
-        let sites_by_disc: Vec<Vec<UseSite>> =
-            if no_sources { vec![Vec::new(); discs.len()] } else { par_map(&(0..discs.len()).collect::<Vec<_>>(), file_sites) };
-        let mut sites: Vec<UseSite> = Vec::new();
-        let mut site_disc: Vec<usize> = Vec::new();
-        for (di, mine) in sites_by_disc.iter().enumerate() {
-            sites.extend(mine.iter().cloned());
-            site_disc.extend(std::iter::repeat_n(di, mine.len()));
-        }
+        type Sites = (std::sync::Arc<[UseSite]>, bool, Vec<UseSite>);
+        let file_sites = |di: &usize| -> Sites {
+            let (di, disc) = (*di, &discs[*di]);
+            let base = &tables.modules[disc.module.0 as usize].path;
+            let (orig, now) = match (&disc.use_sites, &disc.lexed) {
+                (Some(s), _) => (s.clone(), false),
+                (None, Some(l)) => (scan(&l.tokens, base).into(), true),
+                (None, None) => (std::sync::Arc::from([]), false),
+            };
+            let exp = match expanded.get(di) {
+                Some(Some(e)) => scan(&e.tokens, base),
+                _ => Vec::new(),
+            };
+            (orig, now, exp)
+        };
+        let per_disc: Vec<Sites> = if no_sources {
+            (0..discs.len()).map(|_| (std::sync::Arc::from([]), false, Vec::new())).collect()
+        } else {
+            par_map(&(0..discs.len()).collect::<Vec<_>>(), file_sites)
+        };
+        let sites: Vec<&UseSite> = per_disc.iter().flat_map(|d| d.0.iter().chain(&d.2)).collect();
+        let site_disc: Vec<usize> = per_disc.iter().enumerate().flat_map(|(di, d)| std::iter::repeat_n(di, d.0.len() + d.2.len())).collect();
+        let scanned = per_disc.iter().enumerate().filter(|(_, d)| d.1).map(|(di, d)| (di, d.0.clone())).collect();
         let owned_names: Vec<Sym> = owned.iter().map(|o| o.name).collect();
         let (inherited, after_mods, scopes) = textual_env(job, discs, expanded, &srcs, &dep_owned, &owned_names, tables, interner);
         // The macro a one-segment `use name;` names through textual
@@ -3279,10 +3313,10 @@ impl MacroEnv {
         // that brings a macro whose name std also exports (`assert`)
         // is ambiguous with the std macro of that name the same way.
         let mut glob_seeds: Vec<Vec<crate::expand::MacroSeed>> = Vec::with_capacity(discs.len());
-        for mine in &sites_by_disc {
+        for d in &per_disc {
             // (importing module, name) -> (glob target, source, ambiguous), in first-seen order.
             let mut found: Vec<((Vec<Sym>, Sym), (Vec<Sym>, usize, bool))> = Vec::new();
-            for site in mine {
+            for site in d.0.iter().chain(&d.2) {
                 if !site.glob {
                     continue;
                 }
@@ -3320,7 +3354,7 @@ impl MacroEnv {
             }
             glob_seeds.push(extra);
         }
-        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods, glob_seeds, scopes }
+        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods, glob_seeds, scopes, scanned }
     }
 
     /// The extern crate names a `::name::m!` path can start with here
@@ -3476,6 +3510,7 @@ fn resolve_one(
         parent: None,
         lexed: None,
         outline: scan::Outline::default(),
+        use_sites: None,
     }];
     let mut queue: Vec<usize> = vec![0];
     while let Some(di) = queue.pop() {
@@ -3513,6 +3548,7 @@ fn resolve_one(
         after_mods: Vec::new(),
         glob_seeds: Vec::new(),
         scopes: Vec::new(),
+        scanned: Vec::new(),
     };
     for round in 0..8 {
         expanded.resize_with(discs.len(), || None);
@@ -3549,6 +3585,13 @@ fn resolve_one(
         })
         .into_iter()
         .unzip();
+        // The raw streams' `use` sites this round scanned stay with their files.
+        for (di, sites) in std::mem::take(&mut menv.scanned) {
+            if let Some((key, text_hash, _)) = &exp_keys[di] {
+                cache.put_use_sites(key, *text_hash, discs[di].file_id, module_paths[di].clone(), sites.clone());
+            }
+            discs[di].use_sites = Some(sites);
+        }
         // Each stored expansion unpacks on the pool (`PackedLexed`).
         let exp_hits: Vec<std::sync::Mutex<Option<(std::sync::Arc<lexer::Lexed>, Vec<crate::expand::Dep>, u64)>>> = {
             let cache: &ResolveCache = cache;
@@ -9172,6 +9215,40 @@ mod tests {
         }
         assert!(counts[0] >= 8, "cold: every file");
         assert_eq!(counts[1..], [0, 3, 3, 3, 5], "files expanded: no edit, then each m.rs edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file's cached `use` sites hold its module path: the same text under another module
+    /// (`#[path]`, same file key) scans again, so its macro re-export binds there.
+    #[test]
+    fn use_sites_key_on_the_module_path() {
+        let dir = std::env::temp_dir().join(format!("lust-worklist-sites-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.rs"), "macro_rules! hidden { () => { 7 } }\npub(crate) use hidden;\n").unwrap();
+        std::fs::write(dir.join("x.rs"), "pub(crate) use crate::m::hidden as h;\npub fn v() -> i64 { 1 }\n").unwrap();
+        let interner: &'static Interner = Box::leak(Box::new(Interner::default()));
+        let known: &'static Known = Box::leak(Box::new(Known::new(interner)));
+        let mut cache = ResolveCache::new(false);
+        for name in ["a", "b"] {
+            let root = format!("mod m;\n#[path = \"x.rs\"]\nmod {name};\nfn main() {{ println!(\"{{}}\", {name}::v() + {name}::h!()); }}\n");
+            std::fs::write(dir.join("main.rs"), &root).unwrap();
+            let input = CrateInput {
+                root_path: dir.join("main.rs"),
+                root_text: root,
+                env: CfgEnv::new("", &[], false, ProfileFlags::DEV),
+                crate_ids: CrateIds { local: LOCAL_CRATE, stable: stable_crate_hash("pkg:sites", "bin", "sites", false) },
+                crate_name: "sites".into(),
+                cargo_env: Vec::new(),
+                deps: Vec::new(),
+                client: Default::default(),
+                std_splice_lo: None,
+                display_root: None,
+            };
+            let warm = resolve_crate_cached(&input, interner, known, &mut cache).ok().expect("resolves");
+            let cold = resolve_crate_cached(&input, interner, known, &mut ResolveCache::new(false)).ok().expect("resolves cold");
+            assert_eq!(warm.scans.bodies, cold.scans.bodies, "module {name}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
