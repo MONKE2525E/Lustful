@@ -1336,6 +1336,14 @@ struct FnGen<'b, 'p> {
     tmp: u32,
     /// This function's return value uses the out-pointer ABI (`ret_is_large`).
     ret_large: bool,
+    /// R1 (`inplace`): local 0 is `(*out)`, the caller's storage (set in `function`).
+    r1: bool,
+    /// Locals whose address a `Ref`, `SliceOf` or `Subslice` rvalue takes somewhere in the
+    /// body: a reference may reach them (R1's caller rule).
+    borrowed: Vec<bool>,
+    /// R3 (`inplace`): the assignment `emit_assign` writes now makes a value that cannot
+    /// unwind at any point (`dropflags::may_panic_before_moves` is false).
+    r3_value: bool,
     /// Vtable statics this function's unsizing coercions use, by vtable
     /// id, to their C names. Each function emits its own copies (named
     /// by its slot), so a unit never defines one twice.
@@ -2100,6 +2108,30 @@ fn split_ret_by_out(p: &Program, t: &CTy, size: u64) -> bool {
     mode == AggRet::All || (size <= 16 && crosses_eightbyte(p, t, 0))
 }
 
+/// Release C (outside the LLVM backend) builds values in their final place, by the rules of
+/// DEST-PROP-DESIGN.md. R1: a fn that returns through the out pointer builds its return value
+/// in `(*out)` (no `l0`, no copy at the return), and a call passes as its out storage only a
+/// fresh temporary or a whole local that holds no value and that no reference reaches. R3: an
+/// assignment whose value cannot unwind, to a whole local that holds no value, writes the
+/// local with no temporary. Both are on; `LUST_RELEASE_INPLACE` picks: `0` neither, `r1` or
+/// `r3` one of them.
+#[derive(Clone, Copy, Default)]
+struct Inplace {
+    r1: bool,
+    r3: bool,
+}
+
+fn inplace(p: &Program) -> Inplace {
+    static MODE: std::sync::OnceLock<Inplace> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("LUST_RELEASE_INPLACE").as_deref() {
+        Ok("0") => Inplace::default(),
+        Ok("r1") => Inplace { r1: true, r3: false },
+        Ok("r3") => Inplace { r1: false, r3: true },
+        _ => Inplace { r1: true, r3: true },
+    });
+    if names::release() && !ll::on(p) { mode } else { Inplace::default() }
+}
+
 /// True when a piece of a value of type `t`, placed at byte `base` of a larger value, starts
 /// before byte 8 and ends after it. A piece is a scalar or an aggregate of at most 8 bytes,
 /// which clang copies as one integer; a larger aggregate is looked into. A type this cannot
@@ -2638,6 +2670,9 @@ impl<'b, 'p> FnGen<'b, 'p> {
             slots,
             tmp: 0,
             ret_large: ret_is_large(p, body.fn_id),
+            r1: false,
+            borrowed: Vec::new(),
+            r3_value: false,
             vtables: HashMap::new(),
             prelude: String::new(),
             adapters: 0,
@@ -2824,6 +2859,16 @@ impl FnGen<'_, '_> {
                 members.get(i).is_some_and(|m| !m.is_empty()) && param_by_ptr(p, t) && !param_dropped(p, t) && names::release() && !ll::on(p)
             })
             .collect();
+        // R1: the return value is built in the caller's storage, `(*out)` (the rename below),
+        // and the return copies nothing. Lowering never drops local 0 on unwind, so no
+        // cleanup reads it; a frame that did would keep `l0`.
+        self.r1 = inplace(p).r1 && self.ret_large && members.first().is_none_or(|m| m.is_empty());
+        self.borrowed = vec![false; self.local_cty.len()];
+        for s in self.body.blocks.iter().flat_map(|b| &b.stmts) {
+            if let StmtKind::Assign(_, Rvalue::Ref(_, pl) | Rvalue::SliceOf(pl) | Rvalue::Subslice { base: pl, .. }) = &s.kind {
+                self.borrowed[pl.local as usize] = true;
+            }
+        }
         // Locals grouped by C type. No initializers: the borrow checker proves every read is
         // after a write. Drop flags start at 0, except for parameters, which own their values.
         let mut by_type: Vec<(String, Vec<String>)> = Vec::new();
@@ -2863,8 +2908,8 @@ impl FnGen<'_, '_> {
                     frame_init.push(format!("L.m{i}_{k} = 1;"));
                 }
             }
-            if in_place.contains(&i) {
-                // No local: it is the pointee, `(*p{i})`.
+            if in_place.contains(&i) || (i == 0 && self.r1) {
+                // No local: it is the pointee, `(*p{i})` (or `(*out)`).
                 continue;
             }
             // A dropped parameter (see `param_dropped`) has no `p{i}`; its
@@ -2973,8 +3018,11 @@ impl FnGen<'_, '_> {
         self.blocks(&order);
         self.kstr_finish();
         self.out.push_str("}\n");
-        if !in_place.is_empty() {
-            let map: Vec<(String, String)> = in_place.iter().map(|i| (format!("l{i}"), format!("(*p{i})"))).collect();
+        if !in_place.is_empty() || self.r1 {
+            let mut map: Vec<(String, String)> = in_place.iter().map(|i| (format!("l{i}"), format!("(*p{i})"))).collect();
+            if self.r1 {
+                map.push(("l0".into(), "(*out)".into()));
+            }
             let text = rename_idents(&self.out[body_start..], &map);
             self.out.truncate(body_start);
             self.out.push_str(&text);
@@ -3095,6 +3143,21 @@ impl FnGen<'_, '_> {
             return Some(Unw::Abort);
         }
         self.stmt_unw.get(&(bi as u32, si as u32)).map(|&u| Unw::Goto(u))
+    }
+
+    /// R1's caller rule, for a call whose result goes straight into whole local `l` of type
+    /// `t` (the `direct` path). Under R1 a callee that returns through the out pointer writes
+    /// its result there as it runs, not only at its return, so no reference may reach the
+    /// storage during the call. A local with no value on any path here has no live reference
+    /// into it (borrowck): a type with drop glue shows that by its clear flag (`direct` asks
+    /// for it), a type with none by `flags_maybe_set`, which tracks every local. Else a local
+    /// the body never borrows will do. Promoted locals are static storage: never.
+    fn r1_out_ok(&self, l: Local, t: &CTy) -> bool {
+        if !inplace(self.p).r1 || !ret_by_out(self.p, t) {
+            return true;
+        }
+        let clear = self.flags_at_term.get(self.cur_bb).is_some_and(|f| !f[l as usize]);
+        !self.body.promoted.contains(&l) && (needs_drop_c(self.p, t) || clear || !self.borrowed[l as usize])
     }
 
     /// `return <placeholder>;` for a frame that leaves by unwinding: the
@@ -3819,6 +3882,29 @@ impl FnGen<'_, '_> {
         // drop writes it directly: a value left there by a panic is never
         // read, and the statement's own check follows (`function`).
         let unw = self.unw.filter(|_| self.unw_call || drop || !dest.proj.is_empty());
+        // R3: a value that cannot unwind at any point, into a whole local that holds no value
+        // on any path here (its flag is statically clear): there is no old value to drop and
+        // no panic can come between the write and the flag set, so the local is written
+        // directly, with no temporary and no check.
+        if unw.is_some()
+            && self.r3_value
+            && !self.unw_call
+            && dest.proj.is_empty()
+            && !mentions
+            && drop
+            && self.dflags.test(self.at, dest.local) == Some(false)
+        {
+            let (_, refill) = self.drop_old_value(dest, &d, &dt);
+            let _ = writeln!(self.out, "    {d} = {value};");
+            for p in &post {
+                let _ = writeln!(self.out, "    {p}");
+            }
+            if !refill.is_empty() {
+                let _ = writeln!(self.out, "   {refill}");
+            }
+            self.out.push_str("  }\n");
+            return;
+        }
         if let Some(u) = unw {
             // panic=unwind: the value goes to a temporary first and the
             // check runs before the old value drops or the place is
@@ -3953,6 +4039,7 @@ impl FnGen<'_, '_> {
                 }
                 let mentions = rvalue_mentions(rv, dest.local);
                 let dest_cty = self.place(dest, &loc).1;
+                self.r3_value = inplace(self.p).r3 && !crate::ir::dropflags::may_panic_before_moves(dest, rv);
                 self.emit_assign(dest, mentions, &loc, |s, loc, post| match rv {
                     // A never value (which shares the unit C form) used
                     // where another type is expected never actually
@@ -3964,6 +4051,7 @@ impl FnGen<'_, '_> {
                     }
                     _ => s.rvalue(rv, loc, post),
                 });
+                self.r3_value = false;
                 if kguard {
                     self.out.push_str("  }\n");
                 }
@@ -4060,7 +4148,8 @@ impl FnGen<'_, '_> {
                     && matches!(target, CallTarget::Fn(_) | CallTarget::Dyn(_) | CallTarget::Indirect(_))
                     && (!needs_drop_c(self.p, &dest_cty)
                         || self.flags_at_term.get(self.cur_bb).is_some_and(|f| !f[dest.local as usize])
-                        || self.dflags.test(self.at, dest.local) == Some(false));
+                        || self.dflags.test(self.at, dest.local) == Some(false))
+                    && self.r1_out_ok(dest.local, &dest_cty);
                 if direct {
                     let d = self.place(dest, &loc).0;
                     self.out.push_str("  {\n");
@@ -4115,7 +4204,10 @@ impl FnGen<'_, '_> {
                 if self.zc_frame && !self.zc_in_cleanup {
                     self.out.push_str("  L.st = 0;\n");
                 }
-                if self.ret_large {
+                if self.r1 {
+                    // R1: the value is already in the caller's storage.
+                    self.out.push_str("  return;\n")
+                } else if self.ret_large {
                     self.out.push_str("  *out = l0; return;\n")
                 } else {
                     self.out.push_str("  return l0;\n")
@@ -14066,6 +14158,57 @@ mod tests {
             let (kc, sc) = (code(keep), code(sum));
             assert!(!kc.contains("l2 = *p2") && kc.contains("L.pl2 = &(*p2);"), "keep uses its parameter in place:\n{kc}");
             assert!(sc.contains("l1 = *p1"), "sum, whose parameter has nothing to drop (no frame), copies it in:\n{sc}");
+        });
+    }
+
+    /// Release C with unwind tables, `inplace` at its default (both rules): a fn that returns over 32 bytes
+    /// builds its value in `(*out)` and copies nothing at its return, and one that returns a
+    /// call's result passes its own out storage on (R1); an aggregate of plain operands
+    /// assigned to a fresh local with drop glue is written with no temporary (R3).
+    #[test]
+    fn values_are_built_in_their_final_place() {
+        if std::env::var("LUST_RELEASE_INPLACE").is_ok() {
+            return;
+        }
+        let src = "struct Big { a: u64, b: u64, c: u64, d: u64, e: u64 }\nstruct S { v: Vec<u32>, n: u32 }\n\
+                   #[inline(never)]\nfn make(n: u64) -> Big { Big { a: n, b: n + 1, c: n + 2, d: n + 3, e: n + 4 } }\n\
+                   #[inline(never)]\nfn chain(n: u64) -> Big { make(n * 2) }\n\
+                   #[inline(never)]\nfn fresh(v: Vec<u32>, n: u32) -> usize { let s: S; s = S { v, n }; s.v.len() + s.n as usize }\n\
+                   fn main() { println!(\"{} {}\", chain(3).e, fresh(vec![1], 2)); }\n";
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = crate::def::CrateIds { local: crate::def::LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("test.rs", false) };
+        let mut program = collect::collect(std::sync::Arc::new(ast), interner.clone(), known.clone(), ids).unwrap();
+        (program.unwind, program.unwind_tables) = (true, true);
+        let mut map = SourceMap::default();
+        map.add_file("test.rs", src);
+        let n = program.fns.len();
+        let slots: Vec<u32> = (0..n as u32).collect();
+        let names = std::sync::Arc::new(names::Names {
+            fns: (0..n).map(|s| Some(format!("{s:016x}"))).collect(),
+            adts: (0..program.adts.len()).map(|a| format!("t{a}")).collect(),
+            by_id: Default::default(),
+        });
+        let [make, chain, fresh] = ["make", "chain", "fresh"].map(|f| program.fn_names[&interner.intern(f)]);
+        names::with(Some(&names), || {
+            let code = |f: LocalDefId| {
+                let (ck, errs) = check_fn(&program, f);
+                assert!(errs.is_empty(), "{errs:?}");
+                gen_fn(&program, &crate::lower::lower(&program, f, ck), &map, 1, &slots).code_text().into_owned()
+            };
+            let (mc, cc, fc) = (code(make), code(chain), code(fresh));
+            for (name, c) in [("make", &mc), ("chain", &cc)] {
+                assert!(!c.contains("*out = l0") && !c.contains(" l0") && c.contains("(*out)"), "{name} builds its value in (*out):\n{c}");
+            }
+            assert!(cc.contains("&(*out)"), "chain passes its own out storage to make:\n{cc}");
+            // A temporary holding the aggregate: `T tN = ((T){ ... });`.
+            let temp = fc.lines().any(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                w.windows(3).any(|w| w[0].len() > 1 && w[0].starts_with('t') && w[0][1..].bytes().all(|b| b.is_ascii_digit()) && w[1] == "=" && w[2].starts_with("(("))
+            });
+            assert!(!temp, "fresh writes its new S with no temporary:\n{fc}");
         });
     }
 

@@ -518,7 +518,9 @@ fn liveness(
 /// Whether an assignment of `rv` to `dest` can panic before its moves are done: an indexed
 /// destination's bounds check, or making the value (lowering's `may_unwind` rule for an
 /// rvalue: moves, borrows and value building of plain operands with no indexed place cannot).
-fn may_panic_before_moves(dest: &Place, rv: &Rvalue) -> bool {
+/// When false, the assignment cannot unwind at any point (it makes no call): cgen's R3 rule
+/// relies on that stronger fact.
+pub(crate) fn may_panic_before_moves(dest: &Place, rv: &Rvalue) -> bool {
     let indexed = |pl: &Place| pl.proj.iter().any(|p| matches!(p, Proj::Index(_)));
     let op_indexed = |o: &Operand| matches!(o, Operand::Copy(pl) | Operand::Move(pl) if indexed(pl));
     if indexed(dest) {
