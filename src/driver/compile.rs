@@ -4899,15 +4899,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     asm_ms[0] = t_asm.elapsed().as_secs_f64() * 1e3;
     // The cc stream, started during codegen (above).
     let stream = stream_start.and_then(|h| h.join().ok()).flatten();
-    // Release C glue shards come after the fn units (`link_fn_units` counts both). Their cut is
-    // made here, their texts beside the statics unit (below).
-    let shard_keys = match &rgroups {
-        Some(_) => cgen::names::with(rn, || cgen::names::glue_shard_keys(&caches.glue, &caches.out, super::release_c::shard_bytes())),
-        None => Vec::new(),
-    };
-    let n_shards = shard_keys.len();
+    // Release C glue shards come after the fn units (`link_fn_units` counts both). Their cut
+    // and their texts are made beside the statics unit (below).
+    let mut n_shards = 0usize;
     let mut rshards: Vec<String> = Vec::new();
-    asm_ms[1] = t_asm.elapsed().as_secs_f64() * 1e3;
     // B1 (below): the release C fn units cc takes with a fingerprint, by unit name, and whether
     // without text (a skipped assembly).
     let mut b1_units: FxMap<String, (u128, bool)> = FxMap::default();
@@ -4919,7 +4914,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         None => par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay))),
         Some(rg) => {
             let statics_out: std::sync::Mutex<Vec<String>> = Default::default();
-            let first_statics = FIRST_FN_UNIT + rg.len() + n_shards;
+            // The parts' first unit number, sent when the shard cut is done (below). The statics
+            // unit's thread waits for it only once its parts are made.
+            let (first_tx, first_rx) = std::sync::mpsc::channel::<usize>();
+            let first_rx = std::sync::Mutex::new(first_rx);
             let mut jobs: Vec<usize> = vec![0, 1, 2, 3, LOC_UNIT];
             jobs.extend((0..rg.len()).map(|g| g + FIRST_FN_UNIT));
             // Cross-unit inlining for the LLVM backend (cgen/ll.rs `ll_inline_set`): per fn
@@ -5006,8 +5004,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         target => {
                             let (index, parts) = cgen::names::statics_parts(&program, &caches.glue, target);
                             let parts: Vec<String> = parts.into_iter().map(|t| adapt(t, &Default::default())).collect();
-                            if let Some(s) = &stream {
-                                par_map(&(0..parts.len()).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first_statics + j), &parts[j]));
+                            if let Some(s) = &stream
+                                && let Ok(first) = first_rx.lock().unwrap_or_else(|e| e.into_inner()).recv()
+                            {
+                                par_map(&(0..parts.len()).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first + j), &parts[j]));
                             }
                             *statics_out.lock().unwrap_or_else(|e| e.into_inner()) = parts;
                             (adapt(index, &Default::default()), String::new())
@@ -5056,55 +5056,64 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // release C: +11.5% at 1000, +3.7% at 100000, run speed the same.
             let copy_min: u64 = std::env::var("LUST_LL_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
             let hot = (llvm_on && copy_min > 0).then(|| crate::cc::pgo::hot_ids(&dir.join("cc"), copy_min).ok().flatten()).flatten();
-            // The statics unit is one long job (~300 ms for tsgo). With C units only (no copy
-            // sets, and no C refs read from its text) it assembles on a thread of its own, beside
-            // the glue shards and every other part of the assembly below, not before the fn units.
+            // The statics unit is one long job (~150-300 ms for tsgo). With C units only (no copy
+            // sets, and no C refs read from its text) it assembles on a thread of its own from the
+            // start, beside the glue shards' cut and every other part of the assembly below, not
+            // before the fn units: on a build with few changes it ended the assembly.
             let late_statics = !llvm_on;
             let early: Vec<usize> = c_jobs.iter().copied().filter(|&u| !(late_statics && u == 1)).collect();
             // With C units only, the early C units are a pass of their own (below), and the first
             // pass makes the inline sets alone.
             let n_early = if late_statics { 0 } else { early.len() };
             let first: Vec<usize> = early[..n_early].iter().copied().chain(0..rg.len()).collect();
-            // The last build's records name their reads by index in the session's table: the
-            // pass below fingerprints each distinct one once (many units read one type).
-            let old_ids: Vec<u32> = if !b1_record || caches.unit_records.is_empty() {
-                Vec::new()
-            } else {
-                let mut used = vec![false; caches.unit_reads.len()];
-                caches.unit_records.values().flat_map(|u| &u.reads).for_each(|&(i, _)| used[i as usize] = true);
-                (0..caches.unit_reads.len() as u32).filter(|&i| used[i as usize]).collect()
-            };
-            b1_ms[1] = t_b1.elapsed().as_secs_f64() * 1e3 - b1_ms[0];
-            // B1's fingerprints of the last build's reads, in two passes of their own (`par_map`
-            // hands out a pass's jobs in batches, so behind thousands of cheap jobs a few workers
-            // took them all), each in parts: first the reads the glue shards' records hold (a shard
-            // clean by them is not made), then the rest, beside the shards' texts.
-            let (shard_ids_of_reads, rest_ids): (Vec<u32>, Vec<u32>) = {
-                let mut by_shard = vec![false; caches.unit_reads.len()];
-                caches.unit_records.iter().filter(|(reg, _)| reg.starts_with(SHARD_RECORD)).flat_map(|(_, u)| &u.reads).for_each(|&(i, _)| by_shard[i as usize] = true);
-                old_ids.iter().copied().partition(|&i| by_shard[i as usize])
-            };
-            let in_parts = |ids: &[u32]| -> Vec<std::ops::Range<usize>> {
-                let step = ids.len().div_ceil(b1_shards).max(1);
-                (0..ids.len()).step_by(step).map(|a| a..(a + step).min(ids.len())).collect()
-            };
-            let (first_parts, rest_parts) = (in_parts(&shard_ids_of_reads), in_parts(&rest_ids));
-            // B1 for the glue shards: a shard is its keys (their prototypes, in order) under B1's
-            // switches; its record goes by a name of that identity (its unit number moves with the
-            // fn units'). `unit_id` and `rg[g].0` of the fn units, for shard `j` at `rg.len() + j`.
-            let shard_ids: Vec<(u64, u64)> = shard_keys
-                .iter()
-                .map(|keys| {
-                    let mut parts: Vec<&[u8]> = vec![SHARD_RECORD.as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()];
-                    parts.extend(keys.iter().map(|k| caches.glue.protos[*k].as_bytes()));
-                    crate::driver::cache::hash128(&parts, 17)
-                })
-                .collect();
-            let shard_reg: Vec<String> = shard_ids.iter().map(|(a, b)| format!("{SHARD_RECORD}{a:016x}{b:016x}")).collect();
-            let reg_of = |g: usize| if g < rg.len() { rg[g].0.as_str() } else { shard_reg[g - rg.len()].as_str() };
-            let id_of = |g: usize| if g < rg.len() { unit_id(g) } else { shard_ids[g - rg.len()] };
             std::thread::scope(|sc| {
+                // Moved in: should the cut panic, the sender drops as this unwinds, and the statics
+                // thread's wait ends (with no number) before the scope waits for that thread.
+                let first_tx = first_tx;
                 let statics = late_statics.then(|| sc.spawn(|| assemble(1, &[], None)));
+                let shard_keys = cgen::names::with(rn, || cgen::names::glue_shard_keys(&caches.glue, &caches.out, super::release_c::shard_bytes()));
+                n_shards = shard_keys.len();
+                let _ = first_tx.send(FIRST_FN_UNIT + rg.len() + n_shards);
+                asm_ms[1] = t_asm.elapsed().as_secs_f64() * 1e3;
+                // The last build's records name their reads by index in the session's table: the
+                // pass below fingerprints each distinct one once (many units read one type).
+                let t_old = Instant::now();
+                let old_ids: Vec<u32> = if !b1_record || caches.unit_records.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut used = vec![false; caches.unit_reads.len()];
+                    caches.unit_records.values().flat_map(|u| &u.reads).for_each(|&(i, _)| used[i as usize] = true);
+                    (0..caches.unit_reads.len() as u32).filter(|&i| used[i as usize]).collect()
+                };
+                // B1's fingerprints of the last build's reads, in two passes of their own (`par_map`
+                // hands out a pass's jobs in batches, so behind thousands of cheap jobs a few workers
+                // took them all), each in parts: first the reads the glue shards' records hold (a shard
+                // clean by them is not made), then the rest, beside the shards' texts.
+                let (shard_ids_of_reads, rest_ids): (Vec<u32>, Vec<u32>) = {
+                    let mut by_shard = vec![false; caches.unit_reads.len()];
+                    caches.unit_records.iter().filter(|(reg, _)| reg.starts_with(SHARD_RECORD)).flat_map(|(_, u)| &u.reads).for_each(|&(i, _)| by_shard[i as usize] = true);
+                    old_ids.iter().copied().partition(|&i| by_shard[i as usize])
+                };
+                b1_ms[1] = t_old.elapsed().as_secs_f64() * 1e3;
+                let in_parts = |ids: &[u32]| -> Vec<std::ops::Range<usize>> {
+                    let step = ids.len().div_ceil(b1_shards).max(1);
+                    (0..ids.len()).step_by(step).map(|a| a..(a + step).min(ids.len())).collect()
+                };
+                let (first_parts, rest_parts) = (in_parts(&shard_ids_of_reads), in_parts(&rest_ids));
+                // B1 for the glue shards: a shard is its keys (their prototypes, in order) under B1's
+                // switches; its record goes by a name of that identity (its unit number moves with the
+                // fn units'). `unit_id` and `rg[g].0` of the fn units, for shard `j` at `rg.len() + j`.
+                let shard_ids: Vec<(u64, u64)> = shard_keys
+                    .iter()
+                    .map(|keys| {
+                        let mut parts: Vec<&[u8]> = vec![SHARD_RECORD.as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()];
+                        parts.extend(keys.iter().map(|k| caches.glue.protos[*k].as_bytes()));
+                        crate::driver::cache::hash128(&parts, 17)
+                    })
+                    .collect();
+                let shard_reg: Vec<String> = shard_ids.iter().map(|(a, b)| format!("{SHARD_RECORD}{a:016x}{b:016x}")).collect();
+                let reg_of = |g: usize| if g < rg.len() { rg[g].0.as_str() } else { shard_reg[g - rg.len()].as_str() };
+                let id_of = |g: usize| if g < rg.len() { unit_id(g) } else { shard_ids[g - rg.len()] };
                 // Beside the statics unit and the C units (with C units only), each a pass of its own
                 // on the pool: B1's fingerprints of the reads the glue shards' records hold, then the
                 // glue shards beside the fingerprints of the other reads. None reads the others' text,
