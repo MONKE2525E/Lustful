@@ -214,6 +214,12 @@ pub enum ReadKey {
     /// candidate trait. A `use` edit flips it without touching any
     /// binding the body names. The fingerprint is the answer.
     TraitInScope(ModKey, DefId),
+    /// Whether one module imports the std item `<std|core|alloc>::<module>::<name>` at
+    /// module level (any rename, `as _`), or with `name` the glob marker `*`, a glob of
+    /// that std module. Method probes ask it for the std traits a call by name needs in
+    /// scope (`std::ops::Add`, `fmt::Display`, `hash::Hash`): removing the import flips
+    /// the answer and no binding the body names (Sol's read-gap review r06).
+    StdImport(ModKey, Sym, Sym),
     /// The derive list of one local Adt template (PLAN R12): every
     /// `Program::derives_of` call inside a body check, and every selection
     /// of a derivable trait whose Self head is the Adt (a derived impl is a
@@ -2943,6 +2949,28 @@ impl<'a> Program {
         ans
     }
 
+    /// Whether `module` imports the std item `std_mod::name` (or with `name` `*`, globs
+    /// `std_mod`) at module level, recorded as a `StdImport` read.
+    pub(crate) fn std_import(&self, reads: &mut Reads, module: ModuleId, std_mod: &str, name: &str) -> bool {
+        let (std_mod, name) = (self.interner.intern(std_mod), self.interner.intern(name));
+        let ans = self.std_import_answer(module, std_mod, name);
+        reads.record_with(ReadKey::StdImport(self.mod_key(module), std_mod, name), !ans, || trait_in_scope_fingerprint(ans));
+        ans
+    }
+
+    /// The `std_import` answer without recording.
+    pub(crate) fn std_import_answer(&self, module: ModuleId, std_mod: Sym, name: Sym) -> bool {
+        let Some(res) = &self.resolved else { return false };
+        let roots = |s: Sym| matches!(self.interner.get(s), "std" | "core" | "alloc");
+        if self.interner.get(name) == "*" {
+            return res.std_globs.iter().any(|(m, path)| *m == module && path.len() == 2 && roots(path[0]) && path[1] == std_mod);
+        }
+        let ns = crate::resolve::imports::ns_index(Namespace::Type) as u8;
+        res.std_aliases
+            .iter()
+            .any(|(&(m, n, _), (_, path))| m == module && n == ns && path.len() == 3 && roots(path[0]) && path[1] == std_mod && path[2] == name)
+    }
+
     /// The `trait_in_module` answer without recording. See `binding_res`.
     pub(crate) fn trait_in_module_answer(&self, module: ModuleId, trait_def: DefId) -> bool {
         use crate::resolve::imports::{BindState, ns_index};
@@ -3012,6 +3040,10 @@ impl<'a> Program {
             ReadKey::Checked(_) => Read { fingerprint: Fingerprint(u64::MAX), failed: true },
             ReadKey::TraitInScope(module, trait_def) => {
                 let ans = self.mod_of_key(*module).is_some_and(|m| self.trait_in_module_answer(m, *trait_def));
+                Read { fingerprint: trait_in_scope_fingerprint(ans), failed: !ans }
+            }
+            ReadKey::StdImport(module, std_mod, name) => {
+                let ans = self.mod_of_key(*module).is_some_and(|m| self.std_import_answer(m, *std_mod, *name));
                 Read { fingerprint: trait_in_scope_fingerprint(ans), failed: !ans }
             }
             ReadKey::Derives(def) => Read { fingerprint: derives_fingerprint(self, *def), failed: self.adt_by_def(*def).is_none() },
@@ -3356,7 +3388,7 @@ impl Program {
                     self.gx.index.by_def(d).is_none_or(|(_, rec)| reach.record(&self.tys, rec) || rec.items.iter().any(|&it| self.sig_moves(m, it)))
                 })
             }
-            ReadKey::Checked(_) | ReadKey::TraitInScope(..) | ReadKey::AssocVis(..) => false,
+            ReadKey::Checked(_) | ReadKey::TraitInScope(..) | ReadKey::StdImport(..) | ReadKey::AssocVis(..) => false,
         }
     }
 
@@ -3423,7 +3455,7 @@ impl Program {
                 _ => Some(false),
             },
             ReadKey::MethodSet(k) => Some(matches!(k.head, Head::Adt(d) if row(d)) || m.names.contains_key(&k.name)),
-            ReadKey::Checked(_) | ReadKey::TraitInScope(..) | ReadKey::AssocVis(..) => Some(false),
+            ReadKey::Checked(_) | ReadKey::TraitInScope(..) | ReadKey::StdImport(..) | ReadKey::AssocVis(..) => Some(false),
             // As `sig_moves` answers for an Adt def (no fn has that def).
             ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) | ReadKey::DropCk(d) | ReadKey::Structure(d) | ReadKey::Answer(d, _) => match self.adt_by_def(*d) {
                 None => Some(true),

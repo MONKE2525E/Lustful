@@ -529,6 +529,46 @@ def generic_callee_ret(rng):
     return base.format(t=a), base.format(t=b), "String", body
 
 
+# ---- traits that enter or leave scope (Sol's read-gap review r06: a std trait's import) ----
+def _scope_pair(rng, with_import, user):
+    if user:
+        head = "mod t {\n    pub trait Add2 {\n        fn add(self, o: super::S) -> u8;\n    }\n    impl Add2 for super::S {\n        fn add(self, _o: super::S) -> u8 {\n            7\n        }\n    }\n}\n\n"
+        use = "use t::Add2;\n"
+        imp = ""
+    else:
+        head = ""
+        use = "use std::ops::Add;\n"
+        imp = "impl std::ops::Add for S {\n    type Output = u8;\n    fn add(self, _o: S) -> u8 {\n        7\n    }\n}\n\n"
+    mine = "trait Mine {\n    fn add(&self, _o: S) -> u8 {\n        9\n    }\n}\n\nimpl Mine for S {}\n"
+    return (use if with_import else "") + "\n#[derive(Clone, Copy)]\nstruct S;\n\n" + head + imp + mine
+
+
+@family("scope")
+def std_trait_import_removed(rng):
+    body = "    S.add(S)"
+    return _scope_pair(rng, True, False), _scope_pair(rng, False, False), "u8", body
+
+
+@family("scope")
+def std_trait_import_added(rng):
+    body = "    S.add(S)"
+    return _scope_pair(rng, False, False), _scope_pair(rng, True, False), "u8", body
+
+
+@family("scope")
+def user_trait_import_removed(rng):
+    body = "    S.add(S)"
+    return _scope_pair(rng, True, True), _scope_pair(rng, False, True), "u8", body
+
+
+@family("scope")
+def std_glob_removed(rng):
+    v1 = "use std::ops::*;\n\nstruct S;\n\nimpl Add for S {\n    type Output = u8;\n    fn add(self, _o: S) -> u8 {\n        7\n    }\n}\n"
+    v2 = "struct S;\n\nimpl std::ops::Add for S {\n    type Output = u8;\n    fn add(self, _o: S) -> u8 {\n        7\n    }\n}\n"
+    body = "    S.add(S)"
+    return v1, v2, "u8", body
+
+
 FORMS = ["plain", "generic", "closure", "method"]
 
 

@@ -65,7 +65,7 @@ impl<'p> Ctx<'p> {
     /// path, or the trait of the impl this body is in (rustc puts an
     /// impl's own trait in scope inside it). Globs and `as _` imports do
     /// not count yet, which can only reject.
-    pub(super) fn fmt_trait_in_scope(&self, kind: FmtKind) -> bool {
+    pub(super) fn fmt_trait_in_scope(&mut self, kind: FmtKind) -> bool {
         let p = self.p;
         let (trait_def, name) = match kind {
             FmtKind::Display => (p.gx.lang.display, "Display"),
@@ -79,7 +79,7 @@ impl<'p> Ctx<'p> {
     /// any rename, `as _`), or an enclosing block does (`Ast::use_traits`
     /// paths in `std_trait_scopes`). Module-level globs do not count
     /// yet, which can only reject.
-    pub(super) fn std_trait_imported(&self, module: &str, name: &str) -> bool {
+    pub(super) fn std_trait_imported(&mut self, module: &str, name: &str) -> bool {
         let p = self.p;
         if self.std_trait_scopes.iter().flat_map(|layer| layer.iter()).any(|path| {
             path.len() == 3
@@ -89,27 +89,17 @@ impl<'p> Ctx<'p> {
         }) {
             return true;
         }
-        let Some(res) = &p.resolved else { return false };
-        let ns = crate::resolve::imports::ns_index(Namespace::Type) as u8;
-        res.std_aliases.iter().any(|(&(m, n, _), (_, path))| {
-            m == self.module
-                && n == ns
-                && path.len() == 3
-                && matches!(p.interner.get(path[0]), "std" | "core" | "alloc")
-                && p.interner.get(path[1]) == module
-                && p.interner.get(path[2]) == name
-        })
+        // The module's imports: a `StdImport` read, so removing the `use`
+        // checks this body again (Sol's read-gap review r06).
+        p.std_import(&mut self.out.reads, self.module, module, name)
     }
 
     /// True when a glob of std module `module` (or core's: `std::ops::*`,
     /// `std::hash::*`) is imported into this body's module: it brings
-    /// every trait of that module in scope.
-    pub(super) fn std_glob(&self, module: &str) -> bool {
+    /// every trait of that module in scope. Recorded as a `StdImport` read.
+    pub(super) fn std_glob(&mut self, module: &str) -> bool {
         let p = self.p;
-        let Some(res) = &p.resolved else { return false };
-        res.std_globs.iter().any(|(m, path)| {
-            *m == self.module && path.len() == 2 && matches!(p.interner.get(path[0]), "std" | "core") && p.interner.get(path[1]) == module
-        })
+        p.std_import(&mut self.out.reads, self.module, module, "*")
     }
 
     /// `enclosing_impl_trait` for the other std trait modules.
@@ -442,7 +432,7 @@ impl<'p> Ctx<'p> {
     }
 
     /// True when `fmt::Write` is in scope by a `use` of its std path.
-    fn fmt_write_in_scope(&self) -> bool {
+    fn fmt_write_in_scope(&mut self) -> bool {
         self.std_trait_imported("fmt", "Write")
     }
 

@@ -132,6 +132,7 @@ pub(super) fn apply_derives(
                     K::DropCk(_) => "DropCk",
                     K::Checked(_) => "Checked",
                     K::TraitInScope(..) => "TraitInScope",
+                    K::StdImport(..) => "StdImport",
                     K::Derives(_) => "Derives",
                     K::DeriveBits(..) => "DeriveBits",
                     K::LangImpls(_) => "LangImpls",
