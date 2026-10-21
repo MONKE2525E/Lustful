@@ -480,6 +480,55 @@ def generic_layout_instance(rng):
     return base.format(t=t1), base.format(t=t2), "u64", body
 
 
+# ---- header-only edits (the daemon's header delta keeps its program for these) ----
+@family("headers")
+def callee_ret_type(rng):
+    a, b = rng.choice([("u8", "u16"), ("u16", "u32"), ("i8", "i64")])
+    base = "fn g() -> {t} {{\n    100\n}}\n"
+    body = "    let v = g();\n    format!(\"{} {}\", v.wrapping_mul(3), std::mem::size_of_val(&v))"
+    return base.format(t=a), base.format(t=b), "String", body
+
+
+@family("headers")
+def callee_param_type(rng):
+    a, b = rng.choice([("u8", "u16"), ("u16", "u64")])
+    base = "fn g(x: {t}) -> u64 {{\n    x as u64\n}}\n"
+    body = "    let a = 250;\n    let r = g(a);\n    r + a.wrapping_add(10) as u64"
+    return base.format(t=a), base.format(t=b), "u64", body
+
+
+@family("headers")
+def trait_method_sig(rng):
+    a, b = rng.choice([("u8", "u16"), ("u32", "u8")])
+    base = "trait Tr {{\n    fn m(&self) -> {t};\n}}\n\nstruct S;\n\nimpl Tr for S {{\n    fn m(&self) -> {t} {{\n        200\n    }}\n}}\n"
+    body = "    let v = S.m();\n    format!(\"{} {}\", v.wrapping_add(100), std::mem::size_of_val(&v))"
+    return base.format(t=a), base.format(t=b), "String", body
+
+
+@family("headers")
+def const_type(rng):
+    a, b = rng.choice([("u8", "u16"), ("u16", "u8")])
+    base = "const K: {t} = 200;\n"
+    body = "    let v = K;\n    format!(\"{} {}\", v.wrapping_add(100), std::mem::size_of_val(&v))"
+    return base.format(t=a), base.format(t=b), "String", body
+
+
+@family("headers")
+def static_type(rng):
+    a, b = rng.choice([("u8", "u16"), ("u32", "u8")])
+    base = "static G: {t} = 200;\n"
+    body = "    let v = G;\n    format!(\"{} {}\", v.wrapping_add(100), std::mem::size_of_val(&v))"
+    return base.format(t=a), base.format(t=b), "String", body
+
+
+@family("headers")
+def generic_callee_ret(rng):
+    a, b = rng.choice([("u8", "u16"), ("u16", "u32")])
+    base = "fn g<T: Copy>(_t: T) -> {t} {{\n    100\n}}\n"
+    body = "    let v = g(1u8);\n    format!(\"{} {}\", v.wrapping_mul(3), std::mem::size_of_val(&v))"
+    return base.format(t=a), base.format(t=b), "String", body
+
+
 FORMS = ["plain", "generic", "closure", "method"]
 
 
@@ -493,6 +542,45 @@ def split(items, form, ret, body, rng, header):
     return {"main.rs": main, "body.rs": f"#[allow(unused_imports)]\nuse super::*;\n\n{fdef}"}
 
 
+def publish(items):
+    """`items` as a library crate's source: every top-level item, field and inherent impl item
+    pub, so a dependent crate can name them (tuple fields too)."""
+    out, ctx = [], []
+    for line in items.splitlines():
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if indent == 0 and re.match(r"(struct|enum|fn|trait|type|const|static|mod)\b", stripped):
+            m = re.match(r"struct (\w+)(<[^>]*>)?\((.*)\);$", stripped)
+            if m:
+                fields = ", ".join("pub " + f.strip() for f in m.group(3).split(","))
+                line = f"pub struct {m.group(1)}{m.group(2) or ''}({fields});"
+            else:
+                line = "pub " + line
+        if indent == 0 and stripped.endswith("{"):
+            kind = "struct" if re.match(r"(pub )?struct\b", stripped) else ("inherent" if re.match(r"impl(<[^>]*>)? \w+(<[^>]*>)? \{$", stripped) else "other")
+            ctx = [kind]
+        elif indent == 0 and stripped.startswith("}"):
+            ctx = []
+        elif indent == 4 and ctx == ["struct"] and re.match(r"\w+:", stripped):
+            line = "    pub " + stripped
+        elif indent == 4 and ctx == ["inherent"] and re.match(r"(fn|const)\b", stripped):
+            line = "    pub " + stripped
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def dep_history(items1, items2, form, ret, body, rng, header):
+    """The program as a Cargo package whose items live in a path dependency `dep` (an edit
+    there under an unchanged dependent crate). Versions are overlays (tests/daemon cargo
+    layout): v1 the whole package, v2 and v3 only dep/src/lib.rs."""
+    fdef, call = wrap(form, ret, body, rng)
+    main = f"{header}#[allow(unused_imports)]\nuse dep::*;\n\n{fdef}\nfn main() {{\n    println!(\"{{:?}}\", {call});\n}}\n"
+    manifest = '[package]\nname = "scen"\nversion = "0.1.0"\nedition = "2024"\n\n[workspace]\n\n[dependencies]\ndep = { path = "dep", version = "0.1" }\n'
+    dep_manifest = '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2024"\n'
+    v1 = {"Cargo.toml": manifest, "src/main.rs": main, "dep/Cargo.toml": dep_manifest, "dep/src/lib.rs": publish(items1)}
+    return [v1, {"dep/src/lib.rs": publish(items2)}, {"dep/src/lib.rs": publish(items1)}]
+
+
 def history(name, rng):
     cls, fn = FAMILIES[name]
     items1, items2, ret, body = fn(rng)
@@ -500,7 +588,10 @@ def history(name, rng):
     if form == "closure" and ("format!" in body or "let " in body):
         body = "\n".join("    " + l for l in body.splitlines())
     header = f"// read-gap history: family {name} ({cls}), form {form}\n"
-    if rng.random() < 0.4:
+    pick = rng.random()
+    if pick < 0.2 and not any(k in items1 + items2 for k in ("use ", "macro_rules", "static ")) and form != "method":
+        return form + "-dep", dep_history(items1, items2, form, ret, body, rng, header)
+    if pick < 0.5:
         v1 = split(items1, form, ret, body, rng, header)
         v2 = split(items2, form, ret, body, rng, header)
         return form + "-split", [v1, v2, v1]
@@ -528,11 +619,15 @@ def main():
         form, versions = history(name, rng)
         d = os.path.join(a.out, f"rg-{name}-{form}-{a.seed}-{k}")
         os.makedirs(d, exist_ok=True)
+        if form.endswith("-dep"):
+            with open(os.path.join(d, "cargo"), "w") as f:
+                f.write("src/main.rs --bin scen\n")
         for i, src in enumerate(versions, 1):
             if isinstance(src, dict):
                 vd = os.path.join(d, f"v{i}")
                 os.makedirs(vd, exist_ok=True)
                 for fname, text in src.items():
+                    os.makedirs(os.path.dirname(os.path.join(vd, fname)), exist_ok=True)
                     with open(os.path.join(vd, fname), "w") as f:
                         f.write(text)
             else:
