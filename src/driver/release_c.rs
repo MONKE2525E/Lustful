@@ -75,11 +75,14 @@ pub fn unit_bytes() -> usize {
 }
 
 /// The target size of a release C glue shard in bytes of glue definitions
-/// (`LUST_RELEASE_SHARD_KB`, default 64). A shard declares the types of all its glue, so a
-/// merge that edits a central type recompiles many shards, and the slowest one bounded the cc
-/// step of a small merge. On tsgo's replay 64 KB beat 128, 32 and 16 KB.
+/// (`LUST_RELEASE_SHARD_KB`, default 16). A shard declares the types its glue reads, so a merge
+/// that changes a central type recompiles the shards whose keys hold it, and the slowest one
+/// bounds the cc step of a small merge. tsgo's replay in CI's shape, three runs against 64 KB:
+/// median lust -20% / -10% / -11%, the small merges' -14% / -11% / -13% (their tail about
+/// halved), compile CPU +3% / -4% / -5%; m9, the biggest merge, +18% / +4% / -1% (about twice
+/// as many shards miss). 24 KB: median -14% / -9.5%; 32 KB: -16%.
 pub fn shard_bytes() -> usize {
-    std::env::var("LUST_RELEASE_SHARD_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64) * 1024
+    std::env::var("LUST_RELEASE_SHARD_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) * 1024
 }
 
 pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32]) -> Vec<(String, Vec<usize>)> {
