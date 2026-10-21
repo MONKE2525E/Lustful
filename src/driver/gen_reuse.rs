@@ -44,6 +44,7 @@ use crate::def::{DefId, LocalDefId};
 use crate::driver::graph::{Read, ReadKey, ReadKeys, Reads};
 use crate::intern::{FxHasher, FxMap};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// One passing template check of a body with no closure expressions:
 /// its trait picks and closure call kinds, by expression offset from
@@ -95,8 +96,10 @@ struct DiscoveryEntry {
     /// When it was stored (`next_stamp`).
     stamp: u64,
     reads: Reads,
-    adt_tys: Vec<OwnedTy>,
-    requests: Vec<(DefId, Vec<OwnedArg>)>,
+    /// Each one shared with the other entries that hold the same type (`GenReuse::shared`).
+    adt_tys: Vec<Arc<OwnedTy>>,
+    /// The args shared as `adt_tys` are (`GenReuse::shared_args`).
+    requests: Vec<(DefId, Arc<[OwnedArg]>)>,
     closures: Vec<OwnedClosure>,
     vtables: Vec<(OwnedTy, OwnedTy)>,
 }
@@ -305,12 +308,16 @@ impl GenReuse {
             }
             7 => drop(take(&mut self.readers_index)),
             8 => self.discovery.values_mut().for_each(|e| drop(take(&mut e.reads))),
-            9 => self.discovery.values_mut().for_each(|e| {
-                drop(take(&mut e.adt_tys));
-                drop(take(&mut e.requests));
-                drop(take(&mut e.closures));
-                drop(take(&mut e.vtables));
-            }),
+            9 => {
+                self.discovery.values_mut().for_each(|e| {
+                    drop(take(&mut e.adt_tys));
+                    drop(take(&mut e.requests));
+                    drop(take(&mut e.closures));
+                    drop(take(&mut e.vtables));
+                });
+                drop(take(&mut self.shared));
+                drop(take(&mut self.shared_args));
+            }
             10 => drop(take(&mut self.keys)),
             _ => {}
         }
@@ -346,6 +353,14 @@ pub struct GenReuse {
     /// check was clean (`store_closure_template`).
     closure_templates: FxMap<DefId, ClosureTemplateEntry>,
     discovery: FxMap<DefId, DiscoveryEntry>,
+    /// The distinct types of the discovery entries' `adt_tys`, each kept once (`share`): on
+    /// tsgo, ~525k such types hold ~50k distinct ones.
+    shared: FxSet<Arc<OwnedTy>>,
+    /// The distinct arg lists of the entries' instance requests, as `shared`.
+    shared_args: FxSet<Arc<[OwnedArg]>>,
+    /// When `shared` and `shared_args` hold this many values together, `store_discovered`
+    /// drops the ones no entry holds.
+    prune_at: usize,
     /// Defs whose last discovery check stored nothing (a body error), so
     /// their entry, if any, is older than what that collect used. Each
     /// keeps that check's output, stamped (`next_stamp`): never replayed,
@@ -423,6 +438,8 @@ impl GenReuse {
         self.templates.clear();
         self.closure_templates.clear();
         self.discovery.clear();
+        self.shared.clear();
+        self.shared_args.clear();
         self.readers_index.clear();
         self.readers_pushed = 0;
         self.unstored.clear();
@@ -1096,11 +1113,11 @@ impl GenReuse {
         let mut requests = Vec::with_capacity(e.requests.len());
         for (def, args) in &e.requests {
             let l = p.local_def(def.hash).filter(|&l| p.def_id(l) == *def)?;
-            requests.push((l, args.clone()));
+            requests.push((l, args.to_vec()));
         }
         e.env = self.env;
         self.discovery_reused += 1;
-        Some((e.adt_tys.clone(), requests, e.closures.clone(), e.vtables.clone()))
+        Some((e.adt_tys.iter().map(|t| (**t).clone()).collect(), requests, e.closures.clone(), e.vtables.clone()))
     }
 
     /// True when a stored check read the body of one of `defs`: a
@@ -1186,7 +1203,14 @@ impl GenReuse {
             } else {
                 (true, Vec::new())
             };
-            let out = held.then(|| (e.adt_tys.clone(), e.requests.clone(), e.closures.clone(), e.vtables.clone()));
+            let out = held.then(|| {
+                (
+                    e.adt_tys.iter().map(|t| (**t).clone()).collect(),
+                    e.requests.iter().map(|(d, a)| (*d, a.to_vec())).collect(),
+                    e.closures.clone(),
+                    e.vtables.clone(),
+                )
+            });
             Some(Prejudged { stamp: e.stamp, held, answers, out })
         })
     }
@@ -1246,7 +1270,12 @@ impl GenReuse {
             return Some(c.clone());
         }
         let e = self.discovery.get(&def)?;
-        Some(OutCopy { adt_tys: e.adt_tys.clone(), requests: e.requests.clone(), closures: e.closures.clone(), vtables: e.vtables.clone() })
+        Some(OutCopy {
+            adt_tys: e.adt_tys.iter().map(|t| (**t).clone()).collect(),
+            requests: e.requests.iter().map(|(d, a)| (*d, a.to_vec())).collect(),
+            closures: e.closures.clone(),
+            vtables: e.vtables.clone(),
+        })
     }
 
     /// Stores the output of one clean discovery check of fn `f`.
@@ -1266,14 +1295,14 @@ impl GenReuse {
         }
         let Some(src) = self.src_of(p, f) else { return };
         self.keep_held(p.def_id(f));
-        let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
+        let requests = requests.iter().map(|(t, args)| (p.def_id(*t), share(&mut self.shared_args, args, |a| Arc::from(a)))).collect();
         let reads = with_own_sig(p, f, reads, &mut self.keys);
         let entry = DiscoveryEntry {
             src,
             env: self.env,
             stamp: next_stamp(),
             reads,
-            adt_tys: adt_tys.to_vec(),
+            adt_tys: adt_tys.iter().map(|t| share(&mut self.shared, t, |t| Arc::new(t.clone()))).collect(),
             requests,
             closures: closures.to_vec(),
             vtables: vtables.to_vec(),
@@ -1281,7 +1310,23 @@ impl GenReuse {
         self.unstored.remove(&p.def_id(f));
         self.index_reads(p, p.def_id(f), &entry.reads);
         self.discovery.insert(p.def_id(f), entry);
+        if self.shared.len() + self.shared_args.len() >= self.prune_at {
+            self.shared.retain(|t| Arc::strong_count(t) > 1);
+            self.shared_args.retain(|a| Arc::strong_count(a) > 1);
+            self.prune_at = (2 * (self.shared.len() + self.shared_args.len())).max(1 << 12);
+        }
     }
+}
+
+/// `t` as the value that every discovery entry holding it shares (`GenReuse::shared`,
+/// `GenReuse::shared_args`); `own` makes the first copy.
+fn share<T: Hash + Eq + ?Sized>(shared: &mut FxSet<Arc<T>>, t: &T, own: impl FnOnce(&T) -> Arc<T>) -> Arc<T> {
+    if let Some(s) = shared.get(t) {
+        return s.clone();
+    }
+    let s = own(t);
+    shared.insert(s.clone());
+    s
 }
 
 /// The stamp of the next stored entry. One counter for the whole

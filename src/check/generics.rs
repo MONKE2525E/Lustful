@@ -10061,7 +10061,7 @@ pub fn add_synthetic_impls(p: &mut Program) {
 /// snapshot breaks that borrow. It names defs by `DefId`, so it also
 /// outlives the program: the driver's generic reuse cache keeps
 /// discovery output in this form across requests (driver/gen_reuse.rs).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum OwnedTy {
     Leaf(TyKind),
     Ref(Region, Mut, Box<OwnedTy>),
@@ -10081,7 +10081,7 @@ pub(crate) enum OwnedTy {
     Dyn(Option<(DefId, Vec<OwnedArg>, Vec<(DefId, OwnedArg)>)>, AutoTraits, Region),
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum OwnedArg {
     Ty(OwnedTy),
     Lifetime(Region),
