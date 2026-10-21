@@ -2744,7 +2744,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
         } else if param.pat.is_none() && (param.mutable || cx.body_item_of(param.name).is_some()) {
             cx.binding_shadows_item(param.name, param.span, false);
         } else if param.pat.is_none() {
-            match cx.pat_ident(param.name) {
+            match cx.pat_binding(param.name) {
                 PatIdent::Const(_) => {
                     cx.err(
                         "L0110",
@@ -3545,7 +3545,7 @@ impl<'p> Ctx<'p> {
         match self.body_item_of(name) {
             Some(crate::check::collect::BodyItem::Fn(_)) => false,
             Some(_) => true,
-            None => !matches!(self.pat_ident(name), PatIdent::Other),
+            None => !matches!(self.pat_binding(name), PatIdent::Other),
         }
     }
 
@@ -3562,7 +3562,7 @@ impl<'p> Ctx<'p> {
         }
         // A `mut` or `ref` binding over a unit or tuple struct or an
         // imported variant (a block struct first, R18).
-        if !plain && (self.local_ctor_of(name).is_some() || matches!(self.pat_ident(name), PatIdent::Variant(..))) {
+        if !plain && (self.local_ctor_of(name).is_some() || matches!(self.pat_binding(name), PatIdent::Variant(..))) {
             let n = self.name(name).to_string();
             self.err("L0110", span, "bindings cannot shadow unit structs, tuple structs, or variants", format!("Rename the binding: `{n}` names an item here."));
             return true;
@@ -3580,7 +3580,7 @@ impl<'p> Ctx<'p> {
                 self.err("L0110", span, msg, format!("Rename the binding, or compare with `{n}` in a guard."));
                 return true;
             }
-            None => match self.pat_ident(name) {
+            None => match self.pat_binding(name) {
                 PatIdent::Static => "statics",
                 PatIdent::Const(_) if !plain => "constants",
                 _ => return false,
@@ -3597,6 +3597,26 @@ impl<'p> Ctx<'p> {
     /// fresh binding, the name of a struct with named fields (`struct Z
     /// {}` too, which has no value) included. The binding query records the read, so a body
     /// rechecks when the name's target changes.
+    /// `pat_ident` for the name of a binding pattern or parameter. The
+    /// binding query answers a rewritten flat name in every module (a
+    /// root item's flat name is its plain name), but a binding's name was
+    /// never rewritten: the resolver already made each one that names an
+    /// item in scope a path pattern. So outside the root module a name
+    /// the module's own table does not bind is a fresh binding, even when
+    /// the root has a const or unit struct of that name (rustc). The
+    /// table's answer is part of the body: the resolver's rewrite of the
+    /// pattern changes when it does.
+    fn pat_binding(&mut self, name: Sym) -> PatIdent {
+        if self.local_ctor_of(name).is_none()
+            && self.module != crate::ty::defs::ROOT_MODULE
+            && let Some(tables) = &self.p.resolved
+            && tables.lookup(self.module, Namespace::Value, name).is_none()
+        {
+            return PatIdent::Other;
+        }
+        self.pat_ident(name)
+    }
+
     fn pat_ident(&mut self, name: Sym) -> PatIdent {
         use crate::resolve::imports::{BindState, Target};
         let p = self.p;
@@ -21463,7 +21483,7 @@ impl<'p> Ctx<'p> {
             && (self.local_ctor_of(*name).is_some() || self.body_item_of(*name).is_none())
             && self.const_param(*name).is_none()
         {
-            match self.pat_ident(*name) {
+            match self.pat_binding(*name) {
                 PatIdent::Const(idx) => {
                     self.const_item_pat(pi, idx, t, span, in_match);
                     return;
@@ -21529,7 +21549,7 @@ impl<'p> Ctx<'p> {
                         && p.adt(a).is_enum
                         && p.adt(a).variants.iter().any(|v| v.name == *name)
                         && self.lookup(*name, span.ctxt).is_none()
-                        && !matches!(self.pat_ident(*name), PatIdent::Variant(b, _) if b == a)
+                        && !matches!(self.pat_binding(*name), PatIdent::Variant(b, _) if b == a)
                         && !self.lint_lifted(&["bindings_with_variant_name"])
                     {
                         let (vn, en) = (self.name(*name).to_string(), p.display_path(p.adt(a).name));
