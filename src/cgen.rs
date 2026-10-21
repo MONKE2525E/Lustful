@@ -9739,21 +9739,27 @@ impl GlueSet {
         }
     }
 
-    /// The block that a pointer's drop or clone glue reads in place: the count block
-    /// (`RcI_T`) of an Rc, Weak, Arc or Arc's Weak; the element of a Box, Vec, boxed slice
-    /// or Vec iterator; the cell a RefCell guard gives its borrow back to; the lock a lock
-    /// guard unlocks. The glue holds it by value and passes the value in it to the value's
-    /// own glue by pointer, so it reads none of the value's fields.
-    fn pointer_block(k: &(Glue, CTy)) -> Option<CTy> {
+    /// The blocks that a pointer's drop or clone glue reads in place, as a unit defines them:
+    /// the count block (`RcI_T`) of an Rc, Weak, Arc or Arc's Weak; the element of a Box,
+    /// Vec, boxed slice or Vec iterator, by the types that hold it by value (`by_value_deps`:
+    /// a boxed slice element is its slice struct, an Rc element a pointer with no block); the
+    /// cell a RefCell guard gives its borrow back to; the lock a lock guard unlocks. The glue
+    /// holds them by value and passes the value in them to the value's own glue by pointer, so
+    /// it reads none of the value's fields.
+    fn pointer_block(k: &(Glue, CTy)) -> Option<Vec<CTy>> {
         use crate::ty::sync::SyncTy;
         if !matches!(k.0, Glue::Drop | Glue::Clone) {
             return None;
         }
         match &k.1 {
-            CTy::Rc(e) | CTy::Weak(e) | CTy::Sync(SyncTy::Arc | SyncTy::ArcWeak, e) => Some(CTy::Rc(e.clone())),
-            CTy::Boxed(e) | CTy::Vec(e) | CTy::BoxSlice(e) | CTy::VecIter(e) | CTy::VecDrain(e) => Some((**e).clone()),
-            CTy::Guard(e, _) => Some(CTy::RefCell(e.clone())),
-            CTy::Sync(s, e) => s.guard().map(|(lock, _)| CTy::Sync(lock, e.clone())),
+            CTy::Rc(e) | CTy::Weak(e) | CTy::Sync(SyncTy::Arc | SyncTy::ArcWeak, e) => Some(vec![CTy::Rc(e.clone())]),
+            CTy::Boxed(e) | CTy::Vec(e) | CTy::BoxSlice(e) | CTy::VecIter(e) | CTy::VecDrain(e) => {
+                let mut held = Vec::new();
+                by_value_deps(e, &mut held);
+                Some(held)
+            }
+            CTy::Guard(e, _) => Some(vec![CTy::RefCell(e.clone())]),
+            CTy::Sync(s, e) => s.guard().map(|(lock, _)| vec![CTy::Sync(lock, e.clone())]),
             _ => None,
         }
     }
@@ -11371,8 +11377,8 @@ pub fn fn_unit_parts(
                 inl_glue.insert(k);
                 if GlueSet::passes_fields(k) {
                     g.held_types(k, &mut types, &mut named);
-                } else if let Some(block) = GlueSet::pointer_block(k) {
-                    types.insert(block);
+                } else if let Some(blocks) = GlueSet::pointer_block(k) {
+                    types.extend(blocks);
                     g.held_types(k, &mut types, &mut named);
                 } else {
                     g.def_types(k, &mut glue_types);
@@ -13991,6 +13997,20 @@ mod tests {
             assert!(unit.contains(&format!("inline {} clone_{}(", ctype(&s), mangle(&s))), "the struct's clone glue is inline:\n{unit}");
             assert!(!unit.contains(&format!("struct {big} {{")), "the unit defines no {big}:\n{unit}");
         });
+    }
+
+    /// What a Vec's drop or clone glue holds in place is its element as held by value: a
+    /// `Box<[S]>` element is its slice struct (a glue shard that held only such a Vec's drop
+    /// declared the slice by its forward typedef, and its loop indexed it), and an `Rc<S>`
+    /// element is a pointer, with no count block to define. An Rc's own glue holds the block.
+    #[test]
+    fn vec_glue_holds_its_element_by_value() {
+        let s = CTy::Adt(AdtId(0));
+        let vec_of = |e: CTy| (Glue::Drop, CTy::Vec(Box::new(e)));
+        assert_eq!(GlueSet::pointer_block(&vec_of(CTy::BoxSlice(Box::new(s.clone())))), Some(vec![CTy::Slice(Box::new(s.clone()))]));
+        assert_eq!(GlueSet::pointer_block(&vec_of(CTy::Rc(Box::new(s.clone())))), Some(vec![]));
+        assert_eq!(GlueSet::pointer_block(&vec_of(s.clone())), Some(vec![s.clone()]));
+        assert_eq!(GlueSet::pointer_block(&(Glue::Clone, CTy::Rc(Box::new(s.clone())))), Some(vec![CTy::Rc(Box::new(s))]));
     }
 
     /// A fn that borrows a RefCell of `Option<Rc<Rc<Big>>>` (tsgo's FileVersion behind a cache

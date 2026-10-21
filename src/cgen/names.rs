@@ -318,8 +318,8 @@ pub fn glue_shard_texts(p: &Program, g: &GlueSet, shards: &[Vec<&(Glue, CTy)>], 
                 read(k);
                 if GlueSet::passes_fields(k) {
                     g.held_types(k, &mut types, &mut named);
-                } else if let Some(block) = GlueSet::pointer_block(k) {
-                    types.insert(block);
+                } else if let Some(blocks) = GlueSet::pointer_block(k) {
+                    types.extend(blocks);
                     g.held_types(k, &mut types, &mut named);
                 } else {
                     g.def_types(k, &mut deep);
