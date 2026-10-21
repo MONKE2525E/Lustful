@@ -4853,14 +4853,22 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // caller's profile record matches its use): the fns it ran `LUST_PGO_COPY_MIN`
     // times or more (default 1000) get copies of the callees it ran as often.
     // `LUST_PGO_COPIES=*`: every fn counts as hot, a test of the copy rules on any program.
+    // A fn with an unwind cleanup frame gets copies when it ran `cgen::FRAME_COPY_MIN` times.
     let copy_hot = match std::env::var_os("LUST_PGO_COPIES").filter(|_| rgroups.is_some() && !llvm_on) {
-        Some(path) if path == "*" => Some(rn.map(|n| n.fns.iter().flatten().filter_map(|id| u64::from_str_radix(id, 16).ok()).collect()).unwrap_or_default()),
         Some(path) => {
-            let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
-            match crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, "pgo-copies.memo") {
-                Ok(h) => Some(h),
-                Err(e) => return Response { stderr: format!("error: LUST_PGO_COPIES: {e}\n"), code: 3, ..Default::default() },
-            }
+            let (hot, frames) = if path == "*" {
+                let all: std::collections::HashSet<u64> = rn.map(|n| n.fns.iter().flatten().filter_map(|id| u64::from_str_radix(id, 16).ok()).collect()).unwrap_or_default();
+                (all.clone(), all)
+            } else {
+                let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+                let ids = |min: u64, memo: &str| crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, memo);
+                match ids(min, "pgo-copies.memo").and_then(|hot| Ok((ids(min.max(cgen::FRAME_COPY_MIN), "pgo-copies-frames.memo")?, hot))) {
+                    Ok((frames, hot)) => (hot, frames),
+                    Err(e) => return Response { stderr: format!("error: LUST_PGO_COPIES: {e}\n"), code: 3, ..Default::default() },
+                }
+            };
+            let big = cgen::in_layout_phase(cgen::layout_phase(), || cgen::names::with(rn, || cgen::big_adts(&program)));
+            Some(cgen::CopyHot { hot, frames, big })
         }
         None => None,
     };
@@ -4950,10 +4958,14 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     .collect();
                 vars.sort();
                 let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                // Both id sets; the big ADTs are in each pick's read (`cgen::read_fp`).
                 let copies = copy_hot.as_ref().map(|h| {
-                    let mut ids: Vec<u64> = h.iter().copied().collect();
-                    ids.sort_unstable();
-                    crate::driver::cache::hash128(&[&ids.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>()], 14)
+                    let bytes = |s: &std::collections::HashSet<u64>| {
+                        let mut ids: Vec<u64> = s.iter().copied().collect();
+                        ids.sort_unstable();
+                        ids.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>()
+                    };
+                    crate::driver::cache::hash128(&[&bytes(&h.hot), &bytes(&h.frames)], 14)
                 });
                 format!("{}\n{}\ncopies={copies:?}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)), env!("LUST_BUILD_HASH"))
             });
@@ -4974,7 +4986,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // One read's fingerprint now (`cgen::read_fp`), in the assembly's layout phase.
             let read_fp = |r: &cgen::record::Read| {
                 let t = b1_observe.then(Instant::now);
-                let f = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &b1_statics, r)));
+                let f = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &b1_statics, copy_hot.as_ref(), r)));
                 if let Some(t) = t {
                     use cgen::record::Read as R;
                     let k = match r {

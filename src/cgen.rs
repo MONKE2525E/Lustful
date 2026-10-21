@@ -1079,6 +1079,8 @@ pub struct FnOut {
     /// `plain_fn_def`'s answer about the C text for inline copies (`FnOut::pick_info`), made on
     /// first use: `inline_pick` and B1's pick reads read it, not the text.
     pub pick: std::sync::OnceLock<Option<PickInfo>>,
+    /// The ADTs whose layout the C text bakes in (`FnOut::layout_reads`), made on first use.
+    pub layout: std::sync::OnceLock<BTreeSet<String>>,
 }
 
 /// What `inline_pick` and `inline_pick_hot` read of a fn's `plain_fn_def` (`FnOut::pick`).
@@ -1087,6 +1089,7 @@ pub struct PickInfo {
     len: usize,
     code: usize,
     statics: bool,
+    frame: bool,
 }
 
 /// A fn's C text: plain, as `gen_fn` makes it, or packed with other fns' texts in one zstd
@@ -1154,7 +1157,21 @@ impl FnOut {
 
     /// `plain_fn_def`'s answer about the C text, made once (`pick`).
     pub fn pick_info(&self) -> Option<PickInfo> {
-        *self.pick.get_or_init(|| plain_fn_def(&self.code_text()).map(|d| PickInfo { len: d.len, code: d.code, statics: d.statics }))
+        *self.pick.get_or_init(|| plain_fn_def(&self.code_text()).map(|d| PickInfo { len: d.len, code: d.code, statics: d.statics, frame: d.frame.is_some() }))
+    }
+
+    /// The C names of the ADTs whose layout the fn's copy bakes in (`scan_layout_deps` of its
+    /// definition and its frame's cleanup fn; `hot_pick`), made on first use.
+    pub fn layout_reads(&self) -> &BTreeSet<String> {
+        self.layout.get_or_init(|| {
+            let code = self.code_text();
+            let Some(d) = plain_fn_def(&code) else { return BTreeSet::new() };
+            let mut out = scan_layout_deps(d.def);
+            if let Some((_, post)) = d.frame {
+                out.extend(scan_layout_deps(post));
+            }
+            out
+        })
     }
 }
 
@@ -2548,6 +2565,7 @@ pub fn gen_fn(p: &Program, body: &Body, map: &SourceMap, base_line: u32, slots: 
         inline,
         text_digest: Default::default(),
         pick: Default::default(),
+        layout: Default::default(),
     }
 }
 
@@ -11146,6 +11164,147 @@ const HOT_COPY_BYTES: usize = 3000;
 /// Copy levels with a copies profile: Rust's layers (iterator, closure, hasher, accessor)
 /// put hot accessors 7 and more calls below a hot fn.
 const HOT_COPY_DEPTH: usize = 12;
+/// A fn with an unwind cleanup frame gets hot copies only when the copies profile ran it this
+/// many times or more (`CopyHot::frames`). Each frame copy is new code in its caller units: on
+/// tsgo, copies of all 1,821 small hot frame fns doubled warm clang time; 372 ran this often.
+pub const FRAME_COPY_MIN: u64 = 100_000;
+/// The most copies the frame rule (`hot_pick`) adds to one unit, the nearest its own fns
+/// first (`FrameWalk`). On tsgo the biggest units took 30 to 60 new copies (frame fns and the
+/// callees below them), and some of them compiled 2x slower.
+const NEW_COPIES_PER_UNIT: usize = 10;
+/// ADTs of this many bytes or more are the big context structs (`CopyHot::big`). A copy only
+/// the frame rule adds never reads one (`hot_pick`): an edit of one changes the copies of
+/// accessors of it in every unit that holds them (the layout is in their text).
+const BIG_LAYOUT_BYTES: u64 = 512;
+
+/// Release C copies from a copies profile (`LUST_PGO_COPIES`, `inline_callees`): the ids of
+/// the fns it ran often (`hot`) and of those it ran `FRAME_COPY_MIN` times or more (`frames`),
+/// and the C names of the program's ADTs of `BIG_LAYOUT_BYTES` or more (`big`, `big_adts`).
+pub struct CopyHot {
+    pub hot: HashSet<u64>,
+    pub frames: HashSet<u64>,
+    pub big: BTreeSet<String>,
+}
+
+/// The C names of `p`'s ADTs of `BIG_LAYOUT_BYTES` or more (`CopyHot::big`). Call within the
+/// release names.
+pub fn big_adts(p: &Program) -> BTreeSet<String> {
+    (0..p.adts.len() as u32)
+        .map(AdtId)
+        // A def with no variant (an uninhabited placeholder) has no layout.
+        .filter(|&a| !p.adt(a).variants.is_empty() && c_layout(p, &CTy::Adt(a)).is_some_and(|l| l.size >= BIG_LAYOUT_BYTES))
+        .map(names::adt)
+        .collect()
+}
+
+/// The ADTs whose layout a fn definition's C text bakes in (`FnOut::layout_reads`), by C name:
+/// the containers of its byte-offset field reads (a local's or parameter's declared pointer
+/// type, or the `T**` cast of a nested offset read) and the ADTs inside the types of its
+/// by-value locals and parameters. `code` starts with the definition's head.
+fn scan_layout_deps(code: &str) -> BTreeSet<String> {
+    fn adts(t: &str, out: &mut BTreeSet<String>) {
+        let b = t.as_bytes();
+        let mut i = 0;
+        while i + 18 <= b.len() {
+            if b[i] == b'A' && matches!(b[i + 1], b'd' | b'i' | b'n') && (i == 0 || !(b[i - 1].is_ascii_alphanumeric())) && b[i + 2..i + 18].iter().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+                out.insert(t[i..i + 18].to_string());
+                i += 18;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    // Each local's or parameter's declared type and whether it is a pointer: `T *l3`, `T l4`,
+    // `T* p2` (a declaration line lists one type then its declarators).
+    let mut ptr_of: HashMap<&str, &str> = HashMap::new();
+    let mut out = BTreeSet::new();
+    for (n, line) in code.lines().enumerate() {
+        let t = line.trim_start();
+        if n == 0 {
+            // The head: `R f_<id>(T* p1, U p2) {`.
+            if let Some(args) = t.split_once('(').map(|x| x.1) {
+                for a in args.split(',') {
+                    let a = a.trim().trim_end_matches(|c: char| c == ')' || c == '{' || c == ' ');
+                    if let Some((ty, var)) = a.rsplit_once(|c: char| c == ' ' || c == '*') {
+                        let var = var.trim();
+                        if var.starts_with('p') && var[1..].chars().all(|c| c.is_ascii_digit()) && !var[1..].is_empty() {
+                            let ty = ty.trim_end();
+                            if let Some(base) = ty.strip_suffix('*') {
+                                if !base.trim_end().ends_with('*') {
+                                    ptr_of.insert(var, base.trim_end());
+                                }
+                            } else if !a.contains('*') {
+                                adts(ty, &mut out);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if !line.starts_with("  ") || !t.ends_with(';') {
+            continue;
+        }
+        let Some((ty, rest)) = t.split_once(' ') else { continue };
+        if !ty.chars().all(ident) || matches!(ty, "return" | "goto" | "if" | "else") || ty.starts_with("lust_") && !rest.contains('*') {
+            continue;
+        }
+        // Declarators: `*l3`, `l4`, `*l2 = p2` at the top level of the list.
+        let mut depth = 0i32;
+        let mut start = true;
+        let rb = rest.as_bytes();
+        let mut i = 0;
+        while i < rb.len() {
+            let c = rb[i] as char;
+            match c {
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    start = true;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if start && depth == 0 && (c == '*' || c == 'l') {
+                let stars = rest[i..].chars().take_while(|&c| c == '*' || c == ' ').filter(|&c| c == '*').count();
+                let j = i + rest[i..].chars().take_while(|&c| c == '*' || c == ' ').count();
+                let var: String = rest[j..].chars().take_while(|&c| ident(c)).collect();
+                if var.starts_with('l') && var.len() > 1 && var[1..].chars().all(|c| c.is_ascii_digit()) {
+                    let end = j + var.len();
+                    if stars == 1 {
+                        ptr_of.insert(&rest[j..end], ty);
+                    } else if stars == 0 {
+                        adts(ty, &mut out);
+                    }
+                }
+                start = false;
+            } else if c != ' ' {
+                start = false;
+            }
+            i += 1;
+        }
+    }
+    // Byte-offset reads: `(uint8_t*)(l3) + 312`, `(uint8_t*)((*(T**)(...)))`.
+    let mut rest = code;
+    while let Some(at) = rest.find("(uint8_t*)(") {
+        let tail = &rest[at + 11..];
+        let var: String = tail.chars().take_while(|&c| ident(c)).collect();
+        if !var.is_empty() && tail[var.len()..].starts_with(')') {
+            if let Some(ty) = ptr_of.get(var.as_str()) {
+                adts(ty, &mut out);
+            }
+        } else if let Some(inner) = tail.strip_prefix("(*(") {
+            let ty: String = inner.chars().take_while(|&c| ident(c)).collect();
+            if inner[ty.len()..].starts_with("**)") {
+                adts(&ty, &mut out);
+            }
+        }
+        rest = tail;
+    }
+    out
+}
 
 /// Whether the fn with release C id `id` (16 hex digits) is in a copies profile's hot set.
 fn is_hot(hot: &HashSet<u64>, id: &str) -> bool {
@@ -11241,6 +11400,10 @@ struct PlainDef<'a> {
     code: usize,
     /// It holds kconst's static locals (`kconst_static`): only a hot copy may.
     statics: bool,
+    /// Its unwind cleanup frame (`unwind::frame_struct`): the frame's struct, cleanup
+    /// prototype and wrapper before the definition, and the `#undef`s and the cleanup fn after
+    /// it, all named by the fn's tag; a copy takes them along. Only a hot copy may.
+    frame: Option<(&'a str, &'a str)>,
 }
 
 /// The bytes of fn definition `def` (first line `head`) that make instructions: its head,
@@ -11274,13 +11437,24 @@ fn kconst_static(line: &str) -> bool {
 
 /// The one fn definition at the start of `code` (after its outlined panics and its
 /// comment line): None when the text holds anything an inline definition may not have
-/// (static storage other than kconst's, a static helper, a frame's cleanup variable).
+/// (static storage other than kconst's, a static helper). An unwind cleanup frame is the
+/// one exception (`PlainDef::frame`): its struct, cleanup prototype and wrapper come before
+/// the comment line, its variable and member macros are in the definition, and after the
+/// definition come only the macros' `#undef`s and the cleanup fn `cl<tag>` (`unwind::cleanup_fn`).
 fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
     let mut rest = code;
     let mut pks = Vec::new();
     while rest.starts_with(PK_ATTRS) {
         pks.push(&rest[..rest.find(" {\n")?]);
         rest = &rest[rest.find("\n}\n")? + 3..];
+    }
+    let mut pre = None;
+    if let Some(after) = rest.strip_prefix("struct fr") {
+        let tag = &after[..after.find(" {\n")?];
+        let wrap = rest.find(&format!("\nstatic inline __attribute__((always_inline)) void clw{tag}(struct fr{tag} *Lc) {{"))? + 1;
+        let e = rest[wrap..].find('\n')? + wrap + 1;
+        pre = Some((tag, &rest[..e]));
+        rest = &rest[e..];
     }
     // Then the fn alone: its comment line first (any other prelude holds static helpers
     // the fn calls: vtables, thunks).
@@ -11291,23 +11465,43 @@ fn plain_fn_def(code: &str) -> Option<PlainDef<'_>> {
     let end = rest[start..].find("\n}\n")? + start + 3;
     let def = &rest[start..end];
     let head = def.split(" {\n").next()?;
-    // `#define`: an over-aligned local's macro, whose `#undef` follows the fn. Static storage
-    // only as kconst's locals (`statics`): each unit's copy then has its own (clang and gcc
-    // take them in an inline definition), which only cache the canonical program-wide
-    // addresses (cgen/kconst.rs), so identity stays the table's.
-    let statics = def.lines().any(kconst_static);
-    let other_static = def.matches("static ").count() != def.lines().filter(|l| kconst_static(l)).count();
-    (!other_static && !def.contains("__attribute__") && !def.contains("#define") && !head.contains('\n'))
-        .then_some(PlainDef { head, def, pks, len: def.len(), code: code_len(def, head), statics })
+    let (frame, body) = match pre {
+        Some((tag, pre)) => {
+            let after = &rest[end..];
+            let undefs = |mut at: usize| -> Option<usize> {
+                while after[at..].starts_with("#undef ") {
+                    at += after[at..].find('\n')? + 1;
+                }
+                Some(at)
+            };
+            let cl = undefs(0)?;
+            let line = &after[cl..cl + after[cl..].find('\n')?];
+            if !line.starts_with("static ") || !line.ends_with(&format!(" void cl{tag}(struct fr{tag} *Lc) {{")) {
+                return None;
+            }
+            let post = undefs(after[cl..].find("\n}\n")? + cl + 3)?;
+            let var = format!("  struct fr{tag} L __attribute__((cleanup(clw{tag})));\n");
+            (Some((pre, &after[..post])), std::borrow::Cow::Owned(def.replacen(&var, "", 1)))
+        }
+        None => (None, std::borrow::Cow::Borrowed(def)),
+    };
+    // `#define`: an over-aligned local's macro, whose `#undef` follows the fn (a frame's
+    // macros too, `post`). Static storage only as kconst's locals (`statics`): each unit's
+    // copy then has its own (clang and gcc take them in an inline definition), which only
+    // cache the canonical program-wide addresses (cgen/kconst.rs), so identity stays the table's.
+    let statics = body.lines().any(kconst_static);
+    let other_static = body.matches("static ").count() != body.lines().filter(|l| kconst_static(l)).count();
+    (!other_static && !body.contains("__attribute__") && (frame.is_some() || !body.contains("#define")) && !head.contains('\n'))
+        .then_some(PlainDef { head, def, pks, len: def.len(), code: code_len(def, head), statics, frame })
 }
 
 /// Release C: the small fns that the fns in `slots` call and another unit holds; this
 /// unit gets them as C99 inline definitions, so the C compiler can inline them without
 /// LTO (their holder keeps the external definition, so calls and addresses are the same).
 /// At a `deep` level (past `INLINE_DEPTH`) only tiny and `#[inline]` fns. With a copies
-/// profile (`hot`: the fns it ran often, `LUST_PGO_COPIES`), only the fns it saw hot, by
-/// `inline_pick_hot` at every level.
-fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, skip: &HashSet<usize>, deep: bool, hot: Option<&HashSet<u64>>) -> Vec<usize> {
+/// profile (`hot`, `LUST_PGO_COPIES`), only the fns it saw hot, by `hot_pick` at every level
+/// (`frames`: the frame rule's walk, `FrameWalk`).
+fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, skip: &HashSet<usize>, deep: bool, hot: Option<&CopyHot>, frames: Option<FrameWalk<'_>>) -> Vec<usize> {
     let mut out = BTreeSet::new();
     let rec = record::on();
     for e in externs {
@@ -11319,19 +11513,26 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, ski
         if skip.contains(&c) {
             continue;
         }
-        // A copies profile never copies a callee it did not see hot (the hot set is part of
+        // A copies profile never copies a callee it did not see hot (its sets are part of
         // the unit's identity, so that needs no read).
-        if hot.is_some_and(|h| !is_hot(h, id)) {
+        if hot.is_some_and(|h| !is_hot(&h.hot, id)) {
             continue;
         }
-        let pick = fns.get(c).is_some_and(|f| if hot.is_some() { inline_pick_hot(f) } else { inline_pick(f, deep) });
+        let pick = fns.get(c).is_some_and(|f| match hot {
+            Some(h) => hot_pick(f, c, id, h, frames.map(|w| w.today)),
+            None => inline_pick(f, deep),
+        });
+        let new = frames.filter(|w| !w.today.contains(&c));
+        let pick = pick && new.is_none_or(|w| w.take());
         // B1 (`record`): a copied callee's whole output is read; of one left out, only that.
+        // A copy outside `today` also reads its pick, which reads the program's big ADTs.
         if rec {
-            record::read(match (pick, hot.is_some()) {
-                (true, _) => record::Read::Fn(c),
-                (false, false) => record::Read::Pick(c, deep),
-                (false, true) => record::Read::PickHot(c),
-            });
+            if pick {
+                record::read(record::Read::Fn(c));
+            }
+            if !pick || new.is_some() {
+                record::read(if hot.is_some() { record::Read::PickHot(c) } else { record::Read::Pick(c, deep) });
+            }
         }
         if pick {
             out.insert(c);
@@ -11344,25 +11545,60 @@ fn inline_callees<'a>(fns: &[FnOut], externs: impl Iterator<Item = &'a str>, ski
 fn inline_pick(f: &FnOut, deep: bool) -> bool {
     f.error.is_none()
         && f.pick_info().is_some_and(|d| {
-            !d.statics && d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
+            !d.statics && !d.frame && d.len <= inline_limit(f.inline) && (!deep || d.len <= INLINE_TINY_BYTES || matches!(f.inline, InlineAttr::Hint | InlineAttr::Always))
         })
 }
 
-/// Whether `inline_callees` copies `f`, a callee a copies profile saw hot: up to
-/// `HOT_COPY_BYTES` of code (or its `#[inline]` limit when larger) at every level, kconst's
-/// static locals and all. Code, not text (`PlainDef::code`): a match over a parameter that
-/// each caller passes as a constant has many one-jump blocks, which fold away.
+/// Whether `f`, a callee a copies profile saw hot, is small enough for a copy (`hot_pick`):
+/// up to `HOT_COPY_BYTES` of code (or its `#[inline]` limit when larger) at every level,
+/// kconst's static locals and an unwind cleanup frame (`PlainDef::frame`) and all. Code, not
+/// text (`PlainDef::code`): a match over a parameter that each caller passes as a constant
+/// has many one-jump blocks, which fold away.
 fn inline_pick_hot(f: &FnOut) -> bool {
     f.error.is_none() && f.inline != InlineAttr::Never && f.pick_info().is_some_and(|d| d.code <= inline_limit(f.inline).max(HOT_COPY_BYTES))
 }
 
+/// The hot rule's pick of `f` (slot `c`, release C id `id`), a callee `hot` saw hot. With
+/// `today` None, today's rule: `inline_pick_hot`, and no fn with an unwind cleanup frame.
+/// Else (`today`: the unit's copies by that rule) the frame rule: a fn with a frame too when
+/// `hot.frames` holds it, but a copy outside `today` (a frame fn, or a callee below one) only
+/// when its text reads no big ADT (`FnOut::layout_reads`). So the copies the frame rule adds
+/// bring no big context struct's layout into a unit, and an edit of one misses no more units.
+fn hot_pick(f: &FnOut, c: usize, id: &str, hot: &CopyHot, today: Option<&HashSet<usize>>) -> bool {
+    let frame = f.pick_info().is_some_and(|d| d.frame);
+    inline_pick_hot(f)
+        && match today {
+            None => !frame,
+            Some(t) => t.contains(&c) || ((!frame || is_hot(&hot.frames, id)) && f.layout_reads().is_disjoint(&hot.big)),
+        }
+}
+
+/// The frame rule's walk of one unit (`inline_callees`): the unit's copies by today's rule
+/// (`hot_pick`), and how many copies the rule may still add (`NEW_COPIES_PER_UNIT`).
+#[derive(Clone, Copy)]
+struct FrameWalk<'a> {
+    today: &'a HashSet<usize>,
+    left: &'a std::cell::Cell<usize>,
+}
+
+impl FrameWalk<'_> {
+    /// Takes one new copy from the unit's allowance; false when none is left.
+    fn take(&self) -> bool {
+        let n = self.left.get();
+        n > 0 && {
+            self.left.set(n - 1);
+            true
+        }
+    }
+}
+
 /// The deeper copy levels below `frontier` (`fn_unit_parts`): the callees of each level's
 /// copies, added to `inl`, until a level adds none; to `INLINE_DEPTH_TINY` levels, or with a
-/// copies profile (`hot`) to `HOT_COPY_DEPTH`.
-fn copy_levels(fns: &[FnOut], own: &HashSet<usize>, inl: &mut Vec<usize>, mut frontier: Vec<usize>, hot: Option<&HashSet<u64>>) {
+/// copies profile (`hot`, `frames` as `inline_callees`') to `HOT_COPY_DEPTH`.
+fn copy_levels(fns: &[FnOut], own: &HashSet<usize>, inl: &mut Vec<usize>, mut frontier: Vec<usize>, hot: Option<&CopyHot>, frames: Option<FrameWalk<'_>>) {
     for level in 1..if hot.is_some() { HOT_COPY_DEPTH } else { INLINE_DEPTH_TINY } {
         let skip: HashSet<usize> = own.iter().chain(inl.iter()).copied().collect();
-        let more = inline_callees(fns, frontier.iter().flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &skip, level >= INLINE_DEPTH, hot);
+        let more = inline_callees(fns, frontier.iter().flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &skip, level >= INLINE_DEPTH, hot, frames);
         if more.is_empty() {
             break;
         }
@@ -11382,7 +11618,7 @@ pub fn fn_unit(p: &Program, fns: &[FnOut], slots: &[usize], g: &GlueSet, registe
 /// `fn_unit`, and for the LLVM backend (cgen/ll.rs) the C of the unit's helpers: the same
 /// declarations, then each fn's `ll_c` (empty when no fn of the unit has LLVM IR). The fns
 /// in `inl` (cross-unit inlining, `ll::ll_inline_set`) add their declarations and helpers.
-/// `copy_hot`: release C, the fns a copies profile ran often (`inline_callees`).
+/// `copy_hot`: release C, what a copies profile ran often (`inline_callees`).
 #[allow(clippy::too_many_arguments)]
 pub fn fn_unit_parts(
     p: &Program,
@@ -11393,7 +11629,7 @@ pub fn fn_unit_parts(
     register: &str,
     main_slot: Option<u32>,
     c_refs: Option<&ll::CRefs>,
-    copy_hot: Option<&HashSet<u64>>,
+    copy_hot: Option<&CopyHot>,
 ) -> (String, String) {
     // B1 (`record`): every text appended below is one recorded piece; an LLVM-backend unit
     // is never recorded.
@@ -11420,11 +11656,18 @@ pub fn fn_unit_parts(
     let own: HashSet<usize> = slots.iter().copied().collect();
     let inline = names::release() && inline_on();
     // With a copies profile, only the unit's hot fns get copies (a cold unit gets none).
-    let callers = slots.iter().filter(|&&s| copy_hot.is_none_or(|h| names::fn_tag_opt(s as u32).is_some_and(|id| is_hot(h, &id))));
-    let mut inl = if inline && !llvm { inline_callees(fns, callers.flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &own, false, copy_hot) } else { Vec::new() };
-    // Deeper levels: the small callees of the inline callees.
-    let frontier = inl.clone();
-    copy_levels(fns, &own, &mut inl, frontier, copy_hot);
+    let callers: Vec<usize> = slots.iter().copied().filter(|&s| copy_hot.is_none_or(|h| names::fn_tag_opt(s as u32).is_some_and(|id| is_hot(&h.hot, &id)))).collect();
+    let walk = |frames: Option<FrameWalk<'_>>| {
+        let mut inl = if inline && !llvm { inline_callees(fns, callers.iter().flat_map(|&s| fns[s].externs.iter().map(|e| &**e)), &own, false, copy_hot, frames) } else { Vec::new() };
+        // Deeper levels: the small callees of the inline callees.
+        let frontier = inl.clone();
+        copy_levels(fns, &own, &mut inl, frontier, copy_hot, frames);
+        inl
+    };
+    // With a copies profile, today's copies first, then the frame rule's (`hot_pick`).
+    let mut today: HashSet<usize> = if copy_hot.is_some() { walk(None).into_iter().collect() } else { HashSet::new() };
+    let left = std::cell::Cell::new(NEW_COPIES_PER_UNIT);
+    let mut inl = walk(copy_hot.is_some().then_some(FrameWalk { today: &today, left: &left }));
     for f in slots.iter().chain(&inl).chain(ll_inl).map(|&s| &fns[s]) {
         types.extend(f.types.iter().cloned());
         named.extend(f.named.iter().cloned());
@@ -11488,13 +11731,22 @@ pub fn fn_unit_parts(
         }
         // The small fns the inline glue calls (a written `PartialEq` or `Drop`), inline too.
         let skip: HashSet<usize> = own.iter().chain(&inl).copied().collect();
-        let more =
-            if llvm { Vec::new() } else { inline_callees(fns, inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten().map(String::as_str)), &skip, false, copy_hot) };
+        let glue_externs = || inl_glue.iter().flat_map(|k| g.externs.get(*k).into_iter().flatten().map(String::as_str));
+        // With a copies profile, today's copies below the glue join `today` first.
+        if copy_hot.is_some() && !llvm {
+            let mut t = inl.clone();
+            let m = inline_callees(fns, glue_externs(), &skip, false, copy_hot, None);
+            t.extend(&m);
+            copy_levels(fns, &own, &mut t, m, copy_hot, None);
+            today.extend(t);
+        }
+        let frames = copy_hot.is_some().then_some(FrameWalk { today: &today, left: &left });
+        let more = if llvm { Vec::new() } else { inline_callees(fns, glue_externs(), &skip, false, copy_hot, frames) };
         let start = inl.len();
         inl.extend(&more);
         // With a copies profile, their hot callees too (a hasher's `write` below a hash glue).
         if copy_hot.is_some() {
-            copy_levels(fns, &own, &mut inl, more, copy_hot);
+            copy_levels(fns, &own, &mut inl, more, copy_hot, frames);
         }
         for &s in &inl[start..] {
             types.extend(fns[s].types.iter().cloned());
@@ -11613,6 +11865,9 @@ pub fn fn_unit_parts(
         for pk in &d.pks {
             let _ = writeln!(c, "{pk};");
         }
+        if let Some((pre, _)) = d.frame {
+            c.push_str(pre);
+        }
         let _ = writeln!(c, "inline {};", d.head);
         record::piece(record::Kind::InlineDef, record::key(&d.head), &c[m..]);
     }
@@ -11645,6 +11900,9 @@ pub fn fn_unit_parts(
     for d in &defs {
         let m = c.len();
         let _ = write!(c, "inline {}\n", d.def);
+        if let Some((_, post)) = d.frame {
+            c.push_str(post);
+        }
         record::piece(record::Kind::InlineDef, record::key(&d.head), &c[m..]);
     }
     let helpers = if llvm {
@@ -11666,7 +11924,7 @@ pub fn fn_unit_parts(
         // An LLVM fn's C is its C ABI wrapper and trampoline: kept only when a text names them.
         match (c_refs, f.ll.is_empty(), names::fn_tag_opt(s as u32)) {
             (Some(r), false, Some(id)) => c.push_str(&r.c_body(text_of(s), &id)),
-            (_, _, Some(id)) if copy_hot.is_some_and(|h| !is_hot(h, &id)) => c.push_str(&cold_cleanup(text_of(s), &id)),
+            (_, _, Some(id)) if copy_hot.is_some_and(|h| !is_hot(&h.hot, &id)) => c.push_str(&cold_cleanup(text_of(s), &id)),
             _ => c.push_str(text_of(s)),
         }
         record::piece(record::Kind::Body, s as u64, &c[m..]);
@@ -12357,8 +12615,9 @@ pub fn static_decl_map(p: &Program) -> HashMap<String, String> {
 
 /// The fingerprint of what a recorded read of a release C fn unit saw (B1, `record::Read`),
 /// from this program, its fns' outputs and its glue set: an equal fingerprint means the read
-/// sees the same now. Call within the release names (`names::with`).
-pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String, String>, r: &record::Read) -> (u64, u64) {
+/// sees the same now. `copy_hot`: the build's copies profile, as `fn_unit_parts`'. Call within
+/// the release names (`names::with`).
+pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String, String>, copy_hot: Option<&CopyHot>, r: &record::Read) -> (u64, u64) {
     use record::Read;
     let h = |parts: &[&[u8]]| crate::driver::cache::hash128(parts, 11);
     // A read of the last build can name an Adt id this program no longer has, or has for
@@ -12397,7 +12656,14 @@ pub fn read_fp(p: &Program, fns: &[FnOut], g: &GlueSet, statics: &HashMap<String
         },
         Read::SlotOf(id) => names::slot_of_id(id).map_or((0, 2), |s| h(&[&s.to_le_bytes()])),
         Read::Pick(s, deep) => fns.get(*s).map_or((0, 3), |f| h(&[&[inline_pick(f, *deep) as u8]])),
-        Read::PickHot(s) => fns.get(*s).map_or((0, 3), |f| h(&[&[inline_pick_hot(f) as u8]])),
+        // What `hot_pick` reads, but the unit's own `today` (its other reads cover that).
+        Read::PickHot(s) => fns.get(*s).map_or((0, 3), |f| {
+            let hot = copy_hot.filter(|_| inline_pick_hot(f));
+            let frame = f.pick_info().is_some_and(|d| d.frame);
+            let frame_ok = hot.is_some_and(|h| !frame || names::fn_tag_opt(*s as u32).is_some_and(|id| is_hot(&h.frames, &id)));
+            let small = frame_ok && hot.is_some_and(|h| f.layout_reads().is_disjoint(&h.big));
+            h(&[&[hot.is_some() as u8, frame as u8, frame_ok as u8, small as u8]])
+        }),
         Read::Glue(k, t) => {
             let key = (*k, t.clone());
             let deps = g.deps.get(&key).map(|d| d.iter().map(|(a, b)| format!("{a:?} {}", mangle(b))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
@@ -13649,6 +13915,78 @@ mod tests {
         assert!(d.statics);
         // No blocks (no `bb0:;`): all of it.
         assert_eq!(code_len("void f(void) {\n}\n", "void f(void)"), "void f(void) {\n}\n".len());
+    }
+
+    /// A fn with an unwind cleanup frame is copyable by a hot copy only: the copy takes the
+    /// frame's struct, cleanup prototype and wrapper before it, and the `#undef`s and the
+    /// cleanup fn after it, not the trampoline that follows.
+    #[test]
+    fn a_hot_copy_takes_a_cleanup_frame_along() {
+        let id = "1234567890abcdef";
+        let pre = format!(
+            "struct fr{id} {{\n  int32_t st;\n  T *pl2;\n  uint8_t d2;\n}};\nstatic inline __attribute__((always_inline)) void cl{id}(struct fr{id} *Lc);\nstatic inline __attribute__((always_inline)) void clw{id}(struct fr{id} *Lc) {{ if (__builtin_expect(Lc->st != 0, 0)) cl{id}(Lc); }}\n"
+        );
+        let def = format!(
+            "lust_Unit f_{id}(T* p1, T* p2) {{\n  lust_Unit l0;\n  struct fr{id} L __attribute__((cleanup(clw{id})));\n  L.st = 0;\n  L.pl2 = &(*p2);\n  L.d2 = 1;\n#define d2 (L.d2)\nbb0:;\n  d2 = 0;\n  l0 = ((lust_Unit){{}});\n  L.st = 0;\n  return l0;\n}}\n"
+        );
+        let post = format!(
+            "#undef l2\n#undef d2\nstatic inline __attribute__((always_inline)) void cl{id}(struct fr{id} *Lc) {{\n#define l2 (*Lc->pl2)\n#define d2 (Lc->d2)\n  switch (Lc->st) {{\n  case 0: return;\n  default: return;\n  }}\n}}\n#undef l2\n#undef d2\n"
+        );
+        let code = format!("{pre}/* push */\n{def}{post}lust_Unit tramp_{id}(T* p1, T* p2) {{ return f_{id}(p1, p2); }}\n");
+        let d = plain_fn_def(&code).expect("a frame fn is plain for a hot copy");
+        assert_eq!((d.def, d.frame), (def.as_str(), Some((pre.as_str(), post.as_str()))));
+        // Another attribute in the definition still refuses it.
+        let cold = code.replace("  d2 = 0;\n", "  d2 = 0;\n  __attribute__((unused)) int x;\n");
+        assert!(plain_fn_def(&cold).is_none());
+        // The default copy rule never takes a frame.
+        let f = FnOut { text: CText::Plain(code), ..Default::default() };
+        assert!(!inline_pick(&f, false) && inline_pick_hot(&f));
+    }
+
+    /// A fn's layout reads: the ADTs it reads by byte offset (through a pointer local or
+    /// parameter, or a nested `T**` read) or holds by value, not one it only points to.
+    #[test]
+    fn layout_reads_are_offset_reads_and_values() {
+        let (a, b, c, d) = ("Ad00000000000000a1", "Ad00000000000000b2", "Ad00000000000000c3", "Ad00000000000000d4");
+        let code = format!(
+            "uint64_t f_0000000000000001({a}* p1, {c}* p2) {{\n  uint64_t l0;\n  {b} l3;\n  {c} *l4 = p2;\n  l0 = *(uint64_t*)((uint8_t*)(p1) + 640);\n  l0 += *(uint64_t*)((uint8_t*)((*({d}**)((uint8_t*)(p1) + 8))) + 16);\n  f_0000000000000002(l4);\n  return l0;\n}}\n"
+        );
+        assert_eq!(scan_layout_deps(&code), BTreeSet::from([a, b, d].map(String::from)));
+    }
+
+    /// `hot_pick`: today's rule copies no fn with a cleanup frame; the frame rule copies one
+    /// that `frames` holds, and a copy outside the unit's copies by today's rule (`today`)
+    /// only when it reads no big ADT.
+    #[test]
+    fn the_frame_rule_adds_no_big_struct_reader() {
+        let fid = "1234567890abcdef";
+        let framed = FnOut {
+            text: CText::Plain(format!(
+                "struct fr{fid} {{\n  int32_t st;\n}};\nstatic inline __attribute__((always_inline)) void cl{fid}(struct fr{fid} *Lc);\nstatic inline __attribute__((always_inline)) void clw{fid}(struct fr{fid} *Lc) {{ if (__builtin_expect(Lc->st != 0, 0)) cl{fid}(Lc); }}\n/* f */\nlust_Unit f_{fid}(T* p1) {{\n  lust_Unit l0;\n  struct fr{fid} L __attribute__((cleanup(clw{fid})));\n  L.st = 0;\nbb0:;\n  l0 = ((lust_Unit){{}});\n  return l0;\n}}\nstatic inline __attribute__((always_inline)) void cl{fid}(struct fr{fid} *Lc) {{\n  switch (Lc->st) {{\n  default: return;\n  }}\n}}\n"
+            )),
+            ..Default::default()
+        };
+        let (rid, big) = ("00000000000000aa", "Ad00000000000000a1");
+        let reader = FnOut {
+            text: CText::Plain(format!("/* g */\nuint64_t f_{rid}({big}* p1) {{\n  uint64_t l0;\nbb0:;\n  l0 = *(uint64_t*)((uint8_t*)(p1) + 640);\n  return l0;\n}}\n")),
+            ..Default::default()
+        };
+        let hot = |frames: &[&str], big: &[&str]| CopyHot {
+            hot: HashSet::new(),
+            frames: frames.iter().map(|i| u64::from_str_radix(i, 16).unwrap()).collect(),
+            big: big.iter().map(|s| s.to_string()).collect(),
+        };
+        let (none, today) = (HashSet::new(), HashSet::from([7]));
+        // Today's rule.
+        assert!(!hot_pick(&framed, 1, fid, &hot(&[fid], &[]), None));
+        assert!(hot_pick(&reader, 7, rid, &hot(&[], &[big]), None));
+        // The frame rule: a frame fn when `frames` holds it.
+        assert!(!hot_pick(&framed, 1, fid, &hot(&[], &[]), Some(&none)));
+        assert!(hot_pick(&framed, 1, fid, &hot(&[fid], &[]), Some(&none)));
+        // A big ADT's reader only as one of today's copies.
+        assert!(!hot_pick(&reader, 7, rid, &hot(&[], &[big]), Some(&none)));
+        assert!(hot_pick(&reader, 7, rid, &hot(&[], &[big]), Some(&today)));
+        assert!(hot_pick(&reader, 7, rid, &hot(&[], &[]), Some(&none)));
     }
 
     /// Byte grouping: groups fill to the target, an over-target slot
