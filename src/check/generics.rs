@@ -12411,6 +12411,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
     // later round (a fresh check waits for it, `closure_map_pending`).
     // Each is built once its closures exist (`replay_vtable`).
     let mut deferred_vts: Vec<(OwnedTy, OwnedTy, usize)> = Vec::new();
+    // The Adt types of replayed discovery outputs already built here, by address: replays hand
+    // out the types their entries share (`GenReuse::shared`: ~525k on tsgo, ~50k distinct), and
+    // a type built once is in the store with its instances made. The map keeps each type alive,
+    // so no other one takes its address. A fresh check's types stay out: kept to the end, they
+    // spread the heap (90 MB more image pages on tsgo).
+    let mut built: FxMap<*const OwnedTy, std::sync::Arc<OwnedTy>> = FxMap::default();
     let recheck_limit = if p.gx.walk_instances { 8 } else { 1 };
     // The body lints after a clean check add only errors. A discovery
     // check's errors matter only for its instance requests (a failed
@@ -12456,12 +12462,12 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
                 // interned it; the stale ones check again now, in parallel.
                 for found in ahead.window(k) {
                     let (adt_tys, reqs, closures, vts) = &found.out;
-                    let args = reqs.iter().flat_map(|(_, a)| a).filter_map(|a| match a {
+                    let args = reqs.iter().flat_map(|(_, a)| a.iter()).filter_map(|a| match a {
                         OwnedArg::Ty(t) => Some(t),
                         _ => None,
                     });
                     let closure_tys = closures.iter().flat_map(|c| [&c.env, &c.output].into_iter().chain(&c.inputs));
-                    for owned in adt_tys.iter().chain(args).chain(closure_tys).chain(vts.iter().flat_map(|(a, b)| [a, b])) {
+                    for owned in adt_tys.iter().map(|t| &**t).chain(args).chain(closure_tys).chain(vts.iter().flat_map(|(a, b)| [a, b])) {
                         build_owned_ty(p, owned);
                     }
                     // Each request's instance key, as its apply step makes it
@@ -12540,6 +12546,9 @@ fn materialize_all(p: &mut Program) -> Vec<Diag> {
             reuse.note_closures(&closures_owned);
             register_closures(p, fid, closures_owned, FnClass::Closure);
             for owned in &adt_tys_owned {
+                if from_store && built.insert(std::sync::Arc::as_ptr(owned), owned.clone()).is_some() {
+                    continue;
+                }
                 let gt = build_owned_ty(p, owned);
                 ensure_global_adt_instances(p, gt, 0);
             }
@@ -12795,10 +12804,13 @@ impl Found {
                 })
                 .collect::<Vec<_>>()
         };
-        let reqs = |v: &[(LocalDefId, Vec<OwnedArg>)]| v.iter().map(|(t, a)| (*t, a.iter().map(stable_arg).collect::<Vec<_>>())).collect::<Vec<_>>();
+        let shared = |v: &[std::sync::Arc<OwnedTy>]| v.iter().map(|t| stable(t)).collect::<Vec<_>>();
+        let reqs = |v: &[(LocalDefId, std::sync::Arc<[OwnedArg]>)]| {
+            v.iter().map(|(t, a)| (*t, a.iter().map(stable_arg).collect::<Vec<_>>())).collect::<Vec<_>>()
+        };
         let vts = |v: &[(OwnedTy, OwnedTy)]| v.iter().map(|(a, b)| (stable(a), stable(b))).collect::<Vec<_>>();
         let ((a0, a1, a2, a3), (b0, b1, b2, b3)) = (&self.out, &o.out);
-        tys(a0) == tys(b0)
+        shared(a0) == shared(b0)
             && reqs(a1) == reqs(b1)
             && closures(a2) == closures(b2)
             && vts(a3) == vts(b3)
@@ -13066,13 +13078,13 @@ pub(crate) fn discovery_out(p: &Program, checked: &crate::check::Checked<'_>, di
     // makes an instance only the first time. Every type enters
     // the global store (lowering and codegen read body types
     // there); only some can name an instance (`may_make_instances`).
-    let mut adt_tys: Vec<OwnedTy> = Vec::new();
+    let mut adt_tys: Vec<std::sync::Arc<OwnedTy>> = Vec::new();
     let mut seen: crate::intern::FxMap<Ty, ()> = crate::intern::FxMap::default();
     for t in checked.expr_ty.iter().copied().chain(checked.locals.iter().map(|l| l.ty)) {
         if seen.insert(t, ()).is_none()
             && let Some(o) = snapshot_ty(&checked.tys, t)
         {
-            adt_tys.push(o);
+            adt_tys.push(std::sync::Arc::new(o));
         }
     }
     let mut vts: Vec<(OwnedTy, OwnedTy)> = Vec::new();
@@ -13081,7 +13093,7 @@ pub(crate) fn discovery_out(p: &Program, checked: &crate::check::Checked<'_>, di
             vts.push((a, b));
         }
     }
-    let mut reqs: Vec<(LocalDefId, Vec<OwnedArg>)> = Vec::new();
+    let mut reqs: Vec<(LocalDefId, std::sync::Arc<[OwnedArg]>)> = Vec::new();
     for (template, raw_args) in &checked.inst_requests {
         if checked.closure_map_pending
             && raw_args.iter().any(|g| matches!(g, GenericArg::Ty(t) if crate::check::opaque::mentions_template_closure(p, &checked.tys, *t)))
@@ -13110,7 +13122,7 @@ pub(crate) fn discovery_out(p: &Program, checked: &crate::check::Checked<'_>, di
             }
         }
         if ok {
-            reqs.push((*template, owned));
+            reqs.push((*template, owned.into()));
         }
     }
     // A body with errors fails the build (the driver's check reports

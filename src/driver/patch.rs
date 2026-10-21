@@ -2833,7 +2833,7 @@ pub(super) fn reuse_kept(
                     caches.gen_reuse.discovery_checked += 1;
                     // Every body type enters the global store, as discovery's
                     // replay does (lowering and codegen read it there).
-                    for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
+                    for t in out.0.iter().map(|t| &**t).chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
                         crate::check::generics::build_owned_ty(&mut p, t);
                     }
                 }
@@ -2919,8 +2919,13 @@ pub(super) fn instanced_templates(p: &crate::check::collect::Program) -> crate::
 /// exist when `x`'s turn begins. Its turn makes nothing from a type left
 /// out, and the same instances, in the same order, from the rest: the
 /// program holds the instances a cold collect makes, in its order.
-pub(super) fn made_before(p: &mut crate::check::collect::Program, x: crate::def::LocalDefId, old: &[crate::check::generics::OwnedTy], new: &[crate::check::generics::OwnedTy]) -> bool {
-    let mut open = |ts: &[crate::check::generics::OwnedTy]| -> Vec<usize> {
+pub(super) fn made_before(
+    p: &mut crate::check::collect::Program,
+    x: crate::def::LocalDefId,
+    old: &[Arc<crate::check::generics::OwnedTy>],
+    new: &[Arc<crate::check::generics::OwnedTy>],
+) -> bool {
+    let mut open = |ts: &[Arc<crate::check::generics::OwnedTy>]| -> Vec<usize> {
         (0..ts.len())
             .filter(|&i| {
                 let t = crate::check::generics::build_owned_ty(p, &ts[i]);

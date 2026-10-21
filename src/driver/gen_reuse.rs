@@ -107,8 +107,8 @@ struct DiscoveryEntry {
 /// A copy of one stored discovery output (`GenReuse::out_copy`).
 #[derive(Clone)]
 pub(crate) struct OutCopy {
-    adt_tys: Vec<OwnedTy>,
-    requests: Vec<(DefId, Vec<OwnedArg>)>,
+    adt_tys: Vec<Arc<OwnedTy>>,
+    requests: Vec<(DefId, Arc<[OwnedArg]>)>,
     closures: Vec<OwnedClosure>,
     vtables: Vec<(OwnedTy, OwnedTy)>,
 }
@@ -157,7 +157,7 @@ impl OutCopy {
     pub(crate) fn same(&self, p: &Program, out: &Discovered, walk_instances: bool) -> bool {
         let walk_instances = walk_instances || super::patch::walks_requests(p);
         let (adt_tys, requests, closures, vtables) = out;
-        let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).cloned().collect::<Vec<_>>();
+        let makers = |ts: &[Arc<OwnedTy>]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).cloned().collect::<Vec<_>>();
         self.closures == *closures
             && makers(&self.adt_tys) == makers(adt_tys)
             && self.vtables == *vtables
@@ -172,12 +172,12 @@ impl OutCopy {
     /// The kept program admits an edit when the two lists are the same once
     /// the types whose instances were made before the body's turn are left
     /// out (driver/patch.rs `made_before`).
-    pub(crate) fn makers(&self, out: &Discovered) -> Option<(Vec<OwnedTy>, Vec<OwnedTy>)> {
+    pub(crate) fn makers(&self, out: &Discovered) -> Option<(Vec<Arc<OwnedTy>>, Vec<Arc<OwnedTy>>)> {
         let (adt_tys, _, closures, vtables) = out;
         if self.closures != *closures || self.vtables != *vtables {
             return None;
         }
-        let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).cloned().collect::<Vec<_>>();
+        let makers = |ts: &[Arc<OwnedTy>]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).cloned().collect::<Vec<_>>();
         Some((makers(&self.adt_tys), makers(adt_tys)))
     }
 
@@ -185,7 +185,7 @@ impl OutCopy {
     /// (a refusal log line).
     pub(crate) fn differs(&self, p: &Program, out: &Discovered) -> String {
         let (adt_tys, _, closures, vtables) = out;
-        let makers = |ts: &[OwnedTy]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).count();
+        let makers = |ts: &[Arc<OwnedTy>]| ts.iter().filter(|t| crate::check::generics::may_make_instances(t)).count();
         let mut parts = Vec::new();
         if self.closures != *closures {
             let at = self.closures.iter().zip(closures).position(|(a, b)| a != b);
@@ -246,8 +246,9 @@ fn owned_str(p: &Program, t: &OwnedTy) -> String {
 
 /// What one stored discovery check replays: Adt types, requests with
 /// templates as this program's local ids, closures to register, and
-/// vtable requests.
-pub(crate) type Discovered = (Vec<OwnedTy>, Vec<(LocalDefId, Vec<OwnedArg>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>);
+/// vtable requests. A replay hands out the types and request args the
+/// entries share (`GenReuse::shared`), not copies of them.
+pub(crate) type Discovered = (Vec<Arc<OwnedTy>>, Vec<(LocalDefId, Arc<[OwnedArg]>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>);
 
 type FxSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FxHasher>>;
 
@@ -259,7 +260,7 @@ pub(crate) struct Prejudged {
     stamp: u64,
     held: bool,
     answers: Vec<(ReadKey, Read)>,
-    out: Option<(Vec<OwnedTy>, Vec<(DefId, Vec<OwnedArg>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>)>,
+    out: Option<(Vec<Arc<OwnedTy>>, Vec<(DefId, Arc<[OwnedArg]>)>, Vec<OwnedClosure>, Vec<(OwnedTy, OwnedTy)>)>,
 }
 
 /// `LUST_CHECK_PREJUDGE=1`: at each prejudged turn, every key of the entry
@@ -502,15 +503,17 @@ impl GenReuse {
         &mut self,
         p: &Program,
         f: LocalDefId,
-        adt_tys: &[OwnedTy],
-        requests: &[(LocalDefId, Vec<OwnedArg>)],
+        adt_tys: &[Arc<OwnedTy>],
+        requests: &[(LocalDefId, Arc<[OwnedArg]>)],
         closures: &[OwnedClosure],
         vtables: &[(OwnedTy, OwnedTy)],
         pending: Option<&Reads>,
     ) {
         self.keep_held(p.def_id(f));
-        let requests = requests.iter().map(|(t, args)| (p.def_id(*t), args.clone())).collect();
-        let copy = OutCopy { adt_tys: adt_tys.to_vec(), requests, closures: closures.to_vec(), vtables: vtables.to_vec() };
+        // Copies, as `share` makes them.
+        let requests = requests.iter().map(|(t, args)| (p.def_id(*t), Arc::from(&**args))).collect();
+        let adt_tys = adt_tys.iter().map(|t| Arc::new((**t).clone())).collect();
+        let copy = OutCopy { adt_tys, requests, closures: closures.to_vec(), vtables: vtables.to_vec() };
         let pending = match pending.filter(|_| self.on) {
             Some(r) => self.src_of(p, f).map(|src| (src, with_own_sig(p, f, r, &mut self.keys))),
             None => None,
@@ -1113,11 +1116,11 @@ impl GenReuse {
         let mut requests = Vec::with_capacity(e.requests.len());
         for (def, args) in &e.requests {
             let l = p.local_def(def.hash).filter(|&l| p.def_id(l) == *def)?;
-            requests.push((l, args.to_vec()));
+            requests.push((l, args.clone()));
         }
         e.env = self.env;
         self.discovery_reused += 1;
-        Some((e.adt_tys.iter().map(|t| (**t).clone()).collect(), requests, e.closures.clone(), e.vtables.clone()))
+        Some((e.adt_tys.clone(), requests, e.closures.clone(), e.vtables.clone()))
     }
 
     /// True when a stored check read the body of one of `defs`: a
@@ -1203,14 +1206,7 @@ impl GenReuse {
             } else {
                 (true, Vec::new())
             };
-            let out = held.then(|| {
-                (
-                    e.adt_tys.iter().map(|t| (**t).clone()).collect(),
-                    e.requests.iter().map(|(d, a)| (*d, a.to_vec())).collect(),
-                    e.closures.clone(),
-                    e.vtables.clone(),
-                )
-            });
+            let out = held.then(|| (e.adt_tys.clone(), e.requests.clone(), e.closures.clone(), e.vtables.clone()));
             Some(Prejudged { stamp: e.stamp, held, answers, out })
         })
     }
@@ -1270,12 +1266,7 @@ impl GenReuse {
             return Some(c.clone());
         }
         let e = self.discovery.get(&def)?;
-        Some(OutCopy {
-            adt_tys: e.adt_tys.iter().map(|t| (**t).clone()).collect(),
-            requests: e.requests.iter().map(|(d, a)| (*d, a.to_vec())).collect(),
-            closures: e.closures.clone(),
-            vtables: e.vtables.clone(),
-        })
+        Some(OutCopy { adt_tys: e.adt_tys.clone(), requests: e.requests.clone(), closures: e.closures.clone(), vtables: e.vtables.clone() })
     }
 
     /// Stores the output of one clean discovery check of fn `f`.
@@ -1285,8 +1276,8 @@ impl GenReuse {
         p: &Program,
         f: LocalDefId,
         reads: &Reads,
-        adt_tys: &[OwnedTy],
-        requests: &[(LocalDefId, Vec<OwnedArg>)],
+        adt_tys: &[Arc<OwnedTy>],
+        requests: &[(LocalDefId, Arc<[OwnedArg]>)],
         closures: &[OwnedClosure],
         vtables: &[(OwnedTy, OwnedTy)],
     ) {
@@ -1319,7 +1310,8 @@ impl GenReuse {
 }
 
 /// `t` as the value that every discovery entry holding it shares (`GenReuse::shared`,
-/// `GenReuse::shared_args`); `own` makes the first copy.
+/// `GenReuse::shared_args`); `own` makes the first copy. A copy, not the caller's `Arc`: kept,
+/// a discovery check's own values made the tsgo front image 27 MB larger (live bytes).
 fn share<T: Hash + Eq + ?Sized>(shared: &mut FxSet<Arc<T>>, t: &T, own: impl FnOnce(&T) -> Arc<T>) -> Arc<T> {
     if let Some(s) = shared.get(t) {
         return s.clone();

@@ -965,7 +965,7 @@ pub(super) fn replay_discovery(
             }
             reuse.discovery_checked += 1;
             // Every body type enters the global store, as discovery does.
-            for t in out.0.iter().chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
+            for t in out.0.iter().map(|t| &**t).chain(out.3.iter().flat_map(|(a, b)| [a, b])) {
                 generics::build_owned_ty(p, t);
             }
             outs.push((g, reads, pending, out));
