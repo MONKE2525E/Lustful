@@ -517,7 +517,7 @@ impl Touched {
             ReadKey::AssocVis(a, name) => methods.contains(&(*a, *name)),
             // A header delta refuses impl methods of std and lang traits
             // (`generics::delta_impl_trait`), so no `LangImpls` read moves.
-            ReadKey::Layout(_) | ReadKey::Structure(_) | ReadKey::Answer(..) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::LangImpls(_) => false,
+            ReadKey::Layout(_) | ReadKey::DropCk(_) | ReadKey::Structure(_) | ReadKey::Answer(..) | ReadKey::TraitInScope(..) | ReadKey::Derives(_) | ReadKey::DeriveBits(..) | ReadKey::LangImpls(_) => false,
         }
     }
 }

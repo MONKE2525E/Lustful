@@ -969,8 +969,7 @@ def hole2(case, form, v):
     """Sol's const-body review round 2, each history in a fn body or a const body: lint (a
     crate-level allow removed), hygiene (a macro's binder loses its `$`), alias (a type alias
     inside a type argument changes), length (a named const array length changes), drop (a
-    recursive field type behind a Box makes drop checking overflow; its sequences join with the
-    drop check's read). v1 must be rejected."""
+    recursive field type behind a Box makes drop checking overflow). v1 must be rejected."""
     head, item = "", ""
     if case == "lint":
         head = "#![allow(overflowing_literals)]\n" if v == 0 else ""
@@ -1182,7 +1181,7 @@ def corpus():
     seqs.append(("hole-limit", [hole_limit(256), hole_limit(128), hole_limit(256)]))
     seqs.append(("hole-check-then-build", [("check", hole_limit(128)), hole_limit(128)]))
     # Sol's const-body review round 2 histories, in fn and const bodies (2026-10-20).
-    for case in ("lint", "hygiene", "alias", "length"):
+    for case in ("lint", "hygiene", "alias", "length", "drop"):
         for form in ("fn", "const"):
             seqs.append((f"hole2-{case}-{form}", [hole2(case, form, v) for v in (0, 1, 0)]))
     r = recovery

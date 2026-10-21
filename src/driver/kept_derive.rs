@@ -129,6 +129,7 @@ pub(super) fn apply_derives(
                     K::ImplSet(_) => "ImplSet",
                     K::Sig(_) => "Sig",
                     K::Layout(_) => "Layout",
+                    K::DropCk(_) => "DropCk",
                     K::Checked(_) => "Checked",
                     K::TraitInScope(..) => "TraitInScope",
                     K::Derives(_) => "Derives",

@@ -201,6 +201,12 @@ pub enum ReadKey {
     ImplSet(ImplSetKey),
     Sig(DefId),
     Layout(DefId),
+    /// The drop-check constraint of one Adt template, in its own params
+    /// (check/dropck.rs: rustc's `adt_dtorck_constraint`): the drop check of
+    /// a body local follows each Adt's fields, behind pointers too. The
+    /// fingerprint is the constraint, so a field edit that adds no
+    /// constraint (a `u32`) moves nothing.
+    DropCk(DefId),
     /// A mono call edge to the checked body of a def (section 8.2).
     Checked(DefId),
     /// Whether a user trait is defined in or imported into one module,
@@ -639,7 +645,14 @@ fn hash_generics(h: &mut FxHasher, p: &Program, g: &Generics) {
 /// in-memory fingerprint of section 8.1, not the 8.4 disk form: W-DRIVER owns
 /// the disk translation and may reshape it. Kind tags follow `TyKind`
 /// declaration order and change only when it grows at the end.
-fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty) {
+/// `hash_ty` of one type alone, as a value (check/dropck.rs).
+pub(crate) fn hash_ty_value(p: &Program, tys: &impl TyIntern, t: Ty) -> u64 {
+    let mut h = FxHasher::default();
+    hash_ty(&mut h, p, tys, t);
+    h.finish()
+}
+
+pub(crate) fn hash_ty(h: &mut FxHasher, p: &Program, tys: &impl TyIntern, t: Ty) {
     match tys.kind(t) {
         TyKind::Error => 0u8.hash(h),
         TyKind::Unit => 1u8.hash(h),
@@ -868,6 +881,8 @@ pub(crate) struct DeepMemo(FxMap<(Deep, DefId), u64>, bool);
 #[derive(Default)]
 pub struct FpMemo {
     layout: Vec<std::sync::OnceLock<u64>>,
+    /// `DropCk` fingerprints (`drop_check_fingerprint`).
+    dropck: Vec<std::sync::OnceLock<u64>>,
     structure: Vec<std::sync::OnceLock<u64>>,
     regions: Vec<std::sync::OnceLock<u64>>,
     /// `Answer` fingerprints, `ANSWER_KINDS` per Adt.
@@ -882,6 +897,7 @@ impl FpMemo {
     /// Turns the memo on, empty, for a program with `adts` Adts.
     pub fn on(&mut self, adts: usize) {
         self.layout = (0..adts).map(|_| Default::default()).collect();
+        self.dropck = (0..adts).map(|_| Default::default()).collect();
         self.structure = (0..adts).map(|_| Default::default()).collect();
         self.regions = (0..adts).map(|_| Default::default()).collect();
         self.answers = (0..adts * ANSWER_KINDS).map(|_| Default::default()).collect();
@@ -2396,6 +2412,21 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     Fingerprint(h.finish())
 }
 
+/// A `DropCk` node: the drop-check constraint of Adt template `def`
+/// (check/dropck.rs `template_constraint_hash`), memoized per Adt while
+/// the program memo is on.
+fn drop_check_fingerprint(p: &Program, def: DefId) -> Fingerprint {
+    let slot = p.adt_by_def(def).and_then(|a| p.fp_memo.dropck.get(a.0 as usize));
+    if let Some(v) = slot.and_then(|s| s.get()) {
+        return Fingerprint(*v);
+    }
+    let v = crate::check::derive_delta::unlogged(|| crate::check::dropck::template_constraint_hash(p, def));
+    if let Some(s) = slot {
+        let _ = s.set(v);
+    }
+    Fingerprint(v)
+}
+
 /// The fingerprint of the program's statics as the glue unit emits
 /// them: each static's `Sig` fingerprint (evaluated value; its
 /// visibility rides along, so a visibility edit costs one glue rebuild)
@@ -2652,6 +2683,11 @@ impl<'a> Program {
     /// `def` (check/derive_delta.rs `bit`).
     pub(crate) fn record_derive_bits(&self, reads: &mut Reads, def: DefId, mask: u16) {
         reads.record_with(ReadKey::DeriveBits(def, mask), self.adt_by_def(def).is_none(), || derive_bits_fingerprint(self, def, mask));
+    }
+
+    /// Records a `DropCk` read of the Adt template `def`.
+    pub(crate) fn record_drop_check(&self, reads: &mut Reads, def: DefId) {
+        reads.record_with(ReadKey::DropCk(def), self.adt_by_def(def).is_none(), || drop_check_fingerprint(self, def));
     }
 
     /// Records a `LangImpls` read of the Adt template `def`.
@@ -2972,6 +3008,7 @@ impl<'a> Program {
                 let known = self.adt_by_def(*def).is_some() || self.defs.get(*def).is_some();
                 Read { fingerprint: layout_fingerprint(self, *def), failed: !known }
             }
+            ReadKey::DropCk(def) => Read { fingerprint: drop_check_fingerprint(self, *def), failed: self.adt_by_def(*def).is_none() },
             ReadKey::Checked(_) => Read { fingerprint: Fingerprint(u64::MAX), failed: true },
             ReadKey::TraitInScope(module, trait_def) => {
                 let ans = self.mod_of_key(*module).is_some_and(|m| self.trait_in_module_answer(m, *trait_def));
@@ -3290,7 +3327,7 @@ impl Program {
     fn derive_key_moves_uncached(&self, m: &mut DeriveMoves, key: &ReadKey) -> bool {
         let reach = m.reach;
         match key {
-            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) | ReadKey::Structure(d) | ReadKey::Answer(d, _) => {
+            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) | ReadKey::DropCk(d) | ReadKey::Structure(d) | ReadKey::Answer(d, _) => {
                 self.adt_by_def(*d).is_none_or(|a| reach.row(self, a.0 as usize)) || self.hasher_reaches(m, *d)
             }
             // Impl shapes fold types shallow: no derive list.
@@ -3388,7 +3425,7 @@ impl Program {
             ReadKey::MethodSet(k) => Some(matches!(k.head, Head::Adt(d) if row(d)) || m.names.contains_key(&k.name)),
             ReadKey::Checked(_) | ReadKey::TraitInScope(..) | ReadKey::AssocVis(..) => Some(false),
             // As `sig_moves` answers for an Adt def (no fn has that def).
-            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) | ReadKey::Structure(d) | ReadKey::Answer(d, _) => match self.adt_by_def(*d) {
+            ReadKey::Derives(d) | ReadKey::DeriveBits(d, _) | ReadKey::Layout(d) | ReadKey::DropCk(d) | ReadKey::Structure(d) | ReadKey::Answer(d, _) => match self.adt_by_def(*d) {
                 None => Some(true),
                 Some(_) => m.sig.get(d).copied(),
             },

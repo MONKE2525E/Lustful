@@ -70,6 +70,44 @@ struct Dropck<'a, 'g> {
     adts: FxMap<AdtId, Constraint>,
 }
 
+/// The fingerprint of Adt template `def`'s drop-check constraint as `Dropck::adt`
+/// makes it (its fields' items in its own params, std types by their real
+/// layout, and an overflow), for its `ReadKey::DropCk` read. 0 for no Adt.
+pub(crate) fn template_constraint_hash(p: &Program, def: crate::def::DefId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Some(a) = p.defs.local_adt(def) else { return 0 };
+    let mut tys = Tys::new(&p.tys);
+    let mut cx = Dropck { p, limit: crate::check::where_overflow::recursion_limit(p), tys: &mut tys, adts: FxMap::default() };
+    let mut h = crate::intern::FxHasher::default();
+    "dropck-constraint-v1".hash(&mut h);
+    let fields: Vec<Ty> = p.adt(a).variants.iter().flat_map(|v| v.fields.iter().map(|f| f.ty)).collect();
+    let mut own = Constraint::default();
+    for f in fields {
+        cx.inner(Item::Ty(f), 0, &mut own);
+    }
+    let item = |h: &mut crate::intern::FxHasher, i: &Item, tys: &Tys| match *i {
+        Item::Ty(t) => (0u8, crate::driver::graph::hash_ty_value(p, tys, t)).hash(h),
+        Item::Global => 1u8.hash(h),
+        Item::CountedInner(t, arc) => (2u8, arc, crate::driver::graph::hash_ty_value(p, tys, t)).hash(h),
+        Item::NodeRef(k, v) => (3u8, crate::driver::graph::hash_ty_value(p, tys, k), v.map(|v| crate::driver::graph::hash_ty_value(p, tys, v))).hash(h),
+        Item::OwnedLeaf => 4u8.hash(h),
+        Item::SetBox(t) => (5u8, crate::driver::graph::hash_ty_value(p, tys, t)).hash(h),
+        Item::SetPair(t) => (6u8, crate::driver::graph::hash_ty_value(p, tys, t)).hash(h),
+    };
+    own.items.len().hash(&mut h);
+    for i in &own.items {
+        item(&mut h, i, &*cx.tys);
+    }
+    match &own.overflow {
+        Some(o) => {
+            1u8.hash(&mut h);
+            item(&mut h, o, &*cx.tys);
+        }
+        None => 0u8.hash(&mut h),
+    }
+    h.finish()
+}
+
 /// Checks one body for drop-check overflow. `fid` is a plain fn, a
 /// template, or a closure's parent; mono instances are skipped by the
 /// caller. Returns the first overflow as rustc's E0320.
@@ -350,6 +388,9 @@ impl Dropck<'_, '_> {
             return;
         }
         let Some(a) = self.p.defs.local_adt(def) else { return };
+        // This Adt's constraint comes from its fields (`template_constraint_hash`):
+        // a `DropCk` read of the body.
+        crate::check::derive_delta::note_def(def, crate::check::derive_delta::bit::DROPCK);
         if let Some(items) = self.std_items(a, &args) {
             push_dedup(c, items);
             return;

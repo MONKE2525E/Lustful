@@ -53,6 +53,9 @@ pub(crate) mod bit {
     /// (`ReadKey::Layout`), by a reader that sees it through a pointer
     /// (`Program::note_adt_layout`).
     pub(crate) const LAYOUT: u16 = 1 << 14;
+    /// No derive trait: a read of the Adt's drop-check constraint
+    /// (`ReadKey::DropCk`, check/dropck.rs).
+    pub(crate) const DROPCK: u16 = 1 << 13;
 }
 
 /// The derive bit of lang trait `tr`, or 0 for a trait no derive makes.
@@ -169,7 +172,10 @@ pub(crate) fn record(p: &Program, reads: &mut Reads, noted: &[(DefId, u16)]) {
         if mask & bit::LAYOUT != 0 {
             let _ = p.layout_of(reads, def);
         }
-        match mask & !(bit::LANG | bit::LAYOUT) {
+        if mask & bit::DROPCK != 0 {
+            p.record_drop_check(reads, def);
+        }
+        match mask & !(bit::LANG | bit::LAYOUT | bit::DROPCK) {
             0 => {}
             bit::ALL => p.record_derives(reads, def),
             m => p.record_derive_bits(reads, def, m),
