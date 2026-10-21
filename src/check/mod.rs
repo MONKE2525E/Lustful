@@ -8458,28 +8458,7 @@ impl<'p> Ctx<'p> {
     fn resolve_written(&mut self, t: ast::TyId) -> Ty {
         let p = self.p;
         let written_span = p.ast.ty_span(t);
-        // A written type name in a body is a type-namespace binding read.
-        // Primitive names and `Self` are scope layers, not bindings.
-        if let ast::TyExpr::Path(segs) = p.ast.ty(t) {
-            let seg = if segs.len() > 1 && segs[0].name == p.known.std {
-                segs.last()
-            } else if segs.len() == 1 {
-                segs.first()
-            } else {
-                None
-            };
-            if let Some(seg) = seg {
-                let name = seg.name;
-                if p.known.int_ty(name).is_none()
-                    && name != p.known.bool
-                    && name != p.known.char
-                    && name != p.known.str
-                    && name != p.known.self_type
-                {
-                    self.binding(Namespace::Type, name);
-                }
-            }
-        }
+        self.written_names(t);
         let cx = p.gx.resolve_cx(&p.type_names, &p.aliases);
         let span = p.ast.ty_span(t);
         let resolved = generics::resolve_scoped(&p.ast, &p.interner, &p.known, &cx, &mut self.tys, t, &self.body_scope.clone());
@@ -8510,6 +8489,116 @@ impl<'p> Ctx<'p> {
                 self.errs.push(d);
                 ERROR
             }
+        }
+    }
+
+    /// Records a binding read of every name a written type resolves
+    /// through: each path's type name, in generic arguments, bounds, fn
+    /// pointer and qualified-path parts too, and each plain const path in
+    /// an array length or const argument (a value read: a const's `Sig`
+    /// folds its value). Resolution reads them with no other recorded read,
+    /// so an alias inside `Option<m::A>` or the `N` of `[u8; N]` that
+    /// changes under an unchanged body checks that body again (Sol's
+    /// const-body review round 2: false accepts in fn bodies too). Primitive
+    /// names and `Self` are scope layers, not bindings.
+    fn written_names(&mut self, t: ast::TyId) {
+        let p = self.p;
+        match p.ast.ty(t) {
+            ast::TyExpr::Path(segs) => self.written_path(segs, Namespace::Type),
+            ast::TyExpr::Ref { inner, .. } | ast::TyExpr::Slice(inner) | ast::TyExpr::Ptr { inner, .. } | ast::TyExpr::Paren(inner) => {
+                self.written_names(*inner)
+            }
+            ast::TyExpr::Tuple(ts) => ts.iter().for_each(|&e| self.written_names(e)),
+            ast::TyExpr::Array { inner, len } => {
+                self.written_names(*inner);
+                self.written_const(*len);
+            }
+            ast::TyExpr::FnPtr { inputs, ret, .. } => {
+                inputs.iter().for_each(|i| self.written_names(i.ty));
+                ret.iter().for_each(|&r| self.written_names(r));
+            }
+            ast::TyExpr::Dyn { bounds, .. } | ast::TyExpr::ImplTrait { bounds, .. } => self.written_bounds(bounds),
+            ast::TyExpr::QPath { self_ty, trait_path, segs } => {
+                self.written_names(*self_ty);
+                self.written_path(trait_path, Namespace::Type);
+                self.written_args(segs);
+            }
+            ast::TyExpr::Unit | ast::TyExpr::Never | ast::TyExpr::Infer | ast::TyExpr::MacroCall(_) => {}
+        }
+    }
+
+    /// `written_names` for one path: its name (a single segment, or the
+    /// last one after `std`), then its generic arguments.
+    fn written_path(&mut self, segs: &[ast::PathSeg], ns: Namespace) {
+        let p = self.p;
+        let seg = if segs.len() > 1 && segs[0].name == p.known.std {
+            segs.last()
+        } else if segs.len() == 1 {
+            segs.first()
+        } else {
+            None
+        };
+        if let Some(seg) = seg {
+            let name = seg.name;
+            if p.known.int_ty(name).is_none() && name != p.known.bool && name != p.known.char && name != p.known.str && name != p.known.self_type {
+                self.binding(ns, name);
+            }
+        }
+        self.written_args(segs);
+    }
+
+    fn written_args(&mut self, segs: &[ast::PathSeg]) {
+        for seg in segs {
+            match &seg.args {
+                ast::GenericArgs::Angle(args) => {
+                    for a in args {
+                        match a {
+                            ast::GenericArg::Type(t) => self.written_names(*t),
+                            ast::GenericArg::Const(e) => self.written_const(*e),
+                            ast::GenericArg::Binding { kind, .. } => match kind {
+                                ast::BindingKind::EqTy(t) => self.written_names(*t),
+                                ast::BindingKind::EqConst(e) => self.written_const(*e),
+                                ast::BindingKind::Constraint(b) => self.written_bounds(b),
+                            },
+                            ast::GenericArg::Lifetime(_) => {}
+                        }
+                    }
+                }
+                ast::GenericArgs::Parenthesized { inputs, output } => {
+                    inputs.iter().for_each(|&t| self.written_names(t));
+                    output.iter().for_each(|&t| self.written_names(t));
+                }
+                ast::GenericArgs::None => {}
+            }
+        }
+    }
+
+    fn written_bounds(&mut self, bounds: &[ast::TraitBound]) {
+        for b in bounds {
+            if let ast::TraitBound::Trait { trait_ref, .. } = b {
+                self.written_path(&trait_ref.path, Namespace::Type);
+            }
+        }
+    }
+
+    /// A plain const path (`N`, or `{ N }`) in a written type: a value
+    /// binding read. Other const expressions are anonymous consts, checked
+    /// with their own reads (`type_anon_const`).
+    fn written_const(&mut self, e: ast::ExprId) {
+        let ast = &self.p.ast;
+        let path = match ast.expr(e) {
+            ast::Expr::Path(segs) => Some(segs),
+            ast::Expr::Block(b) => {
+                let b = ast.block(*b);
+                b.tail.filter(|_| b.stmts.is_empty()).and_then(|t| match ast.expr(t) {
+                    ast::Expr::Path(segs) => Some(segs),
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        if let Some(segs) = path.filter(|s| s.len() == 1) {
+            self.binding(Namespace::Value, segs[0].name);
         }
     }
 

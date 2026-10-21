@@ -965,6 +965,36 @@ fn main() {{
 }}
 '''
 
+def hole2(case, form, v):
+    """Sol's const-body review round 2, each history in a fn body or a const body: lint (a
+    crate-level allow removed), hygiene (a macro's binder loses its `$`), alias (a type alias
+    inside a type argument changes), length (a named const array length changes), drop (a
+    recursive field type behind a Box makes drop checking overflow; its sequences join with the
+    drop check's read). v1 must be rejected."""
+    head, item = "", ""
+    if case == "lint":
+        head = "#![allow(overflowing_literals)]\n" if v == 0 else ""
+        stmt = "let _: u8 = 256;"
+    elif case == "hygiene":
+        binder = "$x" if v == 0 else "x"
+        item = f"macro_rules! m {{\n    ($x:ident) => {{{{\n        let {binder}: u8 = 1;\n        $x\n    }}}};\n}}\n\n"
+        stmt = "let _: u8 = m!(x);"
+    elif case == "alias":
+        item = f"mod m {{\n    pub type A = {'u8' if v == 0 else 'u16'};\n}}\n\n"
+        stmt = "let _: Option<m::A> = Some(1u8);"
+    elif case == "length":
+        item = f"const N: usize = {1 if v == 0 else 2};\n\n"
+        stmt = "let _: [u8; N] = [0; 1];"
+    else:
+        inner = "T" if v == 0 else "(T, T)"
+        item = f"struct S {{\n    g: Grow<u8>,\n}}\n\nstruct Grow<T> {{\n    value: T,\n    next: Option<Box<Grow<{inner}>>>,\n}}\n\n"
+        stmt = "let _x: Option<Box<S>> = None;"
+    if form == "fn":
+        body = f"fn f() -> u8 {{\n    if false {{\n        {stmt}\n    }}\n    7\n}}\n\nfn main() {{\n    println!(\"{{}}\", f());\n}}\n"
+    else:
+        body = f"const C: u8 = {{\n    if false {{\n        {stmt}\n    }}\n    7\n}};\n\nfn main() {{\n    println!(\"{{}}\", C);\n}}\n"
+    return head + item + body
+
 
 LIFETIME_HEAD = """use std::rc::Rc;
 
@@ -1151,6 +1181,10 @@ def corpus():
         seqs.append((f"hole-module-{kind}", [hole_module(v, kind) for v in (0, 1, 0)]))
     seqs.append(("hole-limit", [hole_limit(256), hole_limit(128), hole_limit(256)]))
     seqs.append(("hole-check-then-build", [("check", hole_limit(128)), hole_limit(128)]))
+    # Sol's const-body review round 2 histories, in fn and const bodies (2026-10-20).
+    for case in ("lint", "hygiene", "alias", "length"):
+        for form in ("fn", "const"):
+            seqs.append((f"hole2-{case}-{form}", [hole2(case, form, v) for v in (0, 1, 0)]))
     r = recovery
     seqs.append(("recover-body", [r("ok1"), r("body_err"), r("ok2")]))
     seqs.append(("recover-two-errors", [r("ok1"), r("body_err"), r("body_err2"), r("ok1")]))
