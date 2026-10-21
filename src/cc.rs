@@ -744,6 +744,9 @@ pub fn build_with(
     });
     let pgo = pgo::Mode::from_env(spec, work, defs.as_ref(), stream.as_ref().and_then(Stream::warm))?;
     let pgo_of = |i: usize| pgo.as_ref().filter(|_| !is_cxx(&names[i]));
+    // A C unit of glue (`pgo::fnless`: no program fn, no system header) compiles the fns its
+    // profile calls cold with no optimization (`pgo::use_flags`).
+    let fnless = |i: usize| !is_ll[i] && pre[i].is_none() && scans[i].as_ref().is_some_and(pgo::fnless);
     // An instrumented build needs a compiler with a profile runtime (`pgo::gen_spec`).
     let gen_spec = if matches!(pgo, Some(pgo::Mode::Gen)) { Some(pgo::gen_spec(spec)?) } else { None };
     let spec = gen_spec.as_ref().unwrap_or(spec);
@@ -778,7 +781,7 @@ pub fn build_with(
     let nopre = rt_max > 0 && pgo.is_some() && !pgo::no_preinline();
     let rt_digest = match rt {
         Some(r) => {
-            let part = pgo_of(r).map(|m| m.key_part(&pfile(r)));
+            let part = pgo_of(r).map(|m| m.key_part(&pfile(r), fnless(r)));
             // The marker is a declaration: the key reads the preprocessed text, without comments.
             let key = keyed.then(|| unit_key(&format!("{}\ntypedef int lust_rtinl_{rt_max};\n", text(r)), None, spec, debug, part.as_deref(), false));
             let cached = matches!((cache, &key), (Some(c), Some(k)) if c.unit_object(k, &objs[r]) && c.unit_object(&format!("{k}-inl"), &rt_inl));
@@ -794,7 +797,7 @@ pub fn build_with(
                     None => work.join(format!("{}.c", names[r])),
                 };
                 std::fs::write(&src, text(r)).map_err(|e| format!("cannot write {}: {e}", src.display()))?;
-                let pf = pgo_of(r).map(|m| m.unit_flags(&pfile(r))).transpose()?;
+                let pf = pgo_of(r).map(|m| m.unit_flags(&pfile(r), fnless(r))).transpose()?;
                 compile_runtime_ir(spec, &flags, &src, &objs[r], &rt_inl, rt_max, pf.as_deref(), key.as_deref())
                     .map_err(|e| format!("the C compiler failed for target {} (runtime IR):\n{e}", spec.triple))?;
                 pgo_of(r).map_or(Ok(()), |m| m.after_compile(&objs[r]))?;
@@ -815,7 +818,7 @@ pub fn build_with(
         }
         let (unit, c) = (&units[i].name, text(i));
         let mine = || {
-            let part = pgo_of(i).map(|m| m.key_part(&pfile(i)));
+            let part = pgo_of(i).map(|m| m.key_part(&pfile(i), fnless(i)));
             keyed.then(|| match ll_of.get(unit.as_str()) {
                 Some(ll) => {
                     let hc = hc_of.get(unit.as_str()).copied().unwrap_or("");
@@ -948,7 +951,7 @@ pub fn build_with(
                     continue;
                 }
                 if let Some(ll) = ll_of.get(units[i].name.as_str()) {
-                    let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i))).transpose() {
+                    let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i), fnless(i))).transpose() {
                         Ok(pf) => pf,
                         Err(e) => {
                             fail(format!("--- unit {name}: {e}\n"));
@@ -972,7 +975,7 @@ pub fn build_with(
                 } else {
                     (unit_words(spec, debug, pre_of(i).is_some() || c.contains("#include <")), &flags)
                 };
-                let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i))) {
+                let pf = match pgo_of(i).map(|m| m.unit_flags(&pfile(i), fnless(i))) {
                     Some(Ok(pf)) => Some((pf, pgo_dir.as_deref().unwrap_or(work))),
                     Some(Err(e)) => {
                         fail(format!("--- unit {name}: {e}\n"));

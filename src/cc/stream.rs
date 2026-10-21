@@ -127,7 +127,8 @@ impl Stream {
                 let (exts, statics) = super::pgo::definitions_of(text);
                 let file = super::pgo::stable_name(&exts).unwrap_or_else(|| name.to_string());
                 let own = w.own(&format!("{file}.c"), &exts, &statics);
-                (file, Some(w.key_part(&own)), Some(w.unit_flags(&own)))
+                let fnless = super::pgo::fnless(&(exts, statics));
+                (file, Some(w.key_part(&own, fnless)), Some(w.unit_flags(&own, fnless)))
             }
             None => (name.to_string(), None, None),
         };

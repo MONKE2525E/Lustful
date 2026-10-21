@@ -96,20 +96,21 @@ impl Mode {
         }
     }
 
-    /// The compile flags of the unit compiled as `file`. With a profile it first writes
-    /// that unit's own profile into the work dir (a unit with no records gets none).
-    pub fn unit_flags(&self, file: &str) -> Result<Vec<String>, String> {
+    /// The compile flags of the unit compiled as `file`; `fnless`: it defines no program fn
+    /// (`fnless`). With a profile it first writes that unit's own profile into the work dir (a
+    /// unit with no records gets none).
+    pub fn unit_flags(&self, file: &str, fnless: bool) -> Result<Vec<String>, String> {
         match self {
             Mode::Gen => Ok(std::iter::once("-fprofile-generate".to_string()).chain(nopre_flags()).collect()),
-            Mode::Use(p) => Ok(use_flags(&p.pins, p.own.get(file).is_some_and(|r| !r.is_empty()), &p.all, &p.key)),
+            Mode::Use(p) => Ok(use_flags(&p.pins, p.own.get(file).is_some_and(|r| !r.is_empty()), &p.all, &p.key, fnless)),
         }
     }
 
     /// The profile part of the cache key of the unit compiled as `file` (`cc::unit_key`).
-    pub fn key_part(&self, file: &str) -> String {
+    pub fn key_part(&self, file: &str, fnless: bool) -> String {
         match self {
             Mode::Gen => format!("gen{} {STATIC_FILE}", if no_preinline() { " nopre" } else { "" }),
-            Mode::Use(p) => use_key_part(&p.pins, p.own.get(file).map_or(&[][..], |v| &v[..])),
+            Mode::Use(p) => use_key_part(&p.pins, p.own.get(file).map_or(&[][..], |v| &v[..]), fnless),
         }
     }
 
@@ -142,7 +143,7 @@ fn nopre_flags() -> impl Iterator<Item = String> {
 }
 
 /// A use build's compile flags of a unit (`Mode::unit_flags`, `Warm::unit_flags`).
-fn use_flags(pins: &[String], has_records: bool, all: &Path, key: &str) -> Vec<String> {
+fn use_flags(pins: &[String], has_records: bool, all: &Path, key: &str, fnless: bool) -> Vec<String> {
     let mut flags = pins.to_vec();
     flags.extend(nopre_flags());
     // A unit with records reads the whole profile: clang takes only the records of
@@ -151,6 +152,13 @@ fn use_flags(pins: &[String], has_records: bool, all: &Path, key: &str) -> Vec<S
     // to write and merge. Its key still holds only its own records (`key_part`).
     if has_records {
         flags.push(format!("-fprofile-use={}", all.display()));
+        // A unit of glue (no program fn: a glue shard or a statics part) compiles the fns the
+        // profile calls cold with no optimization: glue no training run reached costs clang
+        // much time for little code (tsgo replay m9, m11: -7% of the missed units' compile
+        // instructions, +0.9% tsc size). In fn units the same costs 2x the size of tsc.
+        if fnless {
+            flags.extend(["-mllvm".to_string(), "-pgo-cold-func-opt=optnone".to_string()]);
+        }
         // zig cc caches a compile by its source and args, not by this file: the
         // profile's digest in the args keeps another profile at this path from
         // getting the object of the last one.
@@ -160,13 +168,13 @@ fn use_flags(pins: &[String], has_records: bool, all: &Path, key: &str) -> Vec<S
 }
 
 /// A use build's key part of a unit with records `own` (`Mode::key_part`, `Warm::key_part`).
-fn use_key_part(pins: &[String], own: &[u128]) -> String {
+fn use_key_part(pins: &[String], own: &[u128], fnless: bool) -> String {
     let nopre = if no_preinline() { " nopre" } else { "" };
     let pins = pins.join(" ");
     let own: Vec<[u8; 16]> = own.iter().map(|d| d.to_le_bytes()).collect();
     // One part with `nopre`: with the call graph profile kept, keys are those of
     // builds before the flag.
-    let flags = format!("{nopre}{}", if cg_profile() { "" } else { " nocg" });
+    let flags = format!("{nopre}{}{}", if cg_profile() { "" } else { " nocg" }, if fnless && !own.is_empty() { " cold-optnone" } else { "" });
     let mut parts: Vec<&[u8]> = vec![pins.as_bytes(), flags.as_bytes(), STATIC_FILE.as_bytes()];
     parts.extend(own.iter().map(|b| b.as_slice()));
     digest(&parts)
@@ -272,13 +280,13 @@ impl Warm {
     }
 
     /// The compile flags of a unit with records `own` (`Mode::unit_flags`).
-    pub(super) fn unit_flags(&self, own: &[u128]) -> Vec<String> {
-        use_flags(&self.pins, !own.is_empty(), &self.all, &self.key)
+    pub(super) fn unit_flags(&self, own: &[u128], fnless: bool) -> Vec<String> {
+        use_flags(&self.pins, !own.is_empty(), &self.all, &self.key, fnless)
     }
 
     /// The key part of a unit with records `own` (`Mode::key_part`).
-    pub(super) fn key_part(&self, own: &[u128]) -> String {
-        use_key_part(&self.pins, own)
+    pub(super) fn key_part(&self, own: &[u128], fnless: bool) -> String {
+        use_key_part(&self.pins, own, fnless)
     }
 }
 
@@ -845,6 +853,20 @@ pub fn defined_statics(c: &str) -> Vec<&str> {
 /// What a unit's text defines: its external fns (`defined_externs`), then its static fns.
 pub(super) type Defs<'a> = (Vec<&'a str>, Vec<&'a str>);
 
+/// True when a unit's definitions (`definitions_of`) hold no fn of the program, external or
+/// static, only glue, helpers and statics: release C's glue shards and statics parts. A
+/// program fn is `f_<id>` (release C, 16 hex digits) or `f<slot>` (numbered C).
+pub(super) fn fnless(defs: &Defs) -> bool {
+    let program = |n: &&str| match n.strip_prefix('f') {
+        Some(r) => match r.strip_prefix('_') {
+            Some(id) => id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+            None => !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()),
+        },
+        None => false,
+    };
+    !defs.0.iter().chain(&defs.1).any(program)
+}
+
 /// The external and the static functions `c` defines, in one pass over its lines (a warm
 /// tsgo build scans ~1 GB of unit text: its PGO file names and the split both read this).
 pub(super) fn definitions_of(c: &str) -> Defs<'_> {
@@ -1057,6 +1079,26 @@ mod tests {
         assert!(read_index("not an index\n").is_none());
     }
 
+    /// Only a unit of glue with records compiles its cold fns as optnone, and only its key
+    /// says so: a fn unit's flags and key stay as they were.
+    #[test]
+    fn a_unit_of_glue_compiles_its_cold_fns_as_optnone() {
+        let glue = "void drop_A_(A *p) {\n}\nstatic void dgc_A_(A *p) {\n}\n";
+        let fns = "void drop_A_(A *p) {\n}\nint f_0123456789abcdef(int a) {\n}\n";
+        let numbered = "static int f12(int a) {\n}\n";
+        assert!(fnless(&definitions_of(glue)));
+        assert!(!fnless(&definitions_of(fns)), "a release C fn");
+        assert!(!fnless(&definitions_of(numbered)), "a numbered C fn");
+        assert!(fnless(&definitions_of("int fmt_x(int a) {\n}\nint f_12(int a) {\n}\n")), "not program fn names");
+        let pins = vec!["-mllvm".to_string(), "-x".to_string()];
+        let cold = |f: &[String]| f.windows(2).any(|w| w[0] == "-mllvm" && w[1] == "-pgo-cold-func-opt=optnone");
+        assert!(cold(&use_flags(&pins, true, Path::new("p"), "k", true)));
+        assert!(!cold(&use_flags(&pins, true, Path::new("p"), "k", false)));
+        assert!(!cold(&use_flags(&pins, false, Path::new("p"), "k", true)), "no profile, no cold fns");
+        assert_ne!(use_key_part(&pins, &[1], true), use_key_part(&pins, &[1], false));
+        assert_eq!(use_key_part(&pins, &[], true), use_key_part(&pins, &[], false), "a unit with no records keeps its key");
+    }
+
     /// A static fn's record (`STATIC_FILE;<fn>`) goes to every unit that defines a static fn
     /// of that name, whatever the unit is called: a merge that renames a unit keeps it.
     #[test]
@@ -1148,12 +1190,12 @@ mod tests {
             split_mode(&[("f", f), ("g", g), ("u1.c;s", s), ("lust_abs_i8", abs), ("lust_copy", 7), ("f_gone", f + g)], defs, &["lust_abs_i8"])
         };
         let base = mk(&with_copy, 1, 2, 3, 4);
-        assert_eq!(base.key_part("u2.c"), mk(&with_copy, 9, 2, 9, 9).key_part("u2.c"), "others' records");
-        assert_ne!(base.key_part("u2.c"), mk(&with_copy, 1, 5, 3, 4).key_part("u2.c"), "own record");
-        assert_ne!(base.key_part("u1.c"), mk(&with_copy, 1, 2, 5, 4).key_part("u1.c"), "own static record");
-        assert_ne!(base.key_part("u3.c"), mk(&with_copy, 1, 2, 3, 5).key_part("u3.c"), "own macro-made record");
-        assert_eq!(base.key_part("u1.c"), mk(&with_copy, 1, 2, 3, 5).key_part("u1.c"));
-        assert_eq!(base.key_part("u3.c"), mk(&without, 1, 2, 3, 4).key_part("u3.c"), "an inline copy elsewhere comes or goes");
+        assert_eq!(base.key_part("u2.c", false), mk(&with_copy, 9, 2, 9, 9).key_part("u2.c", false), "others' records");
+        assert_ne!(base.key_part("u2.c", false), mk(&with_copy, 1, 5, 3, 4).key_part("u2.c", false), "own record");
+        assert_ne!(base.key_part("u1.c", false), mk(&with_copy, 1, 2, 5, 4).key_part("u1.c", false), "own static record");
+        assert_ne!(base.key_part("u3.c", false), mk(&with_copy, 1, 2, 3, 5).key_part("u3.c", false), "own macro-made record");
+        assert_eq!(base.key_part("u1.c", false), mk(&with_copy, 1, 2, 3, 5).key_part("u1.c", false));
+        assert_eq!(base.key_part("u3.c", false), mk(&without, 1, 2, 3, 4).key_part("u3.c", false), "an inline copy elsewhere comes or goes");
         // `f_gone` and, with no copy left, `lust_copy` (no unit defines them) go to no unit.
         let Mode::Use(p) = &mk(&without, 1, 2, 3, 4) else { unreachable!() };
         assert_eq!(p.counts, Some((1, 2)));
