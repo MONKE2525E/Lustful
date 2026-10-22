@@ -620,6 +620,12 @@ pub(super) fn check_fn_opaque<'p>(p: &'p Program, fid: LocalDefId) -> (Checked<'
             }
             let out = ViewOut { picks: view.trait_picks.iter().copied().collect(), calls: view_calls(p, &view) };
             let (mut ck, mut errs) = check_fn_mode(p, fid, OpaqueMode::Revealed, out);
+            // The revealed check replays the view's picks, so it does not ask
+            // again what the view asked to make them (which traits are in
+            // scope for a method call): the view's reads join the stored set.
+            for (k, r) in view.reads.iter(&crate::driver::graph::ReadKeys::default()) {
+                ck.reads.record(*k, r.fingerprint, r.failed);
+            }
             holds_from_view(p, fid, &view, &mut ck, &mut errs);
             (ck, errs)
         }
