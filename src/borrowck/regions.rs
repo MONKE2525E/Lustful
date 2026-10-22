@@ -5437,7 +5437,7 @@ impl<'b, 'p> Builder<'b, 'p> {
     /// reference.
     /// Like `call_receiver`, for the builtins whose result borrows
     /// the receiver type's own region (its `'a`), not the `&self`
-    /// loan: `ChunksExact::remainder` and the `Utf8Chunk` views
+    /// loan: `Chars::as_str`, `ChunksExact::remainder`, and the `Utf8Chunk` views
     /// (tf-slice). The result walk takes the pointee's first slot
     /// (its region param) as the borrowed region.
     fn call_own_region(&mut self, avs: &[(Ty, Vec<u32>)], dt: Ty, dv: &[u32]) -> bool {
@@ -9786,7 +9786,7 @@ fn fat_local(tys: &impl TyIntern, t: Ty) -> bool {
 /// `Builder::call_own_region`).
 fn own_region_builtin(b: crate::check::Builtin) -> bool {
     use crate::check::Builtin as B;
-    matches!(b, B::IterRemainder | B::Utf8ChunkValid | B::Utf8ChunkInvalid)
+    matches!(b, B::CharsAsStr | B::IterRemainder | B::Utf8ChunkValid | B::Utf8ChunkInvalid)
 }
 
 /// The builtins that borrow into their receiver (or move elements out of

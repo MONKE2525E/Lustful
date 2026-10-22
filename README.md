@@ -2,6 +2,9 @@
 
 # lust-lang
 
+This is the Verenu compatibility fork. See [Verenu support](docs/VERENU.md) for
+the compiler additions, verification commands, and remaining desktop blockers.
+
 Lust is an experiment. It asks one question: how fast can `check` and `build` of real Rust code get if the compiler supports only a subset of Rust, keeps a warm daemon, and gives up LLVM in dev builds?
 
 To test this, lust compiles a subset of Rust. Every program lust accepts must be valid Rust (rustc 1.99, edition 2024), and it must give the same output as the `rustc` build. When lust cannot match rustc, it rejects the program with an error code. That rule makes `rustc` a free test oracle, and it gives lust programs a release path: Cargo builds the release binary from the same source.

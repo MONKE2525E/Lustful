@@ -8470,6 +8470,10 @@ impl FnGen<'_, '_> {
             B::StrToUppercase => format!("lust_str_case({}, 1)", str_of(&vals[0], &tys[0])),
             B::StrToLowercase => format!("lust_str_case({}, 0)", str_of(&vals[0], &tys[0])),
             B::StrChars => format!("lust_chars({})", str_of(&vals[0], &tys[0])),
+            B::CharsAsStr => {
+                let it = &vals[0];
+                format!("((lust_str){{ {it}->pos ? {it}->s.ptr + {it}->pos : {it}->s.ptr, {it}->s.len - {it}->pos }})")
+            }
             B::CharsNext => {
                 let t = self.tmp();
                 let it = &vals[0];

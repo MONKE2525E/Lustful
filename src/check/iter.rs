@@ -336,9 +336,9 @@ impl<'p> Ctx<'p> {
             return Some(self.iter_call(e, recv, wrapped, wrapped, 0, &n, name_span, args, turbofish, expected));
         }
         let n = self.name(name).to_string();
-        // `Chars` keeps its own `next` and `count` builtins (`count`
+        // `Chars` keeps its own `next`, `as_str`, and `count` builtins (`count`
         // through `&mut Chars` counts in place, below).
-        if self.tys.is_chars_ty(base) && (n == "next" || (n == "count" && derefs == 0)) {
+        if self.tys.is_chars_ty(base) && (matches!(n.as_str(), "next" | "as_str") || (n == "count" && derefs == 0)) {
             return None;
         }
         // A range's derived `Hash::hash` is no iterator method: the

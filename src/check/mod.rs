@@ -292,6 +292,7 @@ pub enum Builtin {
     StrToUppercase,
     StrToLowercase,
     StrChars,
+    CharsAsStr,
     CharsNext,
     CharsCount,
     CharIsDigit,
@@ -17400,7 +17401,9 @@ impl<'p> Ctx<'p> {
             }
             (Some(BuiltinTy::Chars), _) => {
                 let opt = self.tys.mk_option(CHAR);
-                if name == k.next {
+                if name == k.as_str {
+                    Some((B::CharsAsStr, Autoref::Ref, vec![], REF_STR))
+                } else if name == k.next {
                     Some((B::CharsNext, Autoref::RefMut, vec![], opt))
                 } else if name == k.count && derefs == 0 {
                     // Through `&mut Chars` the iterator path counts in place
