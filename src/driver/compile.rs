@@ -4798,14 +4798,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     }
     // Release C: every glue key is shared (fn units hold its prototype, `glue_shards`
     // its definition: a set that follows the grouping would move with it), and the fn
-    // units are `release_c::groups`.
+    // units are `release_c::groups`. B1's Glue reads and every unit's switches read the
+    // shared set, so it is set first.
     // With LUST_B1_OBSERVE=1 or LUST_ASM_PARTS=1, the parts of release C assembly (ms from
-    // here): groups, glue shards, B1 before with the C units and inline sets, C refs, fn
-    // units, B1 after, the rest.
+    // here to when this thread has each result): groups, glue shards, B1 before with the C
+    // units and inline sets, C refs, fn units, B1 after, the rest.
     let t_asm = Instant::now();
     let mut asm_ms = [0f64; 7];
-    let rgroups = rnames.as_ref().map(|names| {
+    if rnames.is_some() {
         caches.glue.shared = Some(caches.glue.protos.keys().cloned().collect());
+    }
+    // Release C's fn units, cut beside the statics unit, the glue shard cut and B1's
+    // fingerprints (below); `rgroups` after the assembly.
+    let rg_cell: std::sync::OnceLock<Vec<(String, Vec<usize>)>> = std::sync::OnceLock::new();
+    let cut_fn_units = |names: &cgen::names::Names| {
         let mut file = vec![String::new(); caches.out.len()];
         let mut line = vec![0u32; caches.out.len()];
         for i in 0..front.fn_slot.len().min(program.fns.len()) {
@@ -4816,7 +4822,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             }
         }
         super::release_c::groups(&caches.out, names, &file, &line)
-    });
+    };
     let gen_unit = |u: usize, overlay: bool| match u {
         0 => cgen::main_unit(main_slot, &registered, cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])),
         1 => cgen::glue_unit(&program, &caches.glue),
@@ -4848,51 +4854,16 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         && req.emit_c.is_none()
         && std::env::var_os("LUST_B1").is_none_or(|v| v != "0");
     let b1_record = b1_observe || b1_check || b1_skip;
-    // Release C copies from a pinned profile (`LUST_PGO_COPIES=<profdata>`, read by the
-    // instrumented build and the use build alike, so both copy the same callees and a
-    // caller's profile record matches its use): the fns it ran `LUST_PGO_COPY_MIN`
-    // times or more (default 1000) get copies of the callees it ran as often.
-    // `LUST_PGO_COPIES=*`: every fn counts as hot, a test of the copy rules on any program.
-    // A fn with an unwind cleanup frame gets copies when it ran `cgen::FRAME_COPY_MIN` times.
-    let copy_hot = match std::env::var_os("LUST_PGO_COPIES").filter(|_| rgroups.is_some() && !llvm_on) {
-        Some(path) => {
-            let (hot, frames) = if path == "*" {
-                let all: std::collections::HashSet<u64> = rn.map(|n| n.fns.iter().flatten().filter_map(|id| u64::from_str_radix(id, 16).ok()).collect()).unwrap_or_default();
-                (all.clone(), all)
-            } else {
-                let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
-                let ids = |min: u64, memo: &str| crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, memo);
-                match ids(min, "pgo-copies.memo").and_then(|hot| Ok((ids(min.max(cgen::FRAME_COPY_MIN), "pgo-copies-frames.memo")?, hot))) {
-                    Ok((frames, hot)) => (hot, frames),
-                    Err(e) => return Response { stderr: format!("error: LUST_PGO_COPIES: {e}\n"), code: 3, ..Default::default() },
-                }
-            };
-            let big = cgen::in_layout_phase(cgen::layout_phase(), || cgen::names::with(rn, || cgen::big_adts(&program)));
-            Some(cgen::CopyHot { hot, frames, big })
-        }
-        None => None,
-    };
     // B1's memo pre-check (`cc::memo_misses`) reads the unit memo (10 MB for tsgo), stats each
     // unit's object and, for the memo's tag, asks the compiler its version: 60-90 ms on a boat
     // box with the page cache dropped, more on a CI job's cold disk, and the fn units waited
-    // for it. It starts here on a thread of its own, beside the glue shards and B1's
-    // fingerprints, for every unit the last build recorded (which of them are clean is known
-    // only then).
-    let mut b1_memo = Joined(match &rgroups {
-        Some(rg) if b1_skip && !caches.unit_records.is_empty() => {
-            let mut bare: Vec<crate::cc::UnitIn> = rg
-                .iter()
-                .enumerate()
-                .filter_map(|(g, (reg, _))| {
-                    let fp = caches.unit_records.get(reg)?.fp;
-                    Some(crate::cc::UnitIn { name: format!("u{}", g + FIRST_FN_UNIT), fp: Some(fp), text: None })
-                })
-                .collect();
-            // The last build's glue shards, by their record names (a shard's unit number is known
-            // after the cut).
-            bare.extend(
-                caches.unit_records.iter().filter(|(reg, _)| reg.starts_with(SHARD_RECORD)).map(|(reg, r)| crate::cc::UnitIn { name: reg.clone(), fp: Some(r.fp), text: None }),
-            );
+    // for it. It starts here on a thread of its own, beside both cuts and B1's fingerprints,
+    // for every unit the last build recorded (which of them are clean is known only then), by
+    // its record name (fn units and glue shards get their unit numbers from the cuts).
+    let mut b1_memo = Joined(match rnames {
+        Some(_) if b1_skip && !caches.unit_records.is_empty() => {
+            let bare: Vec<crate::cc::UnitIn> =
+                caches.unit_records.iter().map(|(reg, r)| crate::cc::UnitIn { name: reg.clone(), fp: Some(r.fp), text: None }).collect();
             let triple = if req.session.target_triple.is_empty() { crate::protocol::host_triple().to_string() } else { req.session.target_triple.clone() };
             let (file, debug, work) = (req.file.clone(), req.debug, dir.join("cc"));
             Some(std::thread::spawn(move || -> std::collections::HashSet<String> {
@@ -4904,7 +4875,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
         }
         _ => None,
     });
-    asm_ms[0] = t_asm.elapsed().as_secs_f64() * 1e3;
     // The cc stream, started during codegen (above).
     let stream = stream_start.and_then(|h| h.join().ok()).flatten();
     // Release C glue shards come after the fn units (`link_fn_units` counts both). Their cut
@@ -4918,21 +4888,18 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     // Release C statics in parts (`cgen::names::statics_parts`): unit 1 is their index, and the
     // parts come after the glue shards.
     let mut n_statics = 0usize;
-    let mut units: Vec<(PathBuf, String)> = match &rgroups {
+    let mut units: Vec<(PathBuf, String)> = match rn {
         None => par_map(&todo, |&(u, overlay)| (if overlay { overlay_obj(u) } else { base_obj(u) }, gen_unit(u, overlay))),
-        Some(rg) => {
+        Some(names) => {
             let statics_out: std::sync::Mutex<Vec<String>> = Default::default();
-            // The parts' first unit number, sent when the shard cut is done (below). The statics
+            // The parts' first unit number, sent when both cuts are done (below). The statics
             // unit's thread waits for it only once its parts are made.
             let (first_tx, first_rx) = std::sync::mpsc::channel::<usize>();
             let first_rx = std::sync::Mutex::new(first_rx);
-            let mut jobs: Vec<usize> = vec![0, 1, 2, 3, LOC_UNIT];
-            jobs.extend((0..rg.len()).map(|g| g + FIRST_FN_UNIT));
             // Cross-unit inlining for the LLVM backend (cgen/ll.rs `ll_inline_set`): per fn
-            // unit, the small fns of other units it gets a copy of.
-            let slot_of: std::collections::HashMap<&str, usize> = rn
-                .map(|n| n.fns.iter().enumerate().filter_map(|(s, id)| id.as_deref().map(|id| (id, s))).collect())
-                .unwrap_or_default();
+            // unit, the small fns of other units it gets a copy of (C fns have none).
+            let slot_of: std::collections::HashMap<&str, usize> =
+                if llvm_on { names.fns.iter().enumerate().filter_map(|(s, id)| id.as_deref().map(|id| (id, s))).collect() } else { Default::default() };
             // One layout phase (cgen `in_layout_phase`): the program is frozen, so each
             // worker keeps its `c_layout` answers across the units it assembles.
             let asm_tag = cgen::layout_phase();
@@ -4945,34 +4912,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             };
             type B1Rec = (usize, Option<((u64, u64), Vec<cgen::record::Read>)>);
             let b1_records: std::sync::Mutex<Vec<B1Rec>> = Default::default();
-            // A unit's identity: its registration name, fns and main slot, the switches every
-            // unit reads, every LUST_* knob but paths (the sources' ready file too), B1's own and
-            // the cc stream's (`cc::Stream` changes no unit's text), the copies profile's hot set
-            // (the copy choice reads it), and the compiler build.
-            let b1_switches = b1_record.then(|| {
-                let mut vars: Vec<(String, String)> = std::env::vars()
-                    .filter(|(k, _)| {
-                        k.starts_with("LUST_")
-                            && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP", "CC_STREAM", "SOURCES_READY"].iter().any(|x| k.contains(x))
-                    })
-                    .collect();
-                vars.sort();
-                let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
-                // Both id sets; the big ADTs are in each pick's read (`cgen::read_fp`).
-                let copies = copy_hot.as_ref().map(|h| {
-                    let bytes = |s: &std::collections::HashSet<u64>| {
-                        let mut ids: Vec<u64> = s.iter().copied().collect();
-                        ids.sort_unstable();
-                        ids.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>()
-                    };
-                    crate::driver::cache::hash128(&[&bytes(&h.hot), &bytes(&h.frames)], 14)
-                });
-                format!("{}\n{}\ncopies={copies:?}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)), env!("LUST_BUILD_HASH"))
-            });
-            let unit_id = |g: usize| {
-                let (reg, slots) = &rg[g];
-                crate::driver::cache::hash128(&[reg.as_bytes(), format!("{slots:?} {main_slot}").as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()], 13)
-            };
             // With LUST_B1_OBSERVE=1, where B1's own time goes (ms): the statics' declarations,
             // the last build's reads into shards, the clean test, the memo pre-check, the new
             // reads, the new records.
@@ -4983,31 +4922,12 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // With LUST_B1_OBSERVE=1, the workers' time per read kind (Fn, SlotOf, Glue, Type,
             // Static, Main, Pick) and the count of each.
             let kind_ns: [std::sync::atomic::AtomicU64; 14] = Default::default();
-            // One read's fingerprint now (`cgen::read_fp`), in the assembly's layout phase.
-            let read_fp = |r: &cgen::record::Read| {
-                let t = b1_observe.then(Instant::now);
-                let f = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &b1_statics, copy_hot.as_ref(), r)));
-                if let Some(t) = t {
-                    use cgen::record::Read as R;
-                    let k = match r {
-                        R::Fn(_) => 0,
-                        R::SlotOf(_) => 1,
-                        R::Glue(..) => 2,
-                        R::Type(..) | R::TypeFwd(..) => 3,
-                        R::Static(_) => 4,
-                        R::Main => 5,
-                        R::Pick(..) | R::PickHot(_) => 6,
-                    };
-                    kind_ns[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    kind_ns[7 + k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                f
-            };
             // The last build's distinct reads fingerprint in parts, several per thread.
             let b1_shards = crate::pool::threads().max(1) * 4;
             // With LUST_ASM_PARTS=1 (or B1 observed), each C unit's time (units 0 to 4).
             let c_unit_ms: [std::sync::atomic::AtomicU64; 5] = Default::default();
-            let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>| {
+            // One unit's C, added to the cc stream. Only fn units read the copies set (`copy_hot`).
+            let assemble = |u: usize, inl: &[Vec<usize>], c_refs: Option<&cgen::ll::CRefs>, copy_hot: Option<&cgen::CopyHot>| {
                 let t = Instant::now();
                 let (c, helpers) = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || match u {
                     0 => (cgen::main_unit(main_slot, &[], cgen::unwind_init(&program, |f| front.fn_slot[f.0 as usize])), String::new()),
@@ -5026,17 +4946,20 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         }
                     },
                     2 => (cgen::runtime_unit(), String::new()),
-                    3 => (super::release_c::table_unit(&rg.iter().filter(|(_, s)| s.contains(&(main_slot as usize))).map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
+                    3 => {
+                        let rg = rg_cell.get().expect("the fn units are cut before unit 3");
+                        (super::release_c::table_unit(&rg.iter().filter(|(_, s)| s.contains(&(main_slot as usize))).map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new())
+                    }
                     LOC_UNIT => {
                         let live: Vec<u32> = (0..caches.out.len()).filter(|&s| caches.out[s].has_code()).map(|s| s as u32).collect();
                         (cgen::names::loc_unit(&live, &files, &slot_lines, super::release_c::elf_target(&req.session.target_triple)), String::new())
                     }
                     g => {
-                        let (reg, slots) = &rg[g - FIRST_FN_UNIT];
+                        let (reg, slots) = &rg_cell.get().expect("the fn units are cut before they assemble")[g - FIRST_FN_UNIT];
                         if b1_record {
                             cgen::record::open();
                         }
-                        let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs, copy_hot.as_ref());
+                        let (c, h) = cgen::fn_unit_parts(&program, &caches.out, slots, &inl[g - FIRST_FN_UNIT], &caches.glue, reg, Some(main_slot), c_refs, copy_hot);
                         if b1_record {
                             let rec = cgen::record::close(&c);
                             b1_records.lock().unwrap_or_else(|e| e.into_inner()).push((g - FIRST_FN_UNIT, rec));
@@ -5061,7 +4984,6 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             // C calls (`fl_<id>` is what IR and helpers call), so a unit keeps them only when a
             // text names them (`cgen::ll::CRefs`): the C units and glue shards, and every fn's
             // helpers' C. `main`'s is always kept (the termination entry calls it).
-            let (c_jobs, fn_jobs) = jobs.split_at(5);
             // The C units (the statics unit is the slow one) and the inline sets, together.
             // With a profile, the copies are of the fns it saw hot (`LUST_LL_COPY_MIN=<count>`,
             // default 100000; 0: every callee the rule allows). tsgo, warm merges 4-12 against
@@ -5070,25 +4992,97 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let hot = (llvm_on && copy_min > 0).then(|| crate::cc::pgo::hot_ids(&dir.join("cc"), copy_min).ok().flatten()).flatten();
             // The statics unit is one long job (~150-300 ms for tsgo). With C units only (no copy
             // sets, and no C refs read from its text) it assembles on a thread of its own from the
-            // start, beside the glue shards' cut and every other part of the assembly below, not
-            // before the fn units: on a build with few changes it ended the assembly.
+            // start, before the copies set is read and beside both cuts and every other part of the
+            // assembly below, not before the fn units: on a build with few changes it ended the
+            // assembly.
             let late_statics = !llvm_on;
-            let early: Vec<usize> = c_jobs.iter().copied().filter(|&u| !(late_statics && u == 1)).collect();
-            // With C units only, the early C units are a pass of their own (below), and the first
-            // pass makes the inline sets alone.
+            // With C units only, main, runtime and locations assemble beside the cuts (they need
+            // neither), the table unit after the fn units' cut (it names their units), and there
+            // is no inline set to make; with LLVM units, the C units and the inline sets are one
+            // pass after the cuts.
+            let early: Vec<usize> = if late_statics { vec![0, 2, LOC_UNIT] } else { vec![0, 1, 2, 3, LOC_UNIT] };
             let n_early = if late_statics { 0 } else { early.len() };
-            let first: Vec<usize> = early[..n_early].iter().copied().chain(0..rg.len()).collect();
-            std::thread::scope(|sc| {
-                // Moved in: should the cut panic, the sender drops as this unwinds, and the statics
+            let assembled: Result<Vec<(PathBuf, String)>, String> = std::thread::scope(|sc| {
+                // Moved in: should a cut panic, the sender drops as this unwinds, and the statics
                 // thread's wait ends (with no number) before the scope waits for that thread.
                 let first_tx = first_tx;
-                let statics = late_statics.then(|| sc.spawn(|| assemble(1, &[], None)));
-                let shard_keys = cgen::names::with(rn, || cgen::names::glue_shard_keys(&caches.glue, &caches.out, super::release_c::shard_bytes()));
-                n_shards = shard_keys.len();
-                let _ = first_tx.send(FIRST_FN_UNIT + rg.len() + n_shards);
-                asm_ms[1] = t_asm.elapsed().as_secs_f64() * 1e3;
+                let statics = late_statics.then(|| sc.spawn(|| assemble(1, &[], None, None)));
+                // With it, the jobs that need neither the copies set nor B1's reads: the two cuts
+                // and, with C units only, main, runtime and locations (the table unit names fn units,
+                // so it waits for their cut).
+                let cut = sc.spawn(|| {
+                    cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::names::glue_shard_keys(&caches.glue, &caches.out, super::release_c::shard_bytes())))
+                });
+                let fn_cut = sc.spawn(|| rg_cell.get_or_init(|| cut_fn_units(names)));
+                let early_c = late_statics.then(|| sc.spawn(|| par_map(&early, |&u| assemble(u, &[], None, None))));
+                // Release C copies from a pinned profile (`LUST_PGO_COPIES=<profdata>`, read by the
+                // instrumented build and the use build alike, so both copy the same callees and a
+                // caller's profile record matches its use): the fns it ran `LUST_PGO_COPY_MIN`
+                // times or more (default 1000) get copies of the callees it ran as often.
+                // `LUST_PGO_COPIES=*`: every fn counts as hot, a test of the copy rules on any
+                // program. A fn with an unwind cleanup frame gets copies when it ran
+                // `cgen::FRAME_COPY_MIN` times.
+                let copy_hot = match std::env::var_os("LUST_PGO_COPIES").filter(|_| !llvm_on) {
+                    Some(path) => {
+                        let (hot, frames) = if path == "*" {
+                            let all: std::collections::HashSet<u64> = names.fns.iter().flatten().filter_map(|id| u64::from_str_radix(id, 16).ok()).collect();
+                            (all.clone(), all)
+                        } else {
+                            let min: u64 = std::env::var("LUST_PGO_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+                            let ids = |min: u64, memo: &str| crate::cc::pgo::hot_ids_of(std::path::Path::new(&path), &dir.join("cc"), min, memo);
+                            ids(min, "pgo-copies.memo").and_then(|hot| Ok((hot, ids(min.max(cgen::FRAME_COPY_MIN), "pgo-copies-frames.memo")?)))?
+                        };
+                        let big = cgen::in_layout_phase(cgen::layout_phase(), || cgen::names::with(rn, || cgen::big_adts(&program)));
+                        Some(cgen::CopyHot { hot, frames, big })
+                    }
+                    None => None,
+                };
+                // A unit's identity: its registration name, fns and main slot, the switches every
+                // unit reads, every LUST_* knob but paths (the sources' ready file too), B1's own and
+                // the cc stream's (`cc::Stream` changes no unit's text), the copies profile's hot set
+                // (the copy choice reads it), and the compiler build.
+                let b1_switches = b1_record.then(|| {
+                    let mut vars: Vec<(String, String)> = std::env::vars()
+                        .filter(|(k, _)| {
+                            k.starts_with("LUST_")
+                                && !["DIR", "STATE", "SOCKET", "_FD", "_PID", "ARENA", "HOME", "_IDS", "B1", "UNIT_FP", "CC_STREAM", "SOURCES_READY"].iter().any(|x| k.contains(x))
+                        })
+                        .collect();
+                    vars.sort();
+                    let vars: Vec<String> = vars.into_iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    // Both id sets; the big ADTs are in each pick's read (`cgen::read_fp`).
+                    let copies = copy_hot.as_ref().map(|h| {
+                        let bytes = |s: &std::collections::HashSet<u64>| {
+                            let mut ids: Vec<u64> = s.iter().copied().collect();
+                            ids.sort_unstable();
+                            ids.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>()
+                        };
+                        crate::driver::cache::hash128(&[&bytes(&h.hot), &bytes(&h.frames)], 14)
+                    });
+                    format!("{}\n{}\ncopies={copies:?}\n{}", vars.join("\n"), cgen::names::with(rn, || cgen::unit_switches(&program, &caches.glue)), env!("LUST_BUILD_HASH"))
+                });
+                // One read's fingerprint now (`cgen::read_fp`), in the assembly's layout phase.
+                let read_fp = |r: &cgen::record::Read| {
+                    let t = b1_observe.then(Instant::now);
+                    let f = cgen::in_layout_phase(asm_tag, || cgen::names::with(rn, || cgen::read_fp(&program, &caches.out, &caches.glue, &b1_statics, copy_hot.as_ref(), r)));
+                    if let Some(t) = t {
+                        use cgen::record::Read as R;
+                        let k = match r {
+                            R::Fn(_) => 0,
+                            R::SlotOf(_) => 1,
+                            R::Glue(..) => 2,
+                            R::Type(..) | R::TypeFwd(..) => 3,
+                            R::Static(_) => 4,
+                            R::Main => 5,
+                            R::Pick(..) | R::PickHot(_) => 6,
+                        };
+                        kind_ns[k].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        kind_ns[7 + k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    f
+                };
                 // The last build's records name their reads by index in the session's table: the
-                // pass below fingerprints each distinct one once (many units read one type).
+                // passes below fingerprint each distinct one once (many units read one type).
                 let t_old = Instant::now();
                 let old_ids: Vec<u32> = if !b1_record || caches.unit_records.is_empty() {
                     Vec::new()
@@ -5099,8 +5093,9 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 };
                 // B1's fingerprints of the last build's reads, in two passes of their own (`par_map`
                 // hands out a pass's jobs in batches, so behind thousands of cheap jobs a few workers
-                // took them all), each in parts: first the reads the glue shards' records hold (a shard
-                // clean by them is not made), then the rest, beside the shards' texts.
+                // took them all), each in parts: the reads the glue shards' records hold (a shard
+                // clean by them is not made), and the rest. A read's fingerprint is of the program
+                // now, not of a cut.
                 let (shard_ids_of_reads, rest_ids): (Vec<u32>, Vec<u32>) = {
                     let mut by_shard = vec![false; caches.unit_reads.len()];
                     caches.unit_records.iter().filter(|(reg, _)| reg.starts_with(SHARD_RECORD)).flat_map(|(_, u)| &u.reads).for_each(|&(i, _)| by_shard[i as usize] = true);
@@ -5112,35 +5107,50 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     (0..ids.len()).step_by(step).map(|a| a..(a + step).min(ids.len())).collect()
                 };
                 let (first_parts, rest_parts) = (in_parts(&shard_ids_of_reads), in_parts(&rest_ids));
-                // B1 for the glue shards: a shard is its keys (their prototypes, in order) under B1's
-                // switches; its record goes by a name of that identity (its unit number moves with the
-                // fn units'). `unit_id` and `rg[g].0` of the fn units, for shard `j` at `rg.len() + j`.
-                let shard_ids: Vec<(u64, u64)> = shard_keys
-                    .iter()
-                    .map(|keys| {
-                        let mut parts: Vec<&[u8]> = vec![SHARD_RECORD.as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()];
-                        parts.extend(keys.iter().map(|k| caches.glue.protos[*k].as_bytes()));
-                        crate::driver::cache::hash128(&parts, 17)
-                    })
-                    .collect();
-                let shard_reg: Vec<String> = shard_ids.iter().map(|(a, b)| format!("{SHARD_RECORD}{a:016x}{b:016x}")).collect();
-                let reg_of = |g: usize| if g < rg.len() { rg[g].0.as_str() } else { shard_reg[g - rg.len()].as_str() };
-                let id_of = |g: usize| if g < rg.len() { unit_id(g) } else { shard_ids[g - rg.len()] };
-                // Beside the statics unit and the C units (with C units only), each a pass of its own
-                // on the pool: B1's fingerprints of the reads the glue shards' records hold, then the
-                // glue shards beside the fingerprints of the other reads. None reads the others' text,
-                // and on a build with few changes each in turn ended the assembly. A glue shard still
-                // clean by its last record whose object the unit memo holds is not made (B1). (B1's
-                // records change after these, so these passes have a scope of their own.)
                 let (reads, records) = (&caches.unit_reads, &caches.unit_records);
                 let fingerprints = |ids: &[u32], parts: &[std::ops::Range<usize>]| -> Vec<Vec<(u32, (u64, u64))>> {
                     par_map(&(0..parts.len()).collect::<Vec<_>>(), |&t| ids[parts[t].clone()].iter().map(|&i| (i, read_fp(reads.get(i)))).collect())
                 };
-                let (early_made, now, shard_clean, shard_made, lost) = std::thread::scope(|inner| {
-                    let early_c = late_statics.then(|| inner.spawn(|| par_map(&early, |&u| assemble(u, &[], None))));
+                // Beside the statics unit, the cuts and the C units above, each a job of its own that
+                // reads no other's result (on a build with few changes each in turn ended the
+                // assembly): B1's two passes. Then, beside B1's second pass, the glue shards: one still
+                // clean by its last record whose object the unit memo holds is not made (B1). (B1's
+                // records change after these, so these jobs have a scope of their own.)
+                let (rg, shard_ids, shard_reg, early_made, now, shard_clean, shard_made, lost) = std::thread::scope(|inner| {
+                    // The pool runs one pass at a time (another gets threads of its own), so the
+                    // second pass starts when the first ends.
+                    let (first_done, first_end) = std::sync::mpsc::channel::<()>();
+                    let shard_fps = inner.spawn(move || {
+                        let f = fingerprints(&shard_ids_of_reads, &first_parts);
+                        drop(first_done);
+                        f
+                    });
+                    let rest = inner.spawn(move || {
+                        let _ = first_end.recv();
+                        fingerprints(&rest_ids, &rest_parts)
+                    });
+                    let rg = fn_cut.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                    asm_ms[0] = t_asm.elapsed().as_secs_f64() * 1e3;
+                    let table = late_statics.then(|| assemble(3, &[], None, None));
+                    let shard_keys = cut.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                    n_shards = shard_keys.len();
+                    let _ = first_tx.send(FIRST_FN_UNIT + rg.len() + n_shards);
+                    asm_ms[1] = t_asm.elapsed().as_secs_f64() * 1e3;
+                    // B1 for the glue shards: a shard is its keys (their prototypes, in order) under
+                    // B1's switches; its record goes by a name of that identity (its unit number moves
+                    // with the fn units'). `unit_id` and `rg[g].0` of the fn units, for shard `j` at
+                    // `rg.len() + j`.
+                    let shard_ids: Vec<(u64, u64)> = shard_keys
+                        .iter()
+                        .map(|keys| {
+                            let mut parts: Vec<&[u8]> = vec![SHARD_RECORD.as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()];
+                            parts.extend(keys.iter().map(|k| caches.glue.protos[*k].as_bytes()));
+                            crate::driver::cache::hash128(&parts, 17)
+                        })
+                        .collect();
+                    let shard_reg: Vec<String> = shard_ids.iter().map(|(a, b)| format!("{SHARD_RECORD}{a:016x}{b:016x}")).collect();
                     let mut now: Vec<Option<(u64, u64)>> = vec![None; if old_ids.is_empty() { 0 } else { reads.len() }];
-                    fingerprints(&shard_ids_of_reads, &first_parts).into_iter().flatten().for_each(|(i, f)| now[i as usize] = Some(f));
-                    let rest = inner.spawn(|| fingerprints(&rest_ids, &rest_parts));
+                    shard_fps.join().unwrap_or_else(|e| std::panic::resume_unwind(e)).into_iter().flatten().for_each(|(i, f)| now[i as usize] = Some(f));
                     let shard_clean: Vec<Option<u128>> =
                         if now.is_empty() { vec![None; n_shards] } else { (0..n_shards).map(|j| b1_clean_by(records, &now, &shard_reg[j], shard_ids[j])).collect() };
                     // The memo pre-check's answer (`b1_memo`); none when its thread panicked, and then
@@ -5163,28 +5173,47 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         let first = FIRST_FN_UNIT + rg.len();
                         par_map(&(0..n_shards).collect::<Vec<_>>(), |&j| s.add(&format!("u{}", first + j), &rshards[j]));
                     }
-                    let early_made = early_c.map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).unwrap_or_default();
+                    // In unit order: main, runtime, the table unit, locations.
+                    let early_made = match (early_c, table) {
+                        (Some(h), Some(table)) => {
+                            let mut m = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+                            m.insert(2, table);
+                            m
+                        }
+                        _ => Vec::new(),
+                    };
                     rest.join().unwrap_or_else(|e| std::panic::resume_unwind(e)).into_iter().flatten().for_each(|(i, f)| now[i as usize] = Some(f));
-                    (early_made, now, shard_clean, recs.into_iter().zip(skip).collect::<Vec<_>>(), lost)
+                    (rg, shard_ids, shard_reg, early_made, now, shard_clean, recs.into_iter().zip(skip).collect::<Vec<_>>(), lost)
                 });
-                let mut made = Vec::with_capacity(jobs.len());
+                let unit_id = |g: usize| {
+                    let (reg, slots) = &rg[g];
+                    crate::driver::cache::hash128(&[reg.as_bytes(), format!("{slots:?} {main_slot}").as_bytes(), b1_switches.as_deref().unwrap_or("").as_bytes()], 13)
+                };
+                let reg_of = |g: usize| if g < rg.len() { rg[g].0.as_str() } else { shard_reg[g - rg.len()].as_str() };
+                let id_of = |g: usize| if g < rg.len() { unit_id(g) } else { shard_ids[g - rg.len()] };
+                let mut made = Vec::with_capacity(5 + rg.len());
                 made.extend(early_made);
                 let mut inl: Vec<Vec<usize>> = Vec::with_capacity(rg.len());
-                for (k, r) in par_map(&(0..first.len()).collect::<Vec<_>>(), |&k| {
-                    if k < n_early {
-                        Ok(assemble(first[k], &[], None))
-                    } else {
-                        Err(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of, hot.as_ref()))
-                    }
-                })
-                .into_iter()
-                .enumerate()
-                {
-                    match r {
-                        Ok(m) => made.push(m),
-                        Err(set) => {
-                            debug_assert!(k >= n_early);
-                            inl.push(set)
+                if late_statics {
+                    inl.resize(rg.len(), Vec::new());
+                } else {
+                    let first: Vec<usize> = early[..n_early].iter().copied().chain(0..rg.len()).collect();
+                    for (k, r) in par_map(&(0..first.len()).collect::<Vec<_>>(), |&k| {
+                        if k < n_early {
+                            Ok(assemble(first[k], &[], None, None))
+                        } else {
+                            Err(cgen::ll::ll_inline_set(&caches.out, &rg[first[k]].1, &slot_of, hot.as_ref()))
+                        }
+                    })
+                    .into_iter()
+                    .enumerate()
+                    {
+                        match r {
+                            Ok(m) => made.push(m),
+                            Err(set) => {
+                                debug_assert!(k >= n_early);
+                                inl.push(set)
+                            }
                         }
                     }
                 }
@@ -5205,7 +5234,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                 let mut b1_skipped = vec![false; rg.len()];
                 if let Some(lost) = &lost {
                     for (g, skip) in b1_skipped.iter_mut().enumerate() {
-                        *skip = b1_clean[g].is_some() && !lost.contains(&format!("u{}", g + FIRST_FN_UNIT));
+                        *skip = b1_clean[g].is_some() && !lost.contains(&rg[g].0);
                     }
                 }
                 b1_skipped.extend(shard_made.iter().map(|&(_, skipped)| skipped));
@@ -5238,9 +5267,10 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     r
                 });
                 asm_ms[3] = t_asm.elapsed().as_secs_f64() * 1e3;
-                made.extend(par_map(fn_jobs, |&u| match b1_skipped[u - FIRST_FN_UNIT] {
+                let fn_jobs: Vec<usize> = (0..rg.len()).map(|g| g + FIRST_FN_UNIT).collect();
+                made.extend(par_map(&fn_jobs, |&u| match b1_skipped[u - FIRST_FN_UNIT] {
                     true => (base_obj(u), String::new(), String::new()),
-                    false => assemble(u, &inl, c_refs.as_ref()),
+                    false => assemble(u, &inl, c_refs.as_ref(), copy_hot.as_ref()),
                 }));
                 // The units keep their order: the statics unit is unit 1.
                 if let Some(h) = statics {
@@ -5437,10 +5467,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                         d[0], d[1], d[2], c[0], c[1], c[2], c[3], c[4], d[3], d[4], d[5], d[6]
                     );
                 }
-                units
-            })
+                Ok(units)
+            });
+            match assembled {
+                Ok(units) => units,
+                Err(e) => return Response { stderr: format!("error: LUST_PGO_COPIES: {e}\n"), code: 3, ..Default::default() },
+            }
         }
     };
+    let rgroups = rg_cell.into_inner();
     // The LLVM backend (cgen/ll.rs) wrote `.ll` companions: only cc.rs builds them.
     let llvm = rgroups.is_some() && cgen::names::with(rn, || cgen::ll::on(&program));
     // The units the link takes after 1..4: release C has its own fn units, glue shards and
