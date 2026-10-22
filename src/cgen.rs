@@ -10695,14 +10695,43 @@ fn variant_lit(p: &Program, t: &CTy, variant: usize, vals: &[String]) -> String 
     }
 }
 
+/// File-scope floats need arithmetic constants, not union-member reads.
+/// Build hexadecimal literals from the bits so host decimal formatting cannot
+/// round subnormals, signed zero, or the largest finite value.
+fn static_float_lit(bits: u64, f: FloatTy) -> String {
+    let (bits, frac_bits, exp_bits, bias, suffix) = match f {
+        FloatTy::F64 => (bits, 52, 11, 1023, ""),
+        FloatTy::F32 => (bits as u32 as u64, 23, 8, 127, "f"),
+    };
+    let sign = if bits >> (frac_bits + exp_bits) != 0 { "-" } else { "" };
+    let frac = bits & ((1u64 << frac_bits) - 1);
+    let exp = (bits >> frac_bits) & ((1u64 << exp_bits) - 1);
+    if exp == (1u64 << exp_bits) - 1 {
+        if frac == 0 {
+            return format!("({sign}1.0{suffix}/0.0{suffix})");
+        }
+        // Keep the existing NaN representation: TinyCC's constant tokens
+        // cannot preserve arbitrary payloads or signaling bits. This fix is
+        // limited to finite values and infinities; static NaNs still need a
+        // separate storage solution for portable C initialization.
+        return match f {
+            FloatTy::F64 => format!("(((union {{ uint64_t b; double d; }}){{ .b = {bits}ull }}).d)"),
+            FloatTy::F32 => format!("(((union {{ uint32_t b; float f; }}){{ .b = {}u }}).f)", bits as u32),
+        };
+    }
+    if exp == 0 && frac == 0 {
+        return format!("({sign}0x0p+0{suffix})");
+    }
+    let significand = if exp == 0 { frac } else { frac | (1u64 << frac_bits) };
+    let exponent = exp.max(1) as i32 - bias - frac_bits;
+    format!("({sign}0x{significand:x}p{exponent:+}{suffix})")
+}
+
 /// The C initializer for one const value at the given C type. Referenced
 /// aggregates are promoted to file-scope constants first, written to `pre`.
 fn const_init(p: &Program, v: &crate::ty::consteval::ConstValue, t: &CTy, pre: &mut String, cx: &mut kconst::StaticCx, slots: &[u32], pos: Option<&str>) -> String {
     if let (CV::Float(bits, f), CTy::Float(_)) = (v, t) {
-        return match f {
-            FloatTy::F64 => format!("(((union {{ uint64_t b; double d; }}){{ .b = {}ull }}).d)", bits),
-            FloatTy::F32 => format!("(((union {{ uint32_t b; float f; }}){{ .b = {}u }}).f)", *bits as u32),
-        };
+        return static_float_lit(*bits, *f);
     }
     use crate::ty::consteval::ConstValue as CV;
     match (v, t) {
@@ -13986,6 +14015,41 @@ fn rvalue_mentions(rv: &Rvalue, l: Local) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_float_literals_compile_and_keep_bits() {
+        let cases64 = [
+            0, 1u64 << 63, 1, 0x000f_ffff_ffff_ffff, 0x0010_0000_0000_0000,
+            0x3ff0_0000_0000_0001, 0x7fef_ffff_ffff_ffff, 0x8000_0000_0000_0001,
+            0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000,
+        ];
+        let cases32 = [
+            0, 1u32 << 31, 1, 0x007f_ffff, 0x0080_0000, 0x3f80_0001,
+            0x7f7f_ffff, 0x8000_0001, 0x7f80_0000, 0xff80_0000,
+        ];
+        let lits64: Vec<_> = cases64.iter().map(|&b| static_float_lit(b, FloatTy::F64)).collect();
+        let lits32: Vec<_> = cases32.iter().map(|&b| static_float_lit(b as u64, FloatTy::F32)).collect();
+        // These are file-scope aggregate initializers, where the previous
+        // union-member expressions were rejected even without optimization.
+        let mut src = format!("#include <stdint.h>\n#include <string.h>\nstatic struct {{ double v[{}]; }} a = {{ {{ {} }} }};\nstatic struct {{ float v[{}]; }} b = {{ {{ {} }} }};\nint main(void) {{\n", cases64.len(), lits64.join(", "), cases32.len(), lits32.join(", "));
+        for (i, bits) in cases64.iter().enumerate() {
+            let _ = writeln!(src, "{{ uint64_t u; memcpy(&u, &a.v[{i}], sizeof u); if (u != {bits}ULL) return {}; }}", i + 1);
+        }
+        for (i, bits) in cases32.iter().enumerate() {
+            let _ = writeln!(src, "{{ uint32_t u; memcpy(&u, &b.v[{i}], sizeof u); if (u != {bits}U) return {}; }}", i + 32);
+        }
+        src.push_str("return 0; }\n");
+        let dir = std::env::temp_dir().join(format!("lust-static-float-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("float.c");
+        let exe = dir.join("float");
+        std::fs::write(&file, &src).unwrap();
+        let cc = std::process::Command::new("cc").args(["-std=gnu11", "-O0"]).arg(&file).arg("-o").arg(&exe).output().unwrap();
+        assert!(cc.status.success(), "static floats compile:\n{}\n{src}", String::from_utf8_lossy(&cc.stderr));
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert!(run.status.success(), "static float bits differ: {:?}", run.status.code());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A cold fn's cleanup goes out of line past `COLD_FRAME_INLINE` (flags plus one, times
     /// the nonzero ladder stores), in its prototype and its definition; under it, as it was.
