@@ -160,7 +160,7 @@ pub fn lower_closure<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -
     }
     lw.upvars = Some(Upvars { info: info.clone(), shadow, field });
     for (prm, &l) in params.iter().zip(&param_locals) {
-        lw.bind_pat(prm.pat, Place::local(l));
+        lw.bind_parameter(prm.pat, l);
     }
     lw.expr_into(*body_expr, Some(&Place::local(0)));
     lw.pop_scope(span);

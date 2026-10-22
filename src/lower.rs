@@ -198,21 +198,22 @@ pub fn lower<'p>(p: &'p Program, fid: LocalDefId, mut ck: Checked<'p>) -> Body<'
         lw.bind_of.push((l, cl));
         lw.scopes[0].push(l);
     }
-    // Pattern parameters bind out of their argument locals
-    // before the body: the bindings drop first, then the parts
-    // of the arguments they did not move drop with the locals
-    // above, as in a destructuring `let`.
+    // Keep argument locals contiguous for the calling convention, but
+    // register each argument with its bindings. Parameters drop in reverse
+    // order; within one parameter, bindings precede its unmoved fields.
     {
         let skip = usize::from(f.def(&p.ast).self_param.is_some());
-        let param_pats: Vec<(ast::PatId, Local)> = f
+        let param_pats: Vec<(Option<ast::PatId>, Local)> = f
             .def(&p.ast)
             .params
             .iter()
             .zip(lw.ck.param_locals.iter().skip(skip))
-            .filter_map(|(param, &cl)| param.pat.map(|pat| (pat, lw.local_map[cl as usize])))
+            .map(|(param, &cl)| (param.pat, lw.local_map[cl as usize]))
             .collect();
         for (pat, arg) in param_pats {
-            lw.bind_pat(pat, Place::local(arg));
+            if let Some(pat) = pat {
+                lw.bind_parameter(pat, arg);
+            }
         }
     }
     // A declaration shape (a trait method with no body) lowers to an
@@ -7064,6 +7065,14 @@ impl<'p> Lower<'p> {
         }
     }
 
+    fn bind_parameter(&mut self, pat: PatId, arg: Local) {
+        let before = self.scopes[0].len();
+        let after_arg = self.scopes[0].iter().position(|&local| local == arg).expect("registered argument") + 1;
+        self.bind_pat(pat, Place::local(arg));
+        let added = self.scopes[0].len() - before;
+        self.scopes[0][after_arg..].rotate_right(added);
+    }
+
     fn bind_pat(&mut self, pat: PatId, place: Place) {
         // Or-pattern tags a re-test inside this bind made belong
         // to this one bind: a statically repeated bind of the
@@ -7997,6 +8006,48 @@ mod tests {
     use crate::diag::FileId;
     use crate::intern::{Interner, Known};
     use crate::{lexer, parser};
+
+    fn normal_drop_order(src: &str) -> Vec<Option<String>> {
+        let interner = std::sync::Arc::new(Interner::default());
+        let known = std::sync::Arc::new(Known::new(&interner));
+        let lexed = lexer::lex(src, FileId(0), 0, &interner).unwrap();
+        let ast = parser::parse(&lexed, &interner, &known).unwrap();
+        let ids = CrateIds { local: LOCAL_CRATE, stable: crate::def::synthetic_crate_hash("tail.rs", false) };
+        let program = collect(std::sync::Arc::new(ast), interner.clone(), known, ids).unwrap();
+        let fid = program.fn_names[&interner.intern("f")];
+        let (checked, errors) = crate::check::check_fn(&program, fid);
+        assert!(errors.is_empty(), "{errors:?}");
+        let body = lower(&program, fid, checked);
+        let errors = crate::borrowck::borrowck(&program, &body);
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut drops = Vec::new();
+        let mut bb = Bb(0);
+        for _ in 0..body.blocks.len() {
+            let block = &body.blocks[bb.0 as usize];
+            for stmt in &block.stmts {
+                if let StmtKind::Drop(local) = stmt.kind {
+                    drops.push(body.locals[local as usize].name.clone());
+                }
+            }
+            bb = match block.term {
+                Terminator::Goto(next) | Terminator::Call { next, .. } => next,
+                Terminator::Return => return drops,
+                ref other => panic!("expected a straight-line test body, got {other:?}"),
+            };
+        }
+        panic!("test body did not return");
+    }
+
+    #[test]
+    fn tail_temporaries_drop_before_block_bindings() {
+        for src in [
+            "fn f() -> usize { let local = String::from(\"local\"); String::from(\"temp\").len() }",
+            "fn f() -> usize { let n = { let local = String::from(\"local\"); String::from(\"temp\").len() }; n }",
+            "fn f() -> usize { let local = String::from(\"local\"); return String::from(\"temp\").len(); }",
+        ] {
+            assert_eq!(normal_drop_order(src), vec![None, Some("local".into())], "{src}");
+        }
+    }
 
     /// A deep method chain lowers to a linear number of IR
     /// statements (the shared unwind ladder of `call_into`).
