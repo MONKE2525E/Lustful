@@ -1,5 +1,6 @@
 // Lexer: turns source bytes into a flat token list. Identifiers are interned here.
 use crate::diag::{Diag, FileId, Span};
+use crate::edition::Edition;
 use crate::intern::{FxMap, Interner, Sym};
 use std::borrow::Cow;
 
@@ -495,28 +496,15 @@ fn keyword(s: &str) -> Option<Tok> {
     })
 }
 
-/// Keywords of Rust 2024 (strict and reserved) that have no token of their own here.
+/// Keywords (strict and reserved) with no token of their own in the given edition.
 /// Weak keywords such as `union`, `safe`, and `macro_rules` stay usable as identifiers, as in rustc.
 /// `crate`, `super`, `extern`, and `await` have their own tokens so the parser can
 /// recognize paths, extern items, and `.await` and reject them with the right code.
-fn reserved(s: &str) -> bool {
+fn reserved(s: &str, edition: Edition) -> bool {
     matches!(
         s,
-        "abstract"
-            | "become"
-            | "box"
-            | "do"
-            | "final"
-            | "gen"
-            | "macro"
-            | "override"
-            | "priv"
-            | "try"
-            | "typeof"
-            | "unsized"
-            | "virtual"
-            | "yield"
-    )
+        "abstract" | "become" | "box" | "do" | "final" | "macro" | "override" | "priv" | "try" | "typeof" | "unsized" | "virtual" | "yield"
+    ) || (s == "gen" && edition == Edition::E2024)
 }
 
 /// Names that rustc does not allow even as raw identifiers (`r#self` and friends).
@@ -537,7 +525,12 @@ pub fn lifetime_is_raw(name: &str, span: Span) -> bool {
 /// such names (`stringify!('fn)`): the error is for parsed lifetime and
 /// label positions only, which call this.
 pub fn keyword_lifetime_error(name: &str, raw: bool, label: bool, span: Span) -> Option<Diag> {
-    if raw || (keyword(name).is_none() && !reserved(name)) || (!label && matches!(name, "_" | "static")) {
+    keyword_lifetime_error_in_edition(name, raw, label, span, Edition::E2024)
+}
+
+/// Edition-aware name validation; this does not select a parser edition.
+pub fn keyword_lifetime_error_in_edition(name: &str, raw: bool, label: bool, span: Span, edition: Edition) -> Option<Diag> {
+    if raw || (keyword(name).is_none() && !reserved(name, edition)) || (!label && matches!(name, "_" | "static")) {
         return None;
     }
     let what = if label { "labels" } else { "lifetimes" };
@@ -850,6 +843,11 @@ fn bidi_in(src: &str, start: usize, end: usize, what: &str, file: FileId, base: 
 }
 
 pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Lexed, Diag> {
+    lex_in_edition(src, file, base, interner, Edition::E2024)
+}
+
+/// Selects lexical mechanics only; source admission and parsing remain 2024.
+pub fn lex_in_edition(src: &str, file: FileId, base: u32, interner: &Interner, edition: Edition) -> Result<Lexed, Diag> {
     let b = src.as_bytes();
     let mut tokens = Vec::with_capacity(src.len() / 4);
     let mut strings = Vec::new();
@@ -947,10 +945,12 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
             }
             continue;
         }
-        if c == b'#' && b.get(i + 1) == Some(&b'#') {
+        // Edition 2024 reserves adjacent hashes and unprefixed guarded strings.
+        // Edition 2021 emits separate pound and string tokens instead.
+        if edition == Edition::E2024 && c == b'#' && b.get(i + 1) == Some(&b'#') {
             return Err(err(start, i + 2, "reserved multi-hash token is forbidden"));
         }
-        if c == b'#' && b.get(i + 1) == Some(&b'"') {
+        if edition == Edition::E2024 && c == b'#' && b.get(i + 1) == Some(&b'"') {
             return Err(err(start, i + 2, "invalid string literal"));
         }
         let tok = if c.is_ascii_alphabetic() || c == b'_' || (c >= 0x80 && src[i..].chars().next().is_some_and(is_xid_start)) {
@@ -1057,7 +1057,7 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 Tok::Ident(*cache.entry(name).or_insert_with(|| interner.intern(name)))
             } else if let Some(k) = keyword(s) {
                 k
-            } else if reserved(s) {
+            } else if reserved(s, edition) {
                 Tok::Reserved(*cache.entry(s).or_insert_with(|| interner.intern(s)))
             } else {
                 if non_ascii && !is_nfc(s) {
@@ -1169,15 +1169,6 @@ pub fn lex(src: &str, file: FileId, base: u32, interner: &Interner) -> Result<Le
                 Tok::Char(ch, (!canonical).then(|| push_text(&mut strings, &src[start..i])))
             }
         } else {
-            // `#` runs are reserved in edition 2024: a guarded string
-            // (`#"x"#`) and a multi-hash (`##`) are lexer errors, not
-            // a `#` token next to a literal or another `#`.
-            if c == b'#' && b.get(i + 1) == Some(&b'"') {
-                return Err(err(start, start + 2, "invalid string literal: unprefixed guarded strings are reserved"));
-            }
-            if c == b'#' && b.get(i + 1) == Some(&b'#') {
-                return Err(err(start, start + 2, "reserved multi-hash token is forbidden"));
-            }
             let two = if i + 1 < b.len() { &b[i..i + 2] } else { &b[i..i + 1] };
             let three = if i + 2 < b.len() { &b[i..i + 3] } else { &[][..] };
             let (t, n) = if three == b"..=" {
@@ -1556,6 +1547,108 @@ fn lex_escape(src: &str, i: &mut usize) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edition_mechanics_gen_and_raw_gen() {
+        use crate::edition::Edition::{E2021, E2024};
+        let interner = Interner::default();
+        let gen_sym = interner.intern("gen");
+        for (edition, ordinary) in [(E2021, Tok::Ident(gen_sym)), (E2024, Tok::Reserved(gen_sym))] {
+            let out = lex_in_edition("gen r#gen", FileId(7), 40, &interner, edition).unwrap();
+            assert_eq!(out.tokens.iter().map(|t| t.tok).collect::<Vec<_>>(), [ordinary, Tok::Ident(gen_sym), Tok::Eof]);
+            assert_eq!(out.tokens[0].span, Span::new(FileId(7), 40, 43));
+            assert_eq!(out.tokens[1].span, Span::new(FileId(7), 44, 49));
+            let control = lex_in_edition("try async await dyn", FileId(7), 0, &interner, edition).unwrap();
+            assert_eq!(
+                control.tokens.iter().map(|t| t.tok).collect::<Vec<_>>(),
+                [Tok::Reserved(interner.intern("try")), Tok::Async, Tok::Await, Tok::Dyn, Tok::Eof]
+            );
+            for invalid in ["r#self", "r#Self", "r#super", "r#crate", "r#_"] {
+                assert!(lex_in_edition(invalid, FileId(7), 0, &interner, edition).is_err(), "{invalid}");
+            }
+        }
+        assert_eq!(lex("gen", FileId(7), 0, &interner).unwrap().tokens[0].tok, Tok::Reserved(gen_sym));
+    }
+
+    #[test]
+    fn edition_mechanics_lifetimes_and_labels() {
+        use crate::edition::Edition::{E2021, E2024};
+        let interner = Interner::default();
+        for edition in [E2021, E2024] {
+            for (source, name, raw) in [
+                ("'gen", "gen", false),
+                ("'r#gen", "gen", true),
+                ("'fn", "fn", false),
+                ("'r#fn", "fn", true),
+                ("'try", "try", false),
+                ("'static", "static", false),
+                ("'_", "_", false),
+                ("'a", "a", false),
+            ] {
+                let out = lex_in_edition(source, FileId(8), 60, &interner, edition).unwrap();
+                assert_eq!(out.tokens.len(), 2);
+                let token = out.tokens[0];
+                assert_eq!(token.tok, Tok::Lifetime(interner.intern(name)));
+                assert_eq!(token.span, Span::new(FileId(8), 60, 60 + source.len() as u32));
+                assert_eq!(lifetime_is_raw(name, token.span), raw);
+                for label in [false, true] {
+                    let rejected = !raw
+                        && match name {
+                            "gen" => edition == E2024,
+                            "fn" | "try" => true,
+                            "static" | "_" => label,
+                            _ => false,
+                        };
+                    let error = keyword_lifetime_error_in_edition(name, raw, label, token.span, edition);
+                    assert_eq!(error.is_some(), rejected, "{source}, label={label}, 2024={}", edition == E2024);
+                    if let Some(error) = error {
+                        assert_eq!(error.span, token.span);
+                    }
+                }
+            }
+            for invalid in ["'r#self", "'r#Self", "'r#super", "'r#crate", "'r#_"] {
+                assert!(lex_in_edition(invalid, FileId(8), 0, &interner, edition).is_err(), "{invalid}");
+            }
+        }
+        assert!(keyword_lifetime_error("gen", false, false, Span::new(FileId(8), 0, 4)).is_some());
+    }
+
+    #[test]
+    fn edition_mechanics_adjacent_and_spaced_hashes() {
+        use crate::edition::Edition::{E2021, E2024};
+        let interner = Interner::default();
+        for (source, ranges) in
+            [("##", &[(0, 1), (1, 2)][..]), ("###", &[(0, 1), (1, 2), (2, 3)][..]), ("#\"x\"#", &[(0, 1), (1, 4), (4, 5)][..])]
+        {
+            let out = lex_in_edition(source, FileId(9), 80, &interner, E2021).unwrap();
+            assert_eq!(out.tokens.len(), ranges.len() + 1);
+            for (token, &(lo, hi)) in out.tokens.iter().zip(ranges) {
+                assert_eq!(token.span, Span::new(FileId(9), 80 + lo, 80 + hi));
+                if source.as_bytes()[lo as usize] == b'#' {
+                    assert_eq!(token.tok, Tok::Pound);
+                } else {
+                    let Tok::Str(value, _) = token.tok else { panic!("expected string token") };
+                    assert_eq!(out.strings[value as usize], "x");
+                }
+            }
+            assert_eq!(out.tokens.last().unwrap().tok, Tok::Eof);
+            assert!(lex_in_edition(source, FileId(9), 80, &interner, E2024).is_err(), "{source}");
+            assert!(lex(source, FileId(9), 80, &interner).is_err(), "default remains 2024: {source}");
+        }
+        for edition in [E2021, E2024] {
+            for source in ["# #", "#\n#", "#/* gap */#"] {
+                let out = lex_in_edition(source, FileId(9), 0, &interner, edition).unwrap();
+                assert_eq!(out.tokens.iter().map(|t| t.tok).collect::<Vec<_>>(), [Tok::Pound, Tok::Pound, Tok::Eof]);
+            }
+            let out = lex_in_edition("# \"x\" #", FileId(9), 0, &interner, edition).unwrap();
+            assert_eq!(out.tokens.len(), 4);
+            assert_eq!(out.tokens[0].tok, Tok::Pound);
+            assert!(matches!(out.tokens[1].tok, Tok::Str(_, _)));
+            assert_eq!(out.tokens[2].tok, Tok::Pound);
+            assert_eq!(out.tokens[3].tok, Tok::Eof);
+            assert!(lex_in_edition("r#\"x\"#", FileId(9), 0, &interner, edition).is_ok());
+        }
+    }
 
     /// A packed stream unpacks to the same tokens and strings, spans that jump back (a macro
     /// call's tokens) and another file and context included.

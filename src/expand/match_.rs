@@ -48,7 +48,12 @@ fn node_vars(nodes: &[MNode], out: &mut Vec<Sym>) {
 
 struct Compile<'a> {
     interner: &'a Interner,
+    edition: Edition,
     vars: FxMap<Sym, VarInfo>,
+}
+
+fn effective_fragment(kind: FragKind, edition: Edition) -> FragKind {
+    if edition == Edition::E2021 && kind == FragKind::Expr { FragKind::Expr2021 } else { kind }
 }
 
 impl<'a> Compile<'a> {
@@ -130,7 +135,7 @@ impl<'a> Compile<'a> {
                                 )
                             })?;
                             let name_span = name_tok.span;
-                            if self.vars.insert(name, VarInfo { kind, depth }).is_some() {
+                            if self.vars.insert(name, VarInfo { kind: effective_fragment(kind, self.edition), depth }).is_some() {
                                 return Err(err(
                                     C_DEF,
                                     name_span,
@@ -532,14 +537,14 @@ fn check_empty_reps(nodes: &[MNode]) -> Result<(), Diag> {
 /// Compiles one macro arm: matcher trees to matcher nodes plus the
 /// metavariable table. Runs the follow-set and empty-repetition
 /// definition checks (ARCH 6.2), then lays the nodes out flat.
-pub fn compile_arm(matcher: &[Tt], span: Span, interner: &Interner) -> Result<(ArmMatcher, FxMap<Sym, VarInfo>), Diag> {
-    let mut c = Compile { interner, vars: FxMap::default() };
+pub fn compile_arm(matcher: &[Tt], span: Span, interner: &Interner, edition: Edition) -> Result<(ArmMatcher, FxMap<Sym, VarInfo>), Diag> {
+    let mut c = Compile { interner, edition, vars: FxMap::default() };
     let nodes = c.seq(matcher, 0)?;
     check_empty_reps(&nodes)?;
     check_follow_seq(&nodes, &[])?;
     let _ = span;
     let mut arm = ArmMatcher { locs: Vec::new(), rep_vars: Vec::new() };
-    lay_out(&nodes, &mut arm);
+    lay_out(&nodes, &mut arm, edition);
     arm.locs.push(Loc::Eof);
     Ok((arm, c.vars))
 }
@@ -581,14 +586,15 @@ pub struct ArmMatcher {
 }
 
 /// Appends the flat locations of `nodes` to `arm` (rustc's `compute_locs`).
-fn lay_out(nodes: &[MNode], arm: &mut ArmMatcher) {
+fn lay_out(nodes: &[MNode], arm: &mut ArmMatcher, edition: Edition) {
     for node in nodes {
         match node {
             MNode::Tok(t) => arm.locs.push(Loc::Tok(*t)),
-            MNode::Meta { name, kind, .. } => arm.locs.push(Loc::Meta { name: *name, kind: *kind }),
+            // Keep written kinds through definition diagnostics; matching uses the edition's grammar.
+            MNode::Meta { name, kind, .. } => arm.locs.push(Loc::Meta { name: *name, kind: effective_fragment(*kind, edition) }),
             MNode::Group(d, inner) => {
                 arm.locs.push(Loc::Open(*d));
-                lay_out(inner, arm);
+                lay_out(inner, arm, edition);
                 arm.locs.push(Loc::Close(*d));
             }
             MNode::Rep { inner, sep, op, vars, .. } => {
@@ -598,7 +604,7 @@ fn lay_out(nodes: &[MNode], arm: &mut ArmMatcher) {
                 // Patched below, once the body's length is known.
                 arm.locs.push(Loc::Eof);
                 let first = (at + 1) as u32;
-                lay_out(inner, arm);
+                lay_out(inner, arm, edition);
                 match sep {
                     Some(sep) => {
                         arm.locs.push(Loc::Sep(*sep));
@@ -1305,6 +1311,7 @@ fn keyword_lifetimes(m: &Matcher, trees: &[Tt], meta: bool) -> Result<(), Diag> 
                         && (matches!(tok(i + 2), Some(Tok::Loop | Tok::While | Tok::For))
                             || matches!(trees.get(i + 2), Some(Tt::Delim(Delim::Brace, _, _)))));
                 let text = m.interner.get(name);
+                // Fragment parsing remains 2024 even for a definition using 2021 expr matching.
                 if let Some(d) = crate::lexer::keyword_lifetime_error(text, raw_tok(m, t), label, t.span) {
                     return Err(d);
                 }

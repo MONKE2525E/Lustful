@@ -20,6 +20,7 @@ pub mod transcribe;
 use crate::ast::{MacroCall, MacroRulesDef};
 use crate::def::DefId;
 use crate::diag::{CtxtId, Diag, HygieneMark, Span, mark_no_capture, register_expansion, register_hygiene};
+use crate::edition::Edition;
 use crate::intern::{FxMap, Interner, Known, Sym};
 use crate::lexer::{Delim, Lexed, Tok, Token, TokenTree, build_trees};
 use std::hash::{Hash, Hasher};
@@ -512,7 +513,7 @@ pub struct MacroDef {
     /// tokens may read locals bound before the definition (ARCH 6.3).
     pub local_def: bool,
     pub def_span: Span,
-    /// Hash of the definition's raw tokens (ARCH 6.5 cache key input).
+    /// Hash of the definition's tokens, layout, and edition (ARCH 6.5 cache key input).
     pub fingerprint: u64,
     /// The macro name alone, for diagnostics.
     pub name_text: String,
@@ -564,6 +565,7 @@ pub fn compile_macro(
     def_span: Span,
     strings: &[String],
     interner: &Interner,
+    edition: Edition,
 ) -> Result<MacroDef, Diag> {
     let mut arms = Vec::new();
     let mut i = 0;
@@ -581,7 +583,7 @@ pub fn compile_macro(
             return Err(err(C_DEF, mspan, "expected a macro expansion group", "Write each rule as `( matcher ) => { expansion };`."));
         };
         let template = template.clone();
-        let (matcher, vars) = match_::compile_arm(&matcher, mspan, interner)?;
+        let (matcher, vars) = match_::compile_arm(&matcher, mspan, interner, edition)?;
         transcribe::check_template_vars(&template, &vars, interner)?;
         arms.push(Arm { matcher, template });
         i += 3;
@@ -595,6 +597,11 @@ pub fn compile_macro(
         return Err(err(C_DEF, def_span, "a macro must contain at least one rule", "Add a rule such as `() => {};`."));
     }
     let pos_sensitive = arms.iter().any(|a| template_pos_sensitive(&a.template, interner));
+    // Preserve existing 2024 fingerprints while separating definition-edition semantics.
+    let edition_tag = match edition {
+        Edition::E2021 => 0x2021,
+        Edition::E2024 => 0,
+    };
     Ok(MacroDef {
         name,
         name_span,
@@ -602,10 +609,7 @@ pub fn compile_macro(
         exported,
         local_def: false,
         def_span,
-        // The fingerprint includes the body's spacing shape: an edit
-        // that only respaces a template (`stringify!(x+y)` to
-        // `stringify!(x + y)`) must not hit a cached transcription.
-        fingerprint: hash_tts(body, strings) ^ span_hash_tts(body, body.first().map_or(0, |t| t.span().lo)),
+        fingerprint: hash_tts(body, strings) ^ span_hash_tts(body, body.first().map_or(0, |t| t.span().lo)) ^ edition_tag,
         name_text: interner.get(name).to_string(),
         pos_sensitive,
     })
@@ -614,9 +618,15 @@ pub fn compile_macro(
 /// Compiles an AST `MacroRulesDef` (the shape the 6.1 worklist carries)
 /// into an expander definition. The worklist is its first caller.
 #[allow(dead_code)]
-pub fn compile_ast_macro(def: &MacroRulesDef, exported: bool, strings: &[String], interner: &Interner) -> Result<MacroDef, Diag> {
+pub fn compile_ast_macro(
+    def: &MacroRulesDef,
+    exported: bool,
+    strings: &[String],
+    interner: &Interner,
+    edition: Edition,
+) -> Result<MacroDef, Diag> {
     let body: Vec<Tt> = def.tokens.iter().map(tt_from_tree).collect();
-    compile_macro(def.name, def.name_span, &body, exported, def.span, strings, interner)
+    compile_macro(def.name, def.name_span, &body, exported, def.span, strings, interner, edition)
 }
 
 /// The driver facts expansion needs: who interns, which file this is
@@ -870,6 +880,7 @@ struct CacheKey {
     call_hi: u32,
     call_ctxt: u32,
     cfg_hash: u64,
+    /// Call-site parsing remains fixed at 2024; this is separate from definition edition.
     edition: u16,
     deps_hash: u64,
     /// Input span layout for position-sensitive templates, else 0:
@@ -2246,7 +2257,16 @@ impl<'a> Expander<'a> {
                         };
                         st.check_dup_export(def.name, def.name_span, exported)?;
                         check_def_form(trees, &def)?;
-                        let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &st.strings, st.ctx.interner)?;
+                        let mut compiled = compile_macro(
+                            def.name,
+                            def.name_span,
+                            &body,
+                            exported,
+                            def.span,
+                            &st.strings,
+                            st.ctx.interner,
+                            Edition::E2024,
+                        )?;
                         compiled.local_def = !at_module_list;
                         let idx = st.register(Arc::new(compiled), exported, false);
                         if at_module_list {
@@ -2500,7 +2520,8 @@ impl<'a> Expander<'a> {
                     return Ok(());
                 }
                 let at_root = seed.path.is_empty();
-                let compiled = compile_macro(def.name, def.name_span, &body, at_root, def.span, &self.strings, self.ctx.interner)?;
+                let compiled =
+                    compile_macro(def.name, def.name_span, &body, at_root, def.span, &self.strings, self.ctx.interner, Edition::E2024)?;
                 let idx = self.register(Arc::new(compiled), at_root, false);
                 self.by_path.insert((seed.path.clone(), def.name), idx);
                 match &seed.visible_in {
@@ -4874,7 +4895,8 @@ impl<'a> Expander<'a> {
             self.note_late_export(export_attr, def.name, idx);
             return Ok(());
         }
-        let mut compiled = compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner)?;
+        let mut compiled =
+            compile_macro(def.name, def.name_span, &body, exported, def.span, &self.strings, self.ctx.interner, Edition::E2024)?;
         compiled.local_def = local_def;
         let idx = self.register(Arc::new(compiled), exported, true);
         self.note_late_export(export_attr, def.name, idx);
@@ -5538,6 +5560,180 @@ fn collect_use_sites(trees: &[Tt], prefix: &[Seg], interner: &Interner) -> Vec<(
 mod tests {
     use super::*;
     use crate::diag::FileId;
+
+    fn edition_mechanics_def(interner: &Interner, name: &str, body: &str, edition: crate::edition::Edition) -> (MacroDef, Vec<String>) {
+        // These bodies are edition-neutral; only compile_macro's definition edition varies.
+        let lexed = crate::lexer::lex(body, FileId(31), 100, interner).unwrap();
+        let (trees, balanced) = build_trees(&lexed.tokens);
+        assert!(balanced);
+        let body_tts: Vec<_> = trees.iter().map(tt_from_tree).collect();
+        let span = Span::new(FileId(31), 100, 100 + body.len() as u32);
+        let def = compile_macro(interner.intern(name), span, &body_tts, false, span, &lexed.strings, interner, edition).unwrap();
+        (def, lexed.strings)
+    }
+
+    fn edition_mechanics_transcribe(ctx: &ExpandCtx<'_>, def: &MacroDef, def_strings: &[String], input: &str) -> Vec<String> {
+        // Keep caller edition, file, offsets, and bytes fixed across definition-edition changes.
+        let mut lexed = crate::lexer::lex(input, FileId(32), 300, ctx.interner).unwrap();
+        let mut strings = def_strings.to_vec();
+        for token in &mut lexed.tokens {
+            token.tok.shift_strings(strings.len() as u32);
+        }
+        strings.extend(lexed.strings);
+        let (trees, balanced) = build_trees(&lexed.tokens);
+        assert!(balanced);
+        let span = Span::new(FileId(32), 290, 301 + input.len() as u32);
+        let call = Call {
+            segs: vec![Seg { sym: def.name, text: def.name_text.clone(), span }],
+            leading_colon: false,
+            head: Vec::new(),
+            delim: Delim::Paren,
+            inner: trees.iter().map(tt_from_tree).collect(),
+            group_span: span,
+            span,
+        };
+        let mut expander = Expander::new(ctx, strings);
+        let out = expander.transcribe_call(def, &call, 0).unwrap();
+        let mut tokens = Vec::new();
+        flatten_final(&out, &mut tokens);
+        tokens.iter().map(|t| tok_text(&t.tok, &expander.strings, ctx.interner)).collect()
+    }
+
+    #[test]
+    fn edition_mechanics_macro_arms_match_fragment_oracle() {
+        use crate::edition::Edition::{E2021, E2024};
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("edition-mechanics.rs"), "", false);
+        let choose = "($e:expr) => { 1 }; (const $e:expr) => { 2 }; (_) => { 3 };";
+        let old = "($e:expr_2021) => { 1 }; (const $e:expr_2021) => { 2 }; (_) => { 3 };";
+        let repeat = "($($e:expr),*) => { 4 }; (const $($e:expr),*) => { 5 };";
+        for (edition, expected) in [(E2021, ["2", "3", "2", "3", "1", "5"]), (E2024, ["1", "1", "2", "3", "1", "4"])] {
+            let (choose, choose_strings) = edition_mechanics_def(&interner, "edition_choose", choose, edition);
+            let (old, old_strings) = edition_mechanics_def(&interner, "edition_old", old, edition);
+            let (repeat, repeat_strings) = edition_mechanics_def(&interner, "edition_repeat", repeat, edition);
+            let cases = [
+                (&choose, &choose_strings, "const {1}"),
+                (&choose, &choose_strings, "_"),
+                (&old, &old_strings, "const {1}"),
+                (&old, &old_strings, "_"),
+                (&choose, &choose_strings, "{const {1}}"),
+                (&repeat, &repeat_strings, "const {1}, {2}"),
+            ];
+            for ((def, strings, input), expected) in cases.into_iter().zip(expected) {
+                assert_eq!(edition_mechanics_transcribe(&ctx, def, strings, input), [expected], "{}!({input})", def.name_text);
+            }
+        }
+    }
+
+    #[test]
+    fn edition_mechanics_nested_repetition_and_explicit_expr_2021() {
+        use crate::edition::Edition::{E2021, E2024};
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("edition-nested.rs"), "", false);
+        for edition in [E2021, E2024] {
+            for fragment in ["expr", "expr_2021"] {
+                let body = format!("($(($($e:{fragment}),*));*) => {{ 4 }}; ($(const ($($e:{fragment}),*));*) => {{ 5 }};");
+                let (def, strings) = edition_mechanics_def(&interner, "edition_nested", &body, edition);
+                for input in ["({const {1}}, {2}); ({3})", "const ({1}, {2}); const ({3})"] {
+                    let expected = if input.starts_with("const") { "5" } else { "4" };
+                    assert_eq!(edition_mechanics_transcribe(&ctx, &def, &strings, input), [expected]);
+                }
+                for input in ["(const {1}, {2}); ({3})", "(_, {2}); ({3})"] {
+                    // A tt fallback makes rejection observable without assuming diagnostic wording.
+                    let body = format!("{body} ($($t:tt)*) => {{ 6 }};");
+                    let (def, strings) = edition_mechanics_def(&interner, "edition_nested_fallback", &body, edition);
+                    let expected = if edition == E2024 && fragment == "expr" { "4" } else { "6" };
+                    assert_eq!(edition_mechanics_transcribe(&ctx, &def, &strings, input), [expected]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edition_mechanics_production_expansion_stays_2024() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let source = "macro_rules! edition_default { ($e:expr) => { 1 }; (const $e:expr) => { 2 }; (_) => { 3 }; } fn main() { edition_default!(const {1}); edition_default!(_); }";
+        let output = expand_src(&interner, &known, source).unwrap();
+        let values: Vec<_> = output.iter().filter(|t| matches!(t.as_str(), "1" | "2" | "3")).map(String::as_str).collect();
+        assert_eq!(values, ["1", "1"]);
+    }
+
+    #[test]
+    fn edition_mechanics_patterns_keep_2021_and_2024_grammar() {
+        use crate::edition::Edition::{E2021, E2024};
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("edition-pattern.rs"), "", false);
+        for edition in [E2021, E2024] {
+            for (name, body, input) in
+                [("edition_pat", "($p:pat) => { 1 };", "A | B"), ("edition_pat_param", "($p:pat_param | $q:pat_param) => { 1 };", "A | B")]
+            {
+                let (def, strings) = edition_mechanics_def(&interner, name, body, edition);
+                assert_eq!(edition_mechanics_transcribe(&ctx, &def, &strings, input), ["1"]);
+            }
+        }
+    }
+
+    #[test]
+    fn edition_mechanics_follow_diagnostics_keep_written_fragment() {
+        let interner = Interner::default();
+        for edition in [Edition::E2021, Edition::E2024] {
+            for fragment in ["expr", "expr_2021"] {
+                for matcher in [format!("$e:{fragment} @"), format!("$($e:{fragment})@*"), format!("$e:{fragment} $f:{fragment}")] {
+                    let body = format!("({matcher}) => {{}};");
+                    let lexed = crate::lexer::lex(&body, FileId(31), 0, &interner).unwrap();
+                    let (trees, _) = build_trees(&lexed.tokens);
+                    let tts: Vec<_> = trees.iter().map(tt_from_tree).collect();
+                    let span = Span::new(FileId(31), 0, body.len() as u32);
+                    let error = match compile_macro(interner.intern("follow"), span, &tts, false, span, &lexed.strings, &interner, edition)
+                    {
+                        Err(error) => error,
+                        Ok(_) => panic!("invalid follow set accepted"),
+                    };
+                    assert!(error.message.starts_with(&format!("`{fragment}` fragments")), "{}", error.message);
+                    if fragment == "expr" {
+                        assert!(!error.message.contains("expr_2021"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edition_mechanics_definition_fingerprint_separates_warm_transcriptions() {
+        use crate::edition::Edition::{E2021, E2024};
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("edition-cache.rs"), "", false);
+        let body = "($e:expr) => { 1 }; (const $e:expr) => { 2 }; (_) => { 3 };";
+        let (old, old_strings) = edition_mechanics_def(&interner, "edition_cache_unique", body, E2021);
+        let (new, new_strings) = edition_mechanics_def(&interner, "edition_cache_unique", body, E2024);
+        let (old_again, again_strings) = edition_mechanics_def(&interner, "edition_cache_unique", body, E2021);
+        let lexed = crate::lexer::lex(body, FileId(31), 100, &interner).unwrap();
+        let (trees, _) = build_trees(&lexed.tokens);
+        let tts: Vec<_> = trees.iter().map(tt_from_tree).collect();
+        let original_fingerprint = hash_tts(&tts, &lexed.strings) ^ span_hash_tts(&tts, tts.first().map_or(0, |t| t.span().lo));
+        assert_eq!(new.fingerprint, original_fingerprint, "2024 preserves the existing cache identity");
+        assert_eq!(old.fingerprint, original_fingerprint ^ 0x2021);
+        assert_ne!(old.fingerprint, new.fingerprint, "same source and spans, different definition editions");
+        assert_eq!(old.fingerprint, old_again.fingerprint, "stable when the edition returns to 2021");
+        // Use production matching/transcription/cache, without clearing shared state or forging keys.
+        // Cover both warm transition orders and repeated calls; input and call spans do not change.
+        for (def, strings, expected_const, expected_underscore) in [
+            (&old, &old_strings, "2", "3"),
+            (&old, &old_strings, "2", "3"),
+            (&new, &new_strings, "1", "1"),
+            (&new, &new_strings, "1", "1"),
+            (&old_again, &again_strings, "2", "3"),
+            (&new, &new_strings, "1", "1"),
+        ] {
+            assert_eq!(edition_mechanics_transcribe(&ctx, def, strings, "const {1}"), [expected_const]);
+            assert_eq!(edition_mechanics_transcribe(&ctx, def, strings, "_"), [expected_underscore]);
+        }
+    }
 
     fn expand_src(interner: &Interner, known: &Known, src: &str) -> Result<Vec<String>, Diag> {
         let lexed = crate::lexer::lex(src, FileId(0), 0, interner).expect("test source lexes");

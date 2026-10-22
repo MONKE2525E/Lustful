@@ -21,6 +21,7 @@ mod daemon;
 mod def;
 mod diag;
 mod driver;
+mod edition;
 mod expand;
 mod explain;
 mod image;
