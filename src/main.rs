@@ -321,10 +321,10 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
     drop(resolve::prefetch::take());
     resolve::prefetch::write_list(dir, sessions.iter().flat_map(|s| s.front.resolve_cache.source_paths()));
     // The kept programs ride only when the next build may reuse them
-    // (`Front::image_keeps_kept`).
-    for s in sessions.iter_mut().filter(|s| !s.front.image_keeps_kept()) {
-        let s = &mut **s;
-        driver::drop_kept(&mut s.front, &mut s.caches);
+    // (`Front::image_keeps_kept`). A background save drops the others in its
+    // forked child (`image::save_background`), off this build's way to its cc step.
+    if compact || !background {
+        driver::drop_unkept(&mut sessions);
     }
     let roots = Box::new(image::Roots {
         sessions,

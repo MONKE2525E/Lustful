@@ -621,6 +621,15 @@ pub(crate) fn drop_kept(front: &mut Front, caches: &mut Caches) {
     }
 }
 
+/// `drop_kept` for each session whose kept programs do not ride in the front
+/// image (`Front::image_keeps_kept`).
+pub(crate) fn drop_unkept(sessions: &mut [Box<super::Session>]) {
+    for s in sessions.iter_mut().filter(|s| !s.front.image_keeps_kept()) {
+        let s = &mut **s;
+        drop_kept(&mut s.front, &mut s.caches);
+    }
+}
+
 /// `program`'s type store as the session's type pool (`ty::TypePool::of`).
 fn pool_from(caches: &mut Caches, program: crate::check::collect::Program) {
     let interner = program.interner.clone();

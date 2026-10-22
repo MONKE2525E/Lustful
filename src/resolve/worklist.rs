@@ -411,10 +411,11 @@ fn route_keywords(lexed: &lexer::Lexed, interner: &Interner) -> bool {
             }
             Tok::Const if matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Ident(_)) | Some(Tok::Underscore)) => return true,
             Tok::Type => return true,
-            // A root type named like a std prelude type takes a flat name
-            // only the resolver gives (`flat_name`).
+            // A root type named like a std prelude type or a primitive takes
+            // a flat name only the resolver gives (`flat_name`).
             Tok::Struct | Tok::Enum | Tok::Trait
-                if matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Ident(s)) if PRELUDE_TYPES.contains(&interner.get(s))) =>
+                if matches!(toks.get(i + 1).map(|t| t.tok), Some(Tok::Ident(s))
+                    if PRELUDE_TYPES.contains(&interner.get(s)) || crate::ty::lang::is_primitive_type_name(interner.get(s))) =>
             {
                 return true;
             }
@@ -4982,9 +4983,10 @@ fn strip_fields(fs: &mut Vec<FieldDef>, input: &OneInput, strings: &[String], in
 /// for the selected crate, a stable-hash prefix for a source
 /// dependency), then the module path joined with `$`, then the name.
 /// The selected crate's root keeps plain names, except names of the
-/// std prelude types the checker knows as builtins (`PRELUDE_TYPES`):
-/// those become `crate$Name`, so a root `enum Option` is never read as
-/// std's `Option` (or the reverse, in modules that do not import it).
+/// std prelude types the checker knows as builtins (`PRELUDE_TYPES`) and
+/// of primitive types: those become `crate$Name`, so a root `enum Option`
+/// or `type u8 = u16` is never read as std's `Option` or the primitive
+/// (or the reverse, in modules that do not import it).
 /// Std prelude type names the checker resolves as builtins when they
 /// are written plainly. A crate-root item of one of these names gets a
 /// `crate$` flat name (`flat_name`), and its file goes through the
@@ -4994,8 +4996,9 @@ pub(crate) const PRELUDE_TYPES: &[&str] = &["Option", "Result", "Vec", "String",
 fn flat_name(tables: &ResolvedTables, flat_prefix: &str, module: ModuleId, name: Sym, interner: &Interner) -> Sym {
     let path = &tables.modules[module.0 as usize].path;
     if flat_prefix.is_empty() && path.is_empty() {
-        if PRELUDE_TYPES.contains(&interner.get(name)) {
-            return interner.intern(&format!("crate${}", interner.get(name)));
+        let text = interner.get(name);
+        if PRELUDE_TYPES.contains(&text) || crate::ty::lang::is_primitive_type_name(text) {
+            return interner.intern(&format!("crate${text}"));
         }
         return name;
     }
@@ -6763,6 +6766,18 @@ impl Rewrite<'_> {
                 && let Some(d) = self.missing_in_module(&names, ns, module, span)
             {
                 self.diags.push(d);
+                return;
+            }
+            // A primitive type name another module defines an item of is
+            // still the primitive here (rustc's lowest scope layer): a root
+            // `type u8 = u16` does not reach `u8` in a module that does not
+            // import it.
+            if res == PathRes::Absent
+                && ns == Namespace::Type
+                && let [first] = names[..]
+                && crate::ty::lang::is_primitive_type_name(self.interner.get(first))
+            {
+                self.apply(segs, res, span, module, ns, scopes);
                 return;
             }
             if res == PathRes::Absent && names.first().is_some_and(|&n| self.local_name(n).is_some()) {

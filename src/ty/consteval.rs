@@ -219,6 +219,17 @@ pub trait ConstCx<'a> {
     /// body answers only inside its block scope, and shadows a
     /// module item of the same name there.
     fn const_item(&mut self, name: Sym, at: Span) -> Option<TypedValue>;
+    /// True when name resolution already made each binding pattern that
+    /// names an item in scope a path pattern (the resolver's tables): a
+    /// binding pattern can then name only a const of an enclosing block,
+    /// which the resolver leaves written (`block_const_item`).
+    fn patterns_resolved(&self) -> bool {
+        false
+    }
+    /// A const declared in an enclosing block of `at`, by name.
+    fn block_const_item(&mut self, _name: Sym, _at: Span) -> Option<TypedValue> {
+        None
+    }
     /// `const_item` without the clone, for an item already evaluated:
     /// its value in place. An index into a table item reads one element
     /// through it, so many `static X: &T = &TABLE[i]` items do not copy
@@ -5415,13 +5426,21 @@ impl Evaluator {
                 }
                 // A plain name that resolves to a const item compares
                 // against it, as the checker resolves it; a unit
-                // struct name matches its only value.
+                // struct name matches its only value. After name
+                // resolution only a block const or the prelude's `None`
+                // can be such a name: a module item in scope is a path
+                // pattern by then, and one out of scope (the root's `N`
+                // in module `m`) leaves a fresh binding, as in rustc.
                 if !mutable && !env.iter().any(|(n, _, _, _)| n == name) {
-                    if let Some((cv, _)) = cx.const_item(*name, span) {
+                    let resolved = cx.patterns_resolved();
+                    let item = if resolved { cx.block_const_item(*name, span) } else { cx.const_item(*name, span) };
+                    if let Some((cv, _)) = item {
                         return Ok(values_eq(v, &cv));
                     }
                     let segs = [ast::PathSeg::plain(*name)];
-                    if let Some((_, variant, _)) = cx.unit_variant(&segs, Some(t)) {
+                    if (!resolved || cx.sym_text(*name) == "None")
+                        && let Some((_, variant, _)) = cx.unit_variant(&segs, Some(t))
+                    {
                         return Ok(matches!(v, ConstValue::Variant(got, _) if *got == variant)
                             || matches!(v, ConstValue::Aggregate(_)));
                     }

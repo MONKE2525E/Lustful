@@ -278,6 +278,9 @@ impl<'a, T: TyIntern> ConstCx<'a> for InstCx<'a, T> {
     fn sym_text(&self, s: Sym) -> &str {
         self.p.interner.get(s)
     }
+    fn patterns_resolved(&self) -> bool {
+        self.p.resolved.is_some()
+    }
     fn const_item(&mut self, name: Sym, _at: Span) -> Option<TypedValue> {
         // A const parameter of this instance (`const V: usize = N`).
         for (i, param) in self.env.generics.params.iter().enumerate() {

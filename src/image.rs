@@ -37,7 +37,13 @@
 //      packs the fns' C texts into zstd frames that stay in the heap
 //      (`cgen::pack_texts`): a build unpacks only the frames it reads. Arena pages hold the live blocks mimalloc
 //      reports (`mi_heap_visit_blocks`), with the bytes of free blocks
-//      written as zeros; pages with no live block are left out. The
+//      written as zeros; pages with no live block are left out. Each layer
+//      goes to a temp file and is renamed into place whole; a delta names
+//      its parent (a stale one ends the chain, `read_chain`); a packed
+//      layer's head and sections carry hashes, and a raw layer is fsynced
+//      before its rename. So a save that is killed, or that a crash leaves
+//      half on disk, means the layers before it or a cold build, never
+//      wrong pages. The
 //      process-wide tables the session's spans index into
 //      (`diag::GlobalTables`) and the stamp counters ride in `Roots`.
 //      With `LUST_FRONT_SAVE=background` a forked child writes them while
@@ -100,7 +106,10 @@ const COMPACT_DUE: &str = "compact-due";
 /// Image format. Bump on any change to the header or to what `Roots` holds.
 const MAGIC: &[u8; 8] = b"LUSTFIM3";
 /// A packed layer (`pack`): the raw (`MAGIC`) layer in zstd sections.
-const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ3";
+const MAGIC_PACKED: &[u8; 8] = b"LUSTFIZ4";
+/// A packed layer's own header: `MAGIC_PACKED`, the raw length, the section count, the raw
+/// header's length and `head_check`.
+const PACKED_TOP: usize = 40;
 /// Saves write packed layers when libzstd loads; `LUST_FRONT_ZSTD=0` keeps
 /// them raw.
 const PACK_ENV: &str = "LUST_FRONT_ZSTD";
@@ -147,6 +156,8 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
     fn fork() -> c_int;
     fn setsid() -> c_int;
+    fn setpriority(which: c_int, who: u32, prio: c_int) -> c_int;
+    fn sched_setscheduler(pid: c_int, policy: c_int, param: *const c_int) -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
     fn _exit(code: c_int) -> !;
     fn mi_manage_os_memory_ex(
@@ -568,20 +579,23 @@ fn read_header(path: &Path) -> Result<Header, String> {
     f.read_exact(&mut head).map_err(|_| "short image".to_string())?;
     let word = |b: &[u8], i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
     if &head[..8] == MAGIC_PACKED {
-        // A packed layer (`pack`): raw length, section count and the raw
-        // header's length, the raw header, then the section table.
+        // A packed layer (`pack`): raw length, section count, the raw
+        // header's length and the head's check, the raw header, then the
+        // section table.
         let (raw_len, n, head_len) = (word(&head, 8), word(&head, 16), word(&head, 24));
         if n > 1 << 24 || head_len > 1 << 30 || (head_len as usize) < HEADER {
             return Err("packed image header".into());
         }
         // The first HEADER bytes are read; the rest of the head follows.
         let mut all = head.clone();
-        all.resize(32 + head_len as usize + n as usize * 24, 0);
+        all.resize(PACKED_TOP + head_len as usize + n as usize * 24, 0);
         f.read_exact(&mut all[HEADER..]).map_err(|_| "short packed image".to_string())?;
         let file_len = f.metadata().map_err(|e| format!("image: {e}"))?.len();
-        let inner = &all[32..32 + head_len as usize];
+        let (inner, table) = all[PACKED_TOP..].split_at(head_len as usize);
+        if head_check(&all[8..32], inner, table) != word(&all, 32) {
+            return Err("packed image head check".into());
+        }
         let mut h = parse_header(&inner[..HEADER], &inner[HEADER..], raw_len)?;
-        let table = &all[32 + head_len as usize..];
         let sections: Vec<(u64, u64, u64)> = table.chunks_exact(24).map(|c| (word(c, 0), word(c, 8), word(c, 16))).collect();
         if sections.len() != raw_len.div_ceil(SECTION as u64) as usize || sections.iter().any(|&(o, l, _)| o.checked_add(l).is_none_or(|e| e > file_len)) {
             return Err("packed image section table".into());
@@ -718,6 +732,20 @@ fn section_check(b: &[u8]) -> u64 {
     h.finish()
 }
 
+/// A packed layer's head check: a hash of its three lengths (`lens`), raw header and region
+/// table (`inner`) and section table, which the chain reads without unpacking. With the
+/// sections' checks it covers every byte, so a layer that a crash left half on disk (the save
+/// does not fsync it) fails to load: a cold build, never wrong pages.
+fn head_check(lens: &[u8], inner: &[u8], table: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = crate::intern::FxHasher::default();
+    for b in [lens, inner, table] {
+        h.write(b);
+        h.write_usize(b.len());
+    }
+    h.finish()
+}
+
 /// The threads that pack or unpack a layer's sections.
 fn workers() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16)
@@ -783,9 +811,9 @@ fn decode_runs(buf: &[u8], rlen: usize) -> Option<Vec<(usize, usize, usize)>> {
 }
 
 /// Writes raw layer `raw` (`len` bytes; `head` is its header and region
-/// table) to `out` packed: a short header (`MAGIC_PACKED`, the raw length,
-/// the section count, `head`'s length), `head` itself (so the chain reads
-/// without unpacking), the section table (file offset, packed length,
+/// table) to `out` packed: a short header (`PACKED_TOP`: `MAGIC_PACKED`, the raw
+/// length, the section count, `head`'s length, `head_check`), `head` itself (so the chain
+/// reads without unpacking), the section table (file offset, packed length,
 /// `section_check`), then the raw form cut into `SECTION`-byte sections,
 /// each one zstd frame of its nonzero pages (`encode_runs`), packed in
 /// parallel. Returns the packed length.
@@ -837,7 +865,7 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
         return Err("image pack failed".into());
     }
     let parts: Vec<Vec<u8>> = parts.into_iter().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or_default()).collect();
-    let mut at = (32 + head.len() + n * 24) as u64;
+    let mut at = (PACKED_TOP + head.len() + n * 24) as u64;
     let mut table = Vec::with_capacity(n * 24);
     for p in &parts {
         for v in [at, p.len() as u64, section_check(p)] {
@@ -846,11 +874,13 @@ fn pack(raw: &std::fs::File, len: u64, head: &[u8], out: &mut std::fs::File, z: 
         at += p.len() as u64;
     }
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
-    let mut top = Vec::with_capacity(32);
+    let mut top = Vec::with_capacity(PACKED_TOP);
     top.extend_from_slice(MAGIC_PACKED);
     for v in [len, n as u64, head.len() as u64] {
         top.extend_from_slice(&v.to_le_bytes());
     }
+    let check = head_check(&top[8..], head, &table);
+    top.extend_from_slice(&check.to_le_bytes());
     let ok = w.write_all(&top).is_ok() && w.write_all(head).is_ok() && w.write_all(&table).is_ok() && parts.iter().all(|p| w.write_all(p).is_ok()) && w.flush().is_ok();
     if !ok {
         return Err("image pack write failed".into());
@@ -2174,14 +2204,15 @@ fn quiesce() {
 /// answers and exits at once and a release publishes its artifact without
 /// waiting (a base save takes 10-18 s on tsgo). A release build's cc step
 /// runs after the fork, in the parent (`driver::defer_cc`), so the save
-/// overlaps clang; the child drops it first. The child is this
+/// overlaps clang; the child drops it first and saves at idle priority
+/// (`save_idle`), so clang and the link go first. The child is this
 /// process's memory at the fork with this thread alone; it detaches (its
 /// own session, standard streams on /dev/null, so no pipe of the caller
 /// waits for it), holds the state lock until it exits (`lock`), and
 /// writes its result line to `save.log` in the state directory. Here the
 /// session is leaked: the process exits next. Saves here when the fork
 /// fails.
-pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
+pub fn save_background(dir: &Path, mut roots: Box<Roots>) -> Result<String, String> {
     use std::os::fd::AsRawFd;
     if !arena_on() {
         return Err("not an image process".into());
@@ -2206,9 +2237,12 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
                 dup2(null.as_raw_fd(), fd);
             });
         }
+        save_idle();
         // The parent runs a parked cc step after the fork (`driver::defer_cc`): its unit
-        // texts are freed here, so they are not live blocks of the image.
+        // texts are freed here, so they are not live blocks of the image. So are the kept
+        // programs no later build reuses, which the parent left to this child.
         crate::driver::drop_parked_cc();
+        crate::driver::drop_unkept(&mut roots.sessions);
         // A base from this heap would keep its scattered pages: rebuild the image cold instead
         // (`compaction_due`), unless a job of its own does that. On success the exec does not
         // return.
@@ -2227,10 +2261,40 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
     if pid < 0 {
         // No child: a parked cc step runs first, so its unit texts are freed before the save.
         crate::driver::finish_parked_cc();
+        crate::driver::drop_unkept(&mut roots.sessions);
         return write_image(dir, roots);
     }
     std::mem::forget(roots);
     Ok(format!("lust: front state saving in the background: pid {pid} (fork {:.0} ms), result in {}", t.elapsed().as_secs_f64() * 1e3, log.display()))
+}
+
+/// Puts this thread, a background save's child (its only thread), at idle priority: nice 19,
+/// `SCHED_IDLE` and the idle I/O class, which the threads it starts inherit. The build process
+/// runs its cc step beside the save; at normal priority the save took the CPU and the disk from
+/// clang and the link (tsgo's replay: the cc step +0.3-3.0 s a merge, about half of that back
+/// at idle priority). `LUST_FRONT_SAVE_IDLE=0` keeps the normal priority. Linux only; a failed
+/// call leaves its priority as it was.
+fn save_idle() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("LUST_FRONT_SAVE_IDLE").is_none_or(|v| v != "0") {
+        const PRIO_PROCESS: c_int = 0;
+        const SCHED_IDLE: c_int = 5;
+        // `struct sched_param`: its one field, the static priority, is 0 under SCHED_IDLE.
+        let param: c_int = 0;
+        // SAFETY: calls that change only this thread's priority (who 0 and pid 0 are the caller).
+        unsafe {
+            setpriority(PRIO_PROCESS, 0, 19);
+            sched_setscheduler(0, SCHED_IDLE, &param);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            const SYS_IOPRIO_SET: std::ffi::c_long = 251;
+            const IOPRIO_WHO_PROCESS: std::ffi::c_long = 1;
+            const IOPRIO_IDLE: std::ffi::c_long = 3 << 13;
+            // SAFETY: ioprio_set of this thread (who 0) to the idle class (`IOPRIO_PRIO_VALUE(3, 0)`).
+            unsafe { syscall(SYS_IOPRIO_SET, IOPRIO_WHO_PROCESS, 0 as std::ffi::c_long, IOPRIO_IDLE) };
+        }
+    }
 }
 
 /// Writes the image of `roots` and returns a one-line summary. After a
@@ -2511,6 +2575,11 @@ fn write_image(dir: &Path, mut roots: Box<Roots>) -> Result<String, String> {
     if !ok {
         return fail(&tmp, "image write failed".into());
     }
+    // A raw layer has no checks: it reaches the disk before its name does, so a crash leaves
+    // the layers before it, never part of this one. (A packed layer is all checked.)
+    if packer.is_none() && file.sync_data().is_err() {
+        return fail(&tmp, "image sync failed".into());
+    }
     let mut packed_len = None;
     if let Some(z) = packer {
         let mut out = match std::fs::File::create(&tmp) {
@@ -2577,7 +2646,7 @@ mod tests {
         assert_eq!(&packed[..8], MAGIC_PACKED);
         let word = |i: usize| u64::from_le_bytes(packed[i..i + 8].try_into().unwrap());
         assert_eq!((word(8), word(24)), (len as u64, head.len() as u64));
-        let at = 32 + head.len();
+        let at = PACKED_TOP + head.len();
         let sections: Vec<(u64, u64, u64)> =
             (0..word(16) as usize).map(|k| (word(at + 24 * k), word(at + 24 * k + 8), word(at + 24 * k + 16))).collect();
         assert_eq!(sections.len(), len.div_ceil(SECTION));
@@ -2598,6 +2667,11 @@ mod tests {
         assert_eq!((h.id, h.packed.as_ref().map(|p| p.1.len())), (9, Some(sections.len())));
         std::fs::write(dir.join("short"), &packed[..packed.len() - 100]).unwrap();
         assert!(read_header(&dir.join("short")).is_err(), "a truncated layer read");
+        // A damaged head fails its check, even where its fields still parse (the root here).
+        let mut bad = packed.clone();
+        bad[PACKED_TOP + 104] ^= 0x01;
+        std::fs::write(dir.join("bad"), &bad).unwrap();
+        assert!(read_header(&dir.join("bad")).is_err(), "a damaged head read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

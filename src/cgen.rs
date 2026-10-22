@@ -11202,15 +11202,19 @@ pub struct CopyHot {
     pub big: BTreeSet<String>,
 }
 
-/// The C names of `p`'s ADTs of `BIG_LAYOUT_BYTES` or more (`CopyHot::big`). Call within the
-/// release names.
+/// The C names of `p`'s ADTs of `BIG_LAYOUT_BYTES` or more (`CopyHot::big`), on the pool. Call
+/// within the release names and a layout phase (each worker takes both).
 pub fn big_adts(p: &Program) -> BTreeSet<String> {
-    (0..p.adts.len() as u32)
-        .map(AdtId)
+    let (cur, tag) = (names::current(), LAYOUT_PHASE.with(std::cell::Cell::get));
+    let ids: Vec<u32> = (0..p.adts.len() as u32).collect();
+    crate::pool::par_map(&ids, |&a| {
+        let a = AdtId(a);
         // A def with no variant (an uninhabited placeholder) has no layout.
-        .filter(|&a| !p.adt(a).variants.is_empty() && c_layout(p, &CTy::Adt(a)).is_some_and(|l| l.size >= BIG_LAYOUT_BYTES))
-        .map(names::adt)
-        .collect()
+        in_layout_phase(tag, || names::with(cur.as_ref(), || (!p.adt(a).variants.is_empty() && c_layout(p, &CTy::Adt(a)).is_some_and(|l| l.size >= BIG_LAYOUT_BYTES)).then(|| names::adt(a))))
+    })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// The ADTs whose layout a fn definition's C text bakes in (`FnOut::layout_reads`), by C name:

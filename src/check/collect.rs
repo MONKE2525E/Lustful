@@ -8127,18 +8127,24 @@ impl<'a> crate::ty::consteval::ConstCx<'a> for CollectCx<'a> {
     fn sym_text(&self, s: Sym) -> &str {
         self.p.interner.get(s)
     }
+    fn patterns_resolved(&self) -> bool {
+        self.p.resolved.is_some()
+    }
+    fn block_const_item(&mut self, name: Sym, at: Span) -> Option<crate::ty::consteval::TypedValue> {
+        match self.span_lookup(name, at).or_else(|| self.scope_lookup(name))? {
+            ScopeItem::Pending(i) => {
+                let ty = self.pending[i].0.ty;
+                self.eval_pending(i).map(|v| (v, ty))
+            }
+            ScopeItem::Fn(_) | ScopeItem::Other => None,
+        }
+    }
     fn const_item(&mut self, name: Sym, at: Span) -> Option<crate::ty::consteval::TypedValue> {
         // A body item of this name in scope wins over every module
         // item, and a name no scope item has never finds a nested
         // item: nested items are not in `by_name`.
-        if let Some(hit) = self.span_lookup(name, at).or_else(|| self.scope_lookup(name)) {
-            return match hit {
-                ScopeItem::Pending(i) => {
-                    let ty = self.pending[i].0.ty;
-                    self.eval_pending(i).map(|v| (v, ty))
-                }
-                ScopeItem::Fn(_) | ScopeItem::Other => None,
-            };
+        if self.span_lookup(name, at).or_else(|| self.scope_lookup(name)).is_some() {
+            return self.block_const_item(name, at);
         }
         if let Some(&i) = self.by_name.get(&name) {
             let ty = self.pending[i].0.ty;

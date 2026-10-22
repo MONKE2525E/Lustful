@@ -9042,6 +9042,16 @@ impl<'p> Ctx<'p> {
         {
             let is_param =
                 |cx: &Self, n: Sym| cx.body_scope.param_tys.iter().any(|(pn, _)| *pn == n) || n == p.known.self_type;
+            // Type or const by the flat maps, which record no read: the body
+            // checks again when a type comes to share a const's name, and
+            // when the const's value changes (its `Sig` folds the value), as
+            // `written_const` reads it.
+            if let [seg] = segs.as_slice()
+                && !is_param(self, seg.name)
+            {
+                self.binding(Namespace::Type, seg.name);
+                self.binding(Namespace::Value, seg.name);
+            }
             match segs.as_slice() {
                 // A const param of this body (`f::<N>()`).
                 // `(N)` is a const operation on it, not
@@ -14032,7 +14042,14 @@ impl<'p> Ctx<'p> {
     fn self_from_expected_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], expected: Option<Ty>, span: Span) -> Option<Ty> {
         let p = self.p;
         let Expr::Path(segs) = p.ast.expr(callee) else { return None };
-        if segs.len() != 2 || p.type_names.contains_key(&segs[0].name) || p.aliases.contains_key(&segs[0].name) {
+        if segs.len() != 2 {
+            return None;
+        }
+        // The flat maps answer with no read of their own: the body checks
+        // again when a user item comes to shadow the name (`struct Default`
+        // over `Default::default()`).
+        self.binding(Namespace::Type, segs[0].name);
+        if p.type_names.contains_key(&segs[0].name) || p.aliases.contains_key(&segs[0].name) {
             return None;
         }
         if self.body_scope.param_tys.iter().any(|(n, _)| *n == segs[0].name) {
@@ -25273,6 +25290,18 @@ fn needs_drop_answer(p: &Program, tys: &mut impl TyIntern, drop_defs: &[DefId], 
     Some(r)
 }
 
+impl CheckCx<'_, '_> {
+    /// The block item `name` denotes at `at`, if any: the checker's scopes,
+    /// or by span for blocks inside the const expression itself, which the
+    /// evaluator walks without the checker's scopes.
+    fn body_item(&self, name: Sym, at: Span) -> Option<crate::check::collect::BodyItem> {
+        self.cx.body_item_of(name).or_else(|| {
+            crate::check::collect::stmt_item_in_blocks(&self.cx.p.ast, &self.cx.p.item_blocks, name, at)
+                .and_then(|si| self.cx.p.body_items.get(&si).copied())
+        })
+    }
+}
+
 impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
     type Tys = Tys<'p>;
 
@@ -25349,24 +25378,25 @@ impl<'p> crate::ty::consteval::ConstCx<'p> for CheckCx<'_, 'p> {
     fn sym_text(&self, s: Sym) -> &str {
         self.cx.name(s)
     }
+    fn patterns_resolved(&self) -> bool {
+        self.cx.p.resolved.is_some()
+    }
+    fn block_const_item(&mut self, name: Sym, at: Span) -> Option<crate::ty::consteval::TypedValue> {
+        match self.body_item(name, at)? {
+            crate::check::collect::BodyItem::Const(ci) => {
+                let c = &self.cx.p.body_consts[ci as usize];
+                Some((c.value.clone(), c.ty))
+            }
+            _ => None,
+        }
+    }
     fn const_item(&mut self, name: Sym, at: Span) -> Option<crate::ty::consteval::TypedValue> {
         // A block item of this name wins over every module item, as
         // in `path_expr`: a body const answers with its value, a body
         // static or fn blocks the flat lookup (a static's value is
-        // not a const read; `static_item` answers for it). The span
-        // form covers blocks inside the const expression itself,
-        // which the evaluator walks without the checker's scopes.
-        let body = self.cx.body_item_of(name).or_else(|| {
-            crate::check::collect::stmt_item_in_blocks(&self.cx.p.ast, &self.cx.p.item_blocks, name, at)
-                .and_then(|si| self.cx.p.body_items.get(&si).copied())
-        });
-        match body {
-            Some(crate::check::collect::BodyItem::Const(ci)) => {
-                let c = &self.cx.p.body_consts[ci as usize];
-                return Some((c.value.clone(), c.ty));
-            }
-            Some(_) => return None,
-            None => {}
+        // not a const read; `static_item` answers for it).
+        if self.body_item(name, at).is_some() {
+            return self.block_const_item(name, at);
         }
         // A const read inside body const evaluation consumes the value:
         // record the const's `Sig` read (its fingerprint folds the
