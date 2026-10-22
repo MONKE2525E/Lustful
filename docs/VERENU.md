@@ -45,32 +45,42 @@ The selected Cargo target supplies the crate name for `module_path!()`. A binary
 whose target name differs from its package name therefore records the same
 default log target as rustc.
 
-### Scalar C imports
+### Primitive C imports
 
 On `x86_64-unknown-linux-gnu`, the TinyCC backend accepts module-level
 `unsafe extern "C"` function declarations. Parameters and returns may use
 `i32`, `u32`, `i64`, `u64`, `isize`, and `usize`; a function may also return
-unit. Calls require a lexical `unsafe` block and use the system C ABI.
+unit. Thin raw pointers to `i8`, `u8`, `i32`, `u32`, `i64`, `u64`, `isize`,
+and `usize` are accepted as parameters and returns, preserving mutability.
+Narrow integers remain unsupported by value. Calls require a lexical `unsafe`
+block and use the system C ABI.
 
 ```rust
 unsafe extern "C" { fn abs(value: i32) -> i32; }
 fn main() { assert_eq!(unsafe { abs(-17) }, 17); }
 ```
 
-Pointers, callbacks, variadics, foreign statics, native exports, and `#[link]`
+Nested pointers, other pointees, callbacks, variadics, foreign statics, native exports, and `#[link]`
 remain unsupported. Symbols must be ASCII C identifiers outside the compiler's
 reserved namespace. General unsafe operations remain rejected. Crates that
 deny or forbid `unsafe_code` are rejected until Lust can enforce that lint by
 scope. Other targets and the system C compiler backend reject native imports.
 
-The tests compare scalar calls with rustc, exercise eight mixed arguments and
-void side effects against C peers, and rebuild declaration edits through the
-daemon. The C peers are test fixtures; this does not add library configuration
-or Rust crate linking.
+The tests compare calls with rustc, exercise guarded buffer writes, pointer
+returns, eight mixed arguments and void side effects against C peers, and
+rebuild declaration edits through the daemon. The C peers are test fixtures;
+this does not add library configuration or Rust crate linking. Raw-pointer
+dereferencing and ownership transfer remain unsupported.
+
+Shared daemon bases are validated with an executable link before publication.
+Missing native symbols fail with code 3, including after warm edits or daemon
+restart. Restoring a deleted base validates against its saved main object so
+existing overlays can still be linked without duplicate globals.
 
 ```sh
 bash scripts/difftest.sh native_
 bash scripts/test-native.sh
+LUST_NATIVE_ABI_SANITIZE=1 cargo test --profile gate native_abi_calls_c_peers
 cargo test --profile gate native
 ```
 
@@ -118,9 +128,10 @@ Verenu requires edition 2021, async functions and Tokio, unsafe native FFI,
 custom procedural macros, and dependencies outside Lust's shipped adapters.
 With host preparation explicitly permitted, the edition-2024 compatibility overlay expands `log::warn!` and reaches
 unsupported `serde_json::json!` expansion. The production edition-2021 manifest
-still fails L0530. Async remains rejected as L0405. Scalar C imports work on
-the target above, but Verenu's pointer-based native APIs and callbacks remain
-unsupported. No full desktop build has succeeded.
+still fails L0530. Async remains rejected as L0405. Primitive C imports cover
+buffer calls such as `gethostname` on the target above; broader native APIs,
+callbacks, and foreign library configuration remain unsupported. No full
+desktop build has succeeded.
 
 Strict compilation starts with `cargo metadata --no-deps`. It admits one package
 without dependencies, build scripts, or proc-macro targets, resolving its local

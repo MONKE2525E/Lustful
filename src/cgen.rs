@@ -496,6 +496,23 @@ fn int_c(i: IntTy) -> &'static str {
     }
 }
 
+/// C ABI spelling retains pointee constness, which internal CTy::Ptr erases.
+fn native_value_c(value: crate::native::NativeValue) -> String {
+    use crate::native::NativeValue;
+    let integer = |i| match i {
+        IntTy::Isize => "intptr_t",
+        IntTy::Usize => "uintptr_t",
+        _ => int_c(i),
+    };
+    match value {
+        NativeValue::Int(int) => int_c(int.int_ty()).to_owned(),
+        NativeValue::Ptr { mutability, pointee } => {
+            let qualifier = if mutability.is_mut() { "" } else { "const " };
+            format!("{qualifier}{}*", integer(pointee.int_ty()))
+        }
+    }
+}
+
 fn is128(i: IntTy) -> bool {
     matches!(i, IntTy::I128 | IntTy::U128)
 }
@@ -4686,21 +4703,39 @@ impl FnGen<'_, '_> {
             },
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
             CallTarget::Native(id) => {
-                let native = self.p.native.get(id);
+                let p = self.p;
+                let native = p.native.get(id);
                 let ret = match native.sig().ret() {
-                    crate::native::NativeReturn::Void => "void",
-                    crate::native::NativeReturn::Int(t) => int_c(t.int_ty()),
+                    crate::native::NativeReturn::Void => "void".to_owned(),
+                    crate::native::NativeReturn::Value(value) => native_value_c(value),
                 };
-                let params: Vec<_> = native.sig().params().iter().map(|t| int_c(t.int_ty())).collect();
+                let params: Vec<_> = native.sig().params().iter().map(|&t| native_value_c(t)).collect();
                 let params = if params.is_empty() { "void".to_owned() } else { params.join(", ") };
                 // A private C identifier prevents generated locals (e.g. l0)
                 // from hiding an external symbol of the same spelling.
                 let symbol = format!("lust_native_{:x}_{:x}", native.def().krate.0, native.def().hash.0);
                 self.slots.externs.borrow_mut().insert(format!("extern {ret} {symbol}({params}) __asm__(\"{}\");\n", native.symbol()));
                 let is_void = native.sig().ret() == crate::native::NativeReturn::Void;
-                let vals: Vec<_> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let vals: Vec<_> = args.iter().zip(native.sig().params()).map(|(o, &ty)| {
+                    let value = self.operand(o, loc, post).0;
+                    match ty {
+                        // Internal isize/usize pointers use int64_t/uint64_t;
+                        // the ABI uses intptr_t/uintptr_t. Their C typedefs
+                        // need not have the same spelling or compatible type.
+                        crate::native::NativeValue::Ptr { .. } => format!("(({})({value}))", native_value_c(ty)),
+                        crate::native::NativeValue::Int(_) => value,
+                    }
+                }).collect();
                 let call = format!("{symbol}({})", vals.join(", "));
-                if is_void { format!("({call}, {})", zero_lit(self.p, &CTy::Unit)) } else { call }
+                if is_void {
+                    format!("({call}, {})", zero_lit(self.p, &CTy::Unit))
+                } else if matches!(native.sig().ret(), crate::native::NativeReturn::Value(crate::native::NativeValue::Ptr { .. })) {
+                    // Internal pointer locals erase constness. Convert only at
+                    // this boundary, after checking the exact Rust signature.
+                    format!("(({})({call}))", ctype(dest_cty))
+                } else {
+                    call
+                }
             }
             CallTarget::Dyn(k) => {
                 // Through the vtable: entry `k` is a shim whose receiver

@@ -14442,10 +14442,11 @@ impl<'p> Ctx<'p> {
             }
             let _ = p.sig_of(&mut self.out.reads, def);
             let sig = p.native.get(id).sig();
-            let params: Vec<_> = sig.params().iter().map(|t| t.rust_ty()).collect();
+            let params: Vec<_> = sig.params().iter().map(|t| t.rust_ty(&mut self.tys)).collect();
+            let ret = sig.ret().rust_ty(&mut self.tys);
             self.check_args(&params, args, span);
             self.set_res(e, Res::Native(id));
-            return sig.ret().rust_ty();
+            return ret;
         }
         // `std::mem::drop(value)`: move the value and drop it now.
         // A user fn or body item named `drop` shadows the prelude

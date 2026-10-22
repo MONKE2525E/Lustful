@@ -1279,6 +1279,50 @@ fn main() {
         }
     }
 
+    #[test]
+    fn native_pointer_cache_restores_stable_defs_after_arena_renumbering() {
+        let main = r#"fn main() {
+    let mut bytes = [17u8, 24];
+    let p = bytes.as_mut_ptr();
+    unsafe { assert!(native_identity(p) == p as *const u8); }
+}
+"#;
+        let declarations = [
+            r#"unsafe extern "C" { fn native_identity(p: *const u8) -> *const u8; }"#,
+            r#"unsafe extern "C" { fn native_unused(p: *mut i32); fn native_identity(p: *const u8) -> *const u8; }"#,
+        ];
+        for unwind in [false, true] {
+            let first = format!("{main}{}", declarations[0]);
+            let reordered = format!("{main}{}", declarations[1]);
+            lowered_with(&first, unwind, |p, map, bodies| {
+                assert_eq!(bodies.len(), 1);
+                let body = &bodies[0];
+                let fingerprint = ir_fingerprint(p, body, map, 1);
+                let cached = cache_body(p, body, 7, 0, Vec::new(), fingerprint);
+                let old_id = p.native_names[&p.interner.intern("native_identity")];
+                lowered_with(&reordered, unwind, |next, next_map, fresh| {
+                    let new_id = next.native_names[&next.interner.intern("native_identity")];
+                    assert_ne!(old_id, new_id, "the test must actually renumber the native arena");
+                    let rebuilt = rebuild(next, &cached, LocalDefId(0)).expect("native DefId resolves in the new arena");
+                    assert_eq!(ir_fingerprint(next, &rebuilt, next_map, 1), fingerprint);
+                    assert_eq!(ir_fingerprint(next, &fresh[0], next_map, 1), fingerprint);
+                    for body in [&rebuilt, &fresh[0]] {
+                        let native_calls: Vec<_> = body.blocks.iter().filter_map(|b| match &b.term {
+                            Terminator::Call { target: CallTarget::Native(id), .. } => Some(*id),
+                            _ => None,
+                        }).collect();
+                        assert_eq!(native_calls, vec![new_id]);
+                    }
+                    let restored = crate::cgen::gen_fn(next, &rebuilt, next_map, 1, &[0]);
+                    let fresh = crate::cgen::gen_fn(next, &fresh[0], next_map, 1, &[0]);
+                    assert!(restored.error.is_none() && fresh.error.is_none());
+                    assert_eq!(restored.code_text(), fresh.code_text());
+                    assert_eq!(restored.externs, fresh.externs);
+                });
+            });
+        }
+    }
+
     /// Every builtin payload is part of the fingerprint: these pairs have
     /// the same operand and result types and emit different C (or select
     /// a different std path).

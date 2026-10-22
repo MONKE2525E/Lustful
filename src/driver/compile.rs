@@ -5743,12 +5743,17 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             sweep_bases(&base_dir, 0);
             caches.base_swept = true;
         }
+        // A warm main calls overlay registrations absent from the retained base. Keep
+        // the actual main from the base's generation for validation on restoration;
+        // adding overlays instead would duplicate globals from glue/location units.
+        let base_main = dir.join("base-main.o");
         let base = if rebuild_base {
             caches.base_gen += 1;
             let tmp = base_dir.join(format!("libbase-tmp-{}-{}-{}.so", std::process::id(), caches.base_gen, base_tmp_seq()));
             let built = std::fs::create_dir_all(&base_dir)
                 .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
-                .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
+                .and_then(|_| std::fs::copy(base_obj(0), &base_main).map_err(|e| format!("cannot preserve {}: {e}", base_main.display())))
+                .and_then(|_| crate::tcc::link_shared_validated(&base_main, &all_base, &tmp, req.debug))
                 .and_then(|_| {
                     let bytes = std::fs::read(&tmp).map_err(|e| format!("cannot read {}: {e}", tmp.display()))?;
                     // The object dir in the hash makes the name unique to this
@@ -5778,7 +5783,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
             let tmp = base_dir.join(format!("libbase-tmp-{}-relink-{}.so", std::process::id(), base_tmp_seq()));
             let built = std::fs::create_dir_all(&base_dir)
                 .map_err(|e| format!("cannot create {}: {e}", base_dir.display()))
-                .and_then(|_| crate::tcc::link_shared(&all_base, &tmp, req.debug))
+                .and_then(|_| crate::tcc::link_shared_validated(&base_main, &all_base, &tmp, req.debug))
                 .and_then(|_| install_base(&tmp, &dest));
             if built.is_err() {
                 let _ = std::fs::remove_file(&tmp);

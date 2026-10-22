@@ -304,6 +304,22 @@ pub fn link_shared(objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), Stri
     link_objects(&tcc, objs, out)
 }
 
+/// Validate all base imports with the main object from the same base generation before
+/// writing a shared library. DLL links permit undefined symbols; executable links reject
+/// missing native imports. This only writes an executable: it never loads or runs it.
+pub fn link_shared_validated(main: &Path, objs: &[PathBuf], out: &Path, debug: bool) -> Result<(), String> {
+    let mut check = out.as_os_str().to_owned();
+    check.push(".check");
+    let check = PathBuf::from(check);
+    let mut validation = Vec::with_capacity(objs.len() + 1);
+    validation.push(main.to_path_buf());
+    validation.extend_from_slice(objs);
+    let validated = link(&validation, &check, debug);
+    let _ = std::fs::remove_file(&check);
+    validated?;
+    link_shared(objs, out, debug)
+}
+
 /// Links an executable from `objs` plus `<dir>/lib<base>.so`, which it loads at run time.
 /// The base name is versioned (for example `base-3`), so a rebuilt base never changes what an
 /// executable built earlier loads.
@@ -495,6 +511,66 @@ fn lone_thread() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_base_validation_rejects_missing_native_imports_and_recovers() {
+        let dir = std::env::temp_dir().join(format!("lust-tcc-base-validation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("main.o");
+        let base = dir.join("base.o");
+        let out = dir.join("libbase.so");
+        // A real executable main can provide globals and functions imported by the base.
+        let main_c = "extern int entry(void); int supplied = 17; int supplied_fn(void) { return supplied; } int main(void) { return entry(); }";
+        for (symbol, body) in [
+            ("lustenu_missing_scalar", "extern int lustenu_missing_scalar(int); int entry(void) { return lustenu_missing_scalar(17); }"),
+            ("lustenu_missing_pointer", "extern char *lustenu_missing_pointer(const char *); int entry(void) { return lustenu_missing_pointer(\"native\") != 0; }"),
+        ] {
+            super::compile_units(&[(main.clone(), main_c.into()), (base.clone(), body.into())], false).unwrap();
+            let err = super::link_shared_validated(&main, &[base.clone()], &out, false).unwrap_err();
+            assert!(err.contains(symbol), "{err}");
+            assert!(!out.exists(), "a rejected base must not be published");
+            assert!(!dir.join("libbase.so.check").exists());
+        }
+        let valid = "extern int supplied, supplied_fn(void), abs(int); extern unsigned long strlen(const char *); extern double sqrt(double); int entry(void) { return supplied + supplied_fn() + abs(-3) + strlen(\"native\") + (int)sqrt((double)supplied); }";
+        super::compile_units(&[(base.clone(), valid.into())], false).unwrap();
+        super::link_shared_validated(&main, &[base], &out, false).unwrap();
+        assert!(out.is_file(), "valid libc and executable-provided imports are accepted after failures");
+        assert!(!dir.join("libbase.so.check").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "validation temporaries must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_base_restoration_uses_its_original_main_with_existing_overlays() {
+        let dir = std::env::temp_dir().join(format!("lust-tcc-base-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("base-main.o");
+        let current = dir.join("main.o");
+        let base = dir.join("base.o");
+        let overlay = dir.join("overlay.o");
+        let out = dir.join("libbase.so");
+        super::compile_units(&[
+            (saved.clone(), "extern int entry(void); int supplied = 17; int main(void) { return entry(); }".into()),
+            (base.clone(), "extern int supplied; int locations = 1; int entry(void) { return supplied + locations; }".into()),
+        ], false).unwrap();
+        super::link_shared_validated(&saved, &[base.clone()], &out, false).unwrap();
+        std::fs::remove_file(&out).unwrap();
+        super::compile_units(&[
+            (current.clone(), "extern int entry(void); extern void lust_overlay_u5(void); int supplied = 17; int main(void) { lust_overlay_u5(); return entry(); }".into()),
+            (overlay.clone(), "int locations = 2; void lust_overlay_u5(void) {}".into()),
+        ], false).unwrap();
+        // The current main cannot validate the old base, and including the overlay
+        // to satisfy it would duplicate `locations`. The retained main can.
+        let err = super::link_shared_validated(&current, &[base.clone()], &out, false).unwrap_err();
+        assert!(err.contains("lust_overlay_u5"), "{err}");
+        assert!(!out.exists());
+        super::link_shared_validated(&saved, &[base], &out, false).unwrap();
+        super::link_with_base(&[current, overlay], &dir, "base", &dir.join("program"), false).unwrap();
+        assert!(!dir.join("libbase.so.check").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `set_huge_pages` flips the process flag Linux reports as
     /// `THP_enabled` in /proc/self/status, and back.
     #[cfg(target_os = "linux")]
