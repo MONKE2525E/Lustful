@@ -1,0 +1,9 @@
+[package]
+name = "log"
+version = "0.4.34"
+edition = "2024"
+publish = false
+
+[package.metadata.lust]
+adapter = 1
+features = ["std", "alloc"]

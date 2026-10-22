@@ -9409,6 +9409,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn log_adapter_checks_version_and_features() {
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
+        let mut unit = dep_unit("log", "0.4.34", registry);
+        unit.features = vec!["std".into(), "alloc".into()];
+        assert!(matches!(classify_dep(&unit), DepClass::Source { lust_owned: true, adapter: Some(_), .. }));
+        unit.features.push("kv".into());
+        match classify_dep(&unit) {
+            DepClass::Unsupported(why) => assert!(why.contains("kv"), "{why}"),
+            _ => panic!("unsupported log features must not be silently dropped"),
+        }
+        unit.features.clear();
+        unit.version = "0.4.33".into();
+        match classify_dep(&unit) {
+            DepClass::Unsupported(why) => assert!(why.contains("0.4.33") && why.contains("0.4.34"), "{why}"),
+            _ => panic!("log adapter version must match exactly"),
+        }
+    }
+
     /// The explicit-through-glob example of section 1.3 resolves, and a
     /// glob collision is stored ambiguous without error until used:
     /// both crates resolve here, and the binding answer differs

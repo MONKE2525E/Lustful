@@ -2111,7 +2111,7 @@ fn resolved_setup(
             local: def::LOCAL_CRATE,
             stable: def::stable_crate_hash(&unit.package_id, &key.krate.target_kind, &unit.target.name, key.krate.test),
         };
-        (unit.target.src_path.clone(), root_text, ids, env, deps, unit.package.name.replace('-', "_"), cargo_env)
+        (unit.target.src_path.clone(), root_text, ids, env, deps, unit.target.name.replace('-', "_"), cargo_env)
     } else {
         front.display_root = None;
         let stem = key.krate.root.file_stem().and_then(|s| s.to_str()).unwrap_or("main").to_string();

@@ -4,7 +4,7 @@ This fork develops Lust support for Verenu's Rust backend. The complete Tauri
 application does not compile with Lust yet. Release compilation still uses
 Cargo and rustc through upstream's release path.
 
-## Supported addition
+## Supported additions
 
 `std::str::Chars::as_str(&self) -> &'a str` returns the unconsumed part of the
 iterator's original string. Advancing either end of the iterator changes later
@@ -27,6 +27,21 @@ Verenu's `tools/lust/` workflow pins the fork and checks the original production
 files and tests. Its `full-check` command records the complete dependency graph's
 first failures without replacing implementations or falling back to rustc.
 
+The [log 0.4.34 source adapter](../library/deps/log/README.md) implements logger
+registration, filtering, lazy formatting, record builders, and source metadata.
+Its corpus compares registered logger behavior with the upstream registry crate,
+including concurrent registration and suppressed argument evaluation. Unsupported
+features and layout queries remain explicit errors.
+
+```sh
+LUST=./target/release/lust LUST_STRICT=1 SANITIZE=1 bash scripts/test-adapters.sh log
+LUST=./target/release/lust LUST_STRICT=1 LUST_USE_DAEMON=1 bash scripts/test-adapters.sh log
+```
+
+The selected Cargo target supplies the crate name for `module_path!()`. A binary
+whose target name differs from its package name therefore records the same
+default log target as rustc.
+
 ## Compiler boundary
 
 The selected approach adds language and library support to Lust, with differential
@@ -48,8 +63,14 @@ compatible layouts, generics, unwinding, and metadata support.
 
 Verenu requires edition 2021, async functions and Tokio, unsafe native FFI,
 custom procedural macros, and dependencies outside Lust's shipped adapters.
-The edition-2024 compatibility overlay currently reaches unsupported
-`log::warn!` expansion first. Adding logging alone cannot compile the backend.
+The edition-2024 compatibility overlay now expands `log::warn!` and reaches
+unsupported `serde_json::json!` expansion. The production edition-2021 manifest
+still fails L0530. The standalone async and native-FFI probes still fail L0405
+and L0810. No full desktop build has succeeded.
+
+Cargo graph discovery still uses rustc for host build scripts and procedural
+macro crates. Removing those invocations is also required for a complete build
+that uses rustc only to bootstrap Lust and compile test oracles.
 
 The compiler must preserve native behavior and reject unsupported constructs
 throughout this work. A successful core test run does not establish a working

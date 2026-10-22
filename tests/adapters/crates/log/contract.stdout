@@ -1,0 +1,12 @@
+ERROR explicit error 0
+WARN explicit warn
+INFO explicit capture named
+WARN custom custom
+INFO contract default target
+flushed
+DEBUG explicit debug
+TRACE explicit trace
+INFO location source
+WARN builder builder
+   WARN OFF DEBUG
+attempted to set a logger after the logging system was already initialized

@@ -38,6 +38,7 @@ pub const ADAPTER_FORMAT: u32 = 1;
 /// Registry packages that have (or will have) a lust adapter crate. A name
 /// here with no `library/deps/<name>/src/lib.rs` is "no adapter yet".
 pub const ADAPTER_PACKAGES: &[&str] = &[
+    "log",
     "rustc-hash",
     "indexmap",
     "smallvec",
