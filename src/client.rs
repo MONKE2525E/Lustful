@@ -133,8 +133,8 @@ fn main() {
     }
     match protocol::parse_args(&args) {
         // Release builds and the rustc oracle run right here, streaming output.
-        Some(Invocation::Release { file, out, profile, debug, net }) => {
-            protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net)
+        Some(Invocation::Release { file, out, profile, debug, net, host_tools }) => {
+            protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net, host_tools)
         }
         // The release driver runs in lust-core (cold, one target after
         // another); the client only hands it the same arguments.
@@ -143,7 +143,7 @@ fn main() {
             eprintln!("error: cannot run {}: {err}", core.display());
             std::process::exit(2);
         }
-        Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
+        Some(Invocation::RustcCheck { file, host_tools }) => protocol::run_rustc_check(&file, host_tools),
         Some(Invocation::Compile { req, run, args: run_args }) => {
             let sock = protocol::socket_path();
             // LUST_NO_DAEMON means "do not use a daemon at all": neither

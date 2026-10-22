@@ -114,7 +114,7 @@ Lust compiles fast. Its programs do not run fast. The backend emits C and compil
 | `cargo build` (debug) | 15.7 s | 1x |
 | `cargo build --release` | 0.93 s | 11x to 32x faster |
 
-The release times are 0.01 to 0.12 s, so their ratios are coarse. In total, the lust bin is about 70x slower than the release bin. That matters when an agent runs the project's tests after each edit. For a fast binary, use `lust build --release`, which hands the build to Cargo (or to `rustc -O` for one file).
+The release times are 0.01 to 0.12 s, so their ratios are coarse. In total, the lust bin is about 70x slower than the release bin. That matters when an agent runs the project's tests after each edit. For a fast binary, use `lust build --release --host-tools`, which hands the build to Cargo (or to `rustc -O` for one file).
 
 ## Why it is fast
 
@@ -185,8 +185,8 @@ lust check main.rs [--json] [--timings]     # type check and borrow check
 lust run main.rs [-- args]                  # build with tcc and run
 lust build main.rs [-o out]                 # build a dev binary
 lust test main.rs [filter]                  # run #[test] functions
-lust check main.rs --rustc                  # ask the real rustc for a second opinion
-lust build main.rs --release                # release build with Cargo (rustc -O for one file)
+lust check main.rs --rustc --host-tools     # ask the real rustc for a second opinion
+lust build main.rs --release --host-tools   # release build with Cargo (rustc -O for one file)
 lust explain L0602                          # long help for one error code
 lust capabilities --json                    # what the subset supports and rejects
 ```
@@ -194,9 +194,17 @@ lust capabilities --json                    # what the subset supports and rejec
 A target in a Cargo workspace:
 
 ```sh
-lust check crates/ts_goport/src/lib.rs --manifest-path crates/ts_goport/Cargo.toml --lib
-lust build crates/ts_goport/src/bin/tsgo.rs --manifest-path crates/ts_goport/Cargo.toml --bin tsgo -o tsgo
+lust check crates/ts_goport/src/lib.rs --manifest-path crates/ts_goport/Cargo.toml --lib --host-tools
+lust build crates/ts_goport/src/bin/tsgo.rs --manifest-path crates/ts_goport/Cargo.toml --bin tsgo -o tsgo --host-tools
 ```
+
+This fork forbids rustc host preparation by default. Standalone files and a
+single-package manifest with no dependencies, build script, or proc-macro target
+use this strict path. Other Cargo graphs fail with L0532 before feature probes,
+host builds, or cached host outputs are used. `--host-tools` or
+`LUST_HOST_TOOLS=1` permits those operations explicitly; that run is not
+rustc-free. Building Lust itself and running rustc comparison tests are separate
+toolchain preparation and verification steps.
 
 Crate flags work as in Cargo: `--features`, `--no-default-features`, `--all-features`, `--package`, `--target`, `--offline`, `--locked`. A project can drop features from lust dev builds (for example jemalloc) with `dev-exclude-features` in `.lust.toml`. See [docs/dev-features.md](docs/dev-features.md).
 

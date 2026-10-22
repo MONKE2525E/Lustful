@@ -85,6 +85,29 @@ pub struct SessionKey {
     pub target_triple: String,
     pub profile: ProfileFlags,
     pub cargo_net: CargoNet,
+    pub host_tools: HostTools,
+}
+
+/// An explicit request capability. A daemon must use the caller's policy,
+/// never the environment of the client that happened to start it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HostTools {
+    #[default]
+    Forbid,
+    Allow,
+}
+
+impl HostTools {
+    pub fn from_env() -> Self {
+        if std::env::var("LUST_HOST_TOOLS").is_ok_and(|v| v == "1") { Self::Allow } else { Self::Forbid }
+    }
+
+    pub fn require(self, operation: &str) -> Result<(), String> {
+        match self {
+            Self::Allow => Ok(()),
+            Self::Forbid => Err(format!("error[L0532]: {operation} requires rustc host tools; opt in with --host-tools or LUST_HOST_TOOLS=1 (that run is not rustc-free)")),
+        }
+    }
 }
 
 /// How the Cargo runs lust starts may use the network: `--offline` and
@@ -129,6 +152,7 @@ impl SessionKey {
             target_triple: String::new(),
             profile: ProfileFlags::DEV_UNWIND,
             cargo_net: CargoNet::default(),
+            host_tools: HostTools::Forbid,
         }
     }
 
@@ -138,7 +162,7 @@ impl SessionKey {
         let b = |x: bool| if x { "1" } else { "0" };
         let manifest = self.krate.manifest_path.as_ref().map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
         format!(
-            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} offline={} locked={}",
+            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} offline={} locked={} host_tools={}",
             self.krate.package_id,
             manifest,
             self.krate.target_kind,
@@ -154,6 +178,7 @@ impl SessionKey {
             b(self.profile.debug_assertions),
             b(self.cargo_net.offline),
             b(self.cargo_net.locked),
+            b(self.host_tools == HostTools::Allow),
         )
     }
 }
@@ -351,14 +376,16 @@ pub enum Invocation {
         profile: Option<String>,
         debug: bool,
         net: CargoNet,
+        host_tools: HostTools,
     },
     /// `lust check --rustc`: run the real rustc as an oracle. Never sent to the daemon.
     RustcCheck {
         file: PathBuf,
+        host_tools: HostTools,
     },
 }
 
-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version";
+pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json]\n       lust daemon\n       lust --version\n\nRustc host preparation is forbidden by default. --host-tools or LUST_HOST_TOOLS=1 permits it; that run is not rustc-free.";
 
 /// Crate-selection flags from the command line, before defaults are filled in.
 #[derive(Clone, Default)]
@@ -623,6 +650,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
     let mut file = PathBuf::new();
     let (mut out, mut json, mut timings, mut debug, mut emit_c, mut run_args) = (None, false, false, false, None, Vec::new());
     let (mut release, mut profile, mut rustc) = (false, None, false);
+    let mut host_tools = HostTools::from_env();
     let mut max_errors = 20usize;
     let mut crate_flags = CrateFlags::default();
     // Every --target named, in order. One builds a session; several are
@@ -660,6 +688,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             "--release" => release = true,
             "--profile" => profile = Some(it.next()?.clone()),
             "--rustc" => rustc = true,
+            "--host-tools" => host_tools = HostTools::Allow,
             "--max-errors" => max_errors = it.next()?.parse().ok()?,
             _ if a.starts_with("--max-errors=") => max_errors = a["--max-errors=".len()..].parse().ok()?,
             "--manifest-path" => crate_flags.manifest_path = Some(PathBuf::from(it.next()?)),
@@ -704,7 +733,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         if cmd != "check" || release || profile.is_some() || !run_args.is_empty() || crate_flags.any() || !targets.is_empty() || panic_abort.is_some() || overflow_checks.is_some() || debug_assertions.is_some() {
             return None;
         }
-        return Some(Invocation::RustcCheck { file: abs(&file) });
+        return Some(Invocation::RustcCheck { file: abs(&file), host_tools });
     }
     if (release || profile.is_some()) && !targets.is_empty() {
         // The lust release driver: one cold cc request per named target.
@@ -729,6 +758,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
             let mut flags = crate_flags.clone();
             flags.target_triple = Some(triple.clone());
             let mut session = session_key_for(&file, flags, net);
+            session.host_tools = host_tools;
             session.profile = named;
             if let Some(abort) = panic_abort {
                 session.profile.panic_abort = abort;
@@ -768,7 +798,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         if release && profile.is_none() {
             profile = Some("release".into());
         }
-        return Some(Invocation::Release { file: abs(&file), out: out.map(|p| abs(&p)), profile, debug, net });
+        return Some(Invocation::Release { file: abs(&file), out: out.map(|p| abs(&p)), profile, debug, net, host_tools });
     }
     if targets.len() > 1 {
         return None;
@@ -782,6 +812,7 @@ pub fn parse_args(args: &[String]) -> Option<Invocation> {
         crate_flags.manifest_path = Some(abs(&p));
     }
     let mut session = session_key_for(&file, crate_flags, net);
+    session.host_tools = host_tools;
     if let Some(abort) = panic_abort {
         session.profile.panic_abort = abort;
     }
@@ -884,7 +915,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
     let s = &r.session;
     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
     let mut out = format!(
-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {}\n",
+        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {}\n",
         b(r.json),
         b(r.timings),
         b(r.debug),
@@ -898,6 +929,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
         s.features.len(),
         b(s.cargo_net.offline),
         b(s.cargo_net.locked),
+        b(s.host_tools == HostTools::Allow),
         build_id()
     )
     .into_bytes();
@@ -930,7 +962,7 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
         return Err(ReadError::Bad);
     }
     let f: Vec<&str> = head.split_whitespace().collect();
-    if f.len() != 16 || f[15] != build_id() {
+    if f.len() != 17 || f[16] != build_id() {
         // The first word is always a command, so a short header of a known
         // command is a client from before this field.
         return Err(if matches!(f.first(), Some(&"check" | &"build")) { ReadError::OtherBuild } else { ReadError::Bad });
@@ -996,6 +1028,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
             target_triple,
             profile: ProfileFlags { panic_abort: f[8] == "1", overflow_checks: f[9] == "1", debug_assertions: f[10] == "1" },
             cargo_net: CargoNet { offline: f[13] == "1", locked: f[14] == "1" },
+            host_tools: match f[15] { "0" => HostTools::Forbid, "1" => HostTools::Allow, _ => return None },
         },
         file,
         out,
@@ -1334,7 +1367,11 @@ fn cargo_target_dir(manifest: &Path) -> Option<PathBuf> {
 /// `lust build --release` / `--profile <name>`. With a Cargo.toml above the file, Cargo
 /// builds it with the file's package and bin selection. Without one, rustc builds the
 /// single file with the release oracle flags from DESIGN.md. Never returns.
-pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug: bool, net: CargoNet) -> ! {
+pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug: bool, net: CargoNet, host_tools: HostTools) -> ! {
+    if let Err(error) = host_tools.require("Cargo/rustc release compilation") {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     let profile = profile.unwrap_or("release");
     let dev = profile == "dev";
     if let Some(m) = find_manifest(file) {
@@ -1414,7 +1451,11 @@ pub fn run_release(file: &Path, out: Option<&Path>, profile: Option<&str>, debug
 /// lints (unconditional_panic, arithmetic_overflow) and post-monomorphization const errors that
 /// `rustc` and `cargo build` reject. On a 950-line file the object takes 190 ms against 160 ms
 /// for metadata and 250 ms for a linked binary. Never returns.
-pub fn run_rustc_check(file: &Path) -> ! {
+pub fn run_rustc_check(file: &Path, host_tools: HostTools) -> ! {
+    if let Err(error) = host_tools.require("the rustc check oracle") {
+        eprintln!("{error}");
+        std::process::exit(2);
+    }
     let obj = std::env::temp_dir().join(format!("lust-rustc-check-{}.o", std::process::id()));
     eprintln!("lust: checking with rustc (oracle): rustc --edition 2024 --emit=obj {}", file.display());
     let status = run_streamed(
@@ -1641,6 +1682,7 @@ mod tests {
         ]);
         assert_eq!(req.session.cargo_net, CargoNet { offline: true, locked: true });
         req.session.krate.test = true;
+        req.session.host_tools = HostTools::Allow;
         let bytes = encode(&req);
         let back = read_request(&mut std::io::Cursor::new(bytes)).unwrap();
         assert_eq!(back.session, req.session);
@@ -1659,6 +1701,31 @@ mod tests {
         assert_eq!(read_request(&mut std::io::Cursor::new(old.as_bytes())).err(), Some(ReadError::OtherBuild));
         let other = text.replacen(&format!(" {}\n", build_id()), " 0123.other\n", 1);
         assert_eq!(read_request(&mut std::io::Cursor::new(other.as_bytes())).err(), Some(ReadError::OtherBuild));
+        let mut lines = text.lines();
+        let mut header: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        header[15] = "2";
+        let invalid = format!("{}\n{}\n", header.join(" "), lines.collect::<Vec<_>>().join("\n"));
+        assert_eq!(read_request(&mut std::io::Cursor::new(invalid)).err(), Some(ReadError::Bad));
+    }
+
+    #[test]
+    fn host_tools_are_an_explicit_session_capability() {
+        let req = compile_req(&["check", "/tmp/host-tools.rs", "--host-tools"]);
+        assert_eq!(req.session.host_tools, HostTools::Allow);
+        let mut strict = req.session.clone();
+        strict.host_tools = HostTools::Forbid;
+        assert_ne!(strict, req.session);
+        assert_ne!(strict.describe(), req.session.describe());
+        assert!(HostTools::Forbid.require("feature probe").unwrap_err().starts_with("error[L0532]:"));
+        assert!(HostTools::Allow.require("feature probe").is_ok());
+        for session in [strict, req.session] {
+            let mut r = compile_req(&["check", "/tmp/host-tools.rs"]);
+            r.session = session;
+            let back = read_request(&mut std::io::Cursor::new(encode(&r))).unwrap();
+            assert_eq!(back.session, r.session);
+        }
+        assert!(matches!(parse_args(&args(&["build", "/tmp/x.rs", "--release", "--host-tools"])), Some(Invocation::Release { host_tools: HostTools::Allow, .. })));
+        assert!(matches!(parse_args(&args(&["check", "/tmp/x.rs", "--rustc", "--host-tools"])), Some(Invocation::RustcCheck { host_tools: HostTools::Allow, .. })));
     }
 
     /// Project dev config: `dev-exclude-features` turns the package

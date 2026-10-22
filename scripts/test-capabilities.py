@@ -32,6 +32,8 @@ SECTIONS = ["items", "types", "attributes", "derives", "control_flow", "patterns
 
 # Rejected lines with no single-file probe, and why. Keep this list short.
 UNPROBED = {
+    "Cargo host preparation without an explicit --host-tools opt-in":
+        "requires CLI or manifest selection; scripts/test-host-tools.sh traces strict calls and tests warm-cache rejection",
     "moving a field out of a struct or enum (a fallback that no known program reaches)":
         "borrowck fallback; scripts/agentkit-test.sh needs the unsupported(..) text listed",
     "the `BTreeMap` or `Arc` type where the resolver has no rule for it (a fallback that no known program reaches)":

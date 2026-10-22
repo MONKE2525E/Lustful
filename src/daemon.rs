@@ -367,7 +367,7 @@ fn refresh_key(key: &SessionKey, env: Option<&[(String, String)]>) -> u64 {
     // create or update Cargo.lock, and the graph key must describe
     // the graph as it stands after that run, not before it.
     let build_script = match protocol::manifest_dir(key) {
-        Some(dir) => match crate::driver::buildscript::refresh(&dir, &crate::driver::cache::cache_dir(&key.krate.root), env) {
+        Some(dir) => match crate::driver::buildscript::refresh(&dir, &crate::driver::cache::cache_dir(&key.krate.root), env, key.host_tools) {
             r @ crate::driver::buildscript::Refresh::Failed { .. } => {
                 if let crate::driver::buildscript::Refresh::Failed { error, .. } = &r {
                     eprintln!("lust daemon: build script refresh failed for {}: {error}", dir.display());

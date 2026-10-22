@@ -1,8 +1,8 @@
 # Verenu compatibility
 
 This fork develops Lust support for Verenu's Rust backend. The complete Tauri
-application does not compile with Lust yet. Release compilation still uses
-Cargo and rustc through upstream's release path.
+application does not compile with Lust yet. Cargo/rustc release compilation
+requires an explicit `--host-tools` opt-in in this fork.
 
 ## Supported additions
 
@@ -34,9 +34,12 @@ including concurrent registration and suppressed argument evaluation. Unsupporte
 features and layout queries remain explicit errors.
 
 ```sh
-LUST=./target/release/lust LUST_STRICT=1 SANITIZE=1 bash scripts/test-adapters.sh log
-LUST=./target/release/lust LUST_STRICT=1 LUST_USE_DAEMON=1 bash scripts/test-adapters.sh log
+LUST_HOST_TOOLS=1 LUST=./target/release/lust LUST_STRICT=1 SANITIZE=1 bash scripts/test-adapters.sh log
+LUST_HOST_TOOLS=1 LUST=./target/release/lust LUST_STRICT=1 LUST_USE_DAEMON=1 bash scripts/test-adapters.sh log
 ```
+
+These adapter comparisons use Cargo host tools and a rustc oracle. They are
+not rustc-free build audits.
 
 The selected Cargo target supplies the crate name for `module_path!()`. A binary
 whose target name differs from its package name therefore records the same
@@ -95,16 +98,20 @@ compatible layouts, generics, unwinding, and metadata support.
 
 Verenu requires edition 2021, async functions and Tokio, unsafe native FFI,
 custom procedural macros, and dependencies outside Lust's shipped adapters.
-The edition-2024 compatibility overlay now expands `log::warn!` and reaches
+With host preparation explicitly permitted, the edition-2024 compatibility overlay expands `log::warn!` and reaches
 unsupported `serde_json::json!` expansion. The production edition-2021 manifest
 still fails L0530. Async remains rejected as L0405. Scalar C imports work on
 the target above, but Verenu's pointer-based native APIs and callbacks remain
 unsupported. No full desktop build has succeeded.
 
-Cargo graph discovery can invoke `rustc -vV` even before host build scripts and
-procedural macro crates are built. Removing those invocations is also required
-for a complete build that uses rustc only to bootstrap Lust and compile test
-oracles.
+Strict compilation uses `cargo metadata --no-deps` and admits only one package
+without dependencies, build scripts, or proc-macro targets. Its local feature
+closure is resolved without rustc. Other graphs, including Verenu, stop at
+L0532 before full metadata resolution or host preparation. This gate also
+rejects warm host outputs and is part of each daemon session's identity.
+`--host-tools` or `LUST_HOST_TOOLS=1` opts into existing host-tool behavior and
+is not a rustc-free run. The gate prevents hidden compiler use; it does not
+add the missing desktop compiler capabilities.
 
 The compiler must preserve native behavior and reject unsupported constructs
 throughout this work. A successful core test run does not establish a working

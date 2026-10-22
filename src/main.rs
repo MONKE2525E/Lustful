@@ -408,8 +408,8 @@ fn main() {
     match protocol::parse_args(&args) {
         Some(Invocation::Daemon) => daemon::serve(&protocol::socket_path()),
         // The `lust` client handles these itself; direct `lust-core` calls work too.
-        Some(Invocation::Release { file, out, profile, debug, net }) => {
-            protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net)
+        Some(Invocation::Release { file, out, profile, debug, net, host_tools }) => {
+            protocol::run_release(&file, out.as_deref(), profile.as_deref(), debug, net, host_tools)
         }
         // The release driver: one cold compile per target, in this process,
         // in order. A failed target stops the run with its code.
@@ -453,7 +453,7 @@ fn main() {
             }
             std::process::exit(code);
         }
-        Some(Invocation::RustcCheck { file }) => protocol::run_rustc_check(&file),
+        Some(Invocation::RustcCheck { file, host_tools }) => protocol::run_rustc_check(&file, host_tools),
         Some(Invocation::Compile { mut req, run, args }) => {
             own_env(&mut req);
             // Whole-request disk cache (cold runs only; the daemon path keeps its own

@@ -329,6 +329,7 @@ pub struct GraphRequest {
     pub all_features: bool,
     pub target_triple: String,
     pub cargo_net: crate::protocol::CargoNet,
+    pub host_tools: crate::protocol::HostTools,
     /// The env vars that steer Cargo (`steers_cargo`) as the client sees
     /// them, sorted. None: this process's env (a cold run, unit tests).
     /// A daemon passes its client's: the daemon's own env is the env of
@@ -441,6 +442,7 @@ pub fn graph_key(req: &GraphRequest) -> u64 {
     req.all_features.hash(&mut h);
     req.target_triple.hash(&mut h);
     req.cargo_net.hash(&mut h);
+    req.host_tools.hash(&mut h);
     h.finish()
 }
 
@@ -555,6 +557,46 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
 
 /// One `cargo metadata` run for `req`, read into a graph (key, watch,
 /// and stamp are filled by `load_graph`).
+/// `--no-deps` metadata does not ask Cargo to resolve a crate graph (which
+/// queries rustc even for a package with no dependencies). Admit only the
+/// closed case whose feature closure can be derived from this one manifest.
+fn strict_package_features(root: &Json, req: &GraphRequest) -> Result<Vec<String>, String> {
+    let reject = || crate::protocol::HostTools::Forbid.require("this Cargo graph or host preparation").unwrap_err();
+    let packages = root.get("packages").map(|p| p.as_arr()).unwrap_or(&[]);
+    if packages.len() != 1 || root.get("workspace_members").map(|m| m.as_arr().len()) != Some(1) {
+        return Err(reject());
+    }
+    let package = &packages[0];
+    if !package.get("dependencies").map(|d| d.as_arr()).unwrap_or(&[]).is_empty()
+        || package.get("targets").map(|t| t.as_arr()).unwrap_or(&[]).iter().any(|t| {
+            t.get("kind").map(|k| k.strings()).unwrap_or_default().iter().any(|k| matches!(k.as_str(), "custom-build" | "proc-macro"))
+                || t.get("crate_types").map(|k| k.strings()).unwrap_or_default().iter().any(|k| k == "proc-macro")
+        })
+    {
+        return Err(reject());
+    }
+    let definitions = match package.get("features") {
+        Some(Json::Obj(entries)) => entries,
+        _ => return Err("cannot read feature definitions from Cargo metadata".into()),
+    };
+    let mut pending = req.features.clone();
+    if req.default_features && definitions.iter().any(|(k, _)| k == "default") {
+        pending.push("default".into());
+    }
+    if req.all_features {
+        pending.extend(definitions.iter().map(|(k, _)| k.clone()));
+    }
+    let mut enabled = std::collections::BTreeSet::new();
+    while let Some(feature) = pending.pop() {
+        if !enabled.insert(feature.clone()) { continue; }
+        let Some((_, children)) = definitions.iter().find(|(k, _)| k == &feature) else {
+            return Err(format!("package has no feature `{feature}`"));
+        };
+        pending.extend(children.strings());
+    }
+    Ok(enabled.into_iter().collect())
+}
+
 fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     let mut cmd = cargo_command(req.env.as_deref());
     // Run in the manifest's directory: Cargo discovers `.cargo/config.toml`
@@ -564,6 +606,9 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
         cmd.current_dir(dir);
     }
     cmd.args(["metadata", "--format-version", "1", "--manifest-path"]).arg(&req.manifest_path);
+    if req.host_tools == crate::protocol::HostTools::Forbid {
+        cmd.arg("--no-deps");
+    }
     if !req.features.is_empty() {
         cmd.args(["--features", &req.features.join(",")]);
     }
@@ -577,7 +622,7 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     // never downloads platform crates lust cannot target anyway
     // (a windows-only dependency of rustix broke offline resolves).
     let filter = if req.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.target_triple };
-    if !filter.is_empty() {
+    if !filter.is_empty() && req.host_tools == crate::protocol::HostTools::Allow {
         cmd.args(["--filter-platform", filter]);
     }
     cmd.args(req.cargo_net.args());
@@ -590,6 +635,9 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let root = parse_json(&text).map_err(|e| format!("cannot parse `cargo metadata` output: {e}"))?;
+    let strict_features = if req.host_tools == crate::protocol::HostTools::Forbid {
+        Some(strict_package_features(&root, req)?)
+    } else { None };
     let workspace_root = PathBuf::from(root.get("workspace_root").and_then(|v| v.as_str()).unwrap_or(""));
     let members: Vec<String> = root.get("workspace_members").map(|v| v.strings()).unwrap_or_default();
     // Resolve nodes: features per package id, and the exact dep edges.
@@ -653,7 +701,7 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
             }
         }
         packages.push(PackageInfo {
-            resolved_features: node_features.get(&id_repr).cloned().unwrap_or_default(),
+            resolved_features: strict_features.clone().unwrap_or_else(|| node_features.get(&id_repr).cloned().unwrap_or_default()),
             id_repr: id_repr.clone(),
             name: p.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             version: p.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0").to_string(),
@@ -801,6 +849,7 @@ pub fn build_dir(manifest: &Path, env: Option<&[(String, String)]>) -> Option<Pa
 /// to resolve-node features and the session still works for single-package
 /// graphs.
 fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std::collections::HashMap<(String, String), Vec<String>>> {
+    req.host_tools.require("Cargo feature preparation").ok()?;
     let key = graph.key;
     static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, std::collections::HashMap<(String, String), Vec<String>>>>> =
         OnceLock::new();
@@ -813,7 +862,7 @@ fn unit_features_via_check(req: &GraphRequest, graph: &CrateGraph) -> Option<std
         cache.lock().unwrap().insert(key, map.clone());
         return Some(map);
     }
-    let mut cmd = crate::resolve::probe::check_command(&req.manifest_path, &req.target_triple, req.env.as_deref());
+    let mut cmd = crate::resolve::probe::check_command(&req.manifest_path, &req.target_triple, req.env.as_deref(), req.host_tools).ok()?;
     if let Some(pkg) = &req.package {
         cmd.args(["-p", pkg]);
     }
@@ -942,6 +991,9 @@ pub fn select_unit(
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
     let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
+    if !simple_graph {
+        req.host_tools.require("per-unit Cargo feature resolution")?;
+    }
     let check_map = if simple_graph { None } else { unit_features_via_check(req, graph) };
     let features = check_map
         .as_ref()
@@ -1183,6 +1235,34 @@ mod tests {
     }
 
     #[test]
+    fn strict_metadata_admits_only_local_feature_closures() {
+        let source = r#"{"packages":[{"dependencies":[],"targets":[{"kind":["bin"],"crate_types":["bin"]}],"features":{"default":["a"],"a":["b"],"b":["a"],"extra":[]}}],"workspace_members":["p"]}"#;
+        let root = parse_json(source).unwrap();
+        let mut req = GraphRequest { default_features: true, ..Default::default() };
+        assert_eq!(strict_package_features(&root, &req).unwrap(), ["a", "b", "default"]);
+        req.default_features = false;
+        assert!(strict_package_features(&root, &req).unwrap().is_empty());
+        req.features = vec!["a".into()];
+        assert_eq!(strict_package_features(&root, &req).unwrap(), ["a", "b"]);
+        req.all_features = true;
+        assert_eq!(strict_package_features(&root, &req).unwrap(), ["a", "b", "default", "extra"]);
+        req.features = vec!["missing".into()];
+        assert!(strict_package_features(&root, &req).unwrap_err().contains("no feature"));
+        for changed in [
+            source.replace("\"dependencies\":[]", "\"dependencies\":[{}]"),
+            source.replace("\"kind\":[\"bin\"]", "\"kind\":[\"custom-build\"]"),
+            source.replace("\"kind\":[\"bin\"]", "\"kind\":[\"proc-macro\"]"),
+            source.replace("\"crate_types\":[\"bin\"]", "\"crate_types\":[\"proc-macro\"]"),
+            source.replace("\"workspace_members\":[\"p\"]", "\"workspace_members\":[\"p\",\"q\"]"),
+        ] {
+            assert!(strict_package_features(&parse_json(&changed).unwrap(), &req).unwrap_err().starts_with("error[L0532]:"));
+        }
+        let before = graph_key(&req);
+        req.host_tools = crate::protocol::HostTools::Allow;
+        assert_ne!(before, graph_key(&req));
+    }
+
+    #[test]
     fn graph_of_a_fixture_package() {
         // The checked-in hello fixture: one package, one bin, edition 2024.
         // Copied to a temp dir first: `cargo metadata` writes a Cargo.lock
@@ -1202,6 +1282,7 @@ mod tests {
             target_triple: String::new(),
             cargo_net: Default::default(),
             env: None,
+            host_tools: Default::default(),
         };
         let graph = load_graph(&req).expect("cargo metadata on the hello fixture");
         let interner = crate::intern::Interner::default();
@@ -1228,7 +1309,7 @@ mod tests {
         std::fs::write(dir.join("util/Cargo.toml"), "[package]\nname = \"util\"\nversion = \"0.1.0\"\nedition = \"2024\"\n").unwrap();
         std::fs::write(dir.join("util/src/lib.rs"), "").unwrap();
         std::fs::write(dir.join("src/bin/a.rs"), "fn main() {}").unwrap();
-        let req = GraphRequest { manifest_path: dir.join("Cargo.toml"), default_features: true, ..Default::default() };
+        let req = GraphRequest { manifest_path: dir.join("Cargo.toml"), default_features: true, host_tools: crate::protocol::HostTools::Allow, ..Default::default() };
         let bins = |g: &CrateGraph| g.packages.iter().find(|p| p.name == "w").unwrap().targets.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
         // The first run writes Cargo.lock, which the graph key covers.
         load_graph(&req).expect("metadata");

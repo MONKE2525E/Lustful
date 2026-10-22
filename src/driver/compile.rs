@@ -102,6 +102,7 @@ fn fill_dep_build_outputs(
     deps: &mut [crate::resolve::cargo::DepUnit],
     cache: &Path,
     env: super::buildscript::ClientEnv,
+    host_tools: crate::protocol::HostTools,
     memo: &mut FxMap<PathBuf, Option<super::buildscript::Outputs>>,
 ) -> Result<(), String> {
     for dep in deps {
@@ -109,7 +110,7 @@ fn fill_dep_build_outputs(
             let out = match memo.get(&dep.manifest_dir) {
                 Some(o) => o.clone(),
                 None => {
-                    let o = super::buildscript::outputs(&dep.manifest_dir, cache, env)
+                    let o = super::buildscript::outputs(&dep.manifest_dir, cache, env, host_tools)
                         .map_err(|e| format!("build script of `{}` failed: {e}", dep.package_name))?;
                     memo.insert(dep.manifest_dir.clone(), o.clone());
                     o
@@ -124,7 +125,7 @@ fn fill_dep_build_outputs(
                 dep.build_check_cfgs = out.rustc_check_cfg;
             }
         }
-        fill_dep_build_outputs(&mut dep.deps, cache, env, memo)?;
+        fill_dep_build_outputs(&mut dep.deps, cache, env, host_tools, memo)?;
     }
     Ok(())
 }
@@ -2045,7 +2046,15 @@ fn resolved_setup(
     front.resolved_crate = true;
     let request_start = std::time::SystemTime::now();
     let key = &req.session;
-    let code2 = |msg: String| Response { stderr: format!("error: {msg}\n"), code: 2, ..Default::default() };
+    let code2 = |msg: String| {
+        let stderr = if let Some(message) = msg.strip_prefix("error[L0532]: ") {
+            let mut map = SourceMap::default();
+            map.add_file_with_text(&req.file.to_string_lossy(), "");
+            let d = Diag::new("L0532", crate::diag::Span::default(), message, "use --host-tools only when rustc host preparation is acceptable");
+            crate::diag::render(&mut [d], &map, "", req.json, req.max_errors)
+        } else { format!("error: {msg}\n") };
+        Response { stderr, code: 2, ..Default::default() }
+    };
     // Crate selection: through the Cargo graph when a manifest names the
     // crate, else the synthetic one-file package of the session key.
     let (root_path, mut root_text, crate_ids, env, externs, crate_name, cargo_env) = if let Some(manifest) = &key.krate.manifest_path {
@@ -2057,6 +2066,7 @@ fn resolved_setup(
             all_features: key.all_features,
             target_triple: key.target_triple.clone(),
             cargo_net: key.cargo_net,
+            host_tools: key.host_tools,
             env: req.client.env.as_deref().map(cargo::cargo_env_of),
         };
         let graph = cargo::load_graph(&greq).map_err(code2)?;
@@ -2086,7 +2096,7 @@ fn resolved_setup(
         let manifest_dir = unit.package.manifest_path.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         let mut cargo_env = unit.cargo_env.clone();
         let client_env = req.client.env.as_deref();
-        let selected_out = super::buildscript::outputs(&manifest_dir, &cache, client_env)
+        let selected_out = super::buildscript::outputs(&manifest_dir, &cache, client_env, key.host_tools)
             .map_err(|e| code2(format!("build script of `{}` failed: {e}", unit.package.name)))?;
         if let Some(out) = &selected_out {
             if let Some(dir) = &out.out_dir {
@@ -2103,7 +2113,7 @@ fn resolved_setup(
         let mut deps = unit.deps.clone();
         let mut memo: FxMap<PathBuf, Option<super::buildscript::Outputs>> = FxMap::default();
         memo.insert(manifest_dir, selected_out);
-        fill_dep_build_outputs(&mut deps, &cache, client_env, &mut memo).map_err(code2)?;
+        fill_dep_build_outputs(&mut deps, &cache, client_env, key.host_tools, &mut memo).map_err(code2)?;
         t.lap("build script outputs");
         // Cargo runs rustc from the workspace root, so `file!` shows member paths relative to it.
         front.client.shown_root = Some((graph.workspace_root.clone(), PathBuf::new()));

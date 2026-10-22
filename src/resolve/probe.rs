@@ -36,12 +36,14 @@ const FAKE_DIR_ENV: &str = "LUST_PROBE_FAKE_DIR";
 /// Falls back to a plain check (same messages, full cost) when lust-core
 /// cannot be the wrapper: a process that is not lust-core (unit tests), or
 /// no build dir from `cargo metadata`.
-pub fn check_command(manifest: &Path, triple: &str, env: Option<&[(String, String)]>) -> Command {
+pub fn check_command(manifest: &Path, triple: &str, env: Option<&[(String, String)]>, host_tools: crate::protocol::HostTools) -> Result<Command, String> {
+    host_tools.require("Cargo feature and build-script preparation")?;
     let mut cmd = super::cargo::cargo_command(env);
     if let Some(dir) = manifest.parent() {
         cmd.current_dir(dir);
     }
     cmd.args(["check", "--message-format=json", "--manifest-path"]).arg(manifest);
+    cmd.env("LUST_HOST_TOOLS", "1");
     if !triple.is_empty() {
         cmd.args(["--target", triple]);
     }
@@ -55,13 +57,17 @@ pub fn check_command(manifest: &Path, triple: &str, env: Option<&[(String, Strin
         cmd.env("RUSTC_WRAPPER", exe);
         cmd.env(FAKE_DIR_ENV, profile.join("deps"));
     }
-    cmd
+    Ok(cmd)
 }
 
 /// Wrapper mode of lust-core: Cargo runs `lust-core <rustc> <args...>`.
 /// Returns None when this process is not a probe wrapper, else the exit code.
 pub fn wrapper_main() -> Option<i32> {
     let fake_dir = std::env::var_os(FAKE_DIR_ENV)?;
+    if let Err(error) = crate::protocol::HostTools::from_env().require("the Cargo compiler wrapper") {
+        eprintln!("{error}");
+        return Some(2);
+    }
     let mut argv = std::env::args_os().skip(1);
     let rustc = argv.next()?;
     let args: Vec<OsString> = argv.collect();

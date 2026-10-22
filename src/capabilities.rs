@@ -1625,6 +1625,7 @@ const REJECTED: &[(&str, &str)] = &[
     ("attributes lust does not know by name (named in the message)", "L0402"),
     ("known attributes lust does not handle yet, such as `target_feature`, `crate_name`, `no_implicit_prelude`, and unsafe ones like `#[unsafe(no_mangle)]` (named in the message)", "L0522"),
     ("`deny` and `forbid` of a lint lust does not check (named in the message)", "L0531"),
+    ("Cargo host preparation without an explicit --host-tools opt-in", "L0532"),
     ("deriving traits other than Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, and Default (named in the message)", "L0403"),
     ("unsafe Rust functions and foreign calls outside unsafe blocks", "L0404"),
     ("`async` functions and blocks", "L0405"),

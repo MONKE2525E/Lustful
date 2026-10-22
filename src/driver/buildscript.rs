@@ -296,12 +296,15 @@ impl Refresh {
 /// the graph key already covers. One record per manifest dir serves
 /// every client: a client whose `rerun-if-env-changed` values differ
 /// from the record's re-runs the script, as Cargo would from its shell.
-pub fn refresh(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv) -> Refresh {
+pub fn refresh(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv, host_tools: crate::protocol::HostTools) -> Refresh {
     let Some(script) = build_script_for(manifest_dir) else { return Refresh::None };
+    if let Err(error) = host_tools.require("build-script outputs") {
+        return Refresh::Failed { hash: hash_parts(&[b"host-tools-forbidden"]), error };
+    }
     if let Some(rec) = fresh_record(manifest_dir, cache_dir, &script, env) {
         return Refresh::Fresh { hash: rec.output_hash };
     }
-    match run_through_cargo(manifest_dir, &script, env) {
+    match run_through_cargo(manifest_dir, &script, env, host_tools) {
         Ok(rec) => {
             let hash = rec.output_hash;
             store_record(cache_dir, manifest_dir, &rec);
@@ -344,12 +347,13 @@ pub struct Outputs {
 /// has no build script. An Err means a script exists but its run
 /// failed; the caller must not compile the crate without its outputs.
 /// `env` is the requesting client's env, as for `refresh`.
-pub fn outputs(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv) -> Result<Option<Outputs>, String> {
+pub fn outputs(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv, host_tools: crate::protocol::HostTools) -> Result<Option<Outputs>, String> {
     let Some(script) = build_script_for(manifest_dir) else { return Ok(None) };
+    host_tools.require("build-script outputs")?;
     let rec = match fresh_record(manifest_dir, cache_dir, &script, env) {
         Some(rec) => rec,
         None => {
-            let rec = run_through_cargo(manifest_dir, &script, env)?;
+            let rec = run_through_cargo(manifest_dir, &script, env, host_tools)?;
             store_record(cache_dir, manifest_dir, &rec);
             rec
         }
@@ -369,7 +373,8 @@ pub fn outputs(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv) -> Result<
 /// `resolve::probe` (rustc runs only for build scripts and proc macros).
 /// Cargo runs with the client's whole `env` (Cargo passes its env on to
 /// the script), plus the vars the probe command sets for itself.
-fn run_through_cargo(manifest_dir: &Path, script: &Path, env: ClientEnv) -> Result<Record, String> {
+fn run_through_cargo(manifest_dir: &Path, script: &Path, env: ClientEnv, host_tools: crate::protocol::HostTools) -> Result<Record, String> {
+    host_tools.require("build-script compilation")?;
     // Cargo decides script freshness by mtime; an input edited within
     // the same filesystem timestamp tick as the last run can look
     // fresh to it while our content hashes already moved. Rewriting
@@ -379,7 +384,7 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path, env: ClientEnv) -> Resu
     if let Ok(bytes) = std::fs::read(script) {
         let _ = std::fs::write(script, bytes);
     }
-    let mut cmd = crate::resolve::probe::check_command(&manifest_dir.join("Cargo.toml"), "", env);
+    let mut cmd = crate::resolve::probe::check_command(&manifest_dir.join("Cargo.toml"), "", env, host_tools)?;
     if let Some(env) = env {
         let own: Vec<(std::ffi::OsString, std::ffi::OsString)> =
             cmd.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned()))).collect();
