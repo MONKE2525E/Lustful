@@ -9042,6 +9042,16 @@ impl<'p> Ctx<'p> {
         {
             let is_param =
                 |cx: &Self, n: Sym| cx.body_scope.param_tys.iter().any(|(pn, _)| *pn == n) || n == p.known.self_type;
+            // Type or const by the flat maps, which record no read: the body
+            // checks again when a type comes to share a const's name, and
+            // when the const's value changes (its `Sig` folds the value), as
+            // `written_const` reads it.
+            if let [seg] = segs.as_slice()
+                && !is_param(self, seg.name)
+            {
+                self.binding(Namespace::Type, seg.name);
+                self.binding(Namespace::Value, seg.name);
+            }
             match segs.as_slice() {
                 // A const param of this body (`f::<N>()`).
                 // `(N)` is a const operation on it, not
