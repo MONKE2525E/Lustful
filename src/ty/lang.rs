@@ -44,6 +44,7 @@ pub enum ShippedCrate {
     Bumpalo,
     XxhashRust,
     RyuJs,
+    SerdeJson,
     NumBigInt,
     Rustix,
     Nix,
@@ -65,6 +66,7 @@ impl ShippedCrate {
         ShippedCrate::Bumpalo,
         ShippedCrate::XxhashRust,
         ShippedCrate::RyuJs,
+        ShippedCrate::SerdeJson,
         ShippedCrate::NumBigInt,
         ShippedCrate::Rustix,
         ShippedCrate::Nix,
@@ -85,6 +87,7 @@ impl ShippedCrate {
             ShippedCrate::Bumpalo => "bumpalo",
             ShippedCrate::XxhashRust => "xxhash_rust",
             ShippedCrate::RyuJs => "ryu_js",
+            ShippedCrate::SerdeJson => "serde_json",
             ShippedCrate::NumBigInt => "num_bigint",
             ShippedCrate::Rustix => "rustix",
             ShippedCrate::Nix => "nix",
@@ -779,6 +782,16 @@ pub const INTRINSICS: &[IntrinsicDef] = &[
         params: &[S::StringMut, S::F64],
         ret: S::Unit,
         allowed: &[C::RyuJs],
+        implemented: true,
+    },
+    // Appends the pinned serde_json number text; adapter identity is
+    // granted only after source, path, version and feature validation.
+    IntrinsicDef {
+        name: "json_fmt_f64",
+        c_symbol: "lust_fmt_json_f64",
+        params: &[S::StringMut, S::F64],
+        ret: S::Unit,
+        allowed: &[C::SerdeJson],
         implemented: true,
     },
     // The std platform crate (W-SHIM, library/std/src/platform.rs; C in
@@ -2525,6 +2538,21 @@ mod tests {
         assert!(arena.allows(Some(ShippedCrate::Bumpalo)));
         assert!(!arena.allows(Some(ShippedCrate::Std)));
         assert!(!arena.allows(Some(ShippedCrate::Memchr)));
+    }
+
+    #[test]
+    fn json_writer_signature_and_privilege_are_closed() {
+        let json = intrinsic(intrinsic_by_name("json_fmt_f64").unwrap());
+        assert_eq!(json.c_symbol, "lust_fmt_json_f64");
+        assert_eq!(json.params, &[SigTy::StringMut, SigTy::F64]);
+        assert_eq!(json.ret, SigTy::Unit);
+        assert!(json.implemented);
+        assert!(!json.allows(None));
+        for &krate in ShippedCrate::ALL {
+            assert_eq!(json.allows(Some(krate)), krate == ShippedCrate::SerdeJson);
+        }
+        let js = intrinsic(intrinsic_by_name("ryu_js_fmt_f64").unwrap());
+        assert!(!js.allows(Some(ShippedCrate::SerdeJson)));
     }
 
     /// Shipped crate hashes are distinct, so privilege by disambiguator

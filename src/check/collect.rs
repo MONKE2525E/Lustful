@@ -607,7 +607,7 @@ impl Program {
     /// crate (ARCH 3.6), answer; every user span gets None.
     pub fn shipped_crate_at(&self, span: Span) -> Option<ShippedCrate> {
         if let Some(a) = self.adapter_at(span) {
-            return ShippedCrate::ALL.iter().copied().find(|k| k.name() == a.name);
+            return a.shipped;
         }
         if span.file != crate::diag::FileId(0) {
             return None;

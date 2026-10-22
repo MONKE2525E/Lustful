@@ -1484,6 +1484,7 @@ struct CrateJob {
     deps: Vec<(String, Result<usize, String>)>,
     /// The exact-layout list when this crate is an adapter crate.
     adapter: Option<Vec<String>>,
+    shipped: Option<crate::ty::lang::ShippedCrate>,
     /// True for the std splice job (`add_std_splice_job`): it shares
     /// the root module and file 0 with the selected crate, so its
     /// per-file cache entries take their own keys.
@@ -1555,28 +1556,40 @@ fn lust_dep_lib_root(name: &str) -> Option<PathBuf> {
 /// or unsupported with a reason that names the crate (L0508). The
 /// class is a property of the resolved package, never of a source
 /// spelling: a path package that happens to be named `indexmap` is
-/// plain lust source. `lust_owned` marks the library's own crates
+/// plain lust source. Only the validated canonical serde_json library
+/// adapter is also recognized through its actual path source root. `lust_owned` marks the library's own crates
 /// (adapters and shims): they skip the edition rule and see
 /// `cfg(lust_dev)`. `adapter` carries an adapter's exact-layout list.
 enum DepClass {
-    Source { root: PathBuf, lust_owned: bool, adapter: Option<Vec<String>> },
+    Source {
+        root: PathBuf,
+        lust_owned: bool,
+        adapter: Option<Vec<String>>,
+        shipped: Option<crate::ty::lang::ShippedCrate>,
+    },
     Unsupported(String),
 }
 
 /// Classifies one dependency unit. See `DepClass`.
 fn classify_dep(dep: &super::cargo::DepUnit) -> DepClass {
     if dep.source.is_none() {
-        return DepClass::Source { root: dep.lib_src.clone(), lust_owned: false, adapter: None };
+        return match super::adapters::classify_path(
+            &dep.package_name, &dep.version, &dep.lib_src, &dep.manifest_dir, &dep.features,
+        ) {
+            Ok(Some(a)) => DepClass::Source { root: a.root, lust_owned: true, adapter: Some(a.exact_layout), shipped: a.shipped },
+            Err(why) => DepClass::Unsupported(why),
+            Ok(None) => DepClass::Source { root: dep.lib_src.clone(), lust_owned: false, adapter: None, shipped: None },
+        };
     }
     let name = dep.package_name.as_str();
     match super::adapters::classify(name, &dep.version, dep.source.as_deref(), &dep.features) {
-        Ok(Some(a)) => return DepClass::Source { root: a.root, lust_owned: true, adapter: Some(a.exact_layout) },
+        Ok(Some(a)) => return DepClass::Source { root: a.root, lust_owned: true, adapter: Some(a.exact_layout), shipped: a.shipped },
         Err(why) => return DepClass::Unsupported(why),
         Ok(None) => {},
     }
     if SHIM_CRATES.contains(&name) {
         if let Some(root) = lust_dep_lib_root(name) {
-            return DepClass::Source { root, lust_owned: true, adapter: None };
+            return DepClass::Source { root, lust_owned: true, adapter: None, shipped: None };
         }
         return DepClass::Unsupported(format!("dependency crate `{name}` has no lust shim yet"));
     }
@@ -1740,6 +1753,7 @@ fn add_platform_job(input: &CrateInput, tables: &mut ResolvedTables, jobs: &mut 
         magic,
         deps: Vec::new(),
         adapter: Some(Vec::new()),
+        shipped: Some(crate::ty::lang::ShippedCrate::Std),
         std_splice: false,
     });
     Ok(jobs.len() - 1)
@@ -1766,6 +1780,7 @@ fn add_std_splice_job(input: &CrateInput, lo: u32, jobs: &mut Vec<CrateJob>) -> 
         magic: root.magic,
         deps: Vec::new(),
         adapter: None,
+        shipped: None,
         std_splice: true,
     });
     jobs.len() - 1
@@ -1807,6 +1822,7 @@ pub fn resolve_crate_with(
         magic: main_magic,
         deps: Vec::new(),
         adapter: None,
+        shipped: None,
         std_splice: false,
     }];
     // The session error map for job-build failures (a dependency root
@@ -1960,6 +1976,7 @@ pub fn resolve_crate_with(
                 if let Some(exact_layout) = &jobs[j].adapter {
                     tables.adapters.push(super::imports::AdapterCrate {
                         name: jobs[j].input.crate_name.clone(),
+                        shipped: jobs[j].shipped,
                         files: out.seen.iter().map(|s| s.2).collect(),
                         exact_layout: exact_layout.clone(),
                     });
@@ -2040,8 +2057,8 @@ fn add_dep_job(
     by_key: &mut FxMap<String, usize>,
     interner: &Interner,
 ) -> Result<(String, Result<usize, String>), Diag> {
-    let (root, lust_owned, adapter) = match classify_dep(dep) {
-        DepClass::Source { root, lust_owned, adapter } => (root, lust_owned, adapter),
+    let (root, lust_owned, adapter, shipped) = match classify_dep(dep) {
+        DepClass::Source { root, lust_owned, adapter, shipped } => (root, lust_owned, adapter, shipped),
         DepClass::Unsupported(why) => return Ok((dep.extern_name.clone(), Err(why))),
     };
     let key = format!("{}#{}", dep.package_id, dep.lib_name);
@@ -2101,6 +2118,7 @@ fn add_dep_job(
         magic,
         deps: Vec::new(),
         adapter,
+        shipped,
         std_splice: false,
     });
     let mut sub = Vec::new();
@@ -9478,6 +9496,75 @@ fn main() { let _ = imported; }
             DepClass::Unsupported(why) => assert!(why.contains("frobnicator"), "{why}"),
             DepClass::Source { .. } => panic!("an unknown registry crate has no lust form"),
         }
+    }
+
+    #[test]
+    fn json_shipped_identity_comes_from_classification_not_names() {
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
+        let mut unit = dep_unit("serde_json", "1.0.151", registry);
+        unit.extern_name = "renamed_json".into();
+        unit.lib_name = "unrelated_target_name".into();
+        assert!(matches!(classify_dep(&unit), DepClass::Source {
+            shipped: Some(crate::ty::lang::ShippedCrate::SerdeJson), ..
+        }));
+        unit.source = None;
+        assert!(matches!(classify_dep(&unit), DepClass::Source { shipped: None, adapter: None, lust_owned: false, .. }));
+        unit.source = registry.map(str::to_string);
+        unit.version = "1.0.152".into();
+        assert!(matches!(classify_dep(&unit), DepClass::Unsupported(_)));
+        unit.version = "1.0.151".into();
+        unit.features.push("arbitrary_precision".into());
+        assert!(matches!(classify_dep(&unit), DepClass::Unsupported(_)));
+        unit.features.clear();
+        unit.source = Some("git+https://example.invalid/json".into());
+        assert!(matches!(classify_dep(&unit), DepClass::Source { shipped: None, .. }));
+    }
+
+    #[test]
+    fn trusted_json_path_is_an_adapter_even_with_renamed_targets() {
+        let dir = super::super::adapters::library_root().join("deps/serde_json");
+        let mut unit = dep_unit("serde_json", "1.0.151", None);
+        unit.lib_src = dir.join("src/lib.rs");
+        unit.manifest_dir = dir;
+        unit.extern_name = "renamed_json".into();
+        unit.lib_name = "unrelated_target_name".into();
+        unit.features = vec!["std".into(), "alloc".into()];
+        assert!(matches!(classify_dep(&unit), DepClass::Source {
+            lust_owned: true, adapter: Some(_), shipped: Some(crate::ty::lang::ShippedCrate::SerdeJson), ..
+        }));
+        unit.version = "1.0.152".into();
+        assert!(matches!(classify_dep(&unit), DepClass::Unsupported(_)));
+        unit.version = "1.0.151".into();
+        unit.features.push("raw_value".into());
+        assert!(matches!(classify_dep(&unit), DepClass::Unsupported(_)));
+        unit.features.clear();
+        unit.package_name = "fake_json".into();
+        unit.lib_name = "serde_json".into();
+        unit.extern_name = "serde_json".into();
+        assert!(matches!(classify_dep(&unit), DepClass::Source {
+            lust_owned: false, adapter: None, shipped: None, ..
+        }));
+        unit.package_name = "serde_json".into();
+        unit.lib_src = super::super::adapters::library_root().join("deps/memchr/src/lib.rs");
+        assert!(matches!(classify_dep(&unit), DepClass::Source {
+            lust_owned: false, adapter: None, shipped: None, ..
+        }));
+    }
+
+    #[test]
+    fn existing_shipped_adapter_identity_survives_target_renaming() {
+        let mut unit = dep_unit("memchr", "2.8.2", Some("registry+https://github.com/rust-lang/crates.io-index"));
+        for source in ["registry+https://github.com/rust-lang/crates.io-index", "git+https://example.invalid/memchr"] {
+            unit.source = Some(source.into());
+            unit.lib_name = "serde_json".into();
+            assert!(matches!(classify_dep(&unit), DepClass::Source {
+                shipped: Some(crate::ty::lang::ShippedCrate::Memchr), ..
+            }));
+        }
+        unit.source = None;
+        assert!(matches!(classify_dep(&unit), DepClass::Source {
+            lust_owned: false, adapter: None, shipped: None, ..
+        }));
     }
 
     #[test]

@@ -988,6 +988,72 @@ static uint64_t lust_js_render(char *buf, const lust_fparts *p) {
     return (uint64_t)n;
 }
 
+/* serde_json 1.0.151 / zmij 1.0.23 f64 rendering policy.
+   tests/float/json.sh compares exponent boundaries and seeded finite bit
+   patterns against the pinned upstream formatter. */
+uint64_t lust_fmt_json_f64_buf(char *buf, double value) {
+    lust_fparts p = lust_f64_parts(value);
+    lust_dec v;
+    int n = 0, i, kk, len, exp;
+    /* Matches serde_json Serializer::serialize_f64, rather than the
+       unchecked zmij::format_finite contract. Parsed Number is finite. */
+    if (p.special) {
+        memcpy(buf, "null", 4);
+        return 4;
+    }
+    if (p.sign) buf[n++] = '-';
+    if (p.m == 0) {
+        memcpy(buf + n, "0.0", 3);
+        return (uint64_t)(n + 3);
+    }
+    /* Existing Ryu digit selection, nearest with even-last-digit ties. */
+    lust_dec_shortest(&v, &p, 0);
+    kk = v.e10;
+    len = v.len;
+    exp = kk - 1;
+    if (exp >= -5 && exp <= 15) {
+        if (len <= kk) {
+            memcpy(buf + n, v.d, len);
+            n += len;
+            for (i = len; i < kk; i++) buf[n++] = '0';
+            buf[n++] = '.';
+            buf[n++] = '0';
+        } else if (kk > 0) {
+            memcpy(buf + n, v.d, kk);
+            n += kk;
+            buf[n++] = '.';
+            memcpy(buf + n, v.d + kk, len - kk);
+            n += len - kk;
+        } else {
+            buf[n++] = '0';
+            buf[n++] = '.';
+            for (i = 0; i < -kk; i++) buf[n++] = '0';
+            memcpy(buf + n, v.d, len);
+            n += len;
+        }
+    } else {
+        buf[n++] = v.d[0];
+        if (len > 1) {
+            buf[n++] = '.';
+            memcpy(buf + n, v.d + 1, len - 1);
+            n += len - 1;
+        }
+        buf[n++] = 'e';
+        buf[n++] = exp < 0 ? '-' : '+';
+        if (exp < 0) exp = -exp;
+        if (exp >= 100) buf[n++] = (char)('0' + exp / 100);
+        if (exp >= 10) buf[n++] = (char)('0' + (exp / 10) % 10);
+        buf[n++] = (char)('0' + exp % 10);
+    }
+    return (uint64_t)n;
+}
+
+void lust_fmt_json_f64(lust_String *out, double value) {
+    char buf[32];
+    uint64_t len = lust_fmt_json_f64_buf(buf, value);
+    lust_string_push_bytes(out, buf, len);
+}
+
 uint64_t lust_fmt_js_f64_buf(char *buf, double v) {
     lust_fparts p = lust_f64_parts(v);
     return lust_js_render(buf, &p);

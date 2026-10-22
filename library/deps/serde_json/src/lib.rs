@@ -1,6 +1,10 @@
-//! Closed, integer-only Value construction and compact serialization.
+//! Closed Value construction, owned decoding, and compact serialization.
 //! This is not a Serde implementation. Unsupported inputs have no JsonInput impl.
 mod convert;
+mod de;
+pub mod error;
+// Required integration prerequisite: exact default zmij-equivalent finite output.
+mod float_format;
 mod macros;
 mod number;
 mod ser;
@@ -8,20 +12,11 @@ pub mod map;
 pub mod value;
 
 pub use convert::JsonInput;
+pub use de::{from_slice, from_str, OwnedJsonDecode};
+pub use error::Error;
 pub use map::Map;
 pub use number::Number;
 pub use value::Value;
-
-/// No accepted operation creates an error. The empty representation prevents
-/// inventing parser/IO errors for APIs that this adapter does not implement.
-#[derive(Debug)]
-pub enum Error {}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
-    }
-}
 
 pub type Result<T> = std::result::Result<T, Error>;
 

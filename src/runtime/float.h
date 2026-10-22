@@ -53,6 +53,12 @@ void lust_fmt_js_f32(lust_String *out, float v);
 uint64_t lust_fmt_js_f64_buf(char *buf, double v);
 uint64_t lust_fmt_js_f32_buf(char *buf, float v);
 
+/* Default serde_json f64 policy; checked by tests/float/json.sh.
+   Buffer >= 32 bytes,
+   no NUL. Nonfinite inputs serialize as null. */
+uint64_t lust_fmt_json_f64_buf(char *buf, double v);
+void lust_fmt_json_f64(lust_String *out, double v);
+
 /* Rust str::parse::<f64> / ::<f32>. Returns 0 on success (*out is set),
    1 for an empty string, 2 for an invalid string. These are the two
    ParseFloatError kinds; overflow and underflow are success (inf or 0). */

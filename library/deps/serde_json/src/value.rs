@@ -16,6 +16,18 @@ impl Default for Value {
 }
 
 impl Value {
+    /// String-key lookup only. Numeric indexing remains outside this subset.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self { Self::Object(map) => map.get(key), _ => None }
+    }
+    pub fn is_i64(&self) -> bool { self.as_i64().is_some() }
+    pub fn is_u64(&self) -> bool { self.as_u64().is_some() }
+    pub fn is_f64(&self) -> bool {
+        match self { Self::Number(n) => n.is_f64(), _ => false }
+    }
+    pub fn as_f64(&self) -> Option<f64> {
+        match self { Self::Number(n) => n.as_f64(), _ => None }
+    }
     pub fn is_null(&self) -> bool { self.as_null().is_some() }
     pub fn is_boolean(&self) -> bool { self.as_bool().is_some() }
     pub fn is_string(&self) -> bool { self.as_str().is_some() }

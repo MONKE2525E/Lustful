@@ -452,6 +452,8 @@ const STD_PLATFORM_FULL: &[&str] = &["io", "fs", "path", "ffi"];
 pub struct AdapterCrate {
     /// The crate name as paths write it (`rustc_hash`).
     pub name: String,
+    /// Identity carried from validated adapter classification (or std loader).
+    pub shipped: Option<crate::ty::lang::ShippedCrate>,
     pub files: Vec<crate::diag::FileId>,
     /// Source paths of the types whose layout equals upstream's.
     pub exact_layout: Vec<String>,

@@ -29,7 +29,9 @@
 // lines where the value is a string, an integer, or a one-line array of
 // strings.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::ty::lang::ShippedCrate;
 
 /// The adapter manifest format this compiler reads. An adapter tree built
 /// for another format (a stale `LUST_LIBRARY`) is a mismatch, not a guess.
@@ -83,6 +85,8 @@ pub struct Adapter {
     /// Types whose layout equals upstream's (source paths).
     pub exact_layout: Vec<String>,
     pub dependencies: AdapterDependencies,
+    /// Explicit privilege from validated classification, never a source name.
+    pub shipped: Option<ShippedCrate>,
 }
 
 /// The library tree: `$LUST_LIBRARY` when set (the section 3.8 override
@@ -113,7 +117,8 @@ pub fn load(package: &str) -> Result<Option<Adapter>, String> {
 }
 
 /// The shared classification boundary for graph admission and source loading.
-/// Path packages remain ordinary source, regardless of their package name.
+/// Ordinary path packages are handled separately by `classify_path`; names
+/// alone never identify a trusted source adapter.
 pub fn classify(package: &str, version: &str, source: Option<&str>, features: &[String]) -> Result<Option<Adapter>, String> {
     let Some(source) = source else { return Ok(None) };
     if !ADAPTER_PACKAGES.contains(&package) { return Ok(None); }
@@ -124,7 +129,65 @@ pub fn classify(package: &str, version: &str, source: Option<&str>, features: &[
     if source.starts_with("registry+") && COMPLETE_SOURCE_ADAPTERS.contains(&(package, version)) {
         a.dependencies = AdapterDependencies::Replaced;
     }
+    a.shipped = shipped_identity(&a, package, version, source);
     Ok(Some(a))
+}
+
+/// Path source is privileged only when Cargo points at the exact installed
+/// serde_json adapter, including its package directory. Both comparisons
+/// resolve symlinks and `..`; missing paths fail closed. LUST_LIBRARY is the
+/// installation override, as for core/std, not dependency-controlled metadata.
+pub fn classify_path(
+    package: &str,
+    version: &str,
+    root: &Path,
+    manifest_dir: &Path,
+    features: &[String],
+) -> Result<Option<Adapter>, String> {
+    if package != "serde_json" {
+        return Ok(None);
+    }
+    let dir = library_root().join("deps/serde_json");
+    if !same_canonical_path(root, &dir.join("src/lib.rs"))
+        || !same_canonical_path(manifest_dir, &dir)
+    {
+        return Ok(None);
+    }
+    // Load the trusted manifest, not a manifest selected by a crate name or
+    // supplied path. This validates name, adapter format and feature metadata.
+    let mut a = load(package)
+        .map_err(|e| format!("the lust adapter for `{package}` is broken: {e}"))?
+        .ok_or_else(|| format!("dependency crate `{package}` has no lust adapter yet"))?;
+    check_unit(&a, package, version, features)?;
+    if version != "1.0.151" {
+        return Err(format!("the shipped serde_json intrinsic requires version 1.0.151, got {version}"));
+    }
+    a.shipped = Some(ShippedCrate::SerdeJson);
+    // Preserve Cargo's existing path edges; only registry complete replacements
+    // are eligible for host-discovery edge pruning.
+    Ok(Some(a))
+}
+
+fn same_canonical_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Called only after manifest/unit validation of a compiler-selected adapter.
+fn shipped_identity(a: &Adapter, package: &str, version: &str, source: &str) -> Option<ShippedCrate> {
+    if !same_canonical_path(&a.root, &library_root().join("deps").join(package).join("src/lib.rs")) {
+        return None;
+    }
+    if package == "serde_json" {
+        return (version == "1.0.151" && a.upstream == "1.0.151" && source.starts_with("registry+"))
+            .then_some(ShippedCrate::SerdeJson);
+    }
+    // Preserve existing adapters' identities (including git-backed units):
+    // classification has already selected and validated shipped source.
+    let name = package.replace('-', "_");
+    ShippedCrate::ALL.iter().copied().find(|k| k.name() == name)
 }
 
 /// Queries only complete replacement candidates during strict discovery.
@@ -188,6 +251,7 @@ fn parse_manifest(text: &str, package: &str, root: PathBuf) -> Result<Adapter, S
         features: features.ok_or("no `features` key in [package.metadata.lust]")?,
         exact_layout,
         dependencies: AdapterDependencies::Upstream,
+        shipped: None,
     })
 }
 
@@ -228,17 +292,88 @@ exact-layout = ["memchr::Memchr"]
         for features in [vec![], vec!["default".into(), "std".into()], vec!["alloc".into()]] {
             let a = classify("serde_json", "1.0.151", registry, &features).unwrap().unwrap();
             assert_eq!(a.dependencies, AdapterDependencies::Replaced);
+            assert_eq!(a.shipped, Some(ShippedCrate::SerdeJson));
             assert!(a.exact_layout.is_empty());
         }
         assert!(classify("serde_json", "1.0.151", None, &["raw_value".into()]).unwrap().is_none());
         let git = classify("serde_json", "1.0.151", Some("git+https://example.invalid/json"), &[]).unwrap().unwrap();
         assert_eq!(git.dependencies, AdapterDependencies::Upstream);
+        assert_eq!(git.shipped, None);
         for version in ["1.0.150", "1.0.152", "1.0.151+other"] {
             assert!(classify("serde_json", version, registry, &[]).unwrap_err().contains(version));
         }
         for feature in ["raw_value", "preserve_order", "arbitrary_precision", "float_roundtrip", "unbounded_depth", "unknown"] {
             assert!(classify("serde_json", "1.0.151", registry, &[feature.into()]).unwrap_err().contains(feature));
         }
+    }
+
+    #[test]
+    fn json_privilege_requires_the_pinned_shipped_adapter() {
+        let registry = "registry+https://github.com/rust-lang/crates.io-index";
+        let mut a = load("serde_json").unwrap().unwrap();
+        assert_eq!(a.shipped, None, "loading alone is not validation");
+        assert_eq!(shipped_identity(&a, "serde_json", "1.0.151", registry), Some(ShippedCrate::SerdeJson));
+        assert_eq!(shipped_identity(&a, "serde_json", "1.0.152", registry), None);
+        a.upstream = "1.0.152".into();
+        assert_eq!(shipped_identity(&a, "serde_json", "1.0.151", registry), None);
+        a.upstream = "1.0.151".into();
+        a.root = PathBuf::from("/untrusted/serde_json/src/lib.rs");
+        assert_eq!(shipped_identity(&a, "serde_json", "1.0.151", registry), None);
+        assert!(classify("json_fmt_f64", "1.0.151", Some(registry), &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn copied_json_package_does_not_get_intrinsic_privilege() {
+        let trusted = library_root().join("deps/serde_json");
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let copy = std::env::temp_dir().join(format!("lust-json-identity-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(copy.join("src")).unwrap();
+        std::fs::copy(trusted.join("Cargo.toml"), copy.join("Cargo.toml")).unwrap();
+        std::fs::copy(trusted.join("src/lib.rs"), copy.join("src/lib.rs")).unwrap();
+        let result = classify_path("serde_json", "1.0.151", &copy.join("src/lib.rs"), &copy, &[]);
+        std::fs::remove_dir_all(&copy).unwrap();
+        assert!(result.unwrap().is_none(), "identical package names, metadata and root text do not establish trust");
+    }
+
+    #[test]
+    fn json_path_identity_requires_exact_trusted_root_and_manifest() {
+        let dir = library_root().join("deps/serde_json").canonicalize().unwrap();
+        let root = dir.join("src/lib.rs");
+        for features in [vec![], vec!["default".into(), "std".into()], vec!["alloc".into()]] {
+            let a = classify_path("serde_json", "1.0.151", &root, &dir, &features).unwrap().unwrap();
+            assert_eq!(a.shipped, Some(ShippedCrate::SerdeJson));
+            assert_eq!(a.dependencies, AdapterDependencies::Upstream);
+            assert!(a.exact_layout.is_empty());
+        }
+        // Equivalent canonical paths are the same trusted source, not a copy.
+        let equivalent = dir.join("src/../src/lib.rs");
+        assert!(classify_path("serde_json", "1.0.151", &equivalent, &dir, &[]).unwrap().is_some());
+        assert!(classify_path("fake_json", "1.0.151", &root, &dir, &[]).unwrap().is_none());
+        assert!(classify_path("serde_json", "1.0.151", &root, &dir.join("src"), &[]).unwrap().is_none());
+        // Existing wrong roots exercise canonical comparison, not just ENOENT.
+        assert!(classify_path("serde_json", "1.0.151", &dir.join("src/number.rs"), &dir, &[]).unwrap().is_none());
+        let fake = library_root().join("deps/memchr");
+        assert!(classify_path("serde_json", "1.0.151", &fake.join("src/lib.rs"), &fake, &[]).unwrap().is_none());
+        assert!(classify_path("serde_json", "1.0.151", Path::new("/nonexistent/serde_json/src/lib.rs"), &dir, &[]).unwrap().is_none());
+        for version in ["1.0.150", "1.0.152", "1.0.151+other"] {
+            assert!(classify_path("serde_json", version, &root, &dir, &[]).unwrap_err().contains(version));
+        }
+        for feature in ["raw_value", "preserve_order", "arbitrary_precision", "float_roundtrip", "unbounded_depth", "unknown"] {
+            assert!(classify_path("serde_json", "1.0.151", &root, &dir, &[feature.into()]).unwrap_err().contains(feature));
+        }
+        // No other path crate gains new shipped behavior in this change.
+        assert!(classify_path("memchr", "2.8.2", &fake.join("src/lib.rs"), &fake, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn json_manifest_validation_precedes_identity() {
+        let text = std::fs::read_to_string(library_root().join("deps/serde_json/Cargo.toml")).unwrap();
+        let root = library_root().join("deps/serde_json/src/lib.rs");
+        for bad in [text.replace("adapter = 1", "adapter = 2"), text.replace("name = \"serde_json\"", "name = \"fake_json\"")] {
+            assert!(parse_manifest(&bad, "serde_json", root.clone()).is_err());
+        }
+        let a = parse_manifest(&text, "serde_json", root).unwrap();
+        assert_eq!(a.shipped, None, "the manifest constructor cannot grant identity");
     }
 
     #[test]

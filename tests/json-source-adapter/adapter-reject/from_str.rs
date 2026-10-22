@@ -1,1 +1,0 @@
-fn main() { let _ = serde_json::from_str::<serde_json::Value>("null"); }

@@ -270,6 +270,14 @@ cat > "$json/src/main.rs" <<'RS'
 use renamed_json::json;
 fn main() {
     let value = json!({"name": "Verenu", "items": [1, true, null]});
+    let parsed: renamed_json::Value = renamed_json::from_str(
+        r#"{"item":"Lust","fraction":1.25,"negative_zero":-0.0}"#,
+    ).unwrap();
+    assert_eq!(parsed.get("item").and_then(renamed_json::Value::as_str), Some("Lust"));
+    assert_eq!(parsed.get("fraction").and_then(renamed_json::Value::as_f64), Some(1.25));
+    assert_eq!(parsed.get("negative_zero").unwrap().as_f64().unwrap().to_bits(), 1u64 << 63);
+    assert_eq!(renamed_json::to_string(&parsed).unwrap(),
+        r#"{"fraction":1.25,"item":"Lust","negative_zero":-0.0}"#);
     println!("{}", renamed_json::to_string(&value).unwrap());
 }
 RS
