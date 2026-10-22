@@ -10265,6 +10265,10 @@ fn strip_impl_blocks(src: &str) -> String {
 
 /// The runtime without function bodies: `LUST_BODY(...)` regions are cut out once, so units do
 /// not make tcc tokenize code that would expand to nothing.
+/// The integer and size types units define in place of <stdint.h> and <stddef.h>
+/// (`runtime_decls`), from the compiler's predefined types.
+const INT_TYPEDEFS: &str = "typedef signed char int8_t; typedef unsigned char uint8_t; typedef short int16_t; typedef unsigned short uint16_t;\ntypedef int int32_t; typedef unsigned int uint32_t;\n#ifdef __INT64_TYPE__\ntypedef __INT64_TYPE__ int64_t; typedef unsigned __INT64_TYPE__ uint64_t;\n#else\ntypedef long long int64_t; typedef unsigned long long uint64_t;\n#endif\n#ifdef __SIZE_TYPE__\ntypedef __SIZE_TYPE__ size_t; typedef __PTRDIFF_TYPE__ ptrdiff_t; typedef __UINTPTR_TYPE__ uintptr_t; typedef __INTPTR_TYPE__ intptr_t;\n#else\ntypedef unsigned long size_t; typedef long ptrdiff_t; typedef unsigned long uintptr_t; typedef long intptr_t;\n#endif\n#define INT64_MIN (-9223372036854775807LL-1)\n#ifndef NULL\n#define NULL ((void*)0)\n#endif\n";
+
 fn runtime_decls() -> &'static str {
     static DECLS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DECLS.get_or_init(|| {
@@ -10306,11 +10310,7 @@ fn runtime_decls() -> &'static str {
         // the system headers behind them. The compiler's predefined types define the same names
         // (tcc and gcc both predefine them; on macOS arm64 tcc's __INT64_TYPE__ is long long,
         // which matches Apple's int64_t). The runtime unit keeps the real includes.
-        strip_c_comments(&out.replacen(
-            "#include <stdint.h>\n#include <stddef.h>\n",
-            "typedef signed char int8_t; typedef unsigned char uint8_t; typedef short int16_t; typedef unsigned short uint16_t;\ntypedef int int32_t; typedef unsigned int uint32_t;\n#ifdef __INT64_TYPE__\ntypedef __INT64_TYPE__ int64_t; typedef unsigned __INT64_TYPE__ uint64_t;\n#else\ntypedef long long int64_t; typedef unsigned long long uint64_t;\n#endif\n#ifdef __SIZE_TYPE__\ntypedef __SIZE_TYPE__ size_t; typedef __PTRDIFF_TYPE__ ptrdiff_t; typedef __UINTPTR_TYPE__ uintptr_t; typedef __INTPTR_TYPE__ intptr_t;\n#else\ntypedef unsigned long size_t; typedef long ptrdiff_t; typedef unsigned long uintptr_t; typedef long intptr_t;\n#endif\n#define INT64_MIN (-9223372036854775807LL-1)\n#ifndef NULL\n#define NULL ((void*)0)\n#endif\n",
-            1,
-        ))
+        strip_c_comments(&out.replacen("#include <stdint.h>\n#include <stddef.h>\n", INT_TYPEDEFS, 1))
     })
 }
 
@@ -10384,9 +10384,13 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
 /// change does not re-emit or recompile the arrays: the main unit
 /// rebuilds on every build, and the arrays are most of its bytes on
 /// a large program. The symbol is not static, so an overlay copy in
-/// the executable replaces the base copy, as glue does.
+/// the executable replaces the base copy, as glue does. It holds data
+/// and `lust_loc_init` only, so it declares the four globals that sets
+/// and the integer types, not the runtime (`unit_header`).
 pub fn loc_unit(files: &SlotFiles, slot_lines: &[u32]) -> String {
-    let mut c = unit_header();
+    let mut c = format!(
+        "{INT_TYPEDEFS}extern const char *lust_file;\nextern const uint32_t *lust_fn_line;\nextern const char *const *lust_files;\nextern const uint32_t *lust_slot_file;\n"
+    );
     let lines: Vec<String> = slot_lines.iter().map(|l| l.to_string()).collect();
     let _ = writeln!(c, "static const uint32_t lines[{}] = {{{}}};", lines.len().max(1), lines.join(","));
     let file = files.paths.first().copied().unwrap_or("");
@@ -14508,6 +14512,29 @@ mod tests {
             assert!(unit.contains(&format!("typedef struct RcI_{m} {{ uint64_t strong; uint64_t weak; _Alignas(8) unsigned char v[]; }} RcI_{m};")), "the block holds no Big:\n{unit}");
             assert!(unit.contains(&format!("lust_rc_free(*p, _Alignof(RcI_{m}))")), "the drop glue frees the block with no size of Big:\n{unit}");
             assert!(!unit.contains(&format!("struct {ct} {{")), "the unit defines no Big:\n{unit}");
+        });
+    }
+
+    /// The release location unit: on an ELF target each live fn's word is an element of one
+    /// array with an assembler alias by the fn's name (the same symbols and values as the C
+    /// constants of other targets), ranked by id; the unit declares only the runtime's
+    /// location globals, not the runtime.
+    #[test]
+    fn loc_unit_aliases_one_array_on_elf() {
+        let names = std::sync::Arc::new(names::Names {
+            fns: vec![Some("00000000000000b2".to_string()), Some("00000000000000a1".to_string())],
+            adts: Vec::new(),
+            by_id: Default::default(),
+        });
+        let files = SlotFiles { paths: &["a.rs"], of_slot: &[0, 0] };
+        names::with(Some(&names), || {
+            let elf = names::loc_unit(&[0, 1], &files, &[3, 7], true);
+            assert!(elf.contains("const uint64_t lust_so_tab[2] __attribute__((aligned(8))) = {0ull,1099511627776ull};"), "{elf}");
+            assert!(elf.contains(".set lust_so_00000000000000a1, lust_so_tab+0\\n") && elf.contains(".set lust_so_00000000000000b2, lust_so_tab+8\\n"), "{elf}");
+            assert!(elf.contains("static const uint32_t lines[2] = {7,3};"), "lines by rank:\n{elf}");
+            assert!(!elf.contains("const uint64_t lust_so_0") && !elf.contains("lust_string_new"), "{elf}");
+            let c = names::loc_unit(&[0, 1], &files, &[3, 7], false);
+            assert!(c.contains("const uint64_t lust_so_00000000000000a1 = 0ull;") && c.contains("const uint64_t lust_so_00000000000000b2 = 1099511627776ull;"), "{c}");
         });
     }
 

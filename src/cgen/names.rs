@@ -173,8 +173,12 @@ pub(crate) fn hot_loc(loc: &str) -> String {
 /// `lust_so_<id>` per live fn (the slot its panic sites pack). The tables are indexed
 /// canonically, a live fn by its rank by id and a file by its rank by path, so the unit
 /// is a function of the program: the slot numbers and file ids a disk cache or a front
-/// image carried over from earlier builds do not reach the binary.
-pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> String {
+/// image carried over from earlier builds do not reach the binary. With `elf` (an ELF
+/// target) the words are one array, `lust_so_tab`, and each `lust_so_<id>` an assembler
+/// alias of its element: the same symbols, addresses and values as the constants (so the
+/// same binary), and a unit that compiles about 3x faster than one C constant per fn
+/// (tsgo's 78k: 1.8 s -> 0.55 s).
+pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32], elf: bool) -> String {
     let mut fns: Vec<(String, u32)> = live.iter().filter_map(|&s| fn_id(s).map(|id| (id, s))).collect();
     fns.sort_unstable();
     let file_of = |s: u32| files.of_slot.get(s as usize).copied().unwrap_or(0) as usize;
@@ -187,8 +191,19 @@ pub(crate) fn loc_unit(live: &[u32], files: &SlotFiles, slot_lines: &[u32]) -> S
         .collect();
     let lines: Vec<u32> = fns.iter().map(|&(_, s)| slot_lines.get(s as usize).copied().unwrap_or(0)).collect();
     let mut c = super::loc_unit(&SlotFiles { paths: &paths, of_slot: &of_slot }, &lines);
-    for (k, (id, _)) in fns.iter().enumerate() {
-        c.push_str(&format!("const uint64_t lust_so_{id} = {}ull;\n", (k as u64) << 40));
+    if elf && !fns.is_empty() {
+        let words: Vec<String> = (0..fns.len()).map(|k| format!("{}ull", (k as u64) << 40)).collect();
+        // 8-aligned as each constant is: a C compiler aligns a large array to 16, which moved
+        // every word 8 bytes when the line tables before it ended at 4 or 8 mod 16.
+        c.push_str(&format!("const uint64_t lust_so_tab[{}] __attribute__((aligned(8))) = {{{}}};\n__asm__(\n", fns.len(), words.join(",")));
+        for (k, (id, _)) in fns.iter().enumerate() {
+            c.push_str(&format!("\".globl lust_so_{id}\\n.set lust_so_{id}, lust_so_tab+{}\\n\"\n", 8 * k));
+        }
+        c.push_str(");\n");
+    } else {
+        for (k, (id, _)) in fns.iter().enumerate() {
+            c.push_str(&format!("const uint64_t lust_so_{id} = {}ull;\n", (k as u64) << 40));
+        }
     }
     c
 }

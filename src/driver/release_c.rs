@@ -85,6 +85,14 @@ pub fn shard_bytes() -> usize {
     std::env::var("LUST_RELEASE_SHARD_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) * 1024
 }
 
+/// Whether release C's target (`triple`, the host's when empty) makes ELF objects: not
+/// Apple's Mach-O, Windows' COFF or wasm. The location unit's symbol aliases are ELF
+/// assembler (`cgen::names::loc_unit`).
+pub fn elf_target(triple: &str) -> bool {
+    let t = if triple.is_empty() { crate::protocol::host_triple() } else { triple };
+    !["apple", "darwin", "windows", "wasm", "uefi"].iter().any(|os| t.contains(os))
+}
+
 pub fn groups(out: &[FnOut], names: &cgen::names::Names, file: &[String], line: &[u32]) -> Vec<(String, Vec<usize>)> {
     group_fns(out, names, file, line, unit_bytes(), unit_cap())
 }

@@ -5029,7 +5029,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
                     3 => (super::release_c::table_unit(&rg.iter().filter(|(_, s)| s.contains(&(main_slot as usize))).map(|(r, _)| r.clone()).collect::<Vec<_>>()), String::new()),
                     LOC_UNIT => {
                         let live: Vec<u32> = (0..caches.out.len()).filter(|&s| caches.out[s].has_code()).map(|s| s as u32).collect();
-                        (cgen::names::loc_unit(&live, &files, &slot_lines), String::new())
+                        (cgen::names::loc_unit(&live, &files, &slot_lines, super::release_c::elf_target(&req.session.target_triple)), String::new())
                     }
                     g => {
                         let (reg, slots) = &rg[g - FIRST_FN_UNIT];
