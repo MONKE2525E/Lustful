@@ -90,9 +90,10 @@ pub fn parse_output(text: &str) -> BuildOutput {
 
 /// One recorded build-script run: what its outputs depend on, re-checked
 /// per session, and the outputs consumers read. Stored as text lines in
-/// the disk cache dir (magic `LBS3`; `LBS2` lacked the script's other
-/// sources, the manifests, a rerun-if-changed dir's files, Cargo's
-/// default package files, the setup and the OUT_DIR re-check); W-DRIVER
+/// the disk cache dir (magic `LBS4`; `LBS3` lacked the script's compile,
+/// and `LBS2` the script's other sources, the manifests, a rerun-if-changed
+/// dir's files, Cargo's default package files, the setup and the OUT_DIR
+/// re-check); W-DRIVER
 /// owns the form and changes it only by bumping the magic, never by
 /// migrating an old record (an old record reads as a miss and the script
 /// re-runs).
@@ -116,6 +117,31 @@ pub struct Record {
     pub out_dir: Option<PathBuf>,
     /// The recorded directives (`rustc-cfg`, `rustc-env`, ...).
     pub output: BuildOutput,
+    /// The script's compile, when Cargo printed it and a replay made a binary.
+    pub compile: Option<Compile>,
+}
+
+/// A build script's compile as Cargo ran it (the dir, the vars Cargo set,
+/// rustc and its args), and the hash of the binary a `replay` of it made.
+/// When only the script crate's sources changed, a replay that makes the
+/// same binary means the run would do the same, so the record stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compile {
+    pub cwd: PathBuf,
+    pub vars: Vec<(String, String)>,
+    pub argv: Vec<String>,
+    pub bin: u64,
+}
+
+/// What a stored record says of the client's state now (`Record::holds`).
+#[derive(Debug, PartialEq, Eq)]
+enum Holds {
+    /// Everything the run read still holds.
+    All,
+    /// Only the script crate's sources changed, and a replay can tell.
+    OnlySources,
+    /// Something else changed: the script runs again.
+    No,
 }
 
 /// A file-system input of a record and its hash at the run: a path (a
@@ -331,7 +357,7 @@ impl Record {
     /// fails to read back is a miss, never a wrong answer.
     fn encode(&self) -> Vec<u8> {
         let p = |p: &Path| esc(&p.to_string_lossy());
-        let mut s = String::from("LBS3\n");
+        let mut s = String::from("LBS4\n");
         s.push_str(&format!("script {}\n", p(&self.script)));
         for (path, h) in &self.sources {
             s.push_str(&format!("src {h} {}\n", p(path)));
@@ -364,18 +390,29 @@ impl Record {
             s.push_str(&format!("renv {k} {}\n", esc(v)));
         }
         s.push_str(&format!("output {}\n", self.output_hash));
+        if let Some(c) = &self.compile {
+            s.push_str(&format!("cwd {}\n", p(&c.cwd)));
+            for (k, v) in &c.vars {
+                s.push_str(&format!("cvar {k} {}\n", esc(v)));
+            }
+            for a in &c.argv {
+                s.push_str(&format!("arg {}\n", esc(a)));
+            }
+            s.push_str(&format!("bin {}\n", c.bin));
+        }
         s.into_bytes()
     }
 
     /// Reads bytes written by `encode`. None on any malformed line.
     fn decode(text: &str) -> Option<Record> {
         let mut lines = text.lines();
-        if lines.next()? != "LBS3" {
+        if lines.next()? != "LBS4" {
             return None;
         }
         let (mut script, mut setup, mut output_hash) = (None, None, None);
         let (mut sources, mut inputs, mut env_inputs) = (Vec::new(), Vec::new(), Vec::new());
         let (mut rustc, mut out_dir, mut output) = (None, None, BuildOutput::default());
+        let (mut cwd, mut vars, mut argv, mut bin) = (None, Vec::new(), Vec::new(), None);
         for line in lines {
             let (tag, rest) = line.split_once(' ')?;
             // `<hash> <text>` and `<key> [<text>]` lines.
@@ -404,23 +441,47 @@ impl Record {
                     output.rustc_env.push((k.to_string(), v));
                 }
                 "output" => output_hash = Some(rest.parse().ok()?),
+                "cwd" => cwd = Some(PathBuf::from(unesc(rest))),
+                "cvar" => {
+                    let (k, v) = pair().unwrap_or((rest, String::new()));
+                    vars.push((k.to_string(), v));
+                }
+                "arg" => argv.push(unesc(rest)),
+                "bin" => bin = Some(rest.parse().ok()?),
                 _ => return None,
             }
         }
-        Some(Record { script: script?, sources, inputs, env_inputs, rustc, setup: setup?, output_hash: output_hash?, out_dir, output })
+        let compile = cwd.zip(bin).filter(|_| !argv.is_empty()).map(|(cwd, bin)| Compile { cwd, vars, argv, bin });
+        Some(Record {
+            script: script?,
+            sources,
+            inputs,
+            env_inputs,
+            rustc,
+            setup: setup?,
+            output_hash: output_hash?,
+            out_dir,
+            output,
+            compile,
+        })
     }
 
-    /// True while everything the run read still holds in the client's
-    /// `env`: the setup, each env input, each input path (the package's
-    /// files hashed as `package_hash`, with `cache_dir` left out), the
-    /// script crate's sources, and OUT_DIR's contents with the recorded
-    /// directives (a cleaned target dir is stale).
-    fn holds(&self, cache_dir: &Path, env: ClientEnv) -> bool {
-        self.setup == setup_hash(self.rustc.as_deref(), env)
+    /// Whether everything the run read still holds in the client's `env`:
+    /// the setup, each env input, each input path (the package's files
+    /// hashed as `package_hash`, with `cache_dir` left out), OUT_DIR's
+    /// contents with the recorded directives (a cleaned target dir is
+    /// stale), and the script crate's sources.
+    fn holds(&self, cache_dir: &Path, env: ClientEnv) -> Holds {
+        let rest = self.setup == setup_hash(self.rustc.as_deref(), env)
             && self.env_inputs.iter().all(|(k, v)| client_var(env, k) == *v)
             && self.inputs.iter().all(|i| i.hash == if i.package { package_hash(&i.path, cache_dir) } else { path_hash(&i.path) })
-            && self.sources.iter().all(|(p, h)| file_hash(p) == *h)
-            && output_hash(&self.output, self.out_dir.as_deref()) == self.output_hash
+            && output_hash(&self.output, self.out_dir.as_deref()) == self.output_hash;
+        match (rest, self.sources.iter().all(|(p, h)| file_hash(p) == *h)) {
+            (false, _) => Holds::No,
+            (true, true) => Holds::All,
+            (true, false) if self.compile.is_some() => Holds::OnlySources,
+            (true, false) => Holds::No,
+        }
     }
 }
 
@@ -497,11 +558,100 @@ pub fn refresh(manifest_dir: &Path, cache_dir: &Path, env: ClientEnv) -> Refresh
     }
 }
 
-/// The stored record for `manifest_dir` while everything it read still holds in `env`.
+/// The stored record for `manifest_dir` while everything it read still
+/// holds in `env`. When only the script crate's sources changed (a comment,
+/// say), the script's compile is replayed: the same binary means the same
+/// run, so the record takes the new sources (and any var the compile now
+/// reads) and stands.
 fn fresh_record(manifest_dir: &Path, cache_dir: &Path, script: &Path, env: ClientEnv) -> Option<Record> {
     let path = record_path(cache_dir, manifest_dir);
-    let rec = std::fs::read_to_string(&path).ok().and_then(|t| Record::decode(&t))?;
-    (rec.script == script && rec.holds(cache_dir, env)).then_some(rec)
+    let mut rec = std::fs::read_to_string(&path).ok().and_then(|t| Record::decode(&t))?;
+    if rec.script != script {
+        return None;
+    }
+    match rec.holds(cache_dir, env) {
+        Holds::All => Some(rec),
+        Holds::No => None,
+        Holds::OnlySources => {
+            let c = rec.compile.as_ref()?;
+            let (bin, sources, vars) = replay(c, rec.rustc.as_deref(), script, cache_dir, env)?;
+            if bin != c.bin {
+                return None;
+            }
+            rec.sources = source_hashes(sources, script);
+            for k in vars.into_iter().filter(|k| !k.starts_with("CARGO")) {
+                if !rec.env_inputs.iter().any(|(e, _)| *e == k) {
+                    let v = client_var(env, &k);
+                    rec.env_inputs.push((k, v));
+                }
+            }
+            store_record(cache_dir, manifest_dir, &rec);
+            Some(rec)
+        }
+    }
+}
+
+/// `sources` and the script itself (the one source known without the
+/// compile's dep-info), with their hashes, each path once.
+fn source_hashes(mut sources: Vec<PathBuf>, script: &Path) -> Vec<(PathBuf, u64)> {
+    sources.push(script.to_path_buf());
+    sources.sort();
+    sources.dedup();
+    sources
+        .into_iter()
+        .map(|p| {
+            let h = file_hash(&p);
+            (p, h)
+        })
+        .collect()
+}
+
+/// Compiles the script crate again as `c` says, without incremental state
+/// and into a scratch dir under `cache_dir`, with the client's env plus the
+/// vars Cargo set, and with rustc as Cargo gave it to the script when the
+/// compile named a bare `rustc`: the binary's hash, and the sources and
+/// vars the compile read (its dep-info). None when it fails.
+fn replay(c: &Compile, rustc: Option<&Path>, script: &Path, cache_dir: &Path, env: ClientEnv) -> Option<(u64, Vec<PathBuf>, Vec<String>)> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let scratch = cache_dir.join(format!("buildscript-replay-{}-{nanos:x}", std::process::id()));
+    std::fs::create_dir_all(&scratch).ok()?;
+    let mut argv: Vec<String> = c.argv.first().into_iter().cloned().collect();
+    let mut it = c.argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out-dir" => {
+                it.next();
+                argv.extend(["--out-dir".to_string(), scratch.to_string_lossy().into_owned()]);
+            }
+            "-C" => match it.next() {
+                Some(v) if v.starts_with("incremental=") => {}
+                v => argv.extend(std::iter::once(a.clone()).chain(v.cloned())),
+            },
+            _ if a.starts_with("-Cincremental=") => {}
+            _ => argv.push(a.clone()),
+        }
+    }
+    let program = match (argv.first(), rustc) {
+        (Some(p), Some(r)) if !p.contains('/') => r.to_path_buf(),
+        (p, _) => PathBuf::from(p?),
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&argv[1..])
+        .current_dir(&c.cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(env) = env {
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    }
+    cmd.envs(c.vars.iter().map(|(k, v)| (k, v)));
+    let made = cmd.status().is_ok_and(|s| s.success()).then(|| {
+        let bin = std::fs::read(scratch.join(format!("build_script_build{}", extra_filename(&argv)))).ok()?;
+        let (_, sources, vars) = compile_dep_info(&argv, script)?;
+        Some((hash_parts(&[&bin]), sources, vars))
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    made.flatten()
 }
 
 /// Writes one record to the cache dir (tmp file plus rename).
@@ -620,19 +770,23 @@ fn printed_commands(stderr: &str) -> Vec<(Vec<(String, String)>, Vec<String>)> {
         .collect()
 }
 
-/// The source files and the env vars a build script's compile read, from
-/// the dep-info rustc wrote beside it (`--emit=dep-info`): `argv` is the
-/// compile as Cargo printed it, and relative paths are joined to the dir
-/// Cargo ran rustc in (the dir whose join with the script argument is the
-/// script). None when the dep-info is not there or that dir is not found.
-fn compile_dep_info(argv: &[String], script: &Path) -> Option<(Vec<PathBuf>, Vec<String>)> {
-    let arg = |name: &str| argv.windows(2).find(|w| w[0] == name).map(|w| w[1].as_str());
-    let extra = argv
-        .windows(2)
+/// The `-C extra-filename=` value of a rustc command line ("" without one).
+fn extra_filename(argv: &[String]) -> &str {
+    argv.windows(2)
         .find_map(|w| (w[0] == "-C").then(|| w[1].strip_prefix("extra-filename=")).flatten())
         .or_else(|| argv.iter().find_map(|a| a.strip_prefix("-Cextra-filename=")))
-        .unwrap_or("");
-    let text = std::fs::read_to_string(Path::new(arg("--out-dir")?).join(format!("build_script_build{extra}.d"))).ok()?;
+        .unwrap_or("")
+}
+
+/// The dir Cargo ran a build script's compile in, and the source files and
+/// env vars the compile read, from the dep-info rustc wrote beside it
+/// (`--emit=dep-info`): `argv` is the compile as Cargo printed it, and
+/// relative paths are joined to that dir (the one whose join with the
+/// script argument is the script). None when the dep-info is not there or
+/// that dir is not found.
+fn compile_dep_info(argv: &[String], script: &Path) -> Option<(PathBuf, Vec<PathBuf>, Vec<String>)> {
+    let arg = |name: &str| argv.windows(2).find(|w| w[0] == name).map(|w| w[1].as_str());
+    let text = std::fs::read_to_string(Path::new(arg("--out-dir")?).join(format!("build_script_build{}.d", extra_filename(argv)))).ok()?;
     let src = argv.iter().skip(1).find(|a| !a.starts_with('-') && a.ends_with(".rs"))?;
     let script = std::fs::canonicalize(script).ok()?;
     let cwd = script.ancestors().skip(1).find(|d| d.join(src) == script)?.to_path_buf();
@@ -651,7 +805,7 @@ fn compile_dep_info(argv: &[String], script: &Path) -> Option<(Vec<PathBuf>, Vec
     let files = files.into_iter().filter(|f| !f.is_empty()).map(|f| cwd.join(f)).collect();
     let vars =
         text.lines().filter_map(|l| l.strip_prefix("# env-dep:")).map(|v| v.split_once('=').map_or(v, |(k, _)| k).to_string()).collect();
-    Some((files, vars))
+    Some((cwd, files, vars))
 }
 
 /// The first lines of a failed `cargo -vv` run that are not Cargo's own
@@ -752,19 +906,27 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path, cache_dir: &Path, env: 
             && argv.first().is_some_and(|p| Path::new(p).file_name().is_some_and(|f| f.to_string_lossy().starts_with("build-script-")))
     });
     let rustc = run.and_then(|(vars, _)| vars.iter().find(|(k, _)| k == "RUSTC")).map(|(_, v)| PathBuf::from(v));
-    // The script itself by its own path too: without the compile's dep-info,
-    // it is the one source known.
-    let (mut sources, compile_vars) = compile.and_then(|(_, argv)| compile_dep_info(argv, script)).unwrap_or_default();
-    sources.push(script.to_path_buf());
-    sources.sort();
-    sources.dedup();
+    let dep = compile.and_then(|(_, argv)| compile_dep_info(argv, script));
+    let (sources, compile_vars) = dep.clone().map(|(_, f, v)| (f, v)).unwrap_or_default();
+    // The compile, replayed once now: its binary's hash, for the next check.
+    let compile = compile.zip(dep).and_then(|((vars, argv), (cwd, _, _))| {
+        let mut c = Compile { cwd, vars: vars.clone(), argv: argv.clone(), bin: 0 };
+        c.bin = replay(&c, rustc.as_deref(), script, cache_dir, env)?.0;
+        Some(c)
+    });
+    // A rerun-if-changed path that is also a source of the script crate
+    // (scripts list `build.rs` to turn off Cargo's package default) is checked
+    // as a source: by its hash, or with a compile, by the binary a replay
+    // makes. This takes it that a script does not read its own sources when
+    // it runs; Cargo reruns the script when they change because it compiles
+    // it again.
+    let canon_sources: Vec<PathBuf> = if compile.is_some() { sources.iter().map(|p| canon(p)).collect() } else { Vec::new() };
     let mut inputs: Vec<Input> = parsed
         .rerun_if_changed
         .iter()
-        .map(|p| {
-            let path = if Path::new(p).is_absolute() { PathBuf::from(p) } else { manifest_dir.join(p) };
-            Input { package: false, hash: path_hash(&path), path }
-        })
+        .map(|p| if Path::new(p).is_absolute() { PathBuf::from(p) } else { manifest_dir.join(p) })
+        .filter(|path| !canon_sources.contains(&canon(path)))
+        .map(|path| Input { package: false, hash: path_hash(&path), path })
         .collect();
     // Cargo's default for a script with no rerun-if directive.
     if parsed.rerun_if_changed.is_empty() && parsed.rerun_if_env_changed.is_empty() {
@@ -783,19 +945,14 @@ fn run_through_cargo(manifest_dir: &Path, script: &Path, cache_dir: &Path, env: 
     Ok(Record {
         output_hash: output_hash(&parsed, Some(&out_dir_path)),
         script: script.to_path_buf(),
-        sources: sources
-            .into_iter()
-            .map(|p| {
-                let h = file_hash(&p);
-                (p, h)
-            })
-            .collect(),
+        sources: source_hashes(sources, script),
         inputs,
         env_inputs,
         setup: setup_hash(rustc.as_deref(), env),
         rustc,
         out_dir: Some(out_dir_path),
         output: parsed,
+        compile,
     })
 }
 
@@ -855,6 +1012,7 @@ mod tests {
             output_hash: output_hash(&output, Some(&out)),
             out_dir: Some(out.clone()),
             output,
+            compile: None,
         };
         let back = Record::decode(&String::from_utf8(rec.encode()).unwrap()).unwrap();
         assert_eq!(
@@ -863,26 +1021,26 @@ mod tests {
         );
         assert_eq!((back.out_dir.clone(), back.output.clone()), (rec.out_dir.clone(), rec.output.clone()));
         let cache = dir.join("cache");
-        assert!(back.holds(&cache, Some(&base)), "unchanged inputs hold");
+        assert_eq!(back.holds(&cache, Some(&base)), Holds::All, "unchanged inputs hold");
         // Env values come from the client's env, not this process's.
-        assert!(!back.holds(&cache, Some(&with("LUST_BS_TEST_ENV", "1"))), "a client with the var set is stale");
-        assert!(!back.holds(&cache, Some(&with("LUST_BS_TEST_ENV", ""))), "set to empty is not unset");
-        assert!(!back.holds(&cache, Some(&with("RUSTFLAGS", "-Copt-level=1"))), "a client Cargo var is part of the setup");
+        assert_eq!(back.holds(&cache, Some(&with("LUST_BS_TEST_ENV", "1"))), Holds::No, "a client with the var set is stale");
+        assert_eq!(back.holds(&cache, Some(&with("LUST_BS_TEST_ENV", ""))), Holds::No, "set to empty is not unset");
+        assert_eq!(back.holds(&cache, Some(&with("RUSTFLAGS", "-Copt-level=1"))), Holds::No, "a client Cargo var is part of the setup");
         std::fs::write(&data, "v2").unwrap();
-        assert!(!back.holds(&cache, Some(&base)), "edited rerun-if-changed file is stale");
+        assert_eq!(back.holds(&cache, Some(&base)), Holds::No, "edited rerun-if-changed file is stale");
         std::fs::write(&data, "v1").unwrap();
         std::fs::write(assets.join("b.txt"), "two").unwrap();
-        assert!(!back.holds(&cache, Some(&base)), "a new file in a rerun-if-changed dir is stale");
+        assert_eq!(back.holds(&cache, Some(&base)), Holds::No, "a new file in a rerun-if-changed dir is stale");
         std::fs::remove_file(assets.join("b.txt")).unwrap();
         std::fs::write(assets.join("a.txt"), "uno").unwrap();
-        assert!(!back.holds(&cache, Some(&base)), "an edited file in a rerun-if-changed dir is stale");
+        assert_eq!(back.holds(&cache, Some(&base)), Holds::No, "an edited file in a rerun-if-changed dir is stale");
         std::fs::write(assets.join("a.txt"), "one").unwrap();
-        assert!(back.holds(&cache, Some(&base)), "the same contents again hold");
+        assert_eq!(back.holds(&cache, Some(&base)), Holds::All, "the same contents again hold");
         std::fs::write(&script, "fn main() { }").unwrap();
-        assert!(!back.holds(&cache, Some(&base)), "an edited source is stale");
+        assert_eq!(back.holds(&cache, Some(&base)), Holds::No, "an edited source is stale");
         std::fs::write(&script, "fn main() {}").unwrap();
         std::fs::remove_file(out.join("gen.rs")).unwrap();
-        assert!(!back.holds(&cache, Some(&base)), "a file gone from OUT_DIR is stale");
+        assert_eq!(back.holds(&cache, Some(&base)), Holds::No, "a file gone from OUT_DIR is stale");
         assert!(Record::decode("junk").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -901,17 +1059,14 @@ mod tests {
         std::fs::write(pkg.join("Cargo.toml"), manifest).unwrap();
         std::fs::write(pkg.join("src/main.rs"), "fn main() {}\n").unwrap();
         // `helper.rs` is a module of the script (its compile's dep-info names it), not a rerun-if-changed path.
-        std::fs::write(
-            pkg.join("build.rs"),
-            "mod helper;\nfn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    \
+        let script = "// v1: a plain comment.\nmod helper;\n/// Prints the directives.\nfn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    \
              println!(\"cargo:rerun-if-changed=assets\");\n    println!(\"cargo:rustc-cfg=bs_{}\", helper::tag());\n    \
              let data = std::fs::read_to_string(\"data.txt\").unwrap_or_default();\n    println!(\"cargo:rustc-env=BS_DATA={}\", data.trim());\n    \
              std::fs::write(std::path::Path::new(&std::env::var(\"OUT_DIR\").unwrap()).join(\"gen.txt\"), &data).unwrap();\n    \
              use std::io::Write;\n    let log = std::env::var(\"LUST_BS_TEST_LOG\").unwrap();\n    \
-             std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap().write_all(b\"run\\n\").unwrap();\n}\n",
-        )
-        .unwrap();
-        std::fs::write(pkg.join("helper.rs"), "pub fn tag() -> &'static str {\n    \"a\"\n}\n").unwrap();
+             std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap().write_all(b\"run\\n\").unwrap();\n}\n";
+        std::fs::write(pkg.join("build.rs"), script).unwrap();
+        std::fs::write(pkg.join("helper.rs"), "// helper v1\npub fn tag() -> &'static str {\n    \"a\"\n}\n").unwrap();
         std::fs::write(pkg.join("data.txt"), "v1\n").unwrap();
         std::fs::write(pkg.join("assets/a.txt"), "one\n").unwrap();
         let env: Vec<(String, String)> =
@@ -928,23 +1083,36 @@ mod tests {
         assert_eq!((o.rustc_cfg, o.rustc_env), (vec!["bs_a".to_string()], vec![("BS_DATA".to_string(), "v1".to_string())]));
         assert_eq!(runs(&log), 1, "the first build runs the script");
         check(&pkg, &log, 1, "nothing changed: no run");
+        // Comments the compile drops: the same binary, so no run.
+        let edited = script
+            .replace("v1: a plain comment.", "v2: another comment, longer.")
+            .replace("Prints the directives.", "Prints what Cargo reads.");
+        std::fs::write(pkg.join("build.rs"), &edited).unwrap();
+        check(&pkg, &log, 1, "a comment and a doc comment of the script edited");
+        std::fs::write(pkg.join("helper.rs"), "// helper v2, edited\npub fn tag() -> &'static str {\n    \"a\"\n}\n").unwrap();
+        check(&pkg, &log, 1, "a comment of the script's module edited");
+        check(&pkg, &log, 1, "nothing changed after the replays: no run");
+        // A new line moves the code under it, and with it the panic
+        // locations in the binary: a run.
+        std::fs::write(pkg.join("build.rs"), format!("// a new first line\n{edited}")).unwrap();
+        check(&pkg, &log, 2, "a comment line added above code that can panic");
         std::fs::write(pkg.join("assets/a.txt"), "uno\n").unwrap();
-        check(&pkg, &log, 2, "a file edited inside a rerun-if-changed dir");
+        check(&pkg, &log, 3, "a file edited inside a rerun-if-changed dir");
         std::fs::write(pkg.join("assets/b.txt"), "two\n").unwrap();
-        check(&pkg, &log, 3, "a file added inside a rerun-if-changed dir");
+        check(&pkg, &log, 4, "a file added inside a rerun-if-changed dir");
         std::fs::write(pkg.join("data.txt"), "v2\n").unwrap();
-        check(&pkg, &log, 4, "a rerun-if-changed file edited");
-        std::fs::write(pkg.join("helper.rs"), "pub fn tag() -> &'static str {\n    \"b\"\n}\n").unwrap();
-        check(&pkg, &log, 5, "a module of the script edited");
+        check(&pkg, &log, 5, "a rerun-if-changed file edited");
+        std::fs::write(pkg.join("helper.rs"), "// helper v2, edited\npub fn tag() -> &'static str {\n    \"b\"\n}\n").unwrap();
+        check(&pkg, &log, 6, "a module of the script edited");
         let o = outputs(&pkg, &cache, Some(&env)).unwrap().unwrap();
         assert_eq!((o.rustc_cfg, o.rustc_env), (vec!["bs_b".to_string()], vec![("BS_DATA".to_string(), "v2".to_string())]));
         std::fs::write(pkg.join("Cargo.toml"), manifest.replace("edition", "description = \"x\"\nedition")).unwrap();
-        check(&pkg, &log, 6, "the manifest edited");
+        check(&pkg, &log, 7, "the manifest edited");
         let out_dir = o.out_dir.unwrap();
         std::fs::remove_file(out_dir.join("gen.txt")).unwrap();
-        check(&pkg, &log, 7, "a file gone from OUT_DIR");
+        check(&pkg, &log, 8, "a file gone from OUT_DIR");
         assert!(out_dir.join("gen.txt").exists(), "the run wrote it again");
-        check(&pkg, &log, 7, "nothing changed again: no run");
+        check(&pkg, &log, 8, "nothing changed again: no run");
         // A script with no rerun-if directive reruns on any package file
         // change (Cargo's default), and not on Cargo's own target dir.
         let (pkg2, log2) = (root.join("pkg2"), root.join("runs2.log"));
