@@ -2163,6 +2163,9 @@ fn flock_wait(fd: c_int) -> bool {
 /// detached drops finish. The pool stays stopped: the process exits after
 /// the save.
 fn quiesce() {
+    // Under `cargo test` the pool tests wait for good, as the pool does.
+    #[cfg(test)]
+    std::mem::forget(crate::pool::stop_tests());
     std::mem::forget(crate::pool::stop());
     crate::pool::wait_detached();
 }

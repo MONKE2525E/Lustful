@@ -358,6 +358,15 @@ pub fn stop() -> Stopped {
     stopped
 }
 
+/// Held under `cargo test` by each test whose code calls `stop` (the pool
+/// tests, tcc's in-memory run): one test's stop would join or hold the pool
+/// threads that another test is counting.
+#[cfg(test)]
+pub(crate) fn stop_tests() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Set by a one-shot compile (`small_pages_in_parallel`): parallel regions
 /// run without transparent huge pages, serial code keeps them.
 static SMALL_PAGES: AtomicBool = AtomicBool::new(false);
@@ -456,18 +465,11 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{THREAD_NAME, par_map, stop};
+    use super::{THREAD_NAME, par_map, stop, stop_tests};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Pool threads inside `worker` now: each counts itself while it runs.
     static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-    /// Held by each test that calls `stop`: one test's stop would join the
-    /// pool threads that another test is counting.
-    fn stop_tests() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     pub(super) struct Live;
 

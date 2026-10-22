@@ -421,6 +421,8 @@ pub fn run_in_memory(units: &[(PathBuf, String)], runtime_obj: &Path, argv: &[St
             std::mem::transmute::<*mut c_void, extern "C" fn(c_int, *mut *mut c_char) -> c_int>(sym)
         };
         // No other thread may live at the fork (see above).
+        #[cfg(test)]
+        let _serial = crate::pool::stop_tests();
         let pool_stopped = crate::pool::stop();
         if !lone_thread() {
             return Err("another thread is alive, and an in-memory run forks".into());
