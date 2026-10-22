@@ -2184,7 +2184,7 @@ fn quiesce() {
 /// writes its result line to `save.log` in the state directory. Here the
 /// session is leaked: the process exits next. Saves here when the fork
 /// fails.
-pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> {
+pub fn save_background(dir: &Path, mut roots: Box<Roots>) -> Result<String, String> {
     use std::os::fd::AsRawFd;
     if !arena_on() {
         return Err("not an image process".into());
@@ -2211,8 +2211,10 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
         }
         save_idle();
         // The parent runs a parked cc step after the fork (`driver::defer_cc`): its unit
-        // texts are freed here, so they are not live blocks of the image.
+        // texts are freed here, so they are not live blocks of the image. So are the kept
+        // programs no later build reuses, which the parent left to this child.
         crate::driver::drop_parked_cc();
+        crate::driver::drop_unkept(&mut roots.sessions);
         // A base from this heap would keep its scattered pages: rebuild the image cold instead
         // (`compaction_due`), unless a job of its own does that. On success the exec does not
         // return.
@@ -2231,6 +2233,7 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
     if pid < 0 {
         // No child: a parked cc step runs first, so its unit texts are freed before the save.
         crate::driver::finish_parked_cc();
+        crate::driver::drop_unkept(&mut roots.sessions);
         return write_image(dir, roots);
     }
     std::mem::forget(roots);
