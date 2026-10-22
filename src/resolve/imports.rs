@@ -14,8 +14,9 @@
 // glob copy go in any order: each name's copy reads the source's state of
 // that name and writes the importer's (only the order of the importer's
 // `glob_log`, which is read as a set, shows it). Each binding changes
-// state at most twice (absent, glob, explicit), so the fixpoint ends; a round cap of `modules + 2` full
-// sweeps guards against bugs (a hit is an internal error today).
+// state at most twice (absent, glob, explicit), so the fixpoint ends. The sweep
+// cap also allows each single import to publish its three namespaces separately;
+// hitting the cap is an internal error.
 use crate::ast;
 use crate::def::DefId;
 use crate::diag::{Diag, Span};
@@ -2400,6 +2401,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     let mut diags = Vec::new();
     let mut pending: Vec<(usize, &Import)> = imports.iter().enumerate().collect();
     let mut resolved = vec![false; imports.len()];
+    let mut single_progress: Vec<SingleProgress> = (0..imports.len()).map(|_| SingleProgress::default()).collect();
     tables.pending_single.clear();
     tables.ambig_single.clear();
     tables.single_binds.clear();
@@ -2427,7 +2429,8 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
     let check_skip = std::env::var_os("LUST_CHECK_GLOB_SKIP").is_some();
     loop {
         rounds += 1;
-        if rounds > cap + imports.len() {
+        // A single can publish its three namespaces in separate sweeps.
+        if rounds > cap + 3 * imports.len() {
             return Err("internal: import worklist did not settle".to_string());
         }
         let mut changed = false;
@@ -2452,7 +2455,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
                 }
                 if check_skip {
                     let n = diags.len();
-                    let again = try_import(tables, imp, self_sym, interner, &mut diags);
+                    let again = try_import(tables, imp, self_sym, interner, &mut diags, &mut single_progress[i]);
                     assert!(
                         matches!(again, TryOut::Stay { changed: false, .. }) && diags.len() == n,
                         "internal: a short glob copy missed a change"
@@ -2462,7 +2465,7 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
                 still.push((i, imp));
                 continue;
             }
-            let out = try_import(tables, imp, self_sym, interner, &mut diags);
+            let out = try_import(tables, imp, self_sym, interner, &mut diags, &mut single_progress[i]);
             last_copy[i] = match (&out, src) {
                 (TryOut::Stay { .. }, Some(src)) => Some((src, tables.log_len(src), tables.log_len(imp.module))),
                 _ => None,
@@ -2480,6 +2483,12 @@ pub fn run_imports(tables: &mut ResolvedTables, imports: &[Import], interner: &I
                 }
                 TryOut::Stay { changed: c, resolved: r } => {
                     changed |= c;
+                    if r && !resolved[i]
+                        && let ImportKind::Single { name, .. } = &imp.kind
+                    {
+                        settle_single(tables, imp.module, *name, imp.span);
+                        changed |= glob_bound(tables, imp.module, *name);
+                    }
                     resolved[i] |= r;
                     still.push((i, imp));
                 }
@@ -2734,12 +2743,22 @@ fn glob_source(tables: &ResolvedTables, imp: &Import, interner: &Interner) -> Op
 
 enum TryOut {
     Done(bool),
-    /// Keep this import for the next sweep (a live glob).
+    /// Keep this import for the next sweep (a glob or a single with
+    /// namespaces that may still arrive).
     Stay {
         changed: bool,
         resolved: bool,
     },
     Wait,
+}
+
+/// Per work item, not per span or target: two written imports of the
+/// same item are still duplicates, but retrying one import is not.
+#[derive(Default)]
+struct SingleProgress {
+    namespaces: u8,
+    std_paths: Vec<Vec<Sym>>,
+    dup_reported: bool,
 }
 
 /// The namespaces an explicit import of a canonical std path
@@ -2863,7 +2882,14 @@ fn record_std_alias(tables: &mut ResolvedTables, imp: &Import, path: &[Sym], nam
 }
 
 /// Tries one import against the current tables.
-fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner: &Interner, diags: &mut Vec<Diag>) -> TryOut {
+fn try_import(
+    tables: &mut ResolvedTables,
+    imp: &Import,
+    self_sym: Sym,
+    interner: &Interner,
+    diags: &mut Vec<Diag>,
+    progress: &mut SingleProgress,
+) -> TryOut {
     // `use std::io::Write;`: an item of the shipped platform crate
     // (W-SHIM) imports from that crate's module tree.
     if let ImportKind::Single { path, name } = &imp.kind
@@ -2872,7 +2898,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
         && (imp.leading_colon || tables.std_is_extern(imp.module, interner))
     {
         let imp2 = Import { kind: ImportKind::Single { path: redirected, name: *name }, leading_colon: false, ..imp.clone() };
-        return try_import(tables, &imp2, self_sym, interner, diags);
+        return try_import(tables, &imp2, self_sym, interner, diags, progress);
     }
     match &imp.kind {
         ImportKind::BadLeading { .. } => {
@@ -3261,7 +3287,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         return TryOut::Wait;
                     }
                     // Bind the name in every namespace that has it.
-                    let mut any = false;
+                    let mut any = progress.namespaces != 0;
                     let mut changed = false;
                     let mut saw_private = false;
                     // A re-export of an import binding reaches no further
@@ -3271,6 +3297,9 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                     let mut found: Vec<(Namespace, Bind)> = Vec::new();
                     let mut alias_paths: Vec<Vec<Sym>> = Vec::new();
                     for ns in [Namespace::Type, Namespace::Value, Namespace::Macro] {
+                        if progress.namespaces & (1 << ns_index(ns)) != 0 {
+                            continue;
+                        }
                         let state = match ns {
                             Namespace::Macro => tables.macro_import_lookup(imp, src, mod_path.is_empty(), last),
                             _ => tables.lookup(src, ns, last).cloned(),
@@ -3306,11 +3335,29 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                 let out = insert_ambiguous(tables, imp.module, ns, *name, vec![entry]);
                                 changed |= out;
                                 tables.ambig_single.push((imp.clone(), ns, src, last));
+                                progress.namespaces |= 1 << ns_index(ns);
                             }
                             // A std import in the source module binds
                             // no target; importing it onward copies
                             // the alias under this import's name.
                             None => {
+                                // A source dependency's prelude entry
+                                // resolves to its real root module, not
+                                // Target::Extern, and has no local map
+                                // entry. Import it in the type namespace
+                                // while retaining other namespaces below.
+                                if mod_path.is_empty()
+                                    && ns == Namespace::Type
+                                    && !imp.leading_colon
+                                    && let SegBind::Extern(i) = tables.module_seg(imp.module, last, ns, interner).bind
+                                    && let Some(root) = tables.externs[i as usize].root_module
+                                {
+                                    any = true;
+                                    found.push((ns, Bind {
+                                        target: Target::Module(root), vis: imp.vis.clone(), rank: 2, def_module: imp.module,
+                                    }));
+                                    continue;
+                                }
                                 let key = (src, ns_index(ns) as u8, last);
                                 if let Some((avis, apath)) = tables.std_aliases.get(&key).cloned() {
                                     let adef = tables.std_alias_def_module(key);
@@ -3320,6 +3367,7 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                                         if !alias_paths.contains(&apath) {
                                             alias_paths.push(apath);
                                         }
+                                        progress.namespaces |= 1 << ns_index(ns);
                                     } else {
                                         saw_private = true;
                                     }
@@ -3360,8 +3408,8 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                         diags.push(reexport_diag(interner.get(last), imp.span));
                         return TryOut::Done(false);
                     }
-                    let mut dup_reported = false;
                     for (ns, bind) in found {
+                        progress.namespaces |= 1 << ns_index(ns);
                         let bind_name = import_bind_name(*name, bind.target, interner);
                         // The macro self re-export idiom: `macro_rules! m`
                         // plus one `use m;` in the defining module is one
@@ -3389,20 +3437,26 @@ fn try_import(tables: &mut ResolvedTables, imp: &Import, self_sym: Sym, interner
                             tables.single_binds.push((imp.span, imp.module, src, last, ns, bind.target));
                         }
                         let out = tables.insert(imp.module, ns, bind_name, bind);
-                        if dup && interner.get(*name) != "_" {
-                            if !dup_reported {
+                        if (dup || out == InsertOut::Dup) && interner.get(*name) != "_" {
+                            if !progress.dup_reported {
                                 diags.push(dup_diag(imp, *name, interner));
-                                dup_reported = true;
+                                progress.dup_reported = true;
                             }
-                        } else {
-                            report_dup(out, imp, *name, interner, diags);
                         }
                         changed |= out == InsertOut::Changed;
                     }
                     for apath in &alias_paths {
-                        changed |= record_std_alias(tables, imp, apath, *name, interner, diags);
+                        if !progress.std_paths.contains(apath) {
+                            changed |= record_std_alias(tables, imp, apath, *name, interner, diags);
+                            progress.std_paths.push(apath.clone());
+                        }
                     }
-                    TryOut::Done(changed)
+                    // Missing namespaces can arrive through another single
+                    // import or glob. Publish each known namespace once and
+                    // keep looking for the others until the shared fixpoint.
+                    // Finalization still checks every published non-macro
+                    // target against the final source binding.
+                    TryOut::Stay { changed, resolved: true }
                 }
                 PathRes::Done(Target::Extern(i)) => {
                     // `use dep::Name` where the path did not enter a
@@ -3682,4 +3736,232 @@ pub fn ambiguous_diag(name: &str, span: Span) -> Diag {
         format!("`{name}` is ambiguous: two glob imports bring different items with this name"),
         "Import the one you mean explicitly: an explicit import wins over globs.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_dep(tables: &mut ResolvedTables, owner: ModuleId, name: &str, interner: &Interner) -> ModuleId {
+        let root = tables.add_crate_root(interner.intern("package_name"));
+        tables.externs.push(ExternInfo {
+            name: name.to_string(),
+            def: DefId::PLACEHOLDER,
+            is_std_lib: false,
+            owner,
+            root_module: Some(root),
+            unsupported: None,
+        });
+        root
+    }
+
+    fn single(module: ModuleId, path: &[&str], name: &str, interner: &Interner) -> Import {
+        Import {
+            module,
+            vis: VisKind::Priv,
+            leading_colon: false,
+            span: Span::default(),
+            kind: ImportKind::Single {
+                path: path.iter().map(|s| interner.intern(s)).collect(),
+                name: interner.intern(name),
+            },
+        }
+    }
+
+    fn path(tables: &ResolvedTables, from: ModuleId, names: &[&str], ns: Namespace, leading: bool, interner: &Interner) -> PathRes {
+        let names: Vec<_> = names.iter().map(|s| interner.intern(s)).collect();
+        tables.resolve_path(from, &names, ns, PathMode::Use, leading, interner)
+    }
+
+    #[test]
+    fn source_root_alias_keeps_dependency_identity_and_macro_paths() {
+        let interner = Interner::default();
+        let mut tables = ResolvedTables::new(interner.intern("app"));
+        let app = ModuleId(0);
+        let dep = source_dep(&mut tables, app, "util", &interner);
+        let consumer = tables.add_crate_root(interner.intern("consumer"));
+        let other_dep = source_dep(&mut tables, consumer, "util", &interner);
+        let macro_target = Target::Def(DefId::PLACEHOLDER);
+        tables.insert(dep, Namespace::Macro, interner.intern("m"), Bind {
+            target: macro_target, vis: VisKind::Pub, rank: 2, def_module: dep,
+        });
+        tables.insert(app, Namespace::Value, interner.intern("util"), Bind {
+            target: Target::Def(DefId::PLACEHOLDER), vis: VisKind::Priv, rank: 2, def_module: app,
+        });
+        // Reverse order exercises fixpoint retries through root aliases.
+        let imports = [
+            single(app, &["renamed", "m"], "imported", &interner),
+            single(app, &["later"], "renamed", &interner),
+            single(app, &["util"], "later", &interner),
+            single(consumer, &["util"], "renamed", &interner),
+        ];
+        let diags = run_imports(&mut tables, &imports, &interner).unwrap();
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(path(&tables, app, &["renamed"], Namespace::Type, false, &interner), PathRes::Done(Target::Module(dep)));
+        assert_eq!(path(&tables, consumer, &["renamed"], Namespace::Type, false, &interner), PathRes::Done(Target::Module(other_dep)));
+        for (names, leading) in [(&["renamed", "m"][..], false), (&["imported"][..], false), (&["util", "m"][..], false), (&["util", "m"][..], true)] {
+            assert_eq!(path(&tables, app, names, Namespace::Macro, leading, &interner), PathRes::Done(macro_target));
+        }
+        assert_eq!(path(&tables, app, &["renamed"], Namespace::Type, true, &interner), PathRes::Absent);
+        assert_eq!(path(&tables, app, &["later"], Namespace::Value, false, &interner), PathRes::Done(Target::Def(DefId::PLACEHOLDER)));
+        assert!(tables.lookup(app, Namespace::Macro, interner.intern("later")).is_none());
+    }
+
+    #[test]
+    fn source_root_alias_respects_shadow_and_absolute_imports() {
+        let interner = Interner::default();
+        let mut tables = ResolvedTables::new(interner.intern("app"));
+        let app = ModuleId(0);
+        let dep = source_dep(&mut tables, app, "util", &interner);
+        let local = tables.add_module(app, interner.intern("util"), VisKind::Pub, Span::default());
+        tables.insert(app, Namespace::Type, interner.intern("util"), Bind {
+            target: Target::Module(local), vis: VisKind::Pub, rank: 2, def_module: app,
+        });
+        let mut absolute = single(app, &["util"], "external", &interner);
+        absolute.leading_colon = true;
+        let diags = run_imports(&mut tables, &[single(app, &["util"], "local", &interner), absolute], &interner).unwrap();
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(path(&tables, app, &["local"], Namespace::Type, false, &interner), PathRes::Done(Target::Module(local)));
+        assert_eq!(path(&tables, app, &["external"], Namespace::Type, false, &interner), PathRes::Done(Target::Module(dep)));
+    }
+
+    #[test]
+    fn source_root_alias_preserves_privacy_and_reexport_limits() {
+        let interner = Interner::default();
+        let mut tables = ResolvedTables::new(interner.intern("app"));
+        let app = ModuleId(0);
+        let dep = source_dep(&mut tables, app, "util", &interner);
+        let inner = tables.add_module(app, interner.intern("inner"), VisKind::Pub, Span::default());
+        let sibling = tables.add_module(app, interner.intern("sibling"), VisKind::Pub, Span::default());
+        tables.insert(app, Namespace::Type, interner.intern("inner"), Bind {
+            target: Target::Module(inner), vis: VisKind::Pub, rank: 2, def_module: app,
+        });
+        let diags = run_imports(&mut tables, &[single(inner, &["util"], "hidden", &interner)], &interner).unwrap();
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(path(&tables, sibling, &["crate", "inner", "hidden"], Namespace::Type, false, &interner), PathRes::Private);
+        let mut public = single(app, &["inner", "hidden"], "leaked", &interner);
+        public.vis = VisKind::Pub;
+        let diags = run_imports(&mut tables, &[public], &interner).unwrap();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "L0510");
+        assert!(tables.lookup(app, Namespace::Type, interner.intern("leaked")).is_none());
+        // Importing the prelude root itself may be public.
+        let mut public = single(app, &["util"], "exposed", &interner);
+        public.vis = VisKind::Pub;
+        let diags = run_imports(&mut tables, &[public], &interner).unwrap();
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(path(&tables, sibling, &["crate", "exposed"], Namespace::Type, false, &interner), PathRes::Done(Target::Module(dep)));
+    }
+
+    #[test]
+    fn source_root_alias_waits_for_later_value_import() {
+        check_alias_value_convergence("direct");
+    }
+
+    #[test]
+    fn source_root_alias_converges_through_single_segment_chain() {
+        check_alias_value_convergence("chain");
+    }
+
+    #[test]
+    fn source_root_alias_exposes_type_before_value_converges() {
+        check_alias_value_convergence("through-alias");
+    }
+
+    fn check_alias_value_convergence(case: &str) {
+        for reverse in [false, true] {
+            let interner = Interner::default();
+            let mut tables = ResolvedTables::new(interner.intern("app"));
+            let app = ModuleId(0);
+            let dep = source_dep(&mut tables, app, "util", &interner);
+            let local = tables.add_module(app, interner.intern("local"), VisKind::Pub, Span::default());
+            tables.insert(app, Namespace::Type, interner.intern("local"), Bind {
+                target: Target::Module(local), vis: VisKind::Pub, rank: 2, def_module: app,
+            });
+            let value = Target::Def(DefId::PLACEHOLDER);
+            tables.insert(local, Namespace::Value, interner.intern("util"), Bind {
+                target: value, vis: VisKind::Pub, rank: 2, def_module: local,
+            });
+            tables.insert(dep, Namespace::Value, interner.intern("f"), Bind {
+                target: value, vis: VisKind::Pub, rank: 2, def_module: dep,
+            });
+            let alias = single(app, &["util"], "renamed", &interner);
+            let mut imports = match case {
+                "direct" => vec![alias, single(app, &["crate", "local", "util"], "util", &interner)],
+                "chain" => vec![alias, single(app, &["later"], "util", &interner), single(app, &["crate", "local", "util"], "later", &interner)],
+                "through-alias" => vec![alias, single(app, &["renamed", "f"], "util", &interner)],
+                _ => unreachable!(),
+            };
+            for (i, imp) in imports.iter_mut().enumerate() {
+                imp.span.lo = (2 * i + 1) as u32;
+                imp.span.hi = imp.span.lo + 1;
+            }
+            if reverse { imports.reverse(); }
+            let diags = run_imports(&mut tables, &imports, &interner).unwrap();
+            assert!(diags.is_empty(), "case={case}, reverse={reverse}: {diags:?}");
+            assert_eq!(path(&tables, app, &["renamed"], Namespace::Type, false, &interner), PathRes::Done(Target::Module(dep)));
+            assert_eq!(path(&tables, app, &["renamed"], Namespace::Value, false, &interner), PathRes::Done(value));
+        }
+    }
+
+    #[test]
+    fn source_root_alias_checks_late_namespace_duplicates_once() {
+        for second_alias in [false, true] {
+            for reverse in [false, true] {
+                let interner = Interner::default();
+                let mut tables = ResolvedTables::new(interner.intern("app"));
+                let app = ModuleId(0);
+                source_dep(&mut tables, app, "util", &interner);
+                let local = tables.add_module(app, interner.intern("local"), VisKind::Pub, Span::default());
+                tables.insert(app, Namespace::Type, interner.intern("local"), Bind {
+                    target: Target::Module(local), vis: VisKind::Pub, rank: 2, def_module: app,
+                });
+                let value = Target::Def(DefId::PLACEHOLDER);
+                tables.insert(local, Namespace::Value, interner.intern("util"), Bind {
+                    target: value, vis: VisKind::Pub, rank: 2, def_module: local,
+                });
+                let mut imports = vec![
+                    single(app, &["util"], "renamed", &interner),
+                    single(app, &["later"], "util", &interner),
+                    single(app, &["crate", "local", "util"], "later", &interner),
+                ];
+                if second_alias {
+                    imports.insert(1, single(app, &["util"], "renamed", &interner));
+                } else {
+                    // Type has no collision. The duplicate must be detected
+                    // when Value arrives on a later sweep.
+                    tables.insert(app, Namespace::Value, interner.intern("renamed"), Bind {
+                        target: value, vis: VisKind::Pub, rank: 2, def_module: app,
+                    });
+                }
+                for (i, imp) in imports.iter_mut().enumerate() {
+                    imp.span.lo = (2 * i + 1) as u32;
+                    imp.span.hi = imp.span.lo + 1;
+                }
+                if reverse { imports.reverse(); }
+                let diags = run_imports(&mut tables, &imports, &interner).unwrap();
+                assert_eq!(diags.len(), 1, "second_alias={second_alias}, reverse={reverse}: {diags:?}");
+                assert_eq!(diags[0].code, "L0106");
+                assert_eq!(path(&tables, app, &["renamed"], Namespace::Value, false, &interner), PathRes::Done(value));
+            }
+        }
+    }
+
+    #[test]
+    fn source_root_alias_reports_duplicates_and_glob_ambiguity() {
+        let interner = Interner::default();
+        let mut tables = ResolvedTables::new(interner.intern("app"));
+        let app = ModuleId(0);
+        source_dep(&mut tables, app, "util", &interner);
+        let imports = [single(app, &["util"], "renamed", &interner), single(app, &["util"], "renamed", &interner)];
+        let diags = run_imports(&mut tables, &imports, &interner).unwrap();
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "L0106");
+        let local = tables.add_module(app, interner.intern("local"), VisKind::Pub, Span::default());
+        tables.insert(app, Namespace::Type, interner.intern("util"), Bind {
+            target: Target::Module(local), vis: VisKind::Pub, rank: 1, def_module: app,
+        });
+        let diags = run_imports(&mut tables, &[single(app, &["util"], "ambiguous", &interner)], &interner).unwrap();
+        assert!(diags.iter().any(|d| d.code == "L0507"), "{diags:?}");
+    }
 }

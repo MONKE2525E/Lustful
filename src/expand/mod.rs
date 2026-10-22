@@ -998,6 +998,135 @@ pub fn cache_len() -> usize {
     expansion_cache().lock().unwrap().map.len()
 }
 
+/// Import bindings whose same-file target is demonstrably value-only.
+/// This is a negative proof, not import resolution: unknown contributors veto it.
+fn value_only_imports(trees: &[Tt], ctx: &ExpandCtx) -> Vec<(Span, Sym)> {
+    type Use = (Vec<Sym>, Vec<Seg>, bool, Sym, Span);
+    #[derive(Default)]
+    struct Proof {
+        items: FxMap<Vec<Sym>, bool>,
+        modules: Vec<Vec<Sym>>,
+        blocked: Vec<Vec<Sym>>,
+        uses: Vec<Use>,
+    }
+    // The explicit-leaf collector deliberately omits `self` and globs.
+    // Neither omission can establish the absence of a Type contribution.
+    fn incomplete_use(trees: &[Tt]) -> bool {
+        trees.iter().any(|tree| match tree {
+            Tt::Tok(t) => matches!(t.tok, Tok::Star | Tok::SelfLower),
+            Tt::Delim(_, inner, _) | Tt::Frag(_, inner, _) => incomplete_use(inner),
+        })
+    }
+    fn walk(trees: &[Tt], module: &mut Vec<Sym>, interner: &Interner, proof: &mut Proof) {
+        let mut i = 0;
+        while i < trees.len() {
+            if let Some(def) = macro_rules_at(trees, i, interner) {
+                i = def.end;
+                continue;
+            }
+            if let Some((_, content, end)) = use_span_at(trees, i) {
+                let span = Span { hi: trees[end - 1].span().hi, ..trees[i].span() };
+                let body = &trees[content..end - 1];
+                let sites = collect_use_sites(body, &[], interner);
+                if sites.is_empty() || incomplete_use(body) {
+                    proof.blocked.push(module.clone());
+                }
+                for (segs, leading, alias) in sites {
+                    let mut binding = module.clone();
+                    binding.push(alias);
+                    // Even an import sharing a function's name can supply Type.
+                    proof.items.insert(binding, true);
+                    proof.uses.push((module.clone(), segs, leading, alias, span));
+                }
+                i = end;
+                continue;
+            }
+            let tok = tok_at(trees, i).map(|t| t.tok);
+            // Item macros (including include!), attributes/derive, and extern
+            // blocks can supply bindings absent from this raw item scan.
+            // Bodies and macro definitions are opaque below, so calls inside
+            // a function do not incorrectly poison its containing module.
+            if matches!(tok, Some(Tok::Bang | Tok::Pound | Tok::Extern)) {
+                proof.blocked.push(module.clone());
+            }
+            let type_item = matches!(tok, Some(Tok::Mod | Tok::Struct | Tok::Enum | Tok::Trait | Tok::Type))
+                || matches!(tok, Some(Tok::Ident(s)) if interner.get(s) == "union");
+            if type_item || matches!(tok, Some(Tok::Fn | Tok::Const | Tok::Static)) {
+                let name_at = i + 1 + usize::from(tok == Some(Tok::Static) && tok_at(trees, i + 1).map(|t| t.tok) == Some(Tok::Mut));
+                if let Some(Tok::Ident(name)) = tok_at(trees, name_at).map(|t| t.tok) {
+                    let mut path = module.clone();
+                    path.push(name);
+                    proof.items.entry(path.clone()).and_modify(|ty| *ty |= type_item).or_insert(type_item);
+                    if tok == Some(Tok::Mod) {
+                        // Raw cfg-exclusive bodies must never lend one another
+                        // positive evidence. Out-of-line bodies are unknown too.
+                        if proof.modules.contains(&path) {
+                            proof.blocked.push(path.clone());
+                        }
+                        proof.modules.push(path.clone());
+                        if let Some(Tt::Delim(Delim::Brace, inner, _)) = trees.get(i + 2) {
+                            module.push(name);
+                            walk(inner, module, interner, proof);
+                            module.pop();
+                            i += 3;
+                            continue;
+                        }
+                        proof.blocked.push(path);
+                    }
+                }
+            }
+            // Do not inspect function/impl/type bodies or macro arguments as
+            // module declarations. Their bindings cannot extend this module.
+            i += 1;
+        }
+    }
+    let mut proof = Proof::default();
+    walk(trees, &mut ctx.module_path.clone(), ctx.interner, &mut proof);
+    let known_value = |module: &[Sym], segs: &[Seg], leading: bool| {
+        if leading || segs.is_empty() {
+            return false;
+        }
+        let mut path = module.to_vec();
+        let skip = match segs[0].text.as_str() {
+            "crate" => { path.clear(); 1 }
+            "super" => {
+                let n = segs.iter().take_while(|s| s.text == "super").count();
+                if n > path.len() { return false; }
+                path.truncate(path.len() - n);
+                n
+            }
+            _ => 0,
+        };
+        path.extend(segs[skip..].iter().map(|s| s.sym));
+        if proof.items.get(&path) != Some(&false)
+            || proof.blocked.iter().any(|scope| path.starts_with(scope))
+        {
+            return false;
+        }
+        // A traversed module must be a direct declaration, with no import
+        // contributing the same name. Never follow an alias or re-export.
+        for n in ctx.module_path.len() + 1..path.len() {
+            let prefix = &path[..n];
+            if !proof.modules.iter().any(|m| m.as_slice() == prefix)
+                || proof.uses.iter().any(|(owner, _, _, alias, _)| {
+                    owner.len() + 1 == n && prefix.starts_with(owner) && prefix[n - 1] == *alias
+                })
+            {
+                return false;
+            }
+        }
+        true
+    };
+    let mut imports: FxMap<(u32, u32, Sym), (Span, bool)> = FxMap::default();
+    for (module, segs, leading, alias, span) in &proof.uses {
+        let value = known_value(module, segs, *leading);
+        imports.entry((span.file.0, span.lo, *alias))
+            .and_modify(|(_, only_value)| *only_value &= value)
+            .or_insert((*span, value));
+    }
+    imports.into_iter().filter_map(|((_, _, alias), (span, value))| value.then_some((span, alias))).collect()
+}
+
 /// True when a flat token list can contain work for the expander: a
 /// `macro_rules` definition, a call to a macro the parser does not own,
 /// a `use` that binds a parser macro's name (`use dep::vec;`: calls of
@@ -1011,9 +1140,10 @@ pub fn cache_len() -> usize {
 /// whether the file is the crate root with a top-level `extern crate
 /// alloc;` that no attribute can cfg out, the one way `alloc::` enters
 /// the extern prelude.
-fn crate_name_facts(tokens: &[Token], ctx: &ExpandCtx, root: bool) -> (Vec<Sym>, bool) {
+fn crate_name_facts(tokens: &[Token], trees: &[Tt], ctx: &ExpandCtx, root: bool) -> (Vec<Sym>, bool) {
     let interner = ctx.interner;
     let union = interner.intern("union");
+    let values = value_only_imports(trees, ctx);
     let mut shadowed = Vec::new();
     let mut alloc_extern = false;
     let mut depth = 0u32;
@@ -1024,9 +1154,11 @@ fn crate_name_facts(tokens: &[Token], ctx: &ExpandCtx, root: bool) -> (Vec<Sym>,
             Tok::Ident(s) if matches!(interner.get(s), "std" | "core" | "alloc") || ctx.extern_crates.contains(&s) => {
                 let prev = i.checked_sub(1).map(|j| tokens[j].tok);
                 let next = tokens.get(i + 1).map(|n| n.tok);
-                let binds = matches!(prev, Some(Tok::Mod | Tok::As | Tok::Struct | Tok::Enum | Tok::Trait | Tok::Type))
+                let value_import = values.iter().any(|(span, name)| *name == s && span.file == t.span.file && span.lo <= t.span.lo && t.span.hi <= span.hi);
+                let binds = matches!(prev, Some(Tok::Mod | Tok::Struct | Tok::Enum | Tok::Trait | Tok::Type))
                     || prev == Some(Tok::Ident(union))
-                    || (prev == Some(Tok::PathSep) && matches!(next, Some(Tok::Semi | Tok::Comma | Tok::RBrace)) && in_use_tree(tokens, i));
+                    || (!value_import && (prev == Some(Tok::As)
+                        || (prev == Some(Tok::PathSep) && matches!(next, Some(Tok::Semi | Tok::Comma | Tok::RBrace)) && in_use_tree(tokens, i))));
                 if binds && !shadowed.contains(&s) {
                     shadowed.push(s);
                 }
@@ -1218,6 +1350,12 @@ pub struct Expander<'a> {
     /// Macro names `use` brings into each module, from the prescan:
     /// imports apply to a whole module, not from a text point.
     module_imports: FxMap<(Vec<Sym>, Sym), u32>,
+    /// Module-level aliases of dependency roots, keyed by their local name.
+    /// The optional scope restricts a private alias to its defining module.
+    module_extern_aliases: FxMap<(Vec<Sym>, Sym), (Sym, Option<Vec<Sym>>)>,
+    /// Modules in enclosing blocks, scoped by the list walk and defining
+    /// module. They shadow bare dependency aliases throughout their block.
+    block_modules: Vec<(Vec<Sym>, Sym)>,
     /// Macro names that globs make ambiguous in a module (see
     /// `MacroSeed::ambiguous`). An explicit import or a textual
     /// definition still wins.
@@ -1374,6 +1512,8 @@ impl<'a> Expander<'a> {
             by_path_vis: FxMap::default(),
             module_defs: FxMap::default(),
             module_imports: FxMap::default(),
+            module_extern_aliases: FxMap::default(),
+            block_modules: Vec::new(),
             module_depth: 0,
             own_file: None,
             textual_home: FxMap::default(),
@@ -1807,7 +1947,8 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed], extra: &[Ma
     let mut st = Expander::new(ctx, lexed.strings);
     st.root_file = lexed.tokens.first().map(|t| t.span.file);
     st.own_file = Some(eof.span.file);
-    (st.shadowed_crates, st.alloc_extern) = crate_name_facts(&lexed.tokens, ctx, ctx.module_path.is_empty());
+    let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
+    (st.shadowed_crates, st.alloc_extern) = crate_name_facts(&lexed.tokens, &tts, ctx, ctx.module_path.is_empty());
     // Only the seeds this file can reach (`reach_seeds`): a seed adds its strings to the
     // expander's table, so each one seeded would also be in the output.
     let lists = [&SeedReach::new(seeds, ctx.interner), &SeedReach::new(extra, ctx.interner)];
@@ -1818,7 +1959,6 @@ fn expand_macros(lexed: Lexed, ctx: &ExpandCtx, seeds: &[MacroSeed], extra: &[Ma
     for i in globs {
         st.seed_macro(&extra[i])?;
     }
-    let tts: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
     // Only the crate root's `#![recursion_limit]` counts, as in rustc,
     // where a module's copy is an unused attribute.
     let limit = if ctx.module_path.is_empty() { scan_recursion_limit(&tts, &st.strings, ctx.interner)? } else { None };
@@ -2072,7 +2212,7 @@ impl<'a> Expander<'a> {
                         exported = true;
                     }
                     if attr.path == "cfg" {
-                        cfg_off = !builtin::eval_cfg(&attr.inner, &st.ctx.cfg, st, attr.span)?;
+                        cfg_off |= !builtin::eval_cfg(&attr.inner, &st.ctx.cfg, st, attr.span)?;
                     }
                     if attr.path == "cfg_attr" {
                         // `cfg_attr(cond, macro_export)` exports under
@@ -2088,7 +2228,7 @@ impl<'a> Expander<'a> {
                                 Some("macro_export") => exported = true,
                                 Some("cfg") => {
                                     if let Some(Tt::Delim(_, group, _)) = rest.get(1) {
-                                        cfg_off = !builtin::eval_cfg(group, &st.ctx.cfg, st, attr.span)?;
+                                        cfg_off |= !builtin::eval_cfg(group, &st.ctx.cfg, st, attr.span)?;
                                     }
                                 }
                                 _ => {}
@@ -2116,6 +2256,16 @@ impl<'a> Expander<'a> {
                     exported = false;
                     cfg_off = false;
                     i = def.end;
+                    continue;
+                }
+                // Disabled items must not contribute aliases or imports,
+                // nor may a disabled module contribute any of its children.
+                if cfg_off
+                    && let Some(end) = item_end(trees, i, st.ctx.interner).or_else(|| node_end(trees, i))
+                {
+                    i = end;
+                    exported = false;
+                    cfg_off = false;
                     continue;
                 }
                 // Any other tree here is the node the pending
@@ -2160,6 +2310,29 @@ impl<'a> Expander<'a> {
         let mut uses: Vec<UseSite> = Vec::new();
         let mut module: Vec<Sym> = self.ctx.module_path.clone();
         walk(self, trees, &mut module, true, &mut uses)?;
+        // Resolve dependency-root imports before macro imports. Module uses
+        // are order-independent, including chains such as `use renamed as r`.
+        // Keep the dependency's existing name; do not manufacture macro defs
+        // or change the defining crate's hygiene identity.
+        for _ in 0..uses.len() {
+            let mut changed = false;
+            for (module, segs, leading, alias, public) in &uses {
+                let key = (module.clone(), *alias);
+                if self.module_extern_aliases.contains_key(&key) || self.ctx.interner.get(*alias) == "_" {
+                    continue;
+                }
+                if let Some(path) = self.dependency_path(segs, *leading, module)
+                    && let [name] = path.as_slice()
+                {
+                    let visible_in = if *public { None } else { Some(module.clone()) };
+                    self.module_extern_aliases.insert(key, (*name, visible_in));
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         // Public re-exports first, so other modules' imports can resolve
         // through the path table they create. A seed from the worklist's
         // re-export fixpoint already holds the answer for a `use` it
@@ -2186,6 +2359,58 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
+    /// Canonical dependency path for a direct extern name or a module-level
+    /// dependency alias. Explicit crate/self/super paths must name an actual
+    /// import; they must not accidentally reach the extern prelude.
+    fn dependency_path(&self, segs: &[Seg], leading_colon: bool, from: &[Sym]) -> Option<Vec<Sym>> {
+        let first = segs.first()?;
+        let mut module = from.to_vec();
+        let (offset, prelude) = if leading_colon {
+            if !self.ctx.extern_crates.contains(&first.sym) {
+                return None;
+            }
+            return Some(segs.iter().map(|s| s.sym).collect());
+        } else {
+            match first.text.as_str() {
+                "crate" => {
+                    module.clear();
+                    (1, false)
+                }
+                "self" => (1, false),
+                "super" => {
+                    let supers = segs.iter().take_while(|s| s.text == "super").count();
+                    if supers > module.len() {
+                        return None;
+                    }
+                    module.truncate(module.len() - supers);
+                    (supers, false)
+                }
+                _ => (0, true),
+            }
+        };
+        let head = segs.get(offset)?;
+        // A block module binds before textual order is considered. Only
+        // a bare path searches those lexical scopes; crate/self/super
+        // continue to address the named module's own imports.
+        if prelude && self.block_modules.iter().rev().any(|(scope, name)| scope == from && *name == head.sym) {
+            return None;
+        }
+        let alias = self.module_extern_aliases.get(&(module, head.sym));
+        let name = if let Some((name, visible_in)) = alias {
+            if visible_in.as_ref().is_some_and(|scope| !from.starts_with(scope)) {
+                return None;
+            }
+            *name
+        } else if prelude && self.ctx.extern_crates.contains(&head.sym) && !self.shadowed_crates.contains(&head.sym) {
+            head.sym
+        } else {
+            return None;
+        };
+        let mut path = vec![name];
+        path.extend(segs[offset + 1..].iter().map(|s| s.sym));
+        Some(path)
+    }
+
     /// Resolves a `use` target in the prescan tables, from `from` module:
     /// exported names, `pub use` path entries, and the defining module's
     /// own definitions (for same-module re-exports).
@@ -2194,6 +2419,12 @@ impl<'a> Expander<'a> {
             return None;
         }
         let last = segs[segs.len() - 1].sym;
+        if segs.len() > 1
+            && let Some(path) = self.dependency_path(segs, leading_colon, from)
+        {
+            let key = (path[..path.len() - 1].to_vec(), last);
+            return self.by_path.get(&key).copied().filter(|_| self.by_path_vis.get(&key).is_none_or(|v| from.starts_with(v)));
+        }
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
         let middle: Vec<Sym> = segs[..segs.len() - 1].iter().map(|s| s.sym).collect();
         let path = |module: &[Sym]| self.by_path.get(&(module.to_vec(), last)).copied();
@@ -2672,6 +2903,12 @@ impl<'a> Expander<'a> {
             return None;
         }
         let last = segs[segs.len() - 1].sym;
+        if segs.len() > 1
+            && let Some(path) = self.dependency_path(segs, leading_colon, &self.module)
+        {
+            let key = (path[..path.len() - 1].to_vec(), last);
+            return self.by_path.get(&key).copied().filter(|_| self.by_path_vis.get(&key).is_none_or(|v| self.module.starts_with(v)));
+        }
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
         // Dependency macros sit in the path tables under the crate name,
         // as if it were a root module. In rustc `crate::util` (also
@@ -3935,7 +4172,63 @@ impl<'a> Expander<'a> {
     }
 
     /// `expand_list` on the current stack segment.
-    fn expand_list_here(&mut self, mut trees: Vec<Tt>, depth: u32, item_list: bool, stmt_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
+    fn expand_list_here(&mut self, trees: Vec<Tt>, depth: u32, item_list: bool, stmt_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
+        let block_len = self.block_modules.len();
+        if stmt_list && !item_list {
+            let names = self.block_module_names(&trees)?;
+            self.block_modules.extend(names.into_iter().map(|name| (self.module.clone(), name)));
+        }
+        let result = self.expand_list_scoped(trees, depth, item_list, stmt_list, nest);
+        self.block_modules.truncate(block_len);
+        result
+    }
+
+    /// Block item names are visible before their declaration, but names
+    /// inside nested groups and disabled items do not bind in this list.
+    fn block_module_names(&self, trees: &[Tt]) -> Result<Vec<Sym>, Diag> {
+        let mut names = Vec::new();
+        let mut i = 0;
+        let mut cfg_off = false;
+        while i < trees.len() {
+            if let Some(attr) = attr_at(trees, i, self.ctx.interner) {
+                if attr.path == "cfg" {
+                    cfg_off |= !builtin::eval_cfg(&attr.inner, &self.ctx.cfg, self, attr.span)?;
+                } else if attr.path == "cfg_attr" {
+                    let split = attr.inner.iter().position(|t| t.is_tok(Tok::Comma)).unwrap_or(attr.inner.len());
+                    if builtin::eval_cfg(&attr.inner[..split], &self.ctx.cfg, self, attr.span)? {
+                        let rest = &attr.inner[split + 1.min(attr.inner.len() - split)..];
+                        if rest.first().is_some_and(|t| matches!(t, Tt::Tok(tok) if seg_text(tok.tok, self.ctx.interner).as_deref() == Some("cfg")))
+                            && let Some(Tt::Delim(_, group, _)) = rest.get(1)
+                        {
+                            cfg_off |= !builtin::eval_cfg(group, &self.ctx.cfg, self, attr.span)?;
+                        }
+                    }
+                }
+                i = attr.end;
+                continue;
+            }
+            let end = item_end(trees, i, self.ctx.interner);
+            if !cfg_off {
+                let mut head = i;
+                if tok_at(trees, head).map(|t| t.tok) == Some(Tok::Pub) {
+                    head += 1;
+                    if matches!(trees.get(head), Some(Tt::Delim(Delim::Paren, _, _))) {
+                        head += 1;
+                    }
+                }
+                if tok_at(trees, head).map(|t| t.tok) == Some(Tok::Mod)
+                    && let Some(Tok::Ident(name)) = tok_at(trees, head + 1).map(|t| t.tok)
+                {
+                    names.push(name);
+                }
+            }
+            cfg_off = false;
+            i = end.unwrap_or(i + 1);
+        }
+        Ok(names)
+    }
+
+    fn expand_list_scoped(&mut self, mut trees: Vec<Tt>, depth: u32, item_list: bool, stmt_list: bool, nest: u32) -> Result<Vec<Tt>, Diag> {
         if nest > 1000 {
             return Ok(trees);
         }
@@ -4896,8 +5189,8 @@ impl<'a> Expander<'a> {
             return Err(crate::resolve::imports::ambiguous_diag(&seg.text, call.span));
         }
         if call.segs.len() > 1
-            && let Some((_, why)) = self.ctx.unsupported_externs.iter().find(|(name, _)| *name == call.segs[0].sym)
-            && (call.leading_colon || !self.shadowed_crates.contains(&call.segs[0].sym))
+            && let Some(path) = self.dependency_path(&call.segs, call.leading_colon, &self.module)
+            && let Some((_, why)) = self.ctx.unsupported_externs.iter().find(|(name, _)| *name == path[0])
         {
             return Err(crate::resolve::imports::unsupported_diag(why, call.span));
         }
@@ -5205,7 +5498,9 @@ fn collect_use_sites(trees: &[Tt], prefix: &[Seg], interner: &Interner) -> Vec<(
                 for k in 0..=group.len() {
                     if k == group.len() || matches!(&group[k], Tt::Tok(t) if t.tok == Tok::Comma) {
                         if start < k {
-                            out.extend(collect_use_sites(&group[start..k], &segs, interner));
+                            out.extend(collect_use_sites(&group[start..k], &segs, interner).into_iter().map(|(path, leading, alias)| {
+                                (path, leading_colon || leading, alias)
+                            }));
                         }
                         start = k + 1;
                     }
@@ -5261,6 +5556,16 @@ mod tests {
             ("mod journal {} fn main() { ::journal::debug!(); }", "L0508"),
             ("mod journal {} fn main() { journal::debug!(); }", C_UNKNOWN),
             ("fn main() { other::debug!(); }", C_UNKNOWN),
+            ("use journal as renamed; fn main() { renamed::debug!(); }", "L0508"),
+            ("use later as renamed; use journal as later; fn main() { renamed::debug!(); }", "L0508"),
+            ("use journal as renamed; mod inner { fn f() { crate::renamed::debug!(); } }", "L0508"),
+            ("use journal as renamed; mod inner { fn f() { renamed::debug!(); } }", C_UNKNOWN),
+            ("use journal as renamed; fn main() { ::renamed::debug!(); }", C_UNKNOWN),
+            ("#[cfg(any())] use journal as renamed; fn main() { renamed::debug!(); }", C_UNKNOWN),
+            ("use journal as renamed; fn main() { mod renamed {} renamed::debug!(); }", C_UNKNOWN),
+            ("use journal as renamed; fn main() { renamed::debug!(); mod renamed {} }", C_UNKNOWN),
+            ("use journal as renamed; fn main() { mod renamed {} crate::renamed::debug!(); }", "L0508"),
+            ("use journal as renamed; fn main() { #[cfg(any())] mod renamed {} renamed::debug!(); }", "L0508"),
         ] {
             let lexed = crate::lexer::lex(src, FileId(0), 0, &interner).unwrap();
             let mut ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("test.rs"), src, false);
@@ -5271,6 +5576,182 @@ mod tests {
             assert_eq!(diag.code, code, "{src}");
             if code == "L0508" {
                 assert_eq!(diag.message, "log: unsupported adapter feature");
+            }
+        }
+        for src in [
+            "#[cfg(any())] use journal as renamed; use second_journal as renamed; fn main() { renamed::debug!(); }",
+            "#[cfg(any())] use journal as later; use second_journal as later; use later as renamed; fn main() { renamed::debug!(); }",
+        ] {
+            let lexed = crate::lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let mut ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("test.rs"), src, false);
+            let journal = interner.intern("journal");
+            let second = interner.intern("second_journal");
+            ctx.extern_crates = vec![journal, second];
+            ctx.unsupported_externs = vec![
+                (journal, "first dependency: unsupported adapter feature".to_string()),
+                (second, "second dependency: distinct unsupported reason".to_string()),
+            ];
+            let diag = expand_lexed(lexed, &ctx).err().expect("enabled unsupported dependency");
+            assert_eq!(diag.code, "L0508", "{src}");
+            assert_eq!(diag.message, "second dependency: distinct unsupported reason", "{src}");
+        }
+    }
+
+    #[test]
+    fn dependency_macro_module_aliases() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let dep = interner.intern("dependency");
+        let other = interner.intern("other_version");
+        let make_seed = |name, src| {
+            let lexed = crate::lexer::lex(src, FileId(1), 0, &interner).unwrap();
+            MacroSeed {
+                path: vec![name],
+                tokens: lexed.tokens,
+                strings: Arc::new(lexed.strings),
+                import_into: None,
+                ambiguous: false,
+                visible_in: None,
+            }
+        };
+        let seeds = [
+            make_seed(dep, "macro_rules! m { () => { 41 }; }"),
+            make_seed(other, "macro_rules! m { () => { 99 }; }"),
+        ];
+        for (src, succeeds) in [
+            ("use dependency as renamed; use renamed::m; fn main() { m!(); renamed::m!(); }", true),
+            ("fn main() { renamed::m!(); } use later as renamed; use dependency as later;", true),
+            ("use dependency as renamed; mod inner { fn f() { super::renamed::m!(); } }", true),
+            ("use dependency as renamed; mod inner { fn f() { renamed::m!(); } }", false),
+            ("use dependency as renamed; fn main() { ::renamed::m!(); }", false),
+            ("fn main() { crate::dependency::m!(); }", false),
+            ("use a as b; use b as a; fn main() { a::m!(); }", false),
+            ("use dependency as renamed; use crate::local::dependency; mod local { pub fn dependency() -> i32 { 7 } } mod b { fn f() { dependency::m!(); } } fn main() { renamed::m!(); dependency::m!(); }", true),
+            ("use crate::local::value as dependency; mod local { pub fn value() {} } fn main() { dependency::m!(); }", true),
+            ("use crate::local::{value as dependency}; mod local { pub const value: i32 = 7; } fn main() { dependency::m!(); }", true),
+            ("use crate::local::dependency; mod local { pub static dependency: i32 = 7; } fn main() { dependency::m!(); }", true),
+            ("use crate::local::dependency; mod local { pub mod dependency {} } fn main() { dependency::m!(); }", false),
+            ("use crate::local::dependency; mod local { pub struct dependency {} pub fn dependency() {} } fn main() { dependency::m!(); }", false),
+            ("use dependency as renamed; use other_version as second; fn main() { renamed::m!(); }", true),
+        ] {
+            let lexed = crate::lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let mut ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("test.rs"), src, false);
+            ctx.extern_crates = vec![dep, other];
+            match expand_lexed_seeded(lexed, &ctx, &seeds) {
+                Ok(out) => {
+                    assert!(succeeds, "{src}");
+                    let tokens: Vec<_> = out.tokens.iter().map(|t| tok_text(&t.tok, &out.strings, &interner)).collect();
+                    assert!(tokens.iter().any(|t| t == "41"), "{src}: {tokens:?}");
+                    assert!(!tokens.iter().any(|t| t == "99"), "{src}: {tokens:?}");
+                }
+                Err(diag) => {
+                    assert!(!succeeds, "{src}: {}", diag.message);
+                    assert_eq!(diag.code, C_UNKNOWN, "{src}");
+                }
+            }
+        }
+        // Compare every dependency expansion in order: merely accepting
+        // these programs would miss selecting the wrong dependency.
+        for (src, expected) in [
+            (
+                "#[cfg(any())] use dependency as renamed; use other_version as renamed; use renamed::m; fn main() { renamed::m!(); m!(); }",
+                &["99", "99"][..],
+            ),
+            (
+                "#[cfg(any())] #[cfg(all())] use dependency as renamed; use other_version as renamed; fn main() { renamed::m!(); }",
+                &["99"][..],
+            ),
+            (
+                "#[cfg_attr(all(), cfg(any()))] use dependency as renamed; use other_version as renamed; fn main() { renamed::m!(); }",
+                &["99"][..],
+            ),
+            (
+                "#[cfg(any())] mod inner { use dependency as renamed; pub use renamed::m; } mod inner { use other_version as renamed; pub use renamed::m; } fn main() { inner::m!(); }",
+                &["99"][..],
+            ),
+            (
+                "use dependency as renamed; fn main() { mod renamed { pub use other_version::m; } renamed::m!(); crate::renamed::m!(); self::renamed::m!(); }",
+                &["99", "41", "41"][..],
+            ),
+            (
+                "use dependency as renamed; fn main() { renamed::m!(); mod renamed { pub use other_version::m; } }",
+                &["99"][..],
+            ),
+            (
+                "use dependency as renamed; fn main() { { mod renamed { pub use other_version::m; } { renamed::m!(); } } { renamed::m!(); } renamed::m!(); }",
+                &["99", "41", "41"][..],
+            ),
+            (
+                "use dependency as renamed; fn main() { #[cfg(any())] mod renamed { pub use other_version::m; } renamed::m!(); }",
+                &["41"][..],
+            ),
+            (
+                "use dependency as renamed; fn main() { #[cfg_attr(all(), cfg(any()))] mod renamed { pub use other_version::m; } renamed::m!(); }",
+                &["41"][..],
+            ),
+        ] {
+            let lexed = crate::lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let mut ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("test.rs"), src, false);
+            ctx.extern_crates = vec![dep, other];
+            let out = expand_lexed_seeded(lexed, &ctx, &seeds).unwrap_or_else(|diag| panic!("{src}: {}", diag.message));
+            let values: Vec<_> = out
+                .tokens
+                .iter()
+                .map(|t| tok_text(&t.tok, &out.strings, &interner))
+                .filter(|t| matches!(t.as_str(), "41" | "99"))
+                .collect();
+            assert_eq!(values, expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn value_import_proofs_do_not_select_the_wrong_dependency() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        let dep = interner.intern("dependency");
+        let other = interner.intern("other_version");
+        let target = interner.intern("target");
+        let make_seed = |path, src| {
+            let lexed = crate::lexer::lex(src, FileId(1), 0, &interner).unwrap();
+            MacroSeed {
+                path,
+                tokens: lexed.tokens,
+                strings: Arc::new(lexed.strings),
+                import_into: None,
+                ambiguous: false,
+                visible_in: None,
+            }
+        };
+        let seeds = [
+            make_seed(vec![dep], "macro_rules! m { () => { 41 }; }"),
+            make_seed(vec![other], "macro_rules! m { () => { 99 }; }"),
+            make_seed(vec![other, target], "macro_rules! m { () => { 99 }; }"),
+        ];
+        for src in [
+            "mod local { pub use other_version as target; pub fn target() {} } use crate::local::target as dependency; fn main() { dependency::m!(); }",
+            "mod local { pub fn target() {} pub use other_version::{self as target}; } use crate::local::target as dependency; fn main() { dependency::m!(); }",
+            "#[cfg(any())] mod local { pub fn target() {} } #[cfg(all())] mod local { pub use other_version as target; } use crate::local::target as dependency; fn main() { dependency::m!(); }",
+            "mod other_version { pub fn target() {} } use ::other_version::{target as dependency}; fn main() { dependency::m!(); }",
+            "mod other_version { pub fn target() {} } use ::{other_version::{target as dependency}}; fn main() { dependency::m!(); }",
+            "mod other_version { pub fn target() {} } use ::other_version::target as dependency; fn main() { dependency::m!(); }",
+            "mod local { pub use other_version::*; pub fn target() {} } use crate::local::target as dependency; fn main() { dependency::m!(); }",
+            "mod local { macro_rules! bind { () => { pub use other_version as target; }; } bind!(); pub fn target() {} } use crate::local::target as dependency; fn main() { dependency::m!(); }",
+            "#[cfg(any())] mod local { pub fn target() {} } #[cfg(all())] use other_version as local; use crate::local::target as dependency; fn main() { dependency::m!(); }",
+        ] {
+            let lexed = crate::lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let mut ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("test.rs"), src, false);
+            ctx.extern_crates = vec![dep, other];
+            // Assert the proof gate too: an unrelated expansion error must
+            // not conceal an unsound exemption for this import.
+            let (trees, _) = build_trees(&lexed.tokens);
+            let trees: Vec<Tt> = trees.iter().map(tt_from_tree).collect();
+            assert!(value_only_imports(&trees, &ctx).iter().all(|(_, name)| *name != dep), "{src}");
+            if let Ok(out) = expand_lexed_seeded(lexed, &ctx, &seeds) {
+                let values: Vec<_> = out.tokens.iter()
+                    .map(|t| tok_text(&t.tok, &out.strings, &interner))
+                    .filter(|t| matches!(t.as_str(), "41" | "99"))
+                    .collect();
+                assert_eq!(values, ["99"], "{src}");
             }
         }
     }
