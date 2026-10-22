@@ -5147,6 +5147,25 @@ fn register_items(
                 tables.flat[ns_index(Namespace::Value)].insert(flat, def);
                 f.name = flat;
             }
+            ItemKind::ExternBlock(block) => {
+                for item in &mut block.items {
+                    let crate::ast::ForeignItem::Fn(f) = item else { continue };
+                    check_dup(seen, Namespace::Value, f.name, f.name_span, &mut reported, diags);
+                    let symbol = f.name;
+                    let flat = flat_name(tables, flat_prefix, module, symbol, interner);
+                    record_display(tables, input, flat_prefix, module, flat, symbol, interner);
+                    let def = DefId {
+                        krate: input.crate_ids.local,
+                        hash: def::item_hash(input.crate_ids.stable, &[], def::DefKind::ForeignFn, interner.get(flat), 0),
+                    };
+                    let vis = vis_from_ast(&f.vis, interner);
+                    bind(tables, Namespace::Value, symbol, Target::Def(def), vis.clone());
+                    tables.def_info.insert(def, DefInfo { kind: ResKind::Native, flat, module, vis });
+                    tables.native_symbols.insert(def, symbol);
+                    tables.flat[ns_index(Namespace::Value)].insert(flat, def);
+                    f.name = flat;
+                }
+            }
             ItemKind::Struct(s) => {
                 // A braced struct has no constructor value: its name lives
                 // only in the type namespace. Unit and tuple structs also
@@ -5799,6 +5818,15 @@ impl Rewrite<'_> {
                     let mut def = std::mem::replace(f, dummy_fn());
                     self.fn_def(ast, &mut def, module);
                     *f = def;
+                }
+                ItemKind::ExternBlock(block) => {
+                    for item in &mut block.items {
+                        if let crate::ast::ForeignItem::Fn(f) = item {
+                            let mut def = std::mem::replace(f, dummy_fn());
+                            self.fn_def(ast, &mut def, module);
+                            *f = def;
+                        }
+                    }
                 }
                 ItemKind::Struct(s) => {
                     let mark = self.push_params(&s.generics);
@@ -8779,6 +8807,37 @@ mod tests {
     use crate::driver::graph::Reads;
     use crate::intern::{Interner, Known};
     use crate::protocol::ProfileFlags;
+
+    #[test]
+    fn native_declarations_keep_external_symbols_across_modules_and_imports() {
+        let source = r#"
+mod a { pub type CInt = i32; unsafe extern "C" { pub fn abs(x: CInt) -> CInt; } }
+mod b { unsafe extern "C" { pub fn abs(x: i32) -> i32; } }
+use a::abs as imported;
+fn main() { let _ = imported; }
+"#;
+        let r = resolve(&[("main.rs", source)], "native-bindings").unwrap_or_else(|e| panic!("{:?}", e.diags));
+        assert_eq!(r.tables.native_symbols.len(), 2);
+        let entries: Vec<_> = r.tables.native_symbols.iter().collect();
+        assert_eq!(entries[0].1, entries[1].1, "both modules name the same external symbol");
+        assert_ne!(entries[0].0, entries[1].0, "Rust declarations have distinct stable identities");
+        let flats: Vec<_> = entries.iter().map(|(def, _)| {
+            let info = &r.tables.def_info[def];
+            assert_eq!(info.kind, ResKind::Native);
+            assert_ne!(info.flat, *entries[0].1, "the Rust name is flattened, the C name is not");
+            info.flat
+        }).collect();
+        assert_ne!(flats[0], flats[1]);
+        let declared: Vec<_> = r.ast.items.iter().filter_map(|item| {
+            let ItemKind::ExternBlock(block) = &item.kind else { return None };
+            let crate::ast::ForeignItem::Fn(f) = &block.items[0] else { panic!("foreign declaration was lost") };
+            assert!(f.body.is_none());
+            Some(f.name)
+        }).collect();
+        assert_eq!(declared.len(), 2);
+        assert!(flats.iter().all(|f| declared.contains(f)));
+        assert!(r.ast.exprs.iter().any(|e| matches!(e, Expr::Path(segs) if segs.len() == 1 && declared.contains(&segs[0].name))), "the imported expression resolves to a declaration's Rust name");
+    }
 
     /// A macro definition's own string table holds only the strings of its
     /// tokens, with the same texts as the file's table (`own_def_strings`).

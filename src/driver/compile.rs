@@ -395,7 +395,7 @@ fn check_fingerprint(req: &Request) -> Option<u64> {
         return None;
     }
     let key =
-        format!("{:?}", (&req.session, &req.file, &req.out, req.json, req.debug, req.max_errors, &req.run_args, req.harness, &req.client));
+        format!("{:?}", (&req.session, &req.file, &req.out, req.json, req.debug, req.max_errors, &req.run_args, req.harness, &req.client, req.cc));
     let mut h = crate::intern::FxHasher::default();
     std::hash::Hash::hash(&key, &mut h);
     Some(std::hash::Hasher::finish(&h))
@@ -3269,6 +3269,15 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
     let body_hashes_all: Vec<u64> = (0..fn_count).map(|i| scan_of(front, i).0).collect();
     (map, changed, mention_only, const_fn_changed, fn_count, mode, fn_lines_all, body_hashes_all, None)
     };
+    if let Some(block) = front.ast.items.iter().find_map(|item| match &item.kind {
+        ItemKind::ExternBlock(block) => Some(block),
+        _ => None,
+    }) {
+        let target = if triple.is_empty() { crate::protocol::host_triple() } else { &triple };
+        if let Err(diag) = crate::native::NativeTarget::select(target, req.cc, block.span) {
+            return errors(&mut [diag], &map, &src, req);
+        }
+    }
     // A fn edit that moved Adt or static ids took the full path (`slot_update`).
     let mode = if std::mem::take(&mut front.ids_forced_full) { "full" } else { mode };
     let scan_of = |front: &Front, i: usize| {

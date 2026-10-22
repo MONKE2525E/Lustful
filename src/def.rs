@@ -164,6 +164,7 @@ pub enum DefKind {
     // Added at the end for closures (ARCH 1.7: parent fn hash plus
     // the closure's ordinal in that body, in token order).
     Closure = 12,
+    ForeignFn = 13,
 }
 
 impl DefKind {
@@ -182,6 +183,7 @@ impl DefKind {
             DefKind::Trait => "trait",
             DefKind::Assoc => "assoc",
             DefKind::Closure => "closure",
+            DefKind::ForeignFn => "foreign-fn",
         }
     }
 }

@@ -42,6 +42,38 @@ The selected Cargo target supplies the crate name for `module_path!()`. A binary
 whose target name differs from its package name therefore records the same
 default log target as rustc.
 
+### Scalar C imports
+
+On `x86_64-unknown-linux-gnu`, the TinyCC backend accepts module-level
+`unsafe extern "C"` function declarations. Parameters and returns may use
+`i32`, `u32`, `i64`, `u64`, `isize`, and `usize`; a function may also return
+unit. Calls require a lexical `unsafe` block and use the system C ABI.
+
+```rust
+unsafe extern "C" { fn abs(value: i32) -> i32; }
+fn main() { assert_eq!(unsafe { abs(-17) }, 17); }
+```
+
+Pointers, callbacks, variadics, foreign statics, native exports, and `#[link]`
+remain unsupported. Symbols must be ASCII C identifiers outside the compiler's
+reserved namespace. General unsafe operations remain rejected. Crates that
+deny or forbid `unsafe_code` are rejected until Lust can enforce that lint by
+scope. Other targets and the system C compiler backend reject native imports.
+
+The tests compare scalar calls with rustc, exercise eight mixed arguments and
+void side effects against C peers, and rebuild declaration edits through the
+daemon. The C peers are test fixtures; this does not add library configuration
+or Rust crate linking.
+
+```sh
+bash scripts/difftest.sh native_
+bash scripts/test-native.sh
+cargo test --profile gate native
+```
+
+The Cargo command bootstraps tests and uses rustc as an independent oracle.
+It is separate from a rustc-free Lust target build.
+
 ## Compiler boundary
 
 The selected approach adds language and library support to Lust, with differential
@@ -65,12 +97,14 @@ Verenu requires edition 2021, async functions and Tokio, unsafe native FFI,
 custom procedural macros, and dependencies outside Lust's shipped adapters.
 The edition-2024 compatibility overlay now expands `log::warn!` and reaches
 unsupported `serde_json::json!` expansion. The production edition-2021 manifest
-still fails L0530. The standalone async and native-FFI probes still fail L0405
-and L0810. No full desktop build has succeeded.
+still fails L0530. Async remains rejected as L0405. Scalar C imports work on
+the target above, but Verenu's pointer-based native APIs and callbacks remain
+unsupported. No full desktop build has succeeded.
 
-Cargo graph discovery still uses rustc for host build scripts and procedural
-macro crates. Removing those invocations is also required for a complete build
-that uses rustc only to bootstrap Lust and compile test oracles.
+Cargo graph discovery can invoke `rustc -vV` even before host build scripts and
+procedural macro crates are built. Removing those invocations is also required
+for a complete build that uses rustc only to bootstrap Lust and compile test
+oracles.
 
 The compiler must preserve native behavior and reject unsupported constructs
 throughout this work. A successful core test run does not establish a working

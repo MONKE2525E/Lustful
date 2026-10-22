@@ -30,6 +30,8 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize 
         defs,
         adts,
         fns: _,
+        native: _,
+        native_names: _,
         consts: _,
         const_names: _,
         const_defs: _,

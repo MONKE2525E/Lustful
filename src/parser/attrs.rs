@@ -194,9 +194,7 @@ fn lint_list(level: &str, attr: &Attr, interner: &Interner) -> PResult<()> {
                 "Lust knows the `clippy` and `rustdoc` lint tools.",
             ));
         }
-        // `unsafe_code` needs no lint pass: lust rejects `unsafe`
-        // itself, so denying it can never hide a rustc reject.
-        if matches!(level, "deny" | "forbid") && tool.is_none() && path != "unsafe_code" {
+        if matches!(level, "deny" | "forbid") && tool.is_none() {
             return Err(Diag::new(
                 "L0531",
                 attr.span,

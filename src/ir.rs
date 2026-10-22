@@ -239,6 +239,7 @@ pub enum CallTarget {
     /// payload is the method's word index in that receiver's vtable.
     /// The callee gets the data pointer, then `args[1..]`.
     Dyn(u32),
+    Native(crate::native::NativeFnId),
 }
 
 #[derive(Clone, Debug)]

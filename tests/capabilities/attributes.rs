@@ -1,5 +1,5 @@
 // capability: attributes: derive
-// capability: attributes: allow, warn, and expect; deny and forbid for `unsafe_code` and tool lints
+// capability: attributes: allow, warn, and expect; deny and forbid for tool lints
 // capability: attributes: cfg and cfg_attr
 // capability: attributes: doc
 // capability: attributes: inline, cold, must_use, deprecated, track_caller
@@ -58,8 +58,7 @@ fn f() -> u32 {
 
 #[track_caller]
 #[warn(unused)]
-#[deny(unsafe_code, clippy::all)]
-#[forbid(unsafe_code)]
+#[deny(clippy::all)]
 #[expect(unused_variables)]
 fn g() -> u32 {
     let unused = 1;

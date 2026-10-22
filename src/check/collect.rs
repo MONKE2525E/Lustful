@@ -332,6 +332,8 @@ pub struct Program {
     pub defs: Defs,
     pub adts: Vec<AdtDef>,
     pub fns: Vec<FnInfo>,
+    pub native: crate::native::NativeImports,
+    pub native_names: HashMap<Sym, crate::native::NativeFnId>,
     /// Evaluated const items, and name to index (ARCH 2.13).
     pub consts: Vec<ConstItem>,
     pub const_names: HashMap<Sym, u32>,
@@ -3458,6 +3460,8 @@ pub fn collect_reuse(
         defs: Defs::new(),
         adts: Vec::new(),
         fns: Vec::new(),
+        native: Default::default(),
+        native_names: Default::default(),
         consts: Vec::new(),
         assoc_const_names: HashMap::default(),
         impl_assoc_consts: HashMap::default(),
@@ -5050,6 +5054,7 @@ pub fn collect_reuse(
         }
     }
     // Each impl's path and its methods' (`def::impl_ids`, as the driver's `fn_keys`).
+    super::native::collect_declarations(&mut p, &mut errs);
     let impl_ids = crate::def::impl_ids(p.stable_crate, ast, interner);
     // Top-level fn and method hashes by body block: the parents of fns
     // nested in bodies (`def::nested_fn_ids`).

@@ -50,7 +50,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0401](L0401.md) | this macro call has no expanded form yet |
 | [L0402](L0402.md) | unsupported attribute |
 | [L0403](L0403.md) | cannot derive this trait |
-| [L0404](L0404.md) | `unsafe` is not supported |
+| [L0404](L0404.md) | unsupported unsafe function or missing unsafe block |
 | [L0405](L0405.md) | `async` is not supported |
 | [L0502](L0502.md) | ambiguous module file |
 | [L0503](L0503.md) | module file not found |
@@ -121,6 +121,6 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
 | [L0806](L0806.md) | this macro call does not fit |
 | [L0807](L0807.md) | this macro definition is not valid |
 | [L0809](L0809.md) | this macro form is not supported yet |
-| [L0810](L0810.md) | extern blocks are not supported yet |
+| [L0810](L0810.md) | unsupported foreign interface |
 | [L0820](L0820.md) | this syntax form is not supported yet |
 | [L9001](L9001.md) | feature is not supported yet |

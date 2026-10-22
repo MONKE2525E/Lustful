@@ -9,7 +9,7 @@ Lust is an experiment. It asks one question: how fast can `check` and `build` of
 
 To test this, lust compiles a subset of Rust. Every program lust accepts must be valid Rust (rustc 1.99, edition 2024), and it must give the same output as the `rustc` build. When lust cannot match rustc, it rejects the program with an error code. That rule makes `rustc` a free test oracle, and it gives lust programs a release path: Cargo builds the release binary from the same source.
 
-**Status: early, but it compiles one real project.** About 250k lines of Rust and C in `src/`, plus 44k lines of std and adapter source in `library/`. It has a real type checker, trait solver, and borrow checker, and it reads Cargo workspaces. It checks and builds [ts-rust](https://github.com/pingdotgg/ts-rust) v0.7.0, a Rust port of the TypeScript compiler, with a small set of rewrites. In the 2026-10-17 census, `lust check` passes 18 of 18 targets and `lust build` builds 11 of 11 bins. The lust-built bins give the same stdout, stderr, exit code, and written files as the Cargo-built bins on 540 of 540 fixture runs, 7 of 7 integration test bins, and 12 of 12 tool runs. 683 of 683 unit tests built by lust give the same result. The ts-rust changes are in [pingdotgg/ts-rust#93](https://github.com/pingdotgg/ts-rust/pull/93), which moves the ts-rust dev check loop to lust: 6 commits (74 files) on top of upstream v0.7.0, plus docs. Under Cargo, a normal run behaves the same; only a few error texts change. Lust dev builds turn off jemalloc, the embedded lib snapshots, and real backtraces. The rewrites include a JSON reader in place of serde in two codegen tools (no proc macros), callbacks in place of futures for ATA requests (no `async`), named fns in place of closures in statics, named types in place of nested `impl Trait` and of `dyn WorkGroup<'a>`, the condition text as the message of 16 long `assert!` calls, and one `write_all` per `write!` in 8 `io::Write` impls. It is not a general Rust replacement. Most crates from crates.io will not compile: lust has no `async`, no `unsafe` code, no proc macros other than the built-in derives, and only 18 adapter crates for dependencies. Normal Rust also hits gaps. This will fail:
+**Status: early, but it compiles one real project.** About 250k lines of Rust and C in `src/`, plus 44k lines of std and adapter source in `library/`. It has a real type checker, trait solver, and borrow checker, and it reads Cargo workspaces. It checks and builds [ts-rust](https://github.com/pingdotgg/ts-rust) v0.7.0, a Rust port of the TypeScript compiler, with a small set of rewrites. In the 2026-10-17 census, `lust check` passes 18 of 18 targets and `lust build` builds 11 of 11 bins. The lust-built bins give the same stdout, stderr, exit code, and written files as the Cargo-built bins on 540 of 540 fixture runs, 7 of 7 integration test bins, and 12 of 12 tool runs. 683 of 683 unit tests built by lust give the same result. The ts-rust changes are in [pingdotgg/ts-rust#93](https://github.com/pingdotgg/ts-rust/pull/93), which moves the ts-rust dev check loop to lust: 6 commits (74 files) on top of upstream v0.7.0, plus docs. Under Cargo, a normal run behaves the same; only a few error texts change. Lust dev builds turn off jemalloc, the embedded lib snapshots, and real backtraces. The rewrites include a JSON reader in place of serde in two codegen tools (no proc macros), callbacks in place of futures for ATA requests (no `async`), named fns in place of closures in statics, named types in place of nested `impl Trait` and of `dyn WorkGroup<'a>`, the condition text as the message of 16 long `assert!` calls, and one `write_all` per `write!` in 8 `io::Write` impls. It is not a general Rust replacement. Most crates from crates.io will not compile: lust has no `async`, only a limited scalar native-call subset of unsafe code, no proc macros other than the built-in derives, and 19 adapter crates for dependencies. Normal Rust also hits gaps. This will fail:
 
 ```rust
 fn adders() -> Vec<impl Fn(u32) -> u32> { vec![|x| x + 1] } // lust: error[L0602], impl Trait inside a Vec
@@ -121,7 +121,7 @@ The release times are 0.01 to 0.12 s, so their ratios are coarse. In total, the 
 Four reasons:
 
 1. **No LLVM in dev builds.** Lust emits C and compiles it with `tcc`. `tcc` is much faster than LLVM and produces much worse code.
-2. **Less language to check.** No proc macros, no `async`, and no `unsafe` code. Trait selection matches whole trait references against a deterministic impl index and does not search (docs/ARCH.md 2.4). Lifetimes use a restricted region model with stated rejects (docs/ARCH.md 5).
+2. **Less language to check.** No proc macros or `async`; unsafe operations are limited to [scalar C imports in this fork](docs/VERENU.md#scalar-c-imports). Trait selection matches whole trait references against a deterministic impl index and does not search (docs/ARCH.md 2.4). Lifetimes use a restricted region model with stated rejects (docs/ARCH.md 5).
 3. **Parallel work per function.** Type checking, borrow checking, and C code generation run per function, on a flat IR, across cores.
 4. **The daemon redoes only what an edit touches.** See the next section.
 
@@ -232,15 +232,15 @@ Supported today:
 - Closures, iterator chains, `?` on `Option` and `Result`, `let`-else, `if let` chains, labeled blocks.
 - Derives: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Default`.
 - Std: a std written in lust source (`library/std`, `library/core`, `library/alloc`) plus a C runtime. `HashMap`, `BTreeMap`, `VecDeque`, formatting with specs, `std::fs`, `std::io`, `std::env`, `std::process`, threads, `thread::scope`, `mpsc`, panics with unwinding and `catch_unwind`.
-- Dependencies: 18 adapter crates in `library/deps` stand in for crates.io packages (`indexmap`, `smallvec`, `memchr`, `rustc-hash`, `num-bigint`, `bumpalo`, `flate2`, `jiff`, and others). Each must give the same output as the real crate.
+- Dependencies: 19 adapter crates in `library/deps` stand in for crates.io packages (`indexmap`, `smallvec`, `memchr`, `rustc-hash`, `num-bigint`, `bumpalo`, `flate2`, `jiff`, `log`, and others). Each must give the same output as the real crate.
 - Borrow checking: moves, initialization, NLL-style loans, two-phase borrows, and a restricted region model for lifetimes.
 
 Not supported yet. Each gives an error code:
 
 - `impl Trait` inside another type, such as `Vec<impl Fn()>` (`L0602`).
 - `dyn` with std traits other than the `Fn` family, `Any`, `Error`, `Debug`, and `Display`, such as `dyn Iterator` (`L0702`).
-- `async` (`L0405`) and `unsafe` code (`L0404`). Adapters and shims give lust the few unsafe-backed APIs it needs.
-- Unions (`L0602`), raw references `&raw` (`L0820`), `extern` blocks and fns (`L0810`).
+- `async` (`L0405`) and general unsafe operations. This fork supports [scalar C imports](docs/VERENU.md#scalar-c-imports) within lexical unsafe blocks.
+- Unions (`L0602`), raw references `&raw` (`L0820`), and foreign declarations outside that scalar subset (`L0810`).
 - Dependencies with no adapter (`L0508`).
 - A std item lust does not have yet (`L0505`).
 

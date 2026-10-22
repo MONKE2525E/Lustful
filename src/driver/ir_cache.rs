@@ -417,6 +417,13 @@ pub(crate) fn ir_fingerprint(p: &Program, body: &Body, map: &SourceMap, base_lin
                     CallTarget::Intrinsic(i) => (2u8, i).hash(&mut h),
                     CallTarget::Indirect(l) => (3u8, l).hash(&mut h),
                     CallTarget::Dyn(k) => (4u8, k).hash(&mut h),
+                    CallTarget::Native(id) => {
+                        let native = p.native.get(*id);
+                        5u8.hash(&mut h);
+                        hash_def(&mut h, p, native.def());
+                        native.symbol().hash(&mut h);
+                        native.sig().hash(&mut h);
+                    }
                 }
                 (args.len() as u64).hash(&mut h);
                 for a in args {
@@ -612,6 +619,7 @@ enum CachedTarget {
     Intrinsic(u32),
     Indirect(Local),
     Dyn(u32),
+    Native(DefId),
 }
 
 /// Builds `TyTree`s from one body's type store, memoized per `Ty`.
@@ -960,6 +968,7 @@ pub(crate) fn cache_body(p: &Program, body: &Body, file_hash: u64, slot: u32, us
                         CallTarget::Intrinsic(i) => CachedTarget::Intrinsic(*i),
                         CallTarget::Indirect(l) => CachedTarget::Indirect(*l),
                         CallTarget::Dyn(k) => CachedTarget::Dyn(*k),
+                        CallTarget::Native(id) => CachedTarget::Native(p.native.get(*id).def()),
                     },
                     args: args.iter().map(|a| cache_operand(&mut b, p, a)).collect(),
                     dest: dest.clone(),
@@ -1152,6 +1161,7 @@ pub(crate) fn rebuild<'p>(p: &'p Program, cached: &CachedBody, fn_id: LocalDefId
                     CachedTarget::Intrinsic(i) => CallTarget::Intrinsic(*i),
                     CachedTarget::Indirect(l) => CallTarget::Indirect(*l),
                     CachedTarget::Dyn(k) => CallTarget::Dyn(*k),
+                    CachedTarget::Native(def) => CallTarget::Native(p.native.by_def(*def)?),
                 },
                 args: args.iter().map(|a| operand(&mut intern, &mut tys, &strings, a)).collect::<Option<Vec<_>>>()?,
                 dest: dest.clone(),

@@ -1,4 +1,4 @@
-// capability: types: raw pointers *const T and *mut T (safe methods only; a deref needs `unsafe`)
+// capability: types: raw pointers *const T and *mut T (safe methods only; dereference is unsupported)
 // expect: ok
 
 fn main() {

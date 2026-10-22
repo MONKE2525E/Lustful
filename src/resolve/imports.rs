@@ -186,6 +186,7 @@ pub enum ResKind {
     Alias,
     Macro,
     Trait,
+    Native,
 }
 
 /// Facts the rewrite pass needs about one local def, by DefId.
@@ -276,6 +277,9 @@ pub struct ResolvedTables {
     /// Adt def -> variant names, for variant imports and `use E::*`.
     pub variants: FxMap<DefId, Vec<Sym>>,
     pub def_info: FxMap<DefId, DefInfo>,
+    /// External C symbols, before module names are flattened. These
+    /// definitions have no Rust function body or dispatch-table slot.
+    pub native_symbols: FxMap<DefId, Sym>,
     /// The defining module of each const, static, and associated
     /// const item, keyed by the item's span. The const evaluator in
     /// collect reads it to check field privacy in initializers:
@@ -500,6 +504,7 @@ impl ResolvedTables {
             tuple_field_vis: FxMap::default(),
             variants: FxMap::default(),
             def_info: FxMap::default(),
+            native_symbols: FxMap::default(),
             const_init_module: FxMap::default(),
             display_names: FxMap::default(),
             module_defs: vec![DefId::PLACEHOLDER],
@@ -1535,6 +1540,13 @@ impl ResolvedTables {
                 }
             });
         }
+        for (def, symbol) in &self.native_symbols {
+            fold!(0x4c, |h: &mut crate::intern::FxHasher| {
+                h.write_u64(def.hash.0);
+                h.write_u64(def.krate.0 as u64);
+                h.write_u64(symbol.0 as u64);
+            });
+        }
         for (def, info) in &self.def_info {
             fold!(0x43, |h: &mut crate::intern::FxHasher| {
                 h.write_u64(def.hash.0);
@@ -1547,6 +1559,7 @@ impl ResolvedTables {
                     ResKind::Alias => 5,
                     ResKind::Macro => 6,
                     ResKind::Trait => 7,
+                    ResKind::Native => 8,
                 });
                 h.write_u64(info.flat.0 as u64);
                 h.write_u64(info.module.0 as u64);

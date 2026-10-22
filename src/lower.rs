@@ -2176,7 +2176,7 @@ impl<'p> Lower<'p> {
                     self.assign(d.clone(), Rvalue::Use(op), span);
                 }
             }
-            Expr::Block(b) => self.block_into(*b, dest),
+            Expr::Block(b) | Expr::UnsafeBlock(b) => self.block_into(*b, dest),
             Expr::If { cond, then, els } if self.is_let_chain(*cond) => {
                 let (eb, end) = (self.new_block(), self.new_block());
                 self.scopes.push(Vec::new());
@@ -2401,6 +2401,10 @@ impl<'p> Lower<'p> {
                     Res::Intrinsic(id) => {
                         let d = self.call_dest(dest, ty);
                         self.call_into(CallTarget::Intrinsic(id), ops, d, span);
+                    }
+                    Res::Native(id) => {
+                        let d = self.call_dest(dest, ty);
+                        self.call_into(CallTarget::Native(id), ops, d, span);
                     }
                     Res::Builtin(Builtin::VecNew) => self.set_or_temp(dest, Rvalue::VecLit(self.peel_vec(ty), Vec::new()), ty, span),
                     // `Rc::new_uninit()` is `Rc::new(MaybeUninit::uninit())`
@@ -3094,7 +3098,6 @@ impl<'p> Lower<'p> {
             Expr::Float(_)
             | Expr::Await(_)
             | Expr::AsyncBlock { .. }
-            | Expr::UnsafeBlock(_)
             | Expr::Let { .. }
             | Expr::ConstBlock(_)
             | Expr::Underscore

@@ -4151,7 +4151,7 @@ impl FnGen<'_, '_> {
                     CallTarget::Builtin(Builtin::Sync(crate::check::sync::SyncOp::ResumeUnwind | crate::check::sync::SyncOp::PanicAny)) => true,
                     // Lowering gives a dyn call a destination of the
                     // method's own return type.
-                    CallTarget::Builtin(_) | CallTarget::Dyn(_) => false,
+                    CallTarget::Builtin(_) | CallTarget::Dyn(_) | CallTarget::Native(_) => false,
                 };
                 // Unwind tables: a call into a whole local that its arguments do not read, with no
                 // old value to drop (a type without drop glue, a flag `flags_maybe_set` proves
@@ -4685,6 +4685,23 @@ impl FnGen<'_, '_> {
                 },
             },
             CallTarget::Intrinsic(id) => self.intrinsic(id, args, loc, post),
+            CallTarget::Native(id) => {
+                let native = self.p.native.get(id);
+                let ret = match native.sig().ret() {
+                    crate::native::NativeReturn::Void => "void",
+                    crate::native::NativeReturn::Int(t) => int_c(t.int_ty()),
+                };
+                let params: Vec<_> = native.sig().params().iter().map(|t| int_c(t.int_ty())).collect();
+                let params = if params.is_empty() { "void".to_owned() } else { params.join(", ") };
+                // A private C identifier prevents generated locals (e.g. l0)
+                // from hiding an external symbol of the same spelling.
+                let symbol = format!("lust_native_{:x}_{:x}", native.def().krate.0, native.def().hash.0);
+                self.slots.externs.borrow_mut().insert(format!("extern {ret} {symbol}({params}) __asm__(\"{}\");\n", native.symbol()));
+                let is_void = native.sig().ret() == crate::native::NativeReturn::Void;
+                let vals: Vec<_> = args.iter().map(|o| self.operand(o, loc, post).0).collect();
+                let call = format!("{symbol}({})", vals.join(", "));
+                if is_void { format!("({call}, {})", zero_lit(self.p, &CTy::Unit)) } else { call }
+            }
             CallTarget::Dyn(k) => {
                 // Through the vtable: entry `k` is a shim whose receiver
                 // is the erased data pointer (see `vtable_shim`). The

@@ -1396,6 +1396,13 @@ pub fn trait_key(p: &Program, impl_traits: &FxMap<usize, (DefId, bool, DefId)>) 
     "lang-impls-v1".hash(&mut lh);
     for (i, item) in p.ast.items.iter().enumerate() {
         let derives = match &item.kind {
+            // Checked generic bodies carry native import arena IDs. Any
+            // declaration change rebuilds those checks, including insertion
+            // or reordering that leaves an existing signature unchanged.
+            ItemKind::ExternBlock(_) => {
+                (2u8, crate::driver::ast_hash::item_hash(&p.ast, item)).hash(&mut h);
+                continue;
+            }
             ItemKind::Impl(imp) if imp.trait_ref.is_some() && impl_traits.get(&i).is_some_and(|(d, _, _)| user_trait(d)) => continue,
             ItemKind::Impl(imp) if !imp.is_negative && impl_traits.get(&i).is_some_and(|&(_, keyed, _)| keyed) => {
                 crate::driver::ast_hash::item_hash(&p.ast, item).hash(&mut lh);

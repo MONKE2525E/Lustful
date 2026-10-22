@@ -27,6 +27,7 @@ pub mod into;
 pub mod hashmap;
 pub mod iter;
 pub mod method;
+mod native;
 pub mod object;
 pub mod obligations;
 pub mod outlives;
@@ -1368,6 +1369,7 @@ pub enum Res {
         derefs: u8,
         autoref: Autoref,
     },
+    Native(crate::native::NativeFnId),
 }
 
 /// Which scalar comparison a `Res::PrimCmp` call computes. The
@@ -1907,6 +1909,7 @@ struct LoopCtx {
 
 struct Ctx<'p> {
     p: &'p Program,
+    unsafe_context: bool,
     f: &'p FnInfo,
     /// The crate's recursion limit (128 unless `#![recursion_limit]`):
     /// nested trait obligations overflow at this depth, as in rustc.
@@ -2519,6 +2522,7 @@ fn check_fn_mode<'p>(p: &'p Program, fid: LocalDefId, mode: opaque::OpaqueMode, 
     let n_pats = (def.pats.1 - def.pats.0) as usize;
     let mut cx = Ctx {
         p,
+        unsafe_context: false,
         f,
         recursion_limit: where_overflow::recursion_limit(p),
         auto_memo: Default::default(),
@@ -9205,13 +9209,17 @@ impl<'p> Ctx<'p> {
                 self.lifetime_turbofish(segs);
                 self.path_expr(e, segs, span)
             }
-            Expr::Block(b) => {
+            Expr::Block(b) | Expr::UnsafeBlock(b) => {
                 if let Some(tail) = p.ast.block(*b).tail
                     && self.hinted.contains(&e)
                 {
                     self.hinted.push(tail);
                 }
-                self.block(*b, expected)
+                let previous = self.unsafe_context;
+                self.unsafe_context |= matches!(p.ast.expr(e), Expr::UnsafeBlock(_));
+                let ty = self.block(*b, expected);
+                self.unsafe_context = previous;
+                ty
             }
             Expr::If { cond, then, els } if self.is_let_chain(*cond) => {
                 let scope = self.scopes.len();
@@ -10529,7 +10537,7 @@ impl<'p> Ctx<'p> {
             }
             Expr::QPath { self_ty, trait_path, segs } => self.qpath_value(e, *self_ty, trait_path, segs, span),
             // AST v2 expression forms the parser still rejects.
-            Expr::Await(_) | Expr::AsyncBlock { .. } | Expr::UnsafeBlock(_) | Expr::MacroCall(_) => ERROR,
+            Expr::Await(_) | Expr::AsyncBlock { .. } | Expr::MacroCall(_) => ERROR,
         }
     }
 
@@ -12085,6 +12093,10 @@ impl<'p> Ctx<'p> {
             }
             if let BindingRes::Def(def) = bound {
                 match p.binding_kind(def) {
+                    Some(DefsKind::ForeignFn) => {
+                        self.err("L0810", span, "native function values are not implemented", "Call the foreign function directly inside an unsafe block.");
+                        return ERROR;
+                    }
                     Some(DefsKind::Const) => {
                         if let Some(idx) = p.const_by_def(def) {
                             let c = &p.consts[idx as usize];
@@ -14415,6 +14427,25 @@ impl<'p> Ctx<'p> {
         };
         if is_value {
             return self.value_call(e, callee, args, span);
+        }
+        if let Expr::Path(segs) = p.ast.expr(callee)
+            && segs.len() == 1
+            && self.body_item_of(segs[0].name).is_none()
+            && let BindingRes::Def(def) = self.binding(Namespace::Value, segs[0].name)
+            && let Some(id) = p.native.by_def(def)
+        {
+            if segs[0].has_args() {
+                self.err("L0107", span, "foreign functions take no generic arguments", "Remove the generic arguments.");
+            }
+            if !self.unsafe_context {
+                self.err("L0404", span, "call to unsafe foreign function requires an unsafe block", "Wrap the call in an unsafe block and uphold the native function's safety requirements.");
+            }
+            let _ = p.sig_of(&mut self.out.reads, def);
+            let sig = p.native.get(id).sig();
+            let params: Vec<_> = sig.params().iter().map(|t| t.rust_ty()).collect();
+            self.check_args(&params, args, span);
+            self.set_res(e, Res::Native(id));
+            return sig.ret().rust_ty();
         }
         // `std::mem::drop(value)`: move the value and drop it now.
         // A user fn or body item named `drop` shadows the prelude

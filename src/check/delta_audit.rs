@@ -51,6 +51,8 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
         defs,                        // replace (the fn's generics and sig)
         adts: _,                     // same
         fns,                         // replace
+        native: _,                   // no body state; declarations are item edits
+        native_names: _,             // same
         consts: _,                   // refuse: a fn in `init_names` falls back
         const_names: _,              // same
         const_defs: _,               // same

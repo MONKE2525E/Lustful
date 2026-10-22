@@ -27,6 +27,7 @@ mod intern;
 mod ir;
 mod lexer;
 mod lower;
+mod native;
 #[allow(dead_code)] // Instance discovery is called from collect and the driver as W-TRAITS-CORE lands in increments.
 mod mono;
 mod parser;

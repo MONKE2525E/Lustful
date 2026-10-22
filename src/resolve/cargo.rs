@@ -1065,9 +1065,8 @@ pub fn check_edition(unit: &UnitInfo) -> Result<(), Diag> {
 }
 
 /// Reads `[lints]` and `[workspace.lints]` from the manifest texts of a
-/// selected unit (cargo metadata does not report lints). `unsafe_code` at
-/// forbid/deny is enforced by the parser's blanket `unsafe` reject; any
-/// other rust lint at deny/forbid rejects the session with L0531 naming
+/// selected unit (cargo metadata does not report lints). Any
+/// rust lint at deny/forbid rejects the session with L0531 naming
 /// the lint, because rustc would reject code that triggers it and lust
 /// does not check it (section 1.1).
 pub fn check_lints(graph: &CrateGraph, unit: &UnitInfo) -> Result<(), Diag> {
@@ -1094,7 +1093,7 @@ pub fn check_lints(graph: &CrateGraph, unit: &UnitInfo) -> Result<(), Diag> {
     Ok(())
 }
 
-/// The first non-`unsafe_code` rust lint at deny or forbid level in one
+/// The first rust lint at deny or forbid level in one
 /// manifest text, from `[lints]` / `[workspace.lints]` (inline-table form)
 /// or `[lints.rust]` / `[workspace.lints.rust]` (table form).
 fn first_deny_lint(text: &str) -> Option<String> {
@@ -1116,7 +1115,7 @@ fn first_deny_lint(text: &str) -> Option<String> {
             let (name, value) = line.split_once('=')?;
             let name = name.trim();
             let level = value.trim().trim_matches('"');
-            if (level == "deny" || level == "forbid") && name != "unsafe_code" && !name.contains("::") {
+            if (level == "deny" || level == "forbid") && !name.contains("::") {
                 return Some(name.to_string());
             }
         } else if let Some((_, inner)) = line.split_once('{') {
@@ -1124,7 +1123,7 @@ fn first_deny_lint(text: &str) -> Option<String> {
                 let Some((name, value)) = part.split_once('=') else { continue };
                 let name = name.trim();
                 let level = value.trim().trim_matches('"');
-                if (level == "deny" || level == "forbid") && name != "unsafe_code" && !name.contains("::") {
+                if (level == "deny" || level == "forbid") && !name.contains("::") {
                     return Some(name.to_string());
                 }
             }
@@ -1174,7 +1173,7 @@ mod tests {
     #[test]
     fn deny_lint_scan() {
         let inline = "[workspace.lints.rust]\nunsafe_code = \"forbid\"\n";
-        assert_eq!(first_deny_lint(inline), None);
+        assert_eq!(first_deny_lint(inline).as_deref(), Some("unsafe_code"));
         let table = "[lints.rust]\ndead_code = \"deny\"\n";
         assert_eq!(first_deny_lint(table).as_deref(), Some("dead_code"));
         let inline_table = "[lints]\nrust = { missing_docs = \"deny\" }\n";

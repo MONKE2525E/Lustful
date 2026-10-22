@@ -1,8 +1,5 @@
-// capability: rejected: `unsafe` blocks and functions
+// capability: rejected: unsafe Rust functions and foreign calls outside unsafe blocks
 // expect: L0404
 
-fn main() {
-    let x = 1;
-    let p = &x as *const i32;
-    println!("{}", unsafe { *p });
-}
+unsafe fn value() -> i32 { 1 }
+fn main() { println!("{}", unsafe { value() }); }

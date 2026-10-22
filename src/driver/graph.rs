@@ -2240,6 +2240,13 @@ fn sig_fingerprint(p: &Program, def: DefId) -> Fingerprint {
     hash_vis_facts(&mut h, p, def);
     hash_def_pub(&mut h, p, def);
     let mut seen = DeepMemo::default();
+    if let Some(id) = p.native.by_def(def) {
+        let native = p.native.get(id);
+        "native-C-v1".hash(&mut h);
+        native.symbol().hash(&mut h);
+        native.sig().hash(&mut h);
+        return Fingerprint(h.finish());
+    }
     if let Some(local) = p.local_def(def.hash).filter(|l| p.def_id(*l) == def) {
         let f = p.fn_info(local);
         0u8.hash(&mut h);
@@ -2555,6 +2562,7 @@ impl<'a> Program {
         match ns {
             Namespace::Value => match self.fn_names.get(&name) {
                 Some(&f) => BindingRes::Def(self.def_id(f)),
+                None if self.native_names.contains_key(&name) => BindingRes::Def(self.native.get(self.native_names[&name]).def()),
                 None => match self.type_names.get(&name) {
                     // A struct's name in value space is its constructor.
                     Some(&a) if !self.adt(a).is_enum => BindingRes::Def(self.def_of_adt(a)),
@@ -4169,7 +4177,7 @@ fn main() {}
                     assert!(unwind.is_some(), "every call carries a cleanup edge (W-CORELANG)");
                     match target {
                         CallTarget::Fn(_) | CallTarget::Indirect(_) | CallTarget::Dyn(_) => fn_calls += 1,
-                        CallTarget::Builtin(_) | CallTarget::Intrinsic(_) => builtin_calls += 1,
+                        CallTarget::Builtin(_) | CallTarget::Intrinsic(_) | CallTarget::Native(_) => builtin_calls += 1,
                     }
                 }
             }

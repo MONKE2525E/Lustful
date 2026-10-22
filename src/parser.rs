@@ -35,6 +35,7 @@ fn async_error(span: Span) -> Diag {
 type PResult<T> = Result<T, Diag>;
 
 mod attrs;
+mod foreign;
 mod hrtb;
 
 /// The depth of each arena node built so far (1 for a leaf, else one
@@ -2134,7 +2135,7 @@ impl<'a> Parser<'a> {
             Tok::Type if !has_qual => ItemKind::Type(self.type_alias_def()?),
             // `extern { .. }` and `extern crate ..;`: the qualifier loop ate `extern`.
             Tok::LBrace if qual.abi.is_some() && self.cfg_syntax => ItemKind::Mod(self.extern_block_cfg(start)?),
-            Tok::LBrace if qual.abi.is_some() => return Err(not_yet(C_EXTERN, start, "extern blocks")),
+            Tok::LBrace if qual.abi.is_some() => ItemKind::ExternBlock(self.foreign_block(start, qual, &vis)?),
             Tok::Crate if qual.abi.is_some() => ItemKind::ExternCrate(self.extern_crate_def()?),
             // Qualifiers with nothing after them are a grammar error.
             Tok::Eof | Tok::RBrace if has_qual => return Err(syntax(start, "expected an item after qualifiers")),
@@ -3841,6 +3842,7 @@ impl<'a> Parser<'a> {
                             self.ast.expr(i),
                             Expr::StructLit { .. }
                                 | Expr::Block(_)
+                                | Expr::UnsafeBlock(_)
                                 | Expr::If { .. }
                                 | Expr::While { .. }
                                 | Expr::Loop { .. }
@@ -3869,11 +3871,13 @@ impl<'a> Parser<'a> {
             // An inline `const { .. }` block is block-like too: as a
             // statement it needs no `;` and ends at its `}` (rustc).
             let const_block = self.peek() == Tok::Const && self.peek_at(1) == Tok::LBrace;
+            let unsafe_block = self.peek() == Tok::Unsafe && self.peek_at(1) == Tok::LBrace;
             // A cfg syntax check reads `m! {..}` as rustc does: a whole
             // statement, so `m! {} [1]` is two statements, not an index.
             let brace_mac = self.cfg_syntax && self.at_brace_macro_call();
             let mut block_like = labeled
                 || const_block
+                || unsafe_block
                 || brace_mac
                 || matches!(self.peek(), Tok::If | Tok::Match | Tok::While | Tok::Loop | Tok::For | Tok::LBrace);
             // A statement (or block tail) block may carry inner attributes.
@@ -3890,6 +3894,8 @@ impl<'a> Parser<'a> {
                     self.bump();
                     let b = self.block()?;
                     self.push_expr(Expr::ConstBlock(b), start.to(self.prev_span()))
+                } else if unsafe_block {
+                    self.primary(false, false)?
                 } else {
                     self.block_like_expr(true)?
                 };
@@ -5255,7 +5261,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Expr::Block(self.block()?)
             }
-            Tok::Unsafe => return Err(unsafe_error(start)),
+            Tok::Unsafe => {
+                self.bump();
+                Expr::UnsafeBlock(self.block()?)
+            }
             Tok::Async if self.cfg_syntax => {
                 self.bump();
                 if self.peek() == Tok::LBrace {
@@ -5852,6 +5861,44 @@ mod tests {
         let known = Known::new(&interner);
         let lexed = crate::lexer::lex(src, FileId(0), 0, &interner)?;
         parse(&lexed, &interner, &known)
+    }
+
+    #[test]
+    fn native_declarations_preserve_abi_visibility_and_bodylessness() {
+        let ast = parse_src("unsafe extern \"C\" { pub fn abs(value: i32) -> i32; fn getpid() -> i32; unsafe fn srand(seed: u32); }").unwrap();
+        let ItemKind::ExternBlock(block) = &ast.items[0].kind else { panic!("foreign block was lost") };
+        assert!(block.is_unsafe);
+        assert_eq!(ast.strings[block.abi.unwrap() as usize], "C");
+        assert_eq!(block.items.len(), 3);
+        for (i, item) in block.items.iter().enumerate() {
+            let ForeignItem::Fn(f) = item else { panic!("unexpected foreign item") };
+            assert!(f.body.is_none());
+            assert!(f.qual.is_unsafe);
+            assert_eq!(f.qual.abi, block.abi);
+            assert_eq!(f.vis, if i == 0 { Vis::Public } else { Vis::Private });
+        }
+    }
+
+    #[test]
+    fn native_declarations_reject_unimplemented_or_non_rust_forms() {
+        for source in [
+            "extern \"C\" { fn abs(x: i32) -> i32; }",
+            "unsafe extern { fn abs(x: i32) -> i32; }",
+            "unsafe extern \"system\" { fn abs(x: i32) -> i32; }",
+            "pub unsafe extern \"C\" { fn abs(x: i32) -> i32; }",
+            "const unsafe extern \"C\" { fn abs(x: i32) -> i32; }",
+            "unsafe extern \"C\" { fn abs(x: i32) -> i32 {} }",
+            "unsafe extern \"C\" { fn generic<T>(x: T); }",
+            "unsafe extern \"C\" { fn receiver(self); }",
+            "unsafe extern \"C\" { static NAME: i32; }",
+            "unsafe extern \"C\" { type Opaque; }",
+            "unsafe extern \"C\" { safe fn abs(x: i32) -> i32; }",
+            "unsafe extern \"C\" { #[link_name = \"abs\"] fn alias(x: i32) -> i32; }",
+            "unsafe extern \"C\" { fn variadic(x: i32, ...); }",
+            "fn main() { unsafe extern \"C\" { fn getpid() -> i32; } }",
+        ] {
+            assert!(parse_src(source).is_err(), "must reject: {source}");
+        }
     }
 
     /// A parenthesized `chain`-term sum whose first term is the

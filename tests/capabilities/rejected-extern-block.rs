@@ -1,4 +1,4 @@
-// capability: rejected: extern blocks
+// capability: rejected: extern blocks outside the supported scalar C subset
 // expect: L0810
 
 unsafe extern "C" {
