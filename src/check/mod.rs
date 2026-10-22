@@ -14032,7 +14032,14 @@ impl<'p> Ctx<'p> {
     fn self_from_expected_call(&mut self, e: ExprId, callee: ExprId, args: &[ExprId], expected: Option<Ty>, span: Span) -> Option<Ty> {
         let p = self.p;
         let Expr::Path(segs) = p.ast.expr(callee) else { return None };
-        if segs.len() != 2 || p.type_names.contains_key(&segs[0].name) || p.aliases.contains_key(&segs[0].name) {
+        if segs.len() != 2 {
+            return None;
+        }
+        // The flat maps answer with no read of their own: the body checks
+        // again when a user item comes to shadow the name (`struct Default`
+        // over `Default::default()`).
+        self.binding(Namespace::Type, segs[0].name);
+        if p.type_names.contains_key(&segs[0].name) || p.aliases.contains_key(&segs[0].name) {
             return None;
         }
         if self.body_scope.param_tys.iter().any(|(n, _)| *n == segs[0].name) {

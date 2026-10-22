@@ -67,6 +67,9 @@ impl<'p> Ctx<'p> {
         }
         let last = segs.len() - 1;
         let tdef = if segs.len() == 2 {
+            // The flat maps answer with no read of their own (see
+            // `self_from_expected_call`).
+            self.binding(crate::driver::graph::Namespace::Type, segs[0].name);
             if p.type_names.contains_key(&segs[0].name)
                 || p.aliases.contains_key(&segs[0].name)
                 || self.body_scope.param_tys.iter().any(|(n, _)| *n == segs[0].name)
