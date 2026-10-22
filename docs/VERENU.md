@@ -45,6 +45,30 @@ The selected Cargo target supplies the crate name for `module_path!()`. A binary
 whose target name differs from its package name therefore records the same
 default log target as rustc.
 
+### JSON construction and output
+
+The [serde_json 1.0.151 source adapter](../library/deps/serde_json/README.md)
+supports integer-only `Value` construction, `json!`, and compact serialization
+for a sealed set of primitives and containers. Parsing, typed Serde conversion,
+floating-point values, indexing, and `raw_value` remain unsupported. This is
+insufficient for Verenu's complete JSON use.
+
+Strict dependency discovery accepts this exact registry version only after
+validating the adapter's manifest and enabled features. The replacement source
+does not use upstream's build script or dependency edges. Other retained
+packages still undergo host-work checks; ambiguous host feature unions reject.
+Adapter manifest changes and source availability invalidate graph caches.
+
+```sh
+LUST="$PWD/target/release/lust" JSON_TRACE=1 SANITIZE=1 bash scripts/test-json-source-adapter.sh
+KEEP_ARTIFACTS=1 bash scripts/test-normal-graphs.sh
+```
+
+The first command builds an independent upstream Rust oracle before its guarded
+Lust phase. The second tests registry admission, executes a JSON program, and
+checks daemon invalidation and host-work rejection. Its Cargo oracles run outside
+the guarded target traces. `KEEP_ARTIFACTS=1` preserves those traces and logs.
+
 ### Primitive C imports
 
 On `x86_64-unknown-linux-gnu`, the TinyCC backend accepts module-level
@@ -126,9 +150,10 @@ oracle. The oracle is outside the rustc-free execution traces.
 
 Verenu requires edition 2021, async functions and Tokio, unsafe native FFI,
 custom procedural macros, and dependencies outside Lust's shipped adapters.
-With host preparation explicitly permitted, the edition-2024 compatibility overlay expands `log::warn!` and reaches
-unsupported `serde_json::json!` expansion. The production edition-2021 manifest
-still fails L0530. Async remains rejected as L0405. Primitive C imports cover
+An earlier host-enabled edition-2024 probe expanded `log::warn!` and stopped at
+`serde_json::json!`. The JSON subset above does not establish that this overlay
+now compiles. The production edition-2021 manifest still fails L0530. Async
+remains rejected as L0405. Primitive C imports cover
 buffer calls such as `gethostname` on the target above; broader native APIs,
 callbacks, and foreign library configuration remain unsupported. No full
 desktop build has succeeded.
@@ -148,7 +173,13 @@ rejected: their per-unit feature sets are not implemented on this path.
 Dependency source, adapter versions, and supported adapter features still
 have to satisfy Lust's existing checks. A directly qualified unsupported
 dependency macro reports L0508 with the dependency classifier's reason.
-Imported macros and crate aliases still report the generic unknown-macro error.
+Dependency root aliases and macro imports retain their dependency identity.
+Disabled imports and nearer block modules participate in macro lookup; an
+import proven to bind only a function, constant, or static does not hide a
+dependency's macro namespace. Unknown namespace contributions remain
+conservative, so some valid re-export chains still reject. Import namespaces
+converge independently, allowing a module alias to resolve before a later
+value binding arrives.
 
 Other graphs, including Verenu, stop at L0532 before host preparation. This gate also
 rejects warm host outputs and is part of each daemon session's identity.

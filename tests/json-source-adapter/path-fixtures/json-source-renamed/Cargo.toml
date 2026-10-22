@@ -1,0 +1,10 @@
+[package]
+name = "json-source-renamed"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+renamed_json = { package = "serde_json", path = "../../../../library/deps/serde_json" }
+
+[workspace]

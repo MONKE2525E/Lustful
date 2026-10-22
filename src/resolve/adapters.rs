@@ -39,6 +39,7 @@ pub const ADAPTER_FORMAT: u32 = 1;
 /// here with no `library/deps/<name>/src/lib.rs` is "no adapter yet".
 pub const ADAPTER_PACKAGES: &[&str] = &[
     "log",
+    "serde_json",
     "rustc-hash",
     "indexmap",
     "smallvec",
@@ -59,6 +60,17 @@ pub const ADAPTER_PACKAGES: &[&str] = &[
     "jiff",
 ];
 
+/// Whether the validated source adapter needs the original Cargo edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdapterDependencies {
+    Upstream,
+    Replaced,
+}
+
+// Audited complete source replacements, not a build-script allowlist.
+// Entries still require registry identity and manifest/unit validation.
+const COMPLETE_SOURCE_ADAPTERS: &[(&str, &str)] = &[("serde_json", "1.0.151")];
+
 /// One adapter crate, read from its manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Adapter {
@@ -70,6 +82,7 @@ pub struct Adapter {
     pub features: Vec<String>,
     /// Types whose layout equals upstream's (source paths).
     pub exact_layout: Vec<String>,
+    pub dependencies: AdapterDependencies,
 }
 
 /// The library tree: `$LUST_LIBRARY` when set (the section 3.8 override
@@ -97,6 +110,30 @@ pub fn load(package: &str) -> Result<Option<Adapter>, String> {
     let path = dir.join("Cargo.toml");
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     parse_manifest(&text, package, root).map(Some).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The shared classification boundary for graph admission and source loading.
+/// Path packages remain ordinary source, regardless of their package name.
+pub fn classify(package: &str, version: &str, source: Option<&str>, features: &[String]) -> Result<Option<Adapter>, String> {
+    let Some(source) = source else { return Ok(None) };
+    if !ADAPTER_PACKAGES.contains(&package) { return Ok(None); }
+    let mut a = load(package)
+        .map_err(|e| format!("the lust adapter for `{package}` is broken: {e}"))?
+        .ok_or_else(|| format!("dependency crate `{package}` has no lust adapter yet"))?;
+    check_unit(&a, package, version, features)?;
+    if source.starts_with("registry+") && COMPLETE_SOURCE_ADAPTERS.contains(&(package, version)) {
+        a.dependencies = AdapterDependencies::Replaced;
+    }
+    Ok(Some(a))
+}
+
+/// Queries only complete replacement candidates during strict discovery.
+/// Other adapters keep their existing host checks and L0508 timing.
+pub fn replaces_upstream(package: &str, version: &str, source: Option<&str>, features: &[String]) -> Result<bool, String> {
+    if !source.is_some_and(|s| s.starts_with("registry+"))
+        || !COMPLETE_SOURCE_ADAPTERS.iter().any(|(name, _)| *name == package)
+    { return Ok(false); }
+    Ok(classify(package, version, source, features)?.is_some_and(|a| a.dependencies == AdapterDependencies::Replaced))
 }
 
 /// Checks one resolved dependency unit against its adapter. Returns the
@@ -150,6 +187,7 @@ fn parse_manifest(text: &str, package: &str, root: PathBuf) -> Result<Adapter, S
         upstream: version.ok_or("no package version")?,
         features: features.ok_or("no `features` key in [package.metadata.lust]")?,
         exact_layout,
+        dependencies: AdapterDependencies::Upstream,
     })
 }
 
@@ -183,6 +221,25 @@ adapter = 1
 features = ["alloc", "default", "std"]
 exact-layout = ["memchr::Memchr"]
 "#;
+
+    #[test]
+    fn json_replacement_requires_registry_version_and_feature_validation() {
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
+        for features in [vec![], vec!["default".into(), "std".into()], vec!["alloc".into()]] {
+            let a = classify("serde_json", "1.0.151", registry, &features).unwrap().unwrap();
+            assert_eq!(a.dependencies, AdapterDependencies::Replaced);
+            assert!(a.exact_layout.is_empty());
+        }
+        assert!(classify("serde_json", "1.0.151", None, &["raw_value".into()]).unwrap().is_none());
+        let git = classify("serde_json", "1.0.151", Some("git+https://example.invalid/json"), &[]).unwrap().unwrap();
+        assert_eq!(git.dependencies, AdapterDependencies::Upstream);
+        for version in ["1.0.150", "1.0.152", "1.0.151+other"] {
+            assert!(classify("serde_json", version, registry, &[]).unwrap_err().contains(version));
+        }
+        for feature in ["raw_value", "preserve_order", "arbitrary_precision", "float_roundtrip", "unbounded_depth", "unknown"] {
+            assert!(classify("serde_json", "1.0.151", registry, &[feature.into()]).unwrap_err().contains(feature));
+        }
+    }
 
     #[test]
     fn manifest_reads_the_subset() {

@@ -1569,15 +1569,10 @@ fn classify_dep(dep: &super::cargo::DepUnit) -> DepClass {
         return DepClass::Source { root: dep.lib_src.clone(), lust_owned: false, adapter: None };
     }
     let name = dep.package_name.as_str();
-    if super::adapters::ADAPTER_PACKAGES.contains(&name) {
-        return match super::adapters::load(name) {
-            Ok(Some(a)) => match super::adapters::check_unit(&a, name, &dep.version, &dep.features) {
-                Ok(()) => DepClass::Source { root: a.root, lust_owned: true, adapter: Some(a.exact_layout) },
-                Err(why) => DepClass::Unsupported(why),
-            },
-            Ok(None) => DepClass::Unsupported(format!("dependency crate `{name}` has no lust adapter yet")),
-            Err(e) => DepClass::Unsupported(format!("the lust adapter for `{name}` is broken: {e}")),
-        };
+    match super::adapters::classify(name, &dep.version, dep.source.as_deref(), &dep.features) {
+        Ok(Some(a)) => return DepClass::Source { root: a.root, lust_owned: true, adapter: Some(a.exact_layout) },
+        Err(why) => return DepClass::Unsupported(why),
+        Ok(None) => {},
     }
     if SHIM_CRATES.contains(&name) {
         if let Some(root) = lust_dep_lib_root(name) {

@@ -1,0 +1,10 @@
+[package]
+name = "serde_json"
+version = "1.0.151"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[package.metadata.lust]
+adapter = 1
+features = ["default", "std", "alloc"]

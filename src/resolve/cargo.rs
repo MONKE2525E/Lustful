@@ -411,7 +411,8 @@ fn hash_bytes(h: &mut FxHasher, path: &Path) {
 /// SessionKey, and this key keys the in-process graph cache.
 pub fn graph_key(req: &GraphRequest) -> u64 {
     let mut h = FxHasher::default();
-    "lust-graph-v1".hash(&mut h);
+    "lust-graph-v2".hash(&mut h);
+    hash_adapter_admission(&mut h, &super::adapters::library_root());
     let mut dir = req.manifest_path.parent();
     while let Some(d) = dir {
         let m = d.join("Cargo.toml");
@@ -445,6 +446,18 @@ pub fn graph_key(req: &GraphRequest) -> u64 {
     req.cargo_net.hash(&mut h);
     req.host_tools.hash(&mut h);
     h.finish()
+}
+
+/// Admission depends on the selected library installation, adapter metadata,
+/// and whether source replacement is available. Hash absences too: installing
+/// or removing an adapter must invalidate restored and in-process graphs.
+fn hash_adapter_admission(h: &mut FxHasher, library: &Path) {
+    library.hash(h);
+    for package in super::adapters::ADAPTER_PACKAGES {
+        let dir = library.join("deps").join(package);
+        hash_bytes(h, &dir.join("Cargo.toml"));
+        dir.join("src/lib.rs").is_file().hash(h);
+    }
 }
 
 /// Hashes the inputs of Cargo's view of one path package dir that the
@@ -712,14 +725,35 @@ fn has_host_target(package: &Json) -> bool {
             || t.get("crate_types").map(Json::strings).unwrap_or_default().iter().any(|k| k == "proc-macro"))
 }
 
+fn has_proc_macro_target(package: &Json) -> bool {
+    package.get("targets").map(Json::as_arr).unwrap_or(&[]).iter().any(|t|
+        t.get("kind").map(Json::strings).unwrap_or_default().iter().any(|k| k == "proc-macro")
+            || t.get("crate_types").map(Json::strings).unwrap_or_default().iter().any(|k| k == "proc-macro"))
+}
+
 fn strict_normal_graph(root: &Json, req: &GraphRequest) -> Result<(), String> {
     strict_normal_root(root, req)?;
     let reject = || crate::protocol::HostTools::Forbid.require("this Cargo graph or host preparation").unwrap_err();
     let nodes = root.get("resolve").and_then(|r| r.get("nodes")).map(Json::as_arr).ok_or_else(reject)?;
-    if nodes.is_empty() { return Err(reject()); }
-    for node in nodes {
-        let package = root.get("packages").map(Json::as_arr).unwrap_or(&[]).iter()
-            .find(|p| p.get("id") == node.get("id")).ok_or_else(reject)?;
+    let packages = root.get("packages").map(Json::as_arr).ok_or_else(reject)?;
+    let mut pending = root.get("workspace_members").map(Json::strings).ok_or_else(reject)?;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.clone()) { continue; }
+        let node = nodes.iter().find(|n| n.get("id").and_then(Json::as_str) == Some(id.as_str())).ok_or_else(reject)?;
+        let package = packages.iter().find(|p| p.get("id") == node.get("id")).ok_or_else(reject)?;
+        // A procedural macro is host execution, even if a similarly named
+        // source adapter exists. Only a validated replacement owns its edges.
+        if has_proc_macro_target(package) { return Err(reject()); }
+        let name = package.get("name").and_then(Json::as_str).ok_or_else(reject)?;
+        let version = package.get("version").and_then(Json::as_str).ok_or_else(reject)?;
+        let source = package.get("source").and_then(Json::as_str);
+        let features = node.get("features").map(Json::strings).ok_or_else(reject)?;
+        let replaced = super::adapters::replaces_upstream(name, version, source, &features)
+            .map_err(|why| format!("error[L0508]: {why}"))?;
+        if replaced {
+            continue;
+        }
         if has_host_target(package) || package.get("dependencies").map(Json::as_arr).unwrap_or(&[]).iter().any(|d|
             d.get("kind").and_then(Json::as_str) == Some("build")
                 || matches!(d.get("kind"), Some(Json::Null)) && !matches!(d.get("target"), Some(Json::Null)))
@@ -729,6 +763,29 @@ fn strict_normal_graph(root: &Json, req: &GraphRequest) -> Result<(), String> {
             if kinds.is_empty() || kinds.iter().any(|k|
                 !matches!(k.get("kind"), Some(Json::Null)) || !matches!(k.get("target"), Some(Json::Null)))
             { return Err(reject()); }
+            pending.push(dep.get("pkg").and_then(Json::as_str).ok_or_else(reject)?.to_string());
+        }
+    }
+    // Resolve-node feature unions cease to be exact if an otherwise retained
+    // package is also used in an upstream host/dev/target-specific unit that
+    // replacement discarded. Do not guess which features belonged to it.
+    let mut ambiguous = Vec::new();
+    for node in nodes {
+        for dep in node.get("deps").map(Json::as_arr).unwrap_or(&[]) {
+            if dep.get("dep_kinds").map(Json::as_arr).unwrap_or(&[]).iter().any(|k|
+                !matches!(k.get("kind"), Some(Json::Null)) || !matches!(k.get("target"), Some(Json::Null)))
+            {
+                ambiguous.push(dep.get("pkg").and_then(Json::as_str).ok_or_else(reject)?.to_string());
+            }
+        }
+    }
+    let mut checked = std::collections::HashSet::new();
+    while let Some(id) = ambiguous.pop() {
+        if !checked.insert(id.clone()) { continue; }
+        if seen.contains(&id) { return Err(reject()); }
+        let node = nodes.iter().find(|n| n.get("id").and_then(Json::as_str) == Some(id.as_str())).ok_or_else(reject)?;
+        for dep in node.get("deps").map(Json::as_arr).unwrap_or(&[]) {
+            ambiguous.push(dep.get("pkg").and_then(Json::as_str).ok_or_else(reject)?.to_string());
         }
     }
     Ok(())
@@ -1246,7 +1303,12 @@ fn build_deps(
             .as_ref()
             .and_then(|m| m.get(&(dep_pkg.id_repr.clone(), lib.name.clone())).cloned())
             .unwrap_or_else(|| dep_pkg.resolved_features.clone());
-        let sub = if stack.contains(&dep_pkg.id_repr) {
+        // Use the same validated policy as strict admission, including the
+        // actual unit features in host-allowed graphs. A failed classifier
+        // never prunes; source loading reports its L0508 reason.
+        let replaced = super::adapters::replaces_upstream(&dep_pkg.name, &dep_pkg.version, dep_pkg.source.as_deref(), &features)
+            .unwrap_or(false);
+        let sub = if replaced || stack.contains(&dep_pkg.id_repr) {
             Vec::new()
         } else {
             stack.push(dep_pkg.id_repr.clone());
@@ -1432,6 +1494,106 @@ mod tests {
         let before = graph_key(&req);
         req.host_tools = crate::protocol::HostTools::Allow;
         assert_ne!(before, graph_key(&req));
+    }
+
+    // Reduced metadata shape; end-to-end registry coverage lives in the
+    // existing normal-graph exec audit, using the genuine upstream manifest.
+    fn json_admission_metadata() -> Json {
+        parse_json(r#"{
+          "workspace_members":["app"],
+          "packages":[
+            {"id":"app","name":"app","version":"0.1.0","source":null,
+             "targets":[{"kind":["bin"],"crate_types":["bin"]}],
+             "dependencies":[{"kind":null,"target":null}]},
+            {"id":"json","name":"serde_json","version":"1.0.151",
+             "source":"registry+https://github.com/rust-lang/crates.io-index",
+             "targets":[{"kind":["lib"],"crate_types":["lib"]},{"kind":["custom-build"]}],
+             "dependencies":[{"kind":"build","target":null}]},
+            {"id":"host","name":"host","version":"0.1.0","source":null,
+             "targets":[{"kind":["lib"]},{"kind":["custom-build"]}],"dependencies":[]}
+          ],
+          "resolve":{"nodes":[
+            {"id":"app","features":[],"deps":[{"name":"renamed_json","pkg":"json","dep_kinds":[{"kind":null,"target":null}]}]},
+            {"id":"json","features":["default","std"],"deps":[{"name":"host","pkg":"host","dep_kinds":[{"kind":"build","target":null}]}]},
+            {"id":"host","features":[],"deps":[]}
+          ]}
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn strict_json_replacement_prunes_only_its_own_closure() {
+        let req = GraphRequest { host_tools: crate::protocol::HostTools::Forbid, ..Default::default() };
+        let root = json_admission_metadata();
+        strict_normal_graph(&root, &req).unwrap();
+        let mut shared_host = root.clone();
+        let Json::Obj(fields) = &mut shared_host else { unreachable!() };
+        let resolve = &mut fields.iter_mut().find(|(key, _)| key == "resolve").unwrap().1;
+        let Json::Obj(fields) = resolve else { unreachable!() };
+        let Json::Arr(nodes) = &mut fields.iter_mut().find(|(key, _)| key == "nodes").unwrap().1 else { unreachable!() };
+        let Json::Obj(app) = &mut nodes[0] else { unreachable!() };
+        let Json::Arr(deps) = &mut app.iter_mut().find(|(key, _)| key == "deps").unwrap().1 else { unreachable!() };
+        deps.push(parse_json(r#"{"name":"independent","pkg":"host","dep_kinds":[{"kind":null,"target":null}]}"#).unwrap());
+        assert!(strict_normal_graph(&shared_host, &req).unwrap_err().starts_with("error[L0532]:"));
+
+        // Even a host-free shared lib cannot use a union contaminated by the
+        // removed build dependency's separate host unit.
+        let mut shared_features = shared_host.clone();
+        let Json::Obj(fields) = &mut shared_features else { unreachable!() };
+        let Json::Arr(packages) = &mut fields.iter_mut().find(|(key, _)| key == "packages").unwrap().1 else { unreachable!() };
+        let Json::Obj(host) = &mut packages[2] else { unreachable!() };
+        host.iter_mut().find(|(key, _)| key == "targets").unwrap().1 = parse_json(r#"[{"kind":["lib"],"crate_types":["lib"]}]"#).unwrap();
+        assert!(strict_normal_graph(&shared_features, &req).unwrap_err().starts_with("error[L0532]:"));
+
+        for (field, value, code) in [
+            ("version", Json::Str("1.0.150".into()), "L0508"),
+            ("source", Json::Null, "L0532"),
+            ("source", Json::Str("git+https://example.invalid/json".into()), "L0532"),
+            ("targets", parse_json(r#"[{"kind":["proc-macro"],"crate_types":["proc-macro"]}]"#).unwrap(), "L0532"),
+        ] {
+            let mut changed = root.clone();
+            let Json::Obj(fields) = &mut changed else { unreachable!() };
+            let Json::Arr(packages) = &mut fields.iter_mut().find(|(key, _)| key == "packages").unwrap().1 else { unreachable!() };
+            let Json::Obj(json) = &mut packages[1] else { unreachable!() };
+            json.iter_mut().find(|(key, _)| key == field).unwrap().1 = value;
+            assert!(strict_normal_graph(&changed, &req).unwrap_err().contains(code), "{field}");
+        }
+        for feature in ["raw_value", "preserve_order", "arbitrary_precision", "float_roundtrip", "unbounded_depth", "unknown"] {
+            let mut changed = root.clone();
+            let Json::Obj(fields) = &mut changed else { unreachable!() };
+            let Json::Obj(resolve) = &mut fields.iter_mut().find(|(key, _)| key == "resolve").unwrap().1 else { unreachable!() };
+            let Json::Arr(nodes) = &mut resolve.iter_mut().find(|(key, _)| key == "nodes").unwrap().1 else { unreachable!() };
+            let Json::Obj(json) = &mut nodes[1] else { unreachable!() };
+            json.iter_mut().find(|(key, _)| key == "features").unwrap().1 = Json::Arr(vec![Json::Str(feature.into())]);
+            let why = strict_normal_graph(&changed, &req).unwrap_err();
+            assert!(why.contains("L0508") && why.contains(feature), "{why}");
+        }
+    }
+
+    #[test]
+    fn adapter_admission_inputs_invalidate_graphs() {
+        let dir = std::env::temp_dir().join(format!("lust-adapter-key-{}", std::process::id()));
+        let adapter = dir.join("deps/serde_json");
+        let stamp = || {
+            let mut h = FxHasher::default();
+            hash_adapter_admission(&mut h, &dir);
+            h.finish()
+        };
+        let absent = stamp();
+        std::fs::create_dir_all(adapter.join("src")).unwrap();
+        let manifest = "[package]\nname = \"serde_json\"\nversion = \"1.0.151\"\n";
+        std::fs::write(adapter.join("Cargo.toml"), manifest).unwrap();
+        let metadata = stamp();
+        assert_ne!(absent, metadata);
+        std::fs::write(adapter.join("src/lib.rs"), "").unwrap();
+        let source = stamp();
+        assert_ne!(metadata, source);
+        std::fs::write(adapter.join("Cargo.toml"), manifest.replace("1.0.151", "1.0.150")).unwrap();
+        assert_ne!(source, stamp());
+        std::fs::write(adapter.join("Cargo.toml"), manifest).unwrap();
+        assert_eq!(source, stamp());
+        std::fs::remove_file(adapter.join("src/lib.rs")).unwrap();
+        assert_eq!(metadata, stamp());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
