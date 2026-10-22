@@ -203,8 +203,12 @@ This fork forbids rustc host preparation by default. Standalone files and a
 single-package manifest with no dependencies, build script, or proc-macro target
 use this strict path. Featureless workspaces can also compile when every
 dependency is an unconditional normal path edge to another workspace member,
-with no version requirements, build scripts, or proc macros. Other graphs fail
-with L0532 before feature probes,
+with no version requirements, build scripts, or proc macros. Single-member
+workspaces can also resolve normal unconditional dependency graphs, including
+features and optional or renamed dependencies, through Lust's read-only Cargo
+queries. Build scripts, proc macros, root dev dependencies, and conditional
+dependency graphs remain rejected. Adapter version and feature checks still
+apply. Other graphs fail with L0532 before feature probes,
 host builds, or cached host outputs are used. `--host-tools` or
 `LUST_HOST_TOOLS=1` permits those operations explicitly; that run is not
 rustc-free. Building Lust itself and running rustc comparison tests are separate
@@ -212,9 +216,8 @@ toolchain preparation and verification steps.
 
 `lust metadata` resolves a full Cargo dependency graph through Lust's own
 read-only compiler query interface on native x86_64 Linux. It does not execute
-build scripts or procedural macros, produce compiled artifacts, or expand the
-set of graphs accepted by `check` and `build`. Extra compiler flags and other
-query targets are rejected. See [Verenu support](docs/VERENU.md).
+build scripts or procedural macros or produce compiled artifacts. Extra compiler
+flags and other query targets are rejected. See [Verenu support](docs/VERENU.md).
 
 Crate flags work as in Cargo: `--features`, `--no-default-features`, `--all-features`, `--package`, `--target`, `--offline`, `--locked`. A project can drop features from lust dev builds (for example jemalloc) with `dev-exclude-features` in `.lust.toml`. See [docs/dev-features.md](docs/dev-features.md).
 

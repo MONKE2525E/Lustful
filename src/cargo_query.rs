@@ -80,18 +80,21 @@ pub fn metadata(args: &[String]) -> i32 {
         };
         if !valid { eprintln!("error: unsupported Lust metadata argument `{arg}`"); return 2; }
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => { eprintln!("error: cannot locate Lust compiler: {error}"); return 2; }
-    };
     let mut command = std::process::Command::new("cargo");
     command.arg("metadata");
     if !args.iter().any(|a| a == "--format-version") { command.args(["--format-version", "1"]); }
-    match command.args(args).env(MODE, "1").env("RUSTC", exe).env("CARGO_CACHE_RUSTC_INFO", "0")
-        .env("RUSTC_WRAPPER", "").env("RUSTC_WORKSPACE_WRAPPER", "").status() {
+    if let Err(error) = configure(&mut command) { eprintln!("error: {error}"); return 2; }
+    match command.args(args).status() {
         Ok(status) => status.code().unwrap_or(2),
         Err(error) => { eprintln!("error: cannot run Cargo metadata: {error}"); 2 }
     }
+}
+
+pub fn configure(command: &mut std::process::Command) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("cannot locate Lust compiler: {e}"))?;
+    command.env(MODE, "1").env("RUSTC", exe).env("CARGO_CACHE_RUSTC_INFO", "0")
+        .env("RUSTC_WRAPPER", "").env("RUSTC_WORKSPACE_WRAPPER", "");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -657,6 +657,9 @@ pub struct ExpandCtx<'a> {
     /// resolves only through one of these, as rustc reads `::name` as an
     /// extern crate. Empty off the Cargo path.
     pub extern_crates: Vec<Sym>,
+    /// Dependency names whose source or adapter is unavailable, with the
+    /// classifier's reason. Preserve that reason for unresolved macro paths.
+    pub unsupported_externs: Vec<(Sym, String)>,
     /// The requesting client's env and shown paths (`for_file` gives `ClientView::PROCESS`).
     pub client: &'a ClientView,
 }
@@ -714,6 +717,7 @@ impl<'a> ExpandCtx<'a> {
             module_path: Vec::new(),
             crate_name: None,
             extern_crates: Vec::new(),
+            unsupported_externs: Vec::new(),
             client: &ClientView::PROCESS,
         }
     }
@@ -4891,6 +4895,12 @@ impl<'a> Expander<'a> {
         {
             return Err(crate::resolve::imports::ambiguous_diag(&seg.text, call.span));
         }
+        if call.segs.len() > 1
+            && let Some((_, why)) = self.ctx.unsupported_externs.iter().find(|(name, _)| *name == call.segs[0].sym)
+            && (call.leading_colon || !self.shadowed_crates.contains(&call.segs[0].sym))
+        {
+            return Err(crate::resolve::imports::unsupported_diag(why, call.span));
+        }
         Err(err(
             C_UNKNOWN,
             call.span,
@@ -5239,6 +5249,30 @@ mod tests {
         let ctx = ExpandCtx::for_file(interner, known, std::path::Path::new("test.rs"), src, false);
         let out = expand_lexed(lexed, &ctx)?;
         Ok(out.tokens.iter().map(|t| tok_text(&t.tok, &out.strings, interner)).collect())
+    }
+
+    #[test]
+    fn unsupported_dependency_macro_reports_classifier_reason() {
+        let interner = Interner::default();
+        let known = Known::new(&interner);
+        for (src, code) in [
+            ("fn main() { journal::debug!(); }", "L0508"),
+            ("mod inner { fn f() { journal::debug!(); } }", "L0508"),
+            ("mod journal {} fn main() { ::journal::debug!(); }", "L0508"),
+            ("mod journal {} fn main() { journal::debug!(); }", C_UNKNOWN),
+            ("fn main() { other::debug!(); }", C_UNKNOWN),
+        ] {
+            let lexed = crate::lexer::lex(src, FileId(0), 0, &interner).unwrap();
+            let mut ctx = ExpandCtx::for_file(&interner, &known, std::path::Path::new("test.rs"), src, false);
+            let name = interner.intern("journal");
+            ctx.extern_crates.push(name);
+            ctx.unsupported_externs.push((name, "log: unsupported adapter feature".to_string()));
+            let diag = expand_lexed(lexed, &ctx).err().expect("unsupported macro path");
+            assert_eq!(diag.code, code, "{src}");
+            if code == "L0508" {
+                assert_eq!(diag.message, "log: unsupported adapter feature");
+            }
+        }
     }
 
     /// A simple call expands, and expanding the same call again in the

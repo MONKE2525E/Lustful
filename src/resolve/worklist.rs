@@ -944,6 +944,7 @@ impl FileExpander {
             module_path: module_path.clone(),
             crate_name: Some(self.crate_name.clone()),
             extern_crates: self.menv.extern_crates(interner),
+            unsupported_externs: self.menv.unsupported_externs(interner),
             client,
         };
         let spliced = self.menv.splice(*di, lexed, self.magic);
@@ -1332,6 +1333,7 @@ fn expansion_env_hash(menv: &MacroEnv, job: &CrateJob, input: &OneInput, client:
     let mut externs: Vec<&String> = menv.dep_owned.keys().collect();
     externs.sort_unstable();
     externs.hash(&mut h);
+    menv.unsupported.hash(&mut h);
     h.write_u64(job.magic.0 as u64);
     input.crate_name.hash(&mut h);
     input.cargo_env.hash(&mut h);
@@ -2829,6 +2831,7 @@ struct MacroEnv {
     srcs: Vec<MacroSrc>,
     /// Dependency exported sources by extern name, as owned indices.
     dep_owned: FxMap<String, Vec<usize>>,
+    unsupported: Vec<(String, String)>,
     /// Textual macro sources inherited by each disc, in textual order.
     inherited: Vec<Vec<usize>>,
     /// Per disc: (declaration byte offset, textual sources, is an
@@ -3354,14 +3357,26 @@ impl MacroEnv {
             }
             glob_seeds.push(extra);
         }
-        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, inherited, after_mods, glob_seeds, scopes, scanned }
+        let unsupported = job.deps.iter().filter_map(|(name, dep)| dep.as_ref().err().map(|why| (name.clone(), why.clone()))).collect();
+        MacroEnv { seeds, own, own_exported, root_sources, owned_all: owned, srcs, dep_owned, unsupported, inherited, after_mods, glob_seeds, scopes, scanned }
     }
 
     /// The extern crate names a `::name::m!` path can start with here
     /// (`ExpandCtx::extern_crates`): every dependency, and the magic
     /// segment of every crate below this one.
     fn extern_crates(&self, interner: &Interner) -> Vec<Sym> {
-        self.dep_owned.keys().map(|n| interner.intern(n)).collect()
+        let mut names: Vec<Sym> = self.dep_owned.keys().map(|n| interner.intern(n)).collect();
+        for (name, _) in &self.unsupported {
+            let name = interner.intern(name);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    fn unsupported_externs(&self, interner: &Interner) -> Vec<(Sym, String)> {
+        self.unsupported.iter().map(|(name, why)| (interner.intern(name), why.clone())).collect()
     }
 
     /// The macro sources dependent crates see at this crate's root:
@@ -3544,6 +3559,7 @@ fn resolve_one(
         owned_all: Vec::new(),
         srcs: Vec::new(),
         dep_owned: FxMap::default(),
+        unsupported: Vec::new(),
         inherited: Vec::new(),
         after_mods: Vec::new(),
         glob_seeds: Vec::new(),
@@ -3628,6 +3644,7 @@ fn resolve_one(
                 module_path: module_paths[di].clone(),
                 crate_name: Some(input.crate_name.clone()),
                 extern_crates: menv.extern_crates(interner),
+                unsupported_externs: menv.unsupported_externs(interner),
                 client,
             };
             let spliced = menv.splice(di, orig, job.magic);

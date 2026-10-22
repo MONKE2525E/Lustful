@@ -122,13 +122,24 @@ still fails L0530. Async remains rejected as L0405. Scalar C imports work on
 the target above, but Verenu's pointer-based native APIs and callbacks remain
 unsupported. No full desktop build has succeeded.
 
-Strict compilation uses `cargo metadata --no-deps`. It admits one package
+Strict compilation starts with `cargo metadata --no-deps`. It admits one package
 without dependencies, build scripts, or proc-macro targets, resolving its local
 feature closure without rustc. It also admits featureless workspaces with only
 unconditional normal path dependencies between members, without version
 requirements, build scripts, or proc macros. These edges resolve by canonical
-manifest path; no feature probe runs. Other graphs, including Verenu, stop at
-L0532 before full metadata resolution or host preparation. This gate also
+manifest path; no feature probe runs. A single-member workspace may also use
+normal unconditional dependencies, including optional dependencies, renamed
+crates, and Cargo features. Lust resolves that graph through its read-only Cargo
+query interface and uses Cargo's feature sets. Every resolved edge must be a
+normal unconditional edge, with no build scripts or proc-macro targets. Root
+dev dependencies, build dependencies, and target-conditional dependencies are
+rejected: their per-unit feature sets are not implemented on this path.
+Dependency source, adapter versions, and supported adapter features still
+have to satisfy Lust's existing checks. A directly qualified unsupported
+dependency macro reports L0508 with the dependency classifier's reason.
+Imported macros and crate aliases still report the generic unknown-macro error.
+
+Other graphs, including Verenu, stop at L0532 before host preparation. This gate also
 rejects warm host outputs and is part of each daemon session's identity.
 `--host-tools` or `LUST_HOST_TOOLS=1` opts into existing host-tool behavior and
 is not a rustc-free run. The gate prevents hidden compiler use; it does not
@@ -137,6 +148,11 @@ add the missing desktop compiler capabilities.
 `bash scripts/test-local-graphs.sh` audits the local-workspace path and compares
 its output with a separately built Cargo oracle. The oracle is outside the
 strict build trace and does use rustc.
+
+`bash scripts/test-normal-graphs.sh` audits actual builds with the renamed `log`
+adapter and a path dependency, compares feature-selected output against separate
+Cargo builds, and checks cache/daemon invalidation and host-tool rejection. Those
+Cargo oracle builds use rustc outside the strict traces.
 
 The compiler must preserve native behavior and reject unsupported constructs
 throughout this work. A successful core test run does not establish a working

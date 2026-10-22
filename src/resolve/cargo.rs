@@ -4,8 +4,8 @@
 // file runs `cargo metadata --format-version 1` once per graph key and
 // reads packages, targets, dependencies (kind, rename, target cfg), and the
 // resolve nodes. Per-unit features come from the resolve nodes when the
-// graph shape makes them exact (one workspace member, no dependencies),
-// or a validated featureless local workspace, and otherwise from one cached
+// graph shape makes them exact (one member with only normal unconditional
+// dependencies), or a validated featureless local workspace, and otherwise from one cached
 // `cargo check --message-format=json` run
 // for the same request, whose compiler-artifact messages carry the exact
 // feature set of each selected unit.
@@ -274,7 +274,7 @@ pub struct UnitInfo {
 /// session (ARCH 1.8).
 #[derive(Clone, Debug)]
 pub struct DepUnit {
-    /// The name paths in the dependent crate use (rename or the package
+    /// The name paths in the dependent crate use (rename or the library
     /// name, with `-` read as `_`).
     pub extern_name: String,
     /// The stable package identity string (`package_id_string`).
@@ -453,7 +453,14 @@ pub fn graph_key(req: &GraphRequest) -> u64 {
 /// presence, not their text), and the entries of `src/bin`, `examples`,
 /// `tests`, and `benches` (a file or a dir with a `main.rs` is a target).
 fn hash_package_dir(h: &mut FxHasher, dir: &Path) {
-    hash_bytes(h, &dir.join("Cargo.toml"));
+    // Workspace discovery reads ancestor manifests, including their absence.
+    // A new or edited virtual workspace can change inherited package fields.
+    for ancestor in dir.ancestors() {
+        hash_bytes(h, &ancestor.join("Cargo.toml"));
+    }
+    // Governing workspaces may be selected outside the ancestor chain with
+    // package.workspace. Their lockfile is still a resolution input.
+    hash_bytes(h, &dir.join("Cargo.lock"));
     for f in ["build.rs", "src/main.rs", "src/lib.rs"] {
         dir.join(f).exists().hash(h);
     }
@@ -472,7 +479,7 @@ fn hash_package_dir(h: &mut FxHasher, dir: &Path) {
 /// The watch stamp of a set of path package dirs (`hash_package_dir`).
 fn watch_stamp(dirs: &[PathBuf]) -> u64 {
     let mut h = FxHasher::default();
-    "lust-watch-v1".hash(&mut h);
+    "lust-watch-v3".hash(&mut h);
     for d in dirs {
         d.hash(&mut h);
         hash_package_dir(&mut h, d);
@@ -481,17 +488,30 @@ fn watch_stamp(dirs: &[PathBuf]) -> u64 {
 }
 
 /// The dirs a graph's watch stamp covers: the named manifest's dir and
-/// every path package (workspace members and path dependencies).
-fn watch_dirs(req: &GraphRequest, packages: &[PackageInfo]) -> Vec<PathBuf> {
+/// every path package and its governing workspace. Cargo resolves explicit
+/// `package.workspace` paths too; an ancestor-only scan cannot discover those.
+fn watch_dirs(req: &GraphRequest, packages: &[PackageInfo]) -> Result<Vec<PathBuf>, String> {
     let mut dirs: Vec<PathBuf> = req.manifest_path.parent().map(Path::to_path_buf).into_iter().collect();
     for p in packages.iter().filter(|p| p.source.is_none()) {
         if let Some(d) = p.manifest_path.parent() {
             dirs.push(d.to_path_buf());
+            let mut cmd = cargo_command(req.env.as_deref());
+            if let Some(cwd) = req.manifest_path.parent() { cmd.current_dir(cwd); }
+            cmd.args(["locate-project", "--workspace", "--manifest-path"]).arg(&p.manifest_path);
+            cmd.args(req.cargo_net.args());
+            let out = cmd.output().map_err(|e| format!("cannot locate Cargo workspace: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("cannot locate Cargo workspace: {}", String::from_utf8_lossy(&out.stderr)));
+            }
+            let located = parse_json(&String::from_utf8_lossy(&out.stdout))?;
+            let manifest = located.get("root").and_then(Json::as_str).ok_or("Cargo workspace location has no root")?;
+            let workspace = Path::new(manifest).parent().ok_or("Cargo workspace location has no directory")?;
+            dirs.push(workspace.to_path_buf());
         }
     }
     dirs.sort();
     dirs.dedup();
-    dirs
+    Ok(dirs)
 }
 
 /// In-process cache of loaded graphs, by graph key. A daemon serves many
@@ -536,11 +556,11 @@ pub fn load_graph(req: &GraphRequest) -> Result<std::sync::Arc<CrateGraph>, Stri
     // graph watched (else the named manifest's dir), so an edit made
     // while Cargo runs moves the stamp. When metadata names a path
     // package outside that set, the run repeats with it in the set.
-    let mut watch = cached.map_or_else(|| watch_dirs(req, &[]), |g| g.watch.clone());
+    let mut watch = cached.map_or_else(|| watch_dirs(req, &[]), |g| Ok(g.watch.clone()))?;
     for _ in 0..4 {
         let stamp = watch_stamp(&watch);
         let mut graph = run_metadata(req, key)?;
-        let dirs = watch_dirs(req, &graph.packages);
+        let dirs = watch_dirs(req, &graph.packages)?;
         if dirs.iter().all(|d| watch.contains(d)) {
             let mut h = FxHasher::default();
             (key, stamp).hash(&mut h);
@@ -669,7 +689,52 @@ fn strict_workspace_edges(root: &Json, req: &GraphRequest) -> Result<std::collec
     Ok(edges)
 }
 
-fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
+/// With one root and only normal unconditional dependency units, Cargo's
+/// package feature unions are exact for compilation too. Host/dev/target
+/// splits still require an implementation of per-unit feature resolution.
+fn strict_normal_root(root: &Json, req: &GraphRequest) -> Result<(), String> {
+    let reject = || crate::protocol::HostTools::Forbid.require("this Cargo graph or host preparation").unwrap_err();
+    let members = root.get("workspace_members").map(Json::strings).unwrap_or_default();
+    if members.len() != 1 { return Err(reject()); }
+    let package = root.get("packages").map(Json::as_arr).unwrap_or(&[]).iter()
+        .find(|p| p.get("id").and_then(Json::as_str) == Some(&members[0])).ok_or_else(reject)?;
+    if req.package.as_deref().is_some_and(|name| package.get("name").and_then(Json::as_str) != Some(name))
+        || package.get("dependencies").map(Json::as_arr).unwrap_or(&[]).iter().any(|d|
+            !matches!(d.get("kind"), Some(Json::Null)) || !matches!(d.get("target"), Some(Json::Null)))
+        || has_host_target(package)
+    { return Err(reject()); }
+    Ok(())
+}
+
+fn has_host_target(package: &Json) -> bool {
+    package.get("targets").map(Json::as_arr).unwrap_or(&[]).iter().any(|t|
+        t.get("kind").map(Json::strings).unwrap_or_default().iter().any(|k| matches!(k.as_str(), "custom-build" | "proc-macro"))
+            || t.get("crate_types").map(Json::strings).unwrap_or_default().iter().any(|k| k == "proc-macro"))
+}
+
+fn strict_normal_graph(root: &Json, req: &GraphRequest) -> Result<(), String> {
+    strict_normal_root(root, req)?;
+    let reject = || crate::protocol::HostTools::Forbid.require("this Cargo graph or host preparation").unwrap_err();
+    let nodes = root.get("resolve").and_then(|r| r.get("nodes")).map(Json::as_arr).ok_or_else(reject)?;
+    if nodes.is_empty() { return Err(reject()); }
+    for node in nodes {
+        let package = root.get("packages").map(Json::as_arr).unwrap_or(&[]).iter()
+            .find(|p| p.get("id") == node.get("id")).ok_or_else(reject)?;
+        if has_host_target(package) || package.get("dependencies").map(Json::as_arr).unwrap_or(&[]).iter().any(|d|
+            d.get("kind").and_then(Json::as_str) == Some("build")
+                || matches!(d.get("kind"), Some(Json::Null)) && !matches!(d.get("target"), Some(Json::Null)))
+        { return Err(reject()); }
+        for dep in node.get("deps").map(Json::as_arr).unwrap_or(&[]) {
+            let kinds = dep.get("dep_kinds").map(Json::as_arr).ok_or_else(reject)?;
+            if kinds.is_empty() || kinds.iter().any(|k|
+                !matches!(k.get("kind"), Some(Json::Null)) || !matches!(k.get("target"), Some(Json::Null)))
+            { return Err(reject()); }
+        }
+    }
+    Ok(())
+}
+
+fn read_metadata(req: &GraphRequest, resolved: bool) -> Result<Json, String> {
     let mut cmd = cargo_command(req.env.as_deref());
     // Run in the manifest's directory: Cargo discovers `.cargo/config.toml`
     // from the working directory, and the project's config (source
@@ -678,8 +743,10 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
         cmd.current_dir(dir);
     }
     cmd.args(["metadata", "--format-version", "1", "--manifest-path"]).arg(&req.manifest_path);
-    if req.host_tools == crate::protocol::HostTools::Forbid {
+    if !resolved {
         cmd.arg("--no-deps");
+    } else if req.host_tools == crate::protocol::HostTools::Forbid {
+        crate::cargo_query::configure(&mut cmd)?;
     }
     if !req.features.is_empty() {
         cmd.args(["--features", &req.features.join(",")]);
@@ -694,7 +761,7 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     // never downloads platform crates lust cannot target anyway
     // (a windows-only dependency of rustix broke offline resolves).
     let filter = if req.target_triple.is_empty() { crate::protocol::host_triple() } else { &req.target_triple };
-    if !filter.is_empty() && req.host_tools == crate::protocol::HostTools::Allow {
+    if !filter.is_empty() && resolved {
         cmd.args(["--filter-platform", filter]);
     }
     cmd.args(req.cargo_net.args());
@@ -706,11 +773,24 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let root = parse_json(&text).map_err(|e| format!("cannot parse `cargo metadata` output: {e}"))?;
+    parse_json(&text).map_err(|e| format!("cannot parse `cargo metadata` output: {e}"))
+}
+
+fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
+    let mut root = read_metadata(req, req.host_tools == crate::protocol::HostTools::Allow)?;
     let (strict_features, strict_edges) = if req.host_tools == crate::protocol::HostTools::Forbid {
         match strict_package_features(&root, req) {
             Ok(features) => (Some(features), None),
-            Err(error) if error.starts_with("error[L0532]:") => (Some(Vec::new()), Some(strict_workspace_edges(&root, req)?)),
+            Err(error) if error.starts_with("error[L0532]:") => {
+                if let Ok(edges) = strict_workspace_edges(&root, req) {
+                    (Some(Vec::new()), Some(edges))
+                } else {
+                    strict_normal_root(&root, req)?;
+                    root = read_metadata(req, true)?;
+                    strict_normal_graph(&root, req)?;
+                    (None, None)
+                }
+            },
             Err(error) => return Err(error),
         }
     } else { (None, None) };
@@ -762,17 +842,25 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
                 pkg: None,
             })
             .collect();
-        // Fill each dependency's resolved package by matching the resolve
-        // edges of this package (dependency name plus kind plus target;
-        // the resolve node's name is the dependency lib name, with `-`
-        // read as `_` on both sides).
+        // Cargo names resolve edges after the explicit alias, or otherwise
+        // the library target (which need not match the package name).
         if let Some(edges) = node_deps.get(&id_repr) {
             for dep in &mut dependencies {
-                let want = dep.name.replace('-', "_");
                 dep.pkg = edges
                     .iter()
-                    .find(|(name, _, kind, target)| name.replace('-', "_") == want && *kind == dep.kind && *target == dep.target)
-                    .or_else(|| edges.iter().find(|(name, _, kind, _)| name.replace('-', "_") == want && *kind == dep.kind))
+                    .find(|(name, id, kind, target)| {
+                        if *kind != dep.kind || *target != dep.target { return false; }
+                        let Some(package) = root.get("packages").map(Json::as_arr).unwrap_or(&[]).iter()
+                            .find(|p| p.get("id").and_then(Json::as_str) == Some(id.as_str())) else { return false; };
+                        if package.get("name").and_then(Json::as_str) != Some(dep.name.as_str()) { return false; }
+                        if let Some(alias) = &dep.rename {
+                            return name.replace('-', "_") == alias.replace('-', "_");
+                        }
+                        package.get("targets").map(Json::as_arr).unwrap_or(&[]).iter().any(|t|
+                            t.get("name").and_then(Json::as_str).is_some_and(|lib| lib.replace('-', "_") == name.replace('-', "_"))
+                                && t.get("kind").map(Json::strings).unwrap_or_default().iter()
+                                    .any(|k| matches!(k.as_str(), "lib" | "rlib" | "proc-macro")))
+                    })
                     .map(|(_, pkg, _, _)| pkg.clone());
             }
         }
@@ -1071,7 +1159,7 @@ pub fn select_unit(
         })
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
-    // A Forbid graph has already passed strict local-graph validation. Its
+    // A Forbid graph has already passed strict graph validation. Its
     // stored feature sets are exact; never consult host-derived feature data.
     let simple_graph = req.host_tools == crate::protocol::HostTools::Forbid
         || graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
@@ -1153,7 +1241,7 @@ fn build_deps(
         let Some(dep_pkg_id) = &dep.pkg else { continue };
         let Some(dep_pkg) = graph.packages.iter().find(|p| &p.id_repr == dep_pkg_id) else { continue };
         let Some(lib) = dep_pkg.targets.iter().find(|t| t.kind.iter().any(|k| k == "lib" || k == "rlib")) else { continue };
-        let extern_name = dep.rename.clone().unwrap_or_else(|| dep.name.replace('-', "_"));
+        let extern_name = dep.rename.as_deref().unwrap_or(&lib.name).replace('-', "_");
         let features = check_map
             .as_ref()
             .and_then(|m| m.get(&(dep_pkg.id_repr.clone(), lib.name.clone())).cloned())
