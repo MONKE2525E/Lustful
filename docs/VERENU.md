@@ -96,6 +96,24 @@ compatible layouts, generics, unwinding, and metadata support.
 
 ## Remaining full-application requirements
 
+`lust metadata --manifest-path Cargo.toml --offline --locked` resolves a full
+Cargo graph without calling rustc. It uses a query-only Lust compiler entry:
+the identity says `lust`, target facts come from Lust's own cfg table, and
+unsupported Cargo library artifact types are reported as unsupported. This
+currently accepts the native `x86_64-unknown-linux-gnu` target without extra
+compiler flags. Other queries and all attempts to compile host artifacts fail.
+The returned graph can describe build scripts and procedural macros; neither
+is executed. Resolving a graph does not make its packages compilable by Lust,
+and this command does not relax the strict build policy.
+
+```sh
+bash scripts/test-cargo-query.sh
+```
+
+The test traces query executions with a refusing rustc sentinel and separately
+compares Cargo's graph, including feature activation, against a rustc-query
+oracle. The oracle is outside the rustc-free execution traces.
+
 Verenu requires edition 2021, async functions and Tokio, unsafe native FFI,
 custom procedural macros, and dependencies outside Lust's shipped adapters.
 With host preparation explicitly permitted, the edition-2024 compatibility overlay expands `log::warn!` and reaches

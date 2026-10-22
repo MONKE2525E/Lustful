@@ -12,6 +12,7 @@
 mod ast;
 mod borrowck;
 mod capabilities;
+mod cargo_query;
 mod cc;
 mod cgen;
 mod check;
@@ -369,6 +370,8 @@ fn image_run(reqs: &[driver::Request], dir: &std::path::Path) -> Vec<driver::Res
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = cargo_query::dispatch(&args) { std::process::exit(code); }
     // A re-executed image process (src/image.rs) runs with randomization
     // off and an arena variable: its children get neither.
     image::process_start();
@@ -379,9 +382,9 @@ fn main() {
     #[cfg(unix)]
     raise_stack_limit();
     tcc::use_mimalloc();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     // Agent-kit commands run in this process; they never go through the daemon.
     match args.first().map(String::as_str) {
+        Some("metadata") => std::process::exit(cargo_query::metadata(&args[1..])),
         Some("test") => std::process::exit(testrun::run(&args[1..])),
         Some("explain") => std::process::exit(explain::run(&args[1..])),
         Some("capabilities") => std::process::exit(capabilities::run(&args[1..])),

@@ -189,6 +189,7 @@ lust check main.rs --rustc --host-tools     # ask the real rustc for a second op
 lust build main.rs --release --host-tools   # release build with Cargo (rustc -O for one file)
 lust explain L0602                          # long help for one error code
 lust capabilities --json                    # what the subset supports and rejects
+lust metadata --manifest-path Cargo.toml --offline --locked  # resolve only, without rustc
 ```
 
 A target in a Cargo workspace:
@@ -208,6 +209,12 @@ host builds, or cached host outputs are used. `--host-tools` or
 `LUST_HOST_TOOLS=1` permits those operations explicitly; that run is not
 rustc-free. Building Lust itself and running rustc comparison tests are separate
 toolchain preparation and verification steps.
+
+`lust metadata` resolves a full Cargo dependency graph through Lust's own
+read-only compiler query interface on native x86_64 Linux. It does not execute
+build scripts or procedural macros, produce compiled artifacts, or expand the
+set of graphs accepted by `check` and `build`. Extra compiler flags and other
+query targets are rejected. See [Verenu support](docs/VERENU.md).
 
 Crate flags work as in Cargo: `--features`, `--no-default-features`, `--all-features`, `--package`, `--target`, `--offline`, `--locked`. A project can drop features from lust dev builds (for example jemalloc) with `dev-exclude-features` in `.lust.toml`. See [docs/dev-features.md](docs/dev-features.md).
 
