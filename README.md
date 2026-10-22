@@ -1,6 +1,6 @@
 <img src="assets/icon.svg" width="64" height="64" alt="Lust logo: a pink crab with a smiling face">
 
-# lust-lang
+# Lustful
 
 This is the Verenu compatibility fork. See [Verenu support](docs/VERENU.md) for
 the compiler additions, verification commands, and remaining desktop blockers.
