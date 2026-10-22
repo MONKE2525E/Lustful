@@ -71,9 +71,9 @@ unsupported=0
 # note on a signal death ("line 54: <pid> Aborted  timeout ..."), which lands in the
 # redirected stderr of a function call. A std source path in a panic location is
 # `@STD@/library/..`: boat's rustc prints `/rustc/<hash>/library/..`, a toolchain with
-# rust-src installed prints its local `lib/rustlib/src/rust/library/..`. W-PANIC compares
-# the rest byte for byte.
-mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
+# rust-src installed prints its local `lib/rustlib/src/rust/library/..`, and
+# remapped toolchains print `library/..`. W-PANIC compares the rest byte for byte.
+mask_stderr() { sed -E -e "s/^thread '([^']*)' \([0-9]+\) /thread '\1' (TID) /" -e 's#(/rustc/[0-9a-f]+|/[^ :]*/lib/rustlib/src/rust)/library/#@STD@/library/#g' -e 's#(panicked at )library/#\1@STD@/library/#' -e '/^timeout: the monitored command dumped core$/d' -e '/: line [0-9]+: +[0-9]+ .* timeout /d' "$1"; }
 
 # mask_stdout <case file> <stdout file>: a program's stdout with the paths it can print
 # masked: the case's path as @CASE@ and the checkout root as @ROOT@ (`file!()`,
