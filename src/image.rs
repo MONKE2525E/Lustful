@@ -147,6 +147,8 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
     fn fork() -> c_int;
     fn setsid() -> c_int;
+    fn setpriority(which: c_int, who: u32, prio: c_int) -> c_int;
+    fn sched_setscheduler(pid: c_int, policy: c_int, param: *const c_int) -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
     fn _exit(code: c_int) -> !;
     fn mi_manage_os_memory_ex(
@@ -2174,7 +2176,8 @@ fn quiesce() {
 /// answers and exits at once and a release publishes its artifact without
 /// waiting (a base save takes 10-18 s on tsgo). A release build's cc step
 /// runs after the fork, in the parent (`driver::defer_cc`), so the save
-/// overlaps clang; the child drops it first. The child is this
+/// overlaps clang; the child drops it first and saves at idle priority
+/// (`save_idle`), so clang and the link go first. The child is this
 /// process's memory at the fork with this thread alone; it detaches (its
 /// own session, standard streams on /dev/null, so no pipe of the caller
 /// waits for it), holds the state lock until it exits (`lock`), and
@@ -2206,6 +2209,7 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
                 dup2(null.as_raw_fd(), fd);
             });
         }
+        save_idle();
         // The parent runs a parked cc step after the fork (`driver::defer_cc`): its unit
         // texts are freed here, so they are not live blocks of the image.
         crate::driver::drop_parked_cc();
@@ -2231,6 +2235,35 @@ pub fn save_background(dir: &Path, roots: Box<Roots>) -> Result<String, String> 
     }
     std::mem::forget(roots);
     Ok(format!("lust: front state saving in the background: pid {pid} (fork {:.0} ms), result in {}", t.elapsed().as_secs_f64() * 1e3, log.display()))
+}
+
+/// Puts this thread, a background save's child (its only thread), at idle priority: nice 19,
+/// `SCHED_IDLE` and the idle I/O class, which the threads it starts inherit. The build process
+/// runs its cc step beside the save; at normal priority the save took the CPU and the disk from
+/// clang and the link (tsgo's replay: the cc step +0.3-3.0 s a merge, about half of that back
+/// at idle priority). `LUST_FRONT_SAVE_IDLE=0` keeps the normal priority. Linux only; a failed
+/// call leaves its priority as it was.
+fn save_idle() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("LUST_FRONT_SAVE_IDLE").is_none_or(|v| v != "0") {
+        const PRIO_PROCESS: c_int = 0;
+        const SCHED_IDLE: c_int = 5;
+        // `struct sched_param`: its one field, the static priority, is 0 under SCHED_IDLE.
+        let param: c_int = 0;
+        // SAFETY: calls that change only this thread's priority (who 0 and pid 0 are the caller).
+        unsafe {
+            setpriority(PRIO_PROCESS, 0, 19);
+            sched_setscheduler(0, SCHED_IDLE, &param);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            const SYS_IOPRIO_SET: std::ffi::c_long = 251;
+            const IOPRIO_WHO_PROCESS: std::ffi::c_long = 1;
+            const IOPRIO_IDLE: std::ffi::c_long = 3 << 13;
+            // SAFETY: ioprio_set of this thread (who 0) to the idle class (`IOPRIO_PRIO_VALUE(3, 0)`).
+            unsafe { syscall(SYS_IOPRIO_SET, IOPRIO_WHO_PROCESS, 0 as std::ffi::c_long, IOPRIO_IDLE) };
+        }
+    }
 }
 
 /// Writes the image of `roots` and returns a one-line summary. After a
