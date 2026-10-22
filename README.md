@@ -200,7 +200,10 @@ lust build crates/ts_goport/src/bin/tsgo.rs --manifest-path crates/ts_goport/Car
 
 This fork forbids rustc host preparation by default. Standalone files and a
 single-package manifest with no dependencies, build script, or proc-macro target
-use this strict path. Other Cargo graphs fail with L0532 before feature probes,
+use this strict path. Featureless workspaces can also compile when every
+dependency is an unconditional normal path edge to another workspace member,
+with no version requirements, build scripts, or proc macros. Other graphs fail
+with L0532 before feature probes,
 host builds, or cached host outputs are used. `--host-tools` or
 `LUST_HOST_TOOLS=1` permits those operations explicitly; that run is not
 rustc-free. Building Lust itself and running rustc comparison tests are separate

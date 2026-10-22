@@ -5,7 +5,8 @@
 // reads packages, targets, dependencies (kind, rename, target cfg), and the
 // resolve nodes. Per-unit features come from the resolve nodes when the
 // graph shape makes them exact (one workspace member, no dependencies),
-// and otherwise from one cached `cargo check --message-format=json` run
+// or a validated featureless local workspace, and otherwise from one cached
+// `cargo check --message-format=json` run
 // for the same request, whose compiler-artifact messages carry the exact
 // feature set of each selected unit.
 //
@@ -597,6 +598,77 @@ fn strict_package_features(root: &Json, req: &GraphRequest) -> Result<Vec<String
     Ok(enabled.into_iter().collect())
 }
 
+/// A closed, featureless workspace needs neither Cargo's version solver nor
+/// its compiler probe. Every edge must identify a library already described
+/// by --no-deps metadata. Everything requiring resolution stays forbidden.
+fn strict_workspace_edges(root: &Json, req: &GraphRequest) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, String> {
+    let reject = || crate::protocol::HostTools::Forbid.require("this Cargo graph or host preparation").unwrap_err();
+    let packages = root.get("packages").map(Json::as_arr).unwrap_or(&[]);
+    let members = root.get("workspace_members").map(Json::strings).unwrap_or_default();
+    if packages.is_empty() || packages.len() != members.len() || !req.features.is_empty() || req.all_features {
+        return Err(reject());
+    }
+    let mut paths = std::collections::HashMap::new();
+    for p in packages {
+        let id = p.get("id").and_then(Json::as_str).ok_or_else(reject)?;
+        let manifest = p.get("manifest_path").and_then(Json::as_str).ok_or_else(reject)?;
+        let path = std::fs::canonicalize(manifest).map_err(|_| reject())?;
+        let features_empty = matches!(p.get("features"), Some(Json::Obj(entries)) if entries.is_empty());
+        if !members.iter().any(|m| m == id) || !matches!(p.get("source"), Some(Json::Null)) || !features_empty
+            || p.get("targets").map(Json::as_arr).unwrap_or(&[]).iter().any(|t| {
+                t.get("kind").map(Json::strings).unwrap_or_default().iter().any(|k| matches!(k.as_str(), "custom-build" | "proc-macro"))
+                    || t.get("crate_types").map(Json::strings).unwrap_or_default().iter().any(|k| k == "proc-macro")
+            }) || paths.insert(path, p).is_some()
+        {
+            return Err(reject());
+        }
+    }
+    let mut edges = std::collections::HashMap::new();
+    for p in packages {
+        let mut deps = Vec::new();
+        for d in p.get("dependencies").map(Json::as_arr).unwrap_or(&[]) {
+            let path = d.get("path").and_then(Json::as_str).ok_or_else(reject)?;
+            let manifest = std::fs::canonicalize(Path::new(path).join("Cargo.toml")).map_err(|_| reject())?;
+            let target = paths.get(&manifest).ok_or_else(reject)?;
+            if !matches!(d.get("source"), Some(Json::Null)) || !matches!(d.get("kind"), Some(Json::Null))
+                || !matches!(d.get("target"), Some(Json::Null)) || d.get("optional").map(Json::as_bool).unwrap_or(true)
+                || d.get("req").and_then(Json::as_str) != Some("*")
+                || !d.get("features").map(Json::as_arr).unwrap_or(&[]).is_empty()
+                || d.get("name") != target.get("name")
+                || target.get("targets").map(Json::as_arr).unwrap_or(&[]).iter().filter(|t| {
+                    t.get("kind").map(Json::strings).unwrap_or_default().iter().any(|k| k == "lib" || k == "rlib")
+                }).count() != 1
+            {
+                return Err(reject());
+            }
+            let name = d.get("name").and_then(Json::as_str).ok_or_else(reject)?;
+            let id = target.get("id").and_then(Json::as_str).ok_or_else(reject)?;
+            // Cargo rejects one package depended on through multiple names.
+            // --no-deps does not perform that resolution-time validation.
+            if deps.iter().any(|(_, previous)| previous == id) { return Err(reject()); }
+            deps.push((name.to_string(), id.to_string()));
+        }
+        let id = p.get("id").and_then(Json::as_str).ok_or_else(reject)?;
+        edges.insert(id.to_string(), deps);
+    }
+    fn visit(id: &str, edges: &std::collections::HashMap<String, Vec<(String, String)>>, active: &mut Vec<String>, done: &mut std::collections::HashSet<String>) -> bool {
+        if done.contains(id) { return true; }
+        if active.iter().any(|p| p == id) { return false; }
+        active.push(id.to_string());
+        for (_, dep) in &edges[id] {
+            if !visit(dep, edges, active, done) { return false; }
+        }
+        active.pop();
+        done.insert(id.to_string());
+        true
+    }
+    let mut done = std::collections::HashSet::new();
+    for id in edges.keys() {
+        if !visit(id, &edges, &mut Vec::new(), &mut done) { return Err(reject()); }
+    }
+    Ok(edges)
+}
+
 fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     let mut cmd = cargo_command(req.env.as_deref());
     // Run in the manifest's directory: Cargo discovers `.cargo/config.toml`
@@ -635,9 +707,13 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let root = parse_json(&text).map_err(|e| format!("cannot parse `cargo metadata` output: {e}"))?;
-    let strict_features = if req.host_tools == crate::protocol::HostTools::Forbid {
-        Some(strict_package_features(&root, req)?)
-    } else { None };
+    let (strict_features, strict_edges) = if req.host_tools == crate::protocol::HostTools::Forbid {
+        match strict_package_features(&root, req) {
+            Ok(features) => (Some(features), None),
+            Err(error) if error.starts_with("error[L0532]:") => (Some(Vec::new()), Some(strict_workspace_edges(&root, req)?)),
+            Err(error) => return Err(error),
+        }
+    } else { (None, None) };
     let workspace_root = PathBuf::from(root.get("workspace_root").and_then(|v| v.as_str()).unwrap_or(""));
     let members: Vec<String> = root.get("workspace_members").map(|v| v.strings()).unwrap_or_default();
     // Resolve nodes: features per package id, and the exact dep edges.
@@ -698,6 +774,11 @@ fn run_metadata(req: &GraphRequest, key: u64) -> Result<CrateGraph, String> {
                     .find(|(name, _, kind, target)| name.replace('-', "_") == want && *kind == dep.kind && *target == dep.target)
                     .or_else(|| edges.iter().find(|(name, _, kind, _)| name.replace('-', "_") == want && *kind == dep.kind))
                     .map(|(_, pkg, _, _)| pkg.clone());
+            }
+        }
+        if let Some(edges) = strict_edges.as_ref().and_then(|m| m.get(&id_repr)) {
+            for dep in &mut dependencies {
+                dep.pkg = edges.iter().find(|(name, _)| name == &dep.name).map(|(_, id)| id.clone());
             }
         }
         packages.push(PackageInfo {
@@ -990,7 +1071,10 @@ pub fn select_unit(
         })
         .or_else(|| pkg.targets.iter().find(|t| t.name == target_name))
         .ok_or_else(|| format!("package `{}` has no {target_kind} target named `{target_name}`", pkg.name))?;
-    let simple_graph = graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
+    // A Forbid graph has already passed strict local-graph validation. Its
+    // stored feature sets are exact; never consult host-derived feature data.
+    let simple_graph = req.host_tools == crate::protocol::HostTools::Forbid
+        || graph.workspace_members.len() <= 1 && pkg.dependencies.is_empty();
     if !simple_graph {
         req.host_tools.require("per-unit Cargo feature resolution")?;
     }

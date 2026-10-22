@@ -104,14 +104,21 @@ still fails L0530. Async remains rejected as L0405. Scalar C imports work on
 the target above, but Verenu's pointer-based native APIs and callbacks remain
 unsupported. No full desktop build has succeeded.
 
-Strict compilation uses `cargo metadata --no-deps` and admits only one package
-without dependencies, build scripts, or proc-macro targets. Its local feature
-closure is resolved without rustc. Other graphs, including Verenu, stop at
+Strict compilation uses `cargo metadata --no-deps`. It admits one package
+without dependencies, build scripts, or proc-macro targets, resolving its local
+feature closure without rustc. It also admits featureless workspaces with only
+unconditional normal path dependencies between members, without version
+requirements, build scripts, or proc macros. These edges resolve by canonical
+manifest path; no feature probe runs. Other graphs, including Verenu, stop at
 L0532 before full metadata resolution or host preparation. This gate also
 rejects warm host outputs and is part of each daemon session's identity.
 `--host-tools` or `LUST_HOST_TOOLS=1` opts into existing host-tool behavior and
 is not a rustc-free run. The gate prevents hidden compiler use; it does not
 add the missing desktop compiler capabilities.
+
+`bash scripts/test-local-graphs.sh` audits the local-workspace path and compares
+its output with a separately built Cargo oracle. The oracle is outside the
+strict build trace and does use rustc.
 
 The compiler must preserve native behavior and reject unsupported constructs
 throughout this work. A successful core test run does not establish a working
